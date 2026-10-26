@@ -207,7 +207,7 @@ fn a_failed_group_binding_releases_every_group_of_the_call() -> Result<()> {
 }
 
 #[test]
-fn relay_lanes_are_bounded_by_the_unresolved_window() -> Result<()> {
+fn relay_entries_are_bounded_by_the_unresolved_window() -> Result<()> {
     let store = store(256, 2, 1)?;
     let slots = HashMap::from([(request(), 1)]);
     let placement = OutputPlacement {

@@ -64,10 +64,10 @@ pub struct LaunchDescriptor {
     pub queue_depth: usize,
     /// The engine's watchdog timeout in milliseconds (`worker_config.watchdog_timeout`):
     /// how long a batch may go without progress of the group's ranks before
-    /// the engine replaces them. The rank reports a lane stalled
+    /// the engine replaces them. The rank reports a stalled job
     /// ([`WorkerResponse::Stalled`](crate::WorkerResponse)) once one job has
-    /// run on it for half of it, so the report precedes the engine's expiry;
-    /// at least two.
+    /// run for half of it, so the report precedes the engine's expiry; at
+    /// least two.
     pub watchdog_timeout_ms: u64,
 
     /// Checkpoint path or repository; empty for the stub model.

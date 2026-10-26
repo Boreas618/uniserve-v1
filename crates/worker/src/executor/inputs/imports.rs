@@ -14,7 +14,7 @@ use ipc::{
 use super::{Input, component_device, installs};
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::transfer::latents::{self};
-use crate::lane::Job;
+use crate::job::Job;
 use crate::memory::{Metadata, OutputPlacement, ValueRange};
 use crate::{Error, Result};
 
@@ -178,8 +178,8 @@ pub(super) fn import_products(
                 "cross-call input requires a configured transport".into(),
             ));
         }
-        // The reads' handoff fences are recorded into the job of the lane
-        // that owns the consumers' stream; the reads start once it ran.
+        // The reads' handoff fences are recorded into the job that issues on
+        // the consumers' stream; the reads start once it ran.
         let imported = storage.tensors.import_tensor(
             product,
             tensor,
@@ -253,8 +253,8 @@ fn import_latent(
         .storage
         .ok_or_else(|| Error::Unsupported("latent imports require rank storage".into()))?;
     let ledger = parts
-        .lanes
-        .and_then(crate::executor::lanes::ExecutorLanes::ledger_mut)
+        .computations
+        .and_then(crate::executor::computations::Computations::ledger_mut)
         .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?;
     let (pool, latent) = ledger.parts();
     let input = latents::import(

@@ -1,4 +1,4 @@
-"""The token batch protocol of a text lane.
+"""The token batch protocol of a text computation.
 
 ``uniserve.executor.text.protocol``.
 """

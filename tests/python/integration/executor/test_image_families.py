@@ -72,7 +72,8 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="the image lanes run on a GPU"
+        not torch.cuda.is_available(),
+        reason="the image computations run on a GPU",
     ),
 ]
 

@@ -1,13 +1,13 @@
-//! The prefix cache pages of the lanes whose calls attend to them.
+//! The prefix cache pages of the computations whose calls attend to them.
 //!
-//! A lane whose manifest names the `pages` resource computes over the
+//! A computation whose manifest names the `pages` resource computes over the
 //! prefix cache: its calls read (and a text call writes) the K/V of their
-//! request slots' block tables. Every such lane computes on the device's
-//! lane stream. The worker keeps what the executor does not decide:
+//! request slots' block tables. Every such computation computes on the device's
+//! primary stream. The worker keeps what the executor does not decide:
 //!
-//! - [`Pages`], what those lanes share: the lane stream's unit resets, the
-//!   order of their batches across streams ([`StreamOrder`]), which cache
-//!   transfers and image batches reading the cache wait on, and the block
+//! - [`Pages`], what those computations share: the primary stream's unit
+//!   resets, the order of their batches across streams ([`StreamOrder`]), which
+//!   cache transfers and image batches reading the cache wait on, and the block
 //!   diffusion a generating rank serves;
 //! - [`PageReservation`], what one batch reserves before the executor runs
 //!   it: the active calls' block tables installed, their newly assigned
@@ -37,23 +37,23 @@ use ipc::{
 
 use crate::executor::batch::{Batch, CallState, StreamOrder};
 use crate::executor::columns::{ForwardRows, GroupPages, host_tensor};
-use crate::executor::lanes::LaneCall;
+use crate::executor::computations::CallResources;
 use crate::ffi::{Backing, DType as Element, MemoryKind};
-use crate::lane::{Job, Recorder};
+use crate::job::{Job, Recorder};
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::{AttentionRow, OutputPlacement, PrefixCache, ProductBuffer, UnitColumn};
 use crate::request::RequestPool;
 use crate::{Error, ProductStore, Result};
 
-/// What the rank's cache-backed lanes share.
+/// What the rank's cache-backed computations share.
 pub(crate) struct Pages {
     device: Option<DeviceId>,
-    /// The device's lane stream, which every cache-backed lane computes
-    /// on; `None` on a host lane.
+    /// The device's primary stream, which every cache-backed computation
+    /// computes on; `None` for computations on the host.
     stream: Option<Stream>,
-    /// The unit resets of the lane stream.
+    /// The unit resets of the primary stream.
     column: UnitColumn,
-    /// Orders what committing lanes' batches write (the K/V of their
+    /// Orders what committing computations' batches write (the K/V of their
     /// prefills, slot state) before work of other streams that reads it:
     /// recorded behind each such batch's commit, waited on by the next
     /// cache-backed batch and by transfers and image batches.
@@ -99,7 +99,7 @@ impl Pages {
         &mut self.order
     }
 
-    /// The unit reset column of the lane stream, for work that assigns K/V
+    /// The unit reset column of the primary stream, for work that assigns K/V
     /// units beside the cache-backed batches.
     pub(crate) fn unit_column(&self) -> &UnitColumn {
         &self.column
@@ -107,9 +107,8 @@ impl Pages {
 
     /// Install `plan`'s block tables of the slots `holds` selects and reset
     /// their newly assigned units, recording the stream work into `issue`:
-    /// before any of the batch's writes. Units the host KV cache's reads
-    /// fill on the copy lane are overwritten whole there, and are not
-    /// recycled.
+    /// before any of the batch's writes. Units the host KV cache's reads fill
+    /// on the copy stream are overwritten whole there, and are not recycled.
     pub(crate) fn install(
         &self,
         prefix_cache: &mut PrefixCache,
@@ -176,9 +175,9 @@ pub(crate) fn attention_pages(
     Ok(pages)
 }
 
-/// The device columns the relayed scalars of a lane's batches pass
+/// The device columns the relayed scalars of a computation's batches pass
 /// through: the executor writes each executed call's values at the call's
-/// index, and the batch copies them into the call's products on the lane
+/// index, and the batch copies them into the call's products on the primary
 /// stream behind the executor's work.
 pub(crate) struct RelayStaging {
     /// `int64 [calls]`: each call's sampled token and continuation.
@@ -283,7 +282,7 @@ impl PageReservation {
     pub(crate) fn reserve(
         owners: PageOwners<'_>,
         plan: &BatchPlan,
-        batch: &mut Batch<LaneCall>,
+        batch: &mut Batch<CallResources>,
         job: &Job,
     ) -> Result<Self> {
         let PageOwners {
@@ -344,7 +343,7 @@ fn check_rows(
     pages: &Pages,
     prefix_cache: &mut PrefixCache,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     rows: &ForwardRows,
     denoising: bool,
 ) -> Result<()> {
@@ -459,7 +458,7 @@ fn check_rows(
 fn bind_relays(
     tensors: &ProductStore,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     issue: Recorder<'_>,
 ) -> Result<()> {
     let target = batch.target();
@@ -553,13 +552,13 @@ fn bind_relays(
     Ok(())
 }
 
-/// Lease every active call's relayed (`int64`) predicate on the lane
-/// stream, which waits on each producer's fence: the executor gates the
-/// call on its slot state, which the producer's commit advanced before.
+/// Lease every active call's relayed (`int64`) predicate on the primary stream,
+/// which waits on each producer's fence: the executor gates the call on its
+/// slot state, which the producer's commit advanced before.
 fn lease_predicates(
     tensors: &ProductStore,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     issue: Recorder<'_>,
 ) -> Result<()> {
     let requests: Vec<_> = plan
@@ -588,7 +587,7 @@ fn lease_predicates(
 fn select_pages(
     prefix_cache: &mut PrefixCache,
     plan: &BatchPlan,
-    batch: &Batch<LaneCall>,
+    batch: &Batch<CallResources>,
     rows: &ForwardRows,
     denoising: bool,
 ) -> Result<Vec<GroupPages>> {
@@ -672,18 +671,18 @@ pub(crate) fn relay(
     tensors: &ProductStore,
     staging: &RelayStaging,
     plan: &BatchPlan,
-    batch: &Batch<LaneCall>,
+    batch: &Batch<CallResources>,
     job: &Job,
 ) -> Result<()> {
     if plan.calls.len() > staging.calls() {
         return Err(Error::Invalid(format!(
-            "a batch of {} calls exceeds its lane's relay staging",
+            "a batch of {} calls exceeds its computation's relay staging",
             plan.calls.len()
         )));
     }
     let stream = batch.stream.clone();
     let issue = job.on(stream.as_ref());
-    type Pick = fn(&CallState<LaneCall>) -> Option<&ProductBuffer>;
+    type Pick = fn(&CallState<CallResources>) -> Option<&ProductBuffer>;
     let relays: Vec<(Option<i64>, Pick)> = if denoising(plan) {
         vec![(Some(COMPLETIONS), |state| state.completion_write.as_ref())]
     } else {

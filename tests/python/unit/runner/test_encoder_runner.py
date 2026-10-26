@@ -36,7 +36,7 @@ def storage(model, facts):
 
 
 def prepared(model, tower, encoded, input_images):
-    """An inline image prepared into storage as a host lane prepares it.
+    """An inline image prepared into storage as a host-pool task prepares it.
 
     Its size, its facts, then its pixels.
     """

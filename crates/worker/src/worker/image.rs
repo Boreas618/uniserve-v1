@@ -1,13 +1,13 @@
-//! Startup of an image model's lanes: the executor's `image` section, the
-//! facts the lanes over the prefix cache lay prompts out with, what the
-//! executor's manifest states for capacity planning ([`ImageManifest`]),
+//! Startup of an image model's computations: the executor's `image` section,
+//! the facts the computations over the prefix cache lay prompts out with, what
+//! the executor's manifest states for capacity planning ([`ImageManifest`]),
 //! and what binding reports for the engine ([`ImageInfo`]), including the
 //! agreement of every rank's capture order.
 //!
-//! An image model (BAGEL, SenseNova) serves its vision and latent encoders,
-//! its denoiser and its decoder from the executor's prepared lanes
-//! (`crate::executor::image`); the worker states the deployment's bounds
-//! and graph configuration, and the executor answers with its buckets.
+//! An image model (BAGEL, SenseNova) serves its vision and latent encoders, its
+//! denoiser and its decoder from the executor's prepared computations
+//! (`crate::executor::image`); the worker states the deployment's bounds and
+//! graph configuration, and the executor answers with its buckets.
 
 use std::collections::BTreeMap;
 
@@ -20,7 +20,7 @@ use crate::ffi::{DType, Handle, Interpreter};
 use crate::parallel::host::HostGroup;
 use crate::{Error, Result};
 
-/// The capabilities an image model's lanes serve.
+/// The capabilities an image model's computations serve.
 const IMAGE: [Capability; 4] = [
     Capability::ImageDenoiser,
     Capability::PatchEncoder,
@@ -39,10 +39,10 @@ pub(crate) fn holds(components: &Components, video: bool) -> bool {
             .any(|placed| !placed.host() && IMAGE.iter().any(|&capability| placed.has(capability)))
 }
 
-/// The executor's `image` section: the deployment's batch bounds, its
-/// request slots and the image sizes the latent encoder and the decoder
-/// capture (`flow_shapes`, `[height, width]`). Whether the lanes capture
-/// graphs is the settings' top-level `graphs`.
+/// The executor's `image` section: the deployment's batch bounds, its request
+/// slots and the image sizes the latent encoder and the decoder capture
+/// (`flow_shapes`, `[height, width]`). Whether the computations capture graphs
+/// is the settings' top-level `graphs`.
 pub(crate) fn settings(config: &WorkerConfig) -> serde_json::Value {
     serde_json::json!({
         "max_batch_calls": config.max_batch_calls,
@@ -57,7 +57,7 @@ pub(crate) fn settings(config: &WorkerConfig) -> serde_json::Value {
     })
 }
 
-/// What the lanes over the prefix cache lay a model's prompts out with.
+/// What the computations over the prefix cache lay a model's prompts out with.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub(crate) struct TextFacts {
     /// The model prepares request images (it encodes them).
@@ -99,7 +99,7 @@ impl LatentManifest {
     }
 }
 
-/// What the executor's manifest states of an image model's lanes for
+/// What the executor's manifest states of an image model's computations for
 /// capacity planning (`manifest["image"]`).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct ImageManifest {
@@ -112,7 +112,7 @@ pub(crate) struct ImageManifest {
     /// Bytes of one image's latent features.
     #[serde(default)]
     pub(crate) latent_feature_bytes: u64,
-    /// Device bytes the image lanes allocate whatever the slot count.
+    /// Device bytes the image computations allocate whatever the slot count.
     #[serde(default)]
     pub(crate) fixed_bytes: u64,
     /// Device bytes they allocate per request slot.
@@ -121,14 +121,14 @@ pub(crate) struct ImageManifest {
 }
 
 impl ImageManifest {
-    /// Device bytes the image lanes allocate for `request_slots` slots.
+    /// Device bytes the image computations allocate for `request_slots` slots.
     pub(crate) fn reserved_bytes(&self, request_slots: usize) -> u64 {
         self.fixed_bytes
             .saturating_add(self.slot_bytes.saturating_mul(request_slots as u64))
     }
 }
 
-/// What binding the executor reports of an image model's lanes
+/// What binding the executor reports of an image model's computations
 /// (`bind()["image"]`), for the engine.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct ImageInfo {
@@ -148,7 +148,7 @@ pub(crate) struct ImageInfo {
 }
 
 impl ImageInfo {
-    /// Report the lanes' shapes and extents in `info`.
+    /// Report the computations' shapes and extents in `info`.
     pub(crate) fn apply(&self, info: &mut WorkerInfo) {
         info.image_warmups.clone_from(&self.warmups);
         info.captured_images.clone_from(&self.captured_images);
@@ -161,10 +161,10 @@ impl ImageInfo {
 
 /// Check, collectively over `group` (every rank of the worker group, at the
 /// same point of startup), that every rank holding a component of an image
-/// model captures that component's graph keys in the same order: a capture
-/// in warmup may run the component's collectives, which its ranks must
-/// reach in one order. `digests` holds this rank's digest of each component
-/// it serves image lanes of; ranks holding other components state others.
+/// model captures that component's graph keys in the same order: a capture in
+/// warmup may run the component's collectives, which its ranks must reach in
+/// one order. `digests` holds this rank's digest of each component it serves
+/// image computations of; ranks holding other components state others.
 pub(crate) fn agree(digests: &BTreeMap<String, String>, group: &HostGroup) -> Result<()> {
     let encoded = serde_json::to_vec(digests)
         .map_err(|error| Error::Invariant(format!("encoding image graph digests: {error}")))?;

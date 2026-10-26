@@ -10,7 +10,7 @@ use cuda::{DeviceId, Event, EventFlags};
 use ipc::Wake;
 
 use super::Issue;
-use crate::lane::{Completion, JobId};
+use crate::job::{Completion, JobId};
 use crate::transfer::{DRAIN_LIMIT, drain_event};
 use crate::{Error, Result, lock};
 
@@ -29,13 +29,13 @@ pub(crate) struct Deferral {
 }
 
 /// Starts the job that completes once the events it is given completed
-/// ([`crate::lane::JobQueues::after`]) and names it. The device is the one
-/// whose notification stream waits for the events. It is called with the
-/// pool locked, so it does not use the pool.
-pub(crate) type Submitter = Box<dyn Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId> + Send + Sync>;
+/// ([`crate::job::JobQueue::after`]) and names it. The device is the one whose
+/// notification stream waits for the events. It is called with the pool locked,
+/// so it does not use the pool.
+pub(crate) type Submitter = Box<dyn Fn(DeviceId, Vec<Arc<Event>>) -> JobId + Send + Sync>;
 
 /// What starts the job of deferred work a submitted job carried.
-type Start<'a> = dyn Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId> + 'a;
+type Start<'a> = dyn Fn(DeviceId, Vec<Arc<Event>>) -> JobId + 'a;
 
 #[derive(PartialEq)]
 enum Status {
@@ -75,15 +75,13 @@ struct State {
 /// know it completed or defer the storage's release until it has
 /// ([`Issue::defer`], `defer`).
 ///
-/// The pool asks the driver nothing. Deferred work waits for a job that
-/// holds its events (`crate::lane::JobQueues::after`): a lane orders the
-/// job's completion behind the events, and whoever takes the lanes'
-/// completions hands the pool the ones of its jobs
-/// (`owns`, `complete`). The work runs
-/// there, on that thread, after the pool's lock is released, so it may use
-/// the pool again. The job is always submitted to the lane behind the job
-/// that records the events: a lane passes a wait on an event that has no
-/// record yet.
+/// The pool asks the driver nothing. Deferred work waits for a job that holds
+/// its events (`crate::job::JobQueue::after`): the builder thread orders the
+/// job's completion behind the events, and whoever takes the jobs' completions
+/// hands the pool the ones of its jobs (`owns`, `complete`). The work runs
+/// there, on that thread, after the pool's lock is released, so it may use the
+/// pool again. The job is always submitted behind the job that records the
+/// events: a wait on an event that has no record yet passes.
 ///
 /// - Work deferred while a job is recorded rides with that job, and the
 ///   job's submitter starts the waiting job right behind it
@@ -150,7 +148,7 @@ impl EventPool {
 
     /// Install or clear what starts the jobs of deferred work. The calling
     /// thread becomes the one that starts them: the thread that submits the
-    /// lanes' jobs and takes their completions.
+    /// rank's jobs and takes their completions.
     pub(crate) fn set_submitter(&self, submitter: Option<Submitter>) {
         let submitter = submitter.map(|submitter| (std::thread::current().id(), submitter));
         let previous = std::mem::replace(&mut self.lock().submitter, submitter);
@@ -299,13 +297,12 @@ impl EventPool {
     }
 
     /// Takes the deferred work a job carried when that job was submitted.
-    /// `start` starts the job that waits for the work's events on the
-    /// lane, behind the carrying job. After shutdown drained the pool the
-    /// work runs now.
+    /// `start` starts the job that waits for the work's events, behind the
+    /// carrying job. After shutdown drained the pool the work runs now.
     pub(crate) fn defer_submitted(
         &self,
         deferrals: Vec<Deferral>,
-        start: impl Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId>,
+        start: impl Fn(DeviceId, Vec<Arc<Event>>) -> JobId,
     ) -> Result<()> {
         if deferrals.is_empty() {
             return Ok(());
@@ -518,7 +515,7 @@ fn submit(state: &mut State, deferrals: Vec<Deferral>, start: Option<&Start<'_>>
         .flat_map(|deferral| deferral.events.iter().cloned())
         .collect();
     let started = match device(state, &events) {
-        Some(device) => start(device, events),
+        Some(device) => Ok(start(device, events)),
         None => Err(invariant("deferred work waits on no active device event")),
     };
     match started {
@@ -550,7 +547,7 @@ fn submit_waiting(state: &mut State, deferral: Deferral) -> Result<()> {
         return Err(invariant("deferred work has no submitter"));
     };
     let job = match device(state, &deferral.events) {
-        Some(device) => submitter(device, deferral.events.clone()),
+        Some(device) => Ok(submitter(device, deferral.events.clone())),
         None => Err(invariant("deferred work waits on no active device event")),
     };
     match job {
@@ -695,20 +692,27 @@ mod tests {
 
     use super::*;
     use crate::ffi::{DeferredCall, Function};
-    use crate::lane::{Job, JobQueues};
+    use crate::job::{Completion, Job, JobId, JobQueue};
 
-    /// A pool whose deferred work gets its jobs from `jobs`, started by
-    /// the calling thread. The queues have no lane, so a job completes
-    /// when it is started; what is under test is when the pool runs the
-    /// work.
-    fn served() -> (Arc<EventPool>, JobQueues) {
+    /// A pool whose deferred work gets its jobs from `jobs`, started by the
+    /// calling thread. No builder thread is started, so a job is performed when
+    /// it is started; what is under test is when the pool runs the work.
+    fn served() -> (Arc<EventPool>, JobQueue) {
         let events = EventPool::new();
-        let jobs = JobQueues::default();
-        let lane = jobs.clone();
+        let jobs = JobQueue::default();
+        let submitter = jobs.clone();
         events.set_submitter(Some(Box::new(move |device, events| {
-            lane.after(device, events)
+            submitter.after(device, events)
         })));
         (events, jobs)
+    }
+
+    /// The next completion of a job of `jobs`. A job that completes behind
+    /// events has its completion posted by the driver once they completed,
+    /// after the job was performed, so it is waited for.
+    fn completed(jobs: &JobQueue) -> Result<(JobId, Completion)> {
+        jobs.await_completion(std::time::Duration::from_secs(30))?;
+        jobs.take().ok_or(Error::State("no job completed"))
     }
 
     fn transport(error: IpcError) -> Error {
@@ -745,7 +749,7 @@ mod tests {
         // long ago that job completed.
         events.defer(vec![Arc::clone(&event)], counting(&runs))?;
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        let (job, completion) = completed(&jobs)?;
         assert!(events.owns(job));
 
         events.complete(job, completion)?;
@@ -775,7 +779,7 @@ mod tests {
         let carried = carrying.deferrals();
         events.defer_submitted(carried, |device, fences| jobs.after(device, fences))?;
         assert_eq!(runs.load(Ordering::Relaxed), 0);
-        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        let (job, completion) = completed(&jobs)?;
         events.complete(job, completion)?;
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         Ok(())
@@ -807,7 +811,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 0);
 
         events.submit_deferred()?;
-        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        let (job, completion) = completed(&jobs)?;
         events.complete(job, completion)?;
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         Ok(())
@@ -834,12 +838,12 @@ mod tests {
             .on(None)
             .defer(&events, vec![event], counting(&runs))?;
         events.defer_submitted(carrying.deferrals(), |_, _| {
-            let job = failing.take().ok_or(Error::State("started twice"))?;
+            let job = failing.take().expect("the pool starts the job once");
             jobs.start(job, true)
         })?;
 
         // Its failure says nothing about the event: the work does not run.
-        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        let (job, completion) = completed(&jobs)?;
         assert!(events.complete(job, completion).is_err());
         assert_eq!(runs.load(Ordering::Relaxed), 0);
 

@@ -1,11 +1,11 @@
-"""The bounds, device columns and host staging of a text lane's runners.
+"""Bounds, device columns and host staging of a text computation's runners.
 
-:class:`TextBounds` derives every bound of a lane's runners from the worker
-configuration and the prefix cache's groups: the row and token capacity of
-their columns, the block tables and the page width each graph addresses,
-and the decode and prefill graph buckets. It is derived once for the
-manifest (without the fitted pool, so it bounds what binding allocates) and
-again at binding.
+:class:`TextBounds` derives every bound of a computation's runners from the
+worker configuration and the prefix cache's groups: the row and token
+capacity of their columns, the block tables and the page width each graph
+addresses, and the decode and prefill graph buckets. It is derived once for
+the manifest (without the fitted pool, so it bounds what binding allocates)
+and again at binding.
 
 :class:`Dimensions` sizes one runner's columns; :class:`InputBuffers` holds
 them in one device arena, which every captured graph addresses for the
@@ -228,7 +228,7 @@ class TableShape:
 
 @dataclass(frozen=True, slots=True)
 class TextBounds:
-    """Every bound of a lane's text runners.
+    """Every bound of a computation's text runners.
 
     Attributes:
         rows: Row capacity of the columns: a batch's rows, or a wider
@@ -276,7 +276,7 @@ class TextBounds:
             units: The cache pool's units, sentinel included, once fitted;
                 ``None`` bounds the graph shapes by the configuration
                 alone, as the manifest does before planning.
-            graphs: CUDA graphs serve the lane.
+            graphs: CUDA graphs serve the computation.
             decode_sizes: The configured decode row buckets.
             prefill_token_sizes: The configured prefill token buckets.
             prefill_outputs: Prefill graphs keep their outputs.
@@ -288,7 +288,9 @@ class TextBounds:
             ValueError: No cache group.
         """
         if not groups:
-            raise ValueError("a text lane reads a prefix cache of some group")
+            raise ValueError(
+                "a text computation reads a prefix cache of some group"
+            )
         max_rows = min(max_batch_calls, max(slots, 1))
         tokens = int(max_batch_tokens)
         tables: list[TableShape] = []
@@ -363,7 +365,7 @@ class TextBounds:
         ]
 
     def shapes(self) -> TextShapes:
-        """Return the lane's graph catalogs."""
+        """Return the computation's graph catalogs."""
         return TextShapes(self.decode, self.prefill)
 
     def dimensions(
@@ -698,7 +700,7 @@ class Stage:
 
 
 class Staging:
-    """Page-locked arenas carrying a lane's host values to its columns.
+    """Page-locked arenas carrying a computation's host values to its columns.
 
     An arena serves one submitted :class:`Stage`: its values are copied in,
     one host-to-device copy per value is enqueued on the stream, and an

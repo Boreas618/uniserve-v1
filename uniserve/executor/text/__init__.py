@@ -1,14 +1,15 @@
 """The executor of a causal language model's token batches on one rank.
 
-:class:`TextExecutor` serves the rank's text lanes: one per causal language
-model component, each running on one runner per expert microbatch. The
-worker reaches it through ``uniserve.executor.Executor`` at a few points:
+:class:`TextExecutor` serves the rank's text computations: one per causal
+language model component, each running on one runner per expert
+microbatch. The worker reaches it through ``uniserve.executor.Executor`` at
+a few points:
 
-- :meth:`TextExecutor.manifest`: each lane, the call fields, the device
-  bytes the lanes allocate beside the cache pool and the output words of a
-  lane's largest batch;
+- :meth:`TextExecutor.manifest`: each computation, the call fields, the
+  device bytes the computations allocate beside the cache pool and the
+  output words of a computation's largest batch;
 - :meth:`TextExecutor.bind`: the storage capacity planning granted
-  (:class:`TextBinding`); the lanes construct their runners;
+  (:class:`TextBinding`); the computations construct their runners;
 - :meth:`TextExecutor.warmup_phases`, :meth:`TextExecutor.warmup_phase`,
   :meth:`TextExecutor.warmup_finish` and :meth:`TextExecutor.seal`: graph
   capture in phases around the worker's scratch tables
@@ -16,8 +17,8 @@ worker reaches it through ``uniserve.executor.Executor`` at a few points:
 - :meth:`TextExecutor.start` and :meth:`TextExecutor.release`: the
   requests that start in slots and the slots that retire;
 - :meth:`TextExecutor.execute` and :meth:`TextExecutor.commit`: one token
-  batch (:class:`~.lane.TextLane`), then its slot state past the batch's
-  commit point;
+  batch (:class:`~.computation.TextComputation`), then its slot state past
+  the batch's commit point;
 - :meth:`TextExecutor.kernels` and :meth:`TextExecutor.close`.
 
 The modules hold the parts: the batch protocol (:mod:`.protocol`), graph
@@ -26,8 +27,8 @@ constants and state (:mod:`.state`), sampling inputs and draws
 (:mod:`.sampling`, :mod:`.philox`), forward rows (:mod:`.rows`), vision and
 latent rows (:mod:`.context`), prompt scoring (:mod:`.prompt`), commit rows
 (:mod:`.commit`), the runners' bounds, columns and staging
-(:mod:`.buffers`), the runner of one binding (:mod:`.runner`), a lane's
-batches (:mod:`.lane`) and warmup (:mod:`.warmup`).
+(:mod:`.buffers`), the runner of one binding (:mod:`.runner`), a
+computation's batches (:mod:`.computation`) and warmup (:mod:`.warmup`).
 """
 
 from __future__ import annotations
@@ -44,8 +45,8 @@ import torch
 from uniserve.runner.causal_lm import CausalLMRunner, hidden_size, vocab_size
 
 from .buffers import InputBuffers, PageGroup, TextBounds
+from .computation import TextComputation
 from .context import ImageDenoiser, ImageFacts
-from .lane import TextLane
 from .philox import DrawWindow
 from .protocol import CALL_FIELD_NAMES, COMPLETION_FIELDS
 from .runner import TextRunner
@@ -58,21 +59,21 @@ _logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from uniserve.executor.experts import ExpertUnion
 
-__all__ = ["LaneBinding", "TextBinding", "TextExecutor"]
+__all__ = ["ComputationBinding", "TextBinding", "TextExecutor"]
 
-# The text call kinds a lane may serve, in protocol order.
+# The text call kinds a computation may serve, in protocol order.
 TEXT_KINDS = ("prefill", "decode", "verify")
 
 
 @dataclass(frozen=True, slots=True)
-class LaneBinding:
-    """The storage the worker binds one text lane to.
+class ComputationBinding:
+    """The storage the worker binds one text computation to.
 
     Attributes:
-        index: The lane's index among the rank's token lanes.
-        component: The component the lane serves.
-        streams: One stream per expert microbatch, the lane's first;
-            ``(None,)`` for a lane on the host.
+        index: The computation's index among its executor's computations.
+        component: The component the computation serves.
+        streams: One stream per expert microbatch, the first the device's
+            primary stream; ``(None,)`` for a computation on the host.
         scratches: Each stream's scratch, which every execution context on
             it borrows.
         pools: Each stream's graph pool; ``None`` without graphs.
@@ -96,7 +97,7 @@ class LaneBinding:
 
 @dataclass(frozen=True, slots=True)
 class TextBinding:
-    """What capacity planning granted the rank's text lanes.
+    """What capacity planning granted the rank's text computations.
 
     Attributes:
         slots: The request slots.
@@ -104,7 +105,7 @@ class TextBinding:
         unit_pool: The prefix cache's K/V pool object attention reads.
         tables: The worker's block tables by name (``unit_tables``,
             ``start_pages``, ``table_shapes``, ``verified_lengths``).
-        lanes: The text lanes, in lane order.
+        computations: The text computations, in manifest order.
         prefetch: The distributed expert weights' prefetch object, or
             ``None``.
     """
@@ -113,7 +114,7 @@ class TextBinding:
     units: int
     unit_pool: Any
     tables: Mapping[str, torch.Tensor]
-    lanes: tuple[LaneBinding, ...]
+    computations: tuple[ComputationBinding, ...]
     prefetch: Any | None = None
 
 
@@ -154,7 +155,7 @@ def _model_dtype(name: str) -> torch.dtype:
 
 
 class TextExecutor:
-    """The text lanes of one rank.
+    """The text computations of one rank.
 
     Args:
         loaded: The loaded model.
@@ -194,7 +195,7 @@ class TextExecutor:
         self.vocab = vocab_size(loaded)
         self.hidden = hidden_size(loaded)
 
-        self.lanes: dict[int, TextLane] = {}
+        self.computations: dict[int, TextComputation] = {}
         self.state: SlotState | None = None
         self.table: RequestTable | None = None
         self.union: ExpertUnion | None = None
@@ -219,13 +220,13 @@ class TextExecutor:
     # The manifest.
 
     def manifest(self) -> dict[str, Any]:
-        """The rank's text lanes and what capacity planning reads of them.
+        """The rank's text computations and what capacity planning reads.
 
-        Returns ``lanes`` (each lane's manifest entry, with the output
-        words of its largest batch) and ``pages``: the call fields and the
-        device bytes. ``fixed_bytes`` plus ``slot_bytes`` per request slot
-        bounds what binding allocates on the device beside the cache pool:
-        every runner's columns at the batch bounds (rows at
+        Returns ``computations`` (each computation's manifest entry, with the
+        output words of its largest batch) and ``pages``: the call fields
+        and the device bytes. ``fixed_bytes`` plus ``slot_bytes`` per
+        request slot bounds what binding allocates on the device beside the
+        cache pool: every runner's columns at the batch bounds (rows at
         ``max_batch_calls``, which may over-reserve with fewer slots) and
         the slot state.
         """
@@ -247,7 +248,7 @@ class TextExecutor:
             + bounds.tokens
         )
         return {
-            "lanes": [
+            "computations": [
                 {
                     "component": component.name,
                     "kinds": list(component.kinds),
@@ -271,24 +272,24 @@ class TextExecutor:
     def bind(
         self, binding: TextBinding, union: ExpertUnion | None = None
     ) -> None:
-        """Construct every lane's runners on the granted storage.
+        """Construct every computation's runners on the granted storage.
 
         Allocates the slot state beside the worker's verified lengths and
-        each runner's columns, constructs the numerical runners (in lane
-        and microbatch order on every rank: construction shares the
-        vocabulary over the pipeline group) and hands an expert ``union``
-        each microbatch's context owner and graph pool.
+        each runner's columns, constructs the numerical runners (in
+        computation and microbatch order on every rank: construction shares
+        the vocabulary over the pipeline group) and hands an expert
+        ``union`` each microbatch's context owner and graph pool.
 
         Raises:
-            ValueError: A lane names a component the rank does not hold, or
-                the runners' vocabulary differs from the model's.
+            ValueError: A computation names a component the rank does not
+                hold, or the runners' vocabulary differs from the model's.
         """
-        if not binding.lanes:
+        if not binding.computations:
             return
-        if union is not None and len(binding.lanes) != 1:
+        if union is not None and len(binding.computations) != 1:
             raise NotImplementedError(
                 "expert parallelism serves one text component; "
-                f"{len(binding.lanes)} serve text"
+                f"{len(binding.computations)} serve text"
             )
         by_name = {component.name: component for component in self.components}
         self._units = binding.units
@@ -297,7 +298,7 @@ class TextExecutor:
         tables = binding.tables
         verified = tables["verified_lengths"]
         device = verified.device
-        first = binding.lanes[0].streams[0]
+        first = binding.computations[0].streams[0]
         with torch.cuda.stream(first):
             state = SlotState.allocate(
                 binding.slots, self.vocab, self.dtype, verified
@@ -308,27 +309,27 @@ class TextExecutor:
         block_sizes = [table.block_size for table in bounds.tables]
         windowed = [int(table.windowed) for table in bounds.tables]
 
-        for group, lane in enumerate(binding.lanes):
-            component = by_name.get(lane.component)
+        for group, computation in enumerate(binding.computations):
+            component = by_name.get(computation.component)
             if component is None:
                 raise ValueError(
-                    f"the worker binds a text lane of {lane.component!r}, "
-                    "which the rank does not hold"
+                    "the worker binds a text computation of "
+                    f"{computation.component!r}, which the rank does not hold"
                 )
             runners = []
-            for microbatch, stream in enumerate(lane.streams):
+            for microbatch, stream in enumerate(computation.streams):
                 kernel = CausalLMRunner(
                     self.loaded,
                     component.path,
-                    # A lane on the host computes on the current stream
+                    # A computation on the host runs on the current stream
                     # (handle 0) of no device (-1).
                     -1 if stream is None else int(stream.device.index),
                     0 if stream is None else stream.cuda_stream,
-                    lane.scratches[microbatch],
+                    computation.scratches[microbatch],
                     binding.unit_pool,
                     None if union is None else union.exchanges[microbatch],
                     binding.prefetch,
-                    lane.collectives[microbatch],
+                    computation.collectives[microbatch],
                     bounds.rows,
                     bounds.tokens,
                     bounds.width,
@@ -373,12 +374,12 @@ class TextExecutor:
                         prompt_logits=state.prompt_logits,
                         stream=stream,
                         pool=None
-                        if lane.pools is None
-                        else lane.pools[microbatch],
+                        if computation.pools is None
+                        else computation.pools[microbatch],
                     )
                 )
-            self.lanes[lane.index] = TextLane(
-                index=lane.index,
+            self.computations[computation.index] = TextComputation(
+                index=computation.index,
                 group=group,
                 label=(
                     f"{component.name}.{component.path}"
@@ -390,8 +391,8 @@ class TextExecutor:
                 state=state,
                 table=self.table,
                 window=window,
-                relay_tokens=lane.relay_tokens,
-                relay_flags=lane.relay_flags,
+                relay_tokens=computation.relay_tokens,
+                relay_flags=computation.relay_flags,
                 union=union,
                 prefill_outputs=self.prefill_outputs,
             )
@@ -407,18 +408,18 @@ class TextExecutor:
         self, facts: ImageFacts | None, denoiser: ImageDenoiser | None
     ) -> None:
         """Take the image half's facts and denoiser, which media calls ask."""
-        for lane in self.lanes.values():
-            lane.facts = facts
-            lane.denoiser = denoiser
+        for computation in self.computations.values():
+            computation.facts = facts
+            computation.denoiser = denoiser
 
     def warmup_phases(self) -> list[dict[str, Any]]:
         """Return the warmup phases in the order every rank runs them.
 
-        Each names its lane, the scratch lengths of slots ``1..`` (or
+        Each names its computation, the scratch lengths of slots ``1..`` (or
         none) and each step's attention rows ``[slot, prefix, query]``.
         """
         self._phases = phases(
-            [self.lanes[index] for index in sorted(self.lanes)],
+            [self.computations[index] for index in sorted(self.computations)],
             row_tokens=min(self.max_model_len, self.max_batch_tokens),
             units=max(self._units - 1, 0),
         )
@@ -436,39 +437,41 @@ class TextExecutor:
     def warmup_finish(self) -> None:
         """Capture the graphs that follow every phase.
 
-        The expert union's warmup ends after every executor's lanes
+        The expert union's warmup ends after every executor's computations
         finished (``ExpertUnion.finish_warmup``), which the rank's executor
         calls.
         """
-        finish([self.lanes[index] for index in sorted(self.lanes)])
+        finish(
+            [self.computations[index] for index in sorted(self.computations)]
+        )
         # The startup report of what each runner captured, which the graph
         # policy chose.
-        for lane in self.lanes.values():
-            for runner in lane.runners:
+        for computation in self.computations.values():
+            for runner in computation.runners:
                 if runner.pool is not None:
                     _logger.info(
                         "%s: captured %d text graphs: %d decode and %d "
                         "prefill buckets",
                         runner.graphs.owner,
                         len(runner.graphs),
-                        len(lane.bounds.decode),
-                        len(lane.bounds.prefill),
+                        len(computation.bounds.decode),
+                        len(computation.bounds.prefill),
                     )
 
     def seal(self) -> None:
         """Refuse further captures: serving replays what warmup captured."""
-        for lane in self.lanes.values():
-            lane.seal()
+        for computation in self.computations.values():
+            computation.seal()
 
     def reopen_experts(self) -> None:
-        """Release every lane's graphs so warmup captures them anew.
+        """Release every computation's graphs so warmup captures them anew.
 
         Called when the expert union rebuilt the workspaces the graphs
         addressed; the warmup phases that follow capture again and
         :meth:`seal` closes the tables.
         """
-        for lane in self.lanes.values():
-            lane.reopen()
+        for computation in self.computations.values():
+            computation.reopen()
 
     # Requests.
 
@@ -476,18 +479,18 @@ class TextExecutor:
         """Admit started requests (``NewRequest`` JSON); returns the refused.
 
         Installs each request's constants and resets its slot's state on
-        the lane stream: a request resumed from a predecessor engine counts
-        the tokens it generated there, one with logit biases installs them,
-        one with an adapter selects it. No request is refused.
+        the primary stream: a request resumed from a predecessor engine
+        counts the tokens it generated there, one with logit biases installs
+        them, one with an adapter selects it. No request is refused.
         """
         if self.state is None or self.table is None:
-            raise RuntimeError("the text lanes are not bound")
+            raise RuntimeError("the text computations are not bound")
         started = [NewRequest.from_json(request) for request in requests]
         for request in started:
             self.table.start(request)
         if not started:
             return []
-        stream = next(iter(self.lanes.values())).stream
+        stream = next(iter(self.computations.values())).stream
         with torch.cuda.stream(stream):
             self.state.reset([request.slot for request in started])
             for request in started:
@@ -510,15 +513,17 @@ class TextExecutor:
 
     # Batches.
 
-    def execute(self, lane: int, step: str, *tensors: torch.Tensor) -> int:
-        """Run a token batch on lane ``lane``; return the record words written.
+    def execute(
+        self, computation: int, step: str, *tensors: torch.Tensor
+    ) -> int:
+        """Run a token batch of ``computation``; return record words written.
 
         ``tensors`` are, in order, the host call columns, forward columns,
         flat tokens and records, the page-locked output words, then the
         feature tensors the step JSON names.
         """
         calls, forward, tokens, records, words, *features = tensors
-        return self.lanes[int(lane)].execute(
+        return self.computations[int(computation)].execute(
             json.loads(str(step)),
             calls,
             forward,
@@ -528,26 +533,26 @@ class TextExecutor:
             features,
         )
 
-    def commit(self, lane: int) -> None:
-        """Advance lane ``lane``'s slot state by its last executed batch."""
-        self.lanes[int(lane)].commit()
+    def commit(self, computation: int) -> None:
+        """Advance ``computation``'s slot state by its last executed batch."""
+        self.computations[int(computation)].commit()
 
     def kernels(self) -> list[tuple[str, list[str]]]:
         """Each runner's kernel-table label and selected kernels."""
         return [
             entry
-            for index in sorted(self.lanes)
-            for entry in self.lanes[index].kernels()
+            for index in sorted(self.computations)
+            for entry in self.computations[index].kernels()
         ]
 
     def close(self, aborted: bool) -> None:
-        """Release every lane, newest first; the worker drained the streams."""
+        """Release every computation, newest first; the streams are drained."""
         failure: BaseException | None = None
-        for index in sorted(self.lanes, reverse=True):
+        for index in sorted(self.computations, reverse=True):
             try:
-                self.lanes[index].close(bool(aborted))
+                self.computations[index].close(bool(aborted))
             except Exception as error:
                 failure = failure or error
-        self.lanes.clear()
+        self.computations.clear()
         if failure is not None:
             raise failure

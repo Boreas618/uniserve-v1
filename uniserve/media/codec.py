@@ -8,7 +8,7 @@ into the request's MP4 without decoding them. The serving worker owns the
 assembly's state (which units arrived, in which order, at which decode
 time); these functions hold the codec work only.
 
-A CPU worker runs these calls on its host lane's thread. Closing an x264
+A CPU worker runs these calls on its media thread. Closing an x264
 encoder joins its thread pool while PyAV holds the interpreter lock, so a
 codec call stalls other Python calls of the process for its duration; host
 ranks have no device work to launch beside it.

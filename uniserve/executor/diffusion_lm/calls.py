@@ -1,5 +1,5 @@
-"""Token-denoising calls of a diffusion LM lane: validation, packing and
-completion records.
+"""Token-denoising calls of a diffusion LM computation: validation, packing
+and completion records.
 
 A token-denoising call carries either a readout or a denoising step, and a
 batch's active calls carry one form (:func:`batch_form`). Every forward row
@@ -456,7 +456,7 @@ def seed_bits(seed: int) -> int:
 
 
 class Seeds:
-    """The request and sampling seed each request slot of a lane holds.
+    """The request and sampling seed each of the rank's request slots holds.
 
     A request slot ``s`` in ``1..=slots`` holds one started request; slot 0
     is the padding slot, so every array has ``slots + 1`` rows.
@@ -471,7 +471,7 @@ class Seeds:
 
     def __init__(self, slots: int) -> None:
         if slots <= 0:
-            raise ValueError("a lane serves at least one request slot")
+            raise ValueError("the rank serves at least one request slot")
         rows = slots + 1
         self.request_id = np.zeros(rows, dtype=np.int64)
         self.epoch = np.zeros(rows, dtype=np.int64)
@@ -496,11 +496,11 @@ class Seeds:
                 generates no block or is unseeded.
 
         Raises:
-            ValueError: The slot is the padding slot or outside the lane, or
-                the seed is not a 64-bit unsigned integer.
+            ValueError: The slot is the padding slot or outside the request
+                slots, or the seed is not a 64-bit unsigned integer.
         """
         if not 0 < slot <= self.slots:
-            raise ValueError("request slot is outside the lane")
+            raise ValueError("request slot is outside the request slots")
         bits = 0 if seed is None else seed_bits(seed)
         self.request_id[slot] = request_id
         self.epoch[slot] = epoch
@@ -548,8 +548,8 @@ class Steps:
     def columns(self) -> np.ndarray:
         """Return ``int64 [4, n]``: the denoising columns' live rows.
 
-        Slot, seed bits, block and step of each row. The lane zeroes the
-        rows that pad a step to its bucket: blocks of the sentinel slot,
+        Slot, seed bits, block and step of each row. The computation zeroes
+        the rows that pad a step to its bucket: blocks of the sentinel slot,
         whose commit is skipped.
         """
         return np.stack((self.slot, self.seed, self.block, self.step))
@@ -569,9 +569,9 @@ def pack_steps(
         forward: The batch's ``int64 [FORWARD_FIELDS + 2G, R]`` forward
             columns.
         active: The active calls, ascending, every one a step.
-        seeds: The requests the lane's slots hold.
-        sampling: The sampling the lane steps blocks with; ``None`` on a
-            rank that serves readouts only.
+        seeds: The requests the computation's slots hold.
+        sampling: The sampling the computation steps blocks with; ``None``
+            on a rank that serves readouts only.
 
     Raises:
         ValueError: The batch has no step, a step has no canvas
@@ -590,7 +590,7 @@ def pack_steps(
 
     slot = calls[CallField.SLOT, active]
     if np.any(slot <= 0) or np.any(slot > seeds.slots):
-        raise ValueError("request slot is outside the lane")
+        raise ValueError("request slot is outside the request slots")
     if np.any(
         seeds.request_id[slot] != calls[CallField.REQUEST_ID, active]
     ) or np.any(seeds.epoch[slot] != calls[CallField.EPOCH, active]):

@@ -74,7 +74,8 @@ class DeepEP(ExpertTransport):
             yield_turn=yield_turn,
         )
         self.hidden_size = hidden_size
-        # DeepEP's combine distributes int4 vectors over 32-lane warps.
+        # DeepEP's combine distributes int4 vectors over the 32 threads of a
+        # warp.
         self.wire_hidden = (hidden_size + 255) // 256 * 256
         self.top_k = top_k
         local_experts = num_experts // expert_ranks

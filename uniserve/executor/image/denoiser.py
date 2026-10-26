@@ -1,7 +1,7 @@
 """An image model's denoiser on row buckets: trajectories, steps, conditions.
 
-The denoiser lane of an image model (BAGEL, SenseNova) computes three kinds
-of work on its stream:
+The denoiser computation of an image model (BAGEL, SenseNova) runs three
+kinds of work on its stream:
 
 - a latent preparation opens a request's trajectory and writes its seeded
   initial latent into the worker's latent ledger;
@@ -9,7 +9,7 @@ of work on its stream:
   solver step: its guidance branches' rows are packed into one forward per
   bucket (:class:`RowFamily`), whose predictions the solver combines with
   each trajectory's guidance;
-- a condition write (the text lane's latent conditioning,
+- a condition write (the text computation's latent conditioning,
   :meth:`Denoiser.condition_latents`) writes the keys and values of latent
   images inserted into a prompt.
 
@@ -17,16 +17,17 @@ A *row* is one image's framed sequence in a packed forward
 (:mod:`.rows`): one guidance branch of a stepping image, or one latent image
 written as conditioning. Each family keeps its own execution context, its
 own attention metadata and device columns, and one graph per row bucket
-``(T, R)`` (:mod:`.shapes`) on the lane's graph pool, so any rows that fit
-a bucket replay its graph; the rows enter only as device values. The worker
-owns the latent ledger's two banks of pages: a step gathers each
+``(T, R)`` (:mod:`.shapes`) on the computation's graph pool, so any rows that
+fit a bucket replay its graph; the rows enter only as device values. The
+worker owns the latent ledger's two banks of pages: a step gathers each
 trajectory's committed pages into the denoiser's workspace, and scatters
 its successor into the other bank's pages (:class:`LatentBanks`).
 
 Guidance branches attend to cache prefixes the scheduler placed: the
-request's own context, or prefixes in other slots which the text lane
-prefills the first time a branch reads them (``TextLane.prefill_cache``),
-ordered against the denoiser's stream by events.
+request's own context, or prefixes in other slots which the text
+computation prefills the first time a branch reads them
+(``TextComputation.prefill_cache``), ordered against the denoiser's stream
+by events.
 """
 
 from __future__ import annotations
@@ -84,7 +85,7 @@ __all__ = [
     "Denoiser",
     "LatentBanks",
     "LatentBinding",
-    "PrefixLane",
+    "PrefixComputation",
     "RowFamily",
     "StepCall",
     "WarmForward",
@@ -292,10 +293,10 @@ class RowFamily:
     of the network: it stages the rows' columns and attention row column
     into its device buffers, then replays the graph of the rows' bucket, or
     runs the forward eagerly: without buckets (graphs off), or as the warm
-    run of a bucket whose graph it then captures into the lane's pool. The
-    family's own execution context keeps the host attention plans of its
-    forwards, which an operator that plans on the host builds from the rows'
-    exact lengths before each replay.
+    run of a bucket whose graph it then captures into the computation's
+    pool. The family's own execution context keeps the host attention plans
+    of its forwards, which an operator that plans on the host builds from
+    the rows' exact lengths before each replay.
 
     Args:
         owner: Names the family in errors.
@@ -312,8 +313,8 @@ class RowFamily:
             latent tokens write (the last row is the dump row of every other
             token), or ``None`` for a family whose outputs are discarded.
         shapes: The buckets the family replays, ``None`` without graphs.
-        stream: The lane stream.
-        pool: The lane stream's graph pool, ``None`` without graphs.
+        stream: The primary stream.
+        pool: The primary stream's graph pool, ``None`` without graphs.
         peers: ``(device ordinal, pool)`` of each other device the network
             computes on (a generation tower).
         multiple: The sequence-parallel degree, which divides every
@@ -483,8 +484,8 @@ class RowFamily:
             self.fields[:, :rows].copy_(fields, non_blocking=True)
             self.values[:, :rows].copy_(values, non_blocking=True)
 
-        # Rows of a bucket replay its graph, or capture it on the lane's
-        # stream and pool; any other forward runs eagerly.
+        # Rows of a bucket replay its graph, or capture it on the
+        # computation's stream and pool; any other forward runs eagerly.
         key = RowShape(tokens, rows)
         capture = (
             self.stream
@@ -699,8 +700,8 @@ class LatentBanks:
         )
 
 
-class PrefixLane(Protocol):
-    """The text lane a denoiser's guidance prefixes are prefilled on."""
+class PrefixComputation(Protocol):
+    """The text computation a denoiser's guidance prefixes are prefilled on."""
 
     @property
     def stream(self) -> torch.cuda.Stream: ...
@@ -834,13 +835,13 @@ class _Stepping:
 
 
 class Denoiser:
-    """An image model's denoiser on its lane.
+    """An image model's denoiser, which its denoiser computation runs.
 
     Args:
         network: The loaded ``ImageDenoiser``.
         owner: The denoiser's component and path, naming it.
         layout: The denoiser's latent layout.
-        stream: The lane stream; ``None`` on the host.
+        stream: The primary stream; ``None`` on the host.
         device: The CUDA ordinal ``stream`` belongs to, -1 on the host.
         scratch: The stream's shared work areas.
         attention: The attention backend the model loaded with.
@@ -853,11 +854,11 @@ class Denoiser:
         step_shapes: The denoising steps' buckets, ``None`` without graphs.
         condition_shapes: The condition writes' buckets, ``None`` without
             graphs.
-        pool: The lane stream's graph pool, ``None`` without graphs.
+        pool: The primary stream's graph pool, ``None`` without graphs.
         peers: ``(ordinal, pool)`` of each other device the network computes
             on.
         collectives: The process group of each of the network's
-            multi-member communicators on the lane stream, by name.
+            multi-member communicators on the primary stream, by name.
         frame: The model's framing of an unconditional branch's prefix
             (:func:`framed_prefix`).
         multiple: The sequence-parallel degree, which divides every
@@ -896,7 +897,7 @@ class Denoiser:
         self._frame = frame
         self._framed: dict[BranchSource, tuple[int, ...]] = {}
         self.trajectories = Trajectories()
-        self.text: PrefixLane | None = None
+        self.text: PrefixComputation | None = None
         target = banks.device
 
         step_capacity = _capacity(step_limits, step_shapes, multiple)
@@ -1003,7 +1004,7 @@ class Denoiser:
                 multiple=multiple,
             )
 
-    # The text lane's questions (``uniserve.executor.text.context``).
+    # The text computation's questions (``uniserve.executor.text.context``).
 
     def sequence_length(self, height: int, width: int) -> int:
         """Tokens of an image's framed latent sequence."""
@@ -1027,8 +1028,8 @@ class Denoiser:
         its slot's visible ``prefix`` at its conditioning ``position``;
         ``pages`` is ``int64 [2G, len(rows)]`` each row's first selected
         page and page count per cache group. The writes run on the
-        denoiser's stream after what ``stream`` (the text lane's) enqueued
-        before, and ``stream`` orders after them.
+        denoiser's stream after what ``stream`` (the text computation's)
+        enqueued before, and ``stream`` orders after them.
 
         Raises:
             ValueError: The denoiser does not frame images, or a latent
@@ -1100,9 +1101,9 @@ class Denoiser:
 
     # Trajectories.
 
-    def attach_text(self, lane: PrefixLane | None) -> None:
-        """Take the text lane that prefills the guidance prefixes."""
-        self.text = lane
+    def attach_text(self, computation: PrefixComputation | None) -> None:
+        """Take the text computation that prefills the guidance prefixes."""
+        self.text = computation
 
     def _prefix(self, source: BranchSource) -> Prefix:
         tokens = self._framed.get(source)
@@ -1211,10 +1212,10 @@ class Denoiser:
         branch), then its conditioning row; each with its call index, slot,
         sequence and query lengths, cache write and selected pages per cache
         group. Each call's guidance prefixes not yet evaluated are prefilled
-        on the text lane first; then the stepping images' branch rows are
-        evaluated in as few packed forwards as their buckets allow, and each
-        image's guided prediction advances its committed latent into the
-        bank the ledger bound. Returns each call's graph mode.
+        on the text computation first; then the stepping images' branch rows
+        are evaluated in as few packed forwards as their buckets allow, and
+        each image's guided prediction advances its committed latent into
+        the bank the ledger bound. Returns each call's graph mode.
 
         Raises:
             ValueError: A call continues past its schedule, its rows
@@ -1333,7 +1334,7 @@ class Denoiser:
     def _prefill(
         self, fills: Sequence[tuple[_Stepping, PrefixFill, np.ndarray]]
     ) -> None:
-        """Prefill guidance prefixes on the text lane.
+        """Prefill guidance prefixes on the text computation.
 
         The prefill is ordered against the denoiser's stream both ways.
         """
@@ -1341,7 +1342,7 @@ class Denoiser:
         if text is None:
             raise NotImplementedError(
                 "an image step whose guidance prefixes were not prefilled "
-                "requires a text lane to prefill them"
+                "requires a text computation to prefill them"
             )
         prefixes = [(fill.slot, fill.tokens) for _, fill, _ in fills]
         pages = np.stack([columns for _, _, columns in fills], axis=1)

@@ -208,7 +208,7 @@ impl WorkerProcessArgs {
             // host. Only the placement knows that.
             products_cross_hosts: self.transfer.products_cross_hosts(&self.worker_id, rank),
             queue_depth: depth,
-            // The rank reports a stalled lane after half of it: see
+            // The rank reports a stalled job after half of it: see
             // `WorkerProcessArgs::watchdog_timeout`.
             watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())
                 .unwrap_or(u64::MAX),

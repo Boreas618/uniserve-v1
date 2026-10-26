@@ -31,10 +31,10 @@ impl From<usize> for Argument {
     }
 }
 
-/// A method or library function and its owned arguments, called later,
-/// possibly on another thread (a job a lane's execution thread performs
-/// hands it to the builder thread). A view crosses as its torch tensor
-/// ([`StorageView::handle`]), wrapped by the first call that passes it.
+/// A method or library function and its owned arguments, called later by the
+/// job that records it, on the builder thread (a call made on another thread is
+/// handed to it). A view crosses as its torch tensor ([`StorageView::handle`]),
+/// wrapped by the first call that passes it.
 #[derive(Clone)]
 pub(crate) struct MethodCall {
     function: Function,
@@ -99,11 +99,12 @@ impl MethodCall {
             let Some(watched) = watched else {
                 return result;
             };
+            // The job that performs the call counts these calls with the rest
+            // of its own (`crate::job`).
             let blocking = watched.calls();
             if blocking.is_empty() {
                 return result;
             }
-            crate::profiling::blocking::add("builder", &blocking);
             result?;
             let calls = blocking
                 .iter()

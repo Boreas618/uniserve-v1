@@ -151,7 +151,8 @@ impl ExecutionDomainStats {
     pub(crate) const COUNT: usize = 4;
 
     /// Public metrics aggregate concrete call kinds into four stable labels.
-    /// This index is used only for counters, never for execution or lane routing.
+    /// This index is used only for counters, never for execution or batch
+    /// routing.
     ///
     /// The returned index addresses the array from `groups`, so the two must
     /// keep the same order.
@@ -198,9 +199,9 @@ pub struct WorkerStats {
     pub forward_mode_us: Mutex<BTreeMap<String, u64>>,
     /// Forward execution time keyed by worker component, in microseconds.
     pub forward_component_us: Mutex<BTreeMap<String, u64>>,
-    /// Worker lane stream time keyed `{lane}/{state}`, in microseconds
-    /// (`ForwardStats::lane_us`).
-    pub lane_us: Mutex<BTreeMap<String, u64>>,
+    /// Worker stream device time keyed `{stream}/{state}`, in microseconds
+    /// (`ForwardStats::stream_us`).
+    pub stream_us: Mutex<BTreeMap<String, u64>>,
     /// Worker driver calls that waited for the device, keyed
     /// `{thread}/{call}` (`ForwardStats::blocking_calls`).
     pub blocking_calls: Mutex<BTreeMap<String, u64>>,

@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use crate::metrics::{
     EngineBackendLabels, EngineBlockingLabels, EngineComponentLabels, EngineDomainKindLabels,
-    EngineDomainLabels, EngineLabels, EngineLaneLabels, EngineModeLabels, EnginePathLabels,
+    EngineDomainLabels, EngineLabels, EngineModeLabels, EnginePathLabels, EngineStreamLabels,
     FinishedReasonLabels, METRICS, RequestMetrics, SchedulerMetrics,
 };
 use futures::{Stream, StreamExt as _};
@@ -189,15 +189,15 @@ pub(crate) fn record_scheduler_stats(
                 })
                 .inc_by(*us);
         }
-        for (key, us) in &worker_stats.lane_us {
-            // Keys are `{lane}/{state}` (`ForwardStats::lane_us`).
-            let (lane, state) = key.rsplit_once('/').unwrap_or((key.as_str(), ""));
+        for (key, us) in &worker_stats.stream_us {
+            // Keys are `{stream}/{state}` (`ForwardStats::stream_us`).
+            let (stream, state) = key.rsplit_once('/').unwrap_or((key.as_str(), ""));
             metrics
-                .worker_lane_us
-                .get_or_create(&EngineLaneLabels {
+                .worker_stream_us
+                .get_or_create(&EngineStreamLabels {
                     model_name: model_name.clone(),
                     engine,
-                    lane: lane.to_owned(),
+                    stream: stream.to_owned(),
                     state: state.to_owned(),
                 })
                 .inc_by(*us);

@@ -1556,10 +1556,10 @@ mod tests {
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
     }
 
-    /// A distributed component's lane is its ranks times its units per rank,
-    /// an undistributed one's a single unit, and the narrowest replica binds;
-    /// a call no worker serves has no lane. A latent encoder's lane leaves
-    /// out the ranks its worker's text encoder takes.
+    /// A distributed component's round covers its ranks times its units per
+    /// rank, an undistributed one's a single unit, and the narrowest replica
+    /// binds; a call no worker serves has no round units. A latent encoding
+    /// round leaves out the ranks its worker's text encoder takes.
     #[test]
     fn media_units_count_the_units_one_call_covers() {
         let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
@@ -1589,33 +1589,34 @@ mod tests {
                 vec![("latent_encoder", config)],
             )
         };
-        let lanes = |pools: Vec<((WorkerGroupId, WorkerInfo), (WorkerGroupId, PoolPlacement))>| {
-            let (workers, placements) = pools.into_iter().unzip();
-            ExecutorInfo {
-                workers,
-                placements,
-                ..ExecutorInfo::default()
-            }
-            .media_units(MediaCall::LatentEncoding)
-        };
+        let round_units =
+            |pools: Vec<((WorkerGroupId, WorkerInfo), (WorkerGroupId, PoolPlacement))>| {
+                let (workers, placements) = pools.into_iter().unzip();
+                ExecutorInfo {
+                    workers,
+                    placements,
+                    ..ExecutorInfo::default()
+                }
+                .media_units(MediaCall::LatentEncoding)
+            };
 
         assert_eq!(
-            lanes(vec![encoder("a", temporal((0..4).collect(), 1))]),
+            round_units(vec![encoder("a", temporal((0..4).collect(), 1))]),
             Some(4)
         );
         assert_eq!(
-            lanes(vec![encoder("a", temporal((0..4).collect(), 2))]),
+            round_units(vec![encoder("a", temporal((0..4).collect(), 2))]),
             Some(8)
         );
         assert_eq!(
-            lanes(vec![
+            round_units(vec![
                 encoder("a", temporal((0..4).collect(), 1)),
                 encoder("b", temporal((0..2).collect(), 1)),
             ]),
             Some(2)
         );
         assert_eq!(
-            lanes(vec![encoder("a", parallel((0..4).collect()))]),
+            round_units(vec![encoder("a", parallel((0..4).collect()))]),
             Some(1)
         );
 
@@ -1623,7 +1624,7 @@ mod tests {
         // leaves free: those the latent encoder does not share with its
         // worker's text encoder, or all of them when it shares every one.
         let beside = |text: Vec<usize>| {
-            lanes(vec![pool(
+            round_units(vec![pool(
                 "a",
                 &[
                     (MediaCall::LatentEncoding, "latent_encoder"),
@@ -1639,7 +1640,7 @@ mod tests {
         assert_eq!(beside(vec![0]), Some(7));
         assert_eq!(beside((0..8).collect()), Some(8));
         assert_eq!(
-            lanes(vec![pool(
+            round_units(vec![pool(
                 "a",
                 &[(MediaCall::Denoising, "denoiser")],
                 Vec::new()

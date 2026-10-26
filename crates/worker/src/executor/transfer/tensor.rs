@@ -1,14 +1,14 @@
 //! Tensor product transfers (`TransferMode::Tensor`).
 //!
-//! Each active call copies its one input product into its one output
-//! product in the batch's job and exports the copy, which is published at
-//! the job's completion. The input may be a
-//! product of this rank or one the batch imported from another rank or
-//! worker; either way it is leased from the tensor store. The output keeps
-//! its kind: a relayed scalar (a sampled token) lands in its request's
-//! relay lane, an encoder feature in a feature allocation with its spatial
-//! metadata, any other product in its scheduler allocation. A transfer
-//! never converts: the output declares the input's dtype.
+//! Each active call copies its one input product into its one output product in
+//! the batch's job and exports the copy, which is published at the job's
+//! completion. The input may be a product of this rank or one the batch
+//! imported from another rank or worker; either way it is leased from the
+//! tensor store. The output keeps its kind: a relayed scalar (a sampled token)
+//! lands in its request's relay entry, an encoder feature in a feature
+//! allocation with its spatial metadata, any other product in its scheduler
+//! allocation. A transfer never converts: the output declares the input's
+//! dtype.
 //!
 //! A trajectory transfer (a latent input and output) instead exports the
 //! committed version of the call's request trajectory from the latent pool
@@ -35,7 +35,7 @@ enum Placement {
     Feature,
     /// A product in its scheduler allocation.
     Persistent,
-    /// A scalar in its request's relay lane.
+    /// A scalar in its request's relay entry.
     Relay,
 }
 

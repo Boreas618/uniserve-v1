@@ -583,7 +583,7 @@ pub struct WorkerOptions {
     /// them in the Python environment it is installed in.
     pub executable: PathBuf,
     /// Time a batch may run without rank progress before the worker group is
-    /// replaced; a rank reports a stalled lane after half of it.
+    /// replaced; a rank reports a stalled job after half of it.
     #[serde(with = "values::duration")]
     pub watchdog_timeout: Duration,
     /// `tower=gen:<device>` places the generation tower on another device

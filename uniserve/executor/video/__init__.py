@@ -48,7 +48,7 @@ from uniserve.executor.video.encoder import (
 )
 from uniserve.executor.video.media import (
     Conditions,
-    HostLane,
+    MediaThread,
     MuxSession,
     Reports,
     Staging,
@@ -263,7 +263,7 @@ class VideoExecutor:
         self.audio: AudioDecoder | None = None
         self.reader: Conditions | None = None
         self.staging: Staging | None = None
-        self.lane: HostLane | None = None
+        self.media_thread: MediaThread | None = None
         self.reports: Reports | None = None
         # The layout each admitted slot holds on the denoiser.
         self.held: dict[int, Layout] = {}
@@ -467,7 +467,7 @@ class VideoExecutor:
                 pool=pools.get("audio_decoder"),
             )
         if any(placed.host for placed in self.placed.values()):
-            self.lane = HostLane("uniserve-media")
+            self.media_thread = MediaThread("uniserve-media")
             if "media_reader" in self.placed:
                 self.reader = Conditions(self.loaded, ffmpeg, model.frame_rate)
                 device = self.config.get("device")
@@ -1259,7 +1259,7 @@ class VideoExecutor:
     def _run_media_reading(self, entry, step, prepared, reads, writes) -> int:
         assert (
             self.reader is not None
-            and self.lane is not None
+            and self.media_thread is not None
             and self.reports is not None
         )
         record = self._request(entry["slot"], entry["call"]["request_key"])
@@ -1283,7 +1283,7 @@ class VideoExecutor:
                 staging.upload(host, products)
             return 0, b""
 
-        self.lane.submit(
+        self.media_thread.submit(
             run_reported(
                 self.reports,
                 int(step["batch_id"]),
@@ -1336,7 +1336,7 @@ class VideoExecutor:
         hold one host tensor of each of the rank's units' frames, in unit
         order.
         """
-        assert self.lane is not None and self.reports is not None
+        assert self.media_thread is not None and self.reports is not None
         if not prepared["writes"]:
             return EAGER
         record = self._request(entry["slot"], entry["call"]["request_key"])
@@ -1362,7 +1362,7 @@ class VideoExecutor:
             def work(frames=frames, row=row) -> tuple[int, bytes]:
                 return encode_unit(frames, frame_rate, row), b""
 
-            self.lane.submit(
+            self.media_thread.submit(
                 run_reported(self.reports, batch, call, local, work)
             )
         return EAGER
@@ -1373,7 +1373,7 @@ class VideoExecutor:
         return {"reads": [0], "writes": [], "publication": None, "reports": 1}
 
     def _run_audio_encoding(self, entry, step, prepared, reads, writes) -> int:
-        assert self.lane is not None and self.reports is not None
+        assert self.media_thread is not None and self.reports is not None
         session = self._mux(entry)
         pcm = reads[0]
         rate = self.model.sample_rate
@@ -1382,7 +1382,7 @@ class VideoExecutor:
             session.set_audio(encode_audio(pcm, session.samples, rate))
             return 0, b""
 
-        self.lane.submit(
+        self.media_thread.submit(
             run_reported(
                 self.reports,
                 int(step["batch_id"]),
@@ -1411,7 +1411,7 @@ class VideoExecutor:
         ``reads`` hold each input round's framed rows as ``[rows, width]``
         uint8 host tensors.
         """
-        assert self.lane is not None and self.reports is not None
+        assert self.media_thread is not None and self.reports is not None
         session = self._mux(entry)
         batch, call = int(step["batch_id"]), int(entry["index"])
         if not reads:
@@ -1420,7 +1420,9 @@ class VideoExecutor:
                 data = session.finish()
                 return len(data), data
 
-            self.lane.submit(run_reported(self.reports, batch, call, 0, finish))
+            self.media_thread.submit(
+                run_reported(self.reports, batch, call, 0, finish)
+            )
             return EAGER
         units = [
             read_unit(memoryview(row.numpy())) for rows in reads for row in rows
@@ -1430,7 +1432,9 @@ class VideoExecutor:
             session.append(units)
             return 0, b""
 
-        self.lane.submit(run_reported(self.reports, batch, call, 0, append))
+        self.media_thread.submit(
+            run_reported(self.reports, batch, call, 0, append)
+        )
         return EAGER
 
     def _mux(self, entry) -> MuxSession:
@@ -1468,8 +1472,8 @@ class VideoExecutor:
         Every owner is closed before the first failure is raised.
         """
         failure: BaseException | None = None
-        if self.lane is not None and not aborted:
-            self.lane.close()
+        if self.media_thread is not None and not aborted:
+            self.media_thread.close()
         for owner in (
             self.text,
             self.conditions,

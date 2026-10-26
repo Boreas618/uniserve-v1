@@ -1,4 +1,4 @@
-"""Request constants and slot state of a text lane.
+"""Request constants and slot state of a text computation.
 
 ``uniserve.executor.text.state``.
 """

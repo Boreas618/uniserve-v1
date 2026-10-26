@@ -1,4 +1,4 @@
-"""The captured graphs of a text lane (``uniserve.executor.text.graphs``)."""
+"""Captured graphs of a text computation (``uniserve.executor.text.graphs``)."""
 
 from __future__ import annotations
 

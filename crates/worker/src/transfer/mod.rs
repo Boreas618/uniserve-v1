@@ -68,10 +68,10 @@ pub(crate) const ACK_SLOTS: usize = 64;
 pub(crate) const CLAIMED: u32 = 1;
 pub(crate) const ACKNOWLEDGED: u32 = 2;
 
-/// Run observers returned by a completion, after its owner unlocked.
-/// How long a host wait for device work may last where storage is given
-/// up outside a lane's jobs: at shutdown, when no executor is left to route
-/// a completion, and where a buffer closes before it was announced ready.
+/// Run observers returned by a completion, after its owner unlocked. How long a
+/// host wait for device work may last where storage is given up outside the
+/// rank's jobs: at shutdown, when no executor is left to route a completion,
+/// and where a buffer closes before it was announced ready.
 pub(crate) const DRAIN_LIMIT: Duration = Duration::from_secs(60);
 
 /// Wait on the host until `event`'s latest record completed, at most until

@@ -1,13 +1,13 @@
 """Token batches of a causal language model through the text executor.
 
-The tests play the worker's half of a text lane over the two-layer Qwen3
-fixture on one GPU: they own the prefix cache's unit pool and block tables,
-allocate each slot's pages, select the attention pages of each forward row,
-build a batch's call and forward columns, lend page-locked output words and
-parse the completion records the executor writes; after each batch they
-call the lane's commit and carry the records' progress into the next
-batch. Four requests run together, prefilled in one batch, then decoded
-with relayed continuations:
+The tests play the worker's half of a text computation over the two-layer
+Qwen3 fixture on one GPU: they own the prefix cache's unit pool and block
+tables, allocate each slot's pages, select the attention pages of each
+forward row, build a batch's call and forward columns, lend page-locked
+output words and parse the completion records the executor writes; after
+each batch they call the computation's commit and carry the records'
+progress into the next batch. Four requests run together, prefilled in one
+batch, then decoded with relayed continuations:
 
 - a greedy request (the decode forward's own greedy selection);
 - a top-k sampled request (the decode forward's own top-k sampling);
@@ -18,7 +18,7 @@ Without graphs, the greedy tokens equal the Hugging Face reference's
 argmax continuation and the top-k tokens equal the library's top-k sampler
 applied to the reference's logits with the request's Philox draws. With
 graphs, after the phased warmup and the seal, every batch replays captured
-graphs and selects the same tokens as the eager lane.
+graphs and selects the same tokens as the eager computation.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import torch
 
 from tests.python.fixtures.checkpoints import qwen_checkpoint
 from uniserve.bindings.workspace import Scratch
-from uniserve.executor.text import LaneBinding, TextBinding, TextExecutor
+from uniserve.executor.text import ComputationBinding, TextBinding, TextExecutor
 from uniserve.executor.text.context import VisionBlock
 from uniserve.executor.text.philox import request_sampling_key, sampling_uniform
 from uniserve.executor.text.protocol import (
@@ -67,7 +67,8 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="the text lane runs on a GPU"
+        not torch.cuda.is_available(),
+        reason="the text computation runs on a GPU",
     ),
 ]
 
@@ -199,7 +200,7 @@ class Facts:
 
 
 class Worker:
-    """The worker's half of one text lane, played over one stream."""
+    """The worker's half of one text computation, played over one stream."""
 
     def __init__(self, root, graphs: bool, media: bool = False) -> None:
         device = torch.device("cuda", 0)
@@ -258,8 +259,8 @@ class Worker:
                     "table_shapes": self.table_shapes,
                     "verified_lengths": self.verified,
                 },
-                lanes=(
-                    LaneBinding(
+                computations=(
+                    ComputationBinding(
                         index=0,
                         component="text",
                         streams=(self.stream,),
@@ -405,7 +406,7 @@ class Worker:
         used = self.executor.execute(
             0,
             json.dumps(
-                {"batch": 1, "lane": 0, "collective_seq": 0, "calls": {}}
+                {"batch": 1, "computation": 0, "collective_seq": 0, "calls": {}}
             ),
             torch.from_numpy(calls),
             torch.from_numpy(forward),
@@ -462,7 +463,7 @@ class Worker:
         vision = {"offset": offset, "tensor": 0, "height": 2, "width": 2}
         step = {
             "batch": 1,
-            "lane": 0,
+            "computation": 0,
             "collective_seq": 0,
             "calls": {"0": {"vision": [vision]}},
         }
@@ -596,7 +597,9 @@ def _reference_logits(reference, tokens) -> torch.Tensor:
         return reference(input_ids=ids).logits[0, -1].float()
 
 
-def test_eager_lane_selects_the_reference_continuation(checkpoint, eager):
+def test_eager_computation_selects_the_reference_continuation(
+    checkpoint, eager
+):
     _, reference = checkpoint
     worker, generated, batches = eager
     vocab = int(reference.config.vocab_size)
@@ -662,8 +665,8 @@ def test_captured_graphs_replay_the_eager_selections(checkpoint, eager):
     worker = Worker(checkpoint[0], graphs=True)
     try:
         phases = worker.warm()
-        lane = worker.executor.lanes[0]
-        runner = lane.runners[0]
+        computation = worker.executor.computations[0]
+        runner = computation.runners[0]
         assert runner.graphs.sealed and len(runner.graphs) > 0
         # Prefill buckets first, largest footprint first, then decode
         # buckets largest first; every phase reads scratch tables.
@@ -752,8 +755,8 @@ def test_guidance_prefixes_write_the_cache_a_prefill_continues(
     request = Request(6, 16, (26,), {"temperature": 0.0})
     worker.start([request])
     worker.install(request.slot, len(prefix))
-    lane = worker.executor.lanes[0]
-    executed = lane.prefill_cache(
+    computation = worker.executor.computations[0]
+    executed = computation.prefill_cache(
         [(request.slot, prefix)], worker.pages([request.slot])
     )
     assert executed.mode == GraphMode.EAGER

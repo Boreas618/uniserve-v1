@@ -7,13 +7,13 @@
 //! and the cache unit count are agreed over the group's [`HostGroup`] with a
 //! minimum reduction.
 //!
-//! Token workers (text, diffusion LM, image) place a cache pool beside fixed storage:
-//! the buffer pool, the tensor store's products, the latent pool and the
-//! storage the executor's lanes and the prefix cache reserve (the bytes the
-//! executor's manifest states, block tables, importer scratch). Automatic cache sizing gives the pool the
-//! grant left after those and a graph-capture reservation. Media workers
-//! (video) size request slots instead, because every resident request keeps
-//! its whole media state.
+//! Token workers (text, diffusion LM, image) place a cache pool beside fixed
+//! storage: the buffer pool, the tensor store's products, the latent pool and
+//! the storage the executor's computations and the prefix cache reserve (the
+//! bytes the executor's manifest states, block tables, importer scratch).
+//! Automatic cache sizing gives the pool the grant left after those and a
+//! graph-capture reservation. Media workers (video) size request slots instead,
+//! because every resident request keeps its whole media state.
 
 use std::collections::BTreeMap;
 
@@ -231,7 +231,7 @@ fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
         encoder_cache_entries: 0,
         encoder_entry_bytes: 0,
         max_unresolved_calls: 0,
-        host_lane_capacity: 1,
+        host_task_capacity: 1,
         transfer_tickets: 1,
         image_warmups: Vec::new(),
         captured_images: None,
@@ -302,7 +302,7 @@ impl TokenLayout {
             config.device,
             info.buffer_pool_bytes + arena.deferred_device_bytes() + latent_bytes,
         );
-        info.host_lane_capacity = narrow(arena.host_lane_inflight, "host lane capacity")?;
+        info.host_task_capacity = narrow(arena.host_task_inflight, "host task capacity")?;
         info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
         Ok(Self {
             info,
@@ -453,10 +453,10 @@ pub(crate) fn request_layout(
         concurrent_imports: media.artifact_import_regions,
         device_exports,
     })?;
-    info.host_lane_capacity = if host_components {
+    info.host_task_capacity = if host_components {
         1
     } else {
-        narrow(arena.host_lane_inflight, "host lane capacity")?
+        narrow(arena.host_task_inflight, "host task capacity")?
     };
     info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
     Ok(Plan {

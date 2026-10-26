@@ -1,15 +1,14 @@
 //! The worker's execution backend: request state, lifecycle commands,
 //! batch validation, numerical dispatch and result delivery.
 //!
-//! [`WorkerBackend`] does the work of each step the [`super::Executor`]
-//! orders and answers the rank service. It owns the request pool, the
-//! request storage owners (through [`RequestStorage`]) and the placed
-//! components, and dispatches each batch's calls to what serves their kind
-//! (an executor lane or the transfers), whose forward it runs as jobs of
-//! the batch's lane.
-//! Lifecycle commands (Start, Finish, Free), batch admission, dependencies,
-//! retirement and result delivery are handled here for every batch, with or
-//! without calls.
+//! [`WorkerBackend`] does the work of each step the [`super::Executor`] orders
+//! and answers the rank service. It owns the request pool, the request storage
+//! owners (through [`RequestStorage`]) and the placed components, and
+//! dispatches each batch's calls to what serves their kind (an executor
+//! computation or the transfers), whose forward it runs as jobs of the rank's
+//! job queue. Lifecycle commands (Start, Finish, Free), batch admission,
+//! dependencies, retirement and result delivery are handled here for every
+//! batch, with or without calls.
 
 mod steps;
 
@@ -18,13 +17,13 @@ use std::sync::Arc;
 
 use ipc::{Batch as BatchPlan, BatchCommand, RequestKind, Stall, WorkerInfo, WorkerResponseError};
 
+use super::computations::Computations;
 use super::experts::ExpertMember;
-use super::lanes::ExecutorLanes;
-use super::lifecycle::{LaneJobs, RequestStorage};
+use super::lifecycle::{CommandJob, RequestStorage};
 use super::python::PythonExecutor;
 use crate::config::placement::{Components, GroupPlacement};
 use crate::error::WorkerError;
-use crate::lane::{Job, JobId, JobQueues};
+use crate::job::{Job, JobId, JobQueue};
 use crate::profiling::kernels::KernelWatch;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
@@ -32,7 +31,6 @@ use crate::worker::WorkerMemory;
 use crate::{Error, Result};
 
 pub(crate) use steps::WorkerBatch;
-use steps::lane_lost;
 
 /// The backend of one rank.
 pub(crate) struct WorkerBackend {
@@ -47,11 +45,12 @@ pub(crate) struct WorkerBackend {
     components: Components,
     profiler: Option<Profiler>,
     kernels: Option<KernelWatch>,
-    /// The lanes' job queues: each forward runs as jobs of its lane.
-    jobs: JobQueues,
-    /// What lifecycle commands record for the lanes; submitted after each
-    /// command.
-    lifecycle: LaneJobs,
+    /// The rank's job queue: each forward runs as jobs the builder thread
+    /// performs.
+    jobs: JobQueue,
+    /// What lifecycle commands record for the builder thread; submitted after
+    /// each command.
+    lifecycle: CommandJob,
     /// The submitted lifecycle jobs whose completions have not arrived.
     lifecycle_jobs: HashSet<JobId>,
     /// The job that joins the expert union's step this rank runs no
@@ -64,18 +63,18 @@ pub(crate) struct WorkerBackend {
     control_calls: cuda::cupti::Calls,
 }
 
-/// What serves a rank's components and the storage it owns: the rank's
-/// storage owners, the executor and its lanes, an expert union's member,
-/// the weights streamed ahead of their layers and the transfer runtime.
+/// What serves a rank's components and the storage it owns: the rank's storage
+/// owners, the executor and its computations, an expert union's member, the
+/// weights streamed ahead of their layers and the transfer runtime.
 #[derive(Default)]
 pub(crate) struct Owners {
     /// The rank's storage owners (events, products, transports, prefix cache).
     worker_storage: Option<WorkerMemory>,
-    /// The rank's executor, shared by the lanes, the expert union member
+    /// The rank's executor, shared by the computations, the expert union member
     /// and warmup, and closed after them.
     executor: Option<Arc<PythonExecutor>>,
-    /// The executor's lanes and the resources the worker keeps for them.
-    lanes: Option<ExecutorLanes>,
+    /// The executor's computations and the resources the worker keeps for them.
+    computations: Option<Computations>,
     /// This rank's member of its expert union, whose steps the executor
     /// agrees on and runs.
     experts: Option<ExpertMember>,
@@ -91,8 +90,8 @@ pub(crate) struct Owners {
 
 impl Owners {
     /// Every request storage owner, in lifecycle order: rank storage, the
-    /// executor's lanes (their output leases and latent ledger), then the
-    /// transfer runtime.
+    /// executor's computations (their output leases and latent ledger), then
+    /// the transfer runtime.
     pub(crate) fn request_storage(&mut self) -> impl Iterator<Item = &mut dyn RequestStorage> {
         fn owner<T: RequestStorage>(owner: &mut T) -> &mut dyn RequestStorage {
             owner
@@ -102,7 +101,7 @@ impl Owners {
             .as_mut()
             .map(owner)
             .into_iter()
-            .chain(self.lanes.as_mut().map(owner))
+            .chain(self.computations.as_mut().map(owner))
             .chain(self.transfer.as_mut().map(owner))
     }
 }
@@ -113,7 +112,7 @@ pub(crate) struct Parts<'a> {
     pub rank: usize,
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut WorkerMemory>,
-    pub lanes: Option<&'a mut ExecutorLanes>,
+    pub computations: Option<&'a mut Computations>,
     pub transfer: Option<&'a mut super::transfer::TransferRuntime>,
 }
 
@@ -133,8 +132,8 @@ impl WorkerBackend {
             components,
             profiler: None,
             kernels: None,
-            jobs: JobQueues::default(),
-            lifecycle: LaneJobs::default(),
+            jobs: JobQueue::default(),
+            lifecycle: CommandJob::default(),
             lifecycle_jobs: HashSet::new(),
             joining: None,
             joined: None,
@@ -142,12 +141,11 @@ impl WorkerBackend {
         })
     }
 
-    /// Submit the job the last lifecycle command recorded to the lane
-    /// without waiting for it: the lane performs it in the order of its
-    /// jobs, so a forward submitted later finds its work done. Nothing goes
-    /// on from its completion, which is taken with the next one that
-    /// arrives ([`WorkerBackend::completed`]); a failed one stops the rank
-    /// there.
+    /// Submit the job the last lifecycle command recorded without waiting for
+    /// it: the builder thread performs jobs in the order they were submitted,
+    /// so a forward submitted later finds its work done. Nothing goes on from
+    /// its completion, which is taken with the next one that arrives
+    /// ([`WorkerBackend::completed`]); a failed one stops the rank there.
     fn perform_lifecycle(&mut self) -> Result<()> {
         if let Some(job) = self.lifecycle.take() {
             let submitted = self.start(job, false)?;
@@ -156,17 +154,17 @@ impl WorkerBackend {
         Ok(())
     }
 
-    /// Submit `job` to the lane (the builder thread for a rank without
-    /// one). `wake` is as for [`JobQueues::start`].
+    /// Submit `job` to the builder thread. `wake` is as for
+    /// [`JobQueue::start`].
     ///
-    /// The deferred work the job carries waits for events the job records.
-    /// The job whose completion says they completed is started right
-    /// behind it, on the lane, and the event pool runs the work when that
-    /// completion arrives ([`WorkerBackend::completed`]). Started earlier,
-    /// that job would reach the lane before the records and pass at once.
+    /// The deferred work the job carries waits for events the job records. The
+    /// job whose completion says they completed is started right behind it, and
+    /// the event pool runs the work when that completion arrives
+    /// ([`WorkerBackend::completed`]). Started earlier, that job would reach
+    /// the builder thread before the records and pass at once.
     fn start(&self, job: Job, wake: bool) -> Result<JobId> {
         let deferrals = job.deferrals();
-        let submitted = self.jobs.start(job, wake)?;
+        let submitted = self.jobs.start(job, wake);
         if !deferrals.is_empty() {
             let storage = self.owners.worker_storage.as_ref().ok_or(Error::State(
                 "a job defers work on a rank without an event pool",
@@ -179,8 +177,8 @@ impl WorkerBackend {
         Ok(submitted)
     }
 
-    /// Have the rank's event pool start the jobs its deferred work waits
-    /// for on the lane, from this thread, the control thread.
+    /// Have the rank's event pool start the jobs its deferred work waits for,
+    /// from this thread, the control thread.
     fn serve_events(&self) {
         let Some(storage) = &self.owners.worker_storage else {
             return;
@@ -193,8 +191,8 @@ impl WorkerBackend {
             })));
     }
 
-    /// Use the job queues of the rank's lane for forward submission.
-    pub(crate) fn set_job_queues(&mut self, jobs: JobQueues) {
+    /// Use the rank's job queue for forward submission.
+    pub(crate) fn set_job_queue(&mut self, jobs: JobQueue) {
         self.jobs = jobs;
         self.serve_events();
     }
@@ -244,7 +242,7 @@ impl WorkerBackend {
     }
 
     /// Install the rank's executor, which the backend closes after the
-    /// lanes and the expert union that call it.
+    /// computations and the expert union that call it.
     pub(crate) fn set_executor(&mut self, executor: Arc<PythonExecutor>) {
         self.owners.executor = Some(executor);
     }
@@ -254,34 +252,34 @@ impl WorkerBackend {
         self.owners.executor.as_ref()
     }
 
-    /// Install the executor's lanes.
-    pub(crate) fn set_lanes(&mut self, lanes: ExecutorLanes) {
-        self.owners.lanes = Some(lanes);
+    /// Install the executor's computations.
+    pub(crate) fn set_computations(&mut self, computations: Computations) {
+        self.owners.computations = Some(computations);
     }
 
-    /// The executor's lanes.
-    pub(crate) fn lanes(&self) -> Option<&ExecutorLanes> {
-        self.owners.lanes.as_ref()
+    /// The executor's computations.
+    pub(crate) fn computations(&self) -> Option<&Computations> {
+        self.owners.computations.as_ref()
     }
 
-    /// Whether an executor lane serves calls of `kind` on this rank.
+    /// Whether an executor computation serves calls of `kind` on this rank.
     pub(crate) fn executes(&self, kind: ipc::CallKind) -> bool {
         self.owners
-            .lanes
+            .computations
             .as_ref()
-            .is_some_and(|lanes| lanes.serves(kind))
+            .is_some_and(|computations| computations.serves(kind))
     }
 
-    /// The parts a lane's batch executes with; `None` on a rank without
-    /// executor lanes or storage owners.
-    pub(crate) fn lane_parts(&mut self) -> Option<super::lanes::Parts<'_>> {
-        Some(super::lanes::Parts {
+    /// The parts a computation's batch executes with; `None` on a rank without
+    /// executor computations or storage owners.
+    pub(crate) fn computation_parts(&mut self) -> Option<super::computations::Parts<'_>> {
+        Some(super::computations::Parts {
             placement: &self.placement,
             rank: self.rank,
             info: &self.info,
             requests: &mut self.requests,
             storage: self.owners.worker_storage.as_mut()?,
-            lanes: self.owners.lanes.as_mut()?,
+            computations: self.owners.computations.as_mut()?,
         })
     }
 
@@ -305,9 +303,9 @@ impl WorkerBackend {
         self.owners.host_weights = weights;
     }
 
-    /// The lanes' job queues, for work that runs as jobs outside a batch
-    /// (warmup captures).
-    pub(crate) fn job_queues(&self) -> &JobQueues {
+    /// The rank's job queue, for work that runs as jobs outside a batch (warmup
+    /// captures).
+    pub(crate) fn job_queue(&self) -> &JobQueue {
         &self.jobs
     }
 
@@ -341,8 +339,8 @@ impl WorkerBackend {
         self.owners.transfer = Some(transfer);
     }
 
-    /// The lane's stream on `device` (none on host devices): imports are
-    /// read and published on it.
+    /// The primary stream of `device` (none on host devices): imports are read
+    /// and published on it.
     pub(crate) fn transfer_stream(
         &self,
         device: crate::ffi::MemoryKind,
@@ -366,7 +364,7 @@ impl WorkerBackend {
             rank: self.rank,
             requests: &mut self.requests,
             storage: self.owners.worker_storage.as_mut(),
-            lanes: self.owners.lanes.as_mut(),
+            computations: self.owners.computations.as_mut(),
             transfer: self.owners.transfer.as_mut(),
         }
     }
@@ -397,9 +395,9 @@ impl WorkerBackend {
         // The executor admits the started requests in a job before the
         // batch opens (`admit_inputs`); one it does not serve is refused
         // alone, and its calls report the refusal.
-        if let Some(lanes) = &mut self.owners.lanes {
+        if let Some(computations) = &mut self.owners.computations {
             for request in installed {
-                lanes.start(request)?;
+                computations.start(request)?;
             }
         }
 
@@ -467,8 +465,8 @@ impl WorkerBackend {
         if let Some(storage) = &self.owners.worker_storage {
             storage.set_wake(wake.clone());
         }
-        if let Some(lanes) = &self.owners.lanes {
-            lanes.set_wake(wake);
+        if let Some(computations) = &self.owners.computations {
+            computations.set_wake(wake);
         }
     }
 
@@ -487,9 +485,9 @@ impl WorkerBackend {
         result
     }
 
-    /// Close what computes after the lanes drained: the executor, which
-    /// releases its lanes and the expert union, then the lanes' output
-    /// storage, image host lane and report pipe; attempts every one before
+    /// Close what computes after the jobs drained: the executor, which releases
+    /// its computations and the expert union, then the computations' output
+    /// storage, image host pool and report pipe; attempts every one before
     /// returning the first failure.
     pub(crate) fn close_executor(&mut self, aborted: bool) -> Result<()> {
         let executor = self
@@ -497,12 +495,12 @@ impl WorkerBackend {
             .executor
             .take()
             .map_or(Ok(()), |executor| executor.close(aborted));
-        let lanes = self
+        let computations = self
             .owners
-            .lanes
+            .computations
             .take()
-            .map_or(Ok(()), |mut lanes| lanes.close(aborted));
-        executor.and(lanes)
+            .map_or(Ok(()), |mut computations| computations.close(aborted));
+        executor.and(computations)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -635,12 +633,12 @@ impl WorkerBackend {
                 )
             })?;
 
-        // A join is a job of the lane the union's steps run on: the
-        // executor agrees on the union's next step and, when one was
-        // agreed, joins it on the lane's stream.
+        // A join is a job like the union's steps: the executor agrees on the
+        // union's next step and, when one was agreed, joins it on the stream
+        // the steps run on.
         let job = Job::new();
         job.call_returning(executor.join_expert_step(leaving));
-        let submitted = self.jobs.start(job, true).map_err(lane_lost)?;
+        let submitted = self.jobs.start(job, true);
         self.joining = Some(submitted);
         Ok(None)
     }
@@ -661,9 +659,8 @@ impl WorkerBackend {
         running: std::time::Duration,
         batch: Option<(u64, &WorkerBatch)>,
     ) -> Stall {
-        let (lane, method) = self.jobs.performing(job).unwrap_or_default();
+        let method = self.jobs.performing(job).flatten();
         Stall {
-            lane,
             batch_id: batch.map(|(id, _)| id),
             route: batch
                 .and_then(|(_, batch)| batch.route())

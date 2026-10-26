@@ -1,5 +1,5 @@
-"""The bounds a diffusion LM lane derives from the worker's limits, the
-prefix cache and the model (``uniserve.executor.diffusion_lm.bounds``).
+"""The bounds a diffusion LM computation derives from the worker's limits,
+the prefix cache and the model (``uniserve.executor.diffusion_lm.bounds``).
 """  # noqa: D205
 
 from __future__ import annotations
@@ -53,8 +53,8 @@ def _group(
 
 
 def _bounds(**overrides) -> Bounds:
-    """Derive the bounds of a generating CUDA lane with graphs, eight calls
-    and 2048 tokens a batch and 16 slots, unless ``overrides`` says
+    """Derive the bounds of a generating CUDA computation with graphs, eight
+    calls and 2048 tokens a batch and 16 slots, unless ``overrides`` says
     otherwise.
     """  # noqa: D205
     arguments = {

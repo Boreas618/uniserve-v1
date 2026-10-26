@@ -376,10 +376,10 @@ pub struct Batch {
     /// Imported cache exports consumed by explicit cache installation call kinds.
     pub cache_inputs: Vec<CacheTransfer>,
     /// Pages read from the host KV cache into new units, on the rank's
-    /// copy lane as soon as the batch arrives; the forward waits for them.
+    /// copy stream as soon as the batch arrives; the forward waits for them.
     pub page_loads: Vec<PageCopy>,
     /// Published pages written to the host KV cache, on the rank's copy
-    /// lane as soon as the batch arrives; the batch's output reports them
+    /// stream as soon as the batch arrives; the batch's output reports them
     /// complete. A batch may carry them alone.
     pub page_offloads: Vec<PageCopy>,
 }

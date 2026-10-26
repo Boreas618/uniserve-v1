@@ -2,12 +2,12 @@
 //! encoding decoded images, packed 8-bit RGB pixels, to base64 PNG
 //! ([`ImageTask`]).
 //!
-//! A decoded image reaches the host as `height * width * 3` bytes in
-//! row-major HWC order (`uniserve.media.pixels.quantize_image_hwc`).
-//! Encoding runs on a host lane after the device-to-host copy completes. PNG
-//! is lossless, so the delivered pixels equal the quantized ones whatever
-//! the compression; the fast compression level trades output size for
-//! encoding time on large generated images.
+//! A decoded image reaches the host as `height * width * 3` bytes in row-major
+//! HWC order (`uniserve.media.pixels.quantize_image_hwc`). Encoding runs on a
+//! host pool after the device-to-host copy completes. PNG is lossless, so the
+//! delivered pixels equal the quantized ones whatever the compression; the fast
+//! compression level trades output size for encoding time on large generated
+//! images.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -103,7 +103,7 @@ pub(crate) enum ImageResult {
     Encoded(Vec<u8>),
 }
 
-/// A host-lane action of an image batch.
+/// A host-pool action of an image batch.
 pub(crate) struct ImageTask {
     work: Mutex<ImageWork>,
 }

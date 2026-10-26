@@ -87,12 +87,12 @@ class VisionEncoder:
     Args:
         module: The patch tower.
         owner: Its component and path, naming it.
-        stream: The lane stream.
+        stream: The primary stream.
         device: The CUDA ordinal ``stream`` belongs to, -1 for the host.
         scratch: The stream's shared work areas.
         attention: The attention backend the model loaded with.
         graphs: Whether encodes replay captured graphs.
-        pool: The lane stream's graph pool, ``None`` without graphs.
+        pool: The primary stream's graph pool, ``None`` without graphs.
         peers: ``(ordinal, pool)`` of each other device the tower computes
             on.
         pixel_dtype: The dtype of the pixels the image policy prepares.

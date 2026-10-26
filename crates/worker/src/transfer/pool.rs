@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::read::NativeRead;
 use super::{Notify, ReadReservation, TransferCapacity, notify};
-use crate::host::{HostAction, HostLane, HostTask};
+use crate::host::{HostAction, HostPool, HostTask};
 use crate::{Error, Outcome, Result, lock};
 
 /// A read action submitted through the common native host executor.
@@ -45,7 +45,7 @@ struct PoolState {
 /// ends. Late failures poison admission and unknown completion retains backing.
 pub(crate) struct TransferPool {
     capacity: Arc<TransferCapacity>,
-    lane: HostLane<TransferRead>,
+    host: HostPool<TransferRead>,
     state: Mutex<PoolState>,
 }
 
@@ -54,7 +54,7 @@ impl TransferPool {
         let limit = capacity.ticket_capacity();
         Ok(Self {
             capacity,
-            lane: HostLane::new(limit, workers.min(limit), name)?,
+            host: HostPool::new(limit, workers.min(limit), name)?,
             state: Mutex::new(PoolState {
                 error: None,
                 unretired: Vec::new(),
@@ -96,7 +96,7 @@ impl TransferPool {
         }
 
         let backend = Arc::new(backend);
-        let task = match self.lane.reserve() {
+        let task = match self.host.reserve() {
             Ok(task) => task,
             Err(error) => {
                 self.return_capacity(nbytes)?;
@@ -204,7 +204,7 @@ impl TransferPool {
     /// Join reads before destroying their streams. Failed physical retirement
     /// remains retained and its original error is returned to the caller.
     pub(crate) fn close(&self) -> Option<Arc<Error>> {
-        let mut errors = self.lane.close().into_iter();
+        let mut errors = self.host.close().into_iter();
         let first = errors.next().map(Arc::new);
         let error = {
             let mut state = self.state();

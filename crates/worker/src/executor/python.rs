@@ -1,26 +1,26 @@
 //! The rank's numerical half: the Python executor
 //! (`uniserve.executor.Executor`).
 //!
-//! The worker owns the control and data planes (requests, batches, lanes,
-//! products, transfers and memory); the executor owns every numerical
-//! decision and computation of the components it serves. One executor
-//! serves a rank, shared by what calls it (the executor lanes, the expert
-//! union member, warmup), and the backend closes it once after them. It
-//! serves each computation under a lane index (`crate::executor::lanes`).
-//! The worker calls it at a few points, each a [`MethodCall`] a job of the
-//! lane whose stream the call works on records, or a call startup makes
-//! itself:
+//! The worker owns the control and data planes (requests, batches, jobs,
+//! products, transfers and memory); the executor owns every numerical decision
+//! and computation of the components it serves. One executor serves a rank,
+//! shared by what calls it (the executor computations, the expert union member,
+//! warmup), and the backend closes it once after them. It serves each
+//! computation under its index (`crate::executor::computations`). The worker
+//! calls it at a few points, each a [`MethodCall`] that a job records, to be
+//! performed on the builder thread behind the stream work recorded before it,
+//! or a call startup makes itself:
 //!
 //! | call | when | result |
 //! | --- | --- | --- |
-//! | `manifest` | after loading | JSON of the lanes and what capacity planning reads |
+//! | `manifest` | after loading | JSON of the computations and what capacity planning reads |
 //! | `expert_storage_bytes`, `connect_experts` | after loading, before planning | the expert union |
-//! | `bind` | after capacity planning | the lanes are constructed on the granted storage |
-//! | `warmup_phases`, `warmup_phase`, `warmup_finish` | before the rank reports | every lane prepared, warmed and captured |
+//! | `bind` | after capacity planning | the computations are constructed on the granted storage |
+//! | `warmup_phases`, `warmup_phase`, `warmup_finish` | before the rank reports | every computation prepared, warmed and captured |
 //! | `seal` | after warmup's graph residency check | captures are refused from then on |
 //! | `start` | before a batch that starts requests opens | JSON of the requests refused |
-//! | `prepare` | a preparing lane's batch past its predicates | JSON of what each call reads and writes |
-//! | `execute` | the job that carries a batch's device work | the lane's results |
+//! | `prepare` | a preparing computation's batch past its predicates | JSON of what each call reads and writes |
+//! | `execute` | the job that carries a batch's device work | the computation's results |
 //! | `commit` | that job, past the batch's commit point | — |
 //! | `join_expert_step` | a rank with no step of its own joins the union's | whether a step ran, whether the union released |
 //! | `park_experts`, `promote_experts`, `rebuild_experts` | a standby parks, is promoted | — |
@@ -130,31 +130,31 @@ impl PythonExecutor {
         self.call(function, arguments).invoke().map(drop)
     }
 
-    /// The JSON of the executor's lanes and of what capacity planning and
-    /// the handshake read.
+    /// The JSON of the executor's computations and of what capacity planning
+    /// and the handshake read.
     pub(crate) fn manifest(&self) -> Result<String> {
         self.texts(&self.functions.manifest, Vec::new())
     }
 
-    /// Construct every lane on the storage capacity planning granted:
-    /// `memory` is the JSON `bind` reads and `values` the handles and
-    /// tensors it names, in its order (`crate::worker::lanes`). Returns the
-    /// JSON the executor states of its bound lanes.
+    /// Construct every computation on the storage capacity planning granted:
+    /// `memory` is the JSON `bind` reads and `values` the handles and tensors
+    /// it names, in its order (`crate::worker::computations`). Returns the JSON
+    /// the executor states of its bound computations.
     pub(crate) fn bind(&self, memory: String, values: Vec<Argument>) -> Result<String> {
         let mut arguments = vec![Argument::Text(memory)];
         arguments.extend(values);
         self.texts(&self.functions.bind, arguments)
     }
 
-    /// The JSON list of the lanes' warmup phases, in the order every rank
-    /// runs them: each names its lane, the scratch lengths of its slots
-    /// `1..` (or none) and the attention rows of each of its steps.
+    /// The JSON list of the computations' warmup phases, in the order every
+    /// rank runs them: each names its computation, the scratch lengths of its
+    /// slots `1..` (or none) and the attention rows of each of its steps.
     pub(crate) fn warmup_phases(&self) -> Result<String> {
         self.texts(&self.functions.warmup_phases, Vec::new())
     }
 
-    /// The call that runs warmup phase `index` on its lane, given each of
-    /// its steps' page columns.
+    /// The call that runs warmup phase `index` of its computation, given each
+    /// of its steps' page columns.
     pub(crate) fn warmup_phase(&self, index: usize, pages: Vec<StorageView>) -> MethodCall {
         let mut arguments = vec![Argument::from(index)];
         arguments.extend(pages.into_iter().map(Argument::Tensor));
@@ -179,35 +179,36 @@ impl PythonExecutor {
             .serving()
     }
 
-    /// The call that prepares a batch of lane `lane` (`step`: JSON), whose
-    /// completion's text is the JSON of what each call reads and writes.
-    pub(crate) fn prepare(&self, lane: usize, step: String) -> MethodCall {
+    /// The call that prepares a batch of computation `computation` (`step`:
+    /// JSON), whose completion's text is the JSON of what each call reads and
+    /// writes.
+    pub(crate) fn prepare(&self, computation: usize, step: String) -> MethodCall {
         self.call(
             &self.functions.prepare,
-            vec![Argument::from(lane), Argument::Text(step)],
+            vec![Argument::from(computation), Argument::Text(step)],
         )
         .serving()
     }
 
-    /// The call that executes a batch of lane `lane` (`step`: JSON) on
-    /// `tensors`, whose completion's integers are the lane's results: the
-    /// record words it wrote, or each call's graph mode for a lane that
-    /// prepares.
+    /// The call that executes a batch of computation `computation` (`step`:
+    /// JSON) on `tensors`, whose completion's integers are the computation's
+    /// results: the record words it wrote, or each call's graph mode for a
+    /// computation that prepares.
     pub(crate) fn execute(
         &self,
-        lane: usize,
+        computation: usize,
         step: String,
         tensors: Vec<StorageView>,
     ) -> MethodCall {
-        let mut arguments = vec![Argument::from(lane), Argument::Text(step)];
+        let mut arguments = vec![Argument::from(computation), Argument::Text(step)];
         arguments.extend(tensors.into_iter().map(Argument::Tensor));
         self.call(&self.functions.execute, arguments).serving()
     }
 
-    /// The call that advances lane `lane`'s slot state on the device by its
-    /// last executed batch, past that batch's commit point.
-    pub(crate) fn commit(&self, lane: usize) -> MethodCall {
-        self.call(&self.functions.commit, vec![Argument::from(lane)])
+    /// The call that advances computation `computation`'s slot state on the
+    /// device by its last executed batch, past that batch's commit point.
+    pub(crate) fn commit(&self, computation: usize) -> MethodCall {
+        self.call(&self.functions.commit, vec![Argument::from(computation)])
             .serving()
     }
 
@@ -309,8 +310,8 @@ impl PythonExecutor {
         self.call(&self.functions.kernels, Vec::new())
     }
 
-    /// Release every lane and the expert union after the lanes drained. An
-    /// aborted close keeps what device work may still address.
+    /// Release every computation and the expert union after the jobs drained.
+    /// An aborted close keeps what device work may still address.
     pub(crate) fn close(&self, aborted: bool) -> Result<()> {
         self.unit(&self.functions.close, vec![Argument::Bool(aborted)])
     }

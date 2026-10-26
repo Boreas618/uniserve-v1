@@ -1,12 +1,12 @@
 //! The host KV cache (L2) of the rank's prefix cache.
 //!
-//! Each cache group copies its pages through a page pool of the host's
-//! Storage Server: a memfd of equal slots shared by every worker
-//! of the host whose pages have the same shape. The rank maps each pool
-//! writable and registers it for device copies; the engine decides which
-//! pages to copy and carries them in batches (`Batch::page_loads`,
-//! `Batch::page_offloads`), and the copies run on the rank's copy lane as soon
-//! as the batch arrives (`PrefixCache::issue_pages`).
+//! Each cache group copies its pages through a page pool of the host's Storage
+//! Server: a memfd of equal slots shared by every worker of the host whose
+//! pages have the same shape. The rank maps each pool writable and registers it
+//! for device copies; the engine decides which pages to copy and carries them
+//! in batches (`Batch::page_loads`, `Batch::page_offloads`), and the copies run
+//! on the rank's copy stream as soon as the batch arrives
+//! (`PrefixCache::issue_pages`).
 //!
 //! A page is one page of one group on this rank, layer-major:
 //!

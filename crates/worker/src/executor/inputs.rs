@@ -1,14 +1,13 @@
 //! Inputs a batch imports from other calls, prepared before it executes.
 //!
-//! Every batch reads its tensor inputs from the rank's tensor store, and
-//! its trajectories from the lanes' latent ledger. Products
-//! another rank or worker published reach this rank as descriptors
-//! (`Batch::input_products`): tensors are read into the tensor store,
-//! latent trajectory versions into the consuming request's pages; cache
-//! transfers its install calls name arrive as `Batch::cache_inputs` or are
-//! resident exports of this rank. This module materializes them while
-//! other batches execute, so a lane consumes imported values exactly like
-//! values its own rank produced.
+//! Every batch reads its tensor inputs from the rank's tensor store, and its
+//! trajectories from the computations' latent ledger. Products another rank or
+//! worker published reach this rank as descriptors (`Batch::input_products`):
+//! tensors are read into the tensor store, latent trajectory versions into the
+//! consuming request's pages; cache transfers its install calls name arrive as
+//! `Batch::cache_inputs` or are resident exports of this rank. This module
+//! materializes them while other batches execute, so a computation consumes
+//! imported values exactly like values its own rank produced.
 //!
 //! Preparation runs on the executor thread in phases, each resumed by the
 //! readiness notice of what blocked it ([`admit`], [`prepare`],
@@ -21,24 +20,23 @@
 //!    latent bank waits for the exports of versions in it. A failed access
 //!    keeps its storage forever, so the batch then fails instead.
 //! 2. **Admission.** Product imports are admitted in descriptor order
-//!    ([`admit`]). What an import needs on its consumers' stream, the
-//!    handoff fence each of its reads waits on, is recorded into one job
-//!    of the batch's lane; the reads are handed to their transport threads
-//!    from that job's completion ([`admitted`]), when the fences' records
-//!    are made. A refusal for read credits resumes at the refused product
-//!    once credits return; accepted imports keep their destinations
-//!    meanwhile. Cache imports follow ([`prepare`]), after which nothing is
-//!    repeatable.
+//!    ([`admit`]). What an import needs on its consumers' stream, the handoff
+//!    fence each of its reads waits on, is recorded into one job of the batch;
+//!    the reads are handed to their transport threads from that job's
+//!    completion ([`admitted`]), when the fences' records are made. A refusal
+//!    for read credits resumes at the refused product once credits return;
+//!    accepted imports keep their destinations meanwhile. Cache imports follow
+//!    ([`prepare`]), after which nothing is repeatable.
 //! 3. **Readiness.** The batch launches once every read and cache copy is
 //!    consumable.
 //!
-//! When the batch executes, [`complete`] publishes each imported product on
-//! its consumers' device stream (a new product is committed, a widened
-//! shard is fenced over its union, a trajectory version is adopted as its
-//! slot's committed one) before the lane consumes it; imports only
-//! predicated-off calls read are left unpublished. [`close`] ends the
-//! import leases and abandons every import the batch did not consume, on
-//! success and on failure alike.
+//! When the batch executes, [`complete`] publishes each imported product on its
+//! consumers' device stream (a new product is committed, a widened shard is
+//! fenced over its union, a trajectory version is adopted as its slot's
+//! committed one) before the computation consumes it; imports only
+//! predicated-off calls read are left unpublished. [`close`] ends the import
+//! leases and abandons every import the batch did not consume, on success and
+//! on failure alike.
 //!
 //! [`BatchInputs`] holds the resources a batch retains while its inputs
 //! are prepared.
@@ -52,7 +50,7 @@ use super::transfer::latents::{self, LatentInput};
 use crate::error::WorkerError;
 use crate::executor::Submission;
 use crate::ffi::MemoryKind;
-use crate::lane::{Completion, Job};
+use crate::job::{Completion, Job};
 use crate::memory::{PendingImport, ProductRead, ProductStore};
 use crate::transfer::{Notify, Retirement, fetch};
 use crate::{Error, Result};
@@ -203,17 +201,17 @@ pub(crate) struct Inputs {
 enum Completing {
     #[default]
     Unstarted,
-    /// The job on the lane publishes the imported predicates and reads the
-    /// host-gated predicates of these calls, in this order: they decide
-    /// which other imports are read.
+    /// The job in flight publishes the imported predicates and reads the
+    /// host-gated predicates of these calls, in this order: they decide which
+    /// other imports are read.
     Predicates(Vec<usize>),
     /// The predicates are known: whether each of those calls is skipped.
     Decided(HashMap<usize, bool>),
-    /// The job on the lane publishes the imports an executing call reads.
+    /// The job in flight publishes the imports an executing call reads.
     Publishing,
-    /// Recording a job failed after it recorded work: the job on the lane
-    /// performs that work, whose fences are still due, and the completion
-    /// fails with this error.
+    /// Recording a job failed after it recorded work: the job in flight
+    /// performs that work, whose fences are still due, and the completion fails
+    /// with this error.
     Failing(Error),
 }
 
@@ -246,12 +244,12 @@ pub(crate) fn component_device(backend: &WorkerBackend, component: &str) -> Resu
     Ok(placed.device.memory())
 }
 
-/// Admit the batch's product imports that can be admitted now, recording
-/// what they issue on their consumers' stream into the returned job. The
-/// caller submits a job that holds work to the batch's lane, whatever the
-/// result, and hands its completion to [`admitted`]: fences recorded by an
-/// import that was refused or failed afterwards are still due. With an
-/// empty job nothing waits for the lane.
+/// Admit the batch's product imports that can be admitted now, recording what
+/// they issue on their consumers' stream into the returned job. The caller
+/// submits a job that holds work, whatever the result, and hands its completion
+/// to [`admitted`]: fences recorded by an import that was refused or failed
+/// afterwards are still due. With an empty job nothing waits for the builder
+/// thread.
 pub(crate) fn admit(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
@@ -462,11 +460,11 @@ pub(crate) fn subscribe(
     Ok(())
 }
 
-/// The next job publishing the batch's imported products before its lane
-/// executes, or `None` when nothing is left to issue: predicates
-/// first, then the imports some call that executes reads (a call whose host
-/// predicate is false reads nothing). Each import is published on its
-/// consumers' stream; consumers order after its fence.
+/// The next job publishing the batch's imported products before its computation
+/// executes, or `None` when nothing is left to issue: predicates first, then
+/// the imports some call that executes reads (a call whose host predicate is
+/// false reads nothing). Each import is published on its consumers' stream;
+/// consumers order after its fence.
 ///
 /// The predicates that decide which imports are read are host-gated: the
 /// first job publishes the imported ones and reads them, and its
@@ -579,7 +577,7 @@ pub(crate) fn complete(batch: &mut WorkerBatch, completion: Completion) -> Resul
         }
         Completing::Publishing => Ok(true),
         Completing::Unstarted | Completing::Decided(_) | Completing::Failing(_) => Err(
-            Error::Invariant("an input completion has no job on its lane".into()),
+            Error::Invariant("an input completion has no job in flight".into()),
         ),
     }
 }
@@ -665,7 +663,7 @@ fn publish(
     }
 }
 
-/// The latent pool trajectory transfers use: the lanes' ledger's.
+/// The latent pool trajectory transfers use: the computations' ledger's.
 fn latent_pool(
     backend: &mut WorkerBackend,
 ) -> Result<(
@@ -674,8 +672,8 @@ fn latent_pool(
 )> {
     let ledger = backend
         .parts()
-        .lanes
-        .and_then(crate::executor::lanes::ExecutorLanes::ledger_mut)
+        .computations
+        .and_then(crate::executor::computations::Computations::ledger_mut)
         .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?;
     Ok(ledger.parts())
 }

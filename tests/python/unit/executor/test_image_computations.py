@@ -1,12 +1,12 @@
-"""The image executor serves an image model's lanes on host storage.
+"""The image executor serves an image model's computations on host storage.
 
 The stub model's components hold every kind of image work: a vision tower
 (its own component), a latent encoder, a zero-predicting image denoiser over
 the real schedule and solver, and an RGB image decoder. These tests drive
 the executor as the worker does (``crates/worker/src/executor/image.rs``):
-the lanes it states, each batch's preparation, then its execution on the
-tensors the worker binds in the preparation's order, and compare what it
-writes with the model's own computation.
+the computations it states, each batch's preparation, then its execution on
+the tensors the worker binds in the preparation's order, and compare what
+it writes with the model's own computation.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from uniserve.diffusion import normal_noise
 from uniserve.executor.image import (
     ImageBinding,
     ImageExecutor,
-    ImageLaneBinding,
+    StreamBinding,
 )
 from uniserve.media import image
 from uniserve.media.pixels import quantize_image_hwc
@@ -101,9 +101,9 @@ class _Rank:
     def __init__(self, stub) -> None:
         self.stub = stub
         self.executor = ImageExecutor(stub, _settings())
-        self.lanes = {
+        self.computations = {
             tuple(entry["kinds"]): index
-            for index, entry in enumerate(self.executor.lanes())
+            for index, entry in enumerate(self.executor.computations())
         }
         self.pool = UnitPool.allocate(
             stub.module.cache_config,
@@ -124,9 +124,9 @@ class _Rank:
         self.report = self.executor.bind(
             ImageBinding(
                 slots=SLOTS,
-                lanes=tuple(
-                    ImageLaneBinding(stream=None, scratch=Scratch())
-                    for _ in self.executor.lanes()
+                computations=tuple(
+                    StreamBinding(stream=None, scratch=Scratch())
+                    for _ in self.executor.computations()
                 ),
                 unit_pool=self.pool,
                 tables={
@@ -146,9 +146,9 @@ class _Rank:
             )
         )
 
-    def lane(self, kind: str) -> int:
+    def computation(self, kind: str) -> int:
         return next(
-            index for kinds, index in self.lanes.items() if kind in kinds
+            index for kinds, index in self.computations.items() if kind in kinds
         )
 
     def run(self, kind, calls, tensors, forward=None):
@@ -157,9 +157,9 @@ class _Rank:
         ``tensors`` maps a call to its tensors given its preparation;
         returns the preparation and each call's graph mode.
         """
-        lane = self.lane(kind)
-        step = {"batch_id": 1, "lane": lane, "calls": calls}
-        prepared = self.executor.prepare(lane, step)
+        computation = self.computation(kind)
+        step = {"batch_id": 1, "computation": computation, "calls": calls}
+        prepared = self.executor.prepare(computation, step)
         bound = [
             tensor
             for entry, planned in zip(calls, prepared, strict=True)
@@ -168,7 +168,7 @@ class _Rank:
         if forward is not None:
             bound.append(forward)
         modes = self.executor.execute(
-            lane, {**step, "prepared": prepared}, bound
+            computation, {**step, "prepared": prepared}, bound
         )
         return prepared, modes
 
@@ -234,15 +234,17 @@ def _start(rank: _Rank, steps: int = 2) -> None:
     )
 
 
-def test_lanes_name_each_kind_of_work_and_the_resources_it_uses(rank):
-    lanes = rank.executor.lanes()
-    by_kind = {tuple(entry["kinds"]): entry for entry in lanes}
+def test_computations_name_each_kind_of_work_and_the_resources_it_uses(rank):
+    computations = rank.executor.computations()
+    by_kind = {tuple(entry["kinds"]): entry for entry in computations}
     assert by_kind[("vision_encoding",)]["component"] == "vision_encoder"
     assert by_kind[("vision_encoding",)]["resources"] == ["images"]
     assert by_kind[("latent_encoding",)]["resources"] == ["images"]
     denoiser = by_kind[("latent_preparation", "denoising", "image_decoding")]
     assert denoiser["resources"] == ["pages", "latents", "images"]
-    assert all(entry["prepares"] and not entry["commits"] for entry in lanes)
+    assert all(
+        entry["prepares"] and not entry["commits"] for entry in computations
+    )
     # The longest trajectory sizes the ledger.
     assert rank.executor.manifest()["latent"] == {
         "rows": 1024,

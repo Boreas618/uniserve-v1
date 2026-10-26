@@ -948,7 +948,7 @@ impl Scheduler {
         add_worker_forward_map(&self.stats.worker.forward_mode_tokens, &stats.mode_tokens);
         add_worker_forward_map(&self.stats.worker.forward_mode_us, &stats.mode_us);
         add_worker_forward_map(&self.stats.worker.forward_component_us, &stats.component_us);
-        add_worker_forward_map(&self.stats.worker.lane_us, &stats.lane_us);
+        add_worker_forward_map(&self.stats.worker.stream_us, &stats.stream_us);
         add_worker_forward_map(&self.stats.worker.blocking_calls, &stats.blocking_calls);
         add_worker_forward_map(
             &self.stats.worker.attention_backend_counts,

@@ -168,9 +168,9 @@ impl Retired {
     }
 }
 
-/// One import's copy work, the action of a host task of the cache's import
-/// lane ([`HostAction`](crate::host::HostAction) in `copy.rs`). Workspace
-/// admission, cancellation and physical retirement belong to the importer.
+/// One import's copy work, the action of a host task of the cache's import pool
+/// ([`HostAction`](crate::host::HostAction) in `copy.rs`). Workspace admission,
+/// cancellation and physical retirement belong to the importer.
 pub(crate) struct ImportCopy {
     pub(crate) write: Arc<CacheImport>,
     pub(crate) export: Arc<CacheTransfer>,

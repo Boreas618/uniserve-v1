@@ -856,11 +856,11 @@ fn a_failed_startup_reaches_the_engine_with_the_workers_error() -> anyhow::Resul
     Ok(())
 }
 
-/// A rank whose lane stays inside one job reports the lane and the job's
-/// forward to its engine, unasked, once the job has run for the launch's stall
-/// bound, and goes on serving its channel.
+/// A rank whose builder thread stays inside one job reports the job's
+/// forward to its engine, unasked, once the job has run for the launch's
+/// stall bound, and goes on serving its channel.
 #[test]
-fn a_stalled_lane_is_reported_while_its_worker_serves_on() -> anyhow::Result<()> {
+fn a_stalled_job_is_reported_while_its_worker_serves_on() -> anyhow::Result<()> {
     use ipc::{ErrorCallIdentity, WorkerRequest, WorkerResponse};
 
     let directory = tempfile::tempdir()?;
@@ -896,12 +896,10 @@ fn a_stalled_lane_is_reported_while_its_worker_serves_on() -> anyhow::Result<()>
         // The report answers no request, so it carries no identity.
         let report = engine
             .response(0, Duration::from_secs(60))?
-            .context("the stalled lane was not reported")?;
+            .context("the stalled job was not reported")?;
         let WorkerResponse::Stalled { stall } = report else {
             anyhow::bail!("the rank answered with {report:?}");
         };
-        // A CPU rank has no lane: its builder thread performs every job.
-        anyhow::ensure!(stall.lane.is_none(), "{stall:?}");
         anyhow::ensure!(stall.batch_id == Some(1), "{stall:?}");
         anyhow::ensure!(stall.route.as_deref() == Some("prefill"), "{stall:?}");
         anyhow::ensure!(stall.method.is_some(), "{stall:?}");
@@ -924,17 +922,18 @@ fn a_stalled_lane_is_reported_while_its_worker_serves_on() -> anyhow::Result<()>
         );
         Ok(())
     })();
-    // The rank's lane never returns, so the process is killed.
+    // The rank's builder thread never returns from the job, so the process
+    // is killed.
     let _ = child.kill();
     let _ = child.wait();
     result
 }
 
-/// A group whose rank reports a stalled lane fails the batch's requests with
-/// an error naming the lane and the forward, before its own watchdog timeout,
-/// and is replaced by a group that serves.
+/// A group whose rank reports a stalled job fails the batch's requests with
+/// an error naming the stalled builder thread and the job's forward, before
+/// its own watchdog timeout, and is replaced by a group that serves.
 #[test]
-fn a_reported_stall_replaces_the_group_naming_the_lane() -> anyhow::Result<()> {
+fn a_reported_stall_replaces_the_group_naming_the_forward() -> anyhow::Result<()> {
     let mut args = single_worker_args("stalling", QUEUE_DEPTH);
     // The rank reports a job that has run for half of this, 4 seconds.
     args.watchdog_timeout = Duration::from_secs(8);
@@ -955,12 +954,12 @@ fn a_reported_stall_replaces_the_group_naming_the_lane() -> anyhow::Result<()> {
     group.submit_placed(stalling)?;
     let failure = group
         .poll_batch(Duration::from_secs(30))
-        .expect_err("a stalled lane must fail its group");
+        .expect_err("a stalled job must fail its group");
     let failure = failure
         .downcast_ref::<WorkerFailure>()
         .context("expected the group's replacement")?;
     // The rank's report failed the group, not the group's own deadline,
-    // whose failure names no lane.
+    // whose failure names neither the stalled thread nor the forward.
     for named in ["the builder thread stalled", "batch 1 (prefill", "31/"] {
         anyhow::ensure!(
             failure.message.contains(named),

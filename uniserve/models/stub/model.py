@@ -8,8 +8,8 @@ features are per-patch pixel means, the latent encoder's latents are the
 pixels themselves cast to BF16 and patchified, and the denoiser predicts zero.
 
 On a CPU rank, a forward that embeds ``STUB_STALL_TOKEN_ID`` never returns:
-it stands in for a device call that does not return, so a rank's lane
-stays inside one job until its process ends.
+it stands in for a device call that does not return, so a rank's builder
+thread stays inside one job until its process ends.
 """
 
 from __future__ import annotations

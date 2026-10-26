@@ -11,13 +11,13 @@
 //! CUDA profiler capture range. A failure to start is logged once and the
 //! window is never retried; profiling never fails a batch.
 //!
-//! The window opens before the forward of its first step and closes after
-//! the forward of its last, as jobs that batch's forward waits for like its
-//! own ([`Profiler::next`], [`Profiler::complete`]). The torch profiler's
-//! start, and its stop with the export, are calls submitted to the Python
-//! thread. The CUDA capture range starts and ends in a job of the batch's
-//! lane, whose execution thread makes the driver call. The control thread
-//! makes neither call itself while it serves.
+//! The window opens before the forward of its first step and closes after the
+//! forward of its last, as jobs that batch's forward waits for like its own
+//! ([`Profiler::next`], [`Profiler::complete`]). The torch profiler's start,
+//! and its stop with the export, are calls submitted to the Python thread. The
+//! CUDA capture range starts and ends in a job, which the builder thread
+//! performs by making the driver call. The control thread makes neither call
+//! itself while it serves.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ use cuda::DeviceId;
 
 use crate::ffi::{Argument, MethodCall};
 use crate::ffi::{Function, Handle};
-use crate::lane::{Completion, Job, JobId, JobQueues};
+use crate::job::{Completion, Job, JobId, JobQueue};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -93,7 +93,7 @@ impl ProfileConfig {
 enum Phase {
     /// Start the torch profiler: a call on the builder thread.
     Start,
-    /// Start the CUDA capture range: a driver call on the lane's thread.
+    /// Start the CUDA capture range: a driver call on the builder thread.
     StartRange,
     /// Stop a torch profiler whose capture range did not start.
     Discard,
@@ -123,7 +123,7 @@ pub(crate) struct Profiler {
     phases: VecDeque<Phase>,
     /// The phase whose job is in flight.
     submitted: Option<Phase>,
-    /// Where the lane's thread reports a capture range's driver call that
+    /// Where the builder thread reports a capture range's driver call that
     /// failed.
     failures: (Sender<Error>, Receiver<Error>),
 }
@@ -184,12 +184,12 @@ impl Profiler {
         self.phases.extend([Phase::StopRange, Phase::Export]);
     }
 
-    /// Submit the next job of the window's opening or closing: a job of
-    /// the lane, or calls for the builder thread. `None` when
-    /// nothing is left to submit, or while the last one is in flight. The
-    /// batch whose forward this is waits for the job as for its own and
-    /// hands its completion to [`Self::complete`].
-    pub(crate) fn next(&mut self, jobs: &JobQueues) -> Option<JobId> {
+    /// Submit the next job of the window's opening or closing: a driver call or
+    /// library calls for the builder thread. `None` when nothing is left to
+    /// submit, or while the last one is in flight. The batch whose forward this
+    /// is waits for the job as for its own and hands its completion to
+    /// [`Self::complete`].
+    pub(crate) fn next(&mut self, jobs: &JobQueue) -> Option<JobId> {
         if self.submitted.is_some() {
             return None;
         }
@@ -239,7 +239,7 @@ impl Profiler {
     }
 
     /// Submit `phase`'s job; `None` when the phase has nothing to do.
-    fn submit(&mut self, phase: Phase, jobs: &JobQueues) -> Result<Option<JobId>> {
+    fn submit(&mut self, phase: Phase, jobs: &JobQueue) -> Result<Option<JobId>> {
         let range = self.device.filter(|_| self.config.cuda_profiler);
         match phase {
             Phase::Start => {
@@ -251,7 +251,7 @@ impl Profiler {
                 })?;
                 let calls = Job::new();
                 calls.call_handle(self.start_call());
-                Ok(Some(jobs.call(calls, true)))
+                Ok(Some(jobs.start(calls, true)))
             }
             Phase::StartRange => match range {
                 Some(device) => self.range(jobs, move || cuda::profiler_start(device)),
@@ -264,22 +264,22 @@ impl Profiler {
             Phase::Discard => Ok(self.torch.take().map(|profile| {
                 let calls = Job::new();
                 calls.call(self.discard_call(profile));
-                jobs.call(calls, true)
+                jobs.start(calls, true)
             })),
             Phase::Export => Ok(self.torch.take().map(|profile| {
                 let calls = Job::new();
                 calls.call(self.export_call(profile));
-                jobs.call(calls, true)
+                jobs.start(calls, true)
             })),
         }
     }
 
-    /// A job of the lane that makes `call`, a driver call of
-    /// the capture range, on the lane's execution thread, behind the jobs
-    /// submitted before it. The driver call is not issued on a stream.
+    /// A job that makes `call`, a driver call of the capture range, on the
+    /// builder thread, behind the jobs submitted before it. The driver call is
+    /// not issued on a stream.
     fn range(
         &self,
-        jobs: &JobQueues,
+        jobs: &JobQueue,
         call: impl FnOnce() -> cuda::Result<()> + Send + 'static,
     ) -> Result<Option<JobId>> {
         let failures = self.failures.0.clone();
@@ -290,7 +290,7 @@ impl Profiler {
                 let _ = failures.send(error.into());
             }
         }))?;
-        jobs.start(job, true).map(Some)
+        Ok(Some(jobs.start(job, true)))
     }
 
     /// Note that `phase` failed. A window that did not open is given up,
@@ -417,9 +417,9 @@ mod tests {
 
     use super::*;
 
-    /// Take the completion of `job`, which a rank without lanes and
-    /// without a started interpreter performed where it was submitted.
-    fn completed(jobs: &JobQueues, job: JobId) -> Completion {
+    /// Take the completion of `job`, which a rank without a started interpreter
+    /// performed where it was submitted.
+    fn completed(jobs: &JobQueue, job: JobId) -> Completion {
         let (id, completion) = jobs.take().unwrap();
         assert_eq!(id, job);
         completion
@@ -463,7 +463,7 @@ mod tests {
             Function::new("test.stop", stop),
             None,
         );
-        let jobs = JobQueues::default();
+        let jobs = JobQueue::default();
 
         // The first step lies before the window: its forward waits for
         // nothing.

@@ -1,21 +1,20 @@
-//! Startup of the rank's executor and its lanes: the executor's settings
+//! Startup of the rank's executor and its computations: the executor's settings
 //! and construction once the model is loaded, what its manifest states, the
-//! storage the worker binds its lanes to, and their warmup.
+//! storage the worker binds its computations to, and their warmup.
 //!
-//! One executor serves a rank ([`construct`]). Its settings carry a section
-//! per role the rank serves: `video` for a video model, `image` for an
-//! image model's lanes (`crate::worker::image`), `pages` for the
-//! lanes over the prefix cache (the batch bounds and graph buckets, the
-//! cache groups at the resolved block size, the block diffusion a
-//! generating rank serves) and `experts` for its member of an expert union.
-//! Its manifest ([`Manifest`]) states each lane (its component and call
-//! kinds, whether it prepares and commits, the resources it uses and its
-//! output words) and what capacity planning reads: the device bytes the
-//! lanes over the prefix cache allocate beside its pool, and a video
-//! model's per-request quantities. [`bind`] allocates what the plan grants
-//! and binds every lane to it; [`warm`] runs the warmup the executor lays
-//! out in phases, around the prefix cache's scratch tables the worker
-//! owns.
+//! One executor serves a rank ([`construct`]). Its settings carry a section per
+//! role the rank serves: `video` for a video model, `image` for an image
+//! model's computations (`crate::worker::image`), `pages` for the computations
+//! over the prefix cache (the batch bounds and graph buckets, the cache groups
+//! at the resolved block size, the block diffusion a generating rank serves)
+//! and `experts` for its member of an expert union. Its manifest ([`Manifest`])
+//! states each computation (its component and call kinds, whether it prepares
+//! and commits, the resources it uses and its output words) and what capacity
+//! planning reads: the device bytes the computations over the prefix cache
+//! allocate beside its pool, and a video model's per-request quantities.
+//! [`bind`] allocates what the plan grants and binds every computation to it;
+//! [`warm`] runs the warmup the executor lays out in phases, around the prefix
+//! cache's scratch tables the worker owns.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,16 +30,16 @@ use crate::cuda_graph::{GraphStorage, reserve_pools};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::executor::columns::CALL_FIELD_NAMES;
+use crate::executor::computations::{Computation, Computations, RankResources, Resources};
 use crate::executor::experts::ExpertMember;
 use crate::executor::image_inputs::Images;
-use crate::executor::lanes::{ExecutorLane, ExecutorLanes, LaneResources, Resources};
 use crate::executor::latents::LatentLedger;
 use crate::executor::pages::{Pages, RelayStaging, warmup_pages};
 use crate::executor::python::PythonExecutor;
 use crate::executor::reports::Reports;
 use crate::ffi::Argument;
 use crate::ffi::{Handle, Interpreter};
-use crate::lane::{BLOCK_ON_TIMEOUT, Job, JobQueues};
+use crate::job::{BLOCK_ON_TIMEOUT, Job, JobQueue};
 use crate::memory::allocation::StorageView;
 use crate::memory::{CachePlan, LatentPlan, OutputPool, PrefixCache};
 use crate::parallel::world::CollectiveGroup;
@@ -49,9 +48,9 @@ use crate::stream::{CUDAStream, Streams};
 use crate::worker::image::{ImageInfo, ImageManifest};
 use crate::{Error, LatentPool, LatentStorage, Result};
 
-/// Graph storage keys of the lanes' streams: this plus the stream's index
-/// among them.
-const LANE_GRAPHS: usize = 1100;
+/// Graph storage keys of the computations' streams: this plus the stream's
+/// index among them.
+const COMPUTATION_GRAPHS: usize = 1100;
 
 /// The video denoiser component a deployment places: the unique declared
 /// video denoiser among `deployment` components (or the only one declared).
@@ -184,10 +183,10 @@ pub(crate) fn expert_settings(launch: &WorkerLaunch) -> Option<serde_json::Value
     }))
 }
 
-/// The components whose lanes run collectives on streams of their own,
+/// The components whose computations run collectives on streams of their own,
 /// with how many each runs on: a causal language model one per expert
-/// microbatch, a diffusion language model one. The same on every rank,
-/// which plans the stream groups of every component, held or not.
+/// microbatch, a diffusion language model one. The same on every rank, which
+/// plans the stream groups of every component, held or not.
 pub(crate) fn stream_copies(
     launch: &WorkerLaunch,
     declarations: &Declarations,
@@ -232,26 +231,26 @@ impl Sections {
     }
 }
 
-/// One lane as the manifest states it.
+/// One computation as the manifest states it.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct LaneManifest {
+pub(crate) struct ComputationManifest {
     pub(crate) component: String,
-    /// The call kinds the lane serves, by their protocol names.
+    /// The call kinds the computation serves, by their protocol names.
     pub(crate) kinds: Vec<String>,
     /// The executor prepares each batch (`prepare`).
     pub(crate) prepares: bool,
-    /// The executor advances the lane's slot state past each batch's
+    /// The executor advances the computation's slot state past each batch's
     /// commit point (`commit`).
     pub(crate) commits: bool,
-    /// The worker's resources the lane uses: `pages`, `latents`,
+    /// The worker's resources the computation uses: `pages`, `latents`,
     /// `reports`, `images`.
     #[serde(default)]
     pub(crate) resources: Vec<String>,
-    /// The expert microbatches the lane's forwards split into.
+    /// The expert microbatches the computation's forwards split into.
     #[serde(default = "one")]
     pub(crate) microbatches: usize,
-    /// Output words of the lane's largest batch; a call's completion word
-    /// each when absent.
+    /// Output words of the computation's largest batch; a call's completion
+    /// word each when absent.
     #[serde(default)]
     pub(crate) output_words: usize,
 }
@@ -260,21 +259,21 @@ fn one() -> usize {
     1
 }
 
-/// What the manifest states of the lanes over the prefix cache.
+/// What the manifest states of the computations over the prefix cache.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PageManifest {
     /// The call columns' field names in row order, which must be the
     /// worker's.
     pub(crate) call_fields: Vec<String>,
-    /// Device bytes the lanes allocate beside the cache pool whatever the
-    /// slot count, at the batch bounds.
+    /// Device bytes the computations allocate beside the cache pool whatever
+    /// the slot count, at the batch bounds.
     pub(crate) fixed_bytes: u64,
     /// Device bytes they allocate per request slot.
     pub(crate) slot_bytes: u64,
 }
 
 impl PageManifest {
-    /// Device bytes the lanes allocate beside the cache pool for
+    /// Device bytes the computations allocate beside the cache pool for
     /// `request_slots` slots.
     pub(crate) fn reserved_bytes(&self, request_slots: usize) -> u64 {
         self.fixed_bytes
@@ -286,7 +285,7 @@ impl PageManifest {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct Manifest {
     #[serde(default)]
-    pub(crate) lanes: Vec<LaneManifest>,
+    pub(crate) computations: Vec<ComputationManifest>,
     pub(crate) pages: Option<PageManifest>,
     pub(crate) video: Option<VideoManifest>,
     #[serde(default)]
@@ -377,7 +376,7 @@ fn resources(names: &[String]) -> Result<Resources> {
             "images" => resources.images = true,
             other => {
                 return Err(Error::Interface(format!(
-                    "the executor names the unknown lane resource {other:?}"
+                    "the executor names the unknown computation resource {other:?}"
                 )));
             }
         }
@@ -386,7 +385,7 @@ fn resources(names: &[String]) -> Result<Resources> {
 }
 
 /// What [`bind`] binds the executor with.
-pub(crate) struct LaneStart<'a> {
+pub(crate) struct Binding<'a> {
     pub(crate) executor: &'a Arc<PythonExecutor>,
     /// The loaded model, whose image policy prepares inline images.
     pub(crate) loaded: &'a Handle,
@@ -402,8 +401,7 @@ pub(crate) struct LaneStart<'a> {
     pub(crate) video: Option<&'a VideoCapacity>,
     /// An image model's latent pool, which sizes its ledger.
     pub(crate) latent: Option<LatentPlan>,
-    /// Host tasks the rank admits at once, which bound the image host
-    /// lane's.
+    /// Host tasks the rank admits at once, which bound the image host pool's.
     pub(crate) host_capacity: usize,
     pub(crate) scratches: &'a mut Scratches,
     pub(crate) graphs: &'a mut GraphStorage,
@@ -415,11 +413,11 @@ pub(crate) struct LaneStart<'a> {
     pub(crate) memory: &'a mut dyn crate::memory::ExclusiveMemory,
 }
 
-/// What binding leaves: the lanes, the most rows a token-denoising step
+/// What binding leaves: the computations, the most rows a token-denoising step
 /// holds, which the engine warms the serving path with, and what an image
-/// model's lanes report.
+/// model's computations report.
 pub(crate) struct Bound {
-    pub(crate) lanes: Option<ExecutorLanes>,
+    pub(crate) computations: Option<Computations>,
     pub(crate) step_rows: u32,
     pub(crate) image: Option<ImageInfo>,
 }
@@ -433,16 +431,16 @@ struct Bind {
     image: Option<ImageInfo>,
 }
 
-/// The streams the lanes compute on, in the order the executor binds them,
-/// and which of them the expert microbatches run on.
-struct LaneStreams {
+/// The streams the computations compute on, in the order the executor binds
+/// them, and which of them the expert microbatches run on.
+struct BoundStreams {
     streams: Vec<Stream>,
-    /// The microbatches' streams, by index: the lane stream, then its
-    /// forks.
+    /// The microbatches' streams, by index: the device's primary stream, then
+    /// its forks.
     microbatches: Vec<usize>,
 }
 
-impl LaneStreams {
+impl BoundStreams {
     /// The index of `stream`, added when new.
     fn index(&mut self, stream: &Stream) -> usize {
         match self
@@ -459,25 +457,24 @@ impl LaneStreams {
     }
 }
 
-/// Allocate what the plan grants the lanes and bind the executor to it:
-/// one stream per device lane (the device's lane stream for the lanes over
-/// the prefix cache, with the expert microbatches' forks, a fork of its own
-/// for any other), each with its scratch and, under graphs, a graph pool;
-/// the prefix cache's unit pool and block tables with each such lane's
-/// relay staging; a latent ledger's banks; the pipe host tasks report
-/// through; the image host lane; the stream groups and the weight prefetch
-/// object. A rank whose executor has no lane but an expert union binds the
-/// union's streams. Under graphs a rank whose modules also run on other
-/// devices (a generation tower) binds one more pool per stream on each of
-/// them (`peers`), stream by stream after the streams' own.
+/// Allocate what the plan grants the computations and bind the executor to it:
+/// one stream per device computation (the device's primary stream for the
+/// computations over the prefix cache, with the expert microbatches' forks, a
+/// fork of its own for any other), each with its scratch and, under graphs, a
+/// graph pool; the prefix cache's unit pool and block tables with each such
+/// computation's relay staging; a latent ledger's banks; the pipe host tasks
+/// report through; the image host pool; the stream groups and the weight
+/// prefetch object. A rank whose executor has no computation but an expert
+/// union binds the union's streams. Under graphs a rank whose modules also run
+/// on other devices (a generation tower) binds one more pool per stream on each
+/// of them (`peers`), stream by stream after the streams' own.
 ///
 /// The values `bind` receives follow its JSON in this order: each stream's
-/// scratch, the host scratch when a lane computes on the host, the graph
-/// pools, the prefix cache's unit pool and tables, the
-/// relay staging, the latent banks, the stream groups' handles and the
-/// prefetch object.
-pub(crate) fn bind(start: LaneStart<'_>) -> Result<Bound> {
-    let LaneStart {
+/// scratch, the host scratch when a computation computes on the host, the graph
+/// pools, the prefix cache's unit pool and tables, the relay staging, the
+/// latent banks, the stream groups' handles and the prefetch object.
+pub(crate) fn bind(start: Binding<'_>) -> Result<Bound> {
+    let Binding {
         executor,
         loaded,
         manifest,
@@ -497,30 +494,30 @@ pub(crate) fn bind(start: LaneStart<'_>) -> Result<Bound> {
         prefetch,
         memory,
     } = start;
-    if manifest.lanes.is_empty() && experts.is_none() {
+    if manifest.computations.is_empty() && experts.is_none() {
         return Ok(Bound {
-            lanes: None,
+            computations: None,
             step_rows: 0,
             image: None,
         });
     }
     let device = config.device.cuda();
     let max_calls = config.max_batch_calls.max(1);
-    let mut known = LaneStreams {
+    let mut known = BoundStreams {
         streams: Vec::new(),
         microbatches: Vec::new(),
     };
-    // The expert microbatches' streams come first: the lane stream, then
-    // its forks.
+    // The expert microbatches' streams come first: the device's primary stream,
+    // then its forks.
     for stream in experts.map(ExpertMember::streams).unwrap_or_default() {
         let index = known.index(stream);
         known.microbatches.push(index);
     }
 
-    let mut lanes = Vec::with_capacity(manifest.lanes.len());
-    let mut lanes_json = Vec::with_capacity(manifest.lanes.len());
-    for stated in &manifest.lanes {
-        let (lane, json) = lane(
+    let mut computations = Vec::with_capacity(manifest.computations.len());
+    let mut computations_json = Vec::with_capacity(manifest.computations.len());
+    for stated in &manifest.computations {
+        let (computation, json) = bind_computation(
             stated,
             components,
             streams,
@@ -529,16 +526,19 @@ pub(crate) fn bind(start: LaneStart<'_>) -> Result<Bound> {
             max_calls,
             queue_depth,
         )?;
-        lanes.push(lane);
-        lanes_json.push(json);
+        computations.push(computation);
+        computations_json.push(json);
     }
 
     let mut values: Vec<Argument> = Vec::new();
     for stream in &known.streams {
         values.push(Argument::Handle(scratches.get(stream.raw(), device)?));
     }
-    // Lanes on the host have no stream; they share the rank's host scratch.
-    let host_scratch = lanes.iter().any(|lane| lane.device.is_none());
+    // Computations on the host have no stream; they share the rank's host
+    // scratch.
+    let host_scratch = computations
+        .iter()
+        .any(|computation| computation.device.is_none());
     if host_scratch {
         values.push(Argument::Handle(scratches.get(0, None)?));
     }
@@ -554,38 +554,46 @@ pub(crate) fn bind(start: LaneStart<'_>) -> Result<Bound> {
         values.extend(graph_pools(graphs, known.streams.len(), cuda, &peers)?);
     }
 
-    // The prefix cache's unit pool and block tables, which the lanes over
-    // it read, then their relay staging.
-    let (pages_json, pages) = match lanes.iter().find(|lane| lane.resources.pages) {
-        Some(lane) => {
+    // The prefix cache's unit pool and block tables, which the computations
+    // over it read, then their relay staging.
+    let (pages_json, pages) = match computations
+        .iter()
+        .find(|computation| computation.resources.pages)
+    {
+        Some(computation) => {
             let prefix_cache = prefix_cache.ok_or_else(|| {
-                Error::Invalid("lanes over the prefix cache require a prefix cache".into())
+                Error::Invalid("computations over the prefix cache require a prefix cache".into())
             })?;
-            let (json, pages) = bind_pages(prefix_cache, lane, config, &mut values)?;
+            let (json, pages) = bind_pages(prefix_cache, computation, config, &mut values)?;
             (json, Some(pages))
         }
         None => (serde_json::Value::Null, None),
     };
-    for staging in lanes.iter().filter_map(|lane| lane.staging.as_ref()) {
+    for staging in computations
+        .iter()
+        .filter_map(|computation| computation.staging.as_ref())
+    {
         values.extend(staging.views().into_iter().map(Argument::Tensor));
     }
 
-    let ledger = latent_ledger(&lanes, video, latent, request_slots, memory)?;
+    let ledger = latent_ledger(&computations, video, latent, request_slots, memory)?;
     if let Some(ledger) = &ledger {
         values.extend(ledger.banks()?.into_iter().map(Argument::Tensor));
     }
 
-    // The image host lane of a rank whose lanes read inline images or
+    // The image host pool of a rank whose computations read inline images or
     // encode decoded ones.
-    let images = lanes
+    let images = computations
         .iter()
-        .any(|lane| lane.resources.images)
+        .any(|computation| computation.resources.images)
         .then(|| Images::new(loaded, device, host_capacity))
         .transpose()?;
 
     // The pipe host tasks report through, and on a CUDA rank the stream
     // device products they wrote are fenced on.
-    let reporting = lanes.iter().any(|lane| lane.resources.reports);
+    let reporting = computations
+        .iter()
+        .any(|computation| computation.resources.reports);
     let reports = reporting.then(Reports::new).transpose()?;
     let host_stream = match device {
         Some(cuda) if reporting => Some(Arc::new(CUDAStream::create(cuda)?)),
@@ -618,7 +626,7 @@ pub(crate) fn bind(start: LaneStart<'_>) -> Result<Bound> {
         "host_scratch": host_scratch,
         "pools": capture,
         "peers": if capture { peers.iter().map(|device| device.0).collect() } else { Vec::new() },
-        "lanes": lanes_json,
+        "computations": computations_json,
         "experts": known.microbatches,
         "pages": pages_json,
         "latents": ledger.is_some(),
@@ -628,12 +636,12 @@ pub(crate) fn bind(start: LaneStart<'_>) -> Result<Bound> {
     });
     let bound = executor.bind(memory_json.to_string(), values)?;
     let bound: Bind = serde_json::from_str(&bound)
-        .map_err(|error| Error::Interface(format!("the executor's bound lanes: {error}")))?;
-    let lanes = (!lanes.is_empty()).then(|| {
-        ExecutorLanes::new(
+        .map_err(|error| Error::Interface(format!("the executor's bound computations: {error}")))?;
+    let computations = (!computations.is_empty()).then(|| {
+        Computations::new(
             Arc::clone(executor),
-            lanes,
-            LaneResources {
+            computations,
+            RankResources {
                 pages,
                 ledger,
                 reports,
@@ -643,31 +651,31 @@ pub(crate) fn bind(start: LaneStart<'_>) -> Result<Bound> {
         )
     });
     Ok(Bound {
-        lanes,
+        computations,
         step_rows: bound.diffusion_lm_step_rows,
         image: bound.image,
     })
 }
 
-/// The lane the manifest states as `stated`, and its entry of `bind`'s
-/// JSON. A device lane over the prefix cache computes on the device's lane
-/// stream, or on the first `microbatches` of the expert microbatches'
-/// streams, with relay staging for `max_calls` calls; any other device lane
-/// on a fork of its own. Its output storage holds its largest batch for
-/// each of `queue_depth` batches in flight, and one more for a batch whose
+/// The computation the manifest states as `stated`, and its entry of `bind`'s
+/// JSON. A device computation over the prefix cache computes on the device's
+/// primary stream, or on the first `microbatches` of the expert microbatches'
+/// streams, with relay staging for `max_calls` calls; any other device
+/// computation on a fork of its own. Its output storage holds its largest batch
+/// for each of `queue_depth` batches in flight, and one more for a batch whose
 /// result was reported before its lease retired.
-fn lane(
-    stated: &LaneManifest,
+fn bind_computation(
+    stated: &ComputationManifest,
     components: &Components,
     streams: &mut Streams,
-    known: &mut LaneStreams,
+    known: &mut BoundStreams,
     device: Option<DeviceId>,
     max_calls: usize,
     queue_depth: usize,
-) -> Result<(ExecutorLane, serde_json::Value)> {
+) -> Result<(Computation, serde_json::Value)> {
     let placed = components.get(&stated.component).ok_or_else(|| {
         Error::Interface(format!(
-            "the executor states a lane of {:?}, which the rank does not hold",
+            "the executor states a computation of {:?}, which the rank does not hold",
             stated.component
         ))
     })?;
@@ -686,15 +694,15 @@ fn lane(
     let resources = resources(&stated.resources)?;
     if !stated.prepares && !resources.pages {
         return Err(Error::Interface(format!(
-            "a lane of {:?} that does not prepare computes over the prefix cache",
+            "a computation of {:?} that does not prepare computes over the prefix cache",
             stated.component
         )));
     }
-    let (lane_device, indices) = match device {
+    let (computation_device, indices) = match device {
         Some(cuda) if !placed.host() => {
             let indices = if resources.pages {
-                let lane_stream = lane_stream(streams, cuda)?;
-                let first = known.index(&lane_stream);
+                let primary = primary_stream(streams, cuda)?;
+                let first = known.index(&primary);
                 match stated.microbatches {
                     1 => vec![first],
                     count if count <= known.microbatches.len() => {
@@ -702,7 +710,7 @@ fn lane(
                     }
                     count => {
                         return Err(Error::Interface(format!(
-                            "a lane of {:?} runs {count} microbatches on {} streams",
+                            "a computation of {:?} runs {count} microbatches on {} streams",
                             stated.component,
                             known.microbatches.len()
                         )));
@@ -718,7 +726,7 @@ fn lane(
     };
     let staging = resources
         .pages
-        .then(|| RelayStaging::allocate(lane_device, max_calls))
+        .then(|| RelayStaging::allocate(computation_device, max_calls))
         .transpose()?;
     let json = serde_json::json!({
         "component": stated.component,
@@ -726,27 +734,27 @@ fn lane(
         "streams": indices,
         "resources": stated.resources,
     });
-    let lane = ExecutorLane {
+    let computation = Computation {
         component: stated.component.clone(),
         kinds,
         prepares: stated.prepares,
         commits: stated.commits,
         resources,
-        device: lane_device,
+        device: computation_device,
         stream: indices.first().map(|&index| known.streams[index].clone()),
         outputs: OutputPool::new(
-            lane_device,
+            computation_device,
             queue_depth.max(1) + 1,
             stated.output_words.max(max_calls),
         )?,
         staging,
     };
-    Ok((lane, json))
+    Ok((computation, json))
 }
 
-/// One graph pool per lane stream, of `streams`, on `device`, then, stream
-/// by stream, one on each of `peers`, each registered with `graphs` under
-/// the stream's key.
+/// One graph pool per computation stream, of `streams`, on `device`, then,
+/// stream by stream, one on each of `peers`, each registered with `graphs`
+/// under the stream's key.
 fn graph_pools(
     graphs: &mut GraphStorage,
     streams: usize,
@@ -761,7 +769,7 @@ fn graph_pools(
     let mut peer_pools = Vec::new();
     for index in 0..streams {
         let mut pools =
-            reserve_pools(graphs, &create, LANE_GRAPHS + index, &devices, None)?.into_iter();
+            reserve_pools(graphs, &create, COMPUTATION_GRAPHS + index, &devices, None)?.into_iter();
         let pool = pools
             .next()
             .ok_or_else(|| Error::Invariant("a graph pool was not reserved".into()))?;
@@ -772,12 +780,12 @@ fn graph_pools(
     Ok(own)
 }
 
-/// Bind the prefix cache to the lanes over it, whose first is `lane`: push
-/// its unit pool and block tables to `values` and return their entry of
-/// `bind`'s JSON and what the lanes share.
+/// Bind the prefix cache to the computations over it, whose first is
+/// `computation`: push its unit pool and block tables to `values` and return
+/// their entry of `bind`'s JSON and what the computations share.
 fn bind_pages(
     prefix_cache: &PrefixCache,
-    lane: &ExecutorLane,
+    computation: &Computation,
     config: &WorkerConfig,
     values: &mut Vec<Argument>,
 ) -> Result<(serde_json::Value, Pages)> {
@@ -792,26 +800,29 @@ fn bind_pages(
         "tables": tables,
     });
     let pages = Pages::new(
-        lane.device,
-        lane.stream.clone(),
-        prefix_cache.bind_units(lane.stream.as_ref())?,
+        computation.device,
+        computation.stream.clone(),
+        prefix_cache.bind_units(computation.stream.as_ref())?,
         config.canvas_sampling,
     );
     Ok((json, pages))
 }
 
-/// The latent ledger of the lane that steps latent trajectories, its banks
-/// allocated on that lane's stream: a video model's slot pages
+/// The latent ledger of the computation that steps latent trajectories, its
+/// banks allocated on that computation's stream: a video model's slot pages
 /// (`video`), or an image model's pool whose pages the scheduler assigns
-/// (`latent`). `None` without such a lane.
+/// (`latent`). `None` without such a computation.
 fn latent_ledger(
-    lanes: &[ExecutorLane],
+    computations: &[Computation],
     video: Option<&VideoCapacity>,
     latent: Option<LatentPlan>,
     request_slots: usize,
     memory: &mut dyn crate::memory::ExclusiveMemory,
 ) -> Result<Option<LatentLedger>> {
-    let Some(lane) = lanes.iter().find(|lane| lane.resources.latents) else {
+    let Some(computation) = computations
+        .iter()
+        .find(|computation| computation.resources.latents)
+    else {
         return Ok(None);
     };
     // A video slot owns a fixed run of pages; an image trajectory the pages
@@ -830,13 +841,13 @@ fn latent_ledger(
             ));
         }
     };
-    // The banks live on the lane's device, or in host memory on a rank
+    // The banks live on the computation's device, or in host memory on a rank
     // without one.
     let storage = LatentStorage::allocate(
         &plan,
-        lane.device,
-        lane.stream.as_ref(),
-        "lanes.latent_banks",
+        computation.device,
+        computation.stream.as_ref(),
+        "computations.latent_banks",
         memory,
     )?;
     let pool = LatentPool::new(plan.request_pool_size, plan.num_pages, plan.page_units)?;
@@ -846,11 +857,11 @@ fn latent_ledger(
     }))
 }
 
-/// The device's lane stream.
-fn lane_stream(streams: &Streams, device: DeviceId) -> Result<Stream> {
+/// The device's primary stream.
+fn primary_stream(streams: &Streams, device: DeviceId) -> Result<Stream> {
     Ok(streams
         .stream_for(device)
-        .ok_or(Error::State("the lanes have no execution stream"))?
+        .ok_or(Error::State("the device has no primary stream"))?
         .stream()?
         .clone())
 }
@@ -858,30 +869,31 @@ fn lane_stream(streams: &Streams, device: DeviceId) -> Result<Stream> {
 /// One warmup phase as the executor lays it out (`warmup_phases`).
 #[derive(Debug, Deserialize)]
 struct Phase {
-    lane: usize,
+    computation: usize,
     /// The scratch tables' lengths, of slots `1..`; none for a phase that
     /// reads no prefix cache.
     lengths: Option<Vec<usize>>,
     /// Each step's attention rows, `[slot, prefix, query]`.
     #[serde(default)]
     steps: Vec<Vec<[u32; 3]>>,
-    /// Whether the steps' rows write the cache; by default those of a lane
-    /// whose batches write it do.
+    /// Whether the steps' rows write the cache; by default those of a
+    /// computation whose batches write it do.
     #[serde(default)]
     writes: Option<bool>,
 }
 
-/// The warmup of the executor's lanes and expert union: the phases the
-/// executor lays out, each a job of the lane, on scratch tables the worker
-/// installs and releases around it when it reads the prefix cache; then its
-/// end (the captures that follow every phase and the end of the union's
-/// announced steps). Run again by a promoted standby whose expert
-/// workspaces were rebuilt. The serving path itself is warmed by the
-/// engine once the rank reported, with real requests of the shapes the
-/// rank states (`WorkerInfo::image_warmups`, `diffusion_lm_step_rows`).
+/// The warmup of the executor's computations and expert union: the phases the
+/// executor lays out, each a job, on scratch tables the worker installs and
+/// releases around it when it reads the prefix cache; then its end (the
+/// captures that follow every phase and the end of the union's announced
+/// steps). Run again by a promoted standby whose expert workspaces were
+/// rebuilt. The serving path itself is warmed by the engine once the rank
+/// reported, with real requests of the shapes the rank states
+/// (`WorkerInfo::image_warmups`, `diffusion_lm_step_rows`).
 pub(crate) fn warm(backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
-    run_phases(backend)
-        .map_err(|error| WorkerError::classify(error, Some("lane warmup")).with_phase("warmup"))
+    run_phases(backend).map_err(|error| {
+        WorkerError::classify(error, Some("computation warmup")).with_phase("warmup")
+    })
 }
 
 /// Run every warmup phase, then the warmup's end.
@@ -889,17 +901,17 @@ fn run_phases(backend: &mut WorkerBackend) -> Result<()> {
     let executor = Arc::clone(
         backend
             .executor()
-            .ok_or(Error::State("lane warmup has no executor"))?,
+            .ok_or(Error::State("computation warmup has no executor"))?,
     );
-    let jobs = backend.job_queues().clone();
+    let jobs = backend.job_queue().clone();
     let phases: Vec<Phase> = serde_json::from_str(&executor.warmup_phases()?)
         .map_err(|error| Error::Interface(format!("the executor's warmup phases: {error}")))?;
-    let stream = backend.lanes().and_then(ExecutorLanes::pages_stream);
+    let stream = backend.computations().and_then(Computations::pages_stream);
     for (index, phase) in phases.into_iter().enumerate() {
         let writes = phase.writes.unwrap_or_else(|| {
             backend
-                .lanes()
-                .is_some_and(|lanes| lanes.writes_pages(phase.lane))
+                .computations()
+                .is_some_and(|computations| computations.writes_pages(phase.computation))
         });
         let Some(lengths) = phase.lengths else {
             if !phase.steps.is_empty() {
@@ -917,9 +929,9 @@ fn run_phases(backend: &mut WorkerBackend) -> Result<()> {
                 "a warmup phase over scratch tables requires a prefix cache",
             ))?;
 
-        // One job of the lane installs the scratch tables, one runs the
-        // phase with each step's page columns, and one clears them and
-        // resets the scratch units, whether or not the phase succeeded.
+        // One job installs the scratch tables, one runs the phase with each
+        // step's page columns, and one clears them and resets the scratch
+        // units, whether or not the phase succeeded.
         let before = Job::new();
         let scratch = prefix_cache.install_scratch(&lengths, before.on(stream.as_ref()))?;
         perform(&jobs, before)?;
@@ -943,8 +955,8 @@ fn phase_job(executor: &PythonExecutor, index: usize, pages: Vec<StorageView>) -
     job
 }
 
-/// Perform `job` on the lane and wait for it.
-fn perform(jobs: &JobQueues, job: Job) -> Result<()> {
+/// Perform `job` on the builder thread and wait for it.
+fn perform(jobs: &JobQueue, job: Job) -> Result<()> {
     jobs.block_on(job, BLOCK_ON_TIMEOUT)?
         .check()
         .map(drop)

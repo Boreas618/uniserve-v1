@@ -1,10 +1,10 @@
-"""What a diffusion LM lane sizes its columns, banks and graphs from.
+"""What a diffusion LM computation sizes its columns, banks and graphs from.
 
 :class:`Facts` are the model's: its block length, vocabulary, widths and
 dtypes, pipeline stage, whether the rank denoises blocks and whether
 ``finish`` exchanges tokens with expert peers. :class:`Bounds` derives every
-bound of the lane from the worker's batch limits, the request slots, the
-prefix cache's groups and pool, the facts and the served block sampling
+bound of the computation from the worker's batch limits, the request slots,
+the prefix cache's groups and pool, the facts and the served block sampling
 (:class:`ServedSampling`): once for capacity planning, before the pool is
 fitted, and again at bind over the fitted pool, so that both agree.
 """
@@ -68,7 +68,7 @@ class Facts:
         """Read the facts of a placed diffusion LM.
 
         Args:
-            model: The diffusion LM of the lane's component.
+            model: The diffusion LM of the computation's component.
             exchange: Routed experts communicate through an expert exchange
                 (the deployment's exchange is set and is not DWDP).
             attention_ranks: The attention ranks of a disaggregated expert
@@ -153,7 +153,7 @@ class Denoising(NamedTuple):
 
 @dataclass(frozen=True, slots=True)
 class Bounds:
-    """Every bound of a diffusion LM lane.
+    """Every bound of a diffusion LM computation.
 
     Attributes:
         sequence_length: Tokens of one block.
@@ -199,7 +199,7 @@ class Bounds:
         graph_policy: str,
         sampling: ServedSampling | None,
     ) -> Bounds:
-        """Derive the bounds of a lane.
+        """Derive the bounds of a computation.
 
         Args:
             max_batch_calls: The calls of one batch.
@@ -212,7 +212,7 @@ class Bounds:
                 fitted; ``None`` before fitting, when the pool bounds
                 nothing.
             facts: The model's facts.
-            cuda: The lane runs on a CUDA device.
+            cuda: The computation runs on a CUDA device.
             graph_policy: The worker's graph policy; ``"off"`` captures
                 none.
             sampling: The served block sampling; ``None`` when the
@@ -285,9 +285,9 @@ class Bounds:
         )
 
     def shapes(self) -> Shapes:
-        """Return the lane's graph buckets.
+        """Return the computation's graph buckets.
 
-        A generating lane never steps more blocks than its slots.
+        A generating computation never steps more blocks than its slots.
         """
         return Shapes(
             self.sequence_length,

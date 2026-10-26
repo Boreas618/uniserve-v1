@@ -34,9 +34,11 @@ follow the pinned Transformers ``DiffusionGemmaGenerationMixin``:
 - ``entropy``: entropy of ``softmax(q)`` per position; ``argmax``: first
   maximum of ``q``; ``sample``: Gumbel-max draw from ``softmax(q)`` with the
   SAMPLE stream's per-token uniforms (``uniserve.diffusion.tokens``
-  randomness contract, token ``v`` using lane ``v % 4`` of word ``v // 4``);
+  randomness contract, token ``v`` using output word ``v % 4`` of counter
+  word ``v // 4``);
 - the new canvas takes ``sample`` at the positions ``accept_by_entropy``
-  accepts and a RENOISE-stream token elsewhere (lane 0 of word 0);
+  accepts and a RENOISE-stream token elsewhere (output word 0 of counter
+  word 0);
 - the row stops when its argmax canvas equals the previous ``stability``
   ones (always true for ``stability = 0``) and its mean entropy is below
   ``confidence`` (never true for ``confidence = 0``: entropies are
@@ -45,8 +47,8 @@ follow the pinned Transformers ``DiffusionGemmaGenerationMixin``:
 - ``tokens`` is the argmax canvas truncated after the first end-of-sequence
   id; the self-conditioning embedding for the next pass is
   ``softmax(bf16(q)) @ E * bf16(scale)``;
-- a block's initial canvas uses the INITIAL stream at step 0 (lane 0 of
-  word 0).
+- a block's initial canvas uses the INITIAL stream at step 0 (output word 0
+  of counter word 0).
 
 The CPU path composes the portable primitives of
 ``uniserve.diffusion.tokens`` and matches the reference's arithmetic.

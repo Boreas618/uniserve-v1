@@ -43,7 +43,8 @@ pub struct Storage {
 enum Kind {
     Device(DeviceAllocation),
     Pinned(PinnedBuffer),
-    /// Pageable host memory for CPU lanes. Boxed so its address is stable.
+    /// Pageable host memory for computations on the host. Boxed so its address
+    /// is stable.
     Host(Box<[u8]>),
     /// Another process's (or peer device's) exported allocation mapped into
     /// this process; for memory the Storage Server retains, with the

@@ -623,17 +623,17 @@ pub(crate) mod tests {
         fn a_stream_counts_its_operations_once_and_its_idle_time_as_gap() -> Result<()> {
             let _serial = lock(&crate::cupti::tests::SERIAL);
             let device = DeviceId(0);
-            let lane = Stream::new(device)?;
+            let stream = Stream::new(device)?;
             let other = Stream::new(device)?;
             let memory = DeviceAllocation::linear(device, FILL_BYTES)?;
-            let graph = captured(&memory, &lane, 16)?;
+            let graph = captured(&memory, &stream, 16)?;
             let pause = Duration::from_millis(50);
-            let activity = StreamActivity::start([("lane", &lane)])?;
+            let activity = StreamActivity::start([("device", &stream)])?;
 
-            let first = fills(&memory, &lane, 16)?;
-            lane.synchronize()?;
-            // The lane stands idle for the pause while a stream that is not
-            // registered works.
+            let first = fills(&memory, &stream, 16)?;
+            stream.synchronize()?;
+            // The stream stands idle for the pause while another stream, one
+            // that is not registered, works.
             fill(&memory, &other, 16)?;
             std::thread::sleep(pause);
             other.synchronize()?;
@@ -644,28 +644,29 @@ pub(crate) mod tests {
                 ..EventFlags::default()
             };
             let launched = [Event::new(flags), Event::new(flags)];
-            launched[0].record(&lane)?;
-            graph.launch(&lane)?;
-            launched[1].record(&lane)?;
-            lane.synchronize()?;
+            launched[0].record(&stream)?;
+            graph.launch(&stream)?;
+            launched[1].record(&stream)?;
+            stream.synchronize()?;
 
             let spanned = elapsed_us(&first)? + elapsed_us(&launched)?;
-            let lane_time = super::taken_until("lane", |taken| taken.busy_us >= spanned * 9 / 10);
+            let stream_time =
+                super::taken_until("device", |taken| taken.busy_us >= spanned * 9 / 10);
             let pause_us = pause.as_micros() as u64;
             // The events span the operations and the host's launch latency
             // before the first of each; the gap adds the host's return from
             // the synchronizations around the pause.
             assert!(
-                (spanned * 9 / 10..=spanned + 50).contains(&lane_time.busy_us),
+                (spanned * 9 / 10..=spanned + 50).contains(&stream_time.busy_us),
                 "busy {} us, events {spanned} us",
-                lane_time.busy_us
+                stream_time.busy_us
             );
             assert!(
-                (pause_us..pause_us + 20_000).contains(&lane_time.gap_us),
+                (pause_us..pause_us + 20_000).contains(&stream_time.gap_us),
                 "gap {} us",
-                lane_time.gap_us
+                stream_time.gap_us
             );
-            assert_eq!((lane_time.late_us, take().dropped_records), (0, 0));
+            assert_eq!((stream_time.late_us, take().dropped_records), (0, 0));
             drop(activity);
             Ok(())
         }

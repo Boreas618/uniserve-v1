@@ -562,9 +562,9 @@ pub struct WorkerInfo {
     pub encoder_entry_bytes: u64,
     /// Maximum unresolved calls per request.
     pub max_unresolved_calls: u32,
-    /// Concurrent host-lane tasks this rank's bounded host executor admits.
-    /// The scheduler treats zero as one.
-    pub host_lane_capacity: u32,
+    /// Concurrent tasks this rank's bounded host task pool admits. The
+    /// scheduler treats zero as one.
+    pub host_task_capacity: u32,
     /// Transfer entries this rank's transport holds in flight at once. The
     /// scheduler keeps no more transfer calls reserved than the narrowest
     /// rank holds.
@@ -745,7 +745,7 @@ impl Default for WorkerInfo {
             encoder_cache_entries: 0,
             encoder_entry_bytes: 0,
             max_unresolved_calls: 1,
-            host_lane_capacity: 1,
+            host_task_capacity: 1,
             transfer_tickets: 1,
         }
     }

@@ -6,43 +6,40 @@
 //! ([`Executor::complete`]) and delivers one result per batch
 //! ([`Executor::poll`]).
 //!
-//! A batch's forward is a sequence of jobs on its lane. The executor
+//! A batch's forward is a sequence of jobs, which the rank's builder thread
+//! performs in the order they were submitted (`crate::job`). The executor
 //! submits one and returns; the job's completion, which arrives through the
 //! caller's wake, is applied and the next job submitted from there. The
-//! executor waits for no job: a lane that stopped making progress holds up
-//! the forwards behind its job, while the executor goes on admitting
-//! batches, revoking freed products, delivering the results of forwards
-//! that completed and returning to its caller, which reports such a lane
-//! with the batch its job belongs to ([`Executor::batch_of`]). Two rules
-//! order forwards so that what a job needs has happened when the job is
-//! prepared:
+//! executor waits for no job: a job that stopped making progress holds up every
+//! job behind it, while the executor goes on admitting batches, revoking freed
+//! products, delivering the results of forwards that completed and returning to
+//! its caller, which reports such a job with the batch it belongs to
+//! ([`Executor::batch_of`]). Two rules order forwards so that what a job needs
+//! has happened when the job is prepared:
 //!
 //! - a batch that follows another on a request, or reads what another
 //!   produces, starts once that batch's forward has completed: its host
 //!   state (visible products, pending calls) is committed by the completion
 //!   of its last job;
-//! - a batch starts only when no other batch's forward is in flight. A job
-//!   that waits on an event recorded by another lane's job orders behind
-//!   the record only if the record is already made, and what a batch
-//!   records is prepared against host state that the jobs of a forward
-//!   still in flight may read. Forwards therefore follow one another, as
-//!   they did when the executor waited for each.
+//! - a batch starts only when no other batch's forward is in flight: what a
+//!   batch records is prepared against host state that the jobs of a forward
+//!   still in flight may read. Forwards therefore follow one another, as they
+//!   did when the executor waited for each.
 //!
-//! A forward is complete when its lane has performed its jobs, which is
-//! when the stream holds its work, not when the device finished it: the
-//! next forward is queued on the stream behind work still running, and a
-//! batch's outputs are read later, from the completion of a job of their
-//! own. A batch a rule keeps from starting is started when the forward it
-//! waits for completed.
+//! A forward is complete when the builder thread has performed its jobs, which
+//! is when the stream holds its work, not when the device finished it: the next
+//! forward is queued on the stream behind work still running, and a batch's
+//! outputs are read later, from the completion of a job of their own. A batch a
+//! rule keeps from starting is started when the forward it waits for completed.
 
 pub(crate) mod backend;
 pub(crate) mod batch;
 pub(crate) mod columns;
+pub(crate) mod computations;
 pub(crate) mod experts;
 pub(crate) mod image;
 pub(crate) mod image_inputs;
 pub(crate) mod inputs;
-pub(crate) mod lanes;
 pub(crate) mod latents;
 pub(crate) mod lifecycle;
 pub(crate) mod pages;
@@ -67,7 +64,7 @@ use ipc::Wake;
 use self::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
 use crate::error::WorkerError;
-use crate::lane::{Completion, JobId};
+use crate::job::{Completion, JobId};
 use crate::profiling::range;
 
 /// A submitted batch and the resources used by its numerical backend.
@@ -89,7 +86,7 @@ pub(crate) struct Batch {
     /// Its forward completed: every job ran and its host state is
     /// committed.
     launched: bool,
-    /// The job that admits its inputs on its lane, while it is in flight.
+    /// The job that admits its inputs, while it is in flight.
     inputs: Option<JobId>,
     /// The job whose completion says its outputs can be read.
     outputs: Option<JobId>,
@@ -176,8 +173,8 @@ impl Batch {
             let submission = self.submission.as_ref().expect("submitted batch");
             {
                 let _range = range(c"uniserve.worker.inputs", Some(self.id));
-                // What admitting the inputs issues on the lane is a job:
-                // the batch goes on from its completion.
+                // What admitting the inputs issues is a job: the batch goes on
+                // from its completion.
                 if self.inputs.is_some() {
                     return Ok(());
                 }
@@ -502,8 +499,8 @@ impl Executor {
             advanced |= batch.advance_completion(&mut self.backend);
         }
 
-        // What kept a batch from starting may be gone: the forward it
-        // follows, or a forward on another lane, completed.
+        // What kept a batch from starting may be gone: the forward it follows,
+        // or the forward in flight, completed.
         let startable: Vec<_> = self
             .batches
             .values()
@@ -535,8 +532,8 @@ impl Executor {
             return;
         }
 
-        // Its inputs are admitted on the lane: the batch starts again from
-        // where it submitted the job.
+        // Its inputs are admitted: the batch starts again from where it
+        // submitted the job.
         let id = batch.id;
         batch.inputs = None;
         if batch.complete {

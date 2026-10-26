@@ -187,12 +187,12 @@ impl World {
         Ok(())
     }
 
-    /// Create the stream groups of every component that runs collectives
-    /// on `copies` streams of its own (its token lane, each expert
+    /// Create the stream groups of every component that runs collectives on
+    /// `copies` streams of its own (its token computation, each expert
     /// microbatch of it): one torch group per copy and multi-member fiber of
     /// the component's mesh ([`GroupPlan::streams`]). Collective over the
-    /// process world in plan order, at the same point of every rank's
-    /// startup; returns the groups this rank belongs to, in plan order.
+    /// process world in plan order, at the same point of every rank's startup;
+    /// returns the groups this rank belongs to, in plan order.
     pub(crate) fn bind_stream_groups(
         &self,
         launch: &WorkerLaunch,

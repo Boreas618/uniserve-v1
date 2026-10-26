@@ -12,11 +12,9 @@ pub(crate) use issue::HostFunction;
 pub(crate) use issue::{Fill, Issue, RowFill};
 pub(crate) use scratch::Scratches;
 
-use crossbeam_channel::{Receiver, Sender};
 use cuda::{DeviceId, Stream};
 
 use crate::config::Device;
-use crate::lane::{Completion, JobId, JobQueues, Lane};
 use crate::{Error, Result};
 
 /// The stream a numerical binding names by its integer handle.
@@ -104,24 +102,22 @@ impl Drop for CUDAStream {
     }
 }
 
-/// Every stream of a rank: its lane's, its copy lane's, each device's
-/// preparation stream for startup work outside the lane, the full-device
-/// streams of its other devices, the module streams executor lanes that
-/// run beside the lane's fork, and the expert microbatch streams forked
-/// from the lane's. They close in dependency
-/// order: preparation, modules, microbatches, the copy lane, the lane,
-/// devices, each newest first.
+/// Every stream of a rank: its primary device's full-device stream, the copy
+/// stream of a rank whose prefix cache copies pages through the host KV cache,
+/// each device's preparation stream for startup work, the full-device streams
+/// of its other devices, the module streams the executor's components run
+/// beside the primary stream on, and the expert microbatch streams forked from
+/// it. The builder thread issues the work of every one of them (`crate::job`).
+/// They close in dependency order: preparation, modules, microbatches, the copy
+/// stream, the primary stream, devices, each newest first.
 pub(crate) struct Streams {
-    /// The lane of a rank with a CUDA device, on its primary device.
-    lane: Option<Lane>,
-    /// The copy lane of a rank whose prefix cache copies pages through the
-    /// host KV cache (`crate::lane`), on its primary device.
-    copy: Option<Lane>,
-    /// Where the lanes post their completions; the rank's job queues take
-    /// them from here, and give the posting end to the builder thread's
-    /// work.
-    posted: Sender<(JobId, Completion)>,
-    completions: Receiver<(JobId, Completion)>,
+    /// The full-device stream of a rank with a CUDA device, on its primary
+    /// device: every batch's work is issued on it or on a stream forked from
+    /// it.
+    primary: Option<CUDAStream>,
+    /// The stream a batch's page copies through the host KV cache run on,
+    /// beside the primary stream, on the cache's device.
+    copy: Option<CUDAStream>,
     /// The full-device streams of the rank's other CUDA devices.
     devices: Vec<CUDAStream>,
     preparation: Vec<CUDAStream>,
@@ -129,16 +125,18 @@ pub(crate) struct Streams {
     microbatches: Vec<CUDAStream>,
 }
 
+/// The names [`Streams::observed`] gives the primary and the copy stream, in
+/// the device time the rank reports (`ForwardStats::stream_us`).
+pub(crate) const PRIMARY: &str = "device";
+pub(crate) const COPY: &str = "copy";
+
 impl Streams {
     /// Create the streams of `devices`.
     pub(crate) fn create(devices: &[Device]) -> Result<Self> {
         let cuda: Vec<DeviceId> = devices.iter().filter_map(|device| device.cuda()).collect();
-        let (posted, completions) = crossbeam_channel::unbounded();
         let mut streams = Self {
-            lane: None,
+            primary: None,
             copy: None,
-            posted: posted.clone(),
-            completions,
             devices: Vec::new(),
             preparation: Vec::new(),
             modules: Vec::new(),
@@ -148,11 +146,7 @@ impl Streams {
         for (index, &device) in cuda.iter().enumerate() {
             let stream = CUDAStream::create(device)?;
             if index == 0 {
-                streams.lane = Some(Lane::start(
-                    crate::lane::LANE.into(),
-                    stream,
-                    posted.clone(),
-                )?);
+                streams.primary = Some(stream);
             } else {
                 streams.devices.push(stream);
             }
@@ -163,50 +157,29 @@ impl Streams {
         Ok(streams)
     }
 
-    /// Start the copy lane on a full-device stream of `device`, the device
-    /// of the prefix cache that maps a host page pool, before the job
-    /// queues are taken ([`Self::job_queues`]). Returns its stream.
-    pub(crate) fn start_copy_lane(&mut self, device: DeviceId) -> Result<&CUDAStream> {
+    /// Create the copy stream, a full-device stream of `device`, the device of
+    /// the prefix cache that maps a host page pool. Returns it.
+    pub(crate) fn create_copy(&mut self, device: DeviceId) -> Result<&CUDAStream> {
         if self.copy.is_some() {
-            return Err(Error::State("the rank's copy lane is already started"));
+            return Err(Error::State("the rank's copy stream is already created"));
         }
-        let lane = Lane::start(
-            crate::lane::COPY_LANE.into(),
-            CUDAStream::create(device)?,
-            self.posted.clone(),
-        )?;
-        Ok(&self.copy.insert(lane).stream)
+        Ok(self.copy.insert(CUDAStream::create(device)?))
     }
 
-    /// The job queues of the lane and the copy lane, for the executor,
-    /// which submits each forward to the lane.
-    pub(crate) fn job_queues(&self) -> JobQueues {
-        JobQueues::of(
-            self.lane.as_ref(),
-            self.copy.as_ref(),
-            self.posted.clone(),
-            self.completions.clone(),
-        )
-    }
-
-    /// The lane's and the copy lane's streams, by lane name.
-    pub(crate) fn lanes(&self) -> impl Iterator<Item = (&'static str, &CUDAStream)> {
-        self.lane
+    /// The primary and the copy stream, by the names the rank reports their
+    /// device time under ([`PRIMARY`], [`COPY`]).
+    pub(crate) fn observed(&self) -> impl Iterator<Item = (&'static str, &CUDAStream)> {
+        self.primary
             .iter()
-            .map(|lane| (crate::lane::LANE, &lane.stream))
-            .chain(
-                self.copy
-                    .iter()
-                    .map(|lane| (crate::lane::COPY_LANE, &lane.stream)),
-            )
+            .map(|stream| (PRIMARY, stream))
+            .chain(self.copy.iter().map(|stream| (COPY, stream)))
     }
 
-    /// The full-device stream of `device`: the lane's for the primary
+    /// The full-device stream of `device`: the primary stream for the primary
     /// device.
     pub(crate) fn stream_for(&self, device: DeviceId) -> Option<&CUDAStream> {
-        self.lane
+        self.primary
             .iter()
-            .map(|lane| &lane.stream)
             .chain(&self.devices)
             .find(|stream| stream.device() == device)
     }
@@ -230,13 +203,12 @@ impl Streams {
             .ok_or(Error::State("module stream was not registered"))
     }
 
-    /// Fork the lane's stream for one more microbatch.
+    /// Fork the primary stream for one more microbatch.
     pub(crate) fn fork_microbatch(&mut self) -> Result<&CUDAStream> {
         let origin = self
-            .lane
+            .primary
             .as_ref()
-            .map(|lane| &lane.stream)
-            .ok_or(Error::State("a microbatch stream requires a CUDA lane"))?;
+            .ok_or(Error::State("a microbatch stream requires a CUDA device"))?;
         let stream = origin.fork()?;
         self.microbatches.push(stream);
         self.microbatches
@@ -250,16 +222,16 @@ impl Streams {
             .iter()
             .chain(&self.modules)
             .chain(&self.microbatches)
-            .chain(self.copy.iter().map(|lane| &lane.stream))
-            .chain(self.lane.iter().map(|lane| &lane.stream))
+            .chain(&self.copy)
+            .chain(&self.primary)
             .chain(&self.devices)
     }
 
     /// Close the streams in dependency order: preparation, modules,
-    /// microbatches, the copy lane, the lane, then devices, each newest
-    /// first. Attempts every stream before returning the first failure. No
-    /// job is in flight unless the close is aborted: the worker drained the
-    /// lanes ([`JobQueues::drain`]).
+    /// microbatches, the copy stream, the primary stream, then devices, each
+    /// newest first. Attempts every stream before returning the first failure.
+    /// No job is in flight unless the close is aborted: the worker drained the
+    /// job queue ([`JobQueue::drain`]).
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let mut failure = None;
         let mut close = |stream: &mut CUDAStream| {
@@ -270,11 +242,11 @@ impl Streams {
         self.preparation.iter_mut().rev().for_each(&mut close);
         self.modules.iter_mut().rev().for_each(&mut close);
         self.microbatches.iter_mut().rev().for_each(&mut close);
-        if let Some(lane) = &mut self.copy {
-            close(&mut lane.stream);
+        if let Some(stream) = &mut self.copy {
+            close(stream);
         }
-        if let Some(lane) = &mut self.lane {
-            close(&mut lane.stream);
+        if let Some(stream) = &mut self.primary {
+            close(stream);
         }
         self.devices.iter_mut().rev().for_each(&mut close);
         failure.map_or(Ok(()), Err)

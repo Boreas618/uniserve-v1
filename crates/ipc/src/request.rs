@@ -168,7 +168,8 @@ pub enum ResponseKind {
     Ok,
     /// Structured worker failure.
     Error,
-    /// A lane whose job has not completed within the rank's stall bound.
+    /// A job of the rank that has not completed within the rank's stall
+    /// bound.
     Stalled,
     /// A worker hook's result.
     Hooked,
@@ -203,17 +204,13 @@ pub struct WorkerResponseError {
     pub calls: Vec<ErrorCallIdentity>,
 }
 
-/// A job one of a rank's lanes has performed for at least the rank's stall
-/// bound, half the engine's watchdog timeout
+/// A job the rank's builder thread has performed for at least the rank's
+/// stall bound, half the engine's watchdog timeout
 /// ([`LaunchDescriptor::watchdog_timeout_ms`](crate::LaunchDescriptor)),
 /// as the rank's control thread observes it: the job was submitted and its
 /// completion has not arrived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stall {
-    /// The lane performing the job: `lane-0`, or `copy-lane` for a host KV
-    /// cache's page copies. `None` when the rank's builder thread performs
-    /// it, as it does every job of a rank without a CUDA device.
-    pub lane: Option<String>,
     /// The batch the job belongs to: the one whose forward, input
     /// admission or output wait it is. `None` for a job of no batch, such
     /// as a lifecycle command's work.
@@ -226,7 +223,8 @@ pub struct Stall {
     /// The calls of that batch.
     pub calls: Vec<ErrorCallIdentity>,
     /// How long the job has run, in milliseconds: since its submission, or
-    /// since the lane completed the job before it, whichever is later.
+    /// since the builder thread completed the job before it, whichever is
+    /// later.
     pub running_ms: u64,
 }
 
@@ -266,11 +264,11 @@ pub enum WorkerResponse {
         message_id: Option<u64>,
         result: String,
     },
-    /// Reports, unasked, a lane that stays inside one job. The rank's
-    /// control thread sends it once, and goes on serving the channel; the
-    /// engine fails the rank on it.
+    /// Reports, unasked, a job the rank's builder thread stays inside. The
+    /// rank's control thread sends it once, and goes on serving the
+    /// channel; the engine fails the rank on it.
     Stalled {
-        /// The lane, the job's batch and how long the job has run.
+        /// The job's batch, its method and how long it has run.
         stall: Stall,
     },
 }

@@ -1,8 +1,8 @@
-"""The device columns and resident banks of a diffusion LM lane.
+"""The device columns and resident banks of a diffusion LM computation.
 
-:class:`Dimensions` sizes one lane's columns from its bounds and the
+:class:`Dimensions` sizes one computation's columns from its bounds and the
 model's facts; :class:`Columns` holds them in one zeroed device arena, which
-every captured graph addresses for the lane's life. ``R`` is the packed
+every captured graph addresses for the computation's life. ``R`` is the packed
 sequences of one forward, ``T`` its tokens, ``Tb`` the numerical block
 tables, ``W`` the widest table's page columns, ``H`` the hidden width, ``C``
 the block length, ``K`` the candidates one ``readout`` selects
@@ -36,7 +36,7 @@ write the attend state, the finished rows, the candidate log-probabilities
 (whose 32-bit patterns ``candidate_words`` widens to output words) and a
 step's results and continuation flags.
 
-:class:`Banks` holds a generating lane's resident per-slot state: each
+:class:`Banks` holds a generating computation's resident per-slot state: each
 slot's block, the argmax blocks the stopping rule compares, the
 self-conditioning embedding of its latest distribution and whether its block
 continues. Slot zero is the padding sentinel: the denoiser's commits skip
@@ -98,7 +98,7 @@ def _allocate(
 
 @dataclass(frozen=True, slots=True)
 class Dimensions:
-    """The dimensions of one diffusion LM lane's columns.
+    """The dimensions of one diffusion LM computation's columns.
 
     Attributes:
         rows: Packed sequences of one forward ``R``, padding included.
@@ -111,7 +111,7 @@ class Dimensions:
         compute_dtype: The attend state's and finished rows' element type.
         length: Tokens of one block ``C``.
         denoise_rows: Blocks one denoising step holds ``Rd``; zero on a
-            lane that serves readouts only.
+            computation that serves readouts only.
         depth: The argmax blocks a slot's stopping rule compares (the
             served stability threshold).
         embedding_dtype: The self-conditioning embeddings' element type.
@@ -179,14 +179,14 @@ class Dimensions:
 
 
 class Columns:
-    """A lane's columns in one zeroed device arena.
+    """A computation's columns in one zeroed device arena.
 
     Captured graphs address the columns, so the arena lives as long as the
-    lane. The arena is allocated on the current stream.
+    computation. The arena is allocated on the current stream.
 
     Args:
         dimensions: The columns' dimensions.
-        device: The device the lane computes on.
+        device: The device the computation runs on.
     """
 
     def __init__(self, dimensions: Dimensions, device: torch.device) -> None:
@@ -207,7 +207,7 @@ class Columns:
 
 @dataclass(frozen=True, slots=True)
 class BankShape:
-    """The resident banks of a generating lane.
+    """The resident banks of a generating computation.
 
     Attributes:
         slots: Request slots, the padding slot zero excluded.
@@ -250,7 +250,7 @@ class BankShape:
 
 
 class Banks:
-    """A generating lane's resident per-slot block state, zeroed.
+    """A generating computation's resident per-slot block state, zeroed.
 
     Slot zero is the padding sentinel and stays zero: the denoiser's commits
     skip it. The banks are allocated on the current stream in one arena;
@@ -258,7 +258,7 @@ class Banks:
 
     Args:
         shape: The banks' dimensions.
-        device: The device the lane computes on.
+        device: The device the computation runs on.
     """
 
     def __init__(self, shape: BankShape, device: torch.device) -> None:

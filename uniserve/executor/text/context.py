@@ -21,9 +21,9 @@ row; a visual-state row advances it by the image denoiser's rope advance
 when it completes a feedback.
 
 The image half of the executor answers what the rows need through two
-protocols the text lanes hold: :class:`ImageFacts` (the model's feature
-injection, patch grids and rotary layout) and :class:`ImageDenoiser` (the
-latent sequence of a conditioning image and the write of its K/V).
+protocols the text computations hold: :class:`ImageFacts` (the model's
+feature injection, patch grids and rotary layout) and :class:`ImageDenoiser`
+(the latent sequence of a conditioning image and the write of its K/V).
 
 The module also assembles a forward's rows from calls of either kind
 (:func:`host_rows`, :func:`placed_rows`, :func:`take_rows`,
@@ -112,7 +112,7 @@ class Injection(Protocol):
 
 
 class ImageFacts(Protocol):
-    """What a text lane asks the image half about vision blocks."""
+    """What a text computation asks the image half about vision blocks."""
 
     def spatial_positions(self) -> bool:
         """Whether the model's rows carry three rotary axes."""
@@ -156,7 +156,7 @@ class ConditionRow:
 
 
 class ImageDenoiser(Protocol):
-    """What a text lane asks the image denoiser about latent conditioning."""
+    """What a text computation asks the image denoiser about latents."""
 
     def sequence_length(self, height: int, width: int) -> int:
         """Tokens of an image's framed latent sequence."""
@@ -176,9 +176,9 @@ class ImageDenoiser(Protocol):
 
         ``pages`` is ``int64 [2 * G, len(rows)]``: per cache group ``g``,
         each row's first selected page (row ``2g``) and page count (row
-        ``2g + 1``). The work orders after what ``stream`` (the text lane's,
-        ``None`` on the host) enqueued before, and ``stream`` orders after
-        it.
+        ``2g + 1``). The work orders after what ``stream`` (the text
+        computation's, ``None`` on the host) enqueued before, and ``stream``
+        orders after it.
         """
 
 

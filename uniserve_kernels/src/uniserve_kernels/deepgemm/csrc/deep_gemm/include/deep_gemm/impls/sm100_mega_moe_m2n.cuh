@@ -62,8 +62,8 @@ CUTLASS_DEVICE void fence_acquire_sys() {
 
 // Fire-and-forget bulk L2 prefetch with an evict-last policy.  Weights
 // prefetched during the recv-count wait window must survive the other
-// microbatch lane's streaming GEMM, which otherwise turns the whole L2
-// over several times before this lane's work phase starts.
+// microbatch's streaming GEMM, which otherwise turns the whole L2 over
+// several times before this microbatch's work phase starts.
 CUTLASS_DEVICE void prefetch_l2_evict_last(const void* ptr, const uint32_t& num_bytes) {
     uint64_t policy;
     asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
@@ -72,7 +72,7 @@ CUTLASS_DEVICE void prefetch_l2_evict_last(const void* ptr, const uint32_t& num_
 }
 
 enum class EGTimingSlot: uint32_t {
-    LaneStart = 0,
+    MicrobatchStart = 0,
     Tag3Wait = 1,
     SchedFetchBarrierDispatch = 2,
     RecvCountWaitDispatch = 3,
@@ -84,7 +84,7 @@ enum class EGTimingSlot: uint32_t {
     L2ArrivalWait = 9,
     L2RemoteWriteback = 10,
     Tag2Barrier = 11,
-    LaneEnd = 12,
+    MicrobatchEnd = 12,
     TmaALoop = 13,
     TmaBLoop = 14,
     MmaLoop = 15,
@@ -170,38 +170,38 @@ CUTLASS_DEVICE void ag_timing_store(
     }
 }
 
-template <uint32_t kNumLanes>
+template <uint32_t kNumMicrobatches>
 CUTLASS_DEVICE unsigned long long* eg_timing_ptr(
     unsigned long long* debug_timings,
     const uint32_t& layer_i,
-    const uint32_t& lane_i,
+    const uint32_t& microbatch_i,
     const EGTimingSlot& slot) {
     if (debug_timings == nullptr)
         return nullptr;
-    return debug_timings + (layer_i * kNumLanes + lane_i) *
+    return debug_timings + (layer_i * kNumMicrobatches + microbatch_i) *
         static_cast<uint32_t>(EGTimingSlot::NumSlots) + static_cast<uint32_t>(slot);
 }
 
-template <uint32_t kNumLanes>
+template <uint32_t kNumMicrobatches>
 CUTLASS_DEVICE void eg_timing_add(
     unsigned long long* debug_timings,
     const uint32_t& layer_i,
-    const uint32_t& lane_i,
+    const uint32_t& microbatch_i,
     const EGTimingSlot& slot,
     const unsigned long long& value) {
-    auto ptr = eg_timing_ptr<kNumLanes>(debug_timings, layer_i, lane_i, slot);
+    auto ptr = eg_timing_ptr<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, slot);
     if (ptr != nullptr)
         atomicAdd(ptr, value);
 }
 
-template <uint32_t kNumLanes>
+template <uint32_t kNumMicrobatches>
 CUTLASS_DEVICE void eg_timing_store(
     unsigned long long* debug_timings,
     const uint32_t& layer_i,
-    const uint32_t& lane_i,
+    const uint32_t& microbatch_i,
     const EGTimingSlot& slot,
     const unsigned long long& value) {
-    auto ptr = eg_timing_ptr<kNumLanes>(debug_timings, layer_i, lane_i, slot);
+    auto ptr = eg_timing_ptr<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, slot);
     if (ptr != nullptr)
         *ptr = value;
 }
@@ -1021,7 +1021,7 @@ template <
     // encoding, so they select the MMA's K and its scale-factor type
     // rather than a different b_dtype_t.
     bool kUseNvFp4Weights,
-    uint32_t kNumLanes,
+    uint32_t kNumMicrobatches,
     bool kEnableDebugTiming = false,
     // gpt-oss's SwiGLU differs from the one this kernel was written for by two
     // scalar terms. Both default to the identity, so every other model compiles
@@ -1095,7 +1095,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue threads");
     DG_STATIC_ASSERT(kNumExperts % kNumEGRanks == 0, "Invalid number of experts or EG ranks");
-    DG_STATIC_ASSERT(1 <= kNumLanes and kNumLanes <= 4, "M2N EG supports one to four microbatch lanes");
+    DG_STATIC_ASSERT(1 <= kNumMicrobatches and kNumMicrobatches <= 4, "M2N EG supports one to four microbatches");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -1111,21 +1111,21 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         cute::prefetch_tma_descriptor(&tensor_map_l1_output0);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts0);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf0);
-        if constexpr (kNumLanes >= 2) {
+        if constexpr (kNumMicrobatches >= 2) {
             cute::prefetch_tma_descriptor(&tensor_map_l1_acts1);
             cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf1);
             cute::prefetch_tma_descriptor(&tensor_map_l1_output1);
             cute::prefetch_tma_descriptor(&tensor_map_l2_acts1);
             cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf1);
         }
-        if constexpr (kNumLanes >= 3) {
+        if constexpr (kNumMicrobatches >= 3) {
             cute::prefetch_tma_descriptor(&tensor_map_l1_acts2);
             cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf2);
             cute::prefetch_tma_descriptor(&tensor_map_l1_output2);
             cute::prefetch_tma_descriptor(&tensor_map_l2_acts2);
             cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf2);
         }
-        if constexpr (kNumLanes >= 4) {
+        if constexpr (kNumMicrobatches >= 4) {
             cute::prefetch_tma_descriptor(&tensor_map_l1_acts3);
             cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf3);
             cute::prefetch_tma_descriptor(&tensor_map_l1_output3);
@@ -1336,7 +1336,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     };
 
     // Cross-lane persistent phase counters (the mbarrier/TMEM phases carry
-    // across the lane loop; resetting them would deadlock the pipelines)
+    // across the microbatch loop; resetting them would deadlock the pipelines)
     uint32_t pull_mbarrier_phase[kNumDispatchPullStages] = {};
     uint32_t mma_iter_idx = 0, epi_iter_idx = 0;
 
@@ -1350,26 +1350,26 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     const cute::TmaDescriptor* tensor_map_l2_weights = weight_descs + layer_i * 4 + 2;
     const cute::TmaDescriptor* tensor_map_l2_weights_sf = weight_descs + layer_i * 4 + 3;
 
-    // ---- microbatch-lane loop: one full-width pass per lane ----------------
-    for (uint32_t lane_i = 0; lane_i < kNumLanes; ++ lane_i) {
-    const auto& sym_buffer = lane_i == 0 ? sym_buffer0 :
-                             (lane_i == 1 ? sym_buffer1 :
-                             (lane_i == 2 ? sym_buffer2 : sym_buffer3));
-    const auto& tensor_map_l1_acts = lane_i == 0 ? tensor_map_l1_acts0 :
-                                     (lane_i == 1 ? tensor_map_l1_acts1 :
-                                     (lane_i == 2 ? tensor_map_l1_acts2 : tensor_map_l1_acts3));
-    const auto& tensor_map_l1_acts_sf = lane_i == 0 ? tensor_map_l1_acts_sf0 :
-                                        (lane_i == 1 ? tensor_map_l1_acts_sf1 :
-                                        (lane_i == 2 ? tensor_map_l1_acts_sf2 : tensor_map_l1_acts_sf3));
-    const auto& tensor_map_l1_output = lane_i == 0 ? tensor_map_l1_output0 :
-                                       (lane_i == 1 ? tensor_map_l1_output1 :
-                                       (lane_i == 2 ? tensor_map_l1_output2 : tensor_map_l1_output3));
-    const auto& tensor_map_l2_acts = lane_i == 0 ? tensor_map_l2_acts0 :
-                                     (lane_i == 1 ? tensor_map_l2_acts1 :
-                                     (lane_i == 2 ? tensor_map_l2_acts2 : tensor_map_l2_acts3));
-    const auto& tensor_map_l2_acts_sf = lane_i == 0 ? tensor_map_l2_acts_sf0 :
-                                        (lane_i == 1 ? tensor_map_l2_acts_sf1 :
-                                        (lane_i == 2 ? tensor_map_l2_acts_sf2 : tensor_map_l2_acts_sf3));
+    // ---- microbatch loop: one full-width pass per microbatch --------------
+    for (uint32_t microbatch_i = 0; microbatch_i < kNumMicrobatches; ++ microbatch_i) {
+    const auto& sym_buffer = microbatch_i == 0 ? sym_buffer0 :
+                             (microbatch_i == 1 ? sym_buffer1 :
+                             (microbatch_i == 2 ? sym_buffer2 : sym_buffer3));
+    const auto& tensor_map_l1_acts = microbatch_i == 0 ? tensor_map_l1_acts0 :
+                                     (microbatch_i == 1 ? tensor_map_l1_acts1 :
+                                     (microbatch_i == 2 ? tensor_map_l1_acts2 : tensor_map_l1_acts3));
+    const auto& tensor_map_l1_acts_sf = microbatch_i == 0 ? tensor_map_l1_acts_sf0 :
+                                        (microbatch_i == 1 ? tensor_map_l1_acts_sf1 :
+                                        (microbatch_i == 2 ? tensor_map_l1_acts_sf2 : tensor_map_l1_acts_sf3));
+    const auto& tensor_map_l1_output = microbatch_i == 0 ? tensor_map_l1_output0 :
+                                       (microbatch_i == 1 ? tensor_map_l1_output1 :
+                                       (microbatch_i == 2 ? tensor_map_l1_output2 : tensor_map_l1_output3));
+    const auto& tensor_map_l2_acts = microbatch_i == 0 ? tensor_map_l2_acts0 :
+                                     (microbatch_i == 1 ? tensor_map_l2_acts1 :
+                                     (microbatch_i == 2 ? tensor_map_l2_acts2 : tensor_map_l2_acts3));
+    const auto& tensor_map_l2_acts_sf = microbatch_i == 0 ? tensor_map_l2_acts_sf0 :
+                                        (microbatch_i == 1 ? tensor_map_l2_acts_sf1 :
+                                        (microbatch_i == 2 ? tensor_map_l2_acts_sf2 : tensor_map_l2_acts_sf3));
     // Workspaces (must match the AG kernel byte-for-byte)
     const auto workspace = layout::WorkspaceM2N(
         sym_buffer.get_base_ptr(), kNumAGRanks, kNumEGRanks, kNumExperts,
@@ -1430,7 +1430,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     const bool do_timing_leader = kEnableDebugTiming and sm_idx == 0 and lane_idx == 0;
     const bool do_timing_dispatch_leader = do_timing_leader and warp_idx == 0;
     if (do_timing_dispatch_leader)
-        eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::LaneStart, clock64());
+        eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::MicrobatchStart, clock64());
 
     // Adjust registers
     constexpr uint32_t kNumDispatchRegisters = 48;
@@ -1451,7 +1451,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // component of the work phase, and the wait window has idle HBM
         // bandwidth.  No hazard (static read-only data) and no completion
         // dependency, so it goes before the deferred barrier wait.
-        if (lane_i == 0 and warp_idx == 0 and num_prefetch_bytes > 0) {
+        if (microbatch_i == 0 and warp_idx == 0 and num_prefetch_bytes > 0) {
             const void* l1_weights_prefetch_l = l1_weight_ptrs[layer_i];
             constexpr uint32_t kPrefetchChunk = 128 * 1024;
             const uint32_t slice = (num_prefetch_bytes / kNumSMs) & ~15u;
@@ -1473,7 +1473,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::Tag3Wait, clock64() - t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::Tag3Wait, clock64() - t0);
         // Release the free-running GEMM warps (TMA-A/TMA-B/MMA) for this
         // iteration: the deferred wait above globally orders the previous
         // iteration's workspace cleanup, so their count fetches can no
@@ -1481,7 +1481,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         t0 = do_timing_dispatch_leader ? clock64() : 0;
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::SchedFetchBarrierDispatch, clock64() - t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::SchedFetchBarrierDispatch, clock64() - t0);
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1496,9 +1496,9 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         t0 = do_timing_dispatch_leader ? clock64() : 0;
         scheduler.fetch_expert_recv_count();
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::RecvCountWaitDispatch, clock64() - t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::RecvCountWaitDispatch, clock64() - t0);
         if (do_timing_dispatch_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::RecvCountReadyTime, clock64());
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::RecvCountReadyTime, clock64());
         if constexpr (kEnableDebugTiming) {
             constexpr uint32_t kNumExpertsPerTimingLane =
                 math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
@@ -1524,16 +1524,16 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 max_tokens = max_tokens > other ? max_tokens : other;
             }
             if (do_timing_dispatch_leader) {
-                eg_timing_store<kNumLanes>(
-                    debug_timings, layer_i, lane_i,
+                eg_timing_store<kNumMicrobatches>(
+                    debug_timings, layer_i, microbatch_i,
                     EGTimingSlot::TotalRecvTokens,
                     static_cast<unsigned long long>(total_tokens));
-                eg_timing_store<kNumLanes>(
-                    debug_timings, layer_i, lane_i,
+                eg_timing_store<kNumMicrobatches>(
+                    debug_timings, layer_i, microbatch_i,
                     EGTimingSlot::MaxExpertTokens,
                     static_cast<unsigned long long>(max_tokens));
-                eg_timing_store<kNumLanes>(
-                    debug_timings, layer_i, lane_i,
+                eg_timing_store<kNumMicrobatches>(
+                    debug_timings, layer_i, microbatch_i,
                     EGTimingSlot::TotalMBlocks,
                     static_cast<unsigned long long>(total_m_blocks));
             }
@@ -1766,15 +1766,15 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             }
         }
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::PullLoopDispatch, clock64() - t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::PullLoopDispatch, clock64() - t0);
         if (do_timing_dispatch_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::PullDoneTime, clock64());
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::PullDoneTime, clock64());
 
         // Clean workspace for the next usage, and also do cumulative stats
         t0 = do_timing_dispatch_leader ? clock64() : 0;
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::DispatchEpilogueSync, clock64() - t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::DispatchEpilogueSync, clock64() - t0);
 
         DG_STATIC_ASSERT(kNumSMs > 1, "Invalid SM count");
         if (sm_idx != 0) {
@@ -1821,14 +1821,14 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             true
         );
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::CleanupArrive, clock64() - t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::CleanupArrive, clock64() - t0);
     } else if (warp_idx == kNumDispatchWarps) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         const bool do_timing_tmaa_leader = do_timing_leader and warp_idx == kNumDispatchWarps;
         unsigned long long t0 = do_timing_tmaa_leader ? clock64() : 0;
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
         if (do_timing_tmaa_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::SchedFetchBarrierTmaA, clock64() - t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::SchedFetchBarrierTmaA, clock64() - t0);
 
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1836,7 +1836,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // GEMM TMA load warp for tokens with SFA
         unsigned long long loop_t0 = do_timing_tmaa_leader ? clock64() : 0;
         if (do_timing_tmaa_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaAStartTime, loop_t0);
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::TmaAStartTime, loop_t0);
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1855,7 +1855,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 unsigned long long wait_t0 = (kEnableDebugTiming and lane_idx == 0) ? clock64() : 0;
                 while (ptx::ld_acq(ptr) != expected);
                 if (kEnableDebugTiming and lane_idx == 0)
-                    eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::L1ArrivalWait, clock64() - wait_t0);
+                    eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::L1ArrivalWait, clock64() - wait_t0);
             } else {
                 DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
                 const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
@@ -1863,7 +1863,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 unsigned long long wait_t0 = (kEnableDebugTiming and lane_idx == 0) ? clock64() : 0;
                 while (ptx::ld_acq_gpu(ptr) != expected);
                 if (kEnableDebugTiming and lane_idx == 0)
-                    eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::L2ArrivalWait, clock64() - wait_t0);
+                    eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::L2ArrivalWait, clock64() - wait_t0);
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -1900,9 +1900,9 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             }
         });
         if (do_timing_tmaa_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaALoop, clock64() - loop_t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::TmaALoop, clock64() - loop_t0);
         if (do_timing_tmaa_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaAEndTime, clock64());
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::TmaAEndTime, clock64());
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
@@ -1923,7 +1923,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // GEMM TMA load warp for weights with SF
         unsigned long long loop_t0 = do_timing_tmab_leader ? clock64() : 0;
         if (do_timing_tmab_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaBStartTime, loop_t0);
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::TmaBStartTime, loop_t0);
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1974,9 +1974,9 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             }
         });
         if (do_timing_tmab_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaBLoop, clock64() - loop_t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::TmaBLoop, clock64() - loop_t0);
         if (do_timing_tmab_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaBEndTime, clock64());
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::TmaBEndTime, clock64());
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
@@ -1988,7 +1988,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // GEMM MMA issue warp (only the leader CTA will run)
         unsigned long long loop_t0 = do_timing_mma_leader ? clock64() : 0;
         if (do_timing_mma_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::MmaStartTime, loop_t0);
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::MmaStartTime, loop_t0);
         if (is_leader_cta) {
             // NVFP4 scales are E4M3 and reach the MMA unconverted; MX formats
             // pack theirs into E8M0. `scale_format_` is one descriptor bit, so
@@ -2104,9 +2104,9 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             }
         }
         if (do_timing_mma_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::MmaLoop, clock64() - loop_t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::MmaLoop, clock64() - loop_t0);
         if (do_timing_mma_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::MmaEndTime, clock64());
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::MmaEndTime, clock64());
     } else if (warp_idx == kNumDispatchWarps + 3) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -2141,7 +2141,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         const bool do_timing_epi_leader = do_timing_leader and epilogue_warp_idx == 0;
         unsigned long long loop_t0 = do_timing_epi_leader ? clock64() : 0;
         if (do_timing_epi_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::EpiStartTime, loop_t0);
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::EpiStartTime, loop_t0);
         auto& current_iter_idx = epi_iter_idx;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
@@ -2520,16 +2520,16 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
 
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (kEnableDebugTiming and lane_idx == 0)
-                    eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::L2RemoteWriteback, clock64() - writeback_t0);
+                    eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::L2RemoteWriteback, clock64() - writeback_t0);
             }
         });
         if (do_timing_epi_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::EpilogueLoop, clock64() - loop_t0);
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::EpilogueLoop, clock64() - loop_t0);
         if (do_timing_epi_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::EpiEndTime, clock64());
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::EpiEndTime, clock64());
 
         // Deallocate tensor memory (only at the very END: last layer, last lane)
-        if (layer_i == num_layers - 1 and lane_i == kNumLanes - 1 and epilogue_warp_idx == 0)
+        if (layer_i == num_layers - 1 and microbatch_i == kNumMicrobatches - 1 and epilogue_warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
 
         // Signal the AG ranks that all combine rows have been pushed
@@ -2540,16 +2540,16 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
         if (do_timing_leader and epilogue_warp_idx == 0) {
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::Tag2Barrier, clock64() - tag2_t0);
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::Tag2EndTime, clock64());
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::LaneEnd, clock64());
+            eg_timing_add<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::Tag2Barrier, clock64() - tag2_t0);
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::Tag2EndTime, clock64());
+            eg_timing_store<kNumMicrobatches>(debug_timings, layer_i, microbatch_i, EGTimingSlot::MicrobatchEnd, clock64());
         }
 
         // Barrier with dispatch warps, so that they can clean the workspace.
         // No local combine reduction on EG ranks.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
     }
-    }  // lane loop
+    }  // microbatch loop
     }  // layer loop
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

@@ -1,19 +1,18 @@
-//! Jobs: the work a lane's execution thread performs, and what it posts
-//! back.
+//! A job's operations, and what performing them produced.
 //!
-//! A [`Job`] is an ordered list of operations on streams: copies, fills,
-//! event records and waits, an eager call, output reads, a host function,
-//! a host check of what the job's calls returned, a wait for the stream.
-//! The control thread builds it: a batch's lane and the storage owners it
-//! uses record what they would issue ([`Job::on`], an [`Issue`]) and the
-//! executor calls the batch makes, and do their host bookkeeping as they
-//! are called. Every operation owns its data, so the job moves to the
-//! lane's execution thread, which performs the operations in order and
-//! posts a [`Completion`] with what the eager calls returned and what the
-//! output reads produced. The control thread does not wait for it.
+//! A [`Job`] is an ordered list of operations on streams: copies, fills, event
+//! records and waits, an executor call, output reads, a host function, a host
+//! check of what the job's calls returned, a wait for the stream. The control
+//! thread builds it: a batch's step and the storage owners it uses record what
+//! they would issue ([`Job::on`], an [`Issue`]) and the executor calls the
+//! batch makes, and do their host bookkeeping as they are called. Every
+//! operation owns its data, so the job moves to the builder thread, which
+//! performs the operations in order and posts a [`Completion`] with what the
+//! calls returned and what the output reads produced. The control thread does
+//! not wait for it.
 //!
-//! An operation names its stream, so one job orders work across the lane's
-//! stream and the streams forked from it, and a job of a rank without a
+//! An operation names its stream, so one job orders work across the rank's
+//! device stream and the streams forked from it, and a job of a rank without a
 //! CUDA device (no stream) is plain memory writes and calls.
 //!
 //! A job is performed completely or it fails at one operation. After a
@@ -34,12 +33,13 @@ use crate::ffi::{DeferredCall, Handle};
 use crate::stream::{Deferral, Deferred, EventPool, Fill, HostFunction, Issue, RowFill};
 use crate::{Error, Result};
 
-/// One item of work submitted to a lane. Every operation owns its data, so
-/// a job moves to the thread that performs it and its submitter goes on.
+/// One item of work submitted to the builder thread. Every operation owns its
+/// data, so a job moves to the thread that performs it and its submitter goes
+/// on.
 pub(crate) struct Job {
     operations: RefCell<Vec<Operation>>,
-    /// The events a lane lets complete before it posts the job's
-    /// completion, and the device whose streams recorded them.
+    /// The events that complete before the job's completion is posted, and the
+    /// device whose streams recorded them.
     after: RefCell<Option<After>>,
     /// The deferred work whose events the operations record, or whose
     /// events were recorded before: whoever submits the job hands it on
@@ -107,8 +107,7 @@ pub(super) enum Operation {
 /// touches no stream, and refuses with an error.
 pub(crate) type Check = Box<dyn FnOnce(&Completion) -> Result<()> + Send>;
 
-/// Work the execution thread hands to the builder thread and waits for, or
-/// runs itself where it enters Python on its own.
+/// An executor or library call of a job, made on the thread performing the job.
 pub(super) enum Call {
     /// A library method.
     Method(MethodCall),
@@ -222,9 +221,9 @@ impl Job {
         std::mem::take(&mut self.deferrals.borrow_mut())
     }
 
-    /// The import path of the first library method the job calls, which
-    /// names the job when its lane is reported stalled; `None` for a job
-    /// that calls none (copies, waits).
+    /// The import path of the first library method the job calls, which names
+    /// the job when the builder thread is reported stalled inside it; `None`
+    /// for a job that calls none (copies, waits).
     pub(crate) fn method(&self) -> Option<String> {
         self.operations
             .borrow()
@@ -296,15 +295,16 @@ impl Job {
 
     /// Post the job's completion only once `events`, recorded on streams of
     /// `device`, have completed: the completion then says that the device
-    /// finished what the events fence. The lane does not wait for them; it
-    /// goes on with its next job. A job performed outside a lane completes
-    /// when its operations are performed.
+    /// finished what the events fence. The builder thread does not wait for
+    /// them; it goes on with its next job. A job a test performs on its own
+    /// thread completes when its operations are performed.
     pub(crate) fn after(&self, device: DeviceId, events: Vec<Arc<Event>>) {
         *self.after.borrow_mut() = Some((device, events));
     }
 
-    /// Perform every operation in order on the calling thread, outside a
-    /// lane: the submitter itself on a rank without a lane.
+    /// Perform every operation in order on the calling thread, outside the
+    /// rank's job queue (`crate::job::JobQueue`), as tests do.
+    #[cfg(test)]
     pub(crate) fn perform(self) -> Completion {
         self.perform_operations().0
     }

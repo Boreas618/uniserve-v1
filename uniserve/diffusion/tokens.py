@@ -106,7 +106,7 @@ def canvas_bits(
 
     ``seed``, ``block`` and ``step`` are int64 ``[R]`` per canvas row.
     Returns int64 ``[R, positions, 4 * words]``; value ``j`` of a position
-    is output lane ``j % 4`` of counter word ``j // 4``.
+    is output word ``j % 4`` of counter word ``j // 4``.
     """
     rows = seed.shape[0]
     device = seed.device

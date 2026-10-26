@@ -1,11 +1,12 @@
 //! The driver calls that made a rank's serving threads wait for the device,
 //! counted by thread and call while the rank serves ([`cuda::cupti`]).
 //!
-//! The builder thread watches each serving call of the executor (a call so
-//! counted fails, `crate::ffi::MethodCall::serving`), a lane's execution
-//! thread each job it performs, and the control thread its serve loop. Their
-//! counts accumulate here under `{thread}/{call}` and travel with the next
-//! batch result (`ForwardStats::blocking_calls`).
+//! The builder thread watches each job it performs (a serving call of the
+//! executor inside it that makes such a call fails,
+//! `crate::ffi::MethodCall::serving`), and the control thread its serve loop.
+//! Their counts accumulate here under `{thread}/{call}`, `builder` or
+//! `control`, and travel with the next batch result
+//! (`ForwardStats::blocking_calls`).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

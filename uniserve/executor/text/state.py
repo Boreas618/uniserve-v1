@@ -1,4 +1,4 @@
-"""Per-slot request constants and continuation state of a text lane.
+"""Per-slot request constants and continuation state of a text computation.
 
 A request slot ``s`` in ``1..=slots`` holds one admitted request; slot 0 is
 padding everywhere, so every slot-indexed array has ``S = slots + 1`` rows.
@@ -26,7 +26,7 @@ without a host round trip:
 ``verified_lengths`` belongs to the worker's block tables, which attention
 gathers read too; the state borrows it. Every method enqueues its writes on
 the current stream of the tensors' device: the caller orders them on the
-lane stream.
+primary stream.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ _FIELDS = 8
 
 @dataclass(frozen=True, slots=True)
 class NewRequest:
-    """What a text lane keeps of a request's start (``ipc::NewRequest``).
+    """What a text computation keeps of a request's start (``ipc::NewRequest``).
 
     Attributes:
         slot: The request's slot (``request_pool_idx``), positive.
@@ -109,7 +109,7 @@ class NewRequest:
 
 
 class RequestTable:
-    """Slot-indexed constants of the requests a text lane serves.
+    """Slot-indexed constants of the requests a text computation serves.
 
     Each array has one row per slot, row 0 the padding slot. A slot without
     a request holds neutral values: greedy, no constraint, no report.
@@ -291,7 +291,7 @@ class RequestTable:
 
 
 class SlotState:
-    """The continuation state of every request slot of a text lane.
+    """The continuation state of every request slot of a text computation.
 
     Args:
         future_input_tokens: ``int64 [S, 1]``.

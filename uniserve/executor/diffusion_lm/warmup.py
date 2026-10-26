@@ -1,10 +1,10 @@
 """Diffusion LM warmup: every forward shape serving can select, over scratch
-prefix caches, in one phase per lane.
+prefix caches, in one phase per computation.
 
 Scratch tables belong to the worker, and the executor never calls back into
-it, so a lane's warmup is a phase the worker drives (:class:`Phase`): it
-installs scratch tables of one token for slots ``1..n``, ``n`` the blocks a
-denoising step holds (one page of every cache group each), selects the
+it, so a computation's warmup is a phase the worker drives (:class:`Phase`):
+it installs scratch tables of one token for slots ``1..n``, ``n`` the blocks
+a denoising step holds (one page of every cache group each), selects the
 attention pages of each of the phase's synthetic forwards (rows ``[slot,
 prefix, query]``; row ``r`` of a forward reads the table of slot ``r % n +
 1`` over a one-token prefix, as a serving readout's rows of one request
@@ -26,11 +26,11 @@ first, each right after its method ran eagerly:
    slot bucket its slots can select, at every capacity the step can agree
    on, which captures those ``finish`` buckets too
    (:func:`exchanging_readouts`);
-4. on a generating lane, every ``denoise`` row bucket, starting blocks and
-   stepping them (:class:`Denoise`, :func:`synthetic_steps`), at every
-   expert capacity holding it.
+4. on a generating computation, every ``denoise`` row bucket, starting
+   blocks and stepping them (:class:`Denoise`, :func:`synthetic_steps`), at
+   every expert capacity holding it.
 
-Without a pool, a generating lane runs one eager step of every sampler
+Without a pool, a generating computation runs one eager step of every sampler
 chunk shape: the first self-conditioning product of a shape selects its
 algorithm and synchronizes the device, so serving never does. Denoising
 steps run in slots ``1..``; their synthetic state is harmless because a
@@ -50,7 +50,7 @@ from .calls import ReadoutPass, Steps
 from .shapes import SLOT_BUCKETS, AttendKey, FinishKey, Shapes
 
 if TYPE_CHECKING:
-    from .lane import DiffusionLMLane
+    from .computation import DiffusionLMComputation
 
 __all__ = [
     "Alone",
@@ -267,13 +267,13 @@ def layout(
     chunk_rows: int,
     capacities: Capacities,
 ) -> list[WarmStep]:
-    """Lay out a lane's warmup forwards in the order every rank runs them.
+    """Lay out a computation's warmup forwards in every rank's order.
 
     Args:
-        shapes: The lane's graph buckets.
-        pooled: The lane captures graphs into a pool; otherwise it runs
-            every forward eagerly.
-        generating: The lane denoises resident blocks.
+        shapes: The computation's graph buckets.
+        pooled: The computation captures graphs into a pool; otherwise it
+            runs every forward eagerly.
+        generating: The computation denoises resident blocks.
         local: ``finish`` exchanges no tokens across ranks.
         last: The rank holds the final pipeline stage.
         chunk_rows: Blocks a sampler chunk steps at once.
@@ -281,8 +281,8 @@ def layout(
             captured at, largest first.
 
     Returns:
-        The forwards, in order; none for an eager lane that serves readouts
-        only.
+        The forwards, in order; none for an eager computation that serves
+        readouts only.
     """
     length = shapes.sequence_length
     if not pooled:
@@ -328,17 +328,18 @@ def layout(
 
 @dataclass(slots=True)
 class Phase:
-    """One lane's warmup phase.
+    """One computation's warmup phase.
 
     Attributes:
-        lane: The lane's index among the executor's lanes.
+        computation: The computation's index among the executor's
+            computations.
         lengths: The scratch tables' lengths of slots ``1..``.
         steps: The forwards, in order.
         run: Runs the phase given the page columns (``int64 [2 * G,
             rows]``) of each forward that attends, in order.
     """
 
-    lane: int
+    computation: int
     lengths: tuple[int, ...]
     steps: tuple[WarmStep, ...]
     run: Callable[[Sequence[np.ndarray]], None]
@@ -358,27 +359,30 @@ class Phase:
     def describe(self) -> dict[str, Any]:
         """Return what the worker reads of the phase."""
         return {
-            "lane": self.lane,
+            "computation": self.computation,
             "lengths": list(self.lengths),
             "steps": self.attention(),
         }
 
 
-def phases(lanes: Sequence[DiffusionLMLane]) -> list[Phase]:
-    """Lay out every lane's warmup phase in the order the worker runs them.
+def phases(computations: Sequence[DiffusionLMComputation]) -> list[Phase]:
+    """Lay out every computation's warmup phase in the worker's order.
 
-    A lane without warmup forwards has no phase.
+    A computation without warmup forwards has no phase.
     """
     laid = []
-    for lane in lanes:
-        steps = tuple(lane.warmup())
+    for computation in computations:
+        steps = tuple(computation.warmup())
         if not steps:
             continue
         # One one-token scratch table per block a denoising step holds.
-        installed = lane.shapes.capacity()
+        installed = computation.shapes.capacity()
         laid.append(
             Phase(
-                lane.index, (1,) * installed, steps, partial(lane.warm, steps)
+                computation.index,
+                (1,) * installed,
+                steps,
+                partial(computation.warm, steps),
             )
         )
     return laid

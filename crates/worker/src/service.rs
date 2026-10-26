@@ -1,12 +1,12 @@
 //! Rank-channel admission, result delivery, stall reports, and orderly
 //! worker shutdown.
 //!
-//! The control thread serves the channel here and never waits for a lane.
-//! Each wait for a request or a completion ends, at the latest, when the
-//! job in flight longest reaches the rank's stall bound: a lane that has
-//! stayed inside one job that long, such as a driver call that does not
-//! return, is reported to the engine ([`WorkerResponse::Stalled`]) with the
-//! batch the job belongs to, and the channel goes on being served.
+//! The control thread serves the channel here and never waits for a job. Each
+//! wait for a request or a completion ends, at the latest, when the job in
+//! flight longest reaches the rank's stall bound: a job the builder thread has
+//! stayed inside that long, such as a driver call that does not return, is
+//! reported to the engine ([`WorkerResponse::Stalled`]) with the batch the job
+//! belongs to, and the channel goes on being served.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -31,9 +31,9 @@ pub(crate) enum Ending {
     /// The engine closed the rank, or a fatal response ended admission.
     Closed,
     /// The engine's channel failed (the error says how) while nothing was in
-    /// flight: no admitted batch was unfinished and no job given to a lane
-    /// or the builder thread was without its completion, so nothing the rank
-    /// issued can still run on a device.
+    /// flight: no admitted batch was unfinished and no job given to the builder
+    /// thread was without its completion, so nothing the rank issued can still
+    /// run on a device.
     Orphaned(WorkerError),
     /// The engine's channel failed (the error says how) while work was in
     /// flight. Nothing can deliver its results, and it may never complete:
@@ -73,9 +73,9 @@ pub(crate) struct ParkedExperts {
     /// Workspaces that keep their addresses were suspended: the promotion
     /// maps them back (`promote_experts`).
     pub(crate) suspended: bool,
-    /// Workspaces that cannot keep their addresses were freed: the
-    /// promotion rebuilds them (`rebuild_experts`) and captures the lanes'
-    /// graphs that address them again.
+    /// Workspaces that cannot keep their addresses were freed: the promotion
+    /// rebuilds them (`rebuild_experts`) and captures the computations' graphs
+    /// that address them again.
     pub(crate) released: bool,
 }
 
@@ -148,7 +148,7 @@ impl Parked {
             return Ok(());
         };
         python.rebuild_experts()?;
-        crate::worker::warm_lanes(executor.backend_mut())?;
+        crate::worker::warm_computations(executor.backend_mut())?;
         python.seal()?;
         tracing::info!("the promoted standby worker captured its expert graphs again");
         Ok(())
@@ -164,10 +164,10 @@ pub(crate) struct Service<'a> {
     closing: bool,
     shutdown: Option<WorkerResponse>,
     last_result: Instant,
-    /// How long one job may run on a lane before the lane is reported.
+    /// How long one job may run before it is reported.
     stall_bound: Duration,
-    /// A stalled lane was reported. The engine fails the rank on the report,
-    /// so it is made once.
+    /// A stalled job was reported. The engine fails the rank on the report, so
+    /// it is made once.
     stalled: bool,
     /// The engine's channel failed: it closed, or a send or receive on it
     /// did.
@@ -234,8 +234,8 @@ impl<'a> Service<'a> {
     }
 
     /// Whether nothing the rank issued can still run on a device once its
-    /// engine is gone: no admitted batch is unfinished, and every job given
-    /// to a lane or the builder thread has completed.
+    /// engine is gone: no admitted batch is unfinished, and every job given to
+    /// the builder thread has completed.
     ///
     /// An answered batch can leave jobs in flight, such as the release of
     /// its storage, whose completions announce nothing. Nothing more is
@@ -492,13 +492,13 @@ impl<'a> Service<'a> {
             .map_err(|e| self.channel_error(e))
     }
 
-    /// Report a lane stalled past the bound, then block until a request, a
+    /// Report a job stalled past the bound, then block until a request, a
     /// completion wake, the timeout or the moment the job in flight longest
-    /// reaches the bound. Fails once the engine's connection has closed: it
-    /// is the engine's liveness, and nothing this rank computes can be
-    /// delivered after it.
+    /// reaches the bound. Fails once the engine's connection has closed: it is
+    /// the engine's liveness, and nothing this rank computes can be delivered
+    /// after it.
     fn wait(&mut self, timeout: Duration) -> Result<(), WorkerError> {
-        let timeout = match self.watch_lanes()? {
+        let timeout = match self.watch_jobs()? {
             Some(until) => timeout.min(until),
             None => timeout,
         };
@@ -507,12 +507,11 @@ impl<'a> Service<'a> {
             .map_err(|e| self.channel_error(e))
     }
 
-    /// Report the job a lane has performed for at least the stall bound,
-    /// once; otherwise return how long until the job in flight longest
-    /// reaches the bound. The pass that waits has taken every completion
-    /// posted before its `advance`, so a job still in flight then had not
-    /// completed.
-    fn watch_lanes(&mut self) -> Result<Option<Duration>, WorkerError> {
+    /// Report the job the builder thread has performed for at least the stall
+    /// bound, once; otherwise return how long until the job in flight longest
+    /// reaches the bound. The pass that waits has taken every completion posted
+    /// before its `advance`, so a job still in flight then had not completed.
+    fn watch_jobs(&mut self) -> Result<Option<Duration>, WorkerError> {
         if self.stalled {
             return Ok(None);
         }
@@ -527,13 +526,12 @@ impl<'a> Service<'a> {
         let batch = self.executor.batch_of(job);
         let stall = self.executor.backend().stall(job, running, batch);
         tracing::error!(
-            lane = stall.lane.as_deref().unwrap_or("the builder thread"),
             batch_id = ?stall.batch_id,
             route = ?stall.route,
             method = ?stall.method,
             calls = stall.calls.len(),
             running_ms = stall.running_ms,
-            "a lane has stayed inside one job past the stall bound of {:?}; reporting it to the engine",
+            "the builder thread has stayed inside one job past the stall bound of {:?}; reporting it to the engine",
             self.stall_bound,
         );
         self.stalled = true;
@@ -574,9 +572,9 @@ impl Service<'_> {
     ///   weights in place from the checkpoint at `path`
     ///   (`crate::worker::update`), and answers the rank's worker group and
     ///   the new key seed of each host page pool;
-    /// - `uniserve.attach_cupti`, `uniserve.detach_cupti`: attach CUPTI to
-    ///   the process and detach it (`crate::profiling::cupti`), and answer
-    ///   whether it is attached and records the lanes' device time.
+    /// - `uniserve.attach_cupti`, `uniserve.detach_cupti`: attach CUPTI to the
+    ///   process and detach it (`crate::profiling::cupti`), and answer whether
+    ///   it is attached and records the streams' device time.
     fn built_in(&mut self, name: &str, payload: &str) -> crate::Result<String> {
         let payload: serde_json::Value = if payload.is_empty() {
             serde_json::Value::Null

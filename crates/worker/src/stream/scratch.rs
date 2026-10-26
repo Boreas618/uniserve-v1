@@ -1,13 +1,13 @@
 //! `Scratches`: the shared work areas of the rank's streams.
 //!
 //! Execution contexts serialized on one stream borrow one Python `Scratch`
-//! (`uniserve.bindings.context.Scratch`) per device: a transient
-//! work area grows to the largest context prepared and keeps what captured
-//! graphs address. Rust holds the scratch of each stream and device and
-//! binds the executor's lanes on that stream to it, so their contexts share
-//! it. A device scratch allocates from a pool of device memory Rust
-//! owns ([`GraphPool`]), of its own, so that no graph's activations share
-//! its blocks and its addresses stay fixed while graphs address it.
+//! (`uniserve.bindings.context.Scratch`) per device: a transient work area
+//! grows to the largest context prepared and keeps what captured graphs
+//! address. Rust holds the scratch of each stream and device and binds the
+//! executor's computations on that stream to it, so their contexts share it. A
+//! device scratch allocates from a pool of device memory Rust owns
+//! ([`GraphPool`]), of its own, so that no graph's activations share its blocks
+//! and its addresses stay fixed while graphs address it.
 
 use cuda::DeviceId;
 use std::collections::BTreeMap;

@@ -21,9 +21,9 @@
 //!   commit;
 //! - for each image shape, one image request of two denoising steps at the
 //!   guidance scales that realize the shape's branch count, which also
-//!   decodes its image. The scheduler's denoiser lane runs one request at a
-//!   time, so serving never batches denoising calls and one request reaches
-//!   every shape it can run.
+//!   decodes its image. The scheduler lets one request at a time hold the
+//!   denoiser, so serving never batches denoising calls and one request
+//!   reaches every shape it can run.
 //!
 //! No request reads or populates the prefix or encoder caches. A request the
 //! deployment's generation limits would refuse a client, such as a guidance
@@ -393,7 +393,7 @@ mod tests {
         ]);
         let batches = warmed(sim, |_| {});
 
-        // The denoiser lane runs one request at a time: one call per batch,
+        // The denoiser runs one request at a time: one call per batch,
         // two steps and one decode per shape.
         assert_eq!(
             calls(&batches, CallKind::Media(MediaCall::Denoising)),

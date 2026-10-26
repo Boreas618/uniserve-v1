@@ -285,7 +285,7 @@ public:
         const float* nvfp4_alpha;
         unsigned long long* debug_timings;
         int num_prefetch_bytes;
-        int num_lanes;
+        int num_microbatches;
         layout::SymBuffer<> sym_buffer_ptrs;
         layout::SymBuffer<> sym_buffer_ptrs1;
         layout::SymBuffer<> sym_buffer_ptrs2;
@@ -371,7 +371,7 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.use_fp8_weights ? "true" : "false",
     args.use_nvfp4_weights ? "true" : "false",
-    args.num_lanes,
+    args.num_microbatches,
     args.debug_timings != nullptr ? "true" : "false",
     to_string(args.activation_alpha),
     args.activation_up_bias ? "true" : "false",
@@ -492,7 +492,7 @@ static std::string sm100_mega_moe_m2n_eg(
     const std::vector<int64_t>& sym_buffer_ptrs1,
     const std::vector<int64_t>& sym_buffer_ptrs2,
     const std::vector<int64_t>& sym_buffer_ptrs3,
-    const int& num_lanes,
+    const int& num_microbatches,
     const int& rank_idx,
     const int& num_ag_ranks, const int& num_eg_ranks,
     const int& num_max_tokens_per_rank,
@@ -517,7 +517,7 @@ static std::string sm100_mega_moe_m2n_eg(
     const auto num_experts = num_experts_per_rank * num_eg_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
 
-    // A sub-device grid lets two microbatch lanes co-run their fused kernels;
+    // A sub-device grid lets two microbatches co-run their fused kernels;
     // 2-CTA clusters require an even SM count.
     auto num_sms = num_sms_opt > 0
         ? std::min(num_sms_opt, device_runtime->get_num_sms())
@@ -584,7 +584,8 @@ static std::string sm100_mega_moe_m2n_eg(
                                                         config.sf_block_m, use_nvfp4_weights ? 16 : 32,
                                                         1, 0);
 
-    // Lane-1 activation/output maps (weights are shared across lanes)
+    // Microbatch-1 activation/output maps (weights are shared across
+    // microbatches)
     const auto tensor_map_l1_acts_1 = make_tma_2d_desc(l1_acts1,
                                                        hidden, config.num_max_pool_tokens,
                                                        config.block_k, config.load_block_m,
@@ -698,7 +699,7 @@ static std::string sm100_mega_moe_m2n_eg(
         DG_HOST_ASSERT(debug_timings->is_cuda() and debug_timings->is_contiguous());
         DG_HOST_ASSERT(debug_timings->scalar_type() == torch::kInt64);
         DG_HOST_ASSERT(debug_timings->numel() >=
-            static_cast<int64_t>(num_layers) * std::max(num_lanes, 1) * kEgTimingSlots);
+            static_cast<int64_t>(num_layers) * std::max(num_microbatches, 1) * kEgTimingSlots);
         debug_timings_ptr = reinterpret_cast<unsigned long long*>(
             debug_timings->data_ptr<int64_t>());
     }
@@ -722,7 +723,7 @@ static std::string sm100_mega_moe_m2n_eg(
         .nvfp4_alpha = nvfp4_alpha_ptr,
         .debug_timings = debug_timings_ptr,
         .num_prefetch_bytes = num_prefetch_bytes,
-        .num_lanes = num_lanes,
+        .num_microbatches = num_microbatches,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .sym_buffer_ptrs1 = layout::SymBuffer<>(sym_buffer_ptrs1, rank_idx),
         .sym_buffer_ptrs2 = layout::SymBuffer<>(sym_buffer_ptrs2, rank_idx),
@@ -761,7 +762,7 @@ static std::string sm100_mega_moe_m2n_eg(
         std::cerr << "[megamoe_m2n_eg] generate begin"
                   << " rank=" << rank_idx
                   << " layers=" << num_layers
-                  << " lanes=" << num_lanes
+                  << " microbatches=" << num_microbatches
                   << " expected_tokens=" << expected_num_tokens_per_rank
                   << " max_tokens=" << num_max_tokens_per_rank
                   << " wave_expected_tokens=" << m2n_wave_expected_tokens

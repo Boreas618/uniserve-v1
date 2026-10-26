@@ -381,7 +381,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
 
 /// Builds a `BatchOutput`; the first completion's batch id, when present,
 /// overrides `batch_id`.
-fn lane_report(
+fn batch_output(
     batch_id: u64,
     completions: Vec<CallOutput>,
     products: Vec<TensorExport>,
@@ -457,7 +457,7 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
     record.prompt_logprobs.clear();
     record.committed_tokens.clear();
     record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
-    let report = lane_report(5, vec![record], Vec::new(), None, None);
+    let report = batch_output(5, vec![record], Vec::new(), None, None);
     let decoded = round_trip(&WorkerResponse::result(report.clone()));
     assert_eq!(decoded.output().unwrap(), &report);
 }
@@ -542,7 +542,7 @@ fn a_canvas_step_its_sampling_and_its_block_round_trip() {
     record.top_logprobs.clear();
     record.prompt_logprobs.clear();
     record.committed_tokens = (0..256).collect();
-    let report = lane_report(6, vec![record], Vec::new(), None, None);
+    let report = batch_output(6, vec![record], Vec::new(), None, None);
     let decoded = round_trip(&WorkerResponse::result(report.clone()));
     assert_eq!(decoded.output().unwrap(), &report);
 }
@@ -752,7 +752,7 @@ fn export_round_trips_its_registered_view_and_endpoint() {
             name: "uniserve-export".into(),
         },
     ] {
-        let mut report = lane_report(
+        let mut report = batch_output(
             5,
             vec![completion_record()],
             vec![TensorExport {
@@ -872,7 +872,7 @@ fn unchanged_cache_export_round_trips_without_physical_tensors() {
         output_index: 0,
         generation: 3,
     };
-    let mut report = lane_report(
+    let mut report = batch_output(
         5,
         vec![CallOutput {
             cache_output: Some(CacheTransfer {
@@ -982,7 +982,7 @@ fn raw_cache_export_round_trips_page_representation_and_exact_request() {
             // Tokens [6, 8) lie in one eight-token source page.
             window.push(tensor("window-scales", "float32", vec![1, 2, 1, 1], 4));
         }
-        let report = lane_report(
+        let report = batch_output(
             5,
             vec![CallOutput {
                 cache_output: Some(CacheTransfer {
@@ -1051,7 +1051,7 @@ fn error_completion_round_trips_with_its_error_code() {
     let mut record = completion_record();
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
-    let report = lane_report(6, vec![record.clone()], Vec::new(), None, None);
+    let report = batch_output(6, vec![record.clone()], Vec::new(), None, None);
     let decoded = round_trip(&WorkerResponse::result(report));
     assert_eq!(
         decoded.output().unwrap().completions().next().unwrap(),
@@ -1067,7 +1067,7 @@ fn a_refused_completion_round_trips_with_its_reason() {
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::InputError);
     record.error_message = Some("the conditions take 7808 denoiser rows".to_owned());
-    let report = lane_report(6, vec![record.clone()], Vec::new(), None, None);
+    let report = batch_output(6, vec![record.clone()], Vec::new(), None, None);
     let decoded = round_trip(&WorkerResponse::result(report));
     assert_eq!(
         decoded.output().unwrap().completions().next().unwrap(),
@@ -1885,6 +1885,8 @@ fn full_forward_stats() -> ForwardStats {
         mode_tokens: map("mode_tokens", 3),
         mode_us: map("mode_us", 5),
         component_us: map("component_us", 7),
+        stream_us: map("stream_us", 9),
+        blocking_calls: map("blocking_calls", 40),
         attention_launches: 11,
         attention_us: 12,
         attention_backend_counts: map("backend", 13),
@@ -1969,7 +1971,7 @@ fn full_run_result() -> BatchOutput {
         bytes: 256,
     });
     let products = Vec::new();
-    lane_report(
+    batch_output(
         5,
         vec![ok_record, predicated_record, error_record],
         products,
@@ -2019,7 +2021,6 @@ fn response_fixtures() -> Vec<WorkerResponse> {
         },
         WorkerResponse::Stalled {
             stall: Stall {
-                lane: Some("decode".into()),
                 batch_id: Some(12),
                 route: Some("decode".into()),
                 method: Some("uniserve.runner.forward".into()),

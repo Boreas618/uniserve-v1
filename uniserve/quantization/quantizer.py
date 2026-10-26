@@ -180,8 +180,9 @@ class Quantizer:
             maximum = x.float().abs().amax()
 
         if distribution is not None:
-            # Reduction axes follow the logical value, not its execution lane
-            # or projection chunk. PP layers do not share a statistical domain.
+            # Reduction axes follow the logical value, not the shard one rank
+            # holds or a projection chunk. PP layers do not share a
+            # statistical domain.
             for axis, placement in zip(
                 distribution.mesh.axes, distribution.placements, strict=True
             ):

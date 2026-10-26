@@ -74,8 +74,9 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
 mod tests {
     use super::*;
 
-    /// Owners shared between worker threads (lanes, transfer pools, the
-    /// reclaimer) must be `Send + Sync`; communicators move between threads.
+    /// Owners shared between worker threads (the builder thread, transfer
+    /// pools, the reclaimer) must be `Send + Sync`; communicators move
+    /// between threads.
     #[test]
     fn owners_cross_threads() {
         fn shared<T: Send + Sync>() {}

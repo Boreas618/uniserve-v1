@@ -680,19 +680,20 @@ fn a_context_chunk_ends_before_an_image_block_it_cannot_hold() {
 }
 
 /// The worker prepares each inline input image as one task on its rank's
-/// host lane, so an image encode waits in the scheduler while the lane is
-/// full instead of reaching the worker: with one host task per rank, image
-/// encodes of different requests are never in flight together, and every
-/// request is still answered.
+/// host task pool, so an image encode waits in the scheduler while the pool
+/// is full instead of reaching the worker: with one host task per rank,
+/// image encodes of different requests are never in flight together, and
+/// every request is still answered.
 #[test]
-fn an_image_encode_waits_for_a_free_host_lane_task() {
+fn an_image_encode_waits_for_a_free_host_task() {
     let mut sim = readout_worker();
     // A deep queue and results delivered only when the scheduler waits keep
-    // every ready encode schedulable at once, leaving the lane to bound them.
+    // every ready encode schedulable at once, leaving the host task pool to
+    // bound them.
     sim.set_queue_depth(16);
     sim.set_results_on_wait(true);
     let info = sim.mut_info_for_test();
-    info.host_lane_capacity = 1;
+    info.host_task_capacity = 1;
     info.components = vec![ComponentInfo {
         name: "model".to_owned(),
         outputs: Vec::new(),
@@ -753,7 +754,7 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
                 in_flight.insert(batch.id, count);
                 assert!(
                     in_flight.values().sum::<usize>() <= 1,
-                    "image encodes exceeded the host lane: {in_flight:?}"
+                    "image encodes exceeded the host task pool: {in_flight:?}"
                 );
             }
             BatchEvent::Resolved { batch_id } => {

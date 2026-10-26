@@ -438,7 +438,7 @@ mod tests {
 
     use super::*;
     use crate::EventPool;
-    use crate::lane::Job;
+    use crate::job::Job;
     use crate::memory::{BlockTables, CacheGroupPlan, CachePlan, GroupAxis};
     use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 

@@ -6,10 +6,10 @@
 //!
 //! - **Placement.** A product with a scheduler buffer allocation is
 //!   *persistent*: a range of the device's [`BufferPool`] arena, which is an
-//!   exportable allocation so CUDA VMM exports stay in place. A scalar
-//!   product without one lives in a *relay lane*: one element of a
-//!   per-(device, dtype, field) arena of `(request_capacity + 1) *
-//!   relay_depth` elements, indexed by request slot and lane.
+//!   exportable allocation so CUDA VMM exports stay in place. A scalar product
+//!   without one lives in a *relay entry*: one element of a per-(device, dtype,
+//!   field) arena of `(request_capacity + 1) * relay_depth` elements, indexed
+//!   by request slot and depth index.
 //! - **Writes.** Producers write the bound view (see
 //!   [`ProductBuffer::view`]) and declare it produced, or hand a
 //!   value that is copied natively into it. Writes never convert dtypes: a
@@ -76,8 +76,8 @@ pub(crate) type BufferKey = (RequestKey, CallId, u16);
 
 pub(crate) type CallKey = (RequestKey, CallId);
 
-/// Rank-local values and bounded scalar relay lanes: the store's buffers
-/// and imports, the views of its arenas and of its relay lanes.
+/// Rank-local values and bounded scalar relay entries: the store's buffers and
+/// imports, the views of its arenas and of its relay entries.
 struct State {
     byte_capacity: usize,
     request_capacity: usize,
@@ -88,8 +88,8 @@ struct State {
     views: HashMap<RelayKey, StorageView>,
     allocated_bytes: usize,
     calls: HashMap<CallKey, HashSet<BufferKey>>,
-    lanes: HashMap<LaneKey, Lane>,
-    call_lanes: HashMap<RelayCall, usize>,
+    entries: HashMap<EntryKey, Entry>,
+    call_entries: HashMap<RelayCall, usize>,
 }
 
 impl State {
@@ -104,8 +104,8 @@ impl State {
             views: HashMap::new(),
             allocated_bytes: 0,
             calls: HashMap::new(),
-            lanes: HashMap::new(),
-            call_lanes: HashMap::new(),
+            entries: HashMap::new(),
+            call_entries: HashMap::new(),
         }
     }
 }
@@ -306,33 +306,34 @@ impl State {
             .backing
             .take()
             .ok_or_else(|| Error::Invariant("tensor storage was retired more than once".into()))?;
-        if let Backing::Relay((lane_key, dtype, field)) = &backing {
-            let lane = self
-                .lanes
-                .get_mut(lane_key)
-                .ok_or_else(|| Error::Invariant("request-relay lane lost its owner".into()))?;
-            lane.fields.remove(&(*dtype, *field));
-            if lane.fields.is_empty() {
-                self.call_lanes
-                    .remove(&(lane_key.0, lane_key.1, lane.call.0, lane.call.1));
-                self.lanes.remove(lane_key);
+        if let Backing::Relay((entry_key, dtype, field)) = &backing {
+            let entry = self
+                .entries
+                .get_mut(entry_key)
+                .ok_or_else(|| Error::Invariant("request-relay entry lost its owner".into()))?;
+            entry.fields.remove(&(*dtype, *field));
+            if entry.fields.is_empty() {
+                self.call_entries
+                    .remove(&(entry_key.0, entry_key.1, entry.call.0, entry.call.1));
+                self.entries.remove(entry_key);
             }
         }
         Ok(backing)
     }
 
-    pub(crate) fn relay_lane(
+    pub(crate) fn relay_entry(
         &self,
         id: BufferId,
         device: MemoryKind,
         slot: usize,
     ) -> Result<usize> {
         let call = (device, slot, id.owner, id.producer_call_id);
-        self.call_lanes
+        self.call_entries
             .get(&call)
             .copied()
             .or_else(|| {
-                (0..self.relay_depth).find(|&lane| !self.lanes.contains_key(&(device, slot, lane)))
+                (0..self.relay_depth)
+                    .find(|&index| !self.entries.contains_key(&(device, slot, index)))
             })
             .ok_or(Error::Resource(
                 "request-relay unresolved window is exhausted",
@@ -340,19 +341,19 @@ impl State {
     }
 
     pub(crate) fn bind_relay(&mut self, id: BufferId, relay: &RelayKey) -> Result<()> {
-        let (lane_key, dtype, field) = relay;
-        let lane = self.lanes.entry(*lane_key).or_insert_with(|| Lane {
+        let (entry_key, dtype, field) = relay;
+        let entry = self.entries.entry(*entry_key).or_insert_with(|| Entry {
             call: (id.owner, id.producer_call_id),
             fields: HashSet::new(),
         });
-        if !lane.fields.insert((*dtype, *field)) {
+        if !entry.fields.insert((*dtype, *field)) {
             return Err(Error::Invariant(
-                "request-relay lane was assigned more than once".into(),
+                "request-relay entry was assigned more than once".into(),
             ));
         }
-        self.call_lanes.insert(
-            (lane_key.0, lane_key.1, id.owner, id.producer_call_id),
-            lane_key.2,
+        self.call_entries.insert(
+            (entry_key.0, entry_key.1, id.owner, id.producer_call_id),
+            entry_key.2,
         );
         Ok(())
     }
@@ -367,8 +368,8 @@ impl State {
 
 impl ProductStore {
     /// A store of `byte_capacity` bytes of relay arenas, with features of at
-    /// most `max_feature_bytes` on `devices`, `request_capacity` request
-    /// slots of `relay_depth` relay lanes each (both zero without relays).
+    /// most `max_feature_bytes` on `devices`, `request_capacity` request slots
+    /// of `relay_depth` relay entries each (both zero without relays).
     /// Persistent products lie in `buffer_pool`, whose scheduler placements
     /// bound them.
     pub fn new(

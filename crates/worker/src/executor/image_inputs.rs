@@ -1,15 +1,15 @@
-//! The image host resource of an image model's lanes ([`Images`]) and the
-//! host preparation of a batch's inline input images ([`InlineImages`]).
+//! The image host resource of an image model's computations ([`Images`]) and
+//! the host preparation of a batch's inline input images ([`InlineImages`]).
 //!
-//! A lane whose manifest names the `images` resource reads request images
-//! the engine sent inline (base64 payloads) or encodes the images it
-//! decodes to PNG. Both run on the rank's image host lane beside device
-//! work: an encoding batch's inline images are decoded and transformed by
-//! the model's image policy ([`ImagePreparation`]) into page-locked blocks
-//! before the batch's forward begins ([`prepare_inputs`]), so the
-//! executor's preparation knows each image's facts and its execution reads
-//! the prepared pixels; a decoding batch's PNG encodings run once its pixels
-//! reached the host (`crate::executor::image`).
+//! A computation whose manifest names the `images` resource reads request
+//! images the engine sent inline (base64 payloads) or encodes the images it
+//! decodes to PNG. Both run on the rank's image host pool beside device work:
+//! an encoding batch's inline images are decoded and transformed by the model's
+//! image policy ([`ImagePreparation`]) into page-locked blocks before the
+//! batch's forward begins ([`prepare_inputs`]), so the executor's preparation
+//! knows each image's facts and its execution reads the prepared pixels; a
+//! decoding batch's PNG encodings run once its pixels reached the host
+//! (`crate::executor::image`).
 
 use std::sync::{Arc, Weak};
 
@@ -22,7 +22,7 @@ use crate::executor::Submission;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::host::image::{ImageResult, ImageTask, ImageWork};
-use crate::host::{HostLane, HostTask};
+use crate::host::{HostPool, HostTask};
 use crate::memory::PinnedPool;
 use crate::memory::allocation::StorageView;
 use crate::{Error, Outcome, Result};
@@ -217,11 +217,11 @@ impl ImagePreparation {
     }
 }
 
-/// The rank's image host resource: the host lane that prepares inline
-/// images and encodes decoded ones, the image policy and the page-locked
-/// blocks prepared pixels occupy.
+/// The rank's image host resource: the host pool that prepares inline images
+/// and encodes decoded ones, the image policy and the page-locked blocks
+/// prepared pixels occupy.
 pub(crate) struct Images {
-    pub(crate) host: HostLane<ImageTask>,
+    pub(crate) host: HostPool<ImageTask>,
     pub(crate) preparation: ImagePreparation,
     pub(crate) pinned: Arc<PinnedPool>,
     /// The element type prepared pixels take (`EncoderRunner.pixel_dtype`).
@@ -242,15 +242,15 @@ impl Images {
             ))
         })?;
         Ok(Self {
-            host: HostLane::new(capacity.max(HOST_WORKERS), HOST_WORKERS, "uniserve-image")?,
+            host: HostPool::new(capacity.max(HOST_WORKERS), HOST_WORKERS, "uniserve-image")?,
             preparation: ImagePreparation::new(loaded.clone())?,
             pinned: PinnedPool::new(device),
             dtype,
         })
     }
 
-    /// Stop the host lane once the lanes drained; an aborted close leaves
-    /// running tasks to the process's exit.
+    /// Stop the host pool once the computations drained; an aborted close
+    /// leaves running tasks to the process's exit.
     pub(crate) fn close(&self, aborted: bool) -> Result<()> {
         if aborted {
             self.host.abort();
@@ -303,9 +303,9 @@ impl InlineImages {
 }
 
 /// Start the host preparation of an encoding batch's inline images on the
-/// rank's image host lane, and report whether it completed. Notifies
+/// rank's image host pool, and report whether it completed. Notifies
 /// `submission` when it does. A batch of another kind, or of a rank whose
-/// lanes keep no image host resource, prepares nothing.
+/// computations keep no image host resource, prepares nothing.
 pub(crate) fn prepare_inputs(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
@@ -321,7 +321,10 @@ pub(crate) fn prepare_inputs(
     if plan.calls.iter().all(|call| call.input_image.is_none()) {
         return Ok(true);
     }
-    let Some(images) = backend.lanes().and_then(|lanes| lanes.images()) else {
+    let Some(images) = backend
+        .computations()
+        .and_then(|computations| computations.images())
+    else {
         return Ok(true);
     };
     let requests = backend.requests();

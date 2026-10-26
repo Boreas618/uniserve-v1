@@ -82,12 +82,12 @@ def test_spatial_blocks_take_raster_coordinates_of_the_pooled_grid():
 
 
 @pytest.mark.parametrize("positions", list(PositionLayout))
-def test_every_layouts_block_places_as_a_text_lane_row(positions):
-    """A text lane places each block the image facts lay out.
+def test_every_layouts_block_places_as_a_text_computation_row(positions):
+    """A text computation places each block the image facts lay out.
 
-    The text lane reads a block's positions as one axis or three; every
-    injection layout's block becomes a row with three position axes whose
-    first is the block's temporal or sequential position.
+    The text computation reads a block's positions as one axis or three;
+    every injection layout's block becomes a row with three position axes
+    whose first is the block's temporal or sequential position.
     """
     block = _injection(FeatureLayout.FRAMED, positions).block(
         6, 5, False, (4, 6)

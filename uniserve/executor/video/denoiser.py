@@ -191,7 +191,7 @@ class Denoiser:
         envelope: The slot state every layout fits.
         pages: Each request slot's latent pages.
         slots: Request slots; slot rows ``1..=slots`` belong to requests.
-        stream: The denoiser's lane stream.
+        stream: The primary stream of the denoiser's device.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas.
         conditioning: The text conditioner this rank holds, if any.

@@ -109,7 +109,7 @@ impl TransportBuffer {
     }
 
     /// Shared buffers of CUDA producers unregister their mapping, which may
-    /// wait for the device; they retire on a host lane.
+    /// wait for the device; they retire on a host pool.
     pub(crate) fn asynchronous(&self) -> bool {
         matches!(&*self.lock(), ExportBacking::Shared(storage) if storage.is_cuda())
     }
@@ -187,8 +187,8 @@ impl TransportBuffer {
 }
 
 /// The release of one export's backing and the completion of its physical
-/// retirement signal. It runs after the producer fence, or on a host lane
-/// when unregistering a shared mapping may wait for the device.
+/// retirement signal. It runs after the producer fence, or on a host pool when
+/// unregistering a shared mapping may wait for the device.
 pub(crate) struct SourceRetirement {
     pub(crate) buffer: Arc<TransportBuffer>,
     pub(crate) completion: Option<Arc<Retirement>>,

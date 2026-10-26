@@ -26,7 +26,7 @@ mod error;
 mod executor;
 pub mod ffi;
 mod host;
-mod lane;
+mod job;
 pub mod launch;
 mod logging;
 pub mod memory;

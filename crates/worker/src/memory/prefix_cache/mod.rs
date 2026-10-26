@@ -9,10 +9,10 @@
 //!   transfers;
 //! - [`UnitAccesses`]: the physical accesses (executions, exports, imports)
 //!   that decide unit reuse;
-//! - the import lane: bounded workspaces whose host tasks copy other ranks'
+//! - the import pool: bounded workspaces whose host tasks copy other ranks'
 //!   exports into assigned pages;
 //! - [`HostKvCache`]: the host page pools the engine copies pages through, on
-//!   the rank's copy lane ([`PrefixCache::issue_pages`]).
+//!   the rank's copy stream ([`PrefixCache::issue_pages`]).
 //!
 //! Every device write runs on a stream the caller supplies; nothing reads a
 //! "current" stream. All validation precedes the first device write, and
@@ -46,8 +46,8 @@ use self::planes::{CachePlanes, UnitColumn};
 use super::allocation::StorageView;
 use super::request_slots::RequestSlots;
 use crate::ffi::{Handle, Interpreter, strings};
-use crate::host::HostLane;
-use crate::lane::Job;
+use crate::host::HostPool;
+use crate::job::Job;
 use crate::stream::Issue;
 use crate::transfer::cache_export::{self, CacheExport};
 use crate::transfer::exports::Location;
@@ -60,18 +60,18 @@ use crate::{Error, HostTask, Result, lock};
 /// The most import copy threads (and workspaces) a rank runs.
 const IMPORT_WORKERS: usize = 4;
 
-/// The host KV cache and the copy lane its copies run on: the lane's
-/// stream and its unit column.
-struct PageLane {
+/// The host KV cache, the copy stream its copies run on and the unit column
+/// bound on that stream.
+struct PageCopies {
     cache: HostKvCache,
     stream: Stream,
     column: UnitColumn,
 }
 
-/// A batch's page copies, recorded for the copy lane
+/// A batch's page copies, recorded on the copy stream
 /// ([`PrefixCache::issue_pages`]).
 pub(crate) struct IssuedPages {
-    /// The job to submit to the copy lane.
+    /// The job that issues the copies.
     pub(crate) job: Job,
     /// The device of the cache, whose streams record the fences.
     pub(crate) device: DeviceId,
@@ -89,9 +89,9 @@ pub struct PrefixCache {
     accesses: UnitAccesses,
     bases: TransferBases,
     imports: Imports,
-    /// The host KV cache and the copy lane its copies run on, when the
-    /// engine copies pages through it.
-    pages: Option<PageLane>,
+    /// The host KV cache and the copy stream its copies run on, when the engine
+    /// copies pages through it.
+    pages: Option<PageCopies>,
     /// The most units warmup lent as scratch (`1..=` this), which the rank
     /// reports so that a standby worker's warmup stays inside them.
     scratch_lent: u32,
@@ -186,7 +186,7 @@ impl PrefixCache {
             .map(|_| ImportWorkspace::bind(&planes).map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
         let importer = Arc::new(CacheImporter::new(workspaces));
-        let lane = HostLane::new(import_capacity.max(1), workers, "worker-cache-import")?;
+        let pool = HostPool::new(import_capacity.max(1), workers, "worker-cache-import")?;
         let retired = Arc::new(Retired {
             importer: Arc::downgrade(&importer),
             wake: Mutex::new(None),
@@ -200,7 +200,7 @@ impl PrefixCache {
             bases: TransferBases::default(),
             imports: Imports {
                 importer,
-                lane,
+                pool,
                 retired,
             },
             pages: None,
@@ -214,10 +214,10 @@ impl PrefixCache {
         self.pages.is_some()
     }
 
-    /// Copy pages through `cache` from now on, on the copy lane's `stream`.
+    /// Copy pages through `cache` from now on, on the copy stream `stream`.
     pub(crate) fn set_host_kv_cache(&mut self, cache: HostKvCache, stream: Stream) -> Result<()> {
         let column = UnitColumn::bind(&self.planes, Some(&stream))?;
-        self.pages = Some(PageLane {
+        self.pages = Some(PageCopies {
             cache,
             stream,
             column,
@@ -225,8 +225,8 @@ impl PrefixCache {
         Ok(())
     }
 
-    /// Record a batch's page copies on the copy lane, to be issued as soon
-    /// as the batch arrives: load the units of `loads` from their slots, and
+    /// Record a batch's page copies on the copy stream, to be issued as soon as
+    /// the batch arrives: load the units of `loads` from their slots, and
     /// offload the published units of `offloads` into theirs.
     ///
     /// The loads fill new units of the batch, which are idle (no in-flight
@@ -246,7 +246,7 @@ impl PrefixCache {
         loads: &[PageCopy],
         offloads: &[PageCopy],
     ) -> Result<IssuedPages> {
-        let lane = self.pages.as_ref().ok_or_else(|| {
+        let copies = self.pages.as_ref().ok_or_else(|| {
             Error::Invalid("a batch copies pages but the rank maps no page pool".into())
         })?;
         let device = self
@@ -262,8 +262,8 @@ impl PrefixCache {
         self.accesses.require_reusable(&spans)?;
 
         let job = Job::new();
-        let issue = job.on(Some(&lane.stream));
-        let fence = |issue: crate::lane::Recorder<'_>| -> Result<Arc<Event>> {
+        let issue = job.on(Some(&copies.stream));
+        let fence = |issue: crate::job::Recorder<'_>| -> Result<Arc<Event>> {
             let event = Arc::new(Event::new(EventFlags::default()));
             issue.record(&event)?;
             Ok(event)
@@ -271,13 +271,15 @@ impl PrefixCache {
         let loads_fence = if loads.is_empty() {
             None
         } else {
-            lane.cache.load(&self.planes, loads, &lane.column, issue)?;
+            copies
+                .cache
+                .load(&self.planes, loads, &copies.column, issue)?;
             Some(fence(issue)?)
         };
         let offloads_fence = if offloads.is_empty() {
             None
         } else {
-            lane.cache.offload(&self.planes, offloads, issue)?;
+            copies.cache.offload(&self.planes, offloads, issue)?;
             Some(fence(issue)?)
         };
         Ok(IssuedPages {
@@ -486,7 +488,8 @@ impl PrefixCache {
         Handle::new(Interpreter::import(&format!("{CACHE}.pool"))?.call_values(&arguments)?)
     }
 
-    /// Bind the unit resets to another stream (one per executing lane).
+    /// Bind the unit resets to another stream: the primary stream the
+    /// computations over the prefix cache execute on.
     pub fn bind_units(&self, stream: Option<&Stream>) -> Result<UnitColumn> {
         UnitColumn::bind(&self.planes, stream)
     }
@@ -616,7 +619,7 @@ impl PrefixCache {
             .import_spans(slot, &tables, &export, &initialized)?;
         let copy =
             !initialized.is_empty() || export.groups.iter().any(|group| !group.tensors.is_empty());
-        let task = copy.then(|| self.imports.lane.reserve()).transpose()?;
+        let task = copy.then(|| self.imports.pool.reserve()).transpose()?;
         let write = Arc::new(CacheImport::new(export.source, slot as usize, copy));
         let entry = ImportEntry::new(Arc::clone(&write));
 
@@ -737,7 +740,7 @@ impl PrefixCache {
 
     /// Install the service wake fired when imports finish or retire.
     pub(crate) fn set_wake(&self, wake: Option<Wake>) {
-        self.imports.lane.set_wake(wake.clone());
+        self.imports.pool.set_wake(wake.clone());
         *lock(&self.imports.retired.wake) = wake;
     }
 
@@ -826,7 +829,7 @@ impl PrefixCache {
     pub(crate) fn stop_imports(&mut self) -> Result<()> {
         let cancelled = self.imports.cancel(self.imports.importer.stop());
         let mut stopped = Ok(());
-        for error in self.imports.lane.close() {
+        for error in self.imports.pool.close() {
             stopped = stopped.and(Err(error));
         }
         cancelled.and(stopped).and(self.imports.retired.reap())

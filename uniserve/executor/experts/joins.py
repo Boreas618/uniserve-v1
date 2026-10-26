@@ -102,7 +102,8 @@ class JoinGraphs:
 
         Submits the captured join on the calling thread's current stream,
         which the caller sets to the stream the join was captured for: the
-        lane's for the union's joins, a microbatch's own for its joins.
+        primary stream for the union's joins, a microbatch's own for its
+        joins.
 
         Raises:
             ValueError: No captured join serves ``capacity``.

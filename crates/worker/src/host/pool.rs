@@ -11,7 +11,7 @@ use crate::{Completion, Error, Outcome, Result, lock};
 /// A one-shot observer of a host task's result.
 pub(crate) type HostCallback = Box<dyn FnOnce() + Send>;
 
-/// Work a host lane runs. The lane owns admission, scheduling, results and
+/// Work a host pool runs. The pool owns admission, scheduling, results and
 /// input retirement; an action supplies its work and its inputs' lifetime.
 pub(crate) trait HostAction: Send + Sync + Sized + 'static {
     type Output: Send + Sync;
@@ -21,10 +21,10 @@ pub(crate) trait HostAction: Send + Sync + Sized + 'static {
     /// Release the action's inputs once their physical producer stopped.
     fn release(&self) -> Result<()>;
 
-    /// Whether the inputs' physical producer stopped successfully, asked
-    /// once the action finished or was withdrawn. A failed or cancelled
-    /// outcome leaves the producer's completion unknown: the lane then keeps
-    /// the action, and every input it holds, until process exit.
+    /// Whether the inputs' physical producer stopped successfully, asked once
+    /// the action finished or was withdrawn. A failed or cancelled outcome
+    /// leaves the producer's completion unknown: the pool then keeps the
+    /// action, and every input it holds, until process exit.
     fn input_outcome(&self) -> Outcome;
 }
 
@@ -44,7 +44,7 @@ struct TaskState<A> {
 /// One admitted action and its result. Cancellation removes queued work before
 /// returning capacity; running work retains its inputs until it completes.
 pub(crate) struct HostTask<A: HostAction> {
-    lane: Weak<Mutex<LaneState<A>>>,
+    pool: Weak<Mutex<PoolState<A>>>,
     state: Mutex<TaskState<A>>,
     pub completion: Completion<HostCallback, Arc<A::Output>>,
 }
@@ -55,14 +55,14 @@ impl<A: HostAction> HostTask<A> {
     }
 
     pub(crate) fn configure(&self, action: A) -> Result<()> {
-        let lane = self
-            .lane
+        let pool = self
+            .pool
             .upgrade()
             .ok_or(Error::State("host task is no longer admitted"))?;
-        let lane = lock(&lane);
+        let pool = lock(&pool);
         let mut state = self.state();
 
-        if lane.closed || state.phase != Phase::Reserved {
+        if pool.closed || state.phase != Phase::Reserved {
             return Err(Error::State("host task is no longer admitted"));
         }
         if state.action.is_some() {
@@ -74,14 +74,14 @@ impl<A: HostAction> HostTask<A> {
     }
 
     pub(crate) fn submit(self: &Arc<Self>) -> Result<()> {
-        let lane = self
-            .lane
+        let pool = self
+            .pool
             .upgrade()
             .ok_or(Error::State("host task is no longer admitted"))?;
-        let mut lane = lock(&lane);
+        let mut pool = lock(&pool);
         let mut state = self.state();
 
-        if lane.closed || state.phase == Phase::Finished {
+        if pool.closed || state.phase == Phase::Finished {
             return Err(Error::State("host task is no longer admitted"));
         }
         if state.phase != Phase::Reserved {
@@ -91,9 +91,9 @@ impl<A: HostAction> HostTask<A> {
             return Err(Error::State("host task has no action"));
         }
 
-        lane.queue.push_back(Arc::clone(self));
+        pool.queue.push_back(Arc::clone(self));
         state.phase = Phase::Queued;
-        lane.ready.notify_one();
+        pool.ready.notify_one();
 
         Ok(())
     }
@@ -101,8 +101,8 @@ impl<A: HostAction> HostTask<A> {
     /// Abandon withdraws only unsubmitted work; cancel also withdraws queued
     /// work. Running actions keep their capacity and input leases to completion.
     pub(crate) fn cancel(self: &Arc<Self>, abandon: bool) -> Result<bool> {
-        let lane = self.lane.upgrade();
-        let mut lane = lane.as_ref().map(|lane| lock(lane));
+        let pool = self.pool.upgrade();
+        let mut pool = pool.as_ref().map(|pool| lock(pool));
         let mut state = self.state();
 
         if matches!(state.phase, Phase::Running | Phase::Finished)
@@ -111,18 +111,18 @@ impl<A: HostAction> HostTask<A> {
             return Ok(false);
         }
 
-        if let Some(lane) = lane.as_mut() {
+        if let Some(pool) = pool.as_mut() {
             // Dequeue and cancellation use the same admission lock. Once a
             // worker claims this task, cancellation can no longer release it.
             if state.phase == Phase::Queued {
-                lane.queue.retain(|task| !Arc::ptr_eq(task, self));
+                pool.queue.retain(|task| !Arc::ptr_eq(task, self));
             }
-            lane.tasks.remove(&(Arc::as_ptr(self) as usize));
+            pool.tasks.remove(&(Arc::as_ptr(self) as usize));
         }
         state.phase = Phase::Finished;
         let (cancelled, callbacks) = self.completion.cancel();
         drop(state);
-        drop(lane);
+        drop(pool);
 
         let released = self.release_input();
         notify(callbacks);
@@ -150,8 +150,8 @@ impl<A: HostAction> HostTask<A> {
         reason = "only configured queued tasks reach a worker; running tasks reject cancellation"
     )]
     fn run(self: &Arc<Self>, aborted: bool) {
-        // Worker threads carry their lane's name, which log records name.
-        let lane = thread::current().name().unwrap_or("host").to_owned();
+        // Worker threads carry their pool's name, which log records name.
+        let pool = thread::current().name().unwrap_or("host").to_owned();
         let (action, cancelled, callbacks) = {
             let mut state = self.state();
             let callbacks = if aborted {
@@ -176,7 +176,7 @@ impl<A: HostAction> HostTask<A> {
         if cancelled {
             drop(action);
             if let Err(error) = self.release_input() {
-                tracing::warn!("{lane}: releasing a withdrawn task's inputs failed: {error}");
+                tracing::warn!("{pool}: releasing a withdrawn task's inputs failed: {error}");
             }
             self.remove();
             return;
@@ -189,7 +189,7 @@ impl<A: HostAction> HostTask<A> {
                 Ok(_) => result = Err(cleanup),
                 Err(error) => {
                     tracing::warn!(
-                        "{lane}: releasing the inputs of a failed task also failed: {cleanup} (task: {error})"
+                        "{pool}: releasing the inputs of a failed task also failed: {cleanup} (task: {error})"
                     )
                 }
             }
@@ -209,10 +209,10 @@ impl<A: HostAction> HostTask<A> {
     }
 
     fn remove(self: &Arc<Self>) -> Option<Wake> {
-        let lane = self.lane.upgrade()?;
-        let mut lane = lock(&lane);
-        lane.tasks.remove(&(Arc::as_ptr(self) as usize));
-        lane.wake.clone()
+        let pool = self.pool.upgrade()?;
+        let mut pool = lock(&pool);
+        pool.tasks.remove(&(Arc::as_ptr(self) as usize));
+        pool.wake.clone()
     }
 }
 
@@ -223,7 +223,7 @@ fn notify(callbacks: Vec<HostCallback>) {
     }
 }
 
-struct LaneState<A: HostAction> {
+struct PoolState<A: HostAction> {
     capacity: usize,
     closed: bool,
     aborted: bool,
@@ -233,23 +233,23 @@ struct LaneState<A: HostAction> {
     wake: Option<Wake>,
 }
 
-/// A bounded lane with native worker threads. Abort stops admission without
+/// A bounded pool of native worker threads. Abort stops admission without
 /// joining tasks that may be waiting on a failed device or peer.
-pub(crate) struct HostLane<A: HostAction> {
-    state: Arc<Mutex<LaneState<A>>>,
+pub(crate) struct HostPool<A: HostAction> {
+    state: Arc<Mutex<PoolState<A>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl<A: HostAction> HostLane<A> {
+impl<A: HostAction> HostPool<A> {
     pub(crate) fn new(capacity: usize, workers: usize, name: &str) -> Result<Self> {
         if capacity == 0 || workers == 0 || workers > capacity {
             return Err(Error::Invalid(
-                "host workers must lie within positive lane capacity".into(),
+                "host workers must lie within positive pool capacity".into(),
             ));
         }
 
         let ready = Arc::new(Condvar::new());
-        let state = Arc::new(Mutex::new(LaneState {
+        let state = Arc::new(Mutex::new(PoolState {
             capacity,
             closed: false,
             aborted: false,
@@ -290,7 +290,7 @@ impl<A: HostAction> HostLane<A> {
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, LaneState<A>> {
+    fn state(&self) -> MutexGuard<'_, PoolState<A>> {
         lock(&self.state)
     }
 
@@ -302,13 +302,13 @@ impl<A: HostAction> HostLane<A> {
     pub(crate) fn reserve(&self) -> Result<Arc<HostTask<A>>> {
         let mut state = self.state();
         if state.closed {
-            return Err(Error::Resource("worker host lane is closed"));
+            return Err(Error::Resource("worker host pool is closed"));
         }
         if state.tasks.len() >= state.capacity {
-            return Err(Error::Resource("worker host lane capacity is exhausted"));
+            return Err(Error::Resource("worker host pool capacity is exhausted"));
         }
         let task = Arc::new(HostTask {
-            lane: Arc::downgrade(&self.state),
+            pool: Arc::downgrade(&self.state),
             state: Mutex::new(TaskState {
                 phase: Phase::Reserved,
                 action: None,
@@ -365,14 +365,14 @@ impl<A: HostAction> HostLane<A> {
     }
 }
 
-impl<A: HostAction> Drop for HostLane<A> {
+impl<A: HostAction> Drop for HostPool<A> {
     fn drop(&mut self) {
         // A destructor must not wait on a failed peer or require the GIL.
         self.abort();
     }
 }
 
-fn run_worker<A: HostAction>(state: Arc<Mutex<LaneState<A>>>, ready: Arc<Condvar>) {
+fn run_worker<A: HostAction>(state: Arc<Mutex<PoolState<A>>>, ready: Arc<Condvar>) {
     loop {
         let mut state = ready
             .wait_while(lock(&state), |state| {
@@ -399,7 +399,7 @@ mod tests {
     use super::*;
 
     /// An action whose inputs' producer stopped with `outcome`; it holds
-    /// `input` while the lane retains it.
+    /// `input` while the pool retains it.
     struct Probe {
         outcome: Outcome,
         _input: Arc<()>,
@@ -422,12 +422,12 @@ mod tests {
     }
 
     /// Run one task of `outcome` to its end and report whether its input is
-    /// still held once the lane, the task and every handle are gone.
+    /// still held once the pool, the task and every handle are gone.
     fn retained_after_close(outcome: Outcome) -> Result<bool> {
-        let lane = HostLane::new(1, 1, "lane-test")?;
+        let pool = HostPool::new(1, 1, "pool-test")?;
         let input = Arc::new(());
         let held = Arc::downgrade(&input);
-        let task = lane.reserve()?;
+        let task = pool.reserve()?;
         task.configure(Probe {
             outcome,
             _input: input,
@@ -447,16 +447,16 @@ mod tests {
             Some(Outcome::Success(_))
         ));
 
-        if let Some(error) = lane.close().into_iter().next() {
+        if let Some(error) = pool.close().into_iter().next() {
             return Err(error);
         }
         drop(task);
-        drop(lane);
+        drop(pool);
         Ok(held.upgrade().is_some())
     }
 
     #[test]
-    fn inputs_of_an_unknown_completion_outlive_the_lane() -> Result<()> {
+    fn inputs_of_an_unknown_completion_outlive_the_pool() -> Result<()> {
         assert!(!retained_after_close(Outcome::Success(()))?);
         let unknown = Arc::new(Error::transport("device access could not be drained"));
         assert!(retained_after_close(Outcome::Failed(unknown))?);

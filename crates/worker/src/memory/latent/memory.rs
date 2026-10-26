@@ -73,7 +73,8 @@ impl LatentPlan {
     }
 }
 
-/// The latent pool's storage on one device (or host memory for CPU lanes).
+/// The latent pool's storage on one device (or host memory for computations on
+/// the host).
 pub struct LatentStorage {
     num_pages: u32,
     page_units: u32,

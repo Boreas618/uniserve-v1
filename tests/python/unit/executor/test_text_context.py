@@ -1,6 +1,6 @@
 """Rows of prefill calls placing image features in a request's sequence.
 
-The image half answers a text lane's questions through the
+The image half answers a text computation's questions through the
 :class:`~uniserve.executor.text.context.ImageFacts` and
 :class:`~uniserve.executor.text.context.ImageDenoiser` protocols; these
 tests answer them with framed temporal blocks (a start marker, the

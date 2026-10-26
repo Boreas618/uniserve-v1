@@ -32,7 +32,7 @@ _FIXTURE = (
 
 def test_philox_matches_the_reference_known_answer_vectors():
     # Random123 Philox4x32-10 known-answer vectors establish the exact
-    # round count, lane ordering, and key schedule.
+    # round count, counter word ordering, and key schedule.
     assert philox4x32_10([0, 0, 0, 0], [0, 0]).tolist() == [
         0x6627_E8D5,
         0xE169_C58D,

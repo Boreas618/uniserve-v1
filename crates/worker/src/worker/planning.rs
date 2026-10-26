@@ -1,8 +1,8 @@
 //! Capacity planning of a loaded rank: the block size and the cache's layout
-//! ([`block_size`], [`cache_plan`]), which the executor's token lanes are
-//! sized by, then ([`plan`]) the request slots, cache units and latent pages
-//! its device budget holds, agreed over the group, with a video rank's slot
-//! layout, and the planned capacity reported once for operators.
+//! ([`block_size`], [`cache_plan`]), which the executor's token computations
+//! are sized by, then ([`plan`]) the request slots, cache units and latent
+//! pages its device budget holds, agreed over the group, with a video rank's
+//! slot layout, and the planned capacity reported once for operators.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use std::sync::Arc;
 use cuda::HandleType;
 use ipc::{CallKind, ComponentInfo};
 
+use super::computations::PageManifest;
 use super::image::ImageManifest;
-use super::lanes::PageManifest;
 use super::loading::LoadedModel;
 use super::{endpoint, exports_device_products};
 use crate::capacity::device::{DeviceBudget, total_bytes};
@@ -67,8 +67,9 @@ pub(super) fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     );
 }
 
-/// Unit columns the rank's lane binds beside the import workers'.
-const LANE_COLUMNS: usize = 1;
+/// Unit columns the computations over the prefix cache bind beside the import
+/// workers': one, on the device's primary stream.
+const COMPUTATION_COLUMNS: usize = 1;
 
 /// Resolve the rank's KV block size into `config`: the largest of at most
 /// 64 tokens every resident cache layer's attention reads, agreed over the
@@ -132,10 +133,10 @@ pub(super) fn cache_plan(
     )?))
 }
 
-/// Resolve the rank's capacity on the loaded model, at the block size and
-/// with the `cache` layout resolved before: what the executor's manifest
-/// states its lanes over the prefix cache allocate (`pages`), and a video
-/// model's `video` manifest.
+/// Resolve the rank's capacity on the loaded model, at the block size and with
+/// the `cache` layout resolved before: what the executor's manifest states its
+/// computations over the prefix cache allocate (`pages`), and a video model's
+/// `video` manifest.
 #[expect(
     clippy::too_many_arguments,
     reason = "the loaded rank's owners that capacity planning reads"
@@ -267,7 +268,8 @@ pub(super) fn plan(
             Device::Cpu => 0,
         };
         // The cache's fixed storage beside its units: block tables, import
-        // scratch and one unit index column per import worker and lane.
+        // scratch and one unit index column per import worker and per stream
+        // the computations over the cache bind.
         let shapes = cache.group_shapes()?;
         let width = cache_width(&shapes, config.max_model_len);
         let import_capacity = layout.info().max_unresolved_calls as usize;
@@ -277,18 +279,18 @@ pub(super) fn plan(
             layout.info().request_slots,
             width,
             import_capacity,
-            LANE_COLUMNS,
+            COMPUTATION_COLUMNS,
         )?;
         layout.reserve(config.device, fixed);
-        // The buffers of the lanes over the prefix cache and their request
-        // slots' state.
+        // The buffers of the computations over the prefix cache and their
+        // request slots' state.
         if let Some(pages) = pages {
             layout.reserve(
                 config.device,
                 pages.reserved_bytes(layout.info().request_slots as usize),
             );
         }
-        // The image lanes' buffers and their request slots' state.
+        // The image computations' buffers and their request slots' state.
         if let Some(image) = image {
             layout.reserve(
                 config.device,
@@ -296,10 +298,10 @@ pub(super) fn plan(
             );
         }
         // Every unit column holds one index per unit, charged with each unit:
-        // the import workers', the lane's and the copy lane's of a rank that
-        // copies pages through the host KV cache.
+        // the import workers', the primary stream's and the copy stream's of a
+        // rank that copies pages through the host KV cache.
         let columns = PrefixCache::import_workers(import_capacity)
-            + LANE_COLUMNS
+            + COMPUTATION_COLUMNS
             + usize::from(launch.storage.host_kv_cache);
         let unit_overhead = columns as u64 * UnitColumn::bytes(1);
         let granularity = match config.device {

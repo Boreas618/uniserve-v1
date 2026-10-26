@@ -14,13 +14,12 @@
 //! - **Cache install** (`TransferMode::CacheInstall`): each call adopts the cache
 //!   import its batch prepared into its slot's pages ([`prefix_cache`]).
 //!
-//! A batch is at most two jobs of its lane ([`forward`], [`complete`]) on
-//! the shared batch skeleton ([`crate::executor::batch`]). The first exists
-//! when a call has a host-gated predicate: it reads them, and a false one
-//! skips its call, which only publishes a false completion flag. The last
-//! job carries everything the batch issues: the start of its output lease,
-//! the completion flags, the transfers with their exports, the readers'
-//! fences and the lease's seal.
+//! A batch is at most two jobs ([`forward`], [`complete`]) on the shared batch
+//! skeleton ([`crate::executor::batch`]). The first exists when a call has a
+//! host-gated predicate: it reads them, and a false one skips its call, which
+//! only publishes a false completion flag. The last job carries everything the
+//! batch issues: the start of its output lease, the completion flags, the
+//! transfers with their exports, the readers' fences and the lease's seal.
 //!
 //! The completion of that job is the batch's commit point. Exports are
 //! located only there, so nothing of an export reaches another process
@@ -50,15 +49,15 @@ use ipc::{Batch as BatchPlan, BufferId, CallKind, ForwardStats, RequestKey, Tran
 
 use super::backend::{WorkerBackend, WorkerBatch};
 use super::batch::{Batch, Failure, Launched, Opening, Stage, fail};
+use super::computations::Computations;
 use super::inputs::{Inputs, component_device};
-use super::lanes::ExecutorLanes;
 use super::latents::LatentLedger;
 use super::pages::Pages;
 use super::products::Publications;
 use crate::error::WorkerError;
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{CommandJob, RequestStorage};
 use crate::ffi::MemoryKind;
-use crate::lane::{Completion, Job, Recorder};
+use crate::job::{Completion, Job, Recorder};
 use crate::lock;
 use crate::memory::{OutputPool, ProductBuffer, ProductExport};
 use crate::request::RequestPool;
@@ -71,8 +70,7 @@ use prefix_cache::{Exporting, Installation, Published};
 /// The transfer runtime of a rank: the streams its transfers and imports
 /// run on, and its output storage.
 pub(crate) struct TransferRuntime {
-    /// The full-device stream of each CUDA device, the lane's on the
-    /// primary device.
+    /// The primary stream of each CUDA device.
     streams: HashMap<DeviceId, Stream>,
     outputs: OutputPool,
 }
@@ -114,7 +112,7 @@ impl TransferRuntime {
         Ok(Some(stream.clone()))
     }
 
-    /// Release output storage after the lanes drained.
+    /// Release output storage after the jobs drained.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         self.outputs.begin_close();
         if !aborted {
@@ -128,7 +126,7 @@ impl RequestStorage for TransferRuntime {
     fn release_buffers(
         &mut self,
         _buffers: &std::collections::HashSet<BufferId>,
-        _jobs: &LaneJobs,
+        _jobs: &CommandJob,
     ) -> Result<()> {
         Ok(())
     }
@@ -137,7 +135,7 @@ impl RequestStorage for TransferRuntime {
         &mut self,
         _requests: &std::collections::HashSet<RequestKey>,
         _retained: &std::collections::HashSet<BufferId>,
-        _jobs: &LaneJobs,
+        _jobs: &CommandJob,
     ) -> Result<()> {
         Ok(())
     }
@@ -151,7 +149,7 @@ impl RequestStorage for TransferRuntime {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn retire_slots(&mut self, _slots: &[usize], _jobs: &CommandJob) -> Result<()> {
         Ok(())
     }
 
@@ -170,11 +168,11 @@ fn transfers_cache(kind: CallKind) -> bool {
     kind != CallKind::Transfer(TransferMode::Tensor)
 }
 
-/// What the lanes over the prefix cache share, for `component`'s cache
+/// What the computations over the prefix cache share, for `component`'s cache
 /// transfers, which order with their batches.
-fn cache_pages<'a>(lanes: Option<&'a ExecutorLanes>, component: &str) -> Result<&'a Pages> {
-    lanes
-        .ok_or_else(|| Error::Unsupported("cache transfers require a text lane".into()))?
+fn cache_pages<'a>(computations: Option<&'a Computations>, component: &str) -> Result<&'a Pages> {
+    computations
+        .ok_or_else(|| Error::Unsupported("cache transfers require a text computation".into()))?
         .pages_of(component)
 }
 
@@ -200,7 +198,7 @@ fn placement(
     if transfers_cache(kind) {
         // Cache transfers read and write the pages text batches use, on their
         // stream.
-        let pages = cache_pages(backend.lanes(), &first.component)?;
+        let pages = cache_pages(backend.computations(), &first.component)?;
         Ok((pages.device(), pages.stream().cloned()))
     } else {
         let device = component_device(backend, &first.component)?;
@@ -224,7 +222,7 @@ fn open(
         return Err(Error::Unsupported("transfers require rank storage".into()));
     };
     if transfers_cache(kind) {
-        cache_pages(parts.lanes.as_deref(), &plan.calls[0].component)?
+        cache_pages(parts.computations.as_deref(), &plan.calls[0].component)?
             .order()
             .wait(job.on(stream))?;
     }
@@ -293,15 +291,15 @@ fn record(
     let result = (|| -> Result<()> {
         batch.bind_flags()?;
         if cache {
-            let pages = cache_pages(parts.lanes.as_deref(), &plan.calls[0].component)?;
+            let pages = cache_pages(parts.computations.as_deref(), &plan.calls[0].component)?;
             batch.reserve_cache(pages.unit_column(), inputs)?;
         }
         match kind {
             CallKind::Transfer(TransferMode::Tensor) => batch.copy_products(
                 parts
-                    .lanes
+                    .computations
                     .as_deref_mut()
-                    .and_then(ExecutorLanes::ledger_mut),
+                    .and_then(Computations::ledger_mut),
             )?,
             CallKind::Transfer(TransferMode::CacheExport) => batch.export_cache()?,
             CallKind::Transfer(TransferMode::CacheInstall) => batch.install_cache(inputs)?,
@@ -315,9 +313,9 @@ fn record(
         batch.seal()?;
         if cache
             && let Some(pages) = parts
-                .lanes
+                .computations
                 .as_deref_mut()
-                .and_then(|lanes| lanes.pages_mut())
+                .and_then(|computations| computations.pages_mut())
         {
             // Later batches over the prefix cache on other streams order
             // after the installed tables, pages and verified lengths.
@@ -331,8 +329,8 @@ fn record(
     }
 }
 
-/// The next job of a transfer batch on its lane, or `None` when the batch
-/// advanced without one: it failed and its calls are reported.
+/// The next job of a transfer batch, or `None` when the batch advanced without
+/// one: it failed and its calls are reported.
 pub(crate) fn forward<'a>(
     backend: &'a mut WorkerBackend,
     batch: &'a mut WorkerBatch,
@@ -373,8 +371,8 @@ pub(crate) fn forward<'a>(
                 &job,
             ),
             Some(state) => {
-                // A job of the batch is on the lane: its completion comes
-                // before the next job.
+                // A job of the batch is in flight: its completion comes before
+                // the next job.
                 *pending = Some(state);
                 return Err(WorkerError::classify(
                     Error::Invariant(
@@ -396,7 +394,7 @@ pub(crate) fn forward<'a>(
     Ok(job)
 }
 
-/// Apply the completion of the transfer batch's job on the lane.
+/// Apply the completion of the transfer batch's job.
 pub(crate) fn complete(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
@@ -427,9 +425,9 @@ pub(crate) fn complete(
                 storage,
                 parts.requests,
                 parts
-                    .lanes
+                    .computations
                     .as_deref_mut()
-                    .and_then(ExecutorLanes::ledger_mut),
+                    .and_then(Computations::ledger_mut),
                 &plan,
                 completed.map(drop),
             );
@@ -447,9 +445,9 @@ pub(crate) fn complete(
                 (Some(recorded), Some(storage)) => recorded.discard(
                     storage,
                     parts
-                        .lanes
+                        .computations
                         .as_deref_mut()
-                        .and_then(ExecutorLanes::ledger_mut),
+                        .and_then(Computations::ledger_mut),
                 ),
                 (Some(_), None) => Err(Error::Invariant(
                     "a transfer batch lost its rank storage".into(),
@@ -467,7 +465,7 @@ pub(crate) fn complete(
         (state, _) => {
             *batch.transfer_parts().2 = state;
             return Err(WorkerError::classify(
-                Error::Invariant("a transfer batch has no job on its lane".into()),
+                Error::Invariant("a transfer batch has no job in flight".into()),
                 Some("transfer batch"),
             ));
         }
@@ -478,16 +476,15 @@ pub(crate) fn complete(
 
 /// A transfer batch between two of its jobs.
 pub(crate) enum Pending {
-    /// The job on the lane reads the batch's host-gated predicates.
+    /// The job in flight reads the batch's host-gated predicates.
     Predicates(Opening),
     /// The predicates are known: the batch reserves, transfers and seals
     /// next.
     Opened(Opening),
-    /// The job on the lane is the batch's last: its completion commits the
-    /// batch.
+    /// The job in flight is the batch's last: its completion commits the batch.
     Committing(Box<Recorded>),
-    /// The job on the lane carries what the failed batch recorded: its
-    /// completion retires what the batch reserved, if anything.
+    /// The job in flight carries what the failed batch recorded: its completion
+    /// retires what the batch reserved, if anything.
     Discarding(Option<Box<Recorded>>, Failure),
     /// The batch failed and holds nothing: its calls are reported next.
     Failed(Failure),
