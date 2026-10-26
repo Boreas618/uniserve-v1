@@ -116,9 +116,17 @@ impl Jobs {
                 completions: &self.completions,
             };
             // The job and everything it holds is gone before its submitter
-            // learns that it completed.
+            // learns that it completed. The driver calls in it that wait
+            // for the device are counted, not failed: the host reads of
+            // predicates still wait for their producers.
+            let watched = cuda::cupti::Watched::enter();
             let (completion, after) = job.perform_operations();
             performing.job = None;
+            crate::profiling::blocking::add(
+                std::thread::current().name().unwrap_or("lane"),
+                &watched.calls(),
+            );
+            drop(watched);
 
             let post = Post {
                 id,

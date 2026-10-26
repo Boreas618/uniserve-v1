@@ -189,6 +189,18 @@ impl Streams {
         )
     }
 
+    /// The lane's and the copy lane's streams, by lane name.
+    pub(crate) fn lanes(&self) -> impl Iterator<Item = (&'static str, &CUDAStream)> {
+        self.lane
+            .iter()
+            .map(|lane| (crate::lane::LANE, &lane.stream))
+            .chain(
+                self.copy
+                    .iter()
+                    .map(|lane| (crate::lane::COPY_LANE, &lane.stream)),
+            )
+    }
+
     /// The full-device stream of `device`: the lane's for the primary
     /// device.
     pub(crate) fn stream_for(&self, device: DeviceId) -> Option<&CUDAStream> {

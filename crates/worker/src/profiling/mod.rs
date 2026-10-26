@@ -1,6 +1,9 @@
-//! Observability of a rank: NVTX ranges, selected kernels and profiler
-//! windows.
+//! Observability of a rank: NVTX ranges, selected kernels, profiler
+//! windows, and CUPTI's watch of its waits for the device and record of its
+//! lanes' device time.
 
+pub(crate) mod blocking;
+pub(crate) mod cupti;
 pub(crate) mod kernels;
 pub(crate) mod profiler;
 mod ranges;

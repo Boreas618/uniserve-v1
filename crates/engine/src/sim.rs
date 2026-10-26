@@ -430,8 +430,8 @@ impl Executor for SimExecutor {
     }
 
     /// Answers the engine's own worker hooks as a worker without a device
-    /// does: its cache is not split into segments and it gives back no
-    /// memory. It loads and unloads LoRA adapters as a worker with a LoRA
+    /// does: its cache is not split into segments, it gives back no memory
+    /// and it has no CUPTI to attach. It loads and unloads LoRA adapters as a worker with a LoRA
     /// plugin does, answering the slot; other plugin hooks fail, as no
     /// plugin is loaded.
     fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
@@ -449,6 +449,9 @@ impl Executor for SimExecutor {
             | "uniserve.sleep"
             | "uniserve.wake" => serde_json::Value::Null,
             "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
+            "uniserve.attach_cupti" | "uniserve.detach_cupti" => {
+                serde_json::json!({ "attached": false, "lane_activity": false })
+            }
             "load_lora_adapter" | "unload_lora_adapter" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;
                 serde_json::json!({ "adapter": payload["adapter"] })

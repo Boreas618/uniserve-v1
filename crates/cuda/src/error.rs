@@ -56,6 +56,12 @@ pub enum Error {
         message: &'static str,
     },
 
+    /// A CUPTI call returned a `CUptiResult` other than `CUPTI_SUCCESS`.
+    /// `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED` (39) means another
+    /// CUPTI client, such as a profiler, holds the process's subscription.
+    #[error("{call} failed with CUPTI result {code}")]
+    Cupti { call: &'static str, code: i32 },
+
     /// The operation is not issued on a stream that is being captured into a
     /// CUDA graph.
     #[error("{call} is not permitted on a capturing stream")]
@@ -64,6 +70,18 @@ pub enum Error {
     /// The event has no recorded work to time or export.
     #[error("the CUDA event has not been recorded")]
     NotRecorded,
+
+    /// A recording of stream activity started while another records
+    /// (`cupti::activity::StreamActivity`).
+    #[error("stream activity is already recorded")]
+    ActivityRecorded,
+
+    /// The operating system refused a thread this crate starts.
+    #[error("cannot start the {name} thread: {source}")]
+    Thread {
+        name: &'static str,
+        source: Arc<std::io::Error>,
+    },
 
     /// A caller-supplied value violates the operation's contract.
     #[error("invalid argument: {0}")]

@@ -54,8 +54,8 @@ pub(crate) struct Operation {
     pub id: u64,
     /// `update`, `update_weights`, `pause_generation`,
     /// `continue_generation`, `flush_cache`, `sleep`, `wake_up`,
-    /// `load_lora_adapter`, `unload_lora_adapter`, `hook`, `restart` or
-    /// `shutdown`.
+    /// `load_lora_adapter`, `unload_lora_adapter`, `cupti`, `hook`,
+    /// `restart` or `shutdown`.
     pub kind: String,
     /// `running`, `succeeded` or `failed`.
     pub state: String,
@@ -329,6 +329,7 @@ pub(crate) fn router(state: AdminState) -> Router {
         .route("/admin/wake_up", post(wake_up))
         .route("/admin/load_lora_adapter", post(load_lora_adapter))
         .route("/admin/unload_lora_adapter", post(unload_lora_adapter))
+        .route("/admin/cupti", post(cupti))
         .route("/admin/hooks/{name}", post(named_hook))
         .with_state(state)
 }
@@ -630,6 +631,46 @@ async fn unload_lora_adapter(State(state): State<AdminState>, body: axum::body::
     run(&state.admin, "unload_lora_adapter", true, async move {
         leader
             .unload_adapter(body)
+            .await
+            .map(|results| json!({ "results": json_results(&results) }))
+            .map_err(|error| {
+                (
+                    update_status(&error),
+                    format!("{:#}", anyhow::Error::from(error)),
+                )
+            })
+    })
+    .await
+}
+
+/// The body of `POST /admin/cupti`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CuptiBody {
+    /// Whether every worker's process is to have CUPTI attached.
+    attached: bool,
+}
+
+/// `POST /admin/cupti`: every worker attaches CUPTI
+/// (`uniserve.attach_cupti`) or detaches it (`uniserve.detach_cupti`) at the
+/// engine's next step boundary, and answers whether it is attached and
+/// records its lanes' device time. Attached, the workers count the driver
+/// calls that make their threads wait for the device and report their lane
+/// streams' busy and idle time.
+async fn cupti(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+    let body: CuptiBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
+    };
+    let hook = if body.attached {
+        "uniserve.attach_cupti"
+    } else {
+        "uniserve.detach_cupti"
+    };
+    let leader = Arc::clone(&state.leader);
+    run(&state.admin, "cupti", true, async move {
+        leader
+            .hook(hook, "null")
             .await
             .map(|results| json!({ "results": json_results(&results) }))
             .map_err(|error| {

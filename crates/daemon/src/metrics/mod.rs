@@ -37,8 +37,9 @@ pub(crate) mod stats;
 pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
 pub use request::{FinishedReasonLabels, RequestMetrics};
 pub use scheduler::{
-    EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
-    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics,
+    EngineBackendLabels, EngineBlockingLabels, EngineComponentLabels, EngineDomainKindLabels,
+    EngineDomainLabels, EngineLabels, EngineLaneLabels, EngineModeLabels, EnginePathLabels,
+    SchedulerMetrics,
 };
 
 /// Unsigned Prometheus counter used by metric families.

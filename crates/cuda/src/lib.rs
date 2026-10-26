@@ -25,6 +25,7 @@
 
 mod context;
 mod copy;
+pub mod cupti;
 mod device;
 mod driver;
 mod error;

@@ -2,6 +2,19 @@
 
 UniServe's execution sanitizer reads profiler captures and produces hints about host waits, GIL ownership, copies and language crossings. It does not change execution, reject a request or establish that an operation is unnecessary. Inspect each hint in its workload context, then measure any optimization without the diagnostic instrumentation.
 
+## Watch host waits and lane idle time while serving
+
+A serving worker attaches NVIDIA's CUPTI to its process and reports two counters with every batch result, which the daemon exports as Prometheus metrics:
+
+| Metric | Labels | What it counts |
+| --- | --- | --- |
+| `uniserve:worker_blocking_calls` | `thread`, `call` | Driver calls that made a serving thread wait for the device: stream, event and context synchronization, synchronous copies, `cuMemFree`, `cuMemFreeHost` and `cuMemUnmap`. Runtime and PyTorch calls reach these driver calls and are counted too. `thread` is `builder` (the executor's Python calls), a lane's execution thread (`lane-0`, `copy-lane`) or `control` |
+| `uniserve:worker_lane_us` | `lane`, `state` | Microseconds of each lane stream's device time from CUPTI's activity records of the kernels, copies and fills on the stream, graph nodes included: `busy` is the length of the union of their intervals, `gap` the time the stream had nothing to run between its first operation and its latest end, whether it waited for the host, for another stream or for any work, and `late` the time of records that arrived after the two seconds of device time the union keeps behind the stream's latest end, counted in neither |
+
+A serving call of the executor (`start`, `prepare`, `execute`, `commit`, `join_expert_step`, `release`) that makes the host wait for the device fails with `InvariantViolation`, naming the calls. A lane's job and the control thread are counted without failing, since some of their reads still wait for their producers.
+
+A worker loads the CUPTI library that sits beside the CUDA runtime it loaded, which is the `nvidia-cuda-cupti` package of its Python environment; the CUDA 13.0 toolkit's own CUPTI (2025.3.0) stalls a worker that replays CUDA graphs while kernels are recorded. CUPTI accepts one subscriber per process. A worker whose process a profiler already subscribed, such as Nsight Systems tracing CUDA, logs that CUPTI is not attached and reports neither counter. `POST /admin/cupti` with `{"attached": false}` detaches CUPTI from every worker at the engine's next step boundary, and `{"attached": true}` attaches it again (`docs/admin.md`). Detached, a worker has no CUPTI callback subscription and no activity record enabled, and reports neither counter. The CUPTI library stays loaded in the process: removing it (`cuptiFinalize`) after it recorded a serving worker's activity leaves the device work the worker submits afterwards waiting forever.
+
 ## Capture and inspect a CUDA timeline
 
 Set `UNISERVE_NVTX=1` before starting the worker. The native executor emits synchronous ranges named `uniserve.worker.admit`, `prepare`, `inputs`, `execute`, `retire`, `poll`, `result` and `close`, with the batch ID as a numeric payload. Shared resource reclamation uses `uniserve.worker.reap` without a batch payload. Startup phases emit `uniserve.worker.describe`, `load`, `plan`, `bind`, `warmup` and `capture` without a payload. The switch is read once per process: by the native executor on first use and by the Python library when `uniserve.profiling` is imported. Python numerical ranges, such as `uniserve.collective` launches, remain nested within those stages. Native ranges use the NVIDIA NVTX SDK directly and issue no Python callbacks or CUDA operations.
