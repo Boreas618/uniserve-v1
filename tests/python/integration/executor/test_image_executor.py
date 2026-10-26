@@ -195,7 +195,12 @@ class _Worker:
         self.executor.seal()
         return phases
 
-    def run(self, kind, calls, tensors, forward=None):
+    def run(self, kind, calls, tensors, forward=None, predicate=None):
+        """Prepare and execute one batch.
+
+        ``predicate`` gates the first call on a leased ``uint8 [1]`` device
+        predicate, which follows every other tensor as the worker binds it.
+        """
         computation = self.computations[kind]
         step = {"batch_id": 1, "computation": computation, "calls": calls}
         prepared = self.executor.prepare(computation, step)
@@ -206,6 +211,9 @@ class _Worker:
         ]
         if forward is not None:
             bound.append(forward)
+        if predicate is not None:
+            calls[0]["predicate"] = len(bound)
+            bound.append(predicate)
         modes = self.executor.execute(
             computation, {**step, "prepared": prepared}, bound
         )
@@ -225,8 +233,12 @@ def _call(kind, **fields):
     }
 
 
-def _serve(worker: _Worker) -> dict:
-    """Serve one guided image request's batches; return what they wrote."""
+# The served trajectory's pages and its rows of the latent banks.
+LATENT = {"pages": [3, 4], "units": 4, "height": 32, "width": 32}
+
+
+def _start(worker: _Worker) -> None:
+    """Start one guided image request in slot 1."""
     worker.executor.start(
         [
             {
@@ -249,6 +261,51 @@ def _serve(worker: _Worker) -> dict:
             }
         ]
     )
+
+
+def _preparation() -> dict:
+    """The trajectory's latent preparation, into bank 1."""
+    return {
+        **_call("latent_preparation", image_index=0),
+        "latent": {"read": 1, "write": 1, "step": 0, **LATENT},
+    }
+
+
+def _denoising(worker: _Worker, read: int, write: int, step: int):
+    """A guided denoising step and its attention rows.
+
+    Its branches read slot 1's context, then the empty prefixes of slots 2
+    and 3.
+    """
+    call = {
+        **_call("denoising"),
+        "latent": {"read": read, "write": write, "step": step, **LATENT},
+        "image": {
+            "input": None,
+            "input_images": 1,
+            "progress": {"logical": 4, "visible": 4},
+            "allocated": [[1, 16], [2, 0], [3, 0]],
+        },
+    }
+    query = 4 + 2
+    attention = [(1, 4, query), (2, 0, query), (3, 0, query), (1, 4, 0)]
+    forward = torch.tensor(
+        [
+            [0] * 4,
+            [slot for slot, _, _ in attention],
+            [prefix + count for _, prefix, count in attention],
+            [count for _, _, count in attention],
+            [0] * 4,
+            *worker.columns(attention).tolist(),
+        ],
+        dtype=torch.int64,
+    )
+    return call, forward
+
+
+def _serve(worker: _Worker) -> dict:
+    """Serve one guided image request's batches; return what they wrote."""
+    _start(worker)
     results: dict = {"modes": []}
 
     # A generated image's latent encode.
@@ -274,41 +331,13 @@ def _serve(worker: _Worker) -> dict:
     )
     results["rows"] = rows.cpu()
 
-    # The trajectory, guided by all three branches: slot 1's context, then
-    # the empty prefixes of slots 2 and 3.
+    # The trajectory, guided by all three branches.
     worker.install([4, 0, 0])
-    latent = {"pages": [3, 4], "units": 4, "height": 32, "width": 32}
-    prepare = {
-        **_call("latent_preparation", image_index=0),
-        "latent": {"read": 1, "write": 1, "step": 0, **latent},
-    }
     results["modes"] += worker.run(
-        "latent_preparation", [prepare], lambda entry, planned: []
+        "latent_preparation", [_preparation()], lambda entry, planned: []
     )
-    query = 4 + 2
     for step, (read, write) in enumerate(((1, 0), (0, 1))):
-        call = {
-            **_call("denoising"),
-            "latent": {"read": read, "write": write, "step": step, **latent},
-            "image": {
-                "input": None,
-                "input_images": 1,
-                "progress": {"logical": 4, "visible": 4},
-                "allocated": [[1, 16], [2, 0], [3, 0]],
-            },
-        }
-        attention = [(1, 4, query), (2, 0, query), (3, 0, query), (1, 4, 0)]
-        forward = torch.tensor(
-            [
-                [0] * 4,
-                [slot for slot, _, _ in attention],
-                [prefix + count for _, prefix, count in attention],
-                [count for _, _, count in attention],
-                [0] * 4,
-                *worker.columns(attention).tolist(),
-            ],
-            dtype=torch.int64,
-        )
+        call, forward = _denoising(worker, read, write, step)
         results["modes"] += worker.run(
             "denoising", [call], lambda entry, planned: [], forward=forward
         )
@@ -320,7 +349,7 @@ def _serve(worker: _Worker) -> dict:
             latent_input={"generation": 3},
             image_output={"generation": 1},
         ),
-        "latent": {"read": 1, "write": 1, "step": 2, **latent},
+        "latent": {"read": 1, "write": 1, "step": 2, **LATENT},
     }
     product = torch.zeros((3, 32, 32), dtype=torch.bfloat16, device=DEVICE)
     staged = torch.zeros(3 * 32 * 32, dtype=torch.uint8).pin_memory()
@@ -365,3 +394,37 @@ def test_served_batches_replay_warmup_captures_and_equal_eager(stub):
     for name in ("rows", "latent", "product", "bytes"):
         assert torch.equal(replayed[name], served[name]), name
     assert np.isfinite(replayed["latent"].float().numpy()).all()
+
+
+def test_a_false_predicate_leaves_the_trajectory_as_it_was(stub):
+    worker = _Worker(stub, graphs=False)
+    _start(worker)
+    worker.install([4, 0, 0])
+    true = torch.ones(1, dtype=torch.uint8, device=DEVICE)
+    false = torch.zeros(1, dtype=torch.uint8, device=DEVICE)
+    pages = slice(3, 5)
+    nothing = lambda entry, planned: []  # noqa: E731
+
+    # A skipped preparation leaves the bank it would write as it was; a
+    # run one writes the trajectory's initial latent.
+    worker.banks[1].fill_(0.5)
+    before = worker.banks[1][pages].clone()
+    worker.run("latent_preparation", [_preparation()], nothing, predicate=false)
+    assert torch.equal(worker.banks[1][pages], before)
+    worker.run("latent_preparation", [_preparation()], nothing, predicate=true)
+    initial = worker.banks[1][pages].clone()
+    assert not torch.equal(initial, before)
+
+    # A skipped step writes the committed latent; a run one writes what the
+    # ungated step writes. The stub predicts zero, so no step advances the
+    # latent here (`test_image_families` steps a real denoiser).
+    written = {}
+    for name, predicate in (("false", false), ("true", true), ("none", None)):
+        worker.banks[0].zero_()
+        call, forward = _denoising(worker, 1, 0, 0)
+        worker.run(
+            "denoising", [call], nothing, forward=forward, predicate=predicate
+        )
+        written[name] = worker.banks[0][pages].clone()
+    assert torch.equal(written["false"], initial)
+    assert torch.equal(written["true"], written["none"])

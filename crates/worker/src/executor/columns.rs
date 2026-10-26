@@ -72,8 +72,8 @@ pub(crate) mod field {
     pub(crate) const SLOT: usize = 0;
     /// 0 prefill, 1 decode, 2 verify, 3 token denoising.
     pub(crate) const KIND: usize = 1;
-    /// Whether the call executes: its request was not refused and no
-    /// host-gated predicate skipped it.
+    /// Whether the call executes: its request was not refused. A false
+    /// predicate gates the call on the device instead (`PREDICATE`).
     pub(crate) const ACTIVE: usize = 2;
     /// The call's coordinates: its first token's logical position, the
     /// visible and computed prefix cache lengths.
@@ -87,10 +87,10 @@ pub(crate) mod field {
     /// The tokens the slot's block tables hold once the batch installed
     /// them; zero for a call that does not execute.
     pub(crate) const ALLOCATED: usize = 8;
-    /// 0 none, 1 a `uint8` predicate (read on the host and applied through
-    /// ACTIVE, except a token-denoising step's, which its slot state
-    /// decides on the device), 2 an `int64` relayed continuation, which the
-    /// executor gates on its slot state.
+    /// 0 none, 1 a `uint8` predicate the executor gates the call on, on the
+    /// device: the feature the call's JSON names (`predicate.tensor`), or a
+    /// token-denoising step's, its slot state; 2 an `int64` relayed
+    /// continuation, which the executor gates on its slot state.
     pub(crate) const PREDICATE: usize = 9;
     /// The call's rows among the forward columns, which hold each call's
     /// rows together in row order.
@@ -332,6 +332,19 @@ pub(crate) fn column_step(
         if !entry.is_empty() {
             entries.insert(index.to_string(), serde_json::Value::Object(entry));
         }
+    }
+
+    // The leased `uint8` predicates (`Batch::lease_predicates`), which gate
+    // their calls on the device.
+    for (index, state) in batch.calls.iter().enumerate() {
+        let Some(predicate) = state.predicate.clone() else {
+            continue;
+        };
+        features.push(predicate);
+        let entry = entries
+            .entry(index.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        entry["predicate"] = serde_json::json!({"tensor": features.len() - 1});
     }
 
     // The flat tokens: each active call's input tokens, then each readout's

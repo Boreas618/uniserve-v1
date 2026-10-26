@@ -238,6 +238,39 @@ impl OutputBuffer {
             .ok_or(Error::State("completion words have not been read back"))
     }
 
+    /// Reserve the next `count` token words for device values the lease's owner
+    /// copies in itself, on the lease's stream before its seal (a call
+    /// predicate's byte, `crate::executor::batch`). The words are zero until a
+    /// copy lands, so a copy of fewer bytes than a word leaves the rest zero.
+    /// Returns the offset of the first word and its host address. Words are
+    /// reserved before any are lent.
+    pub(crate) fn reserve_words(&mut self, count: usize) -> Result<(usize, u64)> {
+        self.require_open()?;
+        if self.lent.is_some() {
+            return Err(Error::Invariant(
+                "output words are reserved before the rest are lent".into(),
+            ));
+        }
+        let storage = self.storage()?;
+        let available = (storage.words * 8 - self.bytes) / 8;
+        let offset = self.tokens;
+        if !offset
+            .checked_add(count)
+            .is_some_and(|end| end <= available)
+        {
+            return Err(Error::Resource(
+                "reserved words exceed pinned output capacity",
+            ));
+        }
+        let address = storage.address() + (offset * size_of::<i64>()) as u64;
+        // SAFETY: the words lie inside the lease's storage, which no device
+        // copy writes before this lease issues one, and no reader reads before
+        // the seal's fences.
+        unsafe { std::ptr::write_bytes(address as *mut i64, 0, count) };
+        self.tokens = offset + count;
+        Ok((offset, address))
+    }
+
     /// Lend every token word the buffer has left to a producer that writes
     /// them itself: the executor copies its device values in on the lease's
     /// stream, in its own order, and states afterwards what it wrote

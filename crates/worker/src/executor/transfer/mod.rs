@@ -14,12 +14,11 @@
 //! - **Cache install** (`TransferMode::CacheInstall`): each call adopts the cache
 //!   import its batch prepared into its slot's pages ([`prefix_cache`]).
 //!
-//! A batch is at most two jobs ([`forward`], [`complete`]) on the shared batch
-//! skeleton ([`crate::executor::batch`]). The first exists when a call has a
-//! host-gated predicate: it reads them, and a false one skips its call, which
-//! only publishes a false completion flag. The last job carries everything the
-//! batch issues: the start of its output lease, the completion flags, the
-//! transfers with their exports, the readers' fences and the lease's seal.
+//! A batch is one job ([`forward`], [`complete`]) on the shared batch skeleton
+//! ([`crate::executor::batch`]), which carries everything the batch issues: the
+//! start of its output lease, the completion flags, the transfers with their
+//! exports, the readers' fences and the lease's seal. A transfer carries no
+//! predicate: the engine never queues one behind an unresolved call.
 //!
 //! The completion of that job is the batch's commit point. Exports are
 //! located only there, so nothing of an export reaches another process
@@ -206,36 +205,32 @@ fn placement(
     }
 }
 
-/// Bind the batch's outputs and record in `job` its order after the
-/// batches over the prefix cache (cache transfers) and the reads of its
-/// predicates.
+/// Bind the batch's outputs and record in `job` its order after the batches
+/// over the prefix cache (cache transfers). The engine never queues a transfer
+/// behind an unresolved call, so a transfer carries no predicate: a predicated
+/// transfer is refused.
 fn open(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
     kind: CallKind,
-    device: Option<DeviceId>,
     stream: Option<&Stream>,
     job: &Job,
 ) -> Result<Opening> {
     let parts = backend.parts();
-    let Some(storage) = parts.storage else {
+    if parts.storage.is_none() {
         return Err(Error::Unsupported("transfers require rank storage".into()));
-    };
+    }
+    if plan.calls.iter().any(|call| call.predicate.is_some()) {
+        return Err(Error::Invalid(
+            "a transfer follows a resolved call and carries no predicate".into(),
+        ));
+    }
     if transfers_cache(kind) {
         cache_pages(parts.computations.as_deref(), &plan.calls[0].component)?
             .order()
             .wait(job.on(stream))?;
     }
-    Opening::open(
-        parts.requests,
-        &storage.tensors,
-        parts.placement,
-        parts.rank,
-        plan,
-        device,
-        job.on(stream),
-        |_| true,
-    )
+    Opening::open(parts.requests, parts.placement, parts.rank, plan)
 }
 
 /// Record the opened batch's last job in `job`: its reservations, its
@@ -346,8 +341,7 @@ pub(crate) fn forward<'a>(
     let next = match placement(backend, plan, kind) {
         Err(error) => Pending::Discarding(None, Failure::new(PHASE)(error)),
         Ok((device, stream)) => match state {
-            None => match open(backend, plan, kind, device, stream.as_ref(), &job) {
-                Ok(opening) if opening.reads_predicates() => Pending::Predicates(opening),
+            None => match open(backend, plan, kind, stream.as_ref(), &job) {
                 Ok(opening) => record(
                     backend,
                     plan,
@@ -360,16 +354,6 @@ pub(crate) fn forward<'a>(
                 ),
                 Err(error) => Pending::Discarding(None, Failure::new(PHASE)(error)),
             },
-            Some(Pending::Opened(opening)) => record(
-                backend,
-                plan,
-                inputs,
-                kind,
-                opening,
-                device,
-                stream.as_ref(),
-                &job,
-            ),
             Some(state) => {
                 // A job of the batch is in flight: its completion comes before
                 // the next job.
@@ -405,15 +389,6 @@ pub(crate) fn complete(
     let completed = completion.check().map_err(|failure| failure.error);
     let mut parts = backend.parts();
     let next = match (state, completed) {
-        // A predicate that could not be read fails the batch, which has
-        // reserved nothing yet.
-        (Some(Pending::Predicates(_)), Err(error)) => Pending::Failed(Failure::new(PHASE)(error)),
-        (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
-            match opening.predicates(&mut completion) {
-                Ok(()) => Pending::Opened(opening),
-                Err(error) => Pending::Failed(Failure::new(PHASE)(error)),
-            }
-        }
         (Some(Pending::Committing(recorded)), completed) => {
             let Some(storage) = parts.storage else {
                 return Err(WorkerError::classify(
@@ -476,11 +451,6 @@ pub(crate) fn complete(
 
 /// A transfer batch between two of its jobs.
 pub(crate) enum Pending {
-    /// The job in flight reads the batch's host-gated predicates.
-    Predicates(Opening),
-    /// The predicates are known: the batch reserves, transfers and seals
-    /// next.
-    Opened(Opening),
     /// The job in flight is the batch's last: its completion commits the batch.
     Committing(Box<Recorded>),
     /// The job in flight carries what the failed batch recorded: its completion

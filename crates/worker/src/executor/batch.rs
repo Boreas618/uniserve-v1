@@ -13,11 +13,14 @@
 //! once:
 //!
 //! 1. **Open** ([`Opening::open`]). Bind every call's pending output to its
-//!    request and record in the opening job the read of every host-gated
-//!    predicate. The job's completion decides which calls are active
-//!    ([`Opening::predicates`]); a skipped call only publishes false flags.
-//! 2. **Lease** ([`Batch::lease`]). Lease the batch's output storage and
-//!    record the start of its device work.
+//!    request; a call of a request the rank refused is inactive and only
+//!    publishes false flags.
+//! 2. **Lease** ([`Batch::lease`], [`Batch::lease_predicates`]). Lease the
+//!    batch's output storage, record the start of its device work and lease
+//!    every call's `uint8` predicate on the device: the executor skips a call
+//!    whose predicate is false on the device, and the host learns it from the
+//!    call's predicate word once the batch's fences completed. Nothing waits
+//!    for a predicate on the host.
 //! 3. **Flags** ([`Batch::bind_flags`]). Bind every call's completion flag;
 //!    a skipped call publishes false at once.
 //! 4. **Seal** ([`Batch::end_reads`], [`Batch::set_flags`],
@@ -43,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cuda::{DeviceId, Stream};
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use ipc::CallId;
 use ipc::{
     Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardStats,
@@ -56,7 +59,8 @@ use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::products::ProductOwners;
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::MemoryKind;
-use crate::job::{Completion, Job, Recorder};
+use crate::job::{Completion, Job};
+use crate::memory::allocation::StorageView;
 use crate::memory::{
     OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead, ProductStore,
 };
@@ -112,9 +116,15 @@ pub(crate) struct CallState<F = ()> {
     pub(crate) output: PendingOutput,
     /// The request slot of the call's request.
     pub(crate) slot: usize,
-    /// False when the call's host-gated predicate skipped it, or when the
-    /// rank refused its request (its output then reports the refusal).
+    /// False when the rank refused the call's request (its output then reports
+    /// the refusal). A call whose predicate is false is active: its executor
+    /// skips it on the device ([`Self::predicate`]).
     pub(crate) active: bool,
+    /// The call's leased `uint8` predicate on the batch's device
+    /// ([`Batch::lease_predicates`]): the executor leaves every effect of the
+    /// call undone when it is false, and the call's completion flag and
+    /// predicate word are copies of it.
+    pub(crate) predicate: Option<StorageView>,
     pub(crate) completion_write: Option<ProductBuffer>,
     pub(crate) forward: F,
 }
@@ -127,13 +137,9 @@ impl<F> CallState<F> {
     }
 }
 
-/// A batch whose outputs are bound, before its output storage is leased:
-/// its host-gated predicates decide first which calls are active.
+/// A batch whose outputs are bound, before its output storage is leased.
 pub(crate) struct Opening<F = ()> {
     calls: Vec<CallState<F>>,
-    /// The calls whose predicate the opening job reads, in the order of its
-    /// reads.
-    predicated: Vec<usize>,
     /// This rank reports the component's host results.
     reports: bool,
     started: Instant,
@@ -141,22 +147,13 @@ pub(crate) struct Opening<F = ()> {
 
 impl<F: Default> Opening<F> {
     /// Bind the outputs of `plan`'s calls to their requests' live epochs and
-    /// slots, and record in `job` the read of every host-gated predicate of
-    /// a call `gated` selects. A call of a request this rank refused is
-    /// inactive and reports [`ErrorCode::InputError`] with the refusal's
-    /// reason; it reads no predicate. Each predicate is read after its producer's
-    /// fence; its read lease ends behind the read, and the job's completion
-    /// carries one byte per predicate.
-    #[expect(clippy::too_many_arguments, reason = "the owners a batch opens on")]
+    /// slots. A call of a request this rank refused is inactive and reports
+    /// [`ErrorCode::InputError`] with the refusal's reason.
     pub(crate) fn open(
         requests: &mut RequestPool,
-        tensors: &ProductStore,
         placement: &GroupPlacement,
         rank: usize,
         plan: &BatchPlan,
-        device: Option<DeviceId>,
-        job: Recorder<'_>,
-        gated: impl Fn(&Call) -> bool,
     ) -> Result<Self> {
         let started = Instant::now();
         let first = plan
@@ -184,29 +181,14 @@ impl<F: Default> Opening<F> {
                 output,
                 slot: request.slot(),
                 active: refusal.is_none(),
+                predicate: None,
                 completion_write: None,
                 forward: F::default(),
             });
         }
 
-        let mut predicated = Vec::new();
-        for (index, call) in plan.calls.iter().enumerate() {
-            if !calls[index].active {
-                continue;
-            }
-            let Some(predicate) = call
-                .predicate
-                .as_ref()
-                .filter(|predicate| predicate.dtype == DType::U8 && gated(call))
-            else {
-                continue;
-            };
-            request_flag(tensors, call, predicate, device, job)?;
-            predicated.push(index);
-        }
         Ok(Self {
             calls,
-            predicated,
             reports,
             started,
         })
@@ -217,25 +199,6 @@ impl<F> Opening<F> {
     /// The calls' states.
     pub(crate) fn calls(&self) -> &[CallState<F>] {
         &self.calls
-    }
-
-    /// Whether the opening job reads predicates, so the batch continues
-    /// only once that job completed.
-    pub(crate) fn reads_predicates(&self) -> bool {
-        !self.predicated.is_empty()
-    }
-
-    /// Apply the opening job's completion: a call whose predicate read
-    /// false is skipped.
-    pub(crate) fn predicates(&mut self, completion: &mut Completion) -> Result<()> {
-        for index in std::mem::take(&mut self.predicated) {
-            if !flag(completion)? {
-                let state = &mut self.calls[index];
-                state.active = false;
-                state.output.output.status = CallStatus::Predicated;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -384,14 +347,85 @@ impl<F> Batch<F> {
         tensors.complete_reads(&reads, job.on(self.stream.as_ref()), after)
     }
 
-    /// Record the completion flags of the executed calls: they become true.
+    /// Lease, on the batch's stream behind its producer, the `uint8` predicate
+    /// of every active call that `gated` selects, for the executor that skips
+    /// the call on the device when it is false ([`CallState::predicate`]), and
+    /// copy each into an output word of its own, which the call's result reads
+    /// once the batch's fences completed ([`PendingOutput::predicate_word`]).
+    /// The leases end with the batch's other reads. Nothing waits for a
+    /// predicate on the host.
+    pub(crate) fn lease_predicates(
+        &mut self,
+        plan: &BatchPlan,
+        tensors: &ProductStore,
+        events: &EventPool,
+        job: &Job,
+        gated: impl Fn(&Call) -> bool,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
+        let target = self.target();
+        let mut copies = CopyBatch::new(SourceOrder::Stream);
+        for (index, call) in plan.calls.iter().enumerate() {
+            if !self.calls[index].active {
+                continue;
+            }
+            let Some(predicate) = call
+                .predicate
+                .as_ref()
+                .filter(|predicate| predicate.dtype == DType::U8 && gated(call))
+            else {
+                continue;
+            };
+            let read = tensors.consume(predicate, call.call_id, Some(target), issue)?;
+            self.reads.push(Arc::clone(&read));
+            let value = read.value().clone();
+            if value.numel() != 1 {
+                return Err(Error::Invalid("a call predicate is one byte".into()));
+            }
+            let (word, address) = lock(&self.buffer).reserve_words(1)?;
+            // The byte lands in the low byte of the zeroed little-endian word.
+            copies.push(address, value.address(), 1);
+            let state = &mut self.calls[index];
+            state.output.predicate_word = Some(word);
+            state.predicate = Some(value);
+        }
+        if copies.is_empty() {
+            return Ok(());
+        }
+        if stream.is_some() {
+            lock(&self.buffer).begin_copy(self.device, issue, events)?;
+            // SAFETY: each source is a leased predicate, kept until the batch's
+            // read fences; each destination a reserved word of the batch's
+            // lease, read only after its seal's fences.
+            unsafe { issue.copy(&copies) }
+        } else {
+            // SAFETY: as above, in host memory, in the batch's order.
+            unsafe { issue.host().copy(&copies) }
+        }
+    }
+
+    /// Record the completion flags of the executed calls: true, or a copy of
+    /// the call's predicate for a call the executor may have skipped on the
+    /// device.
     pub(crate) fn set_flags(&self, tensors: &ProductStore, job: &Job) -> Result<()> {
+        let issue = job.on(self.stream.as_ref());
+        let (mut writes, mut predicates) = (Vec::new(), Vec::new());
         for state in self.calls.iter().filter(|state| state.active) {
-            if let Some(write) = &state.completion_write {
-                tensors.write_scalar(write, 1, job.on(self.stream.as_ref()))?;
+            let Some(write) = &state.completion_write else {
+                continue;
+            };
+            match &state.predicate {
+                Some(predicate) => {
+                    writes.push(write.clone());
+                    predicates.push(predicate.clone());
+                }
+                None => {
+                    tensors.write_scalar(write, 1, issue)?;
+                }
             }
         }
-        Ok(())
+        tensors.copy_scalars(&writes, &predicates, issue)
     }
 
     /// Check every call's captured output and the batch's writes before
@@ -499,34 +533,6 @@ impl<F> Batch<F> {
             timer,
             host,
         }
-    }
-}
-
-/// Record the read of a host-gated (U8) predicate after its producer's
-/// fence: the job's completion carries its byte, which [`flag`] decodes.
-pub(crate) fn request_flag(
-    tensors: &ProductStore,
-    call: &Call,
-    predicate: &TensorRef,
-    device: Option<DeviceId>,
-    job: Recorder<'_>,
-) -> Result<()> {
-    let read = tensors.consume(predicate, call.call_id, device.map(MemoryKind::Cuda), job)?;
-    // One byte of a committed product, which the read lease keeps until
-    // the reader's fence that ends it below.
-    job.read(read.value().address(), 1);
-    tensors.complete_reads(&[read], job, &[])
-}
-
-/// The predicate the next read of `completion` carries
-/// ([`request_flag`]).
-pub(crate) fn flag(completion: &mut Completion) -> Result<bool> {
-    match completion.read()?[..] {
-        [0] => Ok(false),
-        [1] => Ok(true),
-        _ => Err(Error::Invalid(
-            "call predicate is not a canonical boolean".into(),
-        )),
     }
 }
 
@@ -843,12 +849,8 @@ pub(crate) fn complete(
     completion: Completion,
 ) -> std::result::Result<(), WorkerError> {
     if batch.stage() == Stage::Inputs {
-        return match crate::executor::inputs::complete(batch, completion) {
-            // The imports' second job follows.
-            Ok(false) => Ok(()),
-            Ok(true) => imported(backend, batch, Ok(())),
-            Err(error) => imported(backend, batch, Err(error)),
-        };
+        let completed = crate::executor::inputs::complete(batch, completion);
+        return imported(backend, batch, completed);
     }
     match kind {
         CallKind::Transfer(_) => crate::executor::transfer::complete(backend, batch, completion),
@@ -965,7 +967,7 @@ mod tests {
         }
     }
 
-    /// The host-gated predicate the request's previous call produced.
+    /// The `uint8` predicate the request's previous call produced.
     fn predicate(request: u64) -> TensorRef {
         TensorRef {
             request_key: key(request),
@@ -1036,10 +1038,11 @@ mod tests {
         store.commit_writes(std::slice::from_ref(&buffer))
     }
 
-    /// Open a batch of one call per request, each gated by a predicate
-    /// holding the request's byte of `values` (`None`: no predicate), and
-    /// apply the opening job's completion.
-    fn open(values: &[Option<u8>]) -> Result<Opening> {
+    /// The statuses a batch of one call per request resolves to, each call
+    /// gated by a predicate holding the request's byte of `values` (`None`: no
+    /// predicate): the batch leases its predicates, copies them into its output
+    /// words in its job, and resolves from the words read back.
+    fn resolved(values: &[Option<u8>]) -> Result<Vec<CallStatus>> {
         let mut requests = RequestPool::new(values.len())?;
         let store = ProductStore::new(
             1024,
@@ -1064,42 +1067,39 @@ mod tests {
             calls.push(call(request, gate));
         }
         let plan = BatchPlan::new(2, Vec::new(), calls);
+        let placement = GroupPlacement {
+            world_size: 1,
+            ..GroupPlacement::default()
+        };
 
+        let opening = Opening::<()>::open(&mut requests, &placement, 0, &plan)?;
+        // A predicate decides nothing on the host: every call is active.
+        assert!(opening.calls().iter().all(|state| state.active));
+        let events = EventPool::new();
+        let mut outputs = OutputPool::new(None, 1, 64)?;
         let job = Job::new();
-        let mut opening = Opening::open(
-            &mut requests,
-            &store,
-            &GroupPlacement {
-                world_size: 1,
-                ..GroupPlacement::default()
-            },
-            0,
-            &plan,
-            None,
-            job.on(None),
-            |_| true,
-        )?;
-        assert_eq!(
-            opening.reads_predicates(),
-            values.iter().any(Option::is_some)
-        );
-        let mut completion = job.perform().check().map_err(|failure| failure.error)?;
-        opening.predicates(&mut completion)?;
-        Ok(opening)
+        let mut batch = Batch::lease(opening, &mut outputs, 64, None, None, &events, &job)?;
+        batch.lease_predicates(&plan, &store, &events, &job, |_| true)?;
+        job.perform().check().map_err(|failure| failure.error)?;
+
+        let mut buffer = lock(&batch.buffer);
+        buffer.seal::<Option<&Stream>>(&[], &events)?;
+        buffer.readback()?;
+        batch
+            .calls
+            .iter_mut()
+            .map(|state| {
+                let parent = state.output.progress;
+                state.output.resolve(parent, &mut buffer)?;
+                Ok(state.output.output.status)
+            })
+            .collect()
     }
 
     #[test]
-    fn a_batch_skips_exactly_the_calls_whose_predicate_is_false() -> Result<()> {
-        let opening = open(&[Some(1), Some(0), None, Some(0), Some(1)])?;
-        let active: Vec<bool> = opening.calls().iter().map(|state| state.active).collect();
-        assert_eq!(active, [true, false, true, false, true]);
-        let statuses: Vec<CallStatus> = opening
-            .calls()
-            .iter()
-            .map(|state| state.output.output.status)
-            .collect();
+    fn exactly_the_calls_whose_predicate_is_false_report_themselves_predicated() -> Result<()> {
         assert_eq!(
-            statuses,
+            resolved(&[Some(1), Some(0), None, Some(0), Some(1)])?,
             [
                 CallStatus::Ok,
                 CallStatus::Predicated,
@@ -1108,15 +1108,15 @@ mod tests {
                 CallStatus::Ok
             ]
         );
-
-        // A batch without host-gated predicates has nothing to read.
-        let opening = open(&[None, None])?;
-        assert!(opening.calls().iter().all(|state| state.active));
+        assert_eq!(resolved(&[None, None])?, [CallStatus::Ok, CallStatus::Ok]);
         Ok(())
     }
 
     #[test]
-    fn a_predicate_that_is_no_canonical_boolean_fails_the_batch() {
-        assert!(matches!(open(&[Some(1), Some(2)]), Err(Error::Invalid(_))));
+    fn a_predicate_that_is_no_canonical_boolean_fails_its_call() {
+        assert!(matches!(
+            resolved(&[Some(1), Some(2)]),
+            Err(Error::State(_))
+        ));
     }
 }

@@ -281,6 +281,9 @@ def prepare_calls(
     scores = np.asarray(scores, dtype=bool)
 
     tagged = predicate == Predicate.RELAY
+    # A relayed token's call and a device-predicated call are gated by the
+    # slot's continuation predicate.
+    gated = tagged | (predicate == Predicate.DEVICE)
     indexed = decode & tagged
     relay = (
         (predicate != Predicate.NONE)
@@ -323,7 +326,7 @@ def prepare_calls(
         prefix=columns[CallField.VISIBLE].copy(),
         query=query.astype(np.int64),
         selection=selection,
-        gated=tagged.copy(),
+        gated=gated,
         force=(
             np.zeros(n, dtype=bool)
             if force is None

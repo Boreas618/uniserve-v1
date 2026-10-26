@@ -78,7 +78,8 @@ class CallField(IntEnum):
     SLOT = 0
     # The call's kind (:class:`CallKind`).
     KIND = 1
-    # 1 when the call runs: not refused, and its host-gated predicate holds.
+    # 1 when the call runs: its request was not refused. A false predicate
+    # gates the call on the device instead (:class:`Predicate`).
     ACTIVE = 2
     # The request's accepted progress: logical position, visible and
     # computed cache lengths, sampling counter and prompt-logits readiness.
@@ -130,8 +131,11 @@ class Predicate(IntEnum):
 
     # The call is ungated.
     NONE = 0
-    # A host-read uint8 predicate, already applied to ``ACTIVE``.
-    HOST = 1
+    # A uint8 predicate the computation gates the call on, on the device:
+    # the call's JSON names its leased tensor (``predicate.tensor``), which
+    # is copied into the slot's continuation predicate before the forward;
+    # the call then runs as a gated row, as a relayed decode does.
+    DEVICE = 1
     # A relayed int64 token: the computation gates on its slot's
     # continuation.
     RELAY = 2

@@ -151,6 +151,71 @@ impl ProductStore {
         Ok(targets)
     }
 
+    /// Copy one element per product from the matching one-element view of
+    /// `sources` (device values of the products' dtype, such as the predicates
+    /// the products' calls read), in one batched copy on the producer `stream`,
+    /// which ordered behind the sources' producers.
+    pub(crate) fn copy_scalars(
+        &self,
+        writes: &[ProductBuffer],
+        sources: &[StorageView],
+        stream: impl Issue,
+    ) -> Result<()> {
+        let state = lock(&self.state);
+        if writes.len() != sources.len() {
+            return Err(Error::Invariant(
+                "a scalar copy names one source per product".into(),
+            ));
+        }
+        let mut batch = CopyBatch::new(SourceOrder::Stream);
+        let mut seen = HashSet::new();
+        let mut device = None;
+        for (write, source) in writes.iter().zip(sources) {
+            state.require_buffer(write)?;
+            if lock(write).state.produced() || !seen.insert(Arc::as_ptr(&write.0) as usize) {
+                return Err(Error::Invariant(
+                    "device product was published more than once".into(),
+                ));
+            }
+            let target = value_view(&write.view(), &[1], 1)?;
+            if source.numel() != 1
+                || target.dtype() != source.dtype()
+                || target.device() != source.device()
+                || device.is_some_and(|device| device != target.device())
+            {
+                return Err(Error::Invalid(
+                    "a scalar copy joins one-element values of one dtype on one device".into(),
+                ));
+            }
+            device = Some(target.device());
+            batch.push(target.address(), source.address(), target.dtype().bytes());
+        }
+        let Some(device) = device else {
+            return Ok(());
+        };
+        match device {
+            MemoryKind::Cuda(_) => {
+                if stream.stream().is_none() {
+                    return Err(Error::Invalid(
+                        "a device product write requires its producer stream".into(),
+                    ));
+                }
+                // SAFETY: each destination is one reserved element; each source
+                // is a leased element its reader keeps until its stream passes
+                // the copy.
+                unsafe { stream.copy(&batch) }?;
+            }
+            // SAFETY: host elements of reserved and leased products, copied in
+            // the producer's order.
+            _ => unsafe { stream.host().copy(&batch) }?,
+        }
+        let fence = self.producer_fence(device, stream, writes.len())?;
+        for write in writes {
+            lock(write).produced(vec![1], 1, fence.clone());
+        }
+        Ok(())
+    }
+
     /// Fill a one-element product with the integer `value` (its bit pattern
     /// in the product's dtype) on the producer `stream`.
     pub fn write_scalar(

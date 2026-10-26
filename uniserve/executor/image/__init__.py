@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from uniserve.errors import SetupError
+from uniserve.executor.predicates import split
 from uniserve.executor.text.protocol import GraphMode
 from uniserve.media.pixels import PreparedImage, Tower, prepare_tensor_image
 from uniserve.models import ImageDecoder, ImageDenoiser, PatchEncoder
@@ -1361,6 +1362,12 @@ class ImageExecutor:
         placed = self.placed[int(computation)]
         calls = step["calls"]
         prepared = step["prepared"]
+        # A predicated call runs whatever its predicate holds: latent
+        # preparation and denoising keep the trajectory's banks as they
+        # were when it is false, and the worker publishes none of a skipped
+        # call's products, so the features, images and bytes an encoding or
+        # decoding wrote are never read.
+        tensors, predicates = split(calls, tensors)
         cursor = sum(
             len(entry.get("reads", ())) + len(entry.get("writes", ()))
             for entry in prepared
@@ -1384,13 +1391,13 @@ class ImageExecutor:
             elif kind == "latent_encoding":
                 self._encode_latents(placed, bound, modes)
             elif kind == "latent_preparation":
-                self._prepare_latents(placed, bound, modes)
+                self._prepare_latents(placed, bound, modes, predicates)
             elif kind == "denoising":
                 if len(rest) != 1:
                     raise ValueError(
                         "a denoising batch receives its attention rows"
                     )
-                self._denoise(placed, bound, rest[0], modes)
+                self._denoise(placed, bound, rest[0], modes, predicates)
             elif kind == "image_decoding":
                 self._decode(placed, bound, modes)
             else:
@@ -1461,7 +1468,7 @@ class ImageExecutor:
                 pixels, out, seed=request.seed, draw=draw
             )
 
-    def _prepare_latents(self, computation, bound, modes) -> None:
+    def _prepare_latents(self, computation, bound, modes, predicates) -> None:
         denoiser = computation.denoiser
         assert denoiser is not None
         for entry, _, _ in bound:
@@ -1477,10 +1484,11 @@ class ImageExecutor:
                 request.negative,
                 int(image_index),
                 LatentBinding.from_json(entry["latent"]),
+                predicates.get(int(entry["index"])),
             )
 
     def _denoise(
-        self, computation, bound, forward: torch.Tensor, modes
+        self, computation, bound, forward: torch.Tensor, modes, predicates
     ) -> None:
         denoiser = computation.denoiser
         assert denoiser is not None
@@ -1502,6 +1510,7 @@ class ImageExecutor:
                         int(slot): int(tokens)
                         for slot, tokens in image.get("allocated") or ()
                     },
+                    predicate=predicates.get(int(entry["index"])),
                 )
             )
         ran = denoiser.denoise(calls, forward.numpy())

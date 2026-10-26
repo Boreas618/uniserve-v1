@@ -45,6 +45,7 @@ import torch
 from uniserve import cuda_graph
 from uniserve.bindings import capturing
 from uniserve.diffusion import advance_, normal_noise
+from uniserve.executor.predicates import kept
 from uniserve.executor.text.context import ConditionRow
 from uniserve.executor.text.graphs import GraphTable
 from uniserve.executor.text.protocol import GraphMode
@@ -725,6 +726,9 @@ class StepCall:
         logical: Its request's logical position.
         visible: Its request's visible cache tokens (its conditioning).
         allocated: The allocated tokens of each slot its rows address.
+        predicate: Its ``uint8 [1]`` device predicate, ``None`` for an
+            ungated call: when it is false, the step writes the committed
+            latent unadvanced (:mod:`uniserve.executor.predicates`).
     """
 
     index: int
@@ -736,6 +740,7 @@ class StepCall:
     logical: int
     visible: int
     allocated: Mapping[int, int]
+    predicate: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1158,13 +1163,15 @@ class Denoiser:
         negative: Sequence[int],
         image_index: int,
         latent: LatentBinding,
+        predicate: torch.Tensor | None = None,
     ) -> GraphMode:
         """Open a trajectory and write its seeded initial latent.
 
         The image's noise comes from the request's seed and ``image_index``,
         the index the engine assigned the image; the initial latent fills
         the trajectory's pages of the bank the ledger bound, zero past its
-        rows.
+        rows. A false ``predicate`` (the call's ``uint8 [1]`` device
+        predicate) leaves those pages as they were.
 
         Raises:
             ValueError: The ledger's binding disagrees with the image.
@@ -1198,6 +1205,10 @@ class Denoiser:
                 constants={},
                 workspace={},
             )
+            if predicate is not None:
+                previous = torch.empty_like(out)
+                self.banks.gather(latent.write, latent.pages, previous)
+                out.copy_(kept(predicate, out, previous))
             self.banks.scatter(latent.write, latent.pages, out)
         return GraphMode.EAGER
 
@@ -1413,6 +1424,11 @@ class Denoiser:
         guided = guidance.combine(outputs, schedule, step)
         timestep = self.slot_timesteps[entry.call.slot]
         timestep.fill_(entry.time)
+        # A call its false predicate skipped writes the committed latent it
+        # gathered, unadvanced: the ledger flips the banks at its commit
+        # either way.
+        predicate = entry.call.predicate
+        previous = None if predicate is None else values.clone()
         advance_(
             self.network,
             {"image": (LatentInput(values, timestep),)},
@@ -1420,6 +1436,8 @@ class Denoiser:
             plan.schedules,
             schedule.step(step),
         )
+        if previous is not None:
+            values.copy_(kept(predicate, values, previous))
         self.banks.scatter(latent.write, latent.pages, self.workspace[sample:])
 
     # Warmup.
