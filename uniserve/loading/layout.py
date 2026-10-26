@@ -81,6 +81,7 @@ def finalize(model: nn.Module, *, experts: ExpertKernels = "local") -> None:
     from uniserve.nn.linear import Linear
     from uniserve.nn.moe import FusedMoE
 
+    provider: moe.Backend
     # Every (module, name) holding each parameter: a replaced parameter is
     # installed on all of them, preserving shared identity.
     owners: dict[int, list[tuple[nn.Module, str]]] = defaultdict(list)
