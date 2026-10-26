@@ -111,10 +111,77 @@ fn raise_descriptor_limit() -> Result<(), String> {
     Ok(())
 }
 
+/// The variable FlashInfer's JIT builds and PyTorch's C++ extensions take
+/// their parallel compilation jobs from. Without it their ninja runs one
+/// job per CPU plus two.
+const COMPILE_JOBS_VARIABLE: &str = "MAX_JOBS";
+
+/// The peak host memory of one compilation job: one `cicc` of FlashInfer's
+/// fused-MoE build reaches 6.1 GiB.
+const COMPILE_JOB_BYTES: u64 = 61 * (1 << 30) / 10;
+
+/// Bound the parallel jobs of the kernels the worker compiles on first use,
+/// unless its environment sets `MAX_JOBS` itself.
+///
+/// The ranks of the worker's launch on its host (`LOCAL_WORLD_SIZE`, one
+/// when unset) start and compile together, so each takes an equal share of
+/// half of the host's available CPUs and of the memory available as it
+/// starts, at [`COMPILE_JOB_BYTES`] per job, and at least one job. The
+/// variable is set before the interpreter starts, so every build of the
+/// worker reads it.
+fn bound_compile_jobs() -> Result<(), String> {
+    if std::env::var_os(COMPILE_JOBS_VARIABLE).is_some() {
+        return Ok(());
+    }
+
+    let ranks = match std::env::var("LOCAL_WORLD_SIZE") {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|&ranks| ranks > 0)
+            .ok_or_else(|| format!("LOCAL_WORLD_SIZE={value} is not a positive rank count"))?,
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(error) => return Err(format!("reading LOCAL_WORLD_SIZE: {error}")),
+    };
+    let cpus = std::thread::available_parallelism()
+        .map_err(|error| format!("counting the available CPUs: {error}"))?
+        .get() as u64;
+    let available = available_memory()?;
+
+    let by_cpus = cpus / 2 / ranks;
+    let by_memory = available / (COMPILE_JOB_BYTES * ranks);
+    let jobs = by_cpus.min(by_memory).max(1);
+    eprintln!(
+        "uniserve worker: kernel compilations run up to {jobs} parallel jobs \
+         ({cpus} CPUs and {} GiB available for {ranks} ranks of this host; \
+         set {COMPILE_JOBS_VARIABLE} to choose)",
+        available >> 30
+    );
+    // SAFETY: no other thread exists yet (see `main`): the worker loads the
+    // Python runtime and starts its threads after this returns.
+    unsafe { std::env::set_var(COMPILE_JOBS_VARIABLE, jobs.to_string()) };
+    Ok(())
+}
+
+/// The host memory available to new allocations without swapping, in bytes:
+/// `MemAvailable` of `/proc/meminfo`.
+fn available_memory() -> Result<u64, String> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|error| format!("reading /proc/meminfo: {error}"))?;
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|value| value.trim().strip_suffix("kB"))
+        .and_then(|kilobytes| kilobytes.trim().parse::<u64>().ok())
+        .map(|kilobytes| kilobytes << 10)
+        .ok_or_else(|| "/proc/meminfo states no MemAvailable in kB".to_owned())
+}
+
 /// Load the environment's runtime and run the worker; returns its exit
 /// status, or why it could not start.
 fn start(arguments: Vec<OsString>) -> Result<c_int, String> {
     raise_descriptor_limit()?;
+    bound_compile_jobs()?;
     let python = environment_interpreter()?;
     let [libpython, libtvm_ffi, library] = locate(&python)?;
     if libpython.as_os_str().is_empty() {
