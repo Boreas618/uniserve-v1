@@ -767,8 +767,9 @@ class VideoExecutor:
         The tensors follow the order :meth:`prepare` named them, call by
         call: its reads, then its writes; the calls' ``uint8`` predicates
         follow them all (:mod:`uniserve.executor.predicates`). A predicated
-        call runs whatever its predicate holds: latent preparation and
-        denoising keep the trajectory's banks as they were when it is false.
+        call runs whatever its predicate holds: when it is false, latent
+        preparation keeps the bank it would write and the slot's tables and
+        conditioning, and denoising writes the samples it read.
         Returns how each call's forward ran.
         """
         tensors, predicates = split(step["calls"], tensors)
@@ -1022,14 +1023,14 @@ class VideoExecutor:
                 raise ValueError(
                     "prompt features disagree with the request's prompt"
                 )
-            mode = denoiser.condition(layout, slot, features)
+            mode = denoiser.condition(layout, slot, features, predicate)
             conditions = reads[1:]
         if record.conditions:
             latents = _condition_latents(record.conditions, conditions)
             mode = max(
                 mode,
                 denoiser.encode_conditions(
-                    layout, slot, admission.size, latents
+                    layout, slot, admission.size, latents, predicate
                 ),
             )
         return mode
