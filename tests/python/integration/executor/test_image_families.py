@@ -48,7 +48,9 @@ from uniserve.executor.image.denoiser import (
     CacheTables,
     Denoiser,
     LatentBanks,
+    LatentBinding,
     RowPages,
+    StepCall,
     split_rows,
 )
 from uniserve.executor.image.layout import ImageLayout
@@ -60,6 +62,7 @@ from uniserve.executor.image.shapes import (
     row_shapes,
     token_sizes,
 )
+from uniserve.executor.image.trajectory import ImageParams
 from uniserve.executor.image.vision import VisionEncoder, VisionImage
 from uniserve.executor.text.context import ConditionRow
 from uniserve.executor.text.protocol import GraphMode
@@ -690,3 +693,91 @@ def test_codec_graphs_replay_the_eager_encode_and_decode():
         results.append((rows, product, staged, quantized))
     for eager, replayed in zip(*results, strict=True):
         assert torch.equal(eager.cpu(), replayed.cpu())
+
+
+def test_a_false_predicate_writes_the_committed_latent_unadvanced(session):
+    """A denoising call its ``uint8`` device predicate skips advances nothing.
+
+    The step still writes its trajectory's next bank: the latent it read,
+    as the ledger flips the banks at the call's commit either way. A true
+    predicate steps as an ungated call does. The image is guided by its
+    conditioned branch alone (both scales 1.0), which reads slot 1's prompt
+    and needs no prefix prefill.
+    """
+    layout = session.layout
+    denoiser = session.eager
+    side = layout.downsample
+    height, width = 2 * side, 2 * side
+    units = layout.latent_rows(height, width)
+    params = ImageParams(
+        steps=2,
+        cfg_text_scale=1.0,
+        cfg_img_scale=1.0,
+        cfg_renorm_type="global",
+        cfg_renorm_min=0.0,
+        cfg_interval=(0.0, 1.0),
+        timestep_shift=1.0,
+        height=height,
+        width=width,
+        seed=11,
+    )
+    # One branch row reading slot 1's prompt, then the conditioning row,
+    # each with the prompt's pages of every cache group.
+    query = units + layout.framing_tokens
+    pages = -(-PROMPT // session.block)
+    groups = len(session.pool.groups)
+    forward = np.array(
+        [
+            [0, 0],
+            [1, 1],
+            [PROMPT + query, PROMPT],
+            [query, 0],
+            [0, 0],
+            *([[0, 0], [pages, pages]] * groups),
+        ],
+        dtype=np.int64,
+    )
+    committed = torch.randn(
+        (units, layout.width), generator=torch.Generator().manual_seed(5)
+    ).to(device=DEVICE, dtype=session.banks.dtype)
+    true = torch.ones(1, dtype=torch.uint8, device=DEVICE)
+    false = torch.zeros(1, dtype=torch.uint8, device=DEVICE)
+    written = {}
+    try:
+        for name, predicate in (
+            ("false", false),
+            ("true", true),
+            ("none", None),
+        ):
+            with torch.inference_mode():
+                session.banks.banks[0][1, :units].copy_(committed)
+                session.banks.banks[1].zero_()
+            call = StepCall(
+                index=0,
+                slot=1,
+                key=("predicated", name),
+                params=params,
+                negative=(),
+                latent=LatentBinding(
+                    read=0,
+                    write=1,
+                    step=0,
+                    pages=(1,),
+                    units=units,
+                    height=height,
+                    width=width,
+                ),
+                logical=PROMPT,
+                visible=PROMPT,
+                allocated={1: WIDTH * session.block},
+                predicate=predicate,
+            )
+            denoiser.denoise([call], forward)
+            session.stream.synchronize()
+            written[name] = session.banks.banks[1][1, :units].clone()
+            denoiser.release([1])
+    finally:
+        denoiser.release([1])
+    assert torch.equal(written["false"], committed)
+    assert not torch.equal(written["none"], committed)
+    assert torch.equal(written["true"], written["none"])

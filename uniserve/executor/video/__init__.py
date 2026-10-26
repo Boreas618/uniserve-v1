@@ -27,6 +27,7 @@ from typing import Any
 
 import torch
 
+from uniserve.executor.predicates import split
 from uniserve.executor.video.decoder import (
     AudioDecoder,
     TrackUnits,
@@ -86,6 +87,10 @@ __all__ = ["VideoExecutor", "VideoRequest", "condition_spans"]
 _HOST_CALLS = frozenset(
     ("media_reading", "video_encoding", "audio_encoding", "muxing")
 )
+
+# The calls that advance a request's trajectory, the ones the engine
+# predicates on their predecessor's completion (``CallKind::advances_state``).
+_PREDICATED_CALLS = frozenset(("latent_preparation", "denoising"))
 
 # The most keyframes a request brings: its first and its last frame
 # (:func:`~uniserve.executor.video.denoiser.keyframe_sets`).
@@ -760,9 +765,13 @@ class VideoExecutor:
         """Run a batch's calls with the tensors the worker leased and bound.
 
         The tensors follow the order :meth:`prepare` named them, call by
-        call: its reads, then its writes. Returns how each call's forward
-        ran.
+        call: its reads, then its writes; the calls' ``uint8`` predicates
+        follow them all (:mod:`uniserve.executor.predicates`). A predicated
+        call runs whatever its predicate holds: latent preparation and
+        denoising keep the trajectory's banks as they were when it is false.
+        Returns how each call's forward ran.
         """
+        tensors, predicates = split(step["calls"], tensors)
         modes = []
         cursor = 0
         for entry, prepared in zip(
@@ -780,11 +789,16 @@ class VideoExecutor:
                 continue
             reads = own[: len(prepared["reads"])]
             writes = own[len(prepared["reads"]) :]
-            modes.append(
-                getattr(self, f"_run_{kind}")(
-                    entry, step, prepared, reads, writes
+            run = getattr(self, f"_run_{kind}")
+            predicate = predicates.get(int(entry["index"]))
+            if kind in _PREDICATED_CALLS:
+                modes.append(
+                    run(entry, step, prepared, reads, writes, predicate)
                 )
-            )
+            elif predicate is not None:
+                raise ValueError(f"a {kind} call carries no predicate")
+            else:
+                modes.append(run(entry, step, prepared, reads, writes))
         return modes
 
     # Text encoding.
@@ -984,7 +998,7 @@ class VideoExecutor:
         return {"reads": reads, "writes": [], "publication": None}
 
     def _run_latent_preparation(
-        self, entry, step, prepared, reads, writes
+        self, entry, step, prepared, reads, writes, predicate=None
     ) -> int:
         assert self.denoiser is not None
         call = entry["call"]
@@ -997,7 +1011,9 @@ class VideoExecutor:
         # The request's noise and the host sources its slot is initialized
         # from.
         denoiser.prepare_latents(layout, slot, admission.size, record.seed)
-        denoiser.initialize(layout, slot, int(entry["latent"]["write"]))
+        denoiser.initialize(
+            layout, slot, int(entry["latent"]["write"]), predicate
+        )
         mode = EAGER
         conditions = reads
         if denoiser.conditions:
@@ -1055,7 +1071,9 @@ class VideoExecutor:
             )
         return {"reads": [], "writes": writes, "publication": None}
 
-    def _run_denoising(self, entry, step, prepared, reads, writes) -> int:
+    def _run_denoising(
+        self, entry, step, prepared, reads, writes, predicate=None
+    ) -> int:
         assert self.denoiser is not None
         record = self._request(entry["slot"], entry["call"]["request_key"])
         admission = record.admission
@@ -1078,6 +1096,7 @@ class VideoExecutor:
             int(latent["read"]),
             int(latent["write"]),
             step_index,
+            predicate,
         )
         if writes:
             samples = self.denoiser.final_samples(layout)

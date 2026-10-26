@@ -33,6 +33,7 @@ from typing import Any
 import torch
 
 from uniserve.cuda_graph import BreakableCUDAGraph, capture
+from uniserve.executor.predicates import kept
 from uniserve.executor.video.plan import (
     Canvas,
     ConditionShape,
@@ -463,30 +464,46 @@ class Denoiser:
             ),
         )
 
-    def initialize(self, layout: Layout, slot: int, bank: int) -> None:
+    def initialize(
+        self,
+        layout: Layout,
+        slot: int,
+        bank: int,
+        predicate: torch.Tensor | None = None,
+    ) -> None:
         """Copy a request's prepared host sources into its slot.
 
         Each modality's sample goes into ``bank`` of its pages and each table
-        into its slot rows.
+        into its slot rows. A false ``predicate`` (the call's ``uint8 [1]``
+        device predicate) leaves both as they were.
         """
         prepared = self.layouts[layout]
         pages = self.banks[bank][self._slot_pages(slot)].view(-1)
+
+        def install(target: torch.Tensor, source: torch.Tensor) -> None:
+            if predicate is None:
+                target.copy_(source, non_blocking=True)
+                return
+            staged = torch.empty_like(target)
+            staged.copy_(source, non_blocking=True)
+            target.copy_(kept(predicate, staged, target))
+
         with torch.cuda.stream(self.stream):
             for index, (name, _) in enumerate(prepared.fields.samples):
                 offset = prepared.samples.offsets[index]
                 count = prepared.samples.elements[index]
-                pages[offset : offset + count].copy_(
+                install(
+                    pages[offset : offset + count],
                     self.sources[f"{name}_source"][slot][:count],
-                    non_blocking=True,
                 )
             for field in prepared.fields.state:
                 if field.sample:
                     continue
-                self.slot_state[field.name][slot][: field.elements].copy_(
+                install(
+                    self.slot_state[field.name][slot][: field.elements],
                     self.sources[f"{field.name}_source"][slot][
                         : field.elements
                     ],
-                    non_blocking=True,
                 )
 
     @property
@@ -613,12 +630,21 @@ class Denoiser:
         return EAGER
 
     def denoise(
-        self, layout: Layout, slot: int, read: int, write: int, step: int
+        self,
+        layout: Layout,
+        slot: int,
+        read: int,
+        write: int,
+        step: int,
+        predicate: torch.Tensor | None = None,
     ) -> int:
         """Advance a request's trajectory by one solver step.
 
         The step reads its samples in bank ``read`` and writes them to bank
-        ``write``, at evaluation ``step``. Returns how the step ran.
+        ``write``, at evaluation ``step``; a false ``predicate`` (the call's
+        ``uint8 [1]`` device predicate) writes the samples it read,
+        unadvanced, since the ledger flips the banks at the call's commit
+        either way. Returns how the step ran.
         """
         prepared = self.layouts[layout]
         span = self._slot_pages(slot)
@@ -634,7 +660,11 @@ class Denoiser:
             self.step.fill_(step)
             mode = self._run_step(prepared)
             self.banks[write][span].reshape(-1)[:count].copy_(
-                self.samples[:count]
+                kept(
+                    predicate,
+                    self.samples[:count],
+                    self.banks[read][span].reshape(-1)[:count],
+                )
             )
         return mode
 

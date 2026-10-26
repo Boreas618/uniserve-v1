@@ -155,8 +155,8 @@ def test_calls_read_their_tokens_from_the_host_or_their_slot():
         {"kind": CallKind.DECODE, "predicate": Predicate.RELAY},
         # An ungated decode reads its first host token.
         {"kind": CallKind.DECODE, "tokens": 2},
-        # A host-gated decode relays its slot's committed token.
-        {"kind": CallKind.DECODE, "predicate": Predicate.HOST},
+        # A device-predicated decode relays its slot's committed token.
+        {"kind": CallKind.DECODE, "predicate": Predicate.DEVICE},
         # Prefills sampling, only writing the cache, and scoring.
         {"kind": CallKind.PREFILL, "tokens": 3, "flags": output},
         {"kind": CallKind.PREFILL, "tokens": 2},
@@ -204,7 +204,7 @@ def test_calls_read_their_tokens_from_the_host_or_their_slot():
     assert rows.host_tokens(1).tolist() == [40]
     assert rows.host_tokens(3).tolist() == [1, 2, 3]
     assert rows.host_tokens(7).tolist() == [81, 91]
-    assert rows.gated.tolist() == [1, 0, 0, 0, 0, 0, 0, 1, 1]
+    assert rows.gated.tolist() == [1, 0, 1, 0, 0, 0, 0, 1, 1]
     assert rows.prefix.tolist() == [10] * 9
     assert rows.position.tolist() == [10] * 9
 
@@ -217,6 +217,28 @@ def test_calls_read_their_tokens_from_the_host_or_their_slot():
     assert drafts[6] == [80, 90]
     assert drafts[7] == [81, 91]
     assert all(not drafts[index] for index in range(6))
+
+
+def test_a_device_predicated_prefill_reads_its_tokens_as_a_gated_row():
+    output = int(CallFlag.TOKEN_OUTPUT)
+    calls, tokens = _calls(
+        {"kind": CallKind.PREFILL, "tokens": 2, "flags": output},
+        {
+            "kind": CallKind.PREFILL,
+            "tokens": 2,
+            "flags": output,
+            "predicate": Predicate.DEVICE,
+        },
+        tokens=[1, 2, 3, 4],
+    )
+    rows = prepare_calls(
+        calls, tokens, np.arange(2), np.zeros(2, dtype=bool)
+    ).rows
+    # Both read their host tokens; only the predicated one is gated by its
+    # slot's continuation predicate.
+    assert rows.source.tolist() == [RowSource.HOST, RowSource.HOST]
+    assert rows.host_tokens(1).tolist() == [3, 4]
+    assert rows.gated.tolist() == [0, 1]
 
 
 @pytest.mark.parametrize(

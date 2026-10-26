@@ -62,6 +62,7 @@ from .protocol import (
     CallKind,
     ForwardField,
     GraphMode,
+    Predicate,
     RecordWriter,
     combine_modes,
     forward_fields,
@@ -121,6 +122,9 @@ class _Batch:
     # Latent conditionings and their pages, ``[2 * groups, n]``.
     conditions: list[ConditionRow]
     condition_pages: list[np.ndarray]
+    # The slot and ``uint8 [1]`` device predicate of each call a predicate
+    # gates (:attr:`Predicate.DEVICE`).
+    predicates: list[tuple[int, torch.Tensor]]
     # Per call of the batch: its task column and microbatch.
     task: np.ndarray = field(init=False)
     microbatch: np.ndarray = field(init=False)
@@ -323,6 +327,14 @@ class TextComputation:
                 np.concatenate(batch.condition_pages, axis=1),
                 self.stream,
             )
+        # A predicated call's predicate becomes its slot's continuation
+        # predicate, which its gated rows read on the device; nothing waits
+        # for it on the host. A false one leaves the call's selection
+        # stopped: its slot state does not continue.
+        if batch.predicates:
+            with torch.cuda.stream(self.stream):
+                for slot, predicate in batch.predicates:
+                    self.state.predicates[slot : slot + 1].copy_(predicate)
         for item in planned:
             assert item.plan is not None
             item.runner.stage(item.plan, item.invocation)
@@ -444,10 +456,22 @@ class TextComputation:
             media_scores={},
             conditions=[],
             condition_pages=[],
+            predicates=[],
         )
         for call in active[media]:
             self._media(
                 batch, int(call), entries.get(str(int(call)), {}), features
+            )
+        gated = active[calls[CallField.PREDICATE, active] == Predicate.DEVICE]
+        for call in map(int, gated):
+            entry = entries.get(str(call), {}).get("predicate")
+            if entry is None:
+                raise ValueError("a predicated call names no predicate tensor")
+            batch.predicates.append(
+                (
+                    int(calls[CallField.SLOT, call]),
+                    features[int(entry["tensor"])],
+                )
             )
         return batch
 
@@ -577,6 +601,11 @@ class TextComputation:
                 if call in batch.media:
                     built = batch.media[call]
                     part = placed_rows(built.rows)
+                    # A predicated media call's rows are gated as a
+                    # predicated text call's row is.
+                    predicate = batch.calls[CallField.PREDICATE, call]
+                    if predicate == Predicate.DEVICE:
+                        part.gated = np.ones(len(part), dtype=bool)
                     page_starts, page_counts = batch.media_pages[call]
                     embeddings.extend(
                         (tokens + token, values)

@@ -47,6 +47,10 @@ pub(crate) struct PendingOutput {
     pub candidate_range: Option<(usize, usize)>,
     /// Element offset and length of [step outcome | canvas token ids].
     pub canvas_range: Option<(usize, usize)>,
+    /// The output word its batch copied the call's `uint8` predicate into
+    /// (`crate::executor::batch`): zero when the executor skipped the call on
+    /// the device, which then reports itself predicated.
+    pub predicate_word: Option<usize>,
     /// The step index the call's latent update publishes, which a
     /// successful denoising result reports; zero for every other call. The
     /// latent pool is the rank's ledger of steps, so no coordinate carries
@@ -81,6 +85,7 @@ impl PendingOutput {
             prompt_logprob_ranges: Vec::new(),
             candidate_range: None,
             canvas_range: None,
+            predicate_word: None,
             step_index: 0,
             tensor_outputs,
             products: Vec::new(),
@@ -230,6 +235,9 @@ impl PendingOutput {
         }
         if self.output.status == CallStatus::Predicated {
             self.output.error_code = None;
+            // A call its false predicate skipped publishes nothing: what its
+            // products hold is what the executor left in them.
+            self.products.clear();
         }
         if self.output.status != CallStatus::Ok || !self.reports_output {
             self.discard_media();
@@ -274,6 +282,20 @@ impl PendingOutput {
     }
 
     fn decode(&mut self, buffer: &mut OutputBuffer) -> Result<()> {
+        // A false predicate skipped the call on the device: nothing else it
+        // captured is read.
+        if let Some(offset) = self.predicate_word {
+            match buffer.read_tokens(offset, 1)? {
+                [0] => {
+                    self.output.status = CallStatus::Predicated;
+                    return Ok(());
+                }
+                [1] => {}
+                _ => {
+                    return Err(Error::State("a call predicate is not a canonical boolean"));
+                }
+            }
+        }
         if let Some((offset, count)) = self.canvas_range {
             let Some((&outcome, tokens)) = buffer.read_tokens(offset, count)?.split_first() else {
                 return Err(Error::State("canvas completion has no step outcome"));
@@ -607,6 +629,41 @@ mod tests {
     }
 
     #[test]
+    fn a_call_its_predicate_skipped_reports_no_products() -> Result<()> {
+        let mut call = call();
+        let reference = TensorRef {
+            request_key: call.request_key,
+            producer_call_id: call.call_id,
+            output_index: 0,
+            generation: 1,
+            dtype: DType::U8,
+            shape_bound: ShapeBound::default(),
+        };
+        call.outputs.push(reference.clone());
+        let mut output = PendingOutput::new(&call, RequestProgress::default(), 0)?;
+        output.set_products(vec![TensorExport {
+            product: reference,
+            value: TransferHandle::DeviceProduct {
+                height: 0,
+                width: 0,
+                value_range: String::new(),
+                tensor: TensorTransfer {
+                    shape: vec![1],
+                    locations: Vec::new(),
+                },
+            },
+        }])?;
+
+        // The predicate word the batch copied the call's predicate into holds
+        // false.
+        output.predicate_word = Some(0);
+        output.resolve(RequestProgress::default(), &mut written(&[0])?)?;
+        assert_eq!(output.result()?.status, CallStatus::Predicated);
+        assert!(output.products().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn undelivered_media_is_unlinked_on_abandonment_or_drop() -> Result<()> {
         for abandon in [false, true] {
             let mut output = pending()?;
@@ -700,9 +757,14 @@ mod tests {
     /// the lent words: one valid, active row whose sampled token is `token`
     /// after `accepted` accepted drafts.
     fn sampling(token: i64, accepted: i64) -> Result<OutputBuffer> {
+        written(&[1_i64, 1, token, accepted])
+    }
+
+    /// An output buffer whose lent words the producer wrote as `words`, read
+    /// back.
+    fn written(words: &[i64]) -> Result<OutputBuffer> {
         use crate::memory::OutputStorage;
 
-        let words = [1_i64, 1, token, accepted];
         let mut buffer =
             OutputBuffer::new(OutputStorage::allocate(None, words.len())?, 1, &[], false);
         let (_, lent) = buffer.lend_words()?;

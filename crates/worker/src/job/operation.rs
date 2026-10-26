@@ -1,26 +1,24 @@
 //! A job's operations, and what performing them produced.
 //!
 //! A [`Job`] is an ordered list of operations on streams: copies, fills, event
-//! records and waits, an executor call, output reads, a host function, a host
-//! check of what the job's calls returned, a wait for the stream. The control
-//! thread builds it: a batch's step and the storage owners it uses record what
-//! they would issue ([`Job::on`], an [`Issue`]) and the executor calls the
-//! batch makes, and do their host bookkeeping as they are called. Every
-//! operation owns its data, so the job moves to the builder thread, which
-//! performs the operations in order and posts a [`Completion`] with what the
-//! calls returned and what the output reads produced. The control thread does
-//! not wait for it.
+//! records and waits, an executor call, a host function, a host check of what
+//! the job's calls returned, a wait for the stream. The control thread builds
+//! it: a batch's step and the storage owners it uses record what they would
+//! issue ([`Job::on`], an [`Issue`]) and the executor calls the batch makes,
+//! and do their host bookkeeping as they are called. Every operation owns its
+//! data, so the job moves to the builder thread, which performs the operations
+//! in order and posts a [`Completion`] with what the calls returned. The
+//! control thread does not wait for it.
 //!
 //! An operation names its stream, so one job orders work across the rank's
 //! device stream and the streams forked from it, and a job of a rank without a
 //! CUDA device (no stream) is plain memory writes and calls.
 //!
-//! A job is performed completely or it fails at one operation. After a
-//! failure the remaining copies, fills, calls, reads, host
-//! functions and waits are not performed, but the remaining event
-//! operations are: an event a job
-//! records fences storage its owner already retains on it, and that
-//! storage is returned only once the record is made.
+//! A job is performed completely or it fails at one operation. After a failure
+//! the remaining copies, fills, calls, host functions and waits are not
+//! performed, but the remaining event operations are: an event a job records
+//! fences storage its owner already retains on it, and that storage is returned
+//! only once the record is made.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -82,12 +80,6 @@ pub(super) enum Operation {
         event: Arc<Event>,
     },
     Call(Call),
-    /// Copy `bytes` at `source` to the host and wait for them.
-    Read {
-        stream: Option<Stream>,
-        source: u64,
-        bytes: usize,
-    },
     /// Run `function` on the host behind the stream's work issued before.
     HostFunction {
         stream: Option<Stream>,
@@ -135,8 +127,6 @@ pub(crate) struct Failure {
 /// operations: each accessor takes the next one of its kind.
 #[derive(Default)]
 pub(crate) struct Completion {
-    /// The bytes of each output read.
-    pub(super) reads: VecDeque<Vec<u8>>,
     /// The integers each returning call returned.
     pub(super) returned: VecDeque<Vec<i64>>,
     /// The object each handle call returned.
@@ -154,11 +144,6 @@ impl Completion {
             Some(failure) => Err(failure),
             None => Ok(self),
         }
-    }
-
-    /// The bytes of the next output read.
-    pub(crate) fn read(&mut self) -> Result<Vec<u8>> {
-        self.reads.pop_front().ok_or(MISSING)
     }
 
     /// The integers the next returning call returned
@@ -364,34 +349,6 @@ impl Operation {
             Self::Record { stream, event } => (&stream).record(&event),
             Self::Wait { stream, event } => (&stream).wait(&event),
             Self::Call(call) => call.perform(completion),
-            Self::Read {
-                stream,
-                source,
-                bytes,
-            } => {
-                let mut value = vec![0_u8; bytes];
-                match &stream {
-                    Some(stream) => {
-                        // SAFETY: the reader keeps the source valid until
-                        // the job completes; the host bytes outlive the
-                        // copy, which the stream is drained for.
-                        unsafe {
-                            cuda::memcpy_async(value.as_mut_ptr() as u64, source, bytes, stream)
-                        }?;
-                        stream.synchronize()?;
-                    }
-                    // SAFETY: host bytes the reader keeps valid.
-                    None => unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            source as *const u8,
-                            value.as_mut_ptr(),
-                            bytes,
-                        );
-                    },
-                }
-                completion.reads.push_back(value);
-                Ok(())
-            }
             Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
             Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
             Self::Check(check) => check(completion),
@@ -443,16 +400,6 @@ pub(crate) struct Recorder<'r> {
 impl Recorder<'_> {
     fn owned(&self) -> Option<Stream> {
         self.stream.cloned()
-    }
-
-    /// An output read of `bytes` bytes at `source`, which stay valid until
-    /// the job completes. The job's completion carries them.
-    pub(crate) fn read(&self, source: u64, bytes: usize) {
-        self.job.push(Operation::Read {
-            stream: self.owned(),
-            source,
-            bytes,
-        });
     }
 }
 
@@ -788,9 +735,8 @@ mod tests {
     }
 
     #[test]
-    fn host_operations_run_when_the_job_is_performed_and_reads_come_back() -> Result<()> {
+    fn host_operations_run_when_the_job_is_performed() -> Result<()> {
         let mut target = [0_u8; 4];
-        let state = [7_u8, 8];
         let job = Job::new();
         {
             // The copied source is gone before the job is performed.
@@ -802,16 +748,13 @@ mod tests {
         }
         // SAFETY: one byte of the test's array.
         unsafe { job.on(None).fill(byte(&raw mut target[3], 9)) }?;
-        job.on(None).read(state.as_ptr() as u64, 2);
 
         // Recording issues nothing.
         assert_eq!(target, [0; 4]);
-        assert_eq!(job.len(), 3);
+        assert_eq!(job.len(), 2);
 
-        let mut completion = job.perform().check().unwrap();
+        assert!(job.perform().check().is_ok());
         assert_eq!(target, [1, 2, 3, 9]);
-        assert_eq!(completion.read()?, vec![7, 8]);
-        assert!(completion.read().is_err());
         Ok(())
     }
 

@@ -18,19 +18,19 @@
 //! Every computation's batch goes through one sequence of jobs on the batch
 //! skeleton ([`crate::executor::batch`]):
 //!
-//! 1. **Opening.** Bind the calls to their requests and read their host-gated
-//!    predicates (a token-denoising step's continuation is never read on the
-//!    host: its slot state decides on the device). A computation over the
+//! 1. **Opening.** Bind the calls to their requests. A computation over the
 //!    prefix cache orders first after the batches whose writes it reads on
 //!    another stream and after the host KV cache reads issued for the batch on
-//!    the copy stream. A batch that reads predicates ends its job here.
+//!    the copy stream.
 //! 2. **Preparation**, for a computation that prepares: a job asks the executor
 //!    what each call reads and writes (`prepare`).
-//! 3. **Reservation**, in the batch's last job: lease the output storage
-//!    and reserve what the batch uses of the worker's resources: the
-//!    prefix cache's tables, units, extents and attention pages and the
-//!    relays (`PageReservation`), or the products the preparation named and
-//!    the trajectories' banks (`crate::executor::products::bind_prepared`).
+//! 3. **Reservation**, in the batch's last job: lease the output storage and
+//!    the calls' `uint8` predicates, which the executor applies on the device
+//!    (a token-denoising step's continuation is its slot state's, which gates
+//!    it on the device too), and reserve what the batch uses of the worker's
+//!    resources: the prefix cache's tables, units, extents and attention pages
+//!    and the relays (`PageReservation`), or the products the preparation named
+//!    and the trajectories' banks (`crate::executor::products::bind_prepared`).
 //! 4. **Execution.** `execute` computes the batch on what was reserved. A
 //!    computation that does not prepare reads host columns and writes its
 //!    results into output words the batch lent it, with completion records a
@@ -64,7 +64,7 @@ use std::sync::{Arc, OnceLock};
 
 use cuda::{DeviceId, Stream};
 use ipc::{
-    Batch as BatchPlan, BufferId, CallKind, ForwardMode, ForwardStats, RequestKey, WorkerInfo,
+    Batch as BatchPlan, BufferId, Call, CallKind, ForwardMode, ForwardStats, RequestKey, WorkerInfo,
 };
 
 use crate::config::placement::GroupPlacement;
@@ -411,11 +411,6 @@ pub(crate) struct Parked {
 
 /// A computation's batch between two of its jobs.
 pub(crate) enum Pending {
-    /// The job in flight reads the batch's host-gated predicates.
-    Predicates(Opening),
-    /// The predicates are known: the batch is prepared or records its last
-    /// job next.
-    Opened(Opening),
     /// The job in flight asks the executor what the batch's calls read and
     /// write.
     Preparing(Opening, serde_json::Value),
@@ -445,11 +440,10 @@ pub(crate) struct Parts<'a> {
 }
 
 impl Opening {
-    /// Bind the batch's calls to their requests and record into `job` the read
-    /// of every host-gated predicate; a computation over the prefix cache first
-    /// orders after the batches on other streams and after `page_loads`, the
-    /// fence of the host KV cache reads issued for the batch on the copy
-    /// stream.
+    /// Bind the batch's calls to their requests; a computation over the prefix
+    /// cache first orders after the batches on other streams and after
+    /// `page_loads`, the fence of the host KV cache reads issued for the batch
+    /// on the copy stream, recorded into `job`.
     fn open(
         parts: &mut Parts<'_>,
         plan: &BatchPlan,
@@ -487,18 +481,7 @@ impl Opening {
                 issue.wait(fence)?;
             }
         }
-        // A token-denoising step's continuation stays on the device: reading
-        // it here would serialize steps that can run.
-        let calls = batch::Opening::open(
-            parts.requests,
-            &parts.storage.tensors,
-            parts.placement,
-            parts.rank,
-            plan,
-            computation.device,
-            issue,
-            |call| call.canvas.is_none(),
-        )?;
+        let calls = batch::Opening::open(parts.requests, parts.placement, parts.rank, plan)?;
         Ok(Self {
             computation: index,
             calls,
@@ -527,14 +510,10 @@ pub(crate) fn forward(
         None => {
             let job = Job::new();
             match Opening::open(&mut parts, plan, &job, page_loads.as_ref()) {
-                Ok(opening) if opening.calls.reads_predicates() => {
-                    (Some(job), Pending::Predicates(opening))
-                }
                 Ok(opening) => opened(&mut parts, plan, inputs, opening, job),
                 Err(error) => ended(job, Failure::new(PHASE)(error)),
             }
         }
-        Some(Pending::Opened(opening)) => opened(&mut parts, plan, inputs, opening, Job::new()),
         Some(Pending::Prepared(opening, step)) => {
             record(&mut parts, plan, inputs, opening, Some(step), Job::new())
         }
@@ -546,8 +525,7 @@ pub(crate) fn forward(
             failure,
         ),
         Some(
-            state @ (Pending::Predicates(_)
-            | Pending::Preparing(..)
+            state @ (Pending::Preparing(..)
             | Pending::Committing(_)
             | Pending::Discarding(_)
             | Pending::Failed(_)),
@@ -673,21 +651,27 @@ fn retire(
     }
 }
 
-/// Output words a batch of `plan`'s calls leases: one completion word per
-/// call of a prepared batch, beside the words its decoded images are lent
-/// (`step`'s preparation); otherwise per call its results' words: a
-/// readout's candidate scores, a canvas step's outcome and tokens, or a
-/// sampling completion and the words of the logprob payload the engine
-/// bounds the call by.
+/// Output words a batch of `plan`'s calls leases: one predicate word per call
+/// its `uint8` predicate gates on the device ([`device_gated`],
+/// `Batch::lease_predicates`); then one completion word per call of a prepared
+/// batch, beside the words its decoded images are lent (`step`'s preparation);
+/// otherwise per call its results' words: a readout's candidate scores, a
+/// canvas step's outcome and tokens, or a sampling completion and the words of
+/// the logprob payload the engine bounds the call by.
 fn lease_words(
     prepares: bool,
     plan: &BatchPlan,
     step: Option<&serde_json::Value>,
 ) -> Result<usize> {
     let calls = plan.calls.len();
+    let predicates = plan
+        .calls
+        .iter()
+        .filter(|call| call.predicate.is_some() && device_gated(call))
+        .count();
     if prepares {
         let images = step.map_or(Ok(0), image::lease_words)?;
-        return Ok(calls.saturating_add(images));
+        return Ok(calls.saturating_add(images).saturating_add(predicates));
     }
     Ok(plan
         .calls
@@ -707,7 +691,15 @@ fn lease_words(
             };
             total.saturating_add(words)
         })
-        .max(calls))
+        .max(calls)
+        .saturating_add(predicates))
+}
+
+/// Whether a computation gates `call` on its `uint8` predicate through a leased
+/// copy (`Batch::lease_predicates`): every call but a token-denoising step,
+/// whose continuation its slot state carries.
+fn device_gated(call: &Call) -> bool {
+    call.canvas.is_none()
 }
 
 /// Lease the batch's output storage and record its last job: its
@@ -787,6 +779,11 @@ fn record_last(
     let executor = Arc::clone(&computations.executor);
     let tensors = &parts.storage.tensors;
 
+    // Every call's `uint8` predicate, which the executor applies on the device.
+    batch
+        .lease_predicates(plan, tensors, &parts.storage.events, job, device_gated)
+        .map_err(&failed)?;
+
     if computation.prepares {
         // The products the preparation named, then the execution on them
         // and the publication of what it wrote. A prepared batch runs
@@ -836,6 +833,14 @@ fn record_last(
             )
             .map_err(&failed)?;
             bound.extend(tensors);
+        }
+        // A predicated call's predicate follows every other tensor; its entry
+        // names its position.
+        for (call, state) in batch.calls.iter().enumerate() {
+            if let Some(predicate) = &state.predicate {
+                step["calls"][call]["predicate"] = serde_json::json!(bound.len());
+                bound.push(predicate.clone());
+            }
         }
         job.call_returning(executor.execute(index, step.to_string(), bound.clone()));
         publish(owners, plan, batch, published, issue).map_err(&failed)?;
@@ -977,17 +982,9 @@ pub(crate) fn complete(
     let failed = Failure::new(PHASE);
     let state = batch.computation_parts().2.take();
     let next = match (state, completion.check()) {
-        // A predicate that could not be read, or a preparation the executor
-        // refused, fails the batch, which has reserved nothing yet.
-        (Some(Pending::Predicates(_) | Pending::Preparing(..)), Err(failure)) => {
-            Pending::Failed(failed(failure.error))
-        }
-        (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
-            match opening.calls.predicates(&mut completion) {
-                Ok(()) => Pending::Opened(opening),
-                Err(error) => Pending::Failed(failed(error)),
-            }
-        }
+        // A preparation the executor refused fails the batch, which has
+        // reserved nothing yet.
+        (Some(Pending::Preparing(..)), Err(failure)) => Pending::Failed(failed(failure.error)),
         (Some(Pending::Preparing(opening, mut step)), Ok(mut completion)) => {
             let prepared = completion.texts().and_then(|texts| {
                 serde_json::from_str::<serde_json::Value>(&texts.concat()).map_err(|error| {

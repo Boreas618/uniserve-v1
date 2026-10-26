@@ -161,6 +161,7 @@ class Outcome:
     token: int
     valid: bool
     progress: Progress
+    active: bool = True
     accepted: int = 0
     logprob_tokens: list[int] = field(default_factory=list)
     prompt_tokens: list[int] = field(default_factory=list)
@@ -349,14 +350,20 @@ class Worker:
         )
         assert refused == []
 
-    def run(self, kind: int, requests, progress, hosts=None) -> list[Outcome]:
+    def run(
+        self, kind: int, requests, progress, hosts=None, predicates=None
+    ) -> list[Outcome]:
         """Execute and commit one batch of one call per request.
 
         ``hosts`` are each call's input tokens: a prefill's prompt, a
         verification's drafts. Decodes and verifications follow their
-        slot's committed token.
+        slot's committed token. ``predicates`` gate each call on a leased
+        ``uint8`` device predicate of that value, as the worker hands it
+        (``None`` for none).
         """
         count = len(requests)
+        entries: dict[str, dict] = {}
+        features: list[torch.Tensor] = []
         calls = np.zeros((CALL_FIELDS, count), dtype=np.int64)
         forward = np.zeros((forward_fields(1), count), dtype=np.int64)
         tokens: list[int] = []
@@ -378,6 +385,16 @@ class Worker:
             column[CallField.PREDICATE] = (
                 Predicate.NONE if kind == CallKind.PREFILL else Predicate.RELAY
             )
+            if predicates is not None and predicates[index] is not None:
+                column[CallField.PREDICATE] = Predicate.DEVICE
+                entries[str(index)] = {"predicate": {"tensor": len(features)}}
+                features.append(
+                    torch.tensor(
+                        [predicates[index]],
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                )
             column[CallField.ROW_START] = index
             column[CallField.ROW_COUNT] = 1
             column[CallField.TOKEN_START] = len(tokens)
@@ -406,13 +423,19 @@ class Worker:
         used = self.executor.execute(
             0,
             json.dumps(
-                {"batch": 1, "computation": 0, "collective_seq": 0, "calls": {}}
+                {
+                    "batch": 1,
+                    "computation": 0,
+                    "collective_seq": 0,
+                    "calls": entries,
+                }
             ),
             torch.from_numpy(calls),
             torch.from_numpy(forward),
             torch.tensor(tokens, dtype=torch.int64),
             records,
             words,
+            *features,
         )
         torch.cuda.synchronize(self.device)
         self.executor.commit(0)
@@ -519,6 +542,7 @@ class Worker:
                 flags=flags,
                 token=int(words[offset + 2 * tasks + row]) & TOKEN_VALUE_MASK,
                 valid=bool(words[offset + row]),
+                active=bool(words[offset + tasks + row]),
                 accepted=int(words[offset + 3 * tasks + row]),
                 progress=Progress(
                     logical=int(fields[RecordField.LOGICAL]),
@@ -686,6 +710,47 @@ def test_captured_graphs_replay_the_eager_selections(checkpoint, eager):
         # rows fill their bucket.
         assert paddings[0] == 32 - sum(len(r.prompt) for r in REQUESTS)
         assert paddings[1:] == [0] * DECODE_STEPS
+    finally:
+        worker.close()
+
+
+def test_a_false_predicate_gates_a_prefill_and_the_decodes_behind_it(
+    checkpoint, eager
+):
+    _, eager_generated, _ = eager
+    worker = Worker(checkpoint[0], graphs=False)
+    try:
+        worker.start(REQUESTS)
+        progress = {request.slot: Progress() for request in REQUESTS}
+        # Each prefill waits on a device predicate, as one queued behind an
+        # unresolved call does: false for the second request alone.
+        gates = [1, 0, 1, 1]
+        prefills = worker.run(
+            CallKind.PREFILL,
+            REQUESTS,
+            progress,
+            hosts=[request.prompt for request in REQUESTS],
+            predicates=gates,
+        )
+        state = worker.executor.computations[0].state
+        slots = [request.slot for request in REQUESTS]
+        assert state.predicates[slots].tolist() == gates
+        decodes = [
+            worker.run(CallKind.DECODE, REQUESTS, progress)
+            for _ in range(DECODE_STEPS)
+        ]
+        for index, request in enumerate(REQUESTS):
+            outcomes = [prefills[index], *(batch[index] for batch in decodes)]
+            if gates[index]:
+                # A true predicate runs the prefill as an ungated one does.
+                assert all(outcome.active for outcome in outcomes)
+                assert [outcome.token for outcome in outcomes] == (
+                    eager_generated[request.slot]
+                )
+            else:
+                # The skipped prefill's selection does not continue its
+                # slot, so no decode behind it continues either.
+                assert not any(outcome.active for outcome in outcomes)
     finally:
         worker.close()
 
