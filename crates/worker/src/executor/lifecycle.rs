@@ -12,16 +12,16 @@
 //!   release never waits behind an allocation-dependent batch; existing
 //!   readers keep their leases.
 //!
-//! Request storage (the product store, the prefix cache and its block
-//! tables, the lanes' output leases and latent ledger, the transfer
-//! runtime's output leases) takes part through [`RequestStorage`]; slot
-//! state the executor keeps is released through its `release`.
+//! Request storage (the product store, the prefix cache and its block tables,
+//! the computations' output leases and latent ledger, the transfer runtime's
+//! output leases) takes part through [`RequestStorage`]; slot state the
+//! executor keeps is released through its `release`.
 //!
-//! Lifecycle commands run on the control thread, which issues no stream
-//! work itself: what an owner's command needs on a device (a slot's reset,
-//! the clearing of released rows, what follows a released buffer's
-//! fences) is recorded into the command's job ([`LaneJobs`]), and the
-//! backend submits it to the lane after the command.
+//! Lifecycle commands run on the control thread, which issues no stream work
+//! itself: what an owner's command needs on a device (a slot's reset, the
+//! clearing of released rows, what follows a released buffer's fences) is
+//! recorded into the command's job ([`CommandJob`]), and the backend submits it
+//! as a job after the command.
 
 use std::collections::HashSet;
 
@@ -29,18 +29,17 @@ use ipc::{Batch, BatchCommand, BufferId, RequestKey};
 
 use super::backend::Owners;
 use crate::Result;
-use crate::lane::Job;
+use crate::job::Job;
 use crate::request::RequestPool;
 
-/// The job a lifecycle command records, performed by the rank's lane (by
-/// the builder thread on a rank without one). An owner records the work
-/// its command needs on a stream into it.
+/// The job a lifecycle command records, performed by the rank's builder thread.
+/// An owner records the work its command needs on a stream into it.
 #[derive(Default)]
-pub(crate) struct LaneJobs {
+pub(crate) struct CommandJob {
     job: Job,
 }
 
-impl LaneJobs {
+impl CommandJob {
     /// The command's job.
     pub(crate) fn job(&self) -> &Job {
         &self.job
@@ -58,7 +57,7 @@ pub(crate) trait RequestStorage {
     /// Revoke explicitly freed products and those of finished requests.
     /// Existing readers keep their physical leases. What follows a
     /// released product's outstanding fences is recorded into `jobs`.
-    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()>;
+    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &CommandJob) -> Result<()>;
 
     /// Begin releasing finished requests' storage, keeping `retained`
     /// products readable until their own `Free`. Device work is recorded
@@ -67,7 +66,7 @@ pub(crate) trait RequestStorage {
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
-        jobs: &LaneJobs,
+        jobs: &CommandJob,
     ) -> Result<()>;
 
     /// Whether every physical reader of these products and requests has
@@ -81,7 +80,7 @@ pub(crate) trait RequestStorage {
 
     /// Return retired requests' slots for reuse; what clears them on a
     /// device is recorded into `jobs`.
-    fn retire_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()>;
+    fn retire_slots(&mut self, slots: &[usize], jobs: &CommandJob) -> Result<()>;
 
     /// Progress asynchronous completions (event pools, remote readers).
     fn reap(&mut self) -> Result<()>;
@@ -129,7 +128,7 @@ impl Retirement {
     }
 
     /// Revoke explicitly freed products before the batch waits for storage.
-    pub(crate) fn admit(&self, owners: &mut Owners, jobs: &LaneJobs) -> Result<()> {
+    pub(crate) fn admit(&self, owners: &mut Owners, jobs: &CommandJob) -> Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
         }
@@ -144,7 +143,7 @@ impl Retirement {
         &mut self,
         requests: &RequestPool,
         owners: &mut Owners,
-        jobs: &LaneJobs,
+        jobs: &CommandJob,
     ) -> Result<()> {
         if self.requests.is_empty() && self.buffers.is_empty() {
             self.complete = true;
@@ -174,7 +173,7 @@ impl Retirement {
         &mut self,
         requests: &mut RequestPool,
         owners: &mut Owners,
-        jobs: &LaneJobs,
+        jobs: &CommandJob,
     ) -> Result<bool> {
         if self.complete {
             return Ok(true);

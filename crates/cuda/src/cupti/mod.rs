@@ -395,13 +395,13 @@ pub(crate) mod tests {
         let stream = Stream::new(DeviceId(0))?;
         let scope = Watched::enter();
         let watch = BlockingWatch::start()?;
-        drop(activity::StreamActivity::start([("lane", &stream)])?);
+        drop(activity::StreamActivity::start([("device", &stream)])?);
         drop(watch);
         stream.synchronize()?;
         assert_eq!(scope.blocking_calls(), 0);
 
         let watch = BlockingWatch::start()?;
-        let recording = activity::StreamActivity::start([("lane", &stream)])?;
+        let recording = activity::StreamActivity::start([("device", &stream)])?;
         let bytes = 256 << 20;
         let memory = DeviceAllocation::linear(DeviceId(0), bytes)?;
         // SAFETY: the allocation holds `bytes` and outlives the fill, which
@@ -409,7 +409,7 @@ pub(crate) mod tests {
         unsafe { memset_d8(memory.address(), 0, bytes, &stream)? };
         stream.synchronize()?;
         assert_eq!(scope.calls(), vec![("cuStreamSynchronize", 1)]);
-        let taken = activity::tests::taken_until("lane", |taken| taken.busy_us > 0);
+        let taken = activity::tests::taken_until("device", |taken| taken.busy_us > 0);
         assert!(taken.busy_us > 0, "{taken:?}");
         drop(recording);
         drop(watch);

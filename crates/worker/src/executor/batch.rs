@@ -2,13 +2,12 @@
 //! dispatch of a batch's jobs to what serves its kind.
 //!
 //! A batch carries calls of one kind on one component. Its forward is a
-//! sequence of jobs of its lane: [`forward`] prepares the next one and
-//! [`complete`] applies its completion. The first job completes the batch's
-//! imported inputs ([`crate::executor::inputs`]); the others belong to what
-//! serves the kind: the executor's lanes ([`crate::executor::lanes`]) and
-//! transfers ([`crate::executor::transfer`]).
-//! No forward issues its own stream work: the jobs of every batch are
-//! operations its owner recorded.
+//! sequence of jobs: [`forward`] prepares the next one and [`complete`] applies
+//! its completion. The first job completes the batch's imported inputs
+//! ([`crate::executor::inputs`]); the others belong to what serves the kind:
+//! the executor's computations ([`crate::executor::computations`]) and
+//! transfers ([`crate::executor::transfer`]). No forward issues its own stream
+//! work: the jobs of every batch are operations its owner recorded.
 //!
 //! Every batch goes through the same steps, which this module implements
 //! once:
@@ -33,13 +32,12 @@
 //!    Once the lease's fences complete, every call's result is decoded and
 //!    its progress accepted.
 //!
-//! A failed batch reports its calls failed under the failure's code
-//! ([`fail`]); a fatal failure stops the rank. A kind no executor lane of
-//! the rank serves is reported unsupported ([`unserved`]), which fails
-//! the batch with `UnsupportedSetup` and leaves the rank serving. A batch
-//! whose results need host work after the device finished (encoding
-//! decoded images, publishing what host media tasks wrote) attaches it to
-//! its launch as a [`HostStage`].
+//! A failed batch reports its calls failed under the failure's code ([`fail`]);
+//! a fatal failure stops the rank. A kind no executor computation of the rank
+//! serves is reported unsupported ([`unserved`]), which fails the batch with
+//! `UnsupportedSetup` and leaves the rank serving. A batch whose results need
+//! host work after the device finished (encoding decoded images, publishing
+//! what host media tasks wrote) attaches it to its launch as a [`HostStage`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,7 +56,7 @@ use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::products::ProductOwners;
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::MemoryKind;
-use crate::lane::{Completion, Job, Recorder};
+use crate::job::{Completion, Job, Recorder};
 use crate::memory::{
     OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead, ProductStore,
 };
@@ -73,9 +71,9 @@ pub(crate) enum Stage {
     /// Its imported inputs are not resident yet.
     #[default]
     Inputs,
-    /// Its lane's forward has jobs to run.
+    /// Its forward has jobs to run.
     Forward,
-    /// Nothing is left for its lane.
+    /// Nothing is left for its forward.
     Done,
 }
 
@@ -108,8 +106,8 @@ impl Failure {
     }
 }
 
-/// One call's state through its batch: what every batch tracks, and
-/// `forward`, what the call contributes to its lane's forward.
+/// One call's state through its batch: what every batch tracks, and `forward`,
+/// what the call contributes to its computation's forward.
 pub(crate) struct CallState<F = ()> {
     pub(crate) output: PendingOutput,
     /// The request slot of the call's request.
@@ -638,10 +636,10 @@ pub(crate) fn fail(
     Ok(())
 }
 
-/// The error of a call kind no executor lane of this rank serves.
+/// The error of a call kind no executor computation of this rank serves.
 pub(crate) fn unserved(kind: CallKind) -> Error {
     Error::Unsupported(format!(
-        "no executor lane of this rank serves {} calls",
+        "no executor computation of this rank serves {} calls",
         kind.as_str()
     ))
 }
@@ -741,10 +739,9 @@ fn abandon_launched(requests: &mut RequestPool, mut launched: Launched) -> Resul
     Ok(())
 }
 
-/// Orders the batches that share per-slot state or storage across the
-/// streams they run on (the lanes over the prefix cache, the users of a
-/// latent ledger): each batch waits for the previous batch recorded on
-/// another stream.
+/// Orders the batches that share per-slot state or storage across the streams
+/// they run on (the computations over the prefix cache, the users of a latent
+/// ledger): each batch waits for the previous batch recorded on another stream.
 #[derive(Default)]
 pub(crate) struct StreamOrder {
     last: Option<(usize, Arc<cuda::Event>)>,
@@ -807,8 +804,7 @@ pub(crate) fn abandon(
 
 /// The next job of a batch's forward at its stage: the completion of its
 /// imported inputs, then the jobs of what serves `kind` (a transfer or an
-/// executor lane). `None` when the stage advanced without needing the
-/// lane.
+/// executor computation). `None` when the stage advanced without needing a job.
 pub(crate) fn forward(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
@@ -825,11 +821,14 @@ pub(crate) fn forward(
         },
         Stage::Forward => match kind {
             CallKind::Transfer(_) => crate::executor::transfer::forward(backend, batch, kind),
-            _ if backend.executes(kind) => crate::executor::lanes::forward(backend, batch, kind),
-            // Only an executor lane serves the other kinds: a call no lane of
-            // this rank serves fails with its batch, and the rank serves on.
+            _ if backend.executes(kind) => {
+                crate::executor::computations::forward(backend, batch, kind)
+            }
+            // Only an executor computation serves the other kinds: a call no
+            // computation of this rank serves fails with its batch, and the
+            // rank serves on.
             Forward(_) | CallKind::Media(_) => {
-                fail(backend, batch, Failure::new("lanes")(unserved(kind))).map(|()| None)
+                fail(backend, batch, Failure::new("computations")(unserved(kind))).map(|()| None)
             }
         },
         Stage::Done => Ok(None),
@@ -853,7 +852,7 @@ pub(crate) fn complete(
     }
     match kind {
         CallKind::Transfer(_) => crate::executor::transfer::complete(backend, batch, completion),
-        _ => crate::executor::lanes::complete(backend, batch, completion),
+        _ => crate::executor::computations::complete(backend, batch, completion),
     }
 }
 

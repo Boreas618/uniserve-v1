@@ -242,13 +242,13 @@ static std::string mega_moe_m2n_eg(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const std::optional<torch::Tensor>& nvfp4_alpha,
     const torch::Tensor& sym_buffer,
-    const std::optional<torch::Tensor>& sym_buffer_lane1,
-    const std::optional<torch::Tensor>& sym_buffer_lane2,
-    const std::optional<torch::Tensor>& sym_buffer_lane3,
+    const std::optional<torch::Tensor>& sym_buffer_microbatch1,
+    const std::optional<torch::Tensor>& sym_buffer_microbatch2,
+    const std::optional<torch::Tensor>& sym_buffer_microbatch3,
     const std::vector<int64_t>& sym_buffer_ptrs,
-    const std::vector<int64_t>& sym_buffer_ptrs_lane1,
-    const std::vector<int64_t>& sym_buffer_ptrs_lane2,
-    const std::vector<int64_t>& sym_buffer_ptrs_lane3,
+    const std::vector<int64_t>& sym_buffer_ptrs_microbatch1,
+    const std::vector<int64_t>& sym_buffer_ptrs_microbatch2,
+    const std::vector<int64_t>& sym_buffer_ptrs_microbatch3,
     const int& rank_idx,
     const int& num_ag_ranks, const int& num_eg_ranks,
     const int& num_max_tokens_per_rank,
@@ -316,20 +316,21 @@ static std::string mega_moe_m2n_eg(
             hidden, intermediate_hidden, use_nvfp4_weights);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
-    // Lane-1 views (dual-lane EG); fall back to lane-0 views when absent
-    const auto& sym1 = sym_buffer_lane1.has_value() ? *sym_buffer_lane1 : sym_buffer;
+    // Microbatch-1 views (an EG serving several microbatches); fall back to
+    // microbatch-0 views when absent
+    const auto& sym1 = sym_buffer_microbatch1.has_value() ? *sym_buffer_microbatch1 : sym_buffer;
     const auto [x1, x1_sf, topk_idx1, topk_weights1, l1_acts1, l1_acts_sf1, l2_acts1, l2_acts_sf1] = slice(sym1);
-    const auto& sym2 = sym_buffer_lane2.has_value() ? *sym_buffer_lane2 : sym_buffer;
+    const auto& sym2 = sym_buffer_microbatch2.has_value() ? *sym_buffer_microbatch2 : sym_buffer;
     const auto [x2, x2_sf, topk_idx2, topk_weights2, l1_acts2, l1_acts_sf2, l2_acts2, l2_acts_sf2] = slice(sym2);
-    const auto& sym3 = sym_buffer_lane3.has_value() ? *sym_buffer_lane3 : sym_buffer;
+    const auto& sym3 = sym_buffer_microbatch3.has_value() ? *sym_buffer_microbatch3 : sym_buffer;
     const auto [x3, x3_sf, topk_idx3, topk_weights3, l1_acts3, l1_acts_sf3, l2_acts3, l2_acts_sf3] = slice(sym3);
-    const int num_lanes =
-        sym_buffer_lane3.has_value() ? 4 :
-        (sym_buffer_lane2.has_value() ? 3 :
-        (sym_buffer_lane1.has_value() ? 2 : 1));
-    const auto& ptrs1 = sym_buffer_lane1.has_value() ? sym_buffer_ptrs_lane1 : sym_buffer_ptrs;
-    const auto& ptrs2 = sym_buffer_lane2.has_value() ? sym_buffer_ptrs_lane2 : sym_buffer_ptrs;
-    const auto& ptrs3 = sym_buffer_lane3.has_value() ? sym_buffer_ptrs_lane3 : sym_buffer_ptrs;
+    const int num_microbatches =
+        sym_buffer_microbatch3.has_value() ? 4 :
+        (sym_buffer_microbatch2.has_value() ? 3 :
+        (sym_buffer_microbatch1.has_value() ? 2 : 1));
+    const auto& ptrs1 = sym_buffer_microbatch1.has_value() ? sym_buffer_ptrs_microbatch1 : sym_buffer_ptrs;
+    const auto& ptrs2 = sym_buffer_microbatch2.has_value() ? sym_buffer_ptrs_microbatch2 : sym_buffer_ptrs;
+    const auto& ptrs3 = sym_buffer_microbatch3.has_value() ? sym_buffer_ptrs_microbatch3 : sym_buffer_ptrs;
     DG_HOST_ASSERT(static_cast<int>(ptrs1.size()) == num_ag_ranks + num_eg_ranks);
     DG_HOST_ASSERT(static_cast<int>(ptrs2.size()) == num_ag_ranks + num_eg_ranks);
     DG_HOST_ASSERT(static_cast<int>(ptrs3.size()) == num_ag_ranks + num_eg_ranks);
@@ -352,7 +353,7 @@ static std::string mega_moe_m2n_eg(
                                       ptrs1,
                                       ptrs2,
                                       ptrs3,
-                                      num_lanes,
+                                      num_microbatches,
                                       rank_idx,
                                       num_ag_ranks, num_eg_ranks,
                                       num_max_tokens_per_rank,

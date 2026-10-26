@@ -104,7 +104,7 @@ class VideoDecoder:
         path: The decoder's module path.
         model: The model's facts.
         plan: What the rank admits.
-        stream: The decoder's lane stream.
+        stream: The primary stream of the decoder's device.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas.
         slots: Request slots.
@@ -395,7 +395,7 @@ class AudioDecoder:
         path: The decoder's module path.
         model: The model's facts.
         plan: What the rank admits.
-        stream: The decoder's lane stream.
+        stream: The primary stream of the decoder's device.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas.
         pool: The graph pool captures allocate in; ``None`` decodes every

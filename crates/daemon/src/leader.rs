@@ -308,7 +308,7 @@ impl Leader {
                 // Reference images are banded to the units one latent
                 // encoding round covers on the deployment's latent encoder
                 // while a request's prompt is encoded.
-                let latent_encoding_lane = info.latent_encoding_units.max(1);
+                let latent_encoding_units = info.latent_encoding_units.max(1);
                 // The video processor's options are its reference sizing,
                 // within what the denoiser declares.
                 let references = models::video::plan::ReferenceConfig::from_kwargs(
@@ -321,7 +321,7 @@ impl Leader {
                         denoiser,
                         vision,
                         config.video_config.max_seconds,
-                        latent_encoding_lane,
+                        latent_encoding_units,
                         &config.media_config,
                         references,
                         Arc::clone(&tokenizer),

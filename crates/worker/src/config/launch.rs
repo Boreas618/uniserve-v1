@@ -24,8 +24,8 @@ pub struct IpcConfig {
     pub products_cross_hosts: bool,
     /// Most unresolved requests on the channel.
     pub queue_depth: usize,
-    /// How long one job may run on a lane before the rank reports the lane
-    /// stalled: half the engine's watchdog timeout.
+    /// How long one job may run before the rank reports it stalled: half the
+    /// engine's watchdog timeout.
     pub stall_bound: std::time::Duration,
 }
 
@@ -216,7 +216,7 @@ pub fn resolve(
             host_slots: descriptor.host_slots.clone(),
             products_cross_hosts: descriptor.products_cross_hosts,
             queue_depth: descriptor.queue_depth,
-            // Half the engine's watchdog, so a stalled lane is reported, and
+            // Half the engine's watchdog, so a stalled job is reported, and
             // named in its requests' failure, before the engine replaces the
             // group, even for a job that started up to half of it after the
             // group's last progress.

@@ -1200,27 +1200,29 @@ pub struct RequestPlan {
 
 impl RequestPlan {
     /// The units each condition's reference image is encoded in when one
-    /// latent encoding round covers `lane` units, one entry per condition
-    /// (other conditions' entries are unread).
+    /// latent encoding round covers `round_units` units, one entry per
+    /// condition (other conditions' entries are unread).
     ///
     /// A lone reference image is the largest visual condition and is a
     /// single rank's work as one unit; its bands spread its encoder tiles
-    /// over the ranks of one round. Fewer images than the lane divide it
-    /// evenly, at least one unit each. More images than the lane encode
-    /// whole, a lane's worth per round, except that when every visual unit
-    /// is an image, the `k` images of a final partial round take `lane / k`
-    /// bands each whenever `k` divides the lane, so that round is full
-    /// rather than leaving ranks idle behind its whole images.
-    pub fn image_bands(&self, lane: u32) -> Vec<u32> {
+    /// over the ranks of one round. Fewer images than a round's units divide
+    /// them evenly, at least one unit each. More images than a round's units
+    /// encode whole, `round_units` images per round, except that when every
+    /// visual unit is an image, the `k` images of a final partial round take
+    /// `round_units / k` bands each whenever `k` divides `round_units`, so
+    /// that round is full rather than leaving ranks idle behind its whole
+    /// images.
+    pub fn image_bands(&self, round_units: u32) -> Vec<u32> {
         let is_image = |plan: &ConditionPlan| matches!(plan.prepared, Prepared::Image(_));
         let images = self.conditions.iter().filter(|plan| is_image(plan)).count() as u32;
-        let mut bands = vec![(lane / images.max(1)).max(1); self.conditions.len()];
+        let mut bands = vec![(round_units / images.max(1)).max(1); self.conditions.len()];
         let only_images = self
             .conditions
             .iter()
             .all(|plan| is_image(plan) || matches!(plan.prepared, Prepared::Audio(_)));
-        let partial = images % lane.max(1);
-        if only_images && images > lane && partial > 0 && lane.is_multiple_of(partial) {
+        let partial = images % round_units.max(1);
+        if only_images && images > round_units && partial > 0 && round_units.is_multiple_of(partial)
+        {
             // The last `partial` images, in request order, form the final
             // round.
             let mut remaining = partial;
@@ -1229,7 +1231,7 @@ impl RequestPlan {
                     break;
                 }
                 if is_image(plan) {
-                    *entry = lane / partial;
+                    *entry = round_units / partial;
                     remaining -= 1;
                 }
             }
@@ -2585,10 +2587,11 @@ pub(super) mod tests {
         assert_eq!(keyframe.latent_units(size, 4), [rows_per_frame(size)]);
     }
 
-    /// The lane is divided evenly among a request's reference images, at
-    /// least one unit each; other conditions take no share.
+    /// A latent encoding round's units are divided evenly among a request's
+    /// reference images, at least one unit each; other conditions take no
+    /// share.
     #[test]
-    fn reference_images_share_the_latent_lane() {
+    fn reference_images_share_the_latent_round() {
         let image = ConditionPlan {
             index: 0,
             prepared: Prepared::Image(Canvas {
@@ -2629,9 +2632,10 @@ pub(super) mod tests {
 
         // Images beyond one round encode whole, a round's worth at a time,
         // and the images of a final partial round split into bands that
-        // fill it: on a four-unit lane nine images take 1 x 8 + 4 units and
-        // six take 1 x 4 + 2 x 2, while seven, whose final three cannot
-        // share four units evenly, stay whole. An audio track takes no part.
+        // fill it: with four units per round nine images take 1 x 8 + 4
+        // units and six take 1 x 4 + 2 x 2, while seven, whose final three
+        // cannot share four units evenly, stay whole. An audio track takes
+        // no part.
         let nine = plan(vec![image.clone(); 9]).image_bands(4);
         assert_eq!(nine, [vec![1; 8], vec![4]].concat());
         let six = plan(vec![image.clone(); 6]).image_bands(4);

@@ -28,17 +28,19 @@ pub struct ForwardStats {
     pub mode_us: BTreeMap<String, u64>,
     /// Component execution time in microseconds.
     pub component_us: BTreeMap<String, u64>,
-    /// Device time of the rank's lane streams in microseconds, keyed
-    /// `{lane}/{state}`, from CUPTI's records of the kernels, copies and
-    /// fills on each stream, graph nodes included: `busy` is the length of the union
+    /// Device time of the rank's primary and copy streams in microseconds,
+    /// keyed `{stream}/{state}`, where `stream` is `device` (the primary
+    /// stream) or `copy` (the stream of page copies through the host KV
+    /// cache), from CUPTI's records of the kernels, copies and fills on
+    /// each stream, graph nodes included: `busy` is the length of the union
     /// of their intervals, `gap` the rest of the span from the stream's
     /// first operation to its latest end (idle while it waited for the
     /// host, another stream or any work), and `late` the time of records
     /// that arrived too far out of order to merge, counted in neither.
-    pub lane_us: BTreeMap<String, u64>,
+    pub stream_us: BTreeMap<String, u64>,
     /// Driver calls that made a serving thread of the rank wait for the
-    /// device, keyed `{thread}/{call}` (`builder`, a lane, `control`). A
-    /// serving call of the executor that made one failed.
+    /// device, keyed `{thread}/{call}` (`builder`, `control`). A serving
+    /// call of the executor that made one failed.
     pub blocking_calls: BTreeMap<String, u64>,
     /// Attention kernel launch count.
     pub attention_launches: u64,
@@ -103,7 +105,7 @@ impl ForwardStats {
             (&mut self.mode_tokens, &other.mode_tokens),
             (&mut self.mode_us, &other.mode_us),
             (&mut self.component_us, &other.component_us),
-            (&mut self.lane_us, &other.lane_us),
+            (&mut self.stream_us, &other.stream_us),
             (&mut self.blocking_calls, &other.blocking_calls),
             (
                 &mut self.attention_backend_counts,
@@ -211,7 +213,7 @@ impl ForwardStats {
             && self.mode_tokens.is_empty()
             && self.mode_us.is_empty()
             && self.component_us.is_empty()
-            && self.lane_us.is_empty()
+            && self.stream_us.is_empty()
             && self.blocking_calls.is_empty()
             && self.attention_launches == 0
             && self.attention_us == 0

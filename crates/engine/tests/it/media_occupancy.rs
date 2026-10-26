@@ -1,4 +1,4 @@
-//! Lane-occupancy scheduling and call graphs of video requests over the
+//! Media occupancy scheduling and call graphs of video requests over the
 //! GPU-free simulator.
 //!
 //! The observation point is the executor boundary: the batches the simulator
@@ -130,10 +130,10 @@ fn media_units(name: &str, units: u32) -> OutputInfo {
 /// Calls route to components the way a loaded model reports them: the video
 /// encoder component encodes the media units the decoder produced, and the
 /// muxer encodes audio and assembles the artifact.
-fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
+fn video_worker(decoder_ranks: usize, host_task_capacity: u32) -> SimEngine {
     let mut sim = SimEngine::new();
     // A deep executor queue keeps queue capacity from bounding which calls
-    // are in flight together, leaving that to the lane rules under test.
+    // are in flight together, leaving that to the occupancy rules under test.
     sim.set_queue_depth(64);
     sim.set_results_on_wait(true);
 
@@ -157,7 +157,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     // pages of samples per request slot.
     info.latent_page_units = 256;
     info.latent_pages = 2 * info.request_slots + 1;
-    info.host_lane_capacity = host_lane_capacity;
+    info.host_task_capacity = host_task_capacity;
     let components = vec![
         component(
             "media_reader",
@@ -413,7 +413,8 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     // `Scheduler::finish_media` enqueues the terminal event on the request's
     // output before it queues the request's `Finish` lifecycle command, so a
     // submitted `Finish` at the executor boundary shows the request has ended.
-    // A stalled lane instead exhausts the deadline and fails `recv_timeout`.
+    // A stalled workload instead exhausts the deadline and fails
+    // `recv_timeout`.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let event = boundary
@@ -649,16 +650,17 @@ fn a_younger_request_denoises_only_after_the_older_request_completes_its_steps()
     let younger_steps = served.submissions_of(younger, MediaCall::Denoising);
     assert_eq!(younger_steps.len(), STEPS as usize);
     for (index, submission) in &younger_steps {
-        // The denoiser lane is exclusive: no step of the older request is in
-        // flight, or dispatched alongside, while the younger request steps.
+        // The denoiser is held exclusively: no step of the older request is
+        // in flight, or dispatched alongside, while the younger request steps.
         assert!(
             !submission
                 .concurrent()
                 .any(|call| call.is(older, MediaCall::Denoising)),
-            "the younger request denoised while the older request held the denoiser lane: {submission:?}"
+            "the younger request denoised while the older request held the denoiser: {submission:?}"
         );
-        // The lane passes to the younger request only once the older one has
-        // dispatched every step, so its first step follows the older's last.
+        // The denoiser passes to the younger request only once the older one
+        // has dispatched every step, so its first step follows the older's
+        // last.
         let older_steps_dispatched = served.submissions[..*index]
             .iter()
             .flat_map(|earlier| earlier.calls.iter())
@@ -670,8 +672,8 @@ fn a_younger_request_denoises_only_after_the_older_request_completes_its_steps()
         );
     }
 
-    // Lane sharing: the older request decodes and encodes its media while the
-    // younger request denoises.
+    // Different components overlap: the older request decodes and encodes
+    // its media while the younger request denoises.
     assert!(
         younger_steps.iter().any(|(_, submission)| {
             submission
@@ -686,8 +688,8 @@ fn a_younger_request_denoises_only_after_the_older_request_completes_its_steps()
 
 #[test]
 fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
-    // Each decoder rank reconstructs one media unit per round, so the lane
-    // holds as many units as the decoder has ranks.
+    // Each decoder rank reconstructs one media unit per round, so the decoder
+    // admits as many units at once as it has ranks.
     const DECODER_RANKS: u32 = 2;
 
     let older = RequestId(1);
@@ -702,8 +704,8 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
     served.assert_completed(older);
     served.assert_completed(younger);
 
-    // A request with more units than the lane holds decodes in successive
-    // rounds: a full round, then the remainder.
+    // A request with more units than the decoder admits at once decodes in
+    // successive rounds: a full round, then the remainder.
     let older_rounds = served
         .submissions_of(older, MediaCall::VideoDecoding)
         .iter()
@@ -713,7 +715,7 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
         .collect::<Vec<_>>();
     assert_eq!(older_rounds, vec![DECODER_RANKS, 1]);
 
-    // The units in flight on the decoder lane never exceed what it holds.
+    // The units in flight on the decoder never exceed what it admits.
     for submission in &served.submissions {
         let units = |calls: &[ObservedCall]| {
             calls
@@ -728,7 +730,7 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
         }
         assert!(
             units(&submission.in_flight) + submitted <= DECODER_RANKS,
-            "decode calls exceeded the lane's media units: {submission:?}"
+            "decode calls exceeded the decoder's media units: {submission:?}"
         );
     }
 
@@ -747,7 +749,7 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
 }
 
 #[test]
-fn a_host_lane_admits_no_more_tasks_than_its_worker_advertises() {
+fn a_host_task_pool_admits_no_more_tasks_than_its_worker_advertises() {
     for capacity in [1_usize, 2] {
         let request = RequestId(1);
         let served = serve(
@@ -756,10 +758,10 @@ fn a_host_lane_admits_no_more_tasks_than_its_worker_advertises() {
         );
         served.assert_completed(request);
 
-        // Every host task of this worker lands on rank 0's host lane, whose
-        // occupancy never exceeds the advertised capacity. With one rank and
-        // one media unit, each host call places exactly one task, so counting
-        // calls counts the lane's tasks.
+        // Every host task of this worker lands on rank 0's host task pool,
+        // whose occupancy never exceeds the advertised capacity. With one rank
+        // and one media unit, each host call places exactly one task, so
+        // counting calls counts the pool's tasks.
         let mut peak = 0;
         for submission in &served.submissions {
             let submitted = submission
@@ -777,17 +779,17 @@ fn a_host_lane_admits_no_more_tasks_than_its_worker_advertises() {
                 .count();
             assert!(
                 occupied + submitted <= capacity,
-                "host tasks exceeded the lane capacity {capacity}: {submission:?}"
+                "host tasks exceeded the pool capacity {capacity}: {submission:?}"
             );
             peak = peak.max(occupied + submitted);
         }
 
         // The video and audio encodes of one request are the tasks that can
-        // overlap: a lane of two holds both, a lane of one serializes them.
+        // overlap: a pool of two holds both, a pool of one serializes them.
         assert_eq!(
             peak,
             capacity.min(2),
-            "host lane capacity {capacity} was not used up to its bound: {:?}",
+            "host task capacity {capacity} was not used up to its bound: {:?}",
             served.submissions
         );
     }

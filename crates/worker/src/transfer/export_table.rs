@@ -17,7 +17,7 @@ use ipc::{Locator, TransferTransport, Wake};
 use super::backing::{SourceRetirement, TransportBuffer};
 use super::registry::{BufferRegistry, RegisteredBuffer};
 use super::{Retirement, notify};
-use crate::host::HostLane;
+use crate::host::HostPool;
 use crate::{Error, EventPool, Result, lock};
 
 /// A registered export's identity within its endpoint.
@@ -62,9 +62,9 @@ pub(crate) struct ExportTable {
     name: String,
     events: Arc<EventPool>,
     state: Mutex<Table>,
-    /// Shared-memory retirements that unregister CUDA host mappings run on
-    /// this lane, created on first use.
-    retirements: Mutex<Option<Arc<HostLane<SourceRetirement>>>>,
+    /// Shared-memory retirements that unregister CUDA host mappings run on this
+    /// host pool, created on first use.
+    retirements: Mutex<Option<Arc<HostPool<SourceRetirement>>>>,
     wake: Mutex<Option<Wake>>,
 }
 
@@ -199,9 +199,9 @@ impl ExportTable {
     }
 
     pub(crate) fn set_wake(&self, wake: Option<Wake>) {
-        let lane = lock(&self.retirements).clone();
-        if let Some(lane) = lane {
-            lane.set_wake(wake.clone());
+        let pool = lock(&self.retirements).clone();
+        if let Some(pool) = pool {
+            pool.set_wake(wake.clone());
         }
         let previous = std::mem::replace(&mut *lock(&self.wake), wake);
         drop(previous);
@@ -226,11 +226,11 @@ impl ExportTable {
         result = result.and(self.events.drain()).and(self.reap());
         result = result.and(self.events.drain());
 
-        // Joining the lane must not hold the registry lock: retirement
+        // Joining the pool must not hold the registry lock: retirement
         // observers may inspect returned storage.
-        let lane = lock(&self.retirements).take();
-        if let Some(lane) = lane {
-            for error in lane.close() {
+        let pool = lock(&self.retirements).take();
+        if let Some(pool) = pool {
+            for error in pool.close() {
                 result = result.and(Err(error));
             }
         }
@@ -263,7 +263,7 @@ impl ExportTable {
         };
 
         let result = if buffer.asynchronous() {
-            self.retire_on_lane(SourceRetirement {
+            self.retire_on_pool(SourceRetirement {
                 buffer,
                 completion: Some(Arc::clone(&retirement)),
             })
@@ -281,21 +281,21 @@ impl ExportTable {
         Ok(())
     }
 
-    fn retire_on_lane(&self, action: SourceRetirement) -> Result<()> {
-        let lane = {
+    fn retire_on_pool(&self, action: SourceRetirement) -> Result<()> {
+        let pool = {
             let mut installed = lock(&self.retirements);
             match &*installed {
-                Some(lane) => Arc::clone(lane),
+                Some(pool) => Arc::clone(pool),
                 None => {
-                    let lane = HostLane::new(256, 1, "uniserve-posix-shm-retire")?;
-                    lane.set_wake(lock(&self.wake).clone());
-                    let lane = Arc::new(lane);
-                    *installed = Some(Arc::clone(&lane));
-                    lane
+                    let pool = HostPool::new(256, 1, "uniserve-posix-shm-retire")?;
+                    pool.set_wake(lock(&self.wake).clone());
+                    let pool = Arc::new(pool);
+                    *installed = Some(Arc::clone(&pool));
+                    pool
                 }
             }
         };
-        let task = lane.reserve()?;
+        let task = pool.reserve()?;
         if let Err(error) = task.configure(action).and_then(|()| task.submit()) {
             if let Err(cleanup) = task.cancel(true) {
                 tracing::warn!("failed to withdraw a transport retirement: {cleanup}");

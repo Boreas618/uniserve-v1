@@ -20,12 +20,11 @@
 //!    bindings of the same membership are distinct ordering domains.
 //!
 //! Stream groups follow in a plan of their own ([`GroupPlan::streams`]),
-//! created at bind: a computation that runs its collectives on its own
-//! stream (a token lane, each expert microbatch of it) gets its own torch
-//! group per multi-member group of its component's mesh, so collectives of
-//! two streams never share a communicator. Components in alphabetical
-//! order, then each component's stream copies, then the mesh's groups in
-//! the order above.
+//! created at bind: a computation that runs its collectives on its own stream
+//! (a token computation, each expert microbatch of it) gets its own torch group
+//! per multi-member group of its component's mesh, so collectives of two
+//! streams never share a communicator. Components in alphabetical order, then
+//! each component's stream copies, then the mesh's groups in the order above.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

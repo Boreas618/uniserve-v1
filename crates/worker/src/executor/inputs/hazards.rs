@@ -109,8 +109,8 @@ pub(super) fn latent_hazards(
     }
     let parts = backend.parts();
     let Some(ledger) = parts
-        .lanes
-        .and_then(crate::executor::lanes::ExecutorLanes::ledger_mut)
+        .computations
+        .and_then(crate::executor::computations::Computations::ledger_mut)
     else {
         return Ok(Vec::new());
     };

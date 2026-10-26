@@ -4,9 +4,10 @@ Each active call of a batch advances its request's progress and contributes
 one slot-state commit row (:func:`finish_rows`), in the layout of
 :mod:`uniserve.sampling.state`: ``[slot, mode, task, cache, logical,
 sampling, visible, penalties]``. The progress goes into the batch's
-completion records; the rows wait as the lane's :class:`CommitWork` until
-the worker has sealed the batch and calls the lane's commit, which pads them
-to a commit bucket (:func:`commit_bucket`) and installs them.
+completion records; the rows wait as the computation's :class:`CommitWork`
+until the worker has sealed the batch and calls the computation's commit,
+which pads them to a commit bucket (:func:`commit_bucket`) and installs
+them.
 
 - a prefill without a task: ``[slot, CACHE, -1, len, 0, 0, 0, 0]``; its
   cache becomes ``len`` and its logical position is kept;
@@ -229,7 +230,7 @@ def commit_bucket(rows: int, decode: Sequence[int], capacity: int) -> int:
 
 @dataclass(slots=True)
 class CommitWork:
-    """What a lane's commit installs after the worker sealed its batch.
+    """What a computation's commit installs after the worker sealed its batch.
 
     Attributes:
         rows: ``int64 [n, COMMIT_FIELDS]`` commit rows.

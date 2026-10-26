@@ -1,48 +1,49 @@
 """The token-denoising calls of a diffusion language model on one rank.
 
-:class:`DiffusionLMExecutor` serves the rank's diffusion LM lanes: one per
-diffusion LM component, each on the device's lane stream. A batch carries
-readouts, which evaluate blocks of tokens over their requests' cached
-prefixes and read candidate log-probabilities at answer slots, or denoising
-steps, which step each request's resident block by one step of block
-diffusion. The worker reaches it through ``uniserve.executor.Executor`` at
-a few points:
+:class:`DiffusionLMExecutor` serves the rank's diffusion LM computations: one
+per diffusion LM component, each on the device's primary stream. A batch
+carries readouts, which evaluate blocks of tokens over their requests'
+cached prefixes and read candidate log-probabilities at answer slots, or
+denoising steps, which step each request's resident block by one step of
+block diffusion. The worker reaches it through ``uniserve.executor.Executor``
+at a few points:
 
-- :meth:`DiffusionLMExecutor.manifest`: each lane and the device bytes the
-  lanes allocate beside the cache pool;
+- :meth:`DiffusionLMExecutor.manifest`: each computation and the device
+  bytes the computations allocate beside the cache pool;
 - :meth:`DiffusionLMExecutor.bind`: the storage capacity planning granted
-  (the text executor's ``TextBinding``); the lanes construct their runners,
-  columns and banks, and :meth:`DiffusionLMExecutor.step_rows` states the
-  blocks a sampler chunk steps;
+  (the text executor's ``TextBinding``); the computations construct their
+  runners, columns and banks, and :meth:`DiffusionLMExecutor.step_rows`
+  states the blocks a sampler chunk steps;
 - :meth:`DiffusionLMExecutor.warmup_phases`,
   :meth:`DiffusionLMExecutor.warmup_phase`,
   :meth:`DiffusionLMExecutor.warmup_finish` and
-  :meth:`DiffusionLMExecutor.seal`: graph capture in one phase per lane
-  around the worker's scratch tables (:mod:`.warmup`), then serving
-  replays only;
+  :meth:`DiffusionLMExecutor.seal`: graph capture in one phase per
+  computation around the worker's scratch tables (:mod:`.warmup`), then
+  serving replays only;
 - :meth:`DiffusionLMExecutor.start` and :meth:`DiffusionLMExecutor.release`:
   the requests and seeds the slots hold;
 - :meth:`DiffusionLMExecutor.execute`: one batch
-  (:class:`~.lane.DiffusionLMLane`); the lanes commit nothing past the
-  worker's commit point;
+  (:class:`~.computation.DiffusionLMComputation`); the computations commit
+  nothing past the worker's commit point;
 - :meth:`DiffusionLMExecutor.reopen_experts`,
   :meth:`DiffusionLMExecutor.kernels` and :meth:`DiffusionLMExecutor.close`.
 
 The parts:
 
-- :mod:`.bounds`: the model's facts and every bound of the lane
+- :mod:`.bounds`: the model's facts and every bound of the computation
   (:class:`~.bounds.Facts`, :class:`~.bounds.Bounds`,
   :class:`~.bounds.ServedSampling`);
 - :mod:`.shapes`: the graph buckets, their padding and the readout slot
   chunks (:class:`~.shapes.Shapes`);
 - :mod:`.calls`: the validation and packing of a batch's calls, the
-  requests the lane's slots hold and the batch's completion records
+  requests the computation's slots hold and the batch's completion records
   (:func:`~.calls.pack_readouts`, :func:`~.calls.pack_steps`,
   :class:`~.calls.Seeds`);
-- :mod:`.buffers`: the lane's device columns and resident banks
+- :mod:`.buffers`: the computation's device columns and resident banks
   (:class:`~.buffers.Columns`, :class:`~.buffers.Banks`);
-- :mod:`.lane`: a lane's batches (:class:`~.lane.DiffusionLMLane`);
-- :mod:`.warmup`: a lane's warmup forwards and phase.
+- :mod:`.computation`: a computation's batches
+  (:class:`~.computation.DiffusionLMComputation`);
+- :mod:`.warmup`: a computation's warmup forwards and phase.
 """
 
 from __future__ import annotations
@@ -64,13 +65,13 @@ from uniserve.runner.diffusion_lm import DiffusionLMRunner, model_at
 from .bounds import Bounds, Facts, ServedSampling
 from .buffers import Banks, BankShape, Columns, Dimensions
 from .calls import Seeds
-from .lane import DiffusionLMLane
+from .computation import DiffusionLMComputation
 from .shapes import SLOT_BUCKETS
 from .warmup import Phase, phases
 
 __all__ = ["DiffusionLMExecutor"]
 
-# The call kind a diffusion LM lane serves, by its protocol name.
+# The call kind a diffusion LM computation serves, by its protocol name.
 KIND = "token_denoising"
 
 
@@ -100,7 +101,7 @@ def _components(settings: Mapping[str, Any]) -> list[_Component]:
 
 
 class DiffusionLMExecutor:
-    """The diffusion LM lanes of one rank.
+    """The diffusion LM computations of one rank.
 
     Args:
         loaded: The loaded model.
@@ -139,7 +140,7 @@ class DiffusionLMExecutor:
             for component in self.components
         }
 
-        self.lanes: dict[int, DiffusionLMLane] = {}
+        self.computations: dict[int, DiffusionLMComputation] = {}
         self.seeds: Seeds | None = None
         self._phases: list[Phase] = []
 
@@ -189,19 +190,20 @@ class DiffusionLMExecutor:
     # The manifest.
 
     def manifest(self) -> dict[str, Any]:
-        """The rank's diffusion LM lanes and what capacity planning reads.
+        """The rank's diffusion LM computations and what planning reads.
 
-        Returns ``lanes`` (each lane's manifest entry, with the output words
-        of its largest denoising batch: a readout batch of more words leases
-        storage of its own) and ``pages``: the call fields and the device
-        bytes. ``fixed_bytes`` plus ``slot_bytes`` per request slot bounds
-        what binding allocates on the device beside the cache pool: every
-        lane's columns and attention metadata at the batch bounds (rows at
-        ``max_batch_calls``, before the pool bounds them, which may
-        over-reserve), a generating lane's sampler workspace, its banks'
-        padding row and alignment, and its banks per slot.
+        Returns ``computations`` (each computation's manifest entry, with the
+        output words of its largest denoising batch: a readout batch of more
+        words leases storage of its own) and ``pages``: the call fields and
+        the device bytes. ``fixed_bytes`` plus ``slot_bytes`` per request
+        slot bounds what binding allocates on the device beside the cache
+        pool: every computation's columns and attention metadata at the
+        batch bounds (rows at ``max_batch_calls``, before the pool bounds
+        them, which may over-reserve), a generating computation's sampler
+        workspace, its banks' padding row and alignment, and its banks per
+        slot.
         """
-        lanes = []
+        computations = []
         fixed = slot_bytes = 0
         for component in self.components:
             facts = self.facts[component.name]
@@ -220,7 +222,7 @@ class DiffusionLMExecutor:
                     dtype=facts.embedding_dtype,
                     device_type="cuda" if self.cuda else "cpu",
                 )
-            lanes.append(
+            computations.append(
                 {
                     "component": component.name,
                     "kinds": [KIND],
@@ -233,7 +235,7 @@ class DiffusionLMExecutor:
                 }
             )
         return {
-            "lanes": lanes,
+            "computations": computations,
             "pages": {
                 "call_fields": list(CALL_FIELD_NAMES),
                 "fixed_bytes": int(fixed),
@@ -244,28 +246,29 @@ class DiffusionLMExecutor:
     # Startup.
 
     def bind(self, binding, union=None, *, joins: bool = False) -> None:
-        """Construct every lane's runner on the granted storage.
+        """Construct every computation's runner on the granted storage.
 
-        Allocates each lane's columns, attention metadata and, on a
-        generating lane, its zeroed banks on the lane stream, then
-        constructs the numerical runners in lane order.
+        Allocates each computation's columns, attention metadata and, on a
+        generating computation, its zeroed banks on the primary stream, then
+        constructs the numerical runners in index order.
 
         Args:
             binding: The text executor's ``TextBinding`` of the diffusion LM
-                lanes: the slots, the fitted pool's units, the K/V pool
-                object, the block tables (``unit_tables``, ``start_pages``,
-                ``table_shapes``), each lane's ``LaneBinding`` (one stream,
-                its scratch, graph pool, relay staging and stream groups)
-                and the prefetch object.
+                computations: the slots, the fitted pool's units, the K/V
+                pool object, the block tables (``unit_tables``,
+                ``start_pages``, ``table_shapes``), each computation's
+                ``ComputationBinding`` (one stream, its scratch, graph pool,
+                relay staging and stream groups) and the prefetch object.
             union: The rank's expert union member, or ``None``.
-            joins: The union's joins run through the first lane's runner:
-                the rank has no text lane that provides them.
+            joins: The union's joins run through the first computation's
+                runner: the rank has no text computation that provides them.
 
         Raises:
-            ValueError: A lane names a component the rank does not hold or
-                more than one stream, or graphs disagree with the pools.
-            NotImplementedError: The union runs microbatches, or a lane
-                stream is not the union's.
+            ValueError: A computation names a component the rank does not
+                hold or more than one stream, or graphs disagree with the
+                pools.
+            NotImplementedError: The union runs microbatches, or a
+                computation's stream is not the union's.
         """
         if union is not None and union.microbatches > 1:
             raise NotImplementedError(
@@ -279,35 +282,37 @@ class DiffusionLMExecutor:
             np.arange(len(self.groups), dtype=np.int64),
             [group.units_per_page for group in self.groups],
         )
-        # The lanes compute where the worker's block tables live: on the
+        # The computations run where the worker's block tables live: on the
         # rank's device, or on the host.
         device = tables["unit_tables"].device
-        for group, lane in enumerate(binding.lanes):
-            component = by_name.get(lane.component)
+        for group, computation in enumerate(binding.computations):
+            component = by_name.get(computation.component)
             if component is None:
                 raise ValueError(
-                    "the worker binds a diffusion LM lane of "
-                    f"{lane.component!r}, which the rank does not hold"
+                    "the worker binds a diffusion LM computation of "
+                    f"{computation.component!r}, which the rank does not hold"
                 )
-            if len(lane.streams) != 1:
-                raise ValueError("a diffusion LM lane runs on one stream")
-            stream = lane.streams[0]
+            if len(computation.streams) != 1:
+                raise ValueError(
+                    "a diffusion LM computation runs on one stream"
+                )
+            stream = computation.streams[0]
             if (
                 union is not None
                 and stream is not None
                 and stream.cuda_stream != union.streams[0].cuda_stream
             ):
                 raise NotImplementedError(
-                    "expert parallelism runs every forward on one execution "
-                    "lane"
+                    "expert parallelism runs every forward on the expert "
+                    "union's stream"
                 )
-            pool = None if lane.pools is None else lane.pools[0]
+            pool = None if computation.pools is None else computation.pools[0]
             facts = self.facts[component.name]
             bounds = self._bounds(facts, binding.slots, binding.units)
             if bounds.graphs != (pool is not None):
                 raise ValueError(
-                    "a diffusion LM lane captures graphs exactly when its "
-                    "stream has a graph pool"
+                    "a diffusion LM computation captures graphs exactly when "
+                    "its stream has a graph pool"
                 )
             dims = self._dimensions(bounds, facts)
             denoising = bounds.denoise
@@ -354,13 +359,13 @@ class DiffusionLMExecutor:
             runner = DiffusionLMRunner(
                 self.loaded,
                 component.path,
-                # A lane on the host computes on the current stream.
+                # A computation on the host runs on the current stream.
                 0 if stream is None else int(stream.cuda_stream),
-                lane.scratches[0],
+                computation.scratches[0],
                 binding.unit_pool,
                 None if union is None else union.exchanges[0],
                 binding.prefetch,
-                lane.collectives[0],
+                computation.collectives[0],
                 max(bounds.tokens, SLOT_BUCKETS[-1]),
                 bounds.rows,
                 list(bounds.block_size),
@@ -372,8 +377,8 @@ class DiffusionLMExecutor:
                 # Idle ranks join expert steps through the runner's expert
                 # layers.
                 union.bind_joins([runner], [pool])
-            self.lanes[lane.index] = DiffusionLMLane(
-                index=lane.index,
+            self.computations[computation.index] = DiffusionLMComputation(
+                index=computation.index,
                 group=group,
                 component=component.name,
                 label=(
@@ -391,7 +396,7 @@ class DiffusionLMExecutor:
                 banks=banks,
                 stream=stream,
                 pool=pool,
-                relay_flags=lane.relay_flags,
+                relay_flags=computation.relay_flags,
                 union=union,
                 table_groups=table_groups,
             )
@@ -402,13 +407,13 @@ class DiffusionLMExecutor:
         """Return the blocks a sampler chunk steps at once.
 
         The engine warms its serving path with them; zero without a
-        generating lane.
+        generating computation.
         """
         return max(
             (
-                lane.bounds.denoise.chunk_rows
-                for lane in self.lanes.values()
-                if lane.bounds.denoise is not None
+                computation.bounds.denoise.chunk_rows
+                for computation in self.computations.values()
+                if computation.bounds.denoise is not None
             ),
             default=0,
         )
@@ -416,11 +421,11 @@ class DiffusionLMExecutor:
     def warmup_phases(self) -> list[dict[str, Any]]:
         """Return the warmup phases in the order every rank runs them.
 
-        Each names its lane, the scratch tables' lengths of slots ``1..``
-        and each attending forward's rows ``[slot, prefix, query]``.
+        Each names its computation, the scratch tables' lengths of slots
+        ``1..`` and each attending forward's rows ``[slot, prefix, query]``.
         """
         self._phases = phases(
-            [self.lanes[index] for index in sorted(self.lanes)]
+            [self.computations[index] for index in sorted(self.computations)]
         )
         return [phase.describe() for phase in self._phases]
 
@@ -434,27 +439,27 @@ class DiffusionLMExecutor:
         phase.run([np.asarray(page.numpy(), dtype=np.int64) for page in pages])
 
     def warmup_finish(self) -> None:
-        """End warmup: every graph was captured in the lanes' phases.
+        """End warmup: every graph was captured in the computations' phases.
 
-        The expert union's warmup ends after every executor's lanes
+        The expert union's warmup ends after every executor's computations
         finished (``ExpertUnion.finish_warmup``), which the rank's executor
         calls.
         """
 
     def seal(self) -> None:
         """Refuse further captures: serving replays what warmup captured."""
-        for lane in self.lanes.values():
-            lane.seal()
+        for computation in self.computations.values():
+            computation.seal()
 
     def reopen_experts(self) -> None:
-        """Release every lane's graphs so warmup captures them anew.
+        """Release every computation's graphs so warmup captures them anew.
 
         Called when the expert union rebuilt the workspaces the graphs
         addressed; the warmup phases that follow capture again and
         :meth:`seal` closes the tables.
         """
-        for lane in self.lanes.values():
-            lane.reopen()
+        for computation in self.computations.values():
+            computation.reopen()
 
     # Requests.
 
@@ -467,12 +472,12 @@ class DiffusionLMExecutor:
         them, so admission resets no device state. No request is refused.
 
         Raises:
-            RuntimeError: The lanes are not bound.
-            ValueError: A slot is outside the lanes, or a seed is not a
-                64-bit unsigned integer.
+            RuntimeError: The computations are not bound.
+            ValueError: A slot is outside the bound request slots, or a seed
+                is not a 64-bit unsigned integer.
         """
         if self.seeds is None:
-            raise RuntimeError("the diffusion LM lanes are not bound")
+            raise RuntimeError("the diffusion LM computations are not bound")
         for value in requests:
             key = value["request_key"]
             generation = value.get("generation")
@@ -494,8 +499,10 @@ class DiffusionLMExecutor:
 
     # Batches.
 
-    def execute(self, lane: int, step: str, *tensors: torch.Tensor) -> int:
-        """Run a token-denoising batch on lane ``lane``; return the record
+    def execute(
+        self, computation: int, step: str, *tensors: torch.Tensor
+    ) -> int:
+        """Run a token-denoising batch of ``computation``; return the record
         words written.
 
         ``tensors`` are, in order, the host call columns, forward columns,
@@ -507,26 +514,26 @@ class DiffusionLMExecutor:
         calls, forward, tokens, records, words, *features = tensors
         if features:
             raise ValueError("token-denoising calls carry no features")
-        return self.lanes[int(lane)].execute(
+        return self.computations[int(computation)].execute(
             json.loads(str(step)), calls, forward, tokens, records, words
         )
 
     def kernels(self) -> list[tuple[str, list[str]]]:
-        """Each lane's kernel-table label and selected kernels."""
+        """Each computation's kernel-table label and selected kernels."""
         return [
             entry
-            for index in sorted(self.lanes)
-            for entry in self.lanes[index].kernels()
+            for index in sorted(self.computations)
+            for entry in self.computations[index].kernels()
         ]
 
     def close(self, aborted: bool) -> None:
-        """Release every lane, newest first; the worker drained the streams."""
+        """Release every computation, newest first; the streams are drained."""
         failure: BaseException | None = None
-        for index in sorted(self.lanes, reverse=True):
+        for index in sorted(self.computations, reverse=True):
             try:
-                self.lanes[index].close(bool(aborted))
+                self.computations[index].close(bool(aborted))
             except Exception as error:
                 failure = failure or error
-        self.lanes.clear()
+        self.computations.clear()
         if failure is not None:
             raise failure

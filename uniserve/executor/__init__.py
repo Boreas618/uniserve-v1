@@ -1,26 +1,28 @@
 """The numerical half of a worker rank: :class:`Executor`.
 
 The worker (Rust) owns the control plane and the data plane: requests,
-batches, the lane thread and its streams, product storage and transfers,
+batches, the builder thread and the streams, product storage and transfers,
 the prefix cache's pages, the latent ledger, the graph pools' device memory
 and the host groups. The executor owns every numerical decision and
 computation of the rank: the components' runners, their buffers, layouts
 and buckets, graph capture and replay, sampling, slot state, expert steps
 and the media work of host components.
 
-The executor serves the rank's lanes. A lane is one computation it serves
-under the lane's index: a component's call kinds on one of the worker's
-streams (or the host). Each lane's manifest entry states whether its
-batches are prepared (the executor first states what each call reads and
-writes), whether they commit (the executor advances its slot state past a
-batch's commit point) and which worker resources it uses (``pages`` of the
-prefix cache, the ``latents`` ledger, host-task ``reports``).
+The executor serves the rank's computations. A computation is one kind of
+work it serves under an index: a component's call kinds on one of the
+worker's streams (or the host). Each computation's manifest entry states
+whether its batches are prepared (the executor first states what each call
+reads and writes), whether they commit (the executor advances its slot
+state past a batch's commit point) and which worker resources it uses
+(``pages`` of the prefix cache, the ``latents`` ledger, host-task
+``reports``).
 
-The worker calls the executor at a few points only, each from a job of the
-lane thread (or at startup), with JSON for structured values and tensors
+The worker calls the executor at a few points only, each from a job on the
+builder thread (or at startup), with JSON for structured values and tensors
 for storage:
 
-- :meth:`Executor.manifest`: every lane and what capacity planning reads;
+- :meth:`Executor.manifest`: every computation and what capacity planning
+  reads;
 - :meth:`Executor.expert_storage_bytes` and :meth:`Executor.connect_experts`:
   this rank's member of an expert union, collectively, before planning;
 - :meth:`Executor.bind`: the storage capacity planning granted; the
@@ -31,7 +33,7 @@ for storage:
 - :meth:`Executor.start` and :meth:`Executor.release`: the requests a batch
   starts, which the executor may refuse, and the slots the worker retires;
 - :meth:`Executor.prepare`, :meth:`Executor.execute` and
-  :meth:`Executor.commit`: one batch of a lane;
+  :meth:`Executor.commit`: one batch of a computation;
 - :meth:`Executor.join_expert_step`, :meth:`Executor.park_experts`,
   :meth:`Executor.promote_experts` and :meth:`Executor.rebuild_experts`: the
   expert union outside the rank's own steps and across a standby's
@@ -67,21 +69,23 @@ class _Binding:
     Attributes:
         slots: Request slots.
         max_calls: The most calls of a batch.
-        streams: Each lane stream by index (``None`` on the host).
+        streams: Each stream the worker grants, by index (``None`` on the
+            host).
         scratches: Each stream's scratch.
-        host_scratch: The scratch the lanes on the host share; ``None``
-            when every lane computes on a device.
+        host_scratch: The scratch the computations on the host share;
+            ``None`` when every computation runs on a device.
         pools: Each stream's graph pool; ``None`` without graphs.
         peer_pools: Under graphs on a rank whose modules also run on other
             devices (a generation tower), each stream's ``(ordinal, pool)``
             on those devices, by stream index.
-        lanes: Each lane's ``component``, ``kinds``, ``streams`` (indices)
-            and ``resources``, in lane order.
+        computations: Each computation's ``component``, ``kinds``,
+            ``streams`` (indices) and ``resources``, in manifest order.
         experts: The stream indices of the expert microbatches.
         unit_pool: The prefix cache's K/V pool object, with pages.
         units: The prefix cache pool's units, sentinel included.
         tables: The worker's block tables by name, with pages.
-        staging: Each pages lane's relay staging (tokens, flags), by lane.
+        staging: The relay staging (tokens, flags) of each computation over
+            the prefix cache, by computation index.
         banks: A latent ledger's two banks.
         reports: The host-task report pipe's descriptor.
         collectives: Each stream group: ``component``, ``copy`` and the
@@ -94,7 +98,7 @@ class _Binding:
     streams: list[torch.cuda.Stream | None]
     scratches: list[Any]
     pools: list[Any] | None
-    lanes: list[dict[str, Any]]
+    computations: list[dict[str, Any]]
     experts: list[int]
     peer_pools: dict[int, list[tuple[int, Any]]] = field(default_factory=dict)
     host_scratch: Any | None = None
@@ -118,10 +122,10 @@ class _Binding:
         Values: one scratch per stream; the host scratch when
         ``host_scratch``; one graph pool per stream when
         ``pools``, then, stream by stream, one per device of ``peers``; with
-        ``pages`` the unit pool then each named table; each
-        pages lane's relay staging (tokens, flags) in lane order; the two
-        latent banks when ``latents``; one process group per stream group;
-        the prefetch object when ``prefetch``.
+        ``pages`` the unit pool then each named table; the relay staging
+        (tokens, flags) of each computation over the prefix cache, in
+        manifest order; the two latent banks when ``latents``; one process
+        group per stream group; the prefetch object when ``prefetch``.
         """
         rest = list(values)
 
@@ -149,7 +153,9 @@ class _Binding:
             streams=streams,
             scratches=scratches,
             pools=take(len(streams)) if memory["pools"] else None,
-            lanes=[dict(lane) for lane in memory["lanes"]],
+            computations=[
+                dict(computation) for computation in memory["computations"]
+            ],
             experts=[int(index) for index in memory["experts"]],
             host_scratch=host_scratch,
         )
@@ -164,8 +170,8 @@ class _Binding:
             names = [str(name) for name in pages["tables"]]
             binding.tables = dict(zip(names, take(len(names)), strict=True))
             binding.units = int(pages["units"])
-        for index, lane in enumerate(binding.lanes):
-            if "pages" in lane["resources"]:
+        for index, computation in enumerate(binding.computations):
+            if "pages" in computation["resources"]:
                 tokens, flags = take(2)
                 binding.staging[index] = (tokens, flags)
         if memory["latents"]:
@@ -181,19 +187,21 @@ class _Binding:
             raise ValueError("bind received more values than it names")
         return binding
 
-    def lane_streams(
-        self, lane: Mapping[str, Any]
+    def computation_streams(
+        self, computation: Mapping[str, Any]
     ) -> tuple[torch.cuda.Stream, ...]:
-        """A lane's streams, by the indices it names; a host lane names none.
+        """A computation's streams, by the indices it names (none on the host).
 
         Raises:
-            ValueError: The lane names a host stream.
+            ValueError: The computation names a host stream.
         """
         streams = []
-        for index in lane["streams"]:
+        for index in computation["streams"]:
             stream = self.streams[int(index)]
             if stream is None:
-                raise ValueError("a device lane names a stream of the host")
+                raise ValueError(
+                    "a device computation names a stream of the host"
+                )
             streams.append(stream)
         return tuple(streams)
 
@@ -208,12 +216,12 @@ class _Binding:
         return groups or None
 
 
-class _VideoLanes:
-    """A video model's lanes over the video executor.
+class _VideoComputations:
+    """A video model's computations over the video executor.
 
-    One lane per component placed on the rank, each preparing its batches:
-    the denoiser's lane steps trajectories in the worker's latent ledger,
-    host components' lanes report their host tasks.
+    One computation per component placed on the rank, each preparing its
+    batches: the denoiser's computation steps trajectories in the worker's
+    latent ledger, host components' computations report their host tasks.
     """
 
     def __init__(self, loaded, settings: Mapping[str, Any]) -> None:
@@ -223,7 +231,7 @@ class _VideoLanes:
         self.section = dict(settings["video"])
         self.placed = list(self.video.placed.values())
 
-    def lanes(self) -> list[dict[str, Any]]:
+    def computations(self) -> list[dict[str, Any]]:
         entries = []
         for placed in self.placed:
             resources = []
@@ -245,22 +253,22 @@ class _VideoLanes:
     def manifest(self) -> dict[str, Any]:
         return self.video.manifest()
 
-    def bind(self, binding: _Binding, lanes: Sequence[int]) -> None:
+    def bind(self, binding: _Binding, computations: Sequence[int]) -> None:
         """Bind the video executor: each kind's stream, scratch and pool.
 
-        ``lanes`` are the global indices of this executor's lanes, in the
-        order :meth:`lanes` stated them.
+        ``computations`` are the global indices of this executor's
+        computations, in the order :meth:`computations` stated them.
         """
         streams: dict[str, torch.cuda.Stream] = {}
         scratches: dict[str, Any] = {}
         pools: dict[str, Any] = {}
-        for placed, index in zip(self.placed, lanes, strict=True):
-            lane = binding.lanes[index]
-            if not lane["streams"]:
+        for placed, index in zip(self.placed, computations, strict=True):
+            computation = binding.computations[index]
+            if not computation["streams"]:
                 continue
-            stream_index = int(lane["streams"][0])
-            (stream, *_) = binding.lane_streams(lane)
-            for kind in lane["kinds"]:
+            stream_index = int(computation["streams"][0])
+            (stream, *_) = binding.computation_streams(computation)
+            for kind in computation["kinds"]:
                 streams[str(kind)] = stream
                 scratches[str(kind)] = binding.scratches[stream_index]
             if binding.pools is not None:
@@ -282,7 +290,7 @@ class _VideoLanes:
     def warmup_phases(self) -> list[dict[str, Any]]:
         # One phase that reads no prefix cache: the video executor warms
         # and captures its components in one call.
-        return [{"lane": 0, "lengths": None, "steps": []}]
+        return [{"computation": 0, "lengths": None, "steps": []}]
 
     def warmup_phase(self, index: int, *pages: torch.Tensor) -> None:
         del index, pages
@@ -300,18 +308,20 @@ class _VideoLanes:
     def release(self, slots: list[int]) -> None:
         self.video.release(slots)
 
-    def prepare(self, lane: int, step: Mapping[str, Any]):
-        del lane
+    def prepare(self, computation: int, step: Mapping[str, Any]):
+        del computation
         return self.video.prepare(step)
 
-    def execute(self, lane: int, step: str, tensors: Sequence[torch.Tensor]):
-        del lane
+    def execute(
+        self, computation: int, step: str, tensors: Sequence[torch.Tensor]
+    ):
+        del computation
         return [
             int(mode) for mode in self.video.execute(json.loads(step), tensors)
         ]
 
-    def commit(self, lane: int) -> None:
-        raise RuntimeError("video lanes do not commit")
+    def commit(self, computation: int) -> None:
+        raise RuntimeError("video computations do not commit")
 
     def kernels(self):
         return self.video.kernels()
@@ -320,8 +330,8 @@ class _VideoLanes:
         self.video.close(aborted)
 
 
-class _TextLanes:
-    """A causal language model's lanes over the text executor."""
+class _TextComputations:
+    """A causal language model's computations over the text executor."""
 
     def __init__(self, loaded, settings: Mapping[str, Any]) -> None:
         from uniserve.executor.text import TextExecutor
@@ -329,8 +339,8 @@ class _TextLanes:
         self.text = TextExecutor(loaded, settings)
         self._manifest: dict[str, Any] | None = None
 
-    def lanes(self) -> list[dict[str, Any]]:
-        return self._stated()["lanes"]
+    def computations(self) -> list[dict[str, Any]]:
+        return self._stated()["computations"]
 
     def pages(self) -> dict[str, Any]:
         return self._stated()["pages"]
@@ -340,7 +350,9 @@ class _TextLanes:
             self._manifest = self.text.manifest()
         return self._manifest
 
-    def bind(self, binding: _Binding, lanes: Sequence[int], union) -> None:
+    def bind(
+        self, binding: _Binding, computations: Sequence[int], union
+    ) -> None:
         from uniserve.executor.text import TextBinding
 
         self.text.bind(
@@ -349,7 +361,7 @@ class _TextLanes:
                 units=binding.units,
                 unit_pool=binding.unit_pool,
                 tables=binding.tables,
-                lanes=_lane_bindings(binding, lanes),
+                computations=_computation_bindings(binding, computations),
                 prefetch=binding.prefetch,
             ),
             union,
@@ -373,14 +385,16 @@ class _TextLanes:
     def release(self, slots: list[int]) -> None:
         self.text.release(slots)
 
-    def prepare(self, lane: int, step: Mapping[str, Any]):
-        raise RuntimeError("text lanes are not prepared")
+    def prepare(self, computation: int, step: Mapping[str, Any]):
+        raise RuntimeError("text computations are not prepared")
 
-    def execute(self, lane: int, step: str, tensors: Sequence[torch.Tensor]):
-        return [int(self.text.execute(lane, step, *tensors))]
+    def execute(
+        self, computation: int, step: str, tensors: Sequence[torch.Tensor]
+    ):
+        return [int(self.text.execute(computation, step, *tensors))]
 
-    def commit(self, lane: int) -> None:
-        self.text.commit(lane)
+    def commit(self, computation: int) -> None:
+        self.text.commit(computation)
 
     def reopen_experts(self) -> None:
         self.text.reopen_experts()
@@ -392,11 +406,12 @@ class _TextLanes:
         self.text.close(aborted)
 
 
-class _DiffusionLMLanes:
-    """A diffusion language model's lanes over the diffusion LM executor.
+class _DiffusionLMComputations:
+    """A diffusion language model's computations over its executor.
 
-    Its lanes compute over the prefix cache like the text lanes, bound
-    through the same lane bindings; they neither prepare nor commit.
+    Its computations run over the prefix cache like the text computations,
+    bound through the same computation bindings; they neither prepare nor
+    commit.
     """
 
     def __init__(self, loaded, settings: Mapping[str, Any]) -> None:
@@ -405,8 +420,8 @@ class _DiffusionLMLanes:
         self.diffusion_lm = DiffusionLMExecutor(loaded, settings)
         self._manifest: dict[str, Any] | None = None
 
-    def lanes(self) -> list[dict[str, Any]]:
-        return self._stated()["lanes"]
+    def computations(self) -> list[dict[str, Any]]:
+        return self._stated()["computations"]
 
     def pages(self) -> dict[str, Any]:
         return self._stated()["pages"]
@@ -417,10 +432,11 @@ class _DiffusionLMLanes:
         return self._manifest
 
     def bind(
-        self, binding: _Binding, lanes: Sequence[int], union, joins: bool
+        self, binding: _Binding, computations: Sequence[int], union, joins: bool
     ) -> None:
-        """Bind the lanes; ``joins`` when no text lane provides the union's
-        joins, which then run through the first lane's runner.
+        """Bind the computations; ``joins`` when no text computation provides
+        the union's joins, which then run through the first computation's
+        runner.
         """  # noqa: D205
         from uniserve.executor.text import TextBinding
 
@@ -430,7 +446,7 @@ class _DiffusionLMLanes:
                 units=binding.units,
                 unit_pool=binding.unit_pool,
                 tables=binding.tables,
-                lanes=_lane_bindings(binding, lanes),
+                computations=_computation_bindings(binding, computations),
                 prefetch=binding.prefetch,
             ),
             union,
@@ -458,14 +474,16 @@ class _DiffusionLMLanes:
     def release(self, slots: list[int]) -> None:
         self.diffusion_lm.release(slots)
 
-    def prepare(self, lane: int, step: Mapping[str, Any]):
-        raise RuntimeError("diffusion LM lanes are not prepared")
+    def prepare(self, computation: int, step: Mapping[str, Any]):
+        raise RuntimeError("diffusion LM computations are not prepared")
 
-    def execute(self, lane: int, step: str, tensors: Sequence[torch.Tensor]):
-        return [int(self.diffusion_lm.execute(lane, step, *tensors))]
+    def execute(
+        self, computation: int, step: str, tensors: Sequence[torch.Tensor]
+    ):
+        return [int(self.diffusion_lm.execute(computation, step, *tensors))]
 
-    def commit(self, lane: int) -> None:
-        raise RuntimeError("diffusion LM lanes do not commit")
+    def commit(self, computation: int) -> None:
+        raise RuntimeError("diffusion LM computations do not commit")
 
     def reopen_experts(self) -> None:
         self.diffusion_lm.reopen_experts()
@@ -477,12 +495,13 @@ class _DiffusionLMLanes:
         self.diffusion_lm.close(aborted)
 
 
-class _ImageLanes:
-    """An image generation model's lanes over the image executor.
+class _ImageComputations:
+    """An image generation model's computations over the image executor.
 
-    One prepared lane per component the rank holds; the denoiser's lane
-    steps trajectories in the worker's latent ledger and prefills its
-    guidance prefixes through the text lane of its component.
+    One prepared computation per kind of work a held component serves; the
+    denoiser's computation steps trajectories in the worker's latent ledger
+    and prefills its guidance prefixes through the text computation of its
+    component.
     """
 
     def __init__(self, loaded, settings: Mapping[str, Any]) -> None:
@@ -490,15 +509,17 @@ class _ImageLanes:
 
         self.image = ImageExecutor(loaded, settings)
 
-    def lanes(self) -> list[dict[str, Any]]:
-        return self.image.lanes()
+    def computations(self) -> list[dict[str, Any]]:
+        return self.image.computations()
 
     def manifest(self) -> dict[str, Any]:
         return self.image.manifest()
 
-    def bind(self, binding: _Binding, lanes: Sequence[int]) -> dict[str, Any]:
-        """Bind the lanes; return the report the worker reads (``image``)."""
-        return self.image.bind_from(binding, lanes)
+    def bind(
+        self, binding: _Binding, computations: Sequence[int]
+    ) -> dict[str, Any]:
+        """Bind the computations; return the worker's ``image`` report."""
+        return self.image.bind_from(binding, computations)
 
     def warmup_phases(self) -> list[dict[str, Any]]:
         return self.image.warmup_phases()
@@ -518,17 +539,21 @@ class _ImageLanes:
     def release(self, slots: list[int]) -> None:
         self.image.release(slots)
 
-    def prepare(self, lane: int, step: Mapping[str, Any]):
-        return self.image.prepare(lane, step)
+    def prepare(self, computation: int, step: Mapping[str, Any]):
+        return self.image.prepare(computation, step)
 
-    def execute(self, lane: int, step: str, tensors: Sequence[torch.Tensor]):
+    def execute(
+        self, computation: int, step: str, tensors: Sequence[torch.Tensor]
+    ):
         return [
             int(mode)
-            for mode in self.image.execute(lane, json.loads(step), tensors)
+            for mode in self.image.execute(
+                computation, json.loads(step), tensors
+            )
         ]
 
-    def commit(self, lane: int) -> None:
-        raise RuntimeError("image lanes do not commit")
+    def commit(self, computation: int) -> None:
+        raise RuntimeError("image computations do not commit")
 
     def kernels(self):
         return self.image.kernels()
@@ -550,9 +575,10 @@ class Executor:
             ``kinds`` it serves, its ``ranks``, whether its media units are
             ``distributed`` and its ``units_per_rank``), and one section per
             role the rank serves, each ``null`` otherwise: ``video`` for a
-            video model, ``pages`` for lanes over the prefix cache (batch
-            bounds, graph buckets, cache groups, block diffusion, expert
-            exchange) and ``experts`` for its member of an expert union.
+            video model, ``pages`` for computations over the prefix cache
+            (batch bounds, graph buckets, cache groups, block diffusion,
+            expert exchange) and ``experts`` for its member of an expert
+            union.
     """
 
     def __init__(self, loaded, config: str) -> None:
@@ -567,43 +593,43 @@ class Executor:
         self._diffusion_lm = None
         self._image = None
         if settings.get("video") is not None:
-            self._video = _VideoLanes(loaded, settings)
+            self._video = _VideoComputations(loaded, settings)
             self._served.append(self._video)
-        # A lane executor whose components serve none of its call kinds on
-        # this rank states no lane and takes no part in the rank.
+        # An executor whose components serve none of its call kinds on this
+        # rank states no computation and takes no part in the rank.
         if settings.get("pages") is not None and _holds(settings, "causal_lm"):
-            text = _TextLanes(loaded, settings)
-            if text.lanes():
+            text = _TextComputations(loaded, settings)
+            if text.computations():
                 self._text = text
                 self._served.append(text)
         if settings.get("pages") is not None and _holds(
             settings, "diffusion_lm"
         ):
-            diffusion_lm = _DiffusionLMLanes(loaded, settings)
-            if diffusion_lm.lanes():
+            diffusion_lm = _DiffusionLMComputations(loaded, settings)
+            if diffusion_lm.computations():
                 self._diffusion_lm = diffusion_lm
                 self._served.append(diffusion_lm)
         if settings.get("image") is not None:
-            self._image = _ImageLanes(loaded, settings)
+            self._image = _ImageComputations(loaded, settings)
             self._served.append(self._image)
         # The member of an expert union, configured before planning.
         self._union: ExpertUnion | None = None
-        # Each lane in manifest order: its executor and its index there.
-        self._lanes: list[tuple[Any, int]] = []
+        # Each computation in manifest order: its executor and its index there.
+        self._computations: list[tuple[Any, int]] = []
         # Each warmup phase in order: its executor and its index there.
         self._phases: list[tuple[Any, int]] = []
 
     # The manifest and the expert union, before planning.
 
     def manifest(self) -> str:
-        """JSON of every lane and what capacity planning reads."""
-        lanes: list[dict[str, Any]] = []
-        self._lanes = []
+        """JSON of every computation and what capacity planning reads."""
+        computations: list[dict[str, Any]] = []
+        self._computations = []
         for served in self._served:
-            for local, entry in enumerate(served.lanes()):
-                lanes.append(entry)
-                self._lanes.append((served, local))
-        manifest: dict[str, Any] = {"lanes": lanes}
+            for local, entry in enumerate(served.computations()):
+                computations.append(entry)
+                self._computations.append((served, local))
+        manifest: dict[str, Any] = {"computations": computations}
         if self._video is not None:
             manifest["video"] = self._video.manifest()
         if self._image is not None:
@@ -619,7 +645,8 @@ class Executor:
             fields = stated[0]["call_fields"]
             if any(pages["call_fields"] != fields for pages in stated):
                 raise AssertionError(
-                    "the lanes over the prefix cache disagree on call fields"
+                    "the computations over the prefix cache disagree on call "
+                    "fields"
                 )
             manifest["pages"] = {
                 "call_fields": fields,
@@ -668,22 +695,22 @@ class Executor:
 
         ``memory`` is JSON: ``slots``, ``max_calls``, the ``streams``
         (``[handle, ordinal]`` each), whether graph ``pools`` follow and
-        the ``peers`` devices they follow on, each lane's ``component``,
-        ``kinds``, ``streams`` and ``resources``, the ``experts`` microbatch
-        stream indices, the prefix cache's ``pages`` (``units`` and table
-        names) or ``null``, whether ``latents`` banks follow, the
-        ``reports`` pipe descriptor, the stream groups' ``collectives`` and
-        whether a ``prefetch`` object follows. Returns JSON
+        the ``peers`` devices they follow on, the ``computations`` (each
+        one's ``component``, ``kinds``, ``streams`` and ``resources``), the
+        ``experts`` microbatch stream indices, the prefix cache's ``pages``
+        (``units`` and table names) or ``null``, whether ``latents`` banks
+        follow, the ``reports`` pipe descriptor, the stream groups'
+        ``collectives`` and whether a ``prefetch`` object follows. Returns JSON
         ``{"diffusion_lm_step_rows": n, "image": report}``: the rows of one
         diffusion LM sampler chunk, and an image model's report (its warmup
         shapes, captured sizes, guidance tokens, capacity and capture-order
         digests) or ``null``.
         """
         binding = _Binding.parse(json.loads(str(memory)), values)
-        if len(binding.lanes) != len(self._lanes):
-            raise ValueError("bind names other lanes than the manifest")
+        if len(binding.computations) != len(self._computations):
+            raise ValueError("bind names other computations than the manifest")
         owned: dict[int, list[int]] = {}
-        for index, (served, _) in enumerate(self._lanes):
+        for index, (served, _) in enumerate(self._computations):
             owned.setdefault(id(served), []).append(index)
         if self._video is not None:
             self._video.bind(binding, owned[id(self._video)])
@@ -702,20 +729,20 @@ class Executor:
         if self._image is not None:
             image = self._image.bind(binding, owned[id(self._image)])
             if self._text is not None:
-                # Media calls of the text lanes ask the image half for its
-                # facts and denoiser; the denoiser prefills its guidance
-                # prefixes through its component's text lane.
+                # Media calls of the text computations ask the image half for
+                # its facts and denoiser; the denoiser prefills its guidance
+                # prefixes through its component's text computation.
                 text = self._text.text
                 text.attach_image(
                     self._image.image.facts(), self._image.image.denoiser()
                 )
                 self._image.image.attach_text(
                     {
-                        str(entry["component"]): text.lanes[local]
-                        for local, entry in enumerate(self._text.lanes())
+                        str(entry["component"]): text.computations[local]
+                        for local, entry in enumerate(self._text.computations())
                     }
                 )
-        if self._union is not None and not self._lanes:
+        if self._union is not None and not self._computations:
             # An expert-only rank joins through layers of its own, one per
             # microbatch stream.
             indices = binding.experts
@@ -734,20 +761,23 @@ class Executor:
     def warmup_phases(self) -> str:
         """JSON of every warmup phase in order.
 
-        Each: the ``lane`` it runs on, the scratch tables' ``lengths`` of
-        slots ``1..`` (``null`` for a phase that reads no prefix cache) and
-        each step's attention rows ``[slot, prefix, query]``.
+        Each: the ``computation`` it runs on, the scratch tables'
+        ``lengths`` of slots ``1..`` (``null`` for a phase that reads no
+        prefix cache) and each step's attention rows ``[slot, prefix,
+        query]``.
         """
         phases = []
         self._phases = []
         for served in self._served:
             first = next(
                 index
-                for index, (owner, _) in enumerate(self._lanes)
+                for index, (owner, _) in enumerate(self._computations)
                 if owner is served
             )
             for local, phase in enumerate(served.warmup_phases()):
-                phases.append({**phase, "lane": first + int(phase["lane"])})
+                phases.append(
+                    {**phase, "computation": first + int(phase["computation"])}
+                )
                 self._phases.append((served, local))
         return json.dumps(phases)
 
@@ -783,8 +813,8 @@ class Executor:
 
         Past the seal a serving call (``start``, ``release``, ``prepare``,
         ``execute``, ``commit``, an expert step's join) only queues work on
-        the lanes' streams: a PyTorch operation that would make the host
-        wait for a stream (a copy from or to pageable memory, a device
+        the computations' streams: a PyTorch operation that would make the
+        host wait for a stream (a copy from or to pageable memory, a device
         scalar read on the host) raises instead, which fails the call. The
         mode is process-wide, so it is set around the call and restored:
         startup, warmup and lifecycle calls may synchronize.
@@ -832,28 +862,28 @@ class Executor:
             for served in self._served:
                 served.release(retired)
 
-    def prepare(self, lane: int, step: str) -> str:
-        """JSON of what each call of lane ``lane``'s batch reads and writes."""
-        served, local = self._lanes[int(lane)]
+    def prepare(self, computation: int, step: str) -> str:
+        """JSON of what each call of a computation's batch reads and writes."""
+        served, local = self._computations[int(computation)]
         with self._serving():
             return json.dumps(served.prepare(local, json.loads(str(step))))
 
     def execute(
-        self, lane: int, step: str, *tensors: torch.Tensor
+        self, computation: int, step: str, *tensors: torch.Tensor
     ) -> list[int]:
-        """Run lane ``lane``'s batch on the tensors the worker granted.
+        """Run ``computation``'s batch on the tensors the worker granted.
 
-        A prepared lane returns how each call's forward ran (0 eager, 1
-        replay); a lane over the prefix cache returns the record
+        A prepared computation returns how each call's forward ran (0 eager,
+        1 replay); a computation over the prefix cache returns the record
         words it wrote.
         """
-        served, local = self._lanes[int(lane)]
+        served, local = self._computations[int(computation)]
         with self._serving():
             return served.execute(local, str(step), tensors)
 
-    def commit(self, lane: int) -> None:
-        """Advance lane ``lane``'s slot state past its last batch."""
-        served, local = self._lanes[int(lane)]
+    def commit(self, computation: int) -> None:
+        """Advance ``computation``'s slot state past its last batch."""
+        served, local = self._computations[int(computation)]
         with self._serving():
             served.commit(local)
 
@@ -927,23 +957,26 @@ class Executor:
         return self._union
 
 
-def _lane_bindings(binding: _Binding, lanes: Sequence[int]) -> tuple:
-    """The ``LaneBinding`` of each of an executor's lanes over the prefix
-    cache, indexed locally in the order of ``lanes`` (global indices).
+def _computation_bindings(
+    binding: _Binding, computations: Sequence[int]
+) -> tuple:
+    """The ``ComputationBinding`` of each of an executor's computations over
+    the prefix cache, indexed locally in the order of ``computations``
+    (global indices).
     """  # noqa: D205
-    from uniserve.executor.text import LaneBinding
+    from uniserve.executor.text import ComputationBinding
 
     entries = []
-    for local, index in enumerate(lanes):
-        lane = binding.lanes[index]
-        component = str(lane["component"])
-        indices = [int(stream) for stream in lane["streams"]]
+    for local, index in enumerate(computations):
+        computation = binding.computations[index]
+        component = str(computation["component"])
+        indices = [int(stream) for stream in computation["streams"]]
         tokens, flags = binding.staging[index]
         if not indices:
-            # A lane on the host runs one microbatch, without a stream or a
-            # graph pool, on the rank's host scratch.
+            # A computation on the host runs one microbatch, without a stream
+            # or a graph pool, on the rank's host scratch.
             entries.append(
-                LaneBinding(
+                ComputationBinding(
                     index=local,
                     component=component,
                     streams=(None,),
@@ -956,10 +989,10 @@ def _lane_bindings(binding: _Binding, lanes: Sequence[int]) -> tuple:
             )
             continue
         entries.append(
-            LaneBinding(
+            ComputationBinding(
                 index=local,
                 component=component,
-                streams=binding.lane_streams(lane),
+                streams=binding.computation_streams(computation),
                 scratches=tuple(binding.scratches[i] for i in indices),
                 pools=None
                 if binding.pools is None
@@ -988,8 +1021,8 @@ def _expert_tokens(settings: Mapping[str, Any]) -> int:
     """Tokens one forward of this rank sends to each expert layer at most.
 
     The batch token bound or, under graphs, the largest decode graph bucket
-    within the batch bound, whichever is larger. A rank without lanes over
-    the prefix cache (an expert-only rank) takes the sources' bound.
+    within the batch bound, whichever is larger. A rank without computations
+    over the prefix cache (an expert-only rank) takes the sources' bound.
     """
     pages = settings.get("pages")
     if pages is None:

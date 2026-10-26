@@ -1,4 +1,4 @@
-"""Graph shapes of a text lane: the buckets startup captures and serving uses.
+"""Text graph shapes: the buckets startup captures and serving uses.
 
 A captured text graph holds a fixed numerical shape. Decode graphs hold a
 row bucket of one-token rows; prefill graphs hold a row and a token bucket of
@@ -11,9 +11,9 @@ one-token rows of slot 0. A prefill bucket adds one sequence holding every
 padding token, then empty sequences, so a row bucket of ``n`` rows holds
 forwards of fewer than ``n`` rows (:func:`prefill_row_buckets`).
 
-The catalogs hold every batch the worker admits, so a lane with graphs
-refuses a forward no captured bucket holds; graph selection depends only on
-call metadata, so every rank of a group selects the same graph.
+The catalogs hold every batch the worker admits, so a computation with
+graphs refuses a forward no captured bucket holds; graph selection depends
+only on call metadata, so every rank of a group selects the same graph.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def task_buckets(rows: int) -> list[int]:
 
 
 def prefill_row_buckets(max_rows: int) -> list[int]:
-    """Return the prefill row buckets of a lane of ``max_rows`` rows a batch.
+    """Return the prefill row buckets for at most ``max_rows`` rows a batch.
 
     Powers of two from 8, then ``max_rows + 1``, so that every batch the
     engine forms fits one: a bucket of ``n`` rows holds batches of fewer
@@ -355,7 +355,7 @@ class Selected(NamedTuple):
 
 
 class TextShapes:
-    """Immutable capture sizes of one text lane.
+    """Immutable capture sizes of one text computation.
 
     Args:
         decode: The decode row buckets, in configured order.

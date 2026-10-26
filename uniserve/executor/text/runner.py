@@ -1,10 +1,10 @@
-"""The forwards of a causal language model on one lane binding.
+"""The forwards of a causal language model on one computation binding.
 
 A :class:`TextRunner` owns one binding's columns
 (:class:`~.buffers.InputBuffers`), its graph catalogs and captured graphs,
 and the numerical runner (:class:`~uniserve.runner.causal_lm.CausalLMRunner`)
-whose methods compute on the binding's stream. A lane has one runner, or
-one per expert microbatch. Per forward the runner:
+whose methods compute on the binding's stream. A computation has one runner,
+or one per expert microbatch. Per forward the runner:
 
 1. plans the forward of an :class:`Invocation` (:meth:`TextRunner.plan`):
    the smallest captured bucket holding its rows (or its live shape when
@@ -13,9 +13,9 @@ one per expert microbatch. Per forward the runner:
 2. stages the host columns into the binding's columns on its stream, then
    the device copies the forward reads besides them
    (:meth:`TextRunner.stage`);
-3. replays the bucket's graph, runs the method eagerly, or, before the lane
-   is sealed, runs it eagerly and returns the capture of its graph, which
-   the caller performs behind the forward's selection
+3. replays the bucket's graph, runs the method eagerly, or, before the
+   computation is sealed, runs it eagerly and returns the capture of its
+   graph, which the caller performs behind the forward's selection
    (:meth:`TextRunner.forward`);
 4. selects the sampled tasks' tokens, reports their logprobs and scores
    prompt chunks with the captured selection graphs
@@ -114,7 +114,7 @@ __all__ = ["Executed", "Invocation", "Plan", "Relays", "TextRunner"]
 
 @dataclass(slots=True)
 class Relays:
-    """The selections an invocation relays into the lane's staging.
+    """The selections an invocation relays into the relay staging.
 
     Each pair names a call (its index in the batch) and the task column of
     its selection; a transition relay of a call that does not sample names
@@ -157,7 +157,7 @@ class Invocation:
         prompt: The prompt chunks the forward scores.
         embeddings: ``(token, features)`` of each vision block, its first
             feature token counted from the forward's first token.
-        relays: The selections the lane relays.
+        relays: The selections the computation relays.
     """
 
     kind: int
@@ -254,17 +254,17 @@ class Executed:
 
 
 class TextRunner:
-    """One lane binding (or expert microbatch) of a causal language model.
+    """One computation binding (or expert microbatch) of a causal LM.
 
     Args:
         owner: Names the runner in errors.
         kernel: The numerical runner on the binding's stream.
-        bounds: The lane's bounds.
+        bounds: The computation's bounds.
         buffers: The binding's columns.
         future_input_tokens: ``int64 [S, 1]`` the slot state's next tokens.
         logical_lengths: ``int64 [S]`` the slot state's logical positions.
         prompt_logits: ``[S, vocab]`` the slot state's retained logits.
-        stream: The binding's stream; ``None`` for a lane on the host.
+        stream: The binding's stream; ``None`` for a computation on the host.
         pool: The binding's graph pool; ``None`` serves every forward
             eagerly at its live shape.
     """
@@ -297,7 +297,8 @@ class TextRunner:
         self._future_tokens = future_input_tokens[:, 0]
         self._logical_lengths = logical_lengths
         self._prompt_logits = prompt_logits
-        # The commit the lane's last executed batch left for this runner.
+        # The commit the computation's last executed batch left for this
+        # runner.
         self.pending: CommitWork | None = None
 
     # Planning.
@@ -848,7 +849,7 @@ class TextRunner:
         and it records without executing.
 
         Raises:
-            ValueError: The lane is sealed and the bucket has no graph.
+            ValueError: The computation is sealed and the bucket has no graph.
         """
         method = self._method(plan, capacity)
         key = plan.key
@@ -1039,10 +1040,10 @@ class TextRunner:
         """Install ``work``'s commit rows and prompt tails into the slot state.
 
         The rows pad to their commit bucket and replay its ``commit`` graph;
-        before the lane is sealed a bucket without one commits eagerly and
-        is captured. Without a pool the rows commit eagerly. Then each
-        scored chunk's retained logits are copied into its slot. Everything
-        here is past the batch's commit point.
+        before the computation is sealed a bucket without one commits
+        eagerly and is captured. Without a pool the rows commit eagerly.
+        Then each scored chunk's retained logits are copied into its slot.
+        Everything here is past the batch's commit point.
         """
         rows = len(work.rows)
         tails = len(work.tails)
@@ -1110,12 +1111,12 @@ class TextRunner:
         """Capture ``method`` into the binding's graph pool on its stream.
 
         Raises:
-            AssertionError: The lane has no graph pool: it serves eagerly,
-                as a lane on the host always does.
+            AssertionError: The computation has no graph pool: it serves
+                eagerly, as a computation on the host always does.
         """
         if self.stream is None or self.pool is None:
             raise AssertionError(
-                "only a device lane with a graph pool captures"
+                "only a device computation with a graph pool captures"
             )
         return cuda_graph.capture(method, stream=self.stream, pool=self.pool)
 

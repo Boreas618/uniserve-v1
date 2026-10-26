@@ -139,7 +139,7 @@ impl BufferPool {
     /// Allocate one arena of `byte_capacity` bytes per memory in `devices`.
     /// Device arenas are exclusive storages `memory` provides, exportable in
     /// place, so CUDA VMM exports of persistent products are made in place;
-    /// host arenas serve CPU lanes. Contents are uninitialized.
+    /// host arenas serve computations on the host. Contents are uninitialized.
     pub fn allocate(
         byte_capacity: u64,
         devices: &[MemoryKind],

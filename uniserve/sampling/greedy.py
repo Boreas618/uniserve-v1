@@ -39,7 +39,7 @@ def greedy(
     if vocab.group.size == 1:
         return values, tokens
 
-    # Ship each rank's (score, token) pair as two int64 lanes through one
+    # Ship each rank's (score, token) pair as two int64 columns through one
     # integer all-gather; the float64 bit pattern is viewed back for the
     # exact-ordering max reduction across ranks.
     candidates = torch.stack(

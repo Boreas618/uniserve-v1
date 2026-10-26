@@ -10,7 +10,7 @@ scratch table. The layout (:class:`Layout`) depends only on configuration,
 pool facts and model facts, so every rank of a group reaches the same
 collectives in the same order.
 
-Per lane and runner (one per expert microbatch):
+Per computation and runner (one per expert microbatch):
 
 1. **Prefill buckets** (:func:`prefill_layouts`), largest footprint first
    (:func:`~.shapes.capture_order` by tokens times rows, then tokens),
@@ -53,6 +53,7 @@ import torch
 from uniserve.sampling import state as slot_commit
 
 from .commit import COMMIT_PADDING, CommitWork
+from .computation import TextComputation
 from .context import (
     Injection,
     block_row,
@@ -62,7 +63,6 @@ from .context import (
     text_row,
 )
 from .graphs import PromptKey, ScoreKey, SelectKey
-from .lane import TextLane
 from .protocol import CallKind
 from .rows import Rows, TokenSelection
 from .sampling import RowSampling, least_top, logprob_words
@@ -104,7 +104,7 @@ Capacities = Callable[[int], Sequence[int | None]]
 
 
 def _synchronize(stream: torch.cuda.Stream | None) -> None:
-    """Wait for a lane's stream; work on the host already completed."""
+    """Wait for a computation's stream; work on the host already completed."""
     if stream is not None:
         stream.synchronize()
 
@@ -302,7 +302,8 @@ def context_layout(
 
     A prompt token at position 0, then a block from position 1, in one
     forward; then a block alone where the first one's positions end. A
-    block ends its prompt, so its row selects as the lane's prefills do.
+    block ends its prompt, so its row selects as the computation's prefills
+    do.
     """
     selection = (
         TokenSelection.LAST_LOGITS if prefill_outputs else TokenSelection.CACHE
@@ -333,17 +334,18 @@ def context_layout(
 
 @dataclass(slots=True)
 class Phase:
-    """One warmup phase on one lane's runner.
+    """One warmup phase on one computation's runner.
 
     Attributes:
-        lane: The lane's index among the rank's token lanes.
+        computation: The computation's index among the executor's
+            computations.
         microbatch: The runner the phase captures on.
         layout: What the phase runs.
         run: Runs the phase given each step's page columns (``int64 [2 * G,
             rows]``).
     """
 
-    lane: int
+    computation: int
     microbatch: int
     layout: Layout
     run: Callable[[Sequence[np.ndarray]], None]
@@ -351,77 +353,79 @@ class Phase:
     def describe(self) -> dict[str, Any]:
         """Return what the worker reads of the phase."""
         return {
-            "lane": self.lane,
+            "computation": self.computation,
             "lengths": list(self.layout.lengths),
             "steps": [step.attention() for step in self.layout.steps],
         }
 
 
 def phases(
-    lanes: Sequence[TextLane], *, row_tokens: int, units: int
+    computations: Sequence[TextComputation], *, row_tokens: int, units: int
 ) -> list[Phase]:
-    """Lay out every lane's warmup phases in the order the worker runs them.
+    """Lay out every computation's warmup phases in the worker's order.
 
-    Every lane's prefill and decode phases, runner by runner, then the
-    context phases of lanes placing vision features.
+    Every computation's prefill and decode phases, runner by runner, then
+    the context phases of computations placing vision features.
 
     Args:
-        lanes: The rank's text lanes, in lane order.
+        computations: The rank's text computations, in index order.
         row_tokens: The most tokens one capture row holds: a request's
             length bound within the batch token bound.
         units: The scratch pool's units, sentinel excluded.
     """
     laid: list[Phase] = []
 
-    def add(lane: TextLane, microbatch: int, layout: Layout) -> None:
+    def add(
+        computation: TextComputation, microbatch: int, layout: Layout
+    ) -> None:
         def run(pages: Sequence[np.ndarray]) -> None:
-            _run(lane, microbatch, layout, pages)
+            _run(computation, microbatch, layout, pages)
 
-        laid.append(Phase(lane.index, microbatch, layout, run))
+        laid.append(Phase(computation.index, microbatch, layout, run))
 
-    for lane in lanes:
-        capacities = _capacities(lane)
-        for microbatch, runner in enumerate(lane.runners):
+    for computation in computations:
+        capacities = _capacities(computation)
+        for microbatch, runner in enumerate(computation.runners):
             for layout in prefill_layouts(
                 runner.shapes,
-                pages=lane.bounds.pages,
+                pages=computation.bounds.pages,
                 row_tokens=row_tokens,
                 units=units,
                 capacities=capacities,
             ):
-                add(lane, microbatch, layout)
+                add(computation, microbatch, layout)
             for layout in decode_layouts(
                 runner.shapes,
-                prefill_outputs=lane.prefill_outputs,
+                prefill_outputs=computation.prefill_outputs,
                 capacities=capacities,
             ):
-                add(lane, microbatch, layout)
-    for lane in lanes:
-        facts = lane.facts
+                add(computation, microbatch, layout)
+    for computation in computations:
+        facts = computation.facts
         injection = None if facts is None else facts.injection
         if facts is None or injection is None:
             continue
-        for microbatch, runner in enumerate(lane.runners):
+        for microbatch, runner in enumerate(computation.runners):
             if runner.dims.embeddings:
                 add(
-                    lane,
+                    computation,
                     microbatch,
                     context_layout(
                         injection,
                         spatial=facts.spatial_positions(),
-                        prefill_outputs=lane.prefill_outputs,
+                        prefill_outputs=computation.prefill_outputs,
                     ),
                 )
     return laid
 
 
-def _capacities(lane: TextLane) -> Capacities:
+def _capacities(computation: TextComputation) -> Capacities:
     # Every capacity a forward of ``tokens`` tokens can run at, largest
     # first; one forward without experts.
-    union = lane.union
+    union = computation.union
     if union is None:
         return lambda tokens: [None]
-    microbatches = len(lane.runners)
+    microbatches = len(computation.runners)
     return lambda tokens: [
         int(capacity)
         for capacity in reversed(union.capacities_for(tokens, microbatches))
@@ -429,7 +433,7 @@ def _capacities(lane: TextLane) -> Capacities:
 
 
 def _run(
-    lane: TextLane,
+    computation: TextComputation,
     microbatch: int,
     layout: Layout,
     pages: Sequence[np.ndarray],
@@ -444,7 +448,7 @@ def _run(
             f"a warmup phase of {len(layout.steps)} steps was given "
             f"{len(pages)} page columns"
         )
-    runner = lane.runners[microbatch]
+    runner = computation.runners[microbatch]
     stream = runner.stream
     # Zero features stand for an encoder's: their values do not choose
     # kernels. They are allocated for the first step placing features and
@@ -455,7 +459,7 @@ def _run(
     try:
         for step, columns in zip(layout.steps, pages, strict=True):
             if layout.primed and step.kind == CallKind.DECODE and not primed:
-                _prime(lane, microbatch, layout.primed)
+                _prime(computation, microbatch, layout.primed)
                 primed = True
             embeddings: list[tuple[int, torch.Tensor]] = []
             if step.features is not None:
@@ -467,7 +471,7 @@ def _run(
                             device=runner.buffers.arena.device,
                         )
                 embeddings.append((step.features, features))
-            lane.warm_step(
+            computation.warm_step(
                 microbatch,
                 step.rows,
                 step.kind,
@@ -483,35 +487,35 @@ def _run(
     finally:
         if primed:
             with torch.cuda.stream(stream):
-                lane.state.set_predicates(slots, False)
+                computation.state.set_predicates(slots, False)
         _synchronize(stream)
 
 
-def _prime(lane: TextLane, microbatch: int, size: int) -> None:
+def _prime(computation: TextComputation, microbatch: int, size: int) -> None:
     # Each slot's one prefilled token becomes its cache, which captures the
     # bucket's commit graph; the slots then continue.
-    runner = lane.runners[microbatch]
+    runner = computation.runners[microbatch]
     rows = np.tile(COMMIT_PADDING, (size, 1))
     rows[:, slot_commit.SLOT] = np.arange(1, size + 1)
     rows[:, slot_commit.CACHE_LENGTH] = 1
     runner.commit(CommitWork(rows=rows, tails=np.zeros((0, 2), dtype=np.int64)))
     with torch.cuda.stream(runner.stream):
-        lane.state.set_predicates(range(1, size + 1), True)
+        computation.state.set_predicates(range(1, size + 1), True)
 
 
-def finish(lanes: Sequence[TextLane]) -> None:
+def finish(computations: Sequence[TextComputation]) -> None:
     """Capture the graphs that follow every phase, then wait for them.
 
     Per runner with a graph pool: the ``commit`` graph of its rows when no
     decode bucket holds them, then its selection graphs, each alone over
     padding inputs, largest first. A ``score`` graph is captured when the
     least reporting tasks and top tokens its bucket holds fit the words a
-    forward may report, and, when the lane's prefills keep the hidden
-    states prompt scoring projects, a ``score_prompt`` graph when one row
-    of its bucket's least top tokens fits them.
+    forward may report, and, when the computation's prefills keep the
+    hidden states prompt scoring projects, a ``score_prompt`` graph when one
+    row of its bucket's least top tokens fits them.
     """
-    for lane in lanes:
-        for runner in lane.runners:
+    for computation in computations:
+        for runner in computation.runners:
             if runner.pool is None:
                 continue
             dims = runner.dims
@@ -540,7 +544,7 @@ def finish(lanes: Sequence[TextLane]) -> None:
                         )
             for top in reversed(tops):
                 if (
-                    lane.prefill_outputs
+                    computation.prefill_outputs
                     and logprob_words(1, least_top(top)) <= words
                 ):
                     runner.capture_alone(PromptKey(dims.prompt_block(top), top))

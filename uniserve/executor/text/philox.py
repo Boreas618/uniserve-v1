@@ -17,9 +17,9 @@ Layout:
   their low 32 bits;
 - uniform: ``(word0 >> 8) * 2**-24``, a 24-bit dyadic float32 in ``[0, 1)``.
 
-Every function is vectorized over numpy arrays: 32-bit lanes are held in
-``uint64`` arrays so that the 32x32-bit products and key additions never
-overflow, and are masked back to 32 bits after each step.
+Every function is vectorized over numpy arrays: 32-bit counter words are
+held in ``uint64`` arrays so that the 32x32-bit products and key additions
+never overflow, and are masked back to 32 bits after each step.
 
 :class:`DrawWindow` caches a window of each slot's draws so that a decode
 step gathers its draws instead of evaluating ten Philox rounds per row.
@@ -70,9 +70,9 @@ def philox4x32_10(counter: ArrayLike, key: ArrayLike) -> np.ndarray:
     Returns:
         ``[..., 4]`` uint32 output words.
     """
-    lanes = np.asarray(counter).astype(np.uint64)
+    counter_words = np.asarray(counter).astype(np.uint64)
     keys = np.asarray(key).astype(np.uint64)
-    c0, c1, c2, c3 = (lanes[..., index] for index in range(4))
+    c0, c1, c2, c3 = (counter_words[..., index] for index in range(4))
     k0, k1 = keys[..., 0], keys[..., 1]
     for round_index in range(_ROUNDS):
         # Round zero consumes the caller's key; every later round advances

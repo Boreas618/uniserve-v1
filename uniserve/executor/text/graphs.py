@@ -1,9 +1,10 @@
-"""The captured graphs of a text lane and the keys that name them.
+"""The captured graphs of a text computation and the keys that name them.
 
 A key names every input property a captured step depends on besides the
-lane's fixed tensors: its method and that method's scalar arguments (shape
-bucket, numerical variant, sampler). Each key holds one graph per routed
-expert token capacity (``None`` for a lane without disaggregated experts).
+computation's fixed tensors: its method and that method's scalar arguments
+(shape bucket, numerical variant, sampler). Each key holds one graph per
+routed expert token capacity (``None`` for a computation without
+disaggregated experts).
 
 A table is filled at startup and sealed; afterwards a configured shape
 without a resident graph is an error, never a silent eager fallback,
@@ -109,10 +110,10 @@ _ABANDONED: list[dict[Any, Graph]] = []
 
 
 class GraphTable:
-    """The captured graphs of one text lane, in capture order.
+    """The captured graphs of one text computation, in capture order.
 
     Args:
-        owner: Names the lane in errors.
+        owner: Names the computation in errors.
     """
 
     def __init__(self, owner: str) -> None:
@@ -149,7 +150,7 @@ class GraphTable:
                 the refused graph is released.
         """
         if self.sealed:
-            reason = "graphs are captured only before the lane is sealed"
+            reason = "graphs are captured only before the computation is sealed"
         elif (key, capacity) in self._graphs:
             reason = f"graph bucket {key!r} was already captured"
         else:

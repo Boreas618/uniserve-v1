@@ -13,22 +13,21 @@
 //!    executor and its manifest, execution streams and the expert union.
 //! 5. Capacity: request slots, cache units and latent pages, all agreed over
 //!    the group; the auxiliary-device check.
-//! 6. Request storage, the stream groups and the executor's lanes bound on
-//!    the plan, handed to the backend; an image model's ranks agree on their
+//! 6. Request storage, the stream groups and the executor's computations bound
+//!    on the plan, handed to the backend; an image model's ranks agree on their
 //!    graph keys.
 //! 7. The batch executor and the profiler.
 //!
-//! [`Worker::warmup`] runs the warmup before the rank reports; the engine
-//! then warms the serving path with real requests of the shapes the report
-//! states. [`Worker::run`] serves the channel, and [`Worker::close`]
-//! consumes the rank and releases its owners in dependency order:
-//! execution, the executor and its lanes, streams, requests, the process
-//! world, then deferred device memory. The launch closes every rank that started,
-//! unless the rank abandoned work its threads may wait in for good, which
-//! ends the process at once.
+//! [`Worker::warmup`] runs the warmup before the rank reports; the engine then
+//! warms the serving path with real requests of the shapes the report states.
+//! [`Worker::run`] serves the channel, and [`Worker::close`] consumes the rank
+//! and releases its owners in dependency order: execution, the executor and its
+//! computations, streams, requests, the process world, then deferred device
+//! memory. The launch closes every rank that started, unless the rank abandoned
+//! work its threads may wait in for good, which ends the process at once.
 
+mod computations;
 mod image;
-mod lanes;
 mod loading;
 mod memory;
 mod planning;
@@ -59,7 +58,7 @@ use crate::executor::backend::WorkerBackend;
 use crate::executor::experts::{ExpertMember, ExpertStart};
 use crate::executor::transfer::TransferRuntime;
 use crate::ffi::{Handle, Interpreter};
-use crate::lane::BLOCK_ON_TIMEOUT;
+use crate::job::{BLOCK_ON_TIMEOUT, JobQueue};
 use crate::memory::HostKvCache;
 use crate::memory::allocation::Storage;
 use crate::memory::retained::Retained;
@@ -76,8 +75,8 @@ use crate::transfer::TransportKind;
 use crate::{Error, Result};
 use loading::{ComponentMesh, Description, ExpertPartition, head_projection, sequence_kind};
 
-use lanes::LaneStart;
-pub(crate) use lanes::warm as warm_lanes;
+use computations::Binding;
+pub(crate) use computations::warm as warm_computations;
 use memory::allocate_storage;
 use planning::{block_size, cache_plan, cache_width, log_capacity, plan};
 
@@ -123,15 +122,15 @@ pub(crate) struct Worker {
     budget: Option<DeviceBudget>,
     streams: Streams,
     graphs: GraphStorage,
-    /// The shared work areas of the lanes' streams, which the executor's
+    /// The shared work areas of the computations' streams, which the executor's
     /// execution contexts borrow.
     scratches: Scratches,
     /// How the worker, parked as a standby, keeps its graph memory.
     standby_memory: ipc::StandbyMemory,
     executor: Executor,
-    /// The executor runs warmup phases: the rank has executor lanes or an
-    /// expert union member.
-    lane_warmup: bool,
+    /// The executor runs warmup phases: the rank has executor computations or
+    /// an expert union member.
+    computation_warmup: bool,
     /// Retained for the rank's lifetime: torch, the driver owners and the
     /// reclaimer all use the device's primary context.
     context: Option<PrimaryContext>,
@@ -308,7 +307,7 @@ impl Worker {
                 .for_media_slots(launch.ipc.queue_depth)
                 .map_err(phase("load"))?;
         }
-        // How the lanes over the prefix cache lay out a model's image
+        // How the computations over the prefix cache lay out a model's image
         // features: a model without image capabilities places none.
         let image_capable = [
             Capability::ImageDenoiser,
@@ -323,28 +322,28 @@ impl Worker {
         } else {
             image::TextFacts::default()
         };
-        // The executor's token lanes are sized by the cache's layout, so the
-        // block size is resolved first, collectively over the worker group.
+        // The executor's token computations are sized by the cache's layout, so
+        // the block size is resolved first, collectively over the worker group.
         block_size(&mut config, &model, &world).map_err(phase("capacity"))?;
         let cache = cache_plan(&launch, &config, &model).map_err(phase("capacity"))?;
-        // The rank's executor states what capacity planning sizes the rank
-        // by: a video model's slot layout, the storage of its lanes over the
+        // The rank's executor states what capacity planning sizes the rank by:
+        // a video model's slot layout, the storage of its computations over the
         // prefix cache.
         let video_denoiser = if model.video_decoder {
             Some(
-                lanes::placed_denoiser(&model.declarations, &config.deployment_components)
+                computations::placed_denoiser(&model.declarations, &config.deployment_components)
                     .map_err(phase("load"))?,
             )
         } else {
             None
         };
-        let sections = lanes::Sections {
+        let sections = computations::Sections {
             video: video_denoiser
                 .as_deref()
-                .map(|denoiser| lanes::video_settings(&config, denoiser)),
+                .map(|denoiser| computations::video_settings(&config, denoiser)),
             image: image::holds(&components, video_denoiser.is_some())
                 .then(|| image::settings(&config)),
-            pages: lanes::page_settings(
+            pages: computations::page_settings(
                 &launch,
                 &config,
                 &components,
@@ -353,9 +352,9 @@ impl Worker {
                 text_facts.media_axes,
             )
             .map_err(phase("load"))?,
-            experts: lanes::expert_settings(&launch),
+            experts: computations::expert_settings(&launch),
         };
-        let executor = lanes::construct(
+        let executor = computations::construct(
             model.handle(),
             &config,
             &components,
@@ -365,7 +364,7 @@ impl Worker {
         .map_err(phase("load"))?;
         let (executor, manifest) = match executor {
             Some((executor, manifest)) => (Some(executor), manifest),
-            None => (None, lanes::Manifest::default()),
+            None => (None, computations::Manifest::default()),
         };
         let video = match (video_denoiser, &manifest.video) {
             (Some(denoiser), Some(video)) => Some((denoiser, video.clone())),
@@ -500,11 +499,11 @@ impl Worker {
                 launch.storage.host_kv_cache_bytes,
             )
             .map_err(phase("storage"))?;
-            // The host KV cache's copies run on a copy lane of the cache's device,
-            // beside the forwards of the lanes.
+            // The host KV cache's copies run on a copy stream of the cache's
+            // device, beside the forwards on the primary stream.
             let copy = streams
-                .start_copy_lane(cuda)
-                .and_then(|lane| Ok(lane.stream()?.clone()))
+                .create_copy(cuda)
+                .and_then(|copy| Ok(copy.stream()?.clone()))
                 .map_err(phase("streams"))?;
             prefix_cache
                 .set_host_kv_cache(host_kv_cache, copy)
@@ -520,14 +519,14 @@ impl Worker {
                 .bind_stream_groups(
                     &launch,
                     &model.declarations,
-                    &lanes::stream_copies(&launch, &model.declarations),
+                    &computations::stream_copies(&launch, &model.declarations),
                 )
                 .map_err(phase("bind"))?
         };
-        // The executor's lanes and expert union bind, in this order on every
-        // rank.
+        // The executor's computations and expert union bind, in this order on
+        // every rank.
         let bound = match &executor {
-            Some(executor) => lanes::bind(LaneStart {
+            Some(executor) => computations::bind(Binding {
                 executor,
                 loaded: model.handle(),
                 manifest: &manifest,
@@ -540,7 +539,7 @@ impl Worker {
                 prefix_cache: storage.prefix_cache.as_ref(),
                 video: video_capacity.as_ref(),
                 latent: plan.latent,
-                host_capacity: info.host_lane_capacity as usize,
+                host_capacity: info.host_task_capacity as usize,
                 scratches: &mut scratches,
                 graphs: &mut graphs,
                 collectives: &collectives,
@@ -548,8 +547,8 @@ impl Worker {
                 memory: &mut &*retained,
             })
             .map_err(phase("bind"))?,
-            None => lanes::Bound {
-                lanes: None,
+            None => computations::Bound {
+                computations: None,
                 step_rows: 0,
                 image: None,
             },
@@ -583,15 +582,15 @@ impl Worker {
         let mut backend = WorkerBackend::new(info.clone(), config.rank, placement, components)
             .map_err(phase("storage"))?;
         backend.set_worker_storage(storage);
-        backend.set_job_queues(streams.job_queues());
+        backend.set_job_queue(JobQueue::default());
         if let Some(executor) = executor {
             backend.set_executor(executor);
         }
-        // The executor's lanes and the expert union warm through the
+        // The executor's computations and the expert union warm through the
         // executor's phases.
-        let lane_warmup = bound.lanes.is_some() || experts.is_some();
-        if let Some(lanes) = bound.lanes {
-            backend.set_lanes(lanes);
+        let computation_warmup = bound.computations.is_some() || experts.is_some();
+        if let Some(computations) = bound.computations {
+            backend.set_computations(computations);
         }
         if let Some(weights) = weights {
             backend.set_weights(weights);
@@ -654,7 +653,7 @@ impl Worker {
             scratches,
             standby_memory: launch.storage.standby_memory,
             executor,
-            lane_warmup,
+            computation_warmup,
             context,
             retained,
             weights: weight_storages,
@@ -667,11 +666,11 @@ impl Worker {
     }
 
     /// Run warmup once, before the first serving submission, in an order
-    /// identical on every rank, since captures run collectives: bind each
-    /// CUDA device's graph budget (what its graph pools hold now plus the
-    /// grant left after product storage not yet resident), run the
-    /// executor's warmup phases ([`warm_lanes`]), then check graph
-    /// residency, report the kernels and seal the graph storage.
+    /// identical on every rank, since captures run collectives: bind each CUDA
+    /// device's graph budget (what its graph pools hold now plus the grant left
+    /// after product storage not yet resident), run the executor's warmup
+    /// phases ([`warm_computations`]), then check graph residency, report the
+    /// kernels and seal the graph storage.
     pub(crate) fn warmup(&mut self) -> std::result::Result<(), WorkerError> {
         if self.warmed {
             return Ok(());
@@ -694,9 +693,9 @@ impl Worker {
             self.bind_graph_budgets().map_err(phase("warmup"))?;
         }
         let executor = &mut self.executor;
-        if self.lane_warmup {
+        if self.computation_warmup {
             let _capture = range(c"uniserve.worker.capture", None);
-            warm_lanes(executor.backend_mut())?;
+            warm_computations(executor.backend_mut())?;
         }
         let backend = executor.backend();
         if backend.components().holds_host() {
@@ -727,10 +726,9 @@ impl Worker {
         Ok(())
     }
 
-    /// Serve the channel until the engine closes the rank or a fatal
-    /// response ends admission, or until the engine's channel fails
-    /// ([`Ending`]), reporting a lane that stays inside one job for
-    /// `stall_bound`.
+    /// Serve the channel until the engine closes the rank or a fatal response
+    /// ends admission, or until the engine's channel fails ([`Ending`]),
+    /// reporting a job the builder thread stays inside for `stall_bound`.
     pub(crate) fn run(
         &mut self,
         channel: &mut Channel,
@@ -796,10 +794,10 @@ impl Worker {
         executor.backend().set_storage_wake(Some(channel.wake()));
         let mut pools = self.graphs.pools();
         pools.extend(self.scratches.pools());
-        let lanes = self
+        let observed = self
             .streams
-            .lanes()
-            .map(|(name, lane)| Ok((name, lane.stream()?.clone())))
+            .observed()
+            .map(|(name, stream)| Ok((name, stream.stream()?.clone())))
             .collect::<Result<Vec<_>>>()?;
         let mut maintenance = crate::service::Maintenance {
             retained: Some(Arc::clone(&self.retained)),
@@ -812,7 +810,7 @@ impl Worker {
             }),
             pools,
             asleep: false,
-            cupti: crate::profiling::cupti::Cupti::new(lanes),
+            cupti: crate::profiling::cupti::Cupti::new(observed),
         };
         // The rank serves with CUPTI attached (`crate::profiling::cupti`),
         // unless a profiler holds it; the control thread's (this one's)
@@ -897,10 +895,10 @@ impl Worker {
             pool.suspend().map_err(phase("standby"))?;
         }
         tracing::info!(bytes, "the standby worker suspended its graph memory");
-        // The expert transports release their workspaces: those that keep
-        // their addresses are suspended, which the promotion maps back; the
-        // others are freed, and the promotion rebuilds them and captures the
-        // lanes' graphs that address them again.
+        // The expert transports release their workspaces: those that keep their
+        // addresses are suspended, which the promotion maps back; the others
+        // are freed, and the promotion rebuilds them and captures the
+        // computations' graphs that address them again.
         let experts = match (
             self.executor.backend().experts(),
             self.executor.backend().executor(),
@@ -966,10 +964,10 @@ impl Worker {
         };
 
         if !aborted {
-            // The lanes first perform what is still queued on them (work
-            // nobody waited for, like a lifecycle command's), so that no
-            // job addresses an owner while it closes.
-            let drained = self.executor.backend().job_queues().drain(BLOCK_ON_TIMEOUT);
+            // The builder thread first performs every job still queued (work
+            // nobody waited for, like a lifecycle command's), so that no job
+            // addresses an owner while it closes.
+            let drained = self.executor.backend().job_queue().drain(BLOCK_ON_TIMEOUT);
             record(drained.map_err(WorkerError::from));
             for stream in self.streams.iter() {
                 record(stream.synchronize().map_err(WorkerError::from));
@@ -980,8 +978,8 @@ impl Worker {
         if !aborted {
             record(executor.close());
         }
-        // The executor releases its lanes' graphs and execution contexts,
-        // then the lanes their output storage.
+        // The executor releases its computations' graphs and execution
+        // contexts, then the computations their output storage.
         let closed = executor.backend_mut().close_executor(aborted);
         record(closed.map_err(WorkerError::from));
         // Transports retire after every context and graph using them;

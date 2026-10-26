@@ -1,4 +1,4 @@
-"""Graph buckets, padding and slot chunks of a diffusion LM lane
+"""Graph buckets, padding and slot chunks of a diffusion LM computation
 (``uniserve.executor.diffusion_lm.shapes``).
 """  # noqa: D205
 

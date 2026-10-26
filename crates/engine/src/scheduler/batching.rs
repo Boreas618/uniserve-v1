@@ -1,7 +1,7 @@
 //! Batch selection, call planning, and physical params assembly.
 //!
-//! Each pass selects a compatible execution lane, applies sequence and token
-//! budgets, and emits at most one planned call per eligible request.
+//! Each pass selects a batch kind, applies sequence and token budgets, and
+//! emits at most one planned call per eligible request.
 //!
 //! This is the generation path: token requests in `running`, including the
 //! image-generation and feedback phases of unified multimodal requests.
@@ -13,8 +13,9 @@
 //! registered as in flight, and joins the pass's batch for its `CallKind`:
 //! one batch per call kind, each a single numerical call on one component.
 //!
-//! The lane (`BatchKind`) only separates prefill from decode. `BatchKind::Media`
-//! calls are eligible in every pass, and a pass with no lane applies no filter.
+//! The batch kind (`BatchKind`) only separates prefill from decode.
+//! `BatchKind::Media` calls are eligible in every pass, and a pass with no
+//! batch kind applies no filter.
 //!
 //! A pass's prefill calls, and likewise its decode calls, travel as one
 //! numerical call, bounded by the batch's call and token budgets and the
@@ -54,10 +55,10 @@ impl Scheduler {
     /// preparation failed; most preparation failures latch engine-fatal.
     pub(super) fn assemble(&mut self) -> Vec<ExecutionBatch> {
         let ids = self.assembly_order();
-        let lane = self.select_batch_kind(&ids);
-        let batches = self.assemble_batch(&ids, lane);
-        if batches.is_empty() && !self.fatal && lane == Some(BatchKind::Prefill) {
-            // A blocked prefill lane must not prevent already-ready decode work
+        let kind = self.select_batch_kind(&ids);
+        let batches = self.assemble_batch(&ids, kind);
+        if batches.is_empty() && !self.fatal && kind == Some(BatchKind::Prefill) {
+            // A blocked prefill pass must not prevent already-ready decode work
             // from using the execution slot.
             return self.assemble_batch(&ids, Some(BatchKind::Decode));
         }
@@ -180,7 +181,8 @@ impl Scheduler {
         Some(buffer_allocations)
     }
 
-    /// Selects compatible call kinds within one lane's token and sequence budgets.
+    /// Selects compatible call kinds of one batch kind within the pass's token
+    /// and sequence budgets.
     ///
     /// Walks `ids` in assembly order until `max_batch` calls are selected or
     /// the token budget is spent. Every selected call is registered in flight
@@ -189,7 +191,7 @@ impl Scheduler {
     pub(super) fn assemble_batch(
         &mut self,
         ids: &[RequestId],
-        lane: Option<BatchKind>,
+        pass_kind: Option<BatchKind>,
     ) -> Vec<ExecutionBatch> {
         // One batch per call kind: a batch is one numerical call on one
         // component, so a rank receives it as a single homogeneous group. The
@@ -210,10 +212,10 @@ impl Scheduler {
             canvas: row_capacity,
             context: row_capacity.min(self.config.max_batch),
         };
-        // Host-lane occupancy, built when the pass meets its first encoder
+        // Host task occupancy, built when the pass meets its first encoder
         // call carrying inline image bytes and charged with each one it
         // selects.
-        let mut image_lanes: Option<super::execution::LaneLedger> = None;
+        let mut image_occupancy: Option<super::execution::Occupancy> = None;
         let mut selected = 0usize;
         for id in ids.iter().copied() {
             if selected >= self.config.max_batch {
@@ -234,23 +236,23 @@ impl Scheduler {
                 continue;
             }
             let next_type = self.peek_next_call_variant(id);
-            // The lane check rejects only a prefill call in a decode pass or
-            // the reverse; `BatchKind::Media` calls pass.
-            if let (Some(target), Some(call_variant)) = (lane, next_type)
+            // The batch kind check rejects only a prefill call in a decode
+            // pass or the reverse; `BatchKind::Media` calls pass.
+            if let (Some(target), Some(call_variant)) = (pass_kind, next_type)
                 && {
-                    let candidate_lane = batch_kind(call_variant);
-                    matches!(candidate_lane, BatchKind::Prefill | BatchKind::Decode)
-                        && candidate_lane != target
+                    let candidate_kind = batch_kind(call_variant);
+                    matches!(candidate_kind, BatchKind::Prefill | BatchKind::Decode)
+                        && candidate_kind != target
                 }
             {
                 continue;
             }
-            // The denoiser is an exclusive lane: a request holds it while one
+            // The denoiser is held exclusively: a request holds it while one
             // of its denoising calls is in flight, so denoising steps of
-            // different requests are never in flight together, in any lane.
+            // different requests are never in flight together, in any pass.
             // Between two steps of one request, another request may take it.
             if next_type == Some(CallKind::Media(MediaCall::Denoising))
-                && (self.inflight.denoiser_lane_held_by_other(id)
+                && (self.inflight.denoiser_held_by_other(id)
                     || !self.guidance_prefix_is_schedulable(id))
             {
                 continue;
@@ -272,8 +274,8 @@ impl Scheduler {
                 // An encoder call carrying inline image bytes holds a host
                 // task on each rank of its component while the worker
                 // prepares the image, so it waits here, as a media call
-                // does, until those host lanes have room.
-                let image_lane =
+                // does, until those host task pools have room.
+                let image_demand =
                     match call.kind {
                         CallKind::Media(media_call) if call.input_image.is_some() => {
                             let Some(request_key) = self.running.get(&id).map(|state| {
@@ -281,9 +283,10 @@ impl Scheduler {
                             }) else {
                                 continue;
                             };
-                            let demand = self.image_lane_demand(request_key, media_call);
-                            let ledger = image_lanes.get_or_insert_with(|| self.lane_occupancy());
-                            if !ledger.admits(&demand, id, self) {
+                            let demand = self.image_demand(request_key, media_call);
+                            let occupancy =
+                                image_occupancy.get_or_insert_with(|| self.media_occupancy());
+                            if !occupancy.admits(&demand, id, self) {
                                 self.record_domain_backpressure(call.kind);
                                 if let Some(state) = self.running.get_mut(&id) {
                                     state.num_cache_units_sent = state
@@ -425,8 +428,8 @@ impl Scheduler {
                     // Most preparation failures latch engine-fatal first.
                     return Vec::new();
                 }
-                if let (Some(demand), Some(ledger)) = (&image_lane, image_lanes.as_mut()) {
-                    ledger.occupy(demand, id);
+                if let (Some(demand), Some(occupancy)) = (&image_demand, image_occupancy.as_mut()) {
+                    occupancy.occupy(demand, id);
                 }
                 selected += 1;
             }
@@ -478,9 +481,9 @@ impl Scheduler {
         batches
     }
 
-    /// Chooses the highest-priority execution lane that has schedulable work.
+    /// Chooses the highest-priority batch kind that has schedulable work.
     ///
-    /// A ready readout pass takes the decode lane first: one pass answers
+    /// A ready readout selects a decode pass first: one pass answers
     /// the readout and releases its prefix cache. Otherwise prefill wins while fewer
     /// than `PREFILL_WINDOW_CREDITS` batches carrying `BatchKind::Prefill`
     /// calls await their results; past that window, ready decode work takes
@@ -492,9 +495,9 @@ impl Scheduler {
     /// step would wait until the running blocks stop instead of joining
     /// their canvas batches.
     ///
-    /// `BatchKind::Media` readiness never selects a lane: with only such work
-    /// ready this returns `None`, and `assemble_batch` then applies no lane
-    /// filter.
+    /// `BatchKind::Media` readiness never selects a batch kind: with only such
+    /// work ready this returns `None`, and `assemble_batch` then applies no
+    /// batch kind filter.
     pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
         let mut readout_ready = false;
         let mut decode_ready = false;
@@ -509,11 +512,11 @@ impl Scheduler {
             let Some(call_type) = self.peek_next_call_variant(id) else {
                 continue;
             };
-            let lane = batch_kind(call_type);
-            if lane == BatchKind::Media || !self.can_schedule_next(id) {
+            let kind = batch_kind(call_type);
+            if kind == BatchKind::Media || !self.can_schedule_next(id) {
                 continue;
             }
-            match lane {
+            match kind {
                 BatchKind::Decode if state.req.is_readout() => readout_ready = true,
                 BatchKind::Decode => decode_ready = true,
                 BatchKind::Prefill => prefill_ready = true,
@@ -663,8 +666,8 @@ impl Scheduler {
         }
 
         // A text batch of one worker group carries the page offloads the
-        // host KV cache reserved for that group: the worker's copy lane
-        // copies them beside its forward, and its output settles them.
+        // host KV cache reserved for that group: the worker copies them on
+        // its copy stream beside its forward, and its output settles them.
         if let Some(kv_offload) = self.kv_offload.as_mut()
             && let Some((_, first)) = batch.requests.first()
             && batch.requests.iter().all(|(call, placement)| {

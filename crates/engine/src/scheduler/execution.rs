@@ -10,9 +10,10 @@
 //! - Video media scheduling: a video request runs the calls of its graph
 //!   (`graph::VideoGraph`, built at admission from its task and conditions),
 //!   offered by `ready_calls` as their inputs become available. Calls occupy
-//!   device lanes and, for media reading, encoding and muxing, host lanes,
-//!   tracked by the lane ledger, and `plan_media_call` builds one call with
-//!   its products, buffer bindings, latent pages and reading components.
+//!   their components' capacity on their workers and, for media reading,
+//!   encoding and muxing, host task pools, tracked by the media occupancy,
+//!   and `plan_media_call` builds one call with its products, buffer
+//!   bindings, latent pages and reading components.
 //! - Successor projection: queries such as `projected_coordinates`,
 //!   `pending_successor_code` and `can_queue_successor` project a token
 //!   request's accepted state through its in-flight calls, so the batching
@@ -40,7 +41,7 @@ mod results;
 use super::*;
 use ipc::{BufferId, MediaCall};
 
-pub(super) use media::LaneLedger;
+pub(super) use media::Occupancy;
 
 /// The products a batch's calls publish.
 fn batch_products(batch: &ExecutionBatch) -> impl Iterator<Item = BufferId> + '_ {

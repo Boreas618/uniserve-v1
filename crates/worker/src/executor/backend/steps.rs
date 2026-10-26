@@ -17,23 +17,23 @@ use crate::executor::image_inputs::InlineImages;
 use crate::executor::lifecycle::Retirement;
 use crate::executor::python::PythonExecutor;
 use crate::executor::{BatchResult, Submission};
-use crate::lane::{Completion, Job, JobId};
+use crate::job::{Completion, Job, JobId};
 use crate::{Error, Result};
 
-/// Where a batch's host KV cache copies stand on the copy lane
+/// Where a batch's host KV cache copies stand on the copy stream
 /// (`PrefixCache::issue_pages`).
 #[derive(Default)]
 enum Pages {
     /// Not recorded yet.
     #[default]
     Unissued,
-    /// Submitted to the copy lane, which has not performed the job yet.
+    /// Submitted as a job the builder thread has not performed yet.
     Issuing(PageFences),
     /// Performed: the fences' records are made.
     Issued(PageFences),
 }
 
-/// The fences of a batch's page copies, recorded on the copy lane of the
+/// The fences of a batch's page copies, recorded on the copy stream of the
 /// cache's `device`. A batch without copies has neither.
 #[derive(Default)]
 struct PageFences {
@@ -52,8 +52,8 @@ pub(crate) struct WorkerBatch {
     retirement: Retirement,
     /// Where the batch's forward stands between its jobs.
     stage: batch::Stage,
-    /// An executor lane's batch between its jobs.
-    lane: Option<crate::executor::lanes::Pending>,
+    /// An executor computation's batch between its jobs.
+    computation: Option<crate::executor::computations::Pending>,
     /// A transfer batch between its jobs.
     transfer: Option<crate::executor::transfer::Pending>,
     /// The batch's profiler step is open: its forward began and has not
@@ -61,7 +61,7 @@ pub(crate) struct WorkerBatch {
     pub(super) stepping: bool,
     /// The job of the profiler's window this batch's forward waits for.
     profiling: Option<JobId>,
-    /// The lane's or the transfer runtime's launched work awaiting
+    /// The computation's or the transfer runtime's launched work awaiting
     /// materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
@@ -93,7 +93,7 @@ impl WorkerBatch {
             predecessors: Vec::new(),
             retirement,
             stage: batch::Stage::default(),
-            lane: None,
+            computation: None,
             transfer: None,
             stepping: false,
             profiling: None,
@@ -106,8 +106,8 @@ impl WorkerBatch {
         }
     }
 
-    /// The fence of the batch's host KV cache reads once the copy lane
-    /// issued them; the batch's forward waits on it.
+    /// The fence of the batch's host KV cache reads once their job issued them
+    /// on the copy stream; the batch's forward waits on it.
     pub(crate) fn page_loads(&self) -> Option<&Arc<cuda::Event>> {
         match &self.pages {
             Pages::Issued(fences) => fences.loads.as_ref(),
@@ -148,33 +148,33 @@ impl WorkerBatch {
         self.stage = stage;
     }
 
-    /// The batch's plan, its imported inputs and its lane batch between
+    /// The batch's plan, its imported inputs and its computation batch between
     /// jobs, borrowed apart.
-    pub(crate) fn lane_parts(
+    pub(crate) fn computation_parts(
         &mut self,
     ) -> (
         &BatchPlan,
         &crate::executor::inputs::Inputs,
-        &mut Option<crate::executor::lanes::Pending>,
+        &mut Option<crate::executor::computations::Pending>,
     ) {
-        (&self.plan, &self.inputs, &mut self.lane)
+        (&self.plan, &self.inputs, &mut self.computation)
     }
 
-    /// The batch's plan, its imported inputs, its host-prepared inline
-    /// images and its lane batch between jobs, borrowed apart.
-    pub(crate) fn lane_inputs(
+    /// The batch's plan, its imported inputs, its host-prepared inline images
+    /// and its computation batch between jobs, borrowed apart.
+    pub(crate) fn computation_inputs(
         &mut self,
     ) -> (
         &BatchPlan,
         &crate::executor::inputs::Inputs,
         Option<&InlineImages>,
-        &mut Option<crate::executor::lanes::Pending>,
+        &mut Option<crate::executor::computations::Pending>,
     ) {
         (
             &self.plan,
             &self.inputs,
             self.image_inputs.as_ref(),
-            &mut self.lane,
+            &mut self.computation,
         )
     }
 
@@ -252,46 +252,40 @@ impl WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
-        // The batch's host KV cache copies go to the copy lane first, so
-        // they overlap the forward the previous batch runs; the batch goes
-        // on once the lane issued them.
+        // The batch's host KV cache copies are issued first, in a job of their
+        // own on the copy stream, so they overlap on the device the forward the
+        // previous batch runs; the batch goes on once that job issued them.
         if matches!(batch.pages, Pages::Unissued)
             && let Some(job) = self.issue_pages(batch)?
         {
             return Ok(Some(job));
         }
 
-        // The executor admits the requests this batch started: it sizes
-        // each, resets its slot state and may refuse it. The batch goes on
-        // from the job's completion, and so do the requests' later calls,
-        // which start behind this batch. Work on a lane's stream (slot state
-        // over the prefix cache, a trajectory's layout) belongs on the lane;
-        // anything else is a job of the builder thread alone.
-        if let Some(lanes) = &mut self.owners.lanes
-            && let Some((job, on_lane)) = lanes.take_started()?
+        // The executor admits the requests this batch started: it sizes each,
+        // resets its slot state and may refuse it. The batch goes on from the
+        // job's completion, and so do the requests' later calls, which start
+        // behind this batch.
+        if let Some(computations) = &mut self.owners.computations
+            && let Some(job) = computations.take_started()?
         {
-            let submitted = if on_lane {
-                self.jobs.start(job, true).map_err(lane_lost)?
-            } else {
-                self.jobs.call(job, true)
-            };
+            let submitted = self.jobs.start(job, true);
             batch.starting = true;
             return Ok(Some(submitted));
         }
 
-        // Products other calls published are imported for every batch
-        // alike. What the imports recorded for the lane is performed even
-        // when an import failed after it: the fences are due either way.
+        // Products other calls published are imported for every batch alike.
+        // What the imports recorded is performed even when an import failed
+        // after it: the fences are due either way.
         let (job, admitted) = crate::executor::inputs::admit(self, batch);
         let submitted = match batch.route() {
-            Some(_) if !job.is_empty() => Some(self.start(job, true).map_err(lane_lost)?),
+            Some(_) if !job.is_empty() => Some(self.start(job, true).map_err(job_lost)?),
             _ => None,
         };
         admitted.map(|()| submitted)
     }
 
-    /// Record the batch's host KV cache copies and submit them to the copy
-    /// lane; `None` when the batch copies no page.
+    /// Record the batch's host KV cache copies on the copy stream and submit
+    /// them; `None` when the batch copies no page.
     fn issue_pages(
         &mut self,
         batch: &mut WorkerBatch,
@@ -310,7 +304,7 @@ impl WorkerBackend {
                 Error::Invalid("a batch copies pages but the rank has no prefix cache".into())
             })?;
         let issued = prefix_cache.issue_pages(&plan.page_loads, &plan.page_offloads)?;
-        let job = self.jobs.start_copy(issued.job, true).map_err(lane_lost)?;
+        let job = self.jobs.start(issued.job, true);
         batch.pages = Pages::Issuing(PageFences {
             device: Some(issued.device),
             loads: issued.loads,
@@ -324,8 +318,8 @@ impl WorkerBackend {
         batch: &mut WorkerBatch,
         completion: Completion,
     ) -> std::result::Result<(), WorkerError> {
-        // The copy lane issued the batch's page copies: their fences are
-        // recorded, whether the copies were issued or failed.
+        // The job issued the batch's page copies: their fences are recorded,
+        // whether the copies were issued or failed.
         if let Pages::Issuing(fences) = std::mem::take(&mut batch.pages) {
             batch.pages = Pages::Issued(fences);
             completion.check().map_err(|failure| {
@@ -369,9 +363,9 @@ impl WorkerBackend {
             return Ok(false);
         }
         // Inline images of an image encoding batch are decoded on the image
-        // host lane while other batches execute; the batch launches once
-        // they are ready (the lane notifies `submission`). Other batches'
-        // inputs are prepared when their lane executes.
+        // host pool while other batches execute; the batch launches once they
+        // are ready (the pool notifies `submission`). Other batches' inputs are
+        // prepared when their computation executes.
         crate::executor::image_inputs::prepare_inputs(self, batch, submission)
     }
 
@@ -403,13 +397,13 @@ impl WorkerBackend {
             return Ok(None);
         };
 
-        let lanes = self.jobs.clone();
+        let queue = self.jobs.clone();
         loop {
             let stage = batch.stage();
             match stage {
-                // Imported values become resident before the lane consumes
-                // them like local ones; an import that failed fails the
-                // batch's calls.
+                // Imported values become resident before the computation
+                // consumes them like local ones; an import that failed fails
+                // the batch's calls.
                 batch::Stage::Inputs => {}
                 // Each executed batch with calls is one profiler step.
                 batch::Stage::Forward if !batch.stepping => {
@@ -427,7 +421,7 @@ impl WorkerBackend {
             // last step's: each of its jobs is one the batch waits for.
             if stage != batch::Stage::Inputs
                 && let Some(profiler) = &mut self.profiler
-                && let Some(job) = profiler.next(&lanes)
+                && let Some(job) = profiler.next(&queue)
             {
                 batch.profiling = Some(job);
                 return Ok(Some(job));
@@ -437,10 +431,9 @@ impl WorkerBackend {
                 return Ok(None);
             }
 
-            // A stage that needs nothing of the lane advances without a
-            // job.
+            // A stage that has nothing to issue advances without a job.
             let submitted = match batch::forward(self, batch, kind) {
-                Ok(Some(job)) => Some(self.start(job, true).map_err(lane_lost)),
+                Ok(Some(job)) => Some(self.start(job, true).map_err(job_lost)),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             };
@@ -505,16 +498,11 @@ impl WorkerBackend {
         };
         let fences = fences.into_iter().map(|(_, fence)| fence).collect();
 
-        // The job holds no operation: its completion is posted once the
-        // fences completed. A batch without calls, which only writes pages,
-        // waits on the copy lane.
+        // The job holds no operation: its completion is posted once the fences
+        // completed.
         let job = Job::new();
         job.after(device, fences);
-        let submitted = match batch.route() {
-            Some(_) => self.jobs.start(job, true),
-            None => self.jobs.start_copy(job, true),
-        };
-        submitted.map(Some).map_err(lane_lost)
+        Ok(Some(self.jobs.start(job, true)))
     }
 
     pub(crate) fn outputs_ready(
@@ -524,7 +512,7 @@ impl WorkerBackend {
     ) -> std::result::Result<(), WorkerError> {
         completion
             .check()
-            .map_err(|failure| lane_lost(failure.error))?;
+            .map_err(|failure| job_lost(failure.error))?;
         if let Some(running) = &batch.running {
             crate::lock(&running.buffer).fences_completed();
         }
@@ -629,21 +617,21 @@ impl WorkerBackend {
             .output
             .take()
             .ok_or_else(|| WorkerError::from(Error::State("batch output is not resolved")))?;
-        // The lanes' stream time and the serving threads' driver calls that
-        // waited for the device, since the last result, travel with this
-        // one; the engine adds every result's into its counters. This runs
-        // on the control thread, whose own calls are counted here.
+        // The streams' device time and the serving threads' driver calls that
+        // waited for the device, since the last result, travel with this one;
+        // the engine adds every result's into its counters. This runs on the
+        // control thread, whose own calls are counted here.
         let control = cuda::cupti::Calls::current();
         crate::profiling::blocking::add("control", &control.since(&self.control_calls));
         self.control_calls = control;
         let activity = cuda::cupti::activity::take();
         if activity.dropped_records > 0 {
             tracing::warn!(
-                "CUPTI dropped {} activity records; the lanes' device time misses their operations",
+                "CUPTI dropped {} activity records; the streams' device time misses their operations",
                 activity.dropped_records
             );
         }
-        let lane_us: Vec<(String, u64)> = activity
+        let stream_us: Vec<(String, u64)> = activity
             .streams
             .iter()
             .flat_map(|stream| {
@@ -657,13 +645,13 @@ impl WorkerBackend {
             .filter(|&(_, us)| us > 0)
             .collect();
         let blocking = crate::profiling::blocking::take();
-        if !lane_us.is_empty() || !blocking.is_empty() {
+        if !stream_us.is_empty() || !blocking.is_empty() {
             let stats = result
                 .output
                 .forward_stats
                 .get_or_insert_with(Default::default);
-            for (key, us) in lane_us {
-                *stats.lane_us.entry(key).or_default() += us;
+            for (key, us) in stream_us {
+                *stats.stream_us.entry(key).or_default() += us;
             }
             for (key, count) in blocking {
                 *stats.blocking_calls.entry(key).or_default() += count;
@@ -709,9 +697,10 @@ impl WorkerBackend {
     }
 }
 
-/// A lane that no longer performs jobs leaves the rank unable to serve.
-pub(super) fn lane_lost(error: Error) -> WorkerError {
-    let mut error = WorkerError::classify(error, Some("lane"));
+/// A job that cannot be submitted, or whose completion cannot be ordered behind
+/// its events, leaves the rank unable to serve.
+pub(super) fn job_lost(error: Error) -> WorkerError {
+    let mut error = WorkerError::classify(error, Some("job"));
     error.fatal = true;
     error
 }

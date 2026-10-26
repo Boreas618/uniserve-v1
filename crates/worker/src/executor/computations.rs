@@ -1,30 +1,30 @@
-//! The executor's lanes and the batches they serve.
+//! The executor's computations and the batches they serve.
 //!
-//! An executor lane is one computation the executor serves under the
-//! lane's index: a component's call kinds, which compute on one of the
-//! rank's streams (the device's lane stream, a stream of the lane's own, or
-//! the host). The executor's manifest declares each lane: whether its
-//! batches are prepared (the executor states first what each call reads
-//! and writes), whether its batches commit (the executor advances its slot
-//! state past the batch's commit point), and the resources the worker keeps
-//! for it: the prefix cache's [`pages`](crate::executor::pages), a latent
-//! trajectory ledger ([`latents`](crate::executor::latents)), the pipe
-//! its host tasks report through ([`reports`](crate::executor::reports)),
-//! and the image host lane an image model's lanes prepare inline images and
-//! encode decoded ones on ([`images`](crate::executor::image_inputs)). The
-//! products, pixels, trajectories and guidance prefixes of an image model's
-//! lanes are bound and published by [`crate::executor::image`].
+//! An executor computation is one kind of work the executor serves under its
+//! index: a component's call kinds, which compute on one of the rank's streams
+//! (the device's primary stream, a stream of the computation's own, or the
+//! host). The executor's manifest declares each computation: whether its
+//! batches are prepared (the executor states first what each call reads and
+//! writes), whether its batches commit (the executor advances its slot state
+//! past the batch's commit point), and the resources the worker keeps for it:
+//! the prefix cache's [`pages`](crate::executor::pages), a latent trajectory
+//! ledger ([`latents`](crate::executor::latents)), the pipe its host tasks
+//! report through ([`reports`](crate::executor::reports)), and the image host
+//! pool an image model's computations prepare inline images and encode decoded
+//! ones on ([`images`](crate::executor::image_inputs)). The products, pixels,
+//! trajectories and guidance prefixes of an image model's computations are
+//! bound and published by [`crate::executor::image`].
 //!
-//! Every lane's batch goes through one sequence of jobs on the batch
+//! Every computation's batch goes through one sequence of jobs on the batch
 //! skeleton ([`crate::executor::batch`]):
 //!
-//! 1. **Opening.** Bind the calls to their requests and read their
-//!    host-gated predicates (a token-denoising step's continuation is never
-//!    read on the host: its slot state decides on the device). A lane over
-//!    the prefix cache orders first after the batches whose writes it reads
-//!    on another stream and after the host KV cache reads the copy lane
-//!    issued for the batch. A batch that reads predicates ends its job here.
-//! 2. **Preparation**, for a lane that prepares: a job asks the executor
+//! 1. **Opening.** Bind the calls to their requests and read their host-gated
+//!    predicates (a token-denoising step's continuation is never read on the
+//!    host: its slot state decides on the device). A computation over the
+//!    prefix cache orders first after the batches whose writes it reads on
+//!    another stream and after the host KV cache reads issued for the batch on
+//!    the copy stream. A batch that reads predicates ends its job here.
+//! 2. **Preparation**, for a computation that prepares: a job asks the executor
 //!    what each call reads and writes (`prepare`).
 //! 3. **Reservation**, in the batch's last job: lease the output storage
 //!    and reserve what the batch uses of the worker's resources: the
@@ -32,33 +32,32 @@
 //!    relays (`PageReservation`), or the products the preparation named and
 //!    the trajectories' banks (`crate::executor::products::bind_prepared`).
 //! 4. **Execution.** `execute` computes the batch on what was reserved. A
-//!    lane that does not prepare reads host columns and writes its results
-//!    into output words the batch lent it, with completion records a host
-//!    check on the lane's thread parses before anything else follows, so a
-//!    malformed record fails the batch before its commit point; the relayed
-//!    values it staged are copied into their products. A lane that prepares
-//!    writes the products the preparation named, whose fences and exports
-//!    follow.
+//!    computation that does not prepare reads host columns and writes its
+//!    results into output words the batch lent it, with completion records a
+//!    host check on the builder thread parses before anything else follows, so
+//!    a malformed record fails the batch before its commit point; the relayed
+//!    values it staged are copied into their products. A computation that
+//!    prepares writes the products the preparation named, whose fences and
+//!    exports follow.
 //! 5. **Seal.** End the read leases, publish the completion flags the host
-//!    sets, validate every owner's update and seal the lease: the commit
-//!    point. Past it, a lane that commits has the executor advance its slot
-//!    state (`commit`), and a committing lane over the prefix cache records
-//!    its place in the stream order.
-//! 6. **Completion.** The job's results become the calls' pending outputs:
-//!    the records' progress and ranges, or each call's graph mode, the
-//!    exports and trajectory commits; the products become visible and the
-//!    calls pending. The launched batch materializes once the lease's fences
-//!    completed and, for a lane whose calls run host tasks, every task
-//!    reported.
+//!    sets, validate every owner's update and seal the lease: the commit point.
+//!    Past it, a computation that commits has the executor advance its slot
+//!    state (`commit`), and a committing computation over the prefix cache
+//!    records its place in the stream order.
+//! 6. **Completion.** The job's results become the calls' pending outputs: the
+//!    records' progress and ranges, or each call's graph mode, the exports and
+//!    trajectory commits; the products become visible and the calls pending.
+//!    The launched batch materializes once the lease's fences completed and,
+//!    for a computation whose calls run host tasks, every task reported.
 //!
 //! A failure before the commit point retires everything the batch reserved
 //! in a job behind what it recorded, and the batch's calls fail; a failure
 //! at or past it is fatal: slot state, a trajectory or a product may have
 //! become visible.
 //!
-//! Requests the rank starts reach the executor (`start`) in a job before
-//! the batch that started them opens, and the executor may refuse them
-//! alone ([`ExecutorLanes::take_started`]).
+//! Requests the rank starts reach the executor (`start`) in a job before the
+//! batch that started them opens, and the executor may refuse them alone
+//! ([`Computations::take_started`]).
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -78,7 +77,7 @@ use crate::executor::image::{self, ImageBatch, ImageCall};
 use crate::executor::image_inputs::{Images, InlineImages};
 use crate::executor::inputs::Inputs;
 use crate::executor::latents::LatentLedger;
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{CommandJob, RequestStorage};
 use crate::executor::pages::{
     PageCall, PageOwners, PageReservation, Pages, RelayStaging, denoising, relay,
 };
@@ -88,7 +87,7 @@ use crate::executor::products::{
 use crate::executor::python::PythonExecutor;
 use crate::executor::records::{COMPLETION_FIELDS, Records};
 use crate::executor::reports::{HostCall, HostTasks, Reports, release_borrowed};
-use crate::lane::{Completion, Job};
+use crate::job::{Completion, Job};
 use crate::memory::OutputPool;
 use crate::memory::allocation::StorageView;
 use crate::request::RequestPool;
@@ -96,7 +95,7 @@ use crate::stream::{CUDAStream, Issue as _};
 use crate::worker::WorkerMemory;
 use crate::{Error, Result, lock};
 
-/// The step a lane batch's failure is reported in.
+/// The step a computation batch's failure is reported in.
 const PHASE: &str = "executor batch";
 
 /// Bytes of the engine's serialized logprob payload, which bounds a call's
@@ -105,7 +104,7 @@ const PHASE: &str = "executor batch";
 /// three words, a row's 4 bytes one.
 const PAYLOAD_BYTES_PER_WORD: u64 = 4;
 
-/// The worker's resources a lane uses.
+/// The worker's resources a computation uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Resources {
     /// Its calls attend to the prefix cache.
@@ -114,40 +113,41 @@ pub(crate) struct Resources {
     pub(crate) latents: bool,
     /// Its calls run host tasks that report through the rank's pipe.
     pub(crate) reports: bool,
-    /// Its calls read inline images or encode decoded ones on the rank's
-    /// image host lane.
+    /// Its calls read inline images or encode decoded ones on the rank's image
+    /// host pool.
     pub(crate) images: bool,
 }
 
-/// One executor lane.
-pub(crate) struct ExecutorLane {
+/// One executor computation.
+pub(crate) struct Computation {
     pub(crate) component: String,
     pub(crate) kinds: Vec<CallKind>,
     /// The executor states what each call of a batch reads and writes
     /// before the batch reserves (`prepare`).
     pub(crate) prepares: bool,
-    /// The executor advances the lane's slot state past each batch's
+    /// The executor advances the computation's slot state past each batch's
     /// commit point (`commit`).
     pub(crate) commits: bool,
     pub(crate) resources: Resources,
-    /// The device and stream the lane computes on; neither on the host.
+    /// The device and stream the computation computes on; neither on the host.
     pub(crate) device: Option<DeviceId>,
     pub(crate) stream: Option<Stream>,
-    /// The output leases of the lane's batches.
+    /// The output leases of the computation's batches.
     pub(crate) outputs: OutputPool,
-    /// The relay staging of a lane over the prefix cache.
+    /// The relay staging of a computation over the prefix cache.
     pub(crate) staging: Option<RelayStaging>,
 }
 
-/// The rank's executor lanes and the resources the worker keeps for them.
-pub(crate) struct ExecutorLanes {
+/// The rank's executor computations and the resources the worker keeps for
+/// them.
+pub(crate) struct Computations {
     executor: Arc<PythonExecutor>,
-    lanes: Vec<ExecutorLane>,
+    list: Vec<Computation>,
     pages: Option<Pages>,
     ledger: Option<LatentLedger>,
     reports: Option<Reports>,
     images: Option<Images>,
-    /// On a CUDA rank whose lanes run host tasks, the stream device
+    /// On a CUDA rank whose computations run host tasks, the stream device
     /// products host tasks wrote are fenced on: the tasks waited for their
     /// copies, so the fences complete at once.
     host_stream: Option<Arc<CUDAStream>>,
@@ -155,8 +155,8 @@ pub(crate) struct ExecutorLanes {
     started: Vec<serde_json::Value>,
 }
 
-/// The resources of a rank's lanes, as startup allocated them.
-pub(crate) struct LaneResources {
+/// The resources of a rank's computations, as startup allocated them.
+pub(crate) struct RankResources {
     pub(crate) pages: Option<Pages>,
     pub(crate) ledger: Option<LatentLedger>,
     pub(crate) reports: Option<Reports>,
@@ -164,15 +164,15 @@ pub(crate) struct LaneResources {
     pub(crate) host_stream: Option<Arc<CUDAStream>>,
 }
 
-impl ExecutorLanes {
+impl Computations {
     pub(crate) fn new(
         executor: Arc<PythonExecutor>,
-        lanes: Vec<ExecutorLane>,
-        resources: LaneResources,
+        list: Vec<Computation>,
+        resources: RankResources,
     ) -> Self {
         Self {
             executor,
-            lanes,
+            list,
             pages: resources.pages,
             ledger: resources.ledger,
             reports: resources.reports,
@@ -182,7 +182,7 @@ impl ExecutorLanes {
         }
     }
 
-    /// The rank's image host resource, when a lane names it.
+    /// The rank's image host resource, when a computation names it.
     pub(crate) fn images(&self) -> Option<&Images> {
         self.images.as_ref()
     }
@@ -192,50 +192,54 @@ impl ExecutorLanes {
         self.ledger.as_mut()
     }
 
-    /// The lane serving `kind` calls of `component`.
+    /// The computation serving `kind` calls of `component`.
     fn route(&self, component: &str, kind: CallKind) -> Option<usize> {
-        self.lanes
-            .iter()
-            .position(|lane| lane.component == component && lane.kinds.contains(&kind))
+        self.list.iter().position(|computation| {
+            computation.component == component && computation.kinds.contains(&kind)
+        })
     }
 
-    /// Whether a lane serves calls of `kind`.
+    /// Whether a computation serves calls of `kind`.
     pub(crate) fn serves(&self, kind: CallKind) -> bool {
-        self.lanes.iter().any(|lane| lane.kinds.contains(&kind))
+        self.list
+            .iter()
+            .any(|computation| computation.kinds.contains(&kind))
     }
 
-    /// What the lanes over the prefix cache share, for work beside
+    /// What the computations over the prefix cache share, for work beside
     /// `component`'s text batches (cache transfers): `component` has a text
-    /// prefill lane over the cache.
+    /// prefill computation over the cache.
     pub(crate) fn pages_of(&self, component: &str) -> Result<&Pages> {
-        let lane = self
+        let index = self
             .route(component, CallKind::Forward(ForwardMode::Prefill))
-            .filter(|&lane| self.lanes[lane].resources.pages);
-        match (lane, &self.pages) {
+            .filter(|&index| self.list[index].resources.pages);
+        match (index, &self.pages) {
             (Some(_), Some(pages)) => Ok(pages),
             _ => Err(Error::Unsupported(format!(
-                "component {component:?} has no text prefill lane over the prefix cache"
+                "component {component:?} has no text prefill computation over the prefix cache"
             ))),
         }
     }
 
-    /// What the lanes over the prefix cache share, for work on other
+    /// What the computations over the prefix cache share, for work on other
     /// streams that orders against their batches.
     pub(crate) fn pages_mut(&mut self) -> Option<&mut Pages> {
         self.pages.as_mut()
     }
 
-    /// The lanes' stream over the prefix cache, for their warmup jobs.
+    /// The stream of the computations over the prefix cache, for their warmup
+    /// jobs.
     pub(crate) fn pages_stream(&self) -> Option<Stream> {
         self.pages.as_ref().and_then(Pages::stream).cloned()
     }
 
-    /// Whether lane `lane`'s batches write the prefix cache: a text lane
-    /// over it (token-denoising lanes read their prefixes only).
-    pub(crate) fn writes_pages(&self, lane: usize) -> bool {
-        self.lanes.get(lane).is_some_and(|lane| {
-            lane.resources.pages
-                && !lane
+    /// Whether computation `index`'s batches write the prefix cache: a text
+    /// computation over it (token-denoising computations read their prefixes
+    /// only).
+    pub(crate) fn writes_pages(&self, index: usize) -> bool {
+        self.list.get(index).is_some_and(|computation| {
+            computation.resources.pages
+                && !computation
                     .kinds
                     .contains(&CallKind::Forward(ForwardMode::TokenDenoising))
         })
@@ -258,13 +262,12 @@ impl ExecutorLanes {
         Ok(())
     }
 
-    /// The job that admits the started requests no batch asked the
-    /// executor to admit yet, whose completion's text is the JSON of those
-    /// it refused, and whether it belongs on the lane: the executor resets
-    /// the requests' slot state over the prefix cache, ordered with the
-    /// batches over it on every stream, or prepares a trajectory's layout on
-    /// its lane's stream. `None` without started requests.
-    pub(crate) fn take_started(&mut self) -> Result<Option<(Job, bool)>> {
+    /// The job that admits the started requests no batch asked the executor to
+    /// admit yet, whose completion's text is the JSON of those it refused: the
+    /// executor resets the requests' slot state over the prefix cache, ordered
+    /// with the batches over it on every stream, or prepares a trajectory's
+    /// layout. `None` without started requests.
+    pub(crate) fn take_started(&mut self) -> Result<Option<Job>> {
         if self.started.is_empty() {
             return Ok(None);
         }
@@ -279,7 +282,7 @@ impl ExecutorLanes {
         if let Some(pages) = &mut self.pages {
             pages.order_mut().record(issue)?;
         }
-        Ok(Some((job, self.pages.is_some() || self.ledger.is_some())))
+        Ok(Some(job))
     }
 
     pub(crate) fn set_wake(&self, wake: Option<ipc::Wake>) {
@@ -291,19 +294,19 @@ impl ExecutorLanes {
         }
     }
 
-    /// Release the lanes' output storage, stop the image host lane and
-    /// close the report pipe, after the lanes drained and the executor
-    /// closed (its host thread stopped).
+    /// Release the computations' output storage, stop the image host pool and
+    /// close the report pipe, after the jobs drained and the executor closed
+    /// (its host thread stopped).
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         self.started.clear();
         let images = self
             .images
             .take()
             .map_or(Ok(()), |images| images.close(aborted));
-        for lane in &mut self.lanes {
-            lane.outputs.begin_close();
+        for computation in &mut self.list {
+            computation.outputs.begin_close();
             if !aborted {
-                lane.outputs.finish_close();
+                computation.outputs.finish_close();
             }
         }
         if let Some(mut reports) = self.reports.take() {
@@ -313,8 +316,8 @@ impl ExecutorLanes {
     }
 }
 
-impl RequestStorage for ExecutorLanes {
-    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
+impl RequestStorage for Computations {
+    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, _jobs: &CommandJob) -> Result<()> {
         // Released buffers' published trajectory versions retire once their
         // readers did.
         if let Some(ledger) = &self.ledger {
@@ -327,7 +330,7 @@ impl RequestStorage for ExecutorLanes {
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
-        _jobs: &LaneJobs,
+        _jobs: &CommandJob,
     ) -> Result<()> {
         match &self.ledger {
             Some(ledger) => ledger.release_requests(requests, retained),
@@ -347,7 +350,7 @@ impl RequestStorage for ExecutorLanes {
             .is_none_or(|ledger| ledger.retirement_ready(requests)))
     }
 
-    fn retire_slots(&mut self, slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn retire_slots(&mut self, slots: &[usize], _jobs: &CommandJob) -> Result<()> {
         if let Some(ledger) = &mut self.ledger {
             ledger.release_slots(slots)?;
         }
@@ -356,8 +359,8 @@ impl RequestStorage for ExecutorLanes {
     }
 
     fn reap(&mut self) -> Result<()> {
-        for lane in &mut self.lanes {
-            lane.outputs.reap();
+        for computation in &mut self.list {
+            computation.outputs.reap();
         }
         if let Some(ledger) = &mut self.ledger {
             ledger.reap();
@@ -371,7 +374,7 @@ impl RequestStorage for ExecutorLanes {
 /// products a preparation named and of an image model's products and
 /// trajectories.
 #[derive(Default)]
-pub(crate) struct LaneCall {
+pub(crate) struct CallResources {
     pub(crate) pages: PageCall,
     pub(crate) products: ProductCall,
     pub(crate) image: ImageCall,
@@ -379,15 +382,14 @@ pub(crate) struct LaneCall {
 
 /// A batch whose calls are bound, before its output storage is leased.
 pub(crate) struct Opening {
-    lane: usize,
-    calls: batch::Opening<LaneCall>,
+    computation: usize,
+    calls: batch::Opening<CallResources>,
 }
 
-/// A batch whose last job is on its lane, or that failed after recording
-/// it.
+/// A batch whose last job is in flight, or that failed after recording it.
 pub(crate) struct Parked {
-    lane: usize,
-    batch: Batch<LaneCall>,
+    computation: usize,
+    batch: Batch<CallResources>,
     /// The executor runs the batch.
     executes: bool,
     /// The job's first operation past the commit point.
@@ -395,7 +397,7 @@ pub(crate) struct Parked {
     /// The tensors the executor reads and writes for the batch, kept until
     /// its last job completed.
     _held: Vec<StorageView>,
-    /// The records the job's check parsed, for a lane that does not
+    /// The records the job's check parsed, for a computation that does not
     /// prepare.
     records: Arc<OnceLock<Records>>,
     /// The lease's first word lent to the executor.
@@ -403,51 +405,51 @@ pub(crate) struct Parked {
     /// The exports of a prepared batch, accepted at its completion and
     /// registered at its commit point.
     publications: Publications,
-    /// What an image lane's batch holds through its last job.
+    /// What an image computation's batch holds through its last job.
     image: ImageBatch,
 }
 
-/// A lane's batch between two of its jobs.
+/// A computation's batch between two of its jobs.
 pub(crate) enum Pending {
-    /// The job on the lane reads the batch's host-gated predicates.
+    /// The job in flight reads the batch's host-gated predicates.
     Predicates(Opening),
     /// The predicates are known: the batch is prepared or records its last
     /// job next.
     Opened(Opening),
-    /// The job on the lane asks the executor what the batch's calls read
-    /// and write.
+    /// The job in flight asks the executor what the batch's calls read and
+    /// write.
     Preparing(Opening, serde_json::Value),
     /// The preparation is known (`step["prepared"]`): the batch records its
     /// last job next.
     Prepared(Opening, serde_json::Value),
-    /// The job on the lane is the batch's last.
+    /// The job in flight is the batch's last.
     Committing(Box<Parked>),
     /// The last job failed before its commit point, or its completion could
     /// not be applied; the batch retires what it reserved next.
     Failing(Box<Parked>, Failure),
-    /// The job on the lane retires what the failed batch reserved, or
-    /// performs what a batch that reserved nothing had recorded.
+    /// The job in flight retires what the failed batch reserved, or performs
+    /// what a batch that reserved nothing had recorded.
     Discarding(Failure),
     /// The batch failed and holds nothing: its calls are reported next.
     Failed(Failure),
 }
 
-/// The parts of the backend a lane's batch executes with.
+/// The parts of the backend a computation's batch executes with.
 pub(crate) struct Parts<'a> {
     pub(crate) placement: &'a GroupPlacement,
     pub(crate) rank: usize,
     pub(crate) info: &'a WorkerInfo,
     pub(crate) requests: &'a mut RequestPool,
     pub(crate) storage: &'a mut WorkerMemory,
-    pub(crate) lanes: &'a mut ExecutorLanes,
+    pub(crate) computations: &'a mut Computations,
 }
 
 impl Opening {
-    /// Bind the batch's calls to their requests and record into `job` the
-    /// read of every host-gated predicate; a lane over the prefix cache
-    /// first orders after the batches on other streams and after
-    /// `page_loads`, the fence of the host KV cache reads the copy lane
-    /// issued for the batch.
+    /// Bind the batch's calls to their requests and record into `job` the read
+    /// of every host-gated predicate; a computation over the prefix cache first
+    /// orders after the batches on other streams and after `page_loads`, the
+    /// fence of the host KV cache reads issued for the batch on the copy
+    /// stream.
     fn open(
         parts: &mut Parts<'_>,
         plan: &BatchPlan,
@@ -465,21 +467,22 @@ impl Opening {
         {
             return Err(Error::Invalid("a batch serves one component".into()));
         }
-        let lanes = &*parts.lanes;
-        let index = lanes.route(&first.component, first.kind).ok_or_else(|| {
-            Error::Unsupported(format!(
-                "component {:?} has no executor lane for {}",
-                first.component,
-                first.kind.as_str()
-            ))
-        })?;
-        let lane = &lanes.lanes[index];
-        let issue = job.on(lane.stream.as_ref());
-        if let (true, Some(pages)) = (lane.resources.pages, &lanes.pages) {
+        let computations = &*parts.computations;
+        let index = computations
+            .route(&first.component, first.kind)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "component {:?} has no executor computation for {}",
+                    first.component,
+                    first.kind.as_str()
+                ))
+            })?;
+        let computation = &computations.list[index];
+        let issue = job.on(computation.stream.as_ref());
+        if let (true, Some(pages)) = (computation.resources.pages, &computations.pages) {
             pages.order().wait(issue)?;
-            // The copy lane made the fence's record before the batch reached
-            // its lane: the batch's inputs waited for the job that records
-            // it.
+            // The job that issued the page copies made the fence's record
+            // before this one: the batch's inputs waited for it.
             if let Some(fence) = page_loads {
                 issue.wait(fence)?;
             }
@@ -492,29 +495,32 @@ impl Opening {
             parts.placement,
             parts.rank,
             plan,
-            lane.device,
+            computation.device,
             issue,
             |call| call.canvas.is_none(),
         )?;
-        Ok(Self { lane: index, calls })
+        Ok(Self {
+            computation: index,
+            calls,
+        })
     }
 }
 
-/// The next job of a lane's batch, or `None` when the batch advanced
+/// The next job of a computation's batch, or `None` when the batch advanced
 /// without one: it failed and its calls are reported.
 pub(crate) fn forward(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     kind: CallKind,
 ) -> std::result::Result<Option<Job>, WorkerError> {
-    let state = match batch.lane_parts().2.take() {
+    let state = match batch.computation_parts().2.take() {
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
         state => state,
     };
     let page_loads = batch.page_loads().cloned();
-    let (plan, imports, images, pending) = batch.lane_inputs();
+    let (plan, imports, images, pending) = batch.computation_inputs();
     let inputs = BatchInputs { imports, images };
-    let Some(mut parts) = backend.lane_parts() else {
+    let Some(mut parts) = backend.computation_parts() else {
         return Err(WorkerError::classify(unserved(kind), None));
     };
     let (job, next) = match state {
@@ -534,7 +540,7 @@ pub(crate) fn forward(
         }
         Some(Pending::Failing(parked, failure)) => retire(
             parts.storage,
-            parts.lanes.ledger.as_mut(),
+            parts.computations.ledger.as_mut(),
             *parked,
             Job::new(),
             failure,
@@ -546,8 +552,8 @@ pub(crate) fn forward(
             | Pending::Discarding(_)
             | Pending::Failed(_)),
         ) => {
-            // A job of the batch is on the lane: its completion comes before
-            // the next job.
+            // A job of the batch is in flight: its completion comes before the
+            // next job.
             *pending = Some(state);
             return Err(WorkerError::classify(
                 Error::Invariant("a batch's job was prepared before its last completed".into()),
@@ -568,7 +574,7 @@ struct BatchInputs<'a> {
     images: Option<&'a InlineImages>,
 }
 
-/// Continue an opened batch: a lane that prepares asks the executor for
+/// Continue an opened batch: a computation that prepares asks the executor for
 /// the batch's preparation in `job`; any other records its last job.
 fn opened(
     parts: &mut Parts<'_>,
@@ -577,16 +583,16 @@ fn opened(
     opening: Opening,
     job: Job,
 ) -> (Option<Job>, Pending) {
-    let lanes = &*parts.lanes;
-    let lane = &lanes.lanes[opening.lane];
-    if !lane.prepares {
+    let computations = &*parts.computations;
+    let computation = &computations.list[opening.computation];
+    if !computation.prepares {
         return record(parts, plan, inputs, opening, None, job);
     }
-    let described = prepared_step(plan, parts.info, opening.lane, opening.calls.calls()).and_then(
-        |mut step| {
+    let described = prepared_step(plan, parts.info, opening.computation, opening.calls.calls())
+        .and_then(|mut step| {
             // An image model's calls also state their input images and
             // progress.
-            if image::serves(lane.resources, lane.prepares) {
+            if image::serves(computation.resources, computation.prepares) {
                 image::describe(
                     &mut step,
                     plan,
@@ -597,11 +603,14 @@ fn opened(
                 )?;
             }
             Ok(step)
-        },
-    );
+        });
     match described {
         Ok(step) => {
-            job.call_texts(lanes.executor.prepare(opening.lane, step.to_string()));
+            job.call_texts(
+                computations
+                    .executor
+                    .prepare(opening.computation, step.to_string()),
+            );
             (Some(job), Pending::Preparing(opening, step))
         }
         Err(error) => ended(job, Failure::new(PHASE)(error)),
@@ -713,18 +722,21 @@ fn record(
     step: Option<serde_json::Value>,
     job: Job,
 ) -> (Option<Job>, Pending) {
-    let Opening { lane, calls } = opening;
-    let executor_lane = &mut parts.lanes.lanes[lane];
-    let words = match lease_words(executor_lane.prepares, plan, step.as_ref()) {
+    let Opening {
+        computation: index,
+        calls,
+    } = opening;
+    let computation = &mut parts.computations.list[index];
+    let words = match lease_words(computation.prepares, plan, step.as_ref()) {
         Ok(words) => words,
         Err(error) => return ended(job, Failure::new(PHASE)(error)),
     };
     let leased = Batch::lease(
         calls,
-        &mut executor_lane.outputs,
+        &mut computation.outputs,
         words,
-        executor_lane.stream.clone(),
-        executor_lane.device,
+        computation.stream.clone(),
+        computation.device,
         &parts.storage.events,
         &job,
     );
@@ -733,7 +745,7 @@ fn record(
         Err(error) => return ended(job, Failure::new(PHASE)(error)),
     };
     let mut parked = Parked {
-        lane,
+        computation: index,
         batch,
         executes: false,
         point: 0,
@@ -747,7 +759,7 @@ fn record(
         Ok(()) => (Some(job), Pending::Committing(Box::new(parked))),
         Err(failure) => retire(
             parts.storage,
-            parts.lanes.ledger.as_mut(),
+            parts.computations.ledger.as_mut(),
             parked,
             job,
             failure,
@@ -766,22 +778,22 @@ fn record_last(
     job: &Job,
 ) -> std::result::Result<(), Failure> {
     let failed = Failure::new(PHASE);
-    let index = parked.lane;
+    let index = parked.computation;
     let batch = &mut parked.batch;
     let stream = batch.stream.clone();
     let issue = job.on(stream.as_ref());
-    let lanes = &mut *parts.lanes;
-    let lane = &lanes.lanes[index];
-    let executor = Arc::clone(&lanes.executor);
+    let computations = &mut *parts.computations;
+    let computation = &computations.list[index];
+    let executor = Arc::clone(&computations.executor);
     let tensors = &parts.storage.tensors;
 
-    if lane.prepares {
+    if computation.prepares {
         // The products the preparation named, then the execution on them
         // and the publication of what it wrote. A prepared batch runs
         // whichever of its calls are active.
         let mut step = step.ok_or_else(|| {
             failed(Error::Invariant(
-                "a prepared lane's batch has no preparation".into(),
+                "a prepared computation's batch has no preparation".into(),
             ))
         })?;
         batch.bind_flags(plan, tensors, job).map_err(&failed)?;
@@ -792,8 +804,8 @@ fn record_last(
         let prepared = PreparedOwners {
             owners,
             info: parts.info,
-            ledger: lanes.ledger.as_ref(),
-            host_stream: lanes.host_stream.clone(),
+            ledger: computations.ledger.as_ref(),
+            host_stream: computations.host_stream.clone(),
             borrowed: &inputs.imports.borrowed(),
         };
         let (mut bound, published) =
@@ -801,16 +813,16 @@ fn record_last(
         // An image model's calls bind their own products, pixels and
         // trajectories, and a denoising batch its rows over the prefix
         // cache; what they wrote is published behind the execution.
-        let images = image::serves(lane.resources, lane.prepares);
+        let images = image::serves(computation.resources, computation.prepares);
         let mut image_owners = image::Owners {
             store: tensors,
             transports: &parts.storage.transports,
             events: &parts.storage.events,
             requests: &*parts.requests,
             prefix_cache: parts.storage.prefix_cache.as_mut(),
-            pages: lanes.pages.as_mut(),
-            ledger: lanes.ledger.as_mut(),
-            images: lanes.images.as_ref(),
+            pages: computations.pages.as_mut(),
+            ledger: computations.ledger.as_mut(),
+            images: computations.images.as_ref(),
         };
         if images {
             let tensors = image::bind(
@@ -834,11 +846,12 @@ fn record_last(
         parked._held = bound;
         parked.executes = true;
     } else {
-        let (Some(pages), Some(prefix_cache)) =
-            (lanes.pages.as_ref(), parts.storage.prefix_cache.as_mut())
-        else {
+        let (Some(pages), Some(prefix_cache)) = (
+            computations.pages.as_ref(),
+            parts.storage.prefix_cache.as_mut(),
+        ) else {
             return Err(failed(Error::Unsupported(
-                "a lane that does not prepare computes over the prefix cache".into(),
+                "a computation that does not prepare computes over the prefix cache".into(),
             )));
         };
         let reservation = PageReservation::reserve(
@@ -863,7 +876,7 @@ fn record_last(
                 column.step.to_string(),
                 column.tensors.clone(),
             ));
-            // The records are checked on the lane's thread right behind the
+            // The records are checked on the builder thread right behind the
             // call that wrote them, before anything past it is performed.
             let records = Arc::clone(&parked.records);
             let memory = Arc::clone(column.records().memory());
@@ -886,9 +899,9 @@ fn record_last(
                     .set(parsed)
                     .map_err(|_| Error::Invariant("a batch's records were checked twice".into()))
             }));
-            let staging = lane.staging.as_ref().ok_or_else(|| {
+            let staging = computation.staging.as_ref().ok_or_else(|| {
                 failed(Error::Invariant(
-                    "a lane over the prefix cache has no relay staging".into(),
+                    "a computation over the prefix cache has no relay staging".into(),
                 ))
             })?;
             relay(tensors, staging, plan, batch, job).map_err(&failed)?;
@@ -920,7 +933,7 @@ fn record_last(
         .iter()
         .filter_map(|state| state.forward.products.latent.clone())
         .collect();
-    match &lanes.ledger {
+    match &computations.ledger {
         Some(ledger) => ledger.validate(&updates),
         None if updates.is_empty() => Ok(()),
         None => Err(Error::Invariant(
@@ -930,20 +943,20 @@ fn record_last(
     .map_err(&failed)?;
     parts
         .requests
-        .validate_pending(&Batch::<LaneCall>::pending(plan))
+        .validate_pending(&Batch::<CallResources>::pending(plan))
         .map_err(&failed)?;
     batch.seal(&parts.storage.events, job).map_err(&failed)?;
 
     // Every owner accepted its update. The job's operations from here on
     // change slot state, and any failure from here is fatal.
     parked.point = job.len();
-    let lane = &lanes.lanes[index];
-    if parked.executes && lane.commits {
+    let computation = &computations.list[index];
+    if parked.executes && computation.commits {
         job.call(executor.commit(index));
     }
-    if lane.commits
-        && lane.resources.pages
-        && let Some(pages) = &mut lanes.pages
+    if computation.commits
+        && computation.resources.pages
+        && let Some(pages) = &mut computations.pages
     {
         // Work on other streams that reads the slot state and K/V the batch
         // wrote orders behind its commit.
@@ -955,14 +968,14 @@ fn record_last(
     Ok(())
 }
 
-/// Apply the completion of a lane batch's job.
+/// Apply the completion of a computation batch's job.
 pub(crate) fn complete(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     completion: Completion,
 ) -> std::result::Result<(), WorkerError> {
     let failed = Failure::new(PHASE);
-    let state = batch.lane_parts().2.take();
+    let state = batch.computation_parts().2.take();
     let next = match (state, completion.check()) {
         // A predicate that could not be read, or a preparation the executor
         // refused, fails the batch, which has reserved nothing yet.
@@ -992,10 +1005,10 @@ pub(crate) fn complete(
         (Some(Pending::Committing(mut parked)), completed) => {
             let committed = match completed {
                 Ok(mut completion) => {
-                    let (plan, _, _) = batch.lane_parts();
-                    let Some(mut parts) = backend.lane_parts() else {
+                    let (plan, _, _) = batch.computation_parts();
+                    let Some(mut parts) = backend.computation_parts() else {
                         return Err(WorkerError::classify(
-                            Error::State("the executor lanes left a batch in flight"),
+                            Error::State("the executor computations left a batch in flight"),
                             Some(PHASE),
                         ));
                     };
@@ -1031,28 +1044,28 @@ pub(crate) fn complete(
         }
         (Some(Pending::Discarding(failure)), Ok(_)) => Pending::Failed(failure),
         (state, _) => {
-            *batch.lane_parts().2 = state;
+            *batch.computation_parts().2 = state;
             return Err(WorkerError::classify(
-                Error::Invariant("a batch has no job on its lane".into()),
+                Error::Invariant("a batch has no job in flight".into()),
                 Some(PHASE),
             ));
         }
     };
-    *batch.lane_parts().2 = Some(next);
+    *batch.computation_parts().2 = Some(next);
     Ok(())
 }
 
 /// Accept what the batch's last job returned before its commit point: a
-/// prepared batch's graph mode per call and the exports its forwards
-/// issued, which may still be refused (the caller then retires the
-/// batch). A lane that does not prepare had its records checked by the
-/// job itself and returns no modes.
+/// prepared batch's graph mode per call and the exports its forwards issued,
+/// which may still be refused (the caller then retires the batch). A
+/// computation that does not prepare had its records checked by the job itself
+/// and returns no modes.
 fn accept(
     parts: &mut Parts<'_>,
     parked: &mut Parked,
     completion: &mut Completion,
 ) -> Result<Vec<GraphMode>> {
-    if !parts.lanes.lanes[parked.lane].prepares {
+    if !parts.computations.list[parked.computation].prepares {
         return Ok(Vec::new());
     }
     let tensors = &parts.storage.tensors;
@@ -1074,7 +1087,7 @@ fn accept(
     }
     // An image model's trajectory versions, published from the ledger.
     image::accept(
-        parts.lanes.ledger.as_ref(),
+        parts.computations.ledger.as_ref(),
         &mut parked.batch.calls,
         &mut parked.publications,
     )?;
@@ -1082,12 +1095,12 @@ fn accept(
     Ok(modes)
 }
 
-/// Apply the completion of the batch's last job, past its commit point:
-/// its results to the calls' pending outputs (a lane's records, whose
-/// check passed before the commit point, or a prepared batch's accepted
-/// exports and trajectory commits with its graph `modes`), the written
-/// output words to the lease; then make the products visible and the calls
-/// pending. Every failure here is fatal.
+/// Apply the completion of the batch's last job, past its commit point: its
+/// results to the calls' pending outputs (a computation's records, whose check
+/// passed before the commit point, or a prepared batch's accepted exports and
+/// trajectory commits with its graph `modes`), the written output words to the
+/// lease; then make the products visible and the calls pending. Every failure
+/// here is fatal.
 fn commit(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
@@ -1096,11 +1109,11 @@ fn commit(
     completion: &mut Completion,
 ) -> std::result::Result<Launched, Failure> {
     let fatal = Failure::fatal(PHASE);
-    let lanes = &mut *parts.lanes;
-    let lane = &lanes.lanes[parked.lane];
+    let computations = &mut *parts.computations;
+    let computation = &computations.list[parked.computation];
     let tensors = &parts.storage.tensors;
     let elapsed = parked.batch.started.elapsed().as_micros() as u64;
-    let (stats, timer) = if lane.prepares {
+    let (stats, timer) = if computation.prepares {
         // Every owner accepted its update.
         let updates: Vec<_> = parked
             .batch
@@ -1108,7 +1121,7 @@ fn commit(
             .iter()
             .filter_map(|state| state.forward.products.latent.clone())
             .collect();
-        if let Some(ledger) = &mut lanes.ledger {
+        if let Some(ledger) = &mut computations.ledger {
             ledger.apply(&updates).map_err(&fatal)?;
         }
         for state in &mut parked.batch.calls {
@@ -1117,7 +1130,7 @@ fn commit(
             }
         }
         parked.publications.register(tensors).map_err(&fatal)?;
-        let timer = if image::serves(lane.resources, lane.prepares) {
+        let timer = if image::serves(computation.resources, computation.prepares) {
             "image_materialize"
         } else {
             "video_materialize"
@@ -1154,12 +1167,12 @@ fn commit(
     parked.batch.commit(plan, tensors, parts.requests)?;
 
     // The host tasks the calls' results wait for.
-    let host = if lane.resources.reports {
-        let inbox = lanes
+    let host = if computation.resources.reports {
+        let inbox = computations
             .reports
             .as_ref()
             .map(Reports::inbox)
-            .ok_or_else(|| Error::State("a lane's host tasks have no report pipe"))
+            .ok_or_else(|| Error::State("a computation's host tasks have no report pipe"))
             .map_err(&fatal)?;
         let calls: Vec<HostCall> = parked
             .batch
@@ -1184,7 +1197,7 @@ fn commit(
                 batch: plan.batch_id,
             }) as Box<dyn HostStage>
         })
-    } else if lane.resources.images {
+    } else if computation.resources.images {
         // The PNG encodings of an image model's decoded images.
         image::host_stage(&mut parked.batch.calls)
     } else {

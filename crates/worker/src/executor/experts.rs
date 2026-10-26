@@ -9,8 +9,8 @@
 //! - the union's host group, without a deadline, which the executor reaches
 //!   through host functions (`crate::parallel::host::bootstrap`) for its
 //!   agreement and for its transports' bootstrap;
-//! - one stream per microbatch: the lane's, then forks of it, which the
-//!   rank's streams close after the executor;
+//! - one stream per microbatch: the device's primary stream, then forks of it,
+//!   which the rank's streams close after the executor;
 //! - split MegaMoE's peer-mapped storage, one per microbatch, which every
 //!   member's exchange addresses until the executor closed the exchanges.
 //!
@@ -41,7 +41,7 @@ pub(crate) struct ExpertMember {
     /// The union's host group, which the executor's host functions hold
     /// too.
     _host: Arc<Mutex<HostGroup>>,
-    /// Each microbatch's stream: the lane's first.
+    /// Each microbatch's stream: the device's primary stream first.
     streams: Vec<Stream>,
     /// Each microbatch's peer-mapped storage, when the exchanges address
     /// one; released once the executor closed them.
@@ -91,14 +91,14 @@ impl ExpertMember {
         group.set_timeout(None)?;
         let host = Arc::new(Mutex::new(group));
 
-        // Microbatch 0 runs on the lane's stream, the others on forks of it.
-        let lane = start
+        // Microbatch 0 runs on the primary stream, the others on forks of it.
+        let primary = start
             .streams
             .stream_for(device)
             .ok_or(Error::State("expert parallelism requires a CUDA stream"))?
             .stream()?
             .clone();
-        let mut streams = vec![lane];
+        let mut streams = vec![primary];
         for _ in 1..config.expert_microbatches.max(1) {
             streams.push(start.streams.fork_microbatch()?.stream()?.clone());
         }
@@ -165,7 +165,7 @@ impl ExpertMember {
         }))
     }
 
-    /// Each microbatch's stream, the lane's first.
+    /// Each microbatch's stream, the device's primary stream first.
     pub(crate) fn streams(&self) -> &[Stream] {
         &self.streams
     }

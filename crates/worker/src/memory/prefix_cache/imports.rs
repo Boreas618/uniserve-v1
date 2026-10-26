@@ -1,13 +1,13 @@
-//! Imports of other ranks' cache exports into this rank's pages: the
-//! reserved import ([`PendingImport`]) and the import lane, whose bounded
-//! workspaces' host tasks copy the exports into assigned pages.
+//! Imports of other ranks' cache exports into this rank's pages: the reserved
+//! import ([`PendingImport`]) and the import pool, whose bounded workspaces'
+//! host tasks copy the exports into assigned pages.
 
 use std::sync::Arc;
 
 use ipc::{BufferId, CacheTransfer};
 
 use super::block_tables::GroupTable;
-use crate::host::HostLane;
+use crate::host::HostPool;
 use crate::transfer::{CacheImporter, ImportCopy, ImportEntry, Retired, Retirement};
 use crate::{Error, HostTask, Outcome, Result};
 
@@ -79,10 +79,11 @@ impl PendingImport {
     }
 }
 
-/// Import workspaces, their copy lane and the retirement observers.
+/// Import workspaces, the host pool their copies run on and the retirement
+/// observers.
 pub(super) struct Imports {
     pub(super) importer: Arc<CacheImporter>,
-    pub(super) lane: HostLane<ImportCopy>,
+    pub(super) pool: HostPool<ImportCopy>,
     pub(super) retired: Arc<Retired>,
 }
 

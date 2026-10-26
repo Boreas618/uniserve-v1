@@ -775,7 +775,7 @@ class DiffusionLMRunner:
                 output[start:stop, 1:] = decision.tokens
 
             # The commit skips zero targets, keeping skipped request rows
-            # and the shared padding row untouched across concurrent lanes.
+            # and the padding row, which every padded row shares, untouched.
             output[:, 0].masked_fill_(~active, STEP_SKIPPED)
             targets = torch.where(active, slots, torch.zeros_like(slots))
             sampler.commit_rows(banks["canvas"], targets, state.canvas)

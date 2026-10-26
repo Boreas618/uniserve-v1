@@ -11,10 +11,10 @@
 //!    on the component meshes and resolves each declared call on the loaded
 //!    model.
 //!
-//! The rank reads what it needs of a loaded model from the owner of each
-//! fact: the loaded model's own (its attention backend and numerical
-//! formats) here, what its lanes serve from the executor's manifest
-//! (`crate::worker::lanes`).
+//! The rank reads what it needs of a loaded model from the owner of each fact:
+//! the loaded model's own (its attention backend and numerical formats) here,
+//! what its computations serve from the executor's manifest
+//! (`crate::worker::computations`).
 
 use std::collections::BTreeSet;
 

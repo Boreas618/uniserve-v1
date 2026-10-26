@@ -321,8 +321,9 @@ impl WorkerExecutor {
             })
             .collect::<Vec<_>>();
         executor_info.video_codecs = video_unit_codecs(&media_routing, &placements)?;
-        // The scheduler plans lanes, rounds and its transfer window from what
-        // each group was launched with, not from its ranks' reports.
+        // The scheduler plans component capacity, rounds and its transfer
+        // window from what each group was launched with, not from its ranks'
+        // reports.
         executor_info.placements = workers
             .iter()
             .map(|(id, worker)| {

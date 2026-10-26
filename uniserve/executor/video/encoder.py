@@ -136,7 +136,7 @@ class TextEncoders:
     Args:
         loaded: The loaded model.
         path: The text encoder's module path.
-        stream: The component's lane stream.
+        stream: The primary stream of the component's device.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas.
         capacities: Configured prompt capacities, ascending; empty to encode
@@ -504,7 +504,7 @@ class ConditionEncoders:
         loaded: The loaded model.
         video_path: The video encoder's module path.
         audio_path: The audio encoder's module path.
-        stream: The encoders' lane stream.
+        stream: The primary stream of the encoders' device.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas.
         pool: The graph pool captures allocate in; ``None`` encodes every

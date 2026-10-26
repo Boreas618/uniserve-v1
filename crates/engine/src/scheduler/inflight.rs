@@ -74,8 +74,8 @@ pub(super) struct PendingBatch {
     /// Worker execution time accumulated across partial results, in
     /// microseconds.
     pub(super) worker_exec_us: u64,
-    /// Whether the batch carries a prefill-lane call; such batches count
-    /// against `PREFILL_WINDOW_CREDITS`.
+    /// Whether the batch carries a `BatchKind::Prefill` call; such batches
+    /// count against `PREFILL_WINDOW_CREDITS`.
     pub(super) prefill: bool,
 }
 
@@ -174,9 +174,9 @@ impl Inflight {
         self.pending_calls.get(&id).map_or(0, VecDeque::len)
     }
 
-    /// Returns whether a request other than `id` holds the denoiser lane,
-    /// that is, has a denoising call in flight.
-    pub(super) fn denoiser_lane_held_by_other(&self, id: RequestId) -> bool {
+    /// Returns whether a request other than `id` holds the denoiser, that is,
+    /// has a denoising call in flight.
+    pub(super) fn denoiser_held_by_other(&self, id: RequestId) -> bool {
         self.pending_calls
             .iter()
             .filter(|(holder, _)| **holder != id)

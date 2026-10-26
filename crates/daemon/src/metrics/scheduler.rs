@@ -45,17 +45,19 @@ pub struct EngineModeLabels {
     pub mode: String,
 }
 
-/// Labels identifying one state of a worker lane's stream.
+/// Labels identifying one state of a worker stream's device time.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct EngineLaneLabels {
+pub struct EngineStreamLabels {
     /// Served model identity.
     pub model_name: String,
     /// Scheduler index.
     pub engine: u32,
-    /// Worker lane (`lane-0`, `copy-lane`).
-    pub lane: String,
-    /// `busy`: device time the lane's jobs spanned; `gap`: idle time of the
-    /// lane's stream between consecutive jobs.
+    /// Worker stream: `device`, the rank's primary stream, or `copy`, the
+    /// stream of its page copies through the host KV cache.
+    pub stream: String,
+    /// `busy`: device time the stream's operations spanned; `gap`: idle time
+    /// of the stream between them; `late`: time of records too far out of
+    /// order to merge.
     pub state: String,
 }
 
@@ -67,7 +69,7 @@ pub struct EngineBlockingLabels {
     pub model_name: String,
     /// Scheduler index.
     pub engine: u32,
-    /// Worker thread (`builder`, a lane, `control`).
+    /// Worker thread (`builder`, `control`).
     pub thread: String,
     /// Driver call.
     pub call: String,
@@ -179,8 +181,8 @@ pub struct SchedulerMetrics {
     pub worker_forward_mode_us: Family<EngineModeLabels, U64Counter>,
     /// Forward wall time grouped by worker component.
     pub worker_forward_component_us: Family<EngineComponentLabels, U64Counter>,
-    /// Worker lane stream time grouped by lane and state.
-    pub worker_lane_us: Family<EngineLaneLabels, U64Counter>,
+    /// Worker stream device time grouped by stream and state.
+    pub worker_stream_us: Family<EngineStreamLabels, U64Counter>,
     /// Worker driver calls that waited for the device, by thread and call.
     pub worker_blocking_calls: Family<EngineBlockingLabels, U64Counter>,
     /// CUDA graph captures.
@@ -389,14 +391,14 @@ impl SchedulerMetrics {
             "Worker forward wall time by component in microseconds.",
             worker_forward_component_us.clone(),
         );
-        let worker_lane_us: Family<EngineLaneLabels, U64Counter> = Default::default();
+        let worker_stream_us: Family<EngineStreamLabels, U64Counter> = Default::default();
         registry.register(
-            "uniserve:worker_lane_us",
-            "Worker lane stream time in microseconds from CUPTI activity records: the union of \
-             the kernels, copies and fills on the stream, graph nodes included (busy), the \
-             stream's idle time between them (gap), and records too far out of order to merge \
-             (late).",
-            worker_lane_us.clone(),
+            "uniserve:worker_stream_us",
+            "Worker stream device time in microseconds from CUPTI activity records, for the \
+             primary stream (device) and the host KV cache copy stream (copy): the union of the \
+             kernels, copies and fills on the stream, graph nodes included (busy), the stream's \
+             idle time between them (gap), and records too far out of order to merge (late).",
+            worker_stream_us.clone(),
         );
         let worker_blocking_calls: Family<EngineBlockingLabels, U64Counter> = Default::default();
         registry.register(
@@ -595,7 +597,7 @@ impl SchedulerMetrics {
             worker_forward_mode_tokens,
             worker_forward_mode_us,
             worker_forward_component_us,
-            worker_lane_us,
+            worker_stream_us,
             worker_blocking_calls,
             worker_cuda_graph_captures,
             worker_cuda_graph_replays,

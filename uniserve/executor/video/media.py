@@ -54,7 +54,7 @@ __all__ = [
     "DONE",
     "FAILED",
     "Conditions",
-    "HostLane",
+    "MediaThread",
     "MuxSession",
     "Reports",
     "Staging",
@@ -188,7 +188,7 @@ class Reports:
                 message = message[written:]
 
 
-class HostLane:
+class MediaThread:
     """One host thread running media tasks in submission order."""
 
     def __init__(self, name: str) -> None:
@@ -534,7 +534,7 @@ class MuxSession:
     """One request's MP4 under assembly.
 
     The engine hands a request's units, audio and finalization to one muxer
-    rank one call at a time, and the host lane runs them in order.
+    rank one call at a time, and the media thread runs them in order.
     """
 
     def __init__(

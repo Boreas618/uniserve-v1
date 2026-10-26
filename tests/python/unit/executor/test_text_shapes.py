@@ -1,4 +1,4 @@
-"""Graph buckets of a text lane (``uniserve.executor.text.shapes``)."""
+"""Graph buckets of a text computation (``uniserve.executor.text.shapes``)."""
 
 from __future__ import annotations
 

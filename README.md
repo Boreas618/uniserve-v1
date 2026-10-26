@@ -212,7 +212,7 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   memory/                     KV, latent, tensor, request-slot and output backing
   transfer/                   Local, shared-memory, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
-  stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
+  stream/, host/, capacity/   CUDA streams and events, host pools, capacity planning
 crates/uniserve/              The `uniserve` executable: `serve`, `engine`, `worker` and `storage`
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   runner/                     The Python half of each runner, which the worker runtime calls

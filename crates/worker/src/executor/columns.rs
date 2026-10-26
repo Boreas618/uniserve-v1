@@ -1,7 +1,7 @@
-//! The step a batch of a lane that does not prepare hands the executor
-//! ([`ColumnStep`]): host columns, a small JSON and the batch's output
-//! words, into which the executor copies its device values, with a host
-//! tensor it writes its completion records into (`crate::executor::records`).
+//! The step a batch of a computation that does not prepare hands the executor
+//! ([`ColumnStep`]): host columns, a small JSON and the batch's output words,
+//! into which the executor copies its device values, with a host tensor it
+//! writes its completion records into (`crate::executor::records`).
 //!
 //! The columns are one column of [`CALL_FIELDS`] integers per call (`int64
 //! [CALL_FIELDS, C]`), the scheduler's forward rows grouped by call with
@@ -25,11 +25,11 @@ use std::sync::Arc;
 use ipc::{Batch as BatchPlan, Call, CallKind, DType, ForwardBatch, ForwardMode, TensorRef};
 
 use crate::executor::batch::Batch;
-use crate::executor::lanes::LaneCall;
+use crate::executor::computations::CallResources;
 use crate::executor::pages::PageReservation;
 use crate::executor::records::{self, CallLimits};
 use crate::ffi::{Backing, DType as Element};
-use crate::lane::Recorder;
+use crate::job::Recorder;
 use crate::memory::Metadata;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::request::RequestProgress;
@@ -262,16 +262,16 @@ impl ColumnStep {
     }
 }
 
-/// Build lane `lane`'s step of `batch`, whose pages `reservation` holds:
-/// lease the active calls' features on `issue`'s stream behind their
-/// producers (they end with the batch's other reads), lay out the columns
-/// and tokens, allocate the records and lend the executor every output
-/// word the lease has left.
+/// Build computation `computation`'s step of `batch`, whose pages `reservation`
+/// holds: lease the active calls' features on `issue`'s stream behind their
+/// producers (they end with the batch's other reads), lay out the columns and
+/// tokens, allocate the records and lend the executor every output word the
+/// lease has left.
 pub(crate) fn column_step(
     tensors: &ProductStore,
     plan: &BatchPlan,
-    lane: usize,
-    batch: &mut Batch<LaneCall>,
+    computation: usize,
+    batch: &mut Batch<CallResources>,
     reservation: &PageReservation,
     issue: Recorder<'_>,
 ) -> Result<ColumnStep> {
@@ -412,7 +412,7 @@ pub(crate) fn column_step(
     Ok(ColumnStep {
         step: serde_json::json!({
             "batch": plan.batch_id,
-            "lane": lane,
+            "computation": computation,
             "collective_seq": plan.collective_seq,
             "calls": entries,
         }),

@@ -1,13 +1,13 @@
 //! Bounded host output storage and per-batch readback lifetimes.
 //!
 //! A batch's results reach the host in the batch's range of a word arena
-//! (`OutputPool`): one arena per executor lane and one for the transfer
-//! runtime, allocated at startup, page-locked for device copies and
-//! pageable on a CPU lane. The producer writes the range itself, on the
+//! (`OutputPool`): one arena per executor computation and one for the transfer
+//! runtime, allocated at startup, page-locked for device copies and pageable
+//! for a computation on the host. The producer writes the range itself, on the
 //! batch's stream in its own order: `int64` words from the range's front
-//! ([`OutputBuffer::lend_words`]) and raw bytes, such as decoded pixels,
-//! from its back ([`OutputBuffer::lend_bytes`]). The lease's seal fences
-//! those copies; the host reads the words only after the fences complete.
+//! ([`OutputBuffer::lend_words`]) and raw bytes, such as decoded pixels, from
+//! its back ([`OutputBuffer::lend_bytes`]). The lease's seal fences those
+//! copies; the host reads the words only after the fences complete.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -26,10 +26,10 @@ mod logprobs;
 
 pub use logprobs::LogprobLayout;
 
-/// One batch's host words: `words` 64-bit words from word `offset` of
-/// `memory`, page-locked for CUDA lanes and pageable for CPU lanes. Only
-/// storage is reused; each batch receives a distinct [`OutputBuffer`] and
-/// completion signal.
+/// One batch's host words: `words` 64-bit words from word `offset` of `memory`,
+/// page-locked for device copies and pageable on the host. Only storage is
+/// reused; each batch receives a distinct [`OutputBuffer`] and completion
+/// signal.
 pub struct OutputStorage {
     memory: Arc<Storage>,
     offset: usize,
@@ -577,17 +577,17 @@ fn record(pool: &EventPool, stream: impl Issue, timing: bool) -> Result<Arc<Even
 /// A batch's output buffer, shared by its pending results and the pool.
 pub(crate) type OutputLease = Arc<Mutex<OutputBuffer>>;
 
-/// Output storage of one lane: one host word arena, allocated when the lane
-/// starts, that every batch leases exactly its words from.
+/// Output storage of one computation: one host word arena, allocated when the
+/// computation is bound, that every batch leases exactly its words from.
 ///
-/// The arena is `blocks` blocks of `block_words` words, the largest lease
-/// the lane's own bounds allow. A lease lies within one block, first fit, so
+/// The arena is `blocks` blocks of `block_words` words, the largest lease the
+/// computation's own bounds allow. A lease lies within one block, first fit, so
 /// while fewer than `blocks` leases are live some block is entirely free and
 /// any lease of at most `block_words` fits: `blocks` is the number of the
-/// largest batches the lane holds at once, and smaller batches share
-/// blocks. A lease's range is reused only after the lease retired: its
-/// copies finished, every row was observed or the batch abandoned, and no
-/// CPU reader holds a byte capture.
+/// largest batches the computation holds at once, and smaller batches share
+/// blocks. A lease's range is reused only after the lease retired: its copies
+/// finished, every row was observed or the batch abandoned, and no CPU reader
+/// holds a byte capture.
 ///
 /// A batch of more words than a block, such as a readout whose candidate
 /// count no admission limit bounds, reads back into storage of its own,
@@ -596,7 +596,7 @@ pub(crate) type OutputLease = Arc<Mutex<OutputBuffer>>;
 pub(crate) struct OutputPool {
     /// Released by [`Self::finish_close`].
     arena: Option<Arc<Storage>>,
-    /// The device the lane's copies read from; `None` for a CPU lane.
+    /// The device the copies read from; `None` for a computation on the host.
     device: Option<DeviceId>,
     blocks: usize,
     block_words: usize,
@@ -608,13 +608,13 @@ pub(crate) struct OutputPool {
 
 impl OutputPool {
     /// `blocks` blocks of `block_words` words, pinned for `device` copies
-    /// (pageable for a CPU lane), allocated now so that no batch within the
-    /// lane's bounds allocates host memory.
+    /// (pageable for a computation on the host), allocated now so that no batch
+    /// within the computation's bounds allocates host memory.
     pub(crate) fn new(device: Option<DeviceId>, blocks: usize, block_words: usize) -> Result<Self> {
         let blocks = blocks.max(1);
         let words = blocks
             .checked_mul(block_words)
-            .ok_or(Error::Resource("lane output storage overflows"))?;
+            .ok_or(Error::Resource("computation output storage overflows"))?;
         Ok(Self {
             arena: Some(words_memory(device, words)?),
             device,
@@ -680,7 +680,7 @@ impl OutputPool {
         }
         let offset = self
             .place(words)
-            .ok_or(Error::Resource("all lane output storage is leased"))?;
+            .ok_or(Error::Resource("all computation output storage is leased"))?;
 
         let storage = OutputStorage {
             memory: arena,
@@ -812,8 +812,9 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_holds_its_largest_batches_at_once_and_smaller_ones_share_its_storage() -> Result<()> {
-        // Storage for two of the lane's largest batches, of eight words each.
+    fn a_pool_holds_its_largest_batches_at_once_and_smaller_ones_share_its_storage() -> Result<()> {
+        // Storage for two of the computation's largest batches, of eight words
+        // each.
         let mut pool = OutputPool::new(None, 2, 8)?;
 
         // Two of the largest batches at once; a third waits for one to retire.
@@ -904,8 +905,8 @@ mod tests {
         Ok(())
     }
 
-    /// A batch of more words than a block, as a readout of more candidates
-    /// than the lane's bounds state, reads back into storage of its own: it
+    /// A batch of more words than a block, as a readout of more candidates than
+    /// the computation's bounds state, reads back into storage of its own: it
     /// holds every word, and both blocks stay free for the largest batches.
     #[test]
     fn a_batch_larger_than_a_block_reads_back_into_storage_of_its_own() -> Result<()> {

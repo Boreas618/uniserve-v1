@@ -46,7 +46,7 @@ impl HostAction for ImportCopy {
 
     fn input_outcome(&self) -> Outcome {
         // Queued cancellation has no numerical access to drain. Failed DMA
-        // retains this action and its backing through the host lane's common
+        // retains this action and its backing through the host pool's common
         // unknown-completion handling.
         self.write.task_done();
         if self.write.drained() {

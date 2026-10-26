@@ -114,7 +114,7 @@ use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
 
-/// Execution lane a call kind is batched in (see `batch_kind`).
+/// The kind of pass a call kind is batched in (see `batch_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchKind {
     /// Every forward prefill, and text, vision, and latent encoding.
@@ -139,9 +139,9 @@ const KV_OFFLOAD_POLL: Duration = Duration::from_millis(1);
 /// host KV cache: for the batches in flight, which carry offloads, and for
 /// the batches of the remaining offloads.
 const PAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
-/// Number of batches carrying prefill-lane calls that may await their
-/// results before ready decode work takes precedence over further prefill
-/// (`Scheduler::select_batch_kind`).
+/// Number of batches carrying `BatchKind::Prefill` calls that may await
+/// their results before ready decode work takes precedence over further
+/// prefill (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
 
 /// Builds an image-completion event from a base64 PNG payload.
@@ -509,10 +509,11 @@ fn finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
     finish_token_ids
 }
 
-/// Classifies a call kind into its execution lane.
+/// Classifies a call kind into its batch kind.
 ///
-/// Lane selection (`Scheduler::select_batch_kind`), batch assembly, and the
-/// prefill flag set by `Inflight::register_pending_batch` read this mapping.
+/// Batch kind selection (`Scheduler::select_batch_kind`), batch assembly,
+/// and the prefill flag set by `Inflight::register_pending_batch` read this
+/// mapping.
 fn batch_kind(call_variant: CallKind) -> BatchKind {
     match call_variant {
         CallKind::Forward(ForwardMode::Prefill)

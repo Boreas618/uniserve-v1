@@ -194,12 +194,13 @@ class Buffer:
         """Prepare one expert launch for all layers and microbatches.
 
         A persistent grid occupies the expert device. Launching independent
-        grids on different streams can make peers choose different lanes and
-        wait forever. One launch visits layer-major, then microbatch order on
-        every expert rank, matching the attention calls' cooperative order.
+        grids on different streams can make peers serve different
+        microbatches and wait forever. One launch visits layer-major, then
+        microbatch order on every expert rank, matching the attention calls'
+        cooperative order.
         """
-        # `mega_moe_m2n_eg` takes a fixed four lane buffers, so the kernel
-        # serves at most four microbatches.
+        # `mega_moe_m2n_eg` takes a fixed four microbatch buffers, so the
+        # kernel serves at most four microbatches.
         if not 1 <= len(buffers) <= 4:
             raise ValueError("split MegaMoE serves one to four microbatches")
         if any(
@@ -246,8 +247,11 @@ class Buffer:
             compile_only,
         )
 
-    def expert(self, operator, *, lanes=(), compile_only=False):
-        buffers = (*lanes, *((None,) * (3 - len(lanes))))
+    def expert(self, operator, *, microbatches=(), compile_only=False):
+        # The other microbatches' buffers fill the kernel's three further
+        # buffer slots; an unused slot passes no storage and this buffer's
+        # pointers.
+        buffers = (*microbatches, *((None,) * (3 - len(microbatches))))
         self.native.mega_moe_m2n_eg(
             operator.descriptors,
             operator.pointers,
@@ -314,11 +318,11 @@ class _Step:
             if self.operators[0].alpha is None
             else torch.stack([op.alpha for op in self.operators])
         )
-        buffers[0].expert(self, lanes=buffers[1:], compile_only=True)
+        buffers[0].expert(self, microbatches=buffers[1:], compile_only=True)
 
     def launch(self, operator):
         if operator is self.operators[0]:
-            self.buffers[0].expert(self, lanes=self.buffers[1:])
+            self.buffers[0].expert(self, microbatches=self.buffers[1:])
 
 
 def _weights(linear, order, rows, columns, *, halves=1):

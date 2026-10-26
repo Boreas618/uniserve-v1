@@ -45,7 +45,7 @@ def test_the_stub_reports_its_image_facts(loaded):
         None,
         1007,
     )
-    # The text lanes' settings: an image policy, three rotary axes.
+    # The text executor's settings: an image policy, three rotary axes.
     assert text_settings(loaded) == (
         '{"image_processor": true, "media_axes": 3}'
     )

@@ -1,31 +1,29 @@
 //! Publication of a batch's products to the ranks and workers that read
 //! them.
 //!
-//! A batch exports a product once the producer has written it: the tensor
-//! store exports its value through every export mechanism that reaches the
-//! producing call's consumers, retains each location's retirement on the
-//! product's buffer, and the product's descriptor joins the call's
-//! completion (and so the batch result the engine routes to the
-//! consumers). The locations become the buffer's registered exports at the
-//! batch's commit point and are revoked when the buffer is released; a
-//! batch that fails before committing revokes them at once. The same rules
-//! hold for every batch, a lane's, a transfer's or what host tasks wrote,
-//! so this module is the one place that applies them.
+//! A batch exports a product once the producer has written it: the tensor store
+//! exports its value through every export mechanism that reaches the producing
+//! call's consumers, retains each location's retirement on the product's
+//! buffer, and the product's descriptor joins the call's completion (and so the
+//! batch result the engine routes to the consumers). The locations become the
+//! buffer's registered exports at the batch's commit point and are revoked when
+//! the buffer is released; a batch that fails before committing revokes them at
+//! once. The same rules hold for every batch, a computation's, a transfer's or
+//! what host tasks wrote, so this module is the one place that applies them.
 //!
-//! A call of a lane that prepares reads products other calls published
+//! A call of a computation that prepares reads products other calls published
 //! (`Call::inputs`, a predicate) and publishes its own (`Call::outputs`, a
-//! completion scalar).
-//! Products live in the rank's [`ProductStore`]: imports from other ranks
-//! reach it before the batch executes ([`crate::executor::inputs`]), and
-//! every input the executor's preparation names is then leased from it
-//! ([`bind_prepared`]); host codecs read some inputs in place from their
-//! shared-memory exports instead. [`bind_outputs`] reserves a call's
-//! outputs at their scheduler placement and [`export`] publishes a written
-//! one.
+//! completion scalar). Products live in the rank's [`ProductStore`]: imports
+//! from other ranks reach it before the batch executes
+//! ([`crate::executor::inputs`]), and every input the executor's preparation
+//! names is then leased from it ([`bind_prepared`]); host codecs read some
+//! inputs in place from their shared-memory exports instead. [`bind_outputs`]
+//! reserves a call's outputs at their scheduler placement and [`export`]
+//! publishes a written one.
 
 use crate::executor::PendingOutput;
 use crate::executor::batch::{Batch, CallState};
-use crate::executor::lanes::LaneCall;
+use crate::executor::computations::CallResources;
 use crate::executor::latents::LatentLedger;
 use crate::executor::reports::Publication;
 use crate::ffi::{Backing, DType, MemoryKind};
@@ -327,13 +325,13 @@ fn product_name<'a>(info: &'a WorkerInfo, call: &Call, output: &TensorRef) -> Re
         })
 }
 
-/// The JSON step the executor prepares and executes on a lane that
+/// The JSON step the executor prepares and executes on a computation that
 /// prepares: every call with what the worker knows of it.
 pub(crate) fn prepared_step(
     plan: &BatchPlan,
     info: &WorkerInfo,
-    lane: usize,
-    calls: &[CallState<LaneCall>],
+    computation: usize,
+    calls: &[CallState<CallResources>],
 ) -> Result<serde_json::Value> {
     let encode = |error: serde_json::Error| Error::Invalid(format!("encoding a batch: {error}"));
     let mut entries = Vec::with_capacity(plan.calls.len());
@@ -360,7 +358,7 @@ pub(crate) fn prepared_step(
     }
     Ok(serde_json::json!({
         "batch_id": plan.batch_id,
-        "lane": lane,
+        "computation": computation,
         "calls": entries,
     }))
 }
@@ -369,7 +367,8 @@ pub(crate) fn prepared_step(
 pub(crate) struct PreparedOwners<'a> {
     pub(crate) owners: ProductOwners<'a>,
     pub(crate) info: &'a WorkerInfo,
-    /// The trajectory ledger of a lane that names the `latents` resource.
+    /// The trajectory ledger of a computation that names the `latents`
+    /// resource.
     pub(crate) ledger: Option<&'a LatentLedger>,
     /// The stream device products host tasks wrote are fenced on.
     pub(crate) host_stream: Option<Arc<CUDAStream>>,
@@ -392,7 +391,7 @@ pub(crate) struct Published {
 pub(crate) fn bind_prepared(
     owners: &PreparedOwners<'_>,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     step: &mut serde_json::Value,
     issue: impl Issue,
 ) -> Result<(Vec<StorageView>, Published)> {
@@ -569,7 +568,7 @@ fn publication(
 /// reads, when it commits or retires.
 fn lease(
     store: &ProductStore,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     product: &TensorRef,
     consumer: CallId,
     memory: MemoryKind,
@@ -591,7 +590,7 @@ fn lease(
 pub(crate) fn publish(
     owners: ProductOwners<'_>,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     published: Published,
     issue: impl Issue,
 ) -> Result<()> {

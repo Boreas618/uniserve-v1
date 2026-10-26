@@ -14,10 +14,10 @@ metadata and model facts alone, so they are known at preparation:
   when the call publishes one.
 
 :class:`PlanEntry` is one call's answer in the preparation's JSON form: the
-generic ``reads``, ``writes`` and ``publication`` every prepared lane states
-(empty for image calls, whose products are fields of their own) and the
-``image`` entry the worker binds them by (``crates/worker/src/executor/
-image.rs``).
+generic ``reads``, ``writes`` and ``publication`` every prepared
+computation states (empty for image calls, whose products are fields of
+their own) and the ``image`` entry the worker binds them by
+(``crates/worker/src/executor/image.rs``).
 
 Vision encodes pack every image of a forward into one patch-row bucket: the
 images' patch rows back to back, then one padding segment
@@ -49,7 +49,7 @@ __all__ = [
 ]
 
 # A call that reads and writes nothing: a refused or skipped call, or one of
-# a lane that binds nothing for it.
+# a computation that binds nothing for it.
 NOTHING: Mapping[str, Any] = {"reads": [], "writes": [], "publication": None}
 
 
@@ -125,7 +125,7 @@ class PlanEntry:
 
     Attributes:
         read: The call reads its resident image product (``image_input``),
-            leased on the lane's device.
+            leased on the computation's device.
         pixels: The call reads its inline image's host-prepared pixels.
         writes: The products it writes, in tensor order.
         staging: Host bytes the call stages: a decoded image's RGB bytes,

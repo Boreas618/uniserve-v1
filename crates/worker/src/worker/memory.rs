@@ -1,11 +1,11 @@
 //! The rank's storage owners and their part in request lifecycles.
 //!
 //! Startup allocates them on the capacity plan: the device event pool, the
-//! product store (relay lanes and the buffer pool), the product transports
-//! and, for a text model, the prefix cache (unit planes, block tables and import
-//! workspaces). The executor's lanes and the transfer runtime borrow them to
-//! execute calls; lifecycle commands release their request storage through
-//! [`RequestStorage`].
+//! product store (relay entries and the buffer pool), the product transports
+//! and, for a text model, the prefix cache (unit planes, block tables and
+//! import workspaces). The executor's computations and the transfer runtime
+//! borrow them to execute calls; lifecycle commands release their request
+//! storage through [`RequestStorage`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use super::cache_width;
 use crate::Result;
 use crate::capacity::plan::Plan;
 use crate::config::{WorkerConfig, WorkerLaunch};
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{CommandJob, RequestStorage};
 use crate::memory::{BufferPool, PrefixCache, ProductStore};
 use crate::stream::{CUDAStream, EventPool, Streams};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
@@ -31,7 +31,7 @@ pub(crate) struct WorkerMemory {
     pub transports: Arc<Transports>,
     pub prefix_cache: Option<PrefixCache>,
     /// Stream that orders slot releases after the batches reading them: the
-    /// lane's.
+    /// device's primary stream.
     release_stream: Option<Stream>,
     /// Finished requests whose guidance prefix slots (image trajectories)
     /// clear with their own slots, once their readers retired.
@@ -112,7 +112,7 @@ impl WorkerMemory {
 }
 
 impl RequestStorage for WorkerMemory {
-    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()> {
+    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &CommandJob) -> Result<()> {
         self.tensors.release_buffers(buffers, jobs.job().on(None))?;
         if let Some(prefix_cache) = &mut self.prefix_cache {
             prefix_cache.release_buffers(buffers)?;
@@ -124,7 +124,7 @@ impl RequestStorage for WorkerMemory {
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
-        jobs: &LaneJobs,
+        jobs: &CommandJob,
     ) -> Result<()> {
         self.tensors
             .release_requests(requests, retained, jobs.job().on(None))?;
@@ -156,10 +156,10 @@ impl RequestStorage for WorkerMemory {
         Ok(ready)
     }
 
-    fn retire_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()> {
+    fn retire_slots(&mut self, slots: &[usize], jobs: &CommandJob) -> Result<()> {
         if let Some(prefix_cache) = &mut self.prefix_cache {
-            // The rows are cleared on the lane's stream, behind the batches
-            // it already performed.
+            // The rows are cleared on the primary stream, behind the batches
+            // already issued on it.
             let release = jobs.job().on(self.release_stream.as_ref());
             let slots: Vec<u32> = slots.iter().map(|&slot| slot as u32).collect();
             prefix_cache.release_slots(&slots, release)?;
@@ -228,8 +228,8 @@ pub(super) fn allocate_storage(
     );
 
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
-    // lanes, one per request slot and unresolved call, on the primary
-    // device where every binding computes.
+    // entries, one per request slot and unresolved call, on the primary device
+    // where every binding computes.
     let devices = vec![config.device.memory()];
     let buffer_pool =
         BufferPool::allocate(plan.info.buffer_pool_bytes.max(1), &devices, &mut *memory)?;
@@ -262,7 +262,7 @@ pub(super) fn allocate_storage(
         stream.synchronize()?;
     }
     // Slot releases order after the token batches that read them, on the
-    // lane's stream.
+    // primary stream.
     let release_stream = match device {
         Some(cuda) => streams
             .stream_for(cuda)

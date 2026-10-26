@@ -13,11 +13,11 @@
 //! import makes it the slot's committed trajectory, which the consuming
 //! call then reads like one this rank computed.
 //!
-//! These functions serve every user of the lanes' latent ledger: an image
-//! model's lanes export the versions their preparation and denoising
-//! produce (`crate::executor::image`), the transfer runtime exports
-//! resident versions for tensor transfers, and batch input preparation
-//! imports versions other ranks published.
+//! These functions serve every user of the computations' latent ledger: an
+//! image model's computations export the versions their preparation and
+//! denoising produce (`crate::executor::image`), the transfer runtime exports
+//! resident versions for tensor transfers, and batch input preparation imports
+//! versions other ranks published.
 
 use std::sync::Arc;
 

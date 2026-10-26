@@ -12,9 +12,9 @@
 //! A rank's connection is its liveness: the engine treats a rank whose
 //! connection has closed as dead, and a rank exits when its connection to
 //! the engine closes. A rank that has not registered yet is known lost by
-//! its daemon's exit report. A rank whose lane stays inside one job reports
-//! it unasked (`WorkerResponse::Stalled`), and the engine fails that rank as
-//! it fails a dead one. The daemon that started a rank reaps it and removes
+//! its daemon's exit report. A rank whose builder thread stays inside one
+//! job reports it unasked (`WorkerResponse::Stalled`), and the engine fails
+//! that rank as it fails a dead one. The daemon that started a rank reaps it and removes
 //! the CUDA driver memory a rank that did not end in order left behind.
 //!
 //! The engine exchanges batch descriptors and bounded result values while
@@ -641,16 +641,13 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// Logs a lane the rank reports stalled and returns the failure of the
-    /// rank, which names the lane and the forward its job belongs to.
+    /// Logs a job the rank reports stalled and returns the failure of the
+    /// rank, which names the forward the job belongs to.
     ///
-    /// The rank's lane stays inside one job, so the rank cannot complete
-    /// the batches behind it: the group fails it as it fails a lost rank.
+    /// The rank's builder thread stays inside one job, so the rank cannot
+    /// complete the batches behind it: the group fails it as it fails a
+    /// lost rank.
     fn stalled(&self, stall: &ipc::Stall) -> anyhow::Error {
-        let lane = stall.lane.as_ref().map_or_else(
-            || "the builder thread".to_owned(),
-            |lane| format!("lane {lane}"),
-        );
         let calls = stall
             .calls
             .iter()
@@ -658,13 +655,12 @@ impl WorkerProcess {
             .collect::<Vec<_>>();
         tracing::error!(
             rank = self.rank,
-            lane = %lane,
             batch_id = ?stall.batch_id,
             route = ?stall.route,
             method = ?stall.method,
             calls = ?calls,
             running_ms = stall.running_ms,
-            "a rank reports a lane stalled inside one job"
+            "a rank reports its builder thread stalled inside one job"
         );
 
         let forward = match stall.batch_id {
@@ -680,7 +676,7 @@ impl WorkerProcess {
             ),
         };
         anyhow::anyhow!(
-            "{lane} stalled: it has performed {forward} for {:.1} s without completing it",
+            "the builder thread stalled: it has performed {forward} for {:.1} s without completing it",
             Duration::from_millis(stall.running_ms).as_secs_f64()
         )
     }

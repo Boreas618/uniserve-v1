@@ -1,13 +1,14 @@
-"""A diffusion LM lane: one diffusion language model component's
+"""A diffusion LM computation: one diffusion language model component's
 token-denoising batches.
 
-The worker hands a lane each token-denoising batch it carries
+The worker hands a computation each token-denoising batch it carries
 (``Executor.execute``): host columns of its calls and of the scheduler's
 forward rows with their attention pages, the calls' flat tokens (each
 readout's answer slots and candidates appended), a small JSON locating the
 readouts' lists, the record column and the output words it lends. A batch's
 active calls are readouts or denoising steps, never both
-(:func:`~.calls.batch_form`). The lane (:meth:`DiffusionLMLane.execute`):
+(:func:`~.calls.batch_form`). The computation
+(:meth:`DiffusionLMComputation.execute`):
 
 1. checks and packs the active calls on the host (:func:`~.calls.pack_readouts`,
    :func:`~.calls.pack_steps`) and writes their completion records
@@ -28,14 +29,14 @@ active calls are readouts or denoising steps, never both
 
 Each method replays its bucket's captured graph (after planning the
 attention launches on the host when an operator plans there), or runs
-eagerly without a graph pool. Before the lane is sealed, a bucket without a
-graph runs eagerly and is captured right after, which records without
-executing. Once sealed, every graph a batch selects is looked up before its
-expert step agrees, so a missing graph never strands the peers.
+eagerly without a graph pool. Before the computation is sealed, a bucket
+without a graph runs eagerly and is captured right after, which records
+without executing. Once sealed, every graph a batch selects is looked up
+before its expert step agrees, so a missing graph never strands the peers.
 
 The banks advance inside ``denoise``: a step commits its rows' stepped
-state to their slots on the device. The lane commits nothing past the
-worker's commit point.
+state to their slots on the device. The computation commits nothing past
+the worker's commit point.
 """  # noqa: D205
 
 from __future__ import annotations
@@ -97,16 +98,16 @@ from .warmup import (
     synthetic_steps,
 )
 
-__all__ = ["DiffusionLMLane", "Executed"]
+__all__ = ["DiffusionLMComputation", "Executed"]
 
 _logger = logging.getLogger(__name__)
 
 # The completion-flag row of the worker's relay staging.
 _COMPLETIONS = 1
 
-# The expert call kind of diffusion LM lane ``g`` is this plus ``g``: above
-# the text lanes' kinds (their group indices), so the union's ready kinds
-# take turns between the two.
+# The expert call kind of diffusion LM computation ``g`` is this plus ``g``:
+# above the text computations' kinds (their group indices), so the union's
+# ready kinds take turns between the two.
 _EXPERT_KINDS = 64
 
 # The attention metadata tensors in the runner's parameter order: query
@@ -161,27 +162,28 @@ def _padded(values: np.ndarray, count: int) -> np.ndarray:
     return np.concatenate([values, zeros], axis=-1)
 
 
-class DiffusionLMLane:
-    """One diffusion language model component's lane on this rank.
+class DiffusionLMComputation:
+    """The token-denoising batches of one diffusion LM component on a rank.
 
     Args:
-        index: The lane's index among the executor's lanes.
-        group: The lane's index among the rank's diffusion LM lanes, which
-            names its expert steps.
-        component: The component the lane serves.
-        label: The kernel-table label of the lane's runner.
-        runner: The numerical runner on the lane stream.
-        bounds: The lane's bounds over the fitted pool.
+        index: The computation's index among the executor's computations.
+        group: The computation's index among the rank's diffusion LM
+            computations, which names its expert steps.
+        component: The component the computation serves.
+        label: The kernel-table label of the computation's runner.
+        runner: The numerical runner on the primary stream.
+        bounds: The computation's bounds over the fitted pool.
         facts: The model's facts.
-        sampling: The block sampling a generating lane steps with; ``None``
-            on a lane that serves readouts only, which refuses steps.
+        sampling: The block sampling a generating computation steps with;
+            ``None`` on a computation that serves readouts only, which
+            refuses steps.
         seeds: The requests the rank's slots hold.
-        columns: The lane's columns.
+        columns: The computation's columns.
         metadata: The attention metadata the forwards read.
-        banks: A generating lane's resident banks, which ``runner`` commits
-            to; ``None`` otherwise.
-        stream: The lane stream.
-        pool: The lane stream's graph pool; ``None`` runs every forward
+        banks: A generating computation's resident banks, which ``runner``
+            commits to; ``None`` otherwise.
+        stream: The primary stream.
+        pool: The primary stream's graph pool; ``None`` runs every forward
             eagerly at its live shape.
         relay_flags: ``uint8 [2, calls]`` the worker's staging of
             transition decisions (row 0) and completion flags (row 1), by
@@ -231,7 +233,7 @@ class DiffusionLMLane:
         self.table_groups = table_groups
         # The cache groups whose pages the forward columns carry.
         self.groups = int(table_groups.max(initial=-1)) + 1
-        self.graphs = GraphTable(f"diffusion LM lane of {component}")
+        self.graphs = GraphTable(f"diffusion LM computation of {component}")
         self.staging = Staging(columns.arena.device)
         # An attention operator plans each launch on the host, so a replay of
         # ``attend`` or ``denoise`` follows ``plan_attention``. Known once
@@ -262,12 +264,13 @@ class DiffusionLMLane:
             tokens: ``int64 [N]`` host flat tokens and readout lists.
             records: ``int64 [K]`` host record column, written.
             words: ``int64 [W]`` page-locked output words, written on the
-                lane stream.
+                primary stream.
 
         Raises:
             ValueError: A call or row is malformed or disagrees with the
-                requests, the forward rows or the lane's bounds; or, once
-                sealed, the batch selects a graph startup did not capture.
+                requests, the forward rows or the computation's bounds; or,
+                once sealed, the batch selects a graph startup did not
+                capture.
             AssertionError: Records or output words exceed their columns.
         """
         call_columns = calls.numpy()
@@ -369,7 +372,7 @@ class DiffusionLMLane:
         )
 
     def _require(self, keys: Iterable[tuple[Hashable, int | None]]) -> None:
-        """Look up every graph a sealed lane's batch selects.
+        """Look up every graph a sealed computation's batch selects.
 
         Called before the batch's expert step agrees, so a missing graph
         fails this rank alone and never strands its peers mid-step.
@@ -407,9 +410,9 @@ class DiffusionLMLane:
 
         Replays the resident graph (behind ``plan``, the host planning of
         the attention launches it reads, when operators plan there), or
-        calls the method eagerly without a pool. Before the lane is sealed,
-        a graph not yet captured is called eagerly, which produces this
-        forward's results and plans its attention, then captured.
+        calls the method eagerly without a pool. Before the computation is
+        sealed, a graph not yet captured is called eagerly, which produces
+        this forward's results and plans its attention, then captured.
         """
         stream = self.stream
         with torch.cuda.stream(stream):
@@ -434,7 +437,7 @@ class DiffusionLMLane:
         extent: int,
         forced: int | None,
     ) -> int:
-        """Run ``forward`` as the lane's expert step; return its capacity.
+        """Run ``forward`` as an expert step; return the step's capacity.
 
         ``extent`` is the tokens the step sends to each expert layer,
         padding included. Without an expert union the forward runs at no
@@ -476,8 +479,9 @@ class DiffusionLMLane:
             forced: The capacity a warmup step runs at.
 
         Raises:
-            ValueError: The readout exceeds the lane's bounds or a table's
-                width, or, once sealed, a graph it selects is not resident.
+            ValueError: The readout exceeds the computation's bounds or a
+                table's width, or, once sealed, a graph it selects is not
+                resident.
         """
         columns = self.columns
         dims = columns.dimensions
@@ -503,8 +507,8 @@ class DiffusionLMLane:
         if total > dims.tokens or sequences > dims.rows:
             raise ValueError(
                 f"a readout of {sequences} sequences and {total} tokens "
-                f"exceeds the lane's {dims.rows} sequences and {dims.tokens} "
-                "tokens"
+                f"exceeds the computation's {dims.rows} sequences and "
+                f"{dims.tokens} tokens"
             )
         widths = self._widths(counts)
         slots = len(readout.slots)
@@ -724,7 +728,8 @@ class DiffusionLMLane:
             ValueError: The step exceeds the denoising rows or a table's
                 width, or, once sealed, its graph is not resident.
         """
-        # Only a generating lane, which keeps banks, packs or warms steps.
+        # Only a generating computation, which keeps banks, packs or warms
+        # steps.
         denoising, banks = self.bounds.denoise, self.banks
         assert denoising is not None and banks is not None
         columns = self.columns
@@ -842,7 +847,7 @@ class DiffusionLMLane:
     # Startup.
 
     def warmup(self) -> list[WarmStep]:
-        """Return the lane's warmup forwards (:func:`~.warmup.layout`)."""
+        """Return the warmup forwards (:func:`~.warmup.layout`)."""
         denoising = self.bounds.denoise
         return layout(
             self.shapes,
@@ -862,9 +867,10 @@ class DiffusionLMLane:
 
         ``pages[k]`` is the host ``int64 [2 * G, rows]`` of the ``k``-th
         forward that attends: per cache group, each row's first selected
-        page and page count. Returns once the lane's device work completed,
-        because the worker releases the scratch tables right after; then
-        learns whether operators plan their launches on the host.
+        page and page count. Returns once the computation's device work
+        completed, because the worker releases the scratch tables right
+        after; then learns whether operators plan their launches on the
+        host.
 
         Raises:
             ValueError: The page columns do not match the attending
@@ -974,7 +980,7 @@ class DiffusionLMLane:
 
         A promoted standby whose expert workspaces were rebuilt captures its
         forwards anew: the released graphs addressed the freed workspaces.
-        The caller drained the lane stream.
+        The caller drained the primary stream.
         """
         try:
             self.graphs.reopen()
@@ -983,7 +989,7 @@ class DiffusionLMLane:
             self.segments = 0
 
     def close(self, aborted: bool) -> None:
-        """Release the graphs, then the execution context, after the lane
+        """Release the graphs, then the execution context, once the stream
         drained. An aborted close keeps both: device work may still address
         them.
         """  # noqa: D205

@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use crate::EventPool;
     use crate::ffi::{Backing, DType};
-    use crate::lane::Job;
+    use crate::job::Job;
     use crate::memory::allocation::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, TransportOptions};
 

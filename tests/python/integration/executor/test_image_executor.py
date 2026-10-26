@@ -1,13 +1,13 @@
-"""An image executor warms, seals and replays its lanes on one GPU.
+"""An image executor warms, seals and replays its computations on one GPU.
 
-The tests play the worker's half of the stub model's image lanes under CUDA
-graphs: they bind the lanes to a prefix cache, latent banks and a graph
-pool, run every warmup phase the executor states over scratch tables
-installed as the worker installs them (each step's page columns selected
-from the scratch slots' pages), seal, and then serve a latent encode, a
-trajectory's preparation, guided denoising steps and its decode. Every
-served forward replays a graph warmup captured, and every result equals the
-same batches served by an executor without graphs.
+The tests play the worker's half of the stub model's image computations
+under CUDA graphs: they bind the computations to a prefix cache, latent
+banks and a graph pool, run every warmup phase the executor states over
+scratch tables installed as the worker installs them (each step's page
+columns selected from the scratch slots' pages), seal, and then serve a
+latent encode, a trajectory's preparation, guided denoising steps and its
+decode. Every served forward replays a graph warmup captured, and every
+result equals the same batches served by an executor without graphs.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from uniserve.bindings.workspace import Scratch
 from uniserve.executor.image import (
     ImageBinding,
     ImageExecutor,
-    ImageLaneBinding,
+    StreamBinding,
 )
 from uniserve.executor.text.protocol import GraphMode
 from uniserve.prefix_cache.units import UnitPool
@@ -32,7 +32,8 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="the image lanes run on a GPU"
+        not torch.cuda.is_available(),
+        reason="the image computations run on a GPU",
     ),
 ]
 
@@ -90,7 +91,7 @@ def stub():
 
 
 class _Worker:
-    """The worker's half of an image executor's lanes on one stream."""
+    """The worker's half of an image executor's computations on one stream."""
 
     def __init__(self, stub, graphs: bool) -> None:
         self.executor = ImageExecutor(stub, _settings(graphs))
@@ -113,22 +114,22 @@ class _Worker:
             )
             for _ in range(2)
         )
-        lanes = self.executor.lanes()
-        self.lanes = {
+        computations = self.executor.computations()
+        self.computations = {
             kind: index
-            for index, entry in enumerate(lanes)
+            for index, entry in enumerate(computations)
             for kind in entry["kinds"]
         }
         self.report = self.executor.bind(
             ImageBinding(
                 slots=SLOTS,
-                lanes=tuple(
-                    ImageLaneBinding(
+                computations=tuple(
+                    StreamBinding(
                         stream=self.stream,
                         scratch=Scratch(),
                         pool=torch.cuda.MemPool() if graphs else None,
                     )
-                    for _ in lanes
+                    for _ in computations
                 ),
                 unit_pool=self.pool,
                 tables={
@@ -195,9 +196,9 @@ class _Worker:
         return phases
 
     def run(self, kind, calls, tensors, forward=None):
-        lane = self.lanes[kind]
-        step = {"batch_id": 1, "lane": lane, "calls": calls}
-        prepared = self.executor.prepare(lane, step)
+        computation = self.computations[kind]
+        step = {"batch_id": 1, "computation": computation, "calls": calls}
+        prepared = self.executor.prepare(computation, step)
         bound = [
             tensor
             for entry, planned in zip(calls, prepared, strict=True)
@@ -206,7 +207,7 @@ class _Worker:
         if forward is not None:
             bound.append(forward)
         modes = self.executor.execute(
-            lane, {**step, "prepared": prepared}, bound
+            computation, {**step, "prepared": prepared}, bound
         )
         self.stream.synchronize()
         return modes

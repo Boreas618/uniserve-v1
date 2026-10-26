@@ -67,7 +67,7 @@ impl ProductStore {
     }
 
     /// Bind one group of outputs: persistent outputs into their pool
-    /// allocations, or scalar outputs into relay lanes.
+    /// allocations, or scalar outputs into relay entries.
     pub fn bind_outputs(
         &self,
         bindings: &[(TensorRef, MemoryKind)],

@@ -720,7 +720,7 @@ mod tests {
             // The simulated worker has no device, and no CUPTI to attach.
             assert_eq!(
                 body["result"]["results"],
-                json!([{ "attached": false, "lane_activity": false }]),
+                json!([{ "attached": false, "stream_activity": false }]),
                 "{body}"
             );
         }

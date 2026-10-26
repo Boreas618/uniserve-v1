@@ -192,7 +192,7 @@ struct Presenter {
     /// Condition units one latent encoding round covers while a request's
     /// prompt is encoded, which reference images are banded to fill
     /// (`RequestPlan::image_bands`).
-    latent_encoding_lane: u32,
+    latent_encoding_units: u32,
     tokenizer: DynTokenizer,
 }
 
@@ -229,7 +229,7 @@ impl VideoService {
         denoiser: DenoiserInfo,
         vision: ProcessorConfig,
         max_video_seconds: f64,
-        latent_encoding_lane: u32,
+        latent_encoding_units: u32,
         media: &MediaOptions,
         references: ReferenceConfig,
         tokenizer: DynTokenizer,
@@ -261,7 +261,7 @@ impl VideoService {
             presenter: Arc::new(Presenter {
                 limits,
                 vision,
-                latent_encoding_lane: latent_encoding_lane.max(1),
+                latent_encoding_units: latent_encoding_units.max(1),
                 tokenizer,
             }),
         })
@@ -499,7 +499,7 @@ impl Presenter {
 
         // Each condition's media reaches the worker's media reader through
         // shared memory on this host.
-        let image_bands = plan.image_bands(self.latent_encoding_lane);
+        let image_bands = plan.image_bands(self.latent_encoding_units);
         let mut media = Vec::with_capacity(fetched.media.len());
         let mut conditions = Vec::with_capacity(fetched.media.len());
         for ((condition, fetched), bands) in
@@ -687,9 +687,9 @@ mod tests {
     }
 
     /// A denoiser serving every task, whose latent encoder covers
-    /// `latent_encoding_lane` condition units in one round, on a deployment
+    /// `latent_encoding_units` condition units in one round, on a deployment
     /// that sizes references as `references` states.
-    fn encoding_service(latent_encoding_lane: u32, references: ReferenceConfig) -> VideoService {
+    fn encoding_service(latent_encoding_units: u32, references: ReferenceConfig) -> VideoService {
         VideoService::new(
             DenoiserInfo {
                 tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
@@ -709,7 +709,7 @@ mod tests {
             },
             vision(),
             15.0,
-            latent_encoding_lane,
+            latent_encoding_units,
             &MediaOptions::default(),
             references,
             Arc::new(character_tokenizer()),
@@ -860,9 +860,9 @@ mod tests {
 
     /// Reference images beyond one latent encoding round encode whole, a
     /// round's worth at a time, and the images of a final partial round
-    /// split into bands that fill it: on a four-unit lane nine square images
-    /// take 1 x 8 + 4 units and six take 1 x 4 + 2 x 2, while seven, whose
-    /// final three cannot share four units evenly, stay whole. A square
+    /// split into bands that fill it: with four units per round nine square
+    /// images take 1 x 8 + 4 units and six take 1 x 4 + 2 x 2, while seven,
+    /// whose final three cannot share four units evenly, stay whole. A square
     /// reference enlarged to its 2048 short edge is 64 patch rows of 64
     /// patches.
     #[tokio::test]

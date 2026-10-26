@@ -1,14 +1,14 @@
 """Token-denoising batches of a diffusion language model through the
 diffusion LM executor.
 
-The tests play the worker's half of a diffusion LM lane over the two-layer
-DiffusionGemma fixture on one SM100 GPU: they prefill a prompt into the
-prefix cache's unit pool, install its pages as the block tables of request
-slots, select each forward row's attention pages as the worker does, build
-a batch's call and forward columns, lend page-locked output words and parse
-the completion records the lane writes. Each batch is compared with direct
-calls of the lane's numerical runner over tensors the test owns, with block
-tables written on the host:
+The tests play the worker's half of a diffusion LM computation over the
+two-layer DiffusionGemma fixture on one SM100 GPU: they prefill a prompt
+into the prefix cache's unit pool, install its pages as the block tables of
+request slots, select each forward row's attention pages as the worker
+does, build a batch's call and forward columns, lend page-locked output
+words and parse the completion records the computation writes. Each batch
+is compared with direct calls of the computation's numerical runner over
+tensors the test owns, with block tables written on the host:
 
 - a readout of blocks of different lengths, two in one call, returns every
   candidate's log-probability in call order, and a call without candidates
@@ -37,7 +37,7 @@ from uniserve.bindings.context import ExecutionContext
 from uniserve.bindings.workspace import Scratch
 from uniserve.executor.diffusion_lm import DiffusionLMExecutor
 from uniserve.executor.diffusion_lm.calls import seed_bits
-from uniserve.executor.text import LaneBinding, TextBinding
+from uniserve.executor.text import ComputationBinding, TextBinding
 from uniserve.executor.text.protocol import (
     CALL_FIELDS,
     CALL_WORDS,
@@ -276,7 +276,7 @@ def _settings(model: Model, graphs: bool) -> dict:
 
 
 class Worker:
-    """The worker's half of one diffusion LM lane, played over one stream.
+    """The worker's half of one diffusion LM computation, over one stream.
 
     Slots ``1..3`` hold requests over the prompt; their block tables hold
     the prompt's pages from page zero.
@@ -331,8 +331,8 @@ class Worker:
                     "start_pages": self.start_pages,
                     "table_shapes": self.table_shapes,
                 },
-                lanes=(
-                    LaneBinding(
+                computations=(
+                    ComputationBinding(
                         index=0,
                         component="denoiser",
                         streams=(self.stream,),
@@ -347,7 +347,7 @@ class Worker:
                 ),
             )
         )
-        self.lane = self.executor.lanes[0]
+        self.computation = self.executor.computations[0]
 
     # Block tables.
 
@@ -520,7 +520,12 @@ class Worker:
             record_capacity(count, len(tokens)), dtype=torch.int64
         )
         words = torch.zeros(WORDS, dtype=torch.int64, pin_memory=True)
-        step = {"batch": 1, "lane": 0, "collective_seq": 0, "calls": entries}
+        step = {
+            "batch": 1,
+            "computation": 0,
+            "collective_seq": 0,
+            "calls": entries,
+        }
         used = self.executor.execute(
             0,
             json.dumps(step),
@@ -597,15 +602,15 @@ class Worker:
         """Candidate values of direct ``attend``, ``finish`` and
         ``readout`` calls over ``(slot, tokens)`` blocks.
         """  # noqa: D205
-        runner = self.lane.runner
+        runner = self.computation.runner
         device = self.model.device
         queries = [len(tokens) for _, tokens in blocks]
         total = sum(queries)
         widths, starts, metadata = self.metadata(
             [slot for slot, _ in blocks], queries
         )
-        hidden = self.lane.facts.hidden_size
-        dtype = self.lane.facts.compute_dtype
+        hidden = self.computation.facts.hidden_size
+        dtype = self.computation.facts.compute_dtype
 
         def longs(values) -> torch.Tensor:
             return torch.tensor(values, dtype=torch.int64, device=device)
@@ -616,7 +621,7 @@ class Worker:
         ).to(device)
         state = [
             torch.zeros((total, width), dtype=dtype, device=device)
-            for width in self.lane.facts.attend_widths
+            for width in self.computation.facts.attend_widths
         ]
         finished = torch.zeros((total, hidden), dtype=dtype, device=device)
         values = torch.zeros(len(index), dtype=torch.float32, device=device)
@@ -656,11 +661,11 @@ class Worker:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """A direct ``denoise`` call stepping the blocks of ``slots``.
 
-        Gathers the slots' state from the lane's banks, which the call
-        commits to. Returns the rows' results and continuation flags.
+        Gathers the slots' state from the computation's banks, which the
+        call commits to. Returns the rows' results and continuation flags.
         """
-        runner = self.lane.runner
-        banks = self.lane.banks
+        runner = self.computation.runner
+        banks = self.computation.banks
         device = self.model.device
         count = len(slots)
         index = torch.tensor(slots, device=device)
@@ -708,11 +713,14 @@ class Worker:
         return results, continued
 
     def banks(self) -> dict[str, torch.Tensor]:
-        return {name: getattr(self.lane.banks, name).clone() for name in BANKS}
+        return {
+            name: getattr(self.computation.banks, name).clone()
+            for name in BANKS
+        }
 
     def restore(self, banks: dict[str, torch.Tensor]) -> None:
         for name, value in banks.items():
-            getattr(self.lane.banks, name).copy_(value)
+            getattr(self.computation.banks, name).copy_(value)
         torch.cuda.synchronize(self.model.device)
 
     def close(self) -> None:
@@ -830,9 +838,9 @@ def _check_steps(worker: Worker, step: int, mode: GraphMode) -> None:
     words = torch.from_numpy(batch.words[: 2 * width].reshape(2, width))
     assert torch.equal(words, results.cpu())
     for name in BANKS:
-        assert torch.equal(getattr(worker.lane.banks, name), expected[name]), (
-            name
-        )
+        assert torch.equal(
+            getattr(worker.computation.banks, name), expected[name]
+        ), name
     relayed = worker.relay_flags[1].cpu()
     assert relayed[[0, 2]].tolist() == continued.cpu().tolist()
     assert int(relayed[1]) == 7
@@ -852,9 +860,9 @@ def eager(model):
     worker.close()
 
 
-def test_the_manifest_states_one_lane_over_the_prefix_cache(eager):
-    (lane,) = eager.manifest["lanes"]
-    assert lane == {
+def test_the_manifest_states_one_computation_over_the_prefix_cache(eager):
+    (computation,) = eager.manifest["computations"]
+    assert computation == {
         "component": "denoiser",
         "kinds": ["token_denoising"],
         "microbatches": 1,
@@ -895,7 +903,10 @@ def test_captured_graphs_replay_the_runners_results(model):
             for rows in phase["steps"]
             for slot, prefix, _ in rows
         )
-        assert worker.lane.graphs.sealed and len(worker.lane.graphs) > 0
+        assert (
+            worker.computation.graphs.sealed
+            and len(worker.computation.graphs) > 0
+        )
 
         worker.start([(slot, 20 + slot, seed) for slot, seed in SEEDS.items()])
         worker.install_prompt(SEEDS)

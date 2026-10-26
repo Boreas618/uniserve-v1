@@ -1,4 +1,4 @@
-"""The columns and resident banks of a diffusion LM lane
+"""The columns and resident banks of a diffusion LM computation
 (``uniserve.executor.diffusion_lm.buffers``).
 """  # noqa: D205
 
@@ -130,7 +130,7 @@ def test_columns_hold_the_forwards_tensors_in_disjoint_storage():
     assert columns.arena.numel() <= dimensions.bytes()
 
 
-def test_readout_lanes_off_the_final_stage_hold_no_state_or_steps():
+def test_readout_computations_off_the_final_stage_hold_no_state_or_steps():
     dimensions = _dimensions(attend_widths=(), denoise_rows=0)
     assert Columns(dimensions, CPU).attend_state == []
     names = {name for name, _, _ in dimensions.columns()}

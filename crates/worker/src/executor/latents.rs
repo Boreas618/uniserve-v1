@@ -1,14 +1,14 @@
-//! The trajectory ledger of a denoising lane: which bank of the latent
+//! The trajectory ledger of a denoising computation: which bank of the latent
 //! pool holds each request's committed step.
 //!
-//! A lane that denoises latent trajectories (a video or an image model's
-//! denoiser) keeps every request's samples in two banks of pages of a
-//! latent pool the worker owns: a step reads the bank holding the
-//! committed step and writes the other, and its commit, applied to the
-//! ledger at the batch's commit point, makes the written bank the committed
-//! one. The executor reads and writes the banks itself; the worker decides
-//! which pages and banks a call addresses ([`LatentLedger::bind`]), checks
-//! every commit before the commit point and applies it after.
+//! A computation that denoises latent trajectories (a video or an image model's
+//! denoiser) keeps every request's samples in two banks of pages of a latent
+//! pool the worker owns: a step reads the bank holding the committed step and
+//! writes the other, and its commit, applied to the ledger at the batch's
+//! commit point, makes the written bank the committed one. The executor reads
+//! and writes the banks itself; the worker decides which pages and banks a call
+//! addresses ([`LatentLedger::bind`]), checks every commit before the commit
+//! point and applies it after.
 //!
 //! The pages of a trajectory follow its model's layout ([`Layout`]): a
 //! video request slot owns a fixed run of pages after the padding page 0,
@@ -18,7 +18,7 @@
 //! versions are published to and imported from other ranks
 //! ([`crate::executor::transfer::latents`]).
 //!
-//! Batches of lanes on different streams may address the pool (an image
+//! Batches of computations on different streams may address the pool (an image
 //! model's denoiser and its decoder): each waits for the previous user on
 //! another stream ([`LatentLedger::enter`]) and records its end
 //! ([`LatentLedger::leave`]).
@@ -56,7 +56,7 @@ pub(crate) struct LatentLedger {
     /// Each admitted video request's canvas `(width, height)`, by slot,
     /// which its trajectory's raster is.
     canvases: HashMap<usize, (u32, u32)>,
-    /// Orders batches addressing the banks across the lanes' streams.
+    /// Orders batches addressing the banks across the computations' streams.
     order: StreamOrder,
 }
 

@@ -1,4 +1,4 @@
-"""The token batch protocol between the worker and a text lane.
+"""The token batch protocol between the worker and a text computation.
 
 Per batch the worker passes host int64 columns and receives completion
 records (``Executor.execute``):
@@ -10,8 +10,8 @@ records (``Executor.execute``):
   them, then each cache group ``g``'s first selected page
   (:func:`page_start`) and selected page count (:func:`page_count`);
 - ``tokens`` ``int64 [N]``: every call's input tokens, concatenated;
-- ``records`` ``int64 [K]``: the completion records the lane writes
-  (:class:`RecordWriter`), ``K = record_capacity(C, N)``
+- ``records`` ``int64 [K]``: the completion records the computation
+  writes (:class:`RecordWriter`), ``K = record_capacity(C, N)``
   (:func:`record_capacity`).
 
 Records, in words:
@@ -112,7 +112,7 @@ class CallField(IntEnum):
 
 CALL_FIELDS = len(CallField)
 
-# The field names a lane's manifest echoes, in row order.
+# The field names a computation's manifest echoes, in row order.
 CALL_FIELD_NAMES = tuple(field.name.lower() for field in CallField)
 
 
@@ -132,7 +132,8 @@ class Predicate(IntEnum):
     NONE = 0
     # A host-read uint8 predicate, already applied to ``ACTIVE``.
     HOST = 1
-    # A relayed int64 token: the lane gates on its slot's continuation.
+    # A relayed int64 token: the computation gates on its slot's
+    # continuation.
     RELAY = 2
 
 
@@ -175,7 +176,7 @@ def page_count(group: int) -> int:
 
 
 def forward_fields(groups: int) -> int:
-    """Return the ``forward`` rows of a lane with ``groups`` cache groups."""
+    """Return the ``forward`` rows given ``groups`` cache groups."""
     return FORWARD_FIELDS + 2 * groups
 
 

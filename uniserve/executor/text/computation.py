@@ -1,11 +1,11 @@
-"""A text lane: one causal language model component's token batches.
+"""A text computation: one causal language model component's token batches.
 
-The worker hands a lane each token batch it carries
+The worker hands a computation each token batch it carries
 (``Executor.execute``): host columns of its calls and of the scheduler's
 forward rows with their attention pages, the calls' flat tokens, a small
 JSON of rare per-call entries (sampling states, vision and latent
-features), the record column and the output words it lends. The lane
-(:meth:`TextLane.execute`):
+features), the record column and the output words it lends. The
+computation (:meth:`TextComputation.execute`):
 
 1. checks the calls against the requests their slots hold and builds every
    active call's rows: one row per text call (:func:`~.rows.prepare_calls`),
@@ -20,11 +20,12 @@ features), the record column and the output words it lends. The lane
    microbatches), and captures the graphs a warmup forward left to capture;
 4. copies each invocation's completion block, logprob words and prompt
    scores into the lent words, relays sampled tokens and transition
-   decisions into the lane's staging columns, writes the calls' completion
-   records and keeps each microbatch's commit rows for :meth:`TextLane.commit`.
+   decisions into the computation's staging columns, writes the calls'
+   completion records and keeps each microbatch's commit rows for
+   :meth:`TextComputation.commit`.
 
 Nothing here advances slot state before the worker sealed the batch:
-:meth:`TextLane.commit` does, past the batch's commit point.
+:meth:`TextComputation.commit` does, past the batch's commit point.
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ from .state import RequestTable, SlotState
 if TYPE_CHECKING:
     from uniserve.executor.experts import ExpertUnion
 
-__all__ = ["TextLane"]
+__all__ = ["TextComputation"]
 
 _MEDIA = CallFlag.WRITES_CONTEXT | CallFlag.WRITES_VISUAL_STATE
 
@@ -147,17 +148,17 @@ class _Planned:
     capture: Callable[[], None] | None = None
 
 
-class TextLane:
-    """One causal language model component's token lane on this rank.
+class TextComputation:
+    """The token batches of one causal language model component on a rank.
 
     Args:
-        index: The lane's index among the rank's token lanes.
-        group: The lane's index among the rank's text lanes: the kind its
-            expert steps agree under.
-        label: The kernel-table label of the lane's runners.
-        runners: One runner per expert microbatch, the first on the lane
+        index: The computation's index among the executor's computations.
+        group: The computation's index among the rank's text computations:
+            the kind its expert steps agree under.
+        label: The kernel-table label of the computation's runners.
+        runners: One runner per expert microbatch, the first on the primary
             stream.
-        bounds: The lane's bounds.
+        bounds: The computation's bounds.
         state: The rank's slot state.
         table: The rank's request constants.
         window: The rank's cached draws.
@@ -166,7 +167,7 @@ class TextLane:
         relay_flags: ``uint8 [2, calls]`` the worker's staging of
             transition decisions (row 0), by call.
         union: The rank's expert union member, or ``None``.
-        prefill_outputs: The lane's prefills keep their outputs.
+        prefill_outputs: The computation's prefills keep their outputs.
     """
 
     def __init__(
@@ -186,7 +187,9 @@ class TextLane:
         prefill_outputs: bool,
     ) -> None:
         if not runners:
-            raise ValueError("a text lane runs on one runner per microbatch")
+            raise ValueError(
+                "a text computation runs on one runner per microbatch"
+            )
         self.index = index
         self.group = group
         self.label = label
@@ -208,7 +211,7 @@ class TextLane:
 
     @property
     def stream(self) -> torch.cuda.Stream | None:
-        """The lane stream, which the first runner computes on; ``None`` on
+        """The primary stream, which the first runner computes on; ``None`` on
         the host.
         """  # noqa: D205
         return self.runners[0].stream
@@ -240,7 +243,7 @@ class TextLane:
             tokens: ``int64 [N]`` host flat tokens.
             records: ``int64 [K]`` host record column, written.
             words: ``int64 [W]`` page-locked output words, written on the
-                lane stream.
+                primary stream.
             features: The feature tensors the JSON names by position.
 
         Raises:
@@ -980,7 +983,7 @@ class TextLane:
     ) -> int:
         """Copy the invocations' results into the lent words and relays.
 
-        Returns the words written. Every copy is enqueued on the lane
+        Returns the words written. Every copy is enqueued on the primary
         stream, which waited for every microbatch's work.
         """
         cursor = 0
@@ -1073,7 +1076,7 @@ class TextLane:
         return cursor
 
     def _relay(self, item: _Planned) -> None:
-        """Write an invocation's relayed values into the lane's staging."""
+        """Write an invocation's relayed values into the relay staging."""
         relays = item.invocation.relays
         if relays is None:
             return
@@ -1106,8 +1109,8 @@ class TextLane:
     ) -> None:
         """Record every active call's progress; keep the commit rows.
 
-        Each microbatch's runner keeps its calls' commit rows until the lane
-        commits.
+        Each microbatch's runner keeps its calls' commit rows until the
+        computation commits.
         """
         calls = batch.calls
         active = batch.active
@@ -1186,21 +1189,21 @@ class TextLane:
         """Install the last executed batch's commit rows and prompt tails.
 
         Each microbatch's runner commits on its stream, which first orders
-        after the lane stream; the lane stream then orders after it.
+        after the primary stream; the primary stream then orders after it.
         """
-        lane = self.stream
+        primary = self.stream
         for index, runner in enumerate(self.runners):
             work, runner.pending = runner.pending, None
             if work is None:
                 continue
             # Microbatches beyond the first run on streams of their own,
-            # which only a device lane has.
+            # which only a device computation has.
             other = runner.stream if index else None
-            if other is not None and lane is not None:
-                other.wait_stream(lane)
+            if other is not None and primary is not None:
+                other.wait_stream(primary)
             runner.commit(work)
-            if other is not None and lane is not None:
-                lane.wait_stream(other)
+            if other is not None and primary is not None:
+                primary.wait_stream(other)
 
     # Couplings and startup.
 
@@ -1210,9 +1213,9 @@ class TextLane:
         """Write the K/V of token prefixes, each from position zero of its slot.
 
         The image executor's guidance prefixes: the prefixes are evaluated
-        causally and only their K/V is kept; slot state and the lane's
+        causally and only their K/V is kept; slot state and the computation's
         pending commit are unchanged. The caller installed the slots'
-        tables, retains their extents and orders the lane stream around
+        tables, retains their extents and orders the primary stream around
         the call.
 
         Args:
@@ -1311,13 +1314,13 @@ class TextLane:
 
         A promoted standby whose expert workspaces were rebuilt captures its
         forwards anew: the released graphs addressed the freed workspaces.
-        The caller drained the lane's streams.
+        The caller drained the computation's streams.
         """
         for runner in self.runners:
             runner.graphs.reopen()
 
     def close(self, aborted: bool) -> None:
-        """Release every runner, newest first; the lane drained.
+        """Release every runner, newest first; its streams are drained.
 
         Every release is attempted before the first failure is raised.
         """

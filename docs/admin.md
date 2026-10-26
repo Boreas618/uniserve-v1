@@ -17,7 +17,7 @@ A deployment's leader daemon serves an admin API under `/admin` on its HTTP addr
 | `POST /admin/update_weights` | `{"model_path": PATH}`: the engine rewrites its weights in place from another checkpoint of the served model, a local directory, a Hugging Face repository or a plugin's weight source `scheme://...` (`docs/plugins.md`) (SGLang's `update_weights_from_disk`; below) |
 | `POST /admin/sleep`, `/admin/wake_up` | The engine gives back its KV cache and CUDA graph memory and keeps its weights, and restores both (vLLM's endpoints of those names; below) |
 | `POST /admin/load_lora_adapter`, `/admin/unload_lora_adapter` | `{"lora_name": NAME, ...}`: the workers load a LoRA adapter into a slot of a plugin's adapter pool, or unload it (vLLM's endpoints of those names; below) |
-| `POST /admin/cupti` | `{"attached": BOOL}`: every worker starts or stops CUPTI's watch of its waits for the device and record of its lanes' device time, and answers whether CUPTI is attached and records the lanes (`docs/profiling.md`) |
+| `POST /admin/cupti` | `{"attached": BOOL}`: every worker starts or stops CUPTI's watch of its waits for the device and record of its streams' device time, and answers whether CUPTI is attached (`attached`) and records the streams (`stream_activity`) (`docs/profiling.md`) |
 | `POST /admin/hooks/NAME` | A worker hook a plugin adds (below) |
 
 Each write is an operation: it has an identity, runs on a task of its own, and ends `succeeded` or `failed` in the status and in the event log, whether or not the client that asked stays connected. One operation runs at a time; another is answered `409`. `"wait": false` answers at once with `202` and the operation.

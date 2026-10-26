@@ -1,5 +1,5 @@
-"""The warmup forwards of a diffusion LM lane and the phase the worker
-drives (``uniserve.executor.diffusion_lm.warmup``).
+"""The warmup forwards of a diffusion LM computation and the phase the
+worker drives (``uniserve.executor.diffusion_lm.warmup``).
 
 Every rank of a group runs the same forwards in the same order: the order
 below is the protocol its collectives follow.
@@ -53,7 +53,7 @@ def test_spread_puts_the_remainder_on_the_first_blocks():
     assert spread(5, 1) == [5]
 
 
-def test_a_pooled_lane_captures_alone_graphs_then_readouts_then_steps():
+def test_a_pooled_computation_captures_alone_graphs_then_readouts_then_steps():
     readouts = [
         Readout((32, 32), (0, 32)),
         Readout((16, 16), (0, 16)),
@@ -73,8 +73,8 @@ def test_a_pooled_lane_captures_alone_graphs_then_readouts_then_steps():
         *readouts,
         *steps,
     ]
-    # Off the final stage no ``finish`` runs alone; a readout-only lane
-    # steps no block.
+    # Off the final stage no ``finish`` runs alone; a readout-only
+    # computation steps no block.
     assert _layout(last=False, generating=False) == [
         Alone("readout", 256),
         Alone("readout", 128),
@@ -188,7 +188,7 @@ def test_exchanging_readouts_capture_every_capacity_a_bucket_can_agree_on():
         assert capacities == sorted(capacities, reverse=True)
 
 
-def test_an_eager_lane_runs_one_first_step_per_sampler_chunk_shape():
+def test_an_eager_computation_runs_one_first_step_per_sampler_chunk_shape():
     assert _layout(pooled=False, chunk_rows=3) == [
         Denoise(1, True, LENGTH),
         Denoise(2, True, LENGTH),
@@ -206,7 +206,7 @@ def test_the_phase_lists_the_rows_of_every_forward_that_attends():
     phase = Phase(0, (1, 1), steps, lambda pages: None)
     # Row ``r`` reads the one-token table of slot ``r % 2 + 1``.
     assert phase.describe() == {
-        "lane": 0,
+        "computation": 0,
         "lengths": [1, 1],
         "steps": [
             [[1, 1, 16], [2, 1, 16], [1, 1, 16]],

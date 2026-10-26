@@ -10,10 +10,9 @@
 //! call kinds a call serves, which components a rank holds, which media
 //! routes it advertises and which placements are legal.
 //!
-//! [`Components`] records the components this rank holds once start has
-//! built their meshes; the executor's settings and lanes, capacity
-//! planning and batch validation look up the components serving a call
-//! kind there.
+//! [`Components`] records the components this rank holds once start has built
+//! their meshes; the executor's settings and computations, capacity planning
+//! and batch validation look up the components serving a call kind there.
 
 use std::collections::{BTreeMap, BTreeSet};
 

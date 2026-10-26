@@ -1,5 +1,5 @@
-"""Graph shapes of a diffusion LM lane: row, token and slot buckets and
-their padding.
+"""Graph shapes of a diffusion LM computation: row, token and slot buckets
+and their padding.
 
 An ``attend`` graph holds ``tokens`` tokens in up to ``2 * rows`` sequences
 of at most a block's tokens each: the live blocks, then padding sequences of
@@ -120,16 +120,16 @@ def _buckets_to(catalog: Sequence[int], limit: int) -> list[int]:
 
 
 class Shapes:
-    """The graph buckets of one diffusion LM lane.
+    """The graph buckets of one diffusion LM computation.
 
     Args:
         sequence_length: Tokens of one block (``C``).
         capacity: Blocks one denoising step may hold.
         readout_rows: Blocks one readout may hold.
         tokens: Tokens one readout may hold.
-        slots: The request slots of a generating lane, which never steps
-            more blocks than it has slots; ``None`` on a lane that serves
-            readouts only.
+        slots: The request slots of a generating computation, which never
+            steps more blocks than it has slots; ``None`` on a computation
+            that serves readouts only.
 
     Raises:
         ValueError: A block length, capacity, readout bound or token bound

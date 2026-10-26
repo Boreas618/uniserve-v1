@@ -1,15 +1,15 @@
 //! `Issue`: where a function issues the work of a stream.
 //!
-//! A lane's execution thread is the only issuer of work on its stream. The
+//! The builder thread is the only issuer of work on the rank's streams. The
 //! owners of request storage decide that work on the control thread: which
-//! copies, fills and fences a batch needs, in which order. They take what
-//! they issue to as an [`Issue`]:
+//! copies, fills and fences a batch needs, in which order. They take what they
+//! issue to as an [`Issue`]:
 //!
 //! - a [`Stream`] (`&Stream`, or `Option<&Stream>` where host storage has no
 //!   stream) issues at once, on the calling thread;
-//! - a job's recorder ([`crate::lane::Job::on`]) appends the same work to
-//!   the job as operations, which the lane's execution thread performs when
-//!   the job reaches it.
+//! - a job's recorder ([`crate::job::Job::on`]) appends the same work to the
+//!   job as operations, which the builder thread performs when the job reaches
+//!   it.
 //!
 //! Host bookkeeping is the same either way and happens when the function is
 //! called. What differs is when the device sees the work, so a function
@@ -115,10 +115,9 @@ pub trait Issue: Copy {
     /// it runs in the order of this issuer's host writes.
     fn launch_host_fn(&self, function: HostFunction) -> Result<()>;
 
-    /// Wait for the work issued before this to complete. A stream waits
-    /// during the call; a job waits where its execution thread performs
-    /// this, so what the wait makes readable is read from the job's
-    /// completion on.
+    /// Wait for the work issued before this to complete. A stream waits during
+    /// the call; a job waits where the builder thread performs this, so what
+    /// the wait makes readable is read from the job's completion on.
     fn synchronize(&self) -> Result<()>;
 
     /// Issue what `record` issues to this issuer as one attempt that gives

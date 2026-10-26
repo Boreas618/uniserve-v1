@@ -81,9 +81,9 @@ class ExpertUnion:
         self._bootstrap = bootstrap
         self._graphs = graphs
         # Set by :meth:`connect`: each microbatch's exchange and stream (the
-        # lane's first), the microbatch threads with two or more, and split
-        # MegaMoE's peer-mapped storage, borrowed from the worker and
-        # referenced until every exchange closed.
+        # first the device's primary stream), the microbatch threads with two
+        # or more, and split MegaMoE's peer-mapped storage, borrowed from the
+        # worker and referenced until every exchange closed.
         self.exchanges: tuple[Any, ...] = ()
         self.streams: tuple[torch.cuda.Stream, ...] = ()
         self._threads: MicrobatchThreads | None = None
@@ -188,7 +188,7 @@ class ExpertUnion:
         """Create every microbatch's exchange, collectively over the union.
 
         ``microbatches`` holds each microbatch's ``stream`` (CUDA stream
-        handle; the first is the lane's), ``device`` (CUDA ordinal) and
+        handle; the first is the primary stream), ``device`` (CUDA ordinal) and
         ``pointers`` (every member's address of its peer storage; empty
         without it); ``storages`` each microbatch's peer-mapped storage as
         an int8 tensor, or ``None``. Microbatch threads, with two or more
@@ -585,12 +585,12 @@ class ExpertUnion:
     ) -> None:
         """Run one step's microbatch calls between a fork and a join.
 
-        Every microbatch stream beyond the first waits on the lane stream's
-        work before the step and the lane stream waits on every microbatch's
-        work after it, so the caller orders later work (the batch's seal)
-        behind the whole step. An empty microbatch of a populated step joins.
-        With microbatch threads, every call runs on its thread in rotation;
-        without, the single call runs here.
+        Every microbatch stream beyond the first waits on the primary
+        stream's work before the step and the primary stream waits on every
+        microbatch's work after it, so the caller orders later work (the
+        batch's seal) behind the whole step. An empty microbatch of a
+        populated step joins. With microbatch threads, every call runs on its
+        thread in rotation; without, the single call runs here.
         """
         resolved = [
             call if call is not None else self._microbatch_join(index, capacity)
@@ -604,18 +604,18 @@ class ExpertUnion:
 
     @contextmanager
     def _forked(self) -> Iterator[None]:
-        lane = self.streams[0]
+        primary = self.streams[0]
         if len(self.streams) == 1:
             yield
             return
-        fork = lane.record_event()
+        fork = primary.record_event()
         for stream in self.streams[1:]:
             stream.wait_event(fork)
         try:
             yield
         finally:
             for stream in self.streams[1:]:
-                lane.wait_event(stream.record_event())
+                primary.wait_event(stream.record_event())
 
 
 # Unions whose aborted close left their resources to the process's exit.

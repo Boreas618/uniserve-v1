@@ -44,7 +44,7 @@ fn mulhilo(a: u32, b: u32) -> (u32, u32) {
     ((product >> 32) as u32, product as u32)
 }
 
-/// Applies one Philox round to both counter lanes under the supplied key.
+/// Applies one Philox round to the four counter words under the supplied key.
 fn single_round(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
     let (hi0, lo0) = mulhilo(PHILOX_M0, counter[0]);
     let (hi1, lo1) = mulhilo(PHILOX_M1, counter[2]);
@@ -60,7 +60,7 @@ fn single_round(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
 pub fn philox4x32_10(mut counter: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     for round in 0..10 {
         // Round zero consumes the caller's key; every later round advances both
-        // lanes by the Philox Weyl constants before permuting the counter.
+        // key words by the Philox Weyl constants before permuting the counter.
         if round > 0 {
             key = [
                 key[0].wrapping_add(PHILOX_KEY_BUMP_0),
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn philox_matches_the_reference_known_answer_vectors() {
         // Random123 Philox4x32-10 known-answer vectors establish the exact
-        // round count, lane ordering, and key schedule.
+        // round count, word ordering, and key schedule.
         assert_eq!(
             philox4x32_10([0, 0, 0, 0], [0, 0]),
             [0x6627_e8d5, 0xe169_c58d, 0xbc57_ac4c, 0x9b00_dbd8]

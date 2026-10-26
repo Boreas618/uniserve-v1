@@ -1,14 +1,14 @@
-//! What the worker keeps for an image model's prepared lanes: the image
-//! products, inline pixels, latent trajectories and guidance prefixes of
-//! their batches.
+//! What the worker keeps for an image model's prepared computations: the image
+//! products, inline pixels, latent trajectories and guidance prefixes of their
+//! batches.
 //!
-//! An image model's encoders, denoiser and decoder serve prepared lanes
-//! ([`crate::executor::lanes`]) that run through the one batch state machine:
-//! the executor states in its preparation what each call reads and writes,
-//! then executes the batch on what the worker reserved. Its calls name their
-//! products in fields of their own (`image_input`, `encoder_output`,
-//! `image_output`, `latent_input`, `latent_output`), so the lane's hooks here
-//! handle them beside the generic products:
+//! An image model's encoders, denoiser and decoder serve prepared computations
+//! ([`crate::executor::computations`]) that run through the one batch state
+//! machine: the executor states in its preparation what each call reads and
+//! writes, then executes the batch on what the worker reserved. Its calls name
+//! their products in fields of their own (`image_input`, `encoder_output`,
+//! `image_output`, `latent_input`, `latent_output`), so the computation's hooks
+//! here handle them beside the generic products:
 //!
 //! - [`describe`] adds to the preparation's step each call's input image (its
 //!   host-prepared facts, or a resident image product's shape and metadata),
@@ -47,8 +47,8 @@ use serde::Deserialize;
 use crate::executor::PendingOutput;
 use crate::executor::batch::{Batch, CallState, HostStage};
 use crate::executor::columns::{FORWARD_FIELDS, ForwardRows, field_major, host_tensor};
+use crate::executor::computations::{CallResources, Resources};
 use crate::executor::image_inputs::{ImageFacts, Images, InlineImages};
-use crate::executor::lanes::{LaneCall, Resources};
 use crate::executor::latents::{Banks, LatentLedger};
 use crate::executor::pages::{Pages, attention_pages};
 use crate::executor::products::{ProductOwners, Publications};
@@ -56,7 +56,7 @@ use crate::executor::transfer::latents::{self, PendingExport};
 use crate::ffi::MemoryKind;
 use crate::host::HostTask;
 use crate::host::image::{ImageResult, ImageTask, ImageWork};
-use crate::lane::{Job, Recorder};
+use crate::job::{Job, Recorder};
 use crate::memory::allocation::StorageView;
 use crate::memory::{
     AttentionRow, Metadata, OutputPlacement, PrefixCache, ProductBuffer, ProductStore, ValueRange,
@@ -66,8 +66,8 @@ use crate::stream::{EventPool, Issue as _};
 use crate::transfer::Transports;
 use crate::{Error, Outcome, Result, lock};
 
-/// Whether a lane serves an image model's calls: it names the image host
-/// resource, or it is a prepared lane over the prefix cache (an image
+/// Whether a computation serves an image model's calls: it names the image host
+/// resource, or it is a prepared computation over the prefix cache (an image
 /// denoiser, whose guidance prefixes and conditioning live there).
 pub(crate) fn serves(resources: Resources, prepares: bool) -> bool {
     resources.images || (prepares && resources.pages)
@@ -93,15 +93,15 @@ fn value_range(name: Option<&str>) -> Result<Option<ValueRange>> {
     }
 }
 
-/// Add to the preparation's step, per call of an image lane, what the
-/// executor reads of it before anything is leased (`calls[i].image`): its
-/// input image, the host-prepared facts of an inline one (`inputs`) or the
-/// shape and metadata of a resident product, its request's input image
-/// count and its progress.
+/// Add to the preparation's step, per call of an image computation, what the
+/// executor reads of it before anything is leased (`calls[i].image`): its input
+/// image, the host-prepared facts of an inline one (`inputs`) or the shape and
+/// metadata of a resident product, its request's input image count and its
+/// progress.
 pub(crate) fn describe(
     step: &mut serde_json::Value,
     plan: &BatchPlan,
-    calls: &[CallState<LaneCall>],
+    calls: &[CallState<CallResources>],
     requests: &RequestPool,
     tensors: &ProductStore,
     inputs: Option<&InlineImages>,
@@ -300,7 +300,7 @@ struct ImageWrite {
     metadata: Option<Metadata>,
 }
 
-/// What one call of an image lane holds through its batch.
+/// What one call of an image computation holds through its batch.
 #[derive(Default)]
 pub(crate) struct ImageCall {
     /// The image products it writes.
@@ -319,7 +319,7 @@ pub(crate) struct ImageCall {
     alternates: Vec<u32>,
 }
 
-/// What an image lane's batch holds through its last job.
+/// What an image computation's batch holds through its last job.
 #[derive(Default)]
 pub(crate) struct ImageBatch {
     /// The batch uses the ledger's banks on its stream
@@ -336,7 +336,7 @@ pub(crate) struct ImageBatch {
     versions: Vec<BufferId>,
 }
 
-/// The rank's owners an image lane's batch binds and publishes through.
+/// The rank's owners an image computation's batch binds and publishes through.
 pub(crate) struct Owners<'a> {
     pub(crate) store: &'a ProductStore,
     pub(crate) transports: &'a Transports,
@@ -399,7 +399,7 @@ fn latent_params<'p>(plan: &'p BatchPlan, call: &Call) -> Result<&'p LatentParam
 pub(crate) fn bind(
     owners: &mut Owners<'_>,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     record: &mut ImageBatch,
     step: &mut serde_json::Value,
     job: &Job,
@@ -532,7 +532,7 @@ pub(crate) fn bind(
             let view = lock(&batch.buffer).lend_bytes(count, batch.device, issue, owners.events)?;
             if batch.reports {
                 let images = owners.images.ok_or_else(|| {
-                    Error::Unsupported("image encoding requires the image host lane".into())
+                    Error::Unsupported("image encoding requires the image host pool".into())
                 })?;
                 batch.calls[index].forward.image.encoding = Some(images.host.reserve()?);
             }
@@ -624,7 +624,7 @@ fn reserve_write(
 fn reserve_rows(
     owners: &mut Owners<'_>,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     step: &mut serde_json::Value,
     issue: Recorder<'_>,
 ) -> Result<Option<StorageView>> {
@@ -656,7 +656,7 @@ fn reserve_rows(
     let pages = owners
         .pages
         .as_deref()
-        .ok_or_else(|| Error::Invariant("a denoising lane lost its pages".into()))?;
+        .ok_or_else(|| Error::Invariant("a denoising computation lost its pages".into()))?;
     let prefix_cache = owners
         .prefix_cache
         .as_deref_mut()
@@ -791,7 +791,7 @@ fn prefill_prefix(forward: &ipc::ForwardBatch, rows: &[usize], slot: u32) -> Opt
 pub(crate) fn publish(
     owners: &mut Owners<'_>,
     plan: &BatchPlan,
-    batch: &mut Batch<LaneCall>,
+    batch: &mut Batch<CallResources>,
     record: &mut ImageBatch,
     job: &Job,
 ) -> Result<()> {
@@ -944,7 +944,7 @@ fn release_pixels(record: &mut ImageBatch, events: &EventPool, issue: Recorder<'
 /// publications and their descriptors join the calls' completions.
 pub(crate) fn accept(
     ledger: Option<&LatentLedger>,
-    calls: &mut [CallState<LaneCall>],
+    calls: &mut [CallState<CallResources>],
     publications: &mut Publications,
 ) -> Result<()> {
     for state in calls {
@@ -971,7 +971,7 @@ pub(crate) fn accept(
 pub(crate) fn retire(
     ledger: Option<&mut LatentLedger>,
     events: &EventPool,
-    calls: &mut [CallState<LaneCall>],
+    calls: &mut [CallState<CallResources>],
     record: &mut ImageBatch,
     issue: Recorder<'_>,
 ) -> Result<()> {
@@ -980,7 +980,7 @@ pub(crate) fn retire(
             export.revoke();
         }
         if let Some(task) = state.forward.image.encoding.take() {
-            // An unconfigured encoding returns its lane capacity.
+            // An unconfigured encoding returns its host pool capacity.
             let _ = task.cancel(true);
         }
     }
@@ -1006,7 +1006,7 @@ pub(crate) fn retire(
 
 /// The host work of a batch's decoded images: their PNG encodings, run
 /// once its fences completed; `None` without one.
-pub(crate) fn host_stage(calls: &mut [CallState<LaneCall>]) -> Option<Box<dyn HostStage>> {
+pub(crate) fn host_stage(calls: &mut [CallState<CallResources>]) -> Option<Box<dyn HostStage>> {
     let encodings: Vec<(usize, Arc<HostTask<ImageTask>>)> = calls
         .iter_mut()
         .enumerate()

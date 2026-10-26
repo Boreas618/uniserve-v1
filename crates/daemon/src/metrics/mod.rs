@@ -38,7 +38,7 @@ pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
 pub use request::{FinishedReasonLabels, RequestMetrics};
 pub use scheduler::{
     EngineBackendLabels, EngineBlockingLabels, EngineComponentLabels, EngineDomainKindLabels,
-    EngineDomainLabels, EngineLabels, EngineLaneLabels, EngineModeLabels, EnginePathLabels,
+    EngineDomainLabels, EngineLabels, EngineModeLabels, EnginePathLabels, EngineStreamLabels,
     SchedulerMetrics,
 };
 

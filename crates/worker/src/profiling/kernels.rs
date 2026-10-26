@@ -20,7 +20,7 @@ use indexmap::IndexMap;
 
 use crate::ffi::{Argument, MethodCall};
 use crate::ffi::{Function, Interpreter};
-use crate::lane::{Completion, Job, JobId, JobQueues};
+use crate::job::{Completion, Job, JobId, JobQueue};
 use crate::{Error, Result};
 
 const TAG: &str = "uniserve-kernel-table";
@@ -199,10 +199,11 @@ impl KernelWatch {
     /// Ask for the count of kernel choices, after a batch's forward. The
     /// count needs no wake of its own: it is taken up with the next
     /// completion the control thread takes.
-    pub(crate) fn count(&mut self, jobs: &JobQueues) {
+    pub(crate) fn count(&mut self, jobs: &JobQueue) {
         let calls = Job::new();
         calls.call_returning(MethodCall::new(&self.choices, Vec::new()));
-        self.pending.insert(jobs.call(calls, false), Pending::Count);
+        self.pending
+            .insert(jobs.start(calls, false), Pending::Count);
     }
 
     /// Whether `job` is a call this watch submitted.
@@ -218,7 +219,7 @@ impl KernelWatch {
         &mut self,
         job: JobId,
         completion: Completion,
-        jobs: &JobQueues,
+        jobs: &JobQueue,
         listing: impl FnOnce() -> Option<MethodCall>,
     ) {
         let Some(pending) = self.pending.remove(&job) else {
@@ -242,7 +243,7 @@ impl KernelWatch {
                 if self.records.merge(current) {
                     let calls = Job::new();
                     calls.call_texts(self.records.table_call("serving", self.rank, &self.device));
-                    self.pending.insert(jobs.call(calls, true), Pending::Table);
+                    self.pending.insert(jobs.start(calls, true), Pending::Table);
                 }
                 if std::mem::take(&mut self.stale) {
                     self.list(jobs, listing);
@@ -263,7 +264,7 @@ impl KernelWatch {
     /// List the executor's kernels, unless a listing is in flight: that one
     /// may predate the newest choice, so they are listed again when it
     /// completed.
-    fn list(&mut self, jobs: &JobQueues, listing: impl FnOnce() -> Option<MethodCall>) {
+    fn list(&mut self, jobs: &JobQueue, listing: impl FnOnce() -> Option<MethodCall>) {
         if self
             .pending
             .values()
@@ -278,7 +279,7 @@ impl KernelWatch {
         let calls = Job::new();
         calls.call_texts(call);
         self.pending
-            .insert(jobs.call(calls, true), Pending::Listing);
+            .insert(jobs.start(calls, true), Pending::Listing);
     }
 }
 
@@ -361,10 +362,10 @@ mod tests {
         let kernels = Function::new("test.kernels", kernels);
         let listing = || Some(MethodCall::new(&kernels, Vec::new()));
 
-        // A rank without lanes and without a started interpreter performs
-        // each call where it is submitted; its completion is taken here as
-        // the control thread takes it. Returns whether one was taken.
-        let jobs = JobQueues::default();
+        // A rank without a started interpreter performs each job where it is
+        // submitted; its completion is taken here as the control thread takes
+        // it. Returns whether one was taken.
+        let jobs = JobQueue::default();
         let take = |watch: &mut KernelWatch| {
             let Some((job, completion)) = jobs.take() else {
                 return false;

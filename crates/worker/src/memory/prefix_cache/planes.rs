@@ -109,7 +109,8 @@ struct Segmenting {
     /// column `c` is `c * count + k`.
     lengths: Vec<usize>,
 }
-/// The pool's storage on one device (or host memory for CPU lanes).
+/// The pool's storage on one device (or host memory for computations on the
+/// host).
 pub struct CachePlanes {
     plan: Arc<CachePlan>,
     device: Option<DeviceId>,
@@ -734,7 +735,8 @@ impl UnitColumn {
     pub(crate) fn bind(planes: &CachePlanes, stream: Option<&Stream>) -> Result<Self> {
         let count = i64::from(planes.num_units);
         let bytes = Self::bytes(planes.num_units) as usize;
-        // A column is rebuilt with its lane, so it is the worker's own memory.
+        // A column is rebuilt with the stream that binds it, so it is the
+        // worker's own memory.
         let memory = match planes.device {
             Some(device) => Storage::device(device, bytes)?,
             None => Storage::host(bytes),

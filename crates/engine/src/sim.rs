@@ -450,7 +450,7 @@ impl Executor for SimExecutor {
             | "uniserve.wake" => serde_json::Value::Null,
             "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
             "uniserve.attach_cupti" | "uniserve.detach_cupti" => {
-                serde_json::json!({ "attached": false, "lane_activity": false })
+                serde_json::json!({ "attached": false, "stream_activity": false })
             }
             "load_lora_adapter" | "unload_lora_adapter" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;

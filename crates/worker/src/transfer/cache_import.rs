@@ -166,8 +166,9 @@ impl CacheImporter {
         Ok(())
     }
 
-    /// Wait only on an import lane, never on the request execution thread.
-    /// Cancellation and shutdown wake blocked workspace borrowers.
+    /// Wait only on a thread of the import pool, never on the builder or
+    /// control thread. Cancellation and shutdown wake blocked workspace
+    /// borrowers.
     pub(crate) fn acquire(&self, write: &CacheImport) -> Result<Arc<ImportWorkspace>> {
         let mut state = self.lock();
         loop {

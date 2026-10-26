@@ -1,23 +1,23 @@
-"""The image half of an executor: image models' media work on its lanes.
+"""The image half of an executor: image models' media work, by computation.
 
 An image model (BAGEL, SenseNova, and any model with a vision tower that is
-not a video model) serves its media calls on prepared lanes of the rank's
-executor: the worker asks first what each call of a batch reads and writes
-(:meth:`ImageExecutor.prepare`), reserves it, and then has the executor
-compute the batch on what it reserved (:meth:`ImageExecutor.execute`).
-:class:`ImageExecutor` serves one lane per kind of work a placed component
-holds:
+not a video model) serves its media calls on prepared computations of the
+rank's executor: the worker asks first what each call of a batch reads and
+writes (:meth:`ImageExecutor.prepare`), reserves it, and then has the
+executor compute the batch on what it reserved
+(:meth:`ImageExecutor.execute`). :class:`ImageExecutor` serves one
+computation per kind of work a placed component holds:
 
-- a *vision* lane encodes input images (and generated images fed back) into
-  the features a prompt's vision block places (:mod:`.vision`);
-- a *latent* lane encodes images into the latents a prompt's latent block
-  conditions on (:mod:`.codec`);
-- the *denoiser* lane opens and steps image trajectories in the worker's
-  latent ledger and writes latent conditioning for the text lanes
-  (:mod:`.denoiser`); it attends to the prefix cache, so it computes on the
-  device's lane stream, and decodes the finished images when the same
-  component holds the image decoder;
-- a *decoder* lane decodes images of a component without a denoiser.
+- a *vision* computation encodes input images (and generated images fed
+  back) into the features a prompt's vision block places (:mod:`.vision`);
+- a *latent* computation encodes images into the latents a prompt's latent
+  block conditions on (:mod:`.codec`);
+- the *denoiser* computation opens and steps image trajectories in the
+  worker's latent ledger and writes latent conditioning for the text
+  computations (:mod:`.denoiser`); it attends to the prefix cache, so it
+  runs on the device's primary stream, and decodes the finished images when
+  the same component holds the image decoder;
+- a *decoder* computation decodes images of a component without a denoiser.
 
 The host-side decisions live in the modules beside: :mod:`.layout` (an
 image denoiser's latent layout), :mod:`.trajectory` (trajectories, guidance
@@ -25,9 +25,9 @@ plans and prefixes), :mod:`.facts` (vision blocks of a text prompt),
 :mod:`.rows` (packed denoiser rows), :mod:`.shapes` (graph buckets) and
 :mod:`.plan` (what each call reads and writes).
 
-The text lanes ask the image half about vision blocks and latent
+The text computations ask the image half about vision blocks and latent
 conditioning (:meth:`ImageExecutor.facts`, :meth:`ImageExecutor.denoiser`),
-and the denoiser prefills guidance prefixes on a text lane
+and the denoiser prefills guidance prefixes on a text computation
 (:meth:`ImageExecutor.attach_text`).
 """
 
@@ -85,11 +85,11 @@ from .vision import VisionEncoder, VisionImage, features
 __all__ = [
     "ImageBinding",
     "ImageExecutor",
-    "ImageLaneBinding",
+    "StreamBinding",
     "text_settings",
 ]
 
-# Each lane's role: the kind of work it serves.
+# Each computation's role: the kind of work it serves.
 VISION = "vision"
 LATENT = "latent"
 DENOISER = "denoiser"
@@ -103,13 +103,13 @@ _FAMILIES = {"vision": 1, "latent": 2, "step": 3, "condition": 4, "decode": 5}
 # most 64 tokens, after it read the manifest that this bounds.
 _MAX_PAGE_UNITS = 64
 
-# Pixels of the largest image a lane bounds when neither the configured
-# image sizes nor an image denoiser's longest sequence bound it.
+# Pixels of the largest image a computation bounds when neither the
+# configured image sizes nor an image denoiser's longest sequence bound it.
 _DEFAULT_MAX_PIXELS = 1024 * 1024
 
 
 def text_settings(loaded) -> str:
-    """JSON of what the text lanes' settings read of a model's images.
+    """JSON of what the text executor's settings read of a model's images.
 
     ``{"image_processor": bool, "media_axes": 1 | 3 | null}``: whether the
     model declares an image policy, and the rotary axes of the vision rows a
@@ -148,7 +148,7 @@ def _key(value: Mapping[str, Any]) -> tuple[int, int, int]:
 
 
 def _device(stream: torch.cuda.Stream | None) -> int:
-    """The CUDA ordinal a lane's stream belongs to, -1 on the host."""
+    """The CUDA ordinal a computation's stream belongs to, -1 on the host."""
     return -1 if stream is None else int(stream.device.index)
 
 
@@ -163,11 +163,11 @@ def _whole_grid(module: PatchEncoder, shape: Sequence[int]) -> tuple[int, int]:
 
 
 @dataclass(frozen=True, slots=True)
-class ImageLaneBinding:
-    """The storage the worker binds one image lane to.
+class StreamBinding:
+    """The storage the worker binds one image computation to.
 
     Attributes:
-        stream: The lane's stream, ``None`` on the host.
+        stream: The computation's stream, ``None`` on the host.
         scratch: The stream's shared work areas.
         pool: The stream's graph pool, ``None`` without graphs.
         peers: ``(ordinal, pool)`` of the stream's graph pool on each other
@@ -185,11 +185,11 @@ class ImageLaneBinding:
 
 @dataclass(frozen=True, slots=True)
 class ImageBinding:
-    """What capacity planning granted the image lanes.
+    """What capacity planning granted the image computations.
 
     Attributes:
         slots: The request slots.
-        lanes: Each image lane's storage, in lane order.
+        computations: Each image computation's storage, in manifest order.
         unit_pool: The prefix cache's K/V pool object, ``None`` without
             one.
         tables: The worker's block tables by name.
@@ -197,7 +197,7 @@ class ImageBinding:
     """
 
     slots: int
-    lanes: tuple[ImageLaneBinding, ...]
+    computations: tuple[StreamBinding, ...]
     unit_pool: Any | None = None
     tables: Mapping[str, torch.Tensor] | None = None
     banks: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -228,10 +228,10 @@ class _Request:
 
 
 @dataclass(slots=True)
-class _Lane:
-    """One image lane: its component, kinds and modules.
+class _Computation:
+    """One image computation: its component, kinds and modules.
 
-    The module of its role, and a denoiser lane's decoder when its
+    The module of its role, and a denoiser computation's decoder when its
     component decodes, are constructed at binding; the others stay
     ``None``.
 
@@ -241,14 +241,14 @@ class _Lane:
         kinds: The call kinds it serves.
         paths: The module path of each capability it computes with.
         resources: The worker's resources it uses.
-        vision: A vision lane's patch tower.
-        latent: A latent lane's latent encoder.
-        denoiser: A denoiser lane's denoiser.
-        decoder: The image decoder of a lane that decodes.
-        rows: A decoding lane's buffer of one trajectory's committed latent
-            rows, gathered from the ledger's banks.
-        banks: The latent ledger's banks a decoding lane gathers from.
-        stream: The lane's stream, ``None`` on the host.
+        vision: A vision computation's patch tower.
+        latent: A latent computation's latent encoder.
+        denoiser: A denoiser computation's denoiser.
+        decoder: The image decoder of a computation that decodes.
+        rows: A decoding computation's buffer of one trajectory's committed
+            latent rows, gathered from the ledger's banks.
+        banks: The latent ledger's banks a decoding computation gathers from.
+        stream: The computation's stream, ``None`` on the host.
     """
 
     role: str
@@ -282,9 +282,11 @@ class _Lane:
         ]
 
 
-def _lanes(components: Sequence[Mapping[str, Any]]) -> list[_Lane]:
-    """The image lanes of the rank's placed device components."""
-    lanes = []
+def _computations(
+    components: Sequence[Mapping[str, Any]],
+) -> list[_Computation]:
+    """The image computations of the rank's placed device components."""
+    computations = []
     for component in components:
         if component["host"]:
             continue
@@ -295,8 +297,8 @@ def _lanes(components: Sequence[Mapping[str, Any]]) -> list[_Lane]:
             for call in component["calls"]
         }
         if "patch_encoder" in paths and "vision_encoding" in kinds:
-            lanes.append(
-                _Lane(
+            computations.append(
+                _Computation(
                     VISION,
                     name,
                     ["vision_encoding"],
@@ -305,8 +307,8 @@ def _lanes(components: Sequence[Mapping[str, Any]]) -> list[_Lane]:
                 )
             )
         if "patch_autoencoder" in paths and "latent_encoding" in kinds:
-            lanes.append(
-                _Lane(
+            computations.append(
+                _Computation(
                     LATENT,
                     name,
                     ["latent_encoding"],
@@ -321,7 +323,7 @@ def _lanes(components: Sequence[Mapping[str, Any]]) -> list[_Lane]:
             if kind in kinds
         ]
         if "image_denoiser" in paths and stepping:
-            lane = _Lane(
+            computation = _Computation(
                 DENOISER,
                 name,
                 stepping,
@@ -329,13 +331,13 @@ def _lanes(components: Sequence[Mapping[str, Any]]) -> list[_Lane]:
                 ["pages", "latents"],
             )
             if decodes:
-                lane.kinds.append("image_decoding")
-                lane.paths["image_decoder"] = paths["image_decoder"]
-                lane.resources.append("images")
-            lanes.append(lane)
+                computation.kinds.append("image_decoding")
+                computation.paths["image_decoder"] = paths["image_decoder"]
+                computation.resources.append("images")
+            computations.append(computation)
         elif decodes:
-            lanes.append(
-                _Lane(
+            computations.append(
+                _Computation(
                     DECODER,
                     name,
                     ["image_decoding"],
@@ -343,11 +345,11 @@ def _lanes(components: Sequence[Mapping[str, Any]]) -> list[_Lane]:
                     ["latents", "images"],
                 )
             )
-    return lanes
+    return computations
 
 
 class ImageExecutor:
-    """The image lanes of one rank.
+    """The image computations of one rank.
 
     Args:
         loaded: The loaded model.
@@ -377,17 +379,17 @@ class ImageExecutor:
         ]
         self.image_facts = ImageFacts.from_loaded(loaded)
         self.layout: ImageLayout | None = self.image_facts.layout
-        self.placed = _lanes(settings["components"])
+        self.placed = _computations(settings["components"])
         # The dtype the worker's host preparation writes pixels in.
         self.pixel_dtype = _dtype(EncoderRunner.pixel_dtype(loaded))
         self.requests: dict[int, _Request] = {}
         self.slots = self.max_slots
-        self._phases: list[tuple[_Lane, str, Any]] = []
+        self._phases: list[tuple[_Computation, str, Any]] = []
         # Each component's graph keys in capture order.
         self._keys: dict[str, list[Any]] = {}
         # Each call kind's preparation (:meth:`prepare`).
         self._preparations: dict[
-            str, Callable[[_Lane, Mapping[str, Any]], PlanEntry]
+            str, Callable[[_Computation, Mapping[str, Any]], PlanEntry]
         ] = {
             "vision_encoding": self._prepare_vision,
             "latent_encoding": self._prepare_latent,
@@ -396,29 +398,29 @@ class ImageExecutor:
             "image_decoding": self._prepare_decoding,
         }
 
-    def _module(self, lane: _Lane, capability: str, kind: type):
-        module = held_module(self.loaded.module, lane.paths[capability])
+    def _module(self, computation: _Computation, capability: str, kind: type):
+        module = held_module(self.loaded.module, computation.paths[capability])
         if not isinstance(module, kind):
             raise SetupError(
-                f"{lane.label(capability)} is not a {kind.__name__} on this "
-                "rank"
+                f"{computation.label(capability)} is not a {kind.__name__} on "
+                "this rank"
             )
         return module
 
     # The manifest.
 
-    def lanes(self) -> list[dict[str, Any]]:
-        """Each lane's manifest entry, in lane order."""
+    def computations(self) -> list[dict[str, Any]]:
+        """Each computation's manifest entry, in index order."""
         entries = []
-        for lane in self.placed:
+        for computation in self.placed:
             entry: dict[str, Any] = {
-                "component": lane.component,
-                "kinds": list(lane.kinds),
+                "component": computation.component,
+                "kinds": list(computation.kinds),
                 "prepares": True,
                 "commits": False,
-                "resources": list(lane.resources),
+                "resources": list(computation.resources),
             }
-            if "image_decoding" in lane.kinds:
+            if "image_decoding" in computation.kinds:
                 # Each call's decoded bytes beside its completion word.
                 pixels = 3 * self._max_pixels()
                 entry["output_words"] = self.max_calls * (1 + -(-pixels // 8))
@@ -426,7 +428,7 @@ class ImageExecutor:
         return entries
 
     def _max_pixels(self) -> int:
-        """Pixels of the largest image a lane encodes or decodes."""
+        """Pixels of the largest image a computation encodes or decodes."""
         sizes = [height * width for height, width in self.flow_shapes]
         if self.layout is not None:
             side = self.layout.downsample
@@ -478,36 +480,36 @@ class ImageExecutor:
         )
 
     def manifest(self) -> dict[str, Any]:
-        """What capacity planning reads of the image lanes.
+        """What capacity planning reads of the image computations.
 
         ``latent``: the latent rows and width of the longest trajectory and
         their dtype, which size the latent ledger (``null`` without a
         denoiser); the largest vision and latent feature products; and the
-        device bytes the lanes allocate beside the pools, ``fixed_bytes``
-        plus ``slot_bytes`` per request slot.
+        device bytes the computations allocate beside the pools,
+        ``fixed_bytes`` plus ``slot_bytes`` per request slot.
         """
         layout = self.layout
         fixed = 0
         latent = None
         latent_bytes = 0
         vision_bytes = 0
-        for lane in self.placed:
-            if lane.role == VISION:
-                product, buffers = self._vision_bytes(lane)
+        for computation in self.placed:
+            if computation.role == VISION:
+                product, buffers = self._vision_bytes(computation)
                 vision_bytes = max(vision_bytes, product)
                 fixed += buffers
-            elif lane.role == LATENT:
-                product, buffers = self._latent_bytes(lane)
+            elif computation.role == LATENT:
+                product, buffers = self._latent_bytes(computation)
                 latent_bytes = max(latent_bytes, product)
                 fixed += buffers
-            elif lane.role == DENOISER and layout is not None:
+            elif computation.role == DENOISER and layout is not None:
                 latent = {
                     "rows": layout.max_sequence_tokens,
                     "width": layout.width,
                     "dtype": _dtype_name(self.dtype),
                 }
                 fixed += self._denoiser_bytes(layout)
-            if "image_decoding" in lane.kinds:
+            if "image_decoding" in computation.kinds:
                 fixed += self._decoder_bytes()
         return {
             "latent": latent,
@@ -518,16 +520,16 @@ class ImageExecutor:
             "slot_bytes": 4 if latent is not None else 0,
         }
 
-    def _vision_bytes(self, lane: _Lane) -> tuple[int, int]:
-        """A vision lane's largest feature product and its buffers' bytes.
+    def _vision_bytes(self, computation: _Computation) -> tuple[int, int]:
+        """A vision computation's largest feature product and buffer bytes.
 
         The buffers hold every slot's patch rows of the largest image the
         image policy admits, and their features.
         """
-        module = self._module(lane, "patch_encoder", PatchEncoder)
+        module = self._module(computation, "patch_encoder", PatchEncoder)
         patches = int(
             EncoderRunner.image_patches(
-                self.loaded, lane.paths["patch_encoder"]
+                self.loaded, computation.paths["patch_encoder"]
             )
         )
         width, dtype = features(module)
@@ -537,13 +539,15 @@ class ImageExecutor:
         pixels = capacity * 3 * module.patch_size**2 * self.pixel_dtype.itemsize
         return patches // unit * feature, pixels + capacity // unit * feature
 
-    def _latent_bytes(self, lane: _Lane) -> tuple[int, int]:
-        """A latent lane's largest feature product and its buffers' bytes.
+    def _latent_bytes(self, computation: _Computation) -> tuple[int, int]:
+        """A latent computation's largest feature product and buffer bytes.
 
         The buffers hold one image's pixels and posterior noise, each at
         most a float32 per pixel value, and its latent rows.
         """
-        module = self._module(lane, "patch_autoencoder", PatchAutoencoder)
+        module = self._module(
+            computation, "patch_autoencoder", PatchAutoencoder
+        )
         width = module.patch_size**2 * module.latent_channels
         rows = (
             self.layout.max_sequence_tokens
@@ -579,7 +583,7 @@ class ImageExecutor:
         return total
 
     def _decoder_bytes(self) -> int:
-        """The bytes of a decoding lane's buffers.
+        """The bytes of a decoding computation's buffers.
 
         The decoded values (float32) and quantized bytes of the largest
         image, and with a denoiser's layout the gathered and captured
@@ -595,27 +599,28 @@ class ImageExecutor:
 
     # Binding.
 
-    def bind_from(self, binding, lanes: Sequence[int]) -> dict[str, Any]:
+    def bind_from(self, binding, computations: Sequence[int]) -> dict[str, Any]:
         """Bind on the executor's binding (``uniserve.executor._Binding``).
 
-        ``lanes`` are the global indices of this executor's lanes, in the
-        order :meth:`lanes` stated them. The binding's ``peer_pools`` holds
-        each stream's ``(ordinal, pool)`` on the rank's other devices, when
-        it has any. Returns :meth:`bind`'s report.
+        ``computations`` are the global indices of this executor's
+        computations, in the order :meth:`computations` stated them. The
+        binding's ``peer_pools`` holds each stream's ``(ordinal, pool)`` on
+        the rank's other devices, when it has any. Returns :meth:`bind`'s
+        report.
         """
         entries = []
-        for placed, index in zip(self.placed, lanes, strict=True):
-            lane = binding.lanes[index]
-            streams = [int(stream) for stream in lane["streams"]]
+        for placed, index in zip(self.placed, computations, strict=True):
+            computation = binding.computations[index]
+            streams = [int(stream) for stream in computation["streams"]]
             if not streams:
-                # A lane on the host computes on the rank's host scratch.
+                # A computation on the host runs on the rank's host scratch.
                 entries.append(
-                    ImageLaneBinding(stream=None, scratch=binding.host_scratch)
+                    StreamBinding(stream=None, scratch=binding.host_scratch)
                 )
                 continue
             stream = streams[0]
             entries.append(
-                ImageLaneBinding(
+                StreamBinding(
                     stream=binding.streams[stream],
                     scratch=binding.scratches[stream],
                     pool=None
@@ -630,7 +635,7 @@ class ImageExecutor:
         return self.bind(
             ImageBinding(
                 slots=int(binding.slots),
-                lanes=tuple(entries),
+                computations=tuple(entries),
                 unit_pool=binding.unit_pool,
                 tables=binding.tables or None,
                 banks=binding.banks,
@@ -638,54 +643,58 @@ class ImageExecutor:
         )
 
     def bind(self, binding: ImageBinding) -> dict[str, Any]:
-        """Construct every lane's modules on the granted storage.
+        """Construct every computation's modules on the granted storage.
 
-        Returns what the engine reads of the bound lanes: ``warmups`` (the
-        image shapes it warms the serving path with), ``captured_images``
-        and ``captured_latents`` (the sizes the codecs captured, ``null``
-        without graphs), ``unconditional_token_ids`` (the prefix the
-        image-unconditional branch reads, ``null`` when it reads the
-        request's own context), ``capacity`` (each packed forward's rows and
-        tokens) and ``digests`` (each component's SHA-256 of its graph keys
-        in capture order, which the worker compares across the ranks that
-        hold the component).
+        Returns what the engine reads of the bound computations:
+        ``warmups`` (the image shapes it warms the serving path with),
+        ``captured_images`` and ``captured_latents`` (the sizes the codecs
+        captured, ``null`` without graphs), ``unconditional_token_ids`` (the
+        prefix the image-unconditional branch reads, ``null`` when it reads
+        the request's own context), ``capacity`` (each packed forward's rows
+        and tokens) and ``digests`` (each component's SHA-256 of its graph
+        keys in capture order, which the worker compares across the ranks
+        that hold the component).
 
         Raises:
-            SetupError: A lane's module is not on this rank, or its storage
-                is missing.
+            SetupError: A computation's module is not on this rank, or its
+                storage is missing.
         """
-        if len(binding.lanes) != len(self.placed):
-            raise ValueError("the worker binds other image lanes than stated")
+        if len(binding.computations) != len(self.placed):
+            raise ValueError(
+                "the worker binds other image computations than stated"
+            )
         self.slots = int(binding.slots)
         self._keys = {}
-        for lane, bound in zip(self.placed, binding.lanes, strict=True):
-            lane.stream = bound.stream
+        for computation, bound in zip(
+            self.placed, binding.computations, strict=True
+        ):
+            computation.stream = bound.stream
             pool = bound.pool if self.graphs else None
             keys: list[Any] = []
-            if lane.role == VISION:
-                keys += self._bind_vision(lane, bound, pool)
-            elif lane.role == LATENT:
-                keys += self._bind_latent(lane, bound, pool)
-            elif lane.role == DENOISER:
-                keys += self._bind_denoiser(lane, bound, binding, pool)
-            if "image_decoding" in lane.kinds:
-                keys += self._bind_decoder(lane, bound, binding, pool)
-            self._keys.setdefault(lane.component, []).extend(keys)
+            if computation.role == VISION:
+                keys += self._bind_vision(computation, bound, pool)
+            elif computation.role == LATENT:
+                keys += self._bind_latent(computation, bound, pool)
+            elif computation.role == DENOISER:
+                keys += self._bind_denoiser(computation, bound, binding, pool)
+            if "image_decoding" in computation.kinds:
+                keys += self._bind_decoder(computation, bound, binding, pool)
+            self._keys.setdefault(computation.component, []).extend(keys)
         return self._report()
 
     def _bind_vision(
-        self, lane: _Lane, bound: ImageLaneBinding, pool: Any | None
+        self, computation: _Computation, bound: StreamBinding, pool: Any | None
     ) -> list[Any]:
-        """Construct a vision lane's patch tower; its graph keys."""
-        module = self._module(lane, "patch_encoder", PatchEncoder)
+        """Construct a vision computation's patch tower; its graph keys."""
+        module = self._module(computation, "patch_encoder", PatchEncoder)
         patches = int(
             EncoderRunner.image_patches(
-                self.loaded, lane.paths["patch_encoder"]
+                self.loaded, computation.paths["patch_encoder"]
             )
         )
-        lane.vision = VisionEncoder(
+        computation.vision = VisionEncoder(
             module=module,
-            owner=lane.label("patch_encoder"),
+            owner=computation.label("patch_encoder"),
             stream=bound.stream,
             device=_device(bound.stream),
             scratch=bound.scratch,
@@ -697,25 +706,27 @@ class ImageExecutor:
             row_budget=max(self.max_batch_tokens, patches),
             max_images=self.max_calls,
         )
-        return [("vision", *key) for key in lane.vision.keys()]
+        return [("vision", *key) for key in computation.vision.keys()]
 
     def _bind_latent(
-        self, lane: _Lane, bound: ImageLaneBinding, pool: Any | None
+        self, computation: _Computation, bound: StreamBinding, pool: Any | None
     ) -> list[Any]:
-        """Construct a latent lane's encoder; its graph keys.
+        """Construct a latent computation's encoder; its graph keys.
 
         It captures the prepared pixel size of every configured image size.
         """
-        module = self._module(lane, "patch_autoencoder", PatchAutoencoder)
+        module = self._module(
+            computation, "patch_autoencoder", PatchAutoencoder
+        )
         sizes = []
         for height, width in self.flow_shapes:
             facts = EncoderRunner.image_facts(
                 self.loaded, "vae", height, width, 0
             )
             sizes.append((int(facts[-2]), int(facts[-1])))
-        lane.latent = LatentEncoder(
+        computation.latent = LatentEncoder(
             module=module,
-            owner=lane.label("patch_autoencoder"),
+            owner=computation.label("patch_autoencoder"),
             stream=bound.stream,
             device=_device(bound.stream),
             scratch=bound.scratch,
@@ -725,16 +736,16 @@ class ImageExecutor:
             pool=pool,
             peers=bound.peers,
         )
-        return [("latent", *key) for key in lane.latent.keys()]
+        return [("latent", *key) for key in computation.latent.keys()]
 
     def _bind_denoiser(
         self,
-        lane: _Lane,
-        bound: ImageLaneBinding,
+        computation: _Computation,
+        bound: StreamBinding,
         binding: ImageBinding,
         pool: Any | None,
     ) -> list[Any]:
-        """Construct the denoiser lane's denoiser; its graph keys."""
+        """Construct the denoiser computation's denoiser; its graph keys."""
         layout = self.layout
         if layout is None:
             raise SetupError("an image denoiser reports no latent layout")
@@ -747,7 +758,7 @@ class ImageExecutor:
                 "an image denoiser requires the prefix cache and the latent "
                 "ledger"
             )
-        network = self._module(lane, "image_denoiser", ImageDenoiser)
+        network = self._module(computation, "image_denoiser", ImageDenoiser)
         # The sequence-parallel degree divides every forward's tokens.
         mesh = network.mesh
         multiple = int(mesh.size("sp")) if "sp" in mesh.axes else 1
@@ -781,9 +792,9 @@ class ImageExecutor:
             if graphs and condition_limits is not None
             else None
         )
-        lane.denoiser = Denoiser(
+        computation.denoiser = Denoiser(
             network=network,
-            owner=lane.label("image_denoiser"),
+            owner=computation.label("image_denoiser"),
             layout=layout,
             stream=bound.stream,
             device=_device(bound.stream),
@@ -815,32 +826,32 @@ class ImageExecutor:
 
     def _bind_decoder(
         self,
-        lane: _Lane,
-        bound: ImageLaneBinding,
+        computation: _Computation,
+        bound: StreamBinding,
         binding: ImageBinding,
         pool: Any | None,
     ) -> list[Any]:
-        """Construct a lane's image decoder and its latent row buffer.
+        """Construct a computation's image decoder and its latent row buffer.
 
         It captures every configured image size the ledger's longest
         trajectory holds. Returns its graph keys.
         """
         layout = self.layout
-        module = self._module(lane, "image_decoder", ImageDecoder)
+        module = self._module(computation, "image_decoder", ImageDecoder)
         if layout is None or binding.banks is None:
             raise SetupError(
                 "image decoding requires an image denoiser's layout and the "
                 "latent ledger"
             )
-        banks = lane.banks = LatentBanks(binding.banks)
+        banks = computation.banks = LatentBanks(binding.banks)
         sizes = [
             (height, width, layout.latent_rows(height, width))
             for height, width in self.flow_shapes
             if layout.latent_rows(height, width) <= layout.max_sequence_tokens
         ]
-        lane.decoder = PixelDecoder(
+        computation.decoder = PixelDecoder(
             module=module,
-            owner=lane.label("image_decoder"),
+            owner=computation.label("image_decoder"),
             stream=bound.stream,
             device=_device(bound.stream),
             scratch=bound.scratch,
@@ -853,7 +864,7 @@ class ImageExecutor:
         )
         with torch.cuda.stream(bound.stream):
             # The longest trajectory's rows, page padded.
-            lane.rows = torch.zeros(
+            computation.rows = torch.zeros(
                 (
                     layout.max_sequence_tokens + banks.page_units,
                     layout.width,
@@ -861,7 +872,7 @@ class ImageExecutor:
                 dtype=banks.dtype,
                 device=banks.device,
             )
-        return [("decode", *key) for key in lane.decoder.keys()]
+        return [("decode", *key) for key in computation.decoder.keys()]
 
     def _capacity(self) -> dict[str, int] | None:
         """Each packed forward's live rows and tokens; ``None`` for none."""
@@ -876,16 +887,16 @@ class ImageExecutor:
             ),
             0,
         )
-        for lane in self.placed:
-            if lane.vision is not None:
-                patches, images = lane.vision.capacity()
+        for computation in self.placed:
+            if computation.vision is not None:
+                patches, images = computation.vision.capacity()
                 capacity["max_vision_patch_rows"] = max(
                     capacity["max_vision_patch_rows"], patches
                 )
                 capacity["max_vision_images"] = max(
                     capacity["max_vision_images"], images
                 )
-            denoiser = lane.denoiser
+            denoiser = computation.denoiser
             if denoiser is not None:
                 capacity["max_step_tokens"] = denoiser.steps.live_tokens
                 capacity["max_step_rows"] = denoiser.steps.live_rows
@@ -896,7 +907,7 @@ class ImageExecutor:
         return capacity if any(capacity.values()) else None
 
     def _report(self) -> dict[str, Any]:
-        """What the engine reads of the bound lanes (see :meth:`bind`)."""
+        """What the engine reads of the bound computations (:meth:`bind`)."""
         graphs = self.graphs
         report: dict[str, Any] = {
             "warmups": [],
@@ -910,7 +921,9 @@ class ImageExecutor:
             },
         }
         latents = [
-            lane.latent for lane in self.placed if lane.latent is not None
+            computation.latent
+            for computation in self.placed
+            if computation.latent is not None
         ]
         if graphs and latents:
             report["captured_latents"] = [
@@ -927,9 +940,9 @@ class ImageExecutor:
         steps = denoiser.steps.live_tokens
         fitting = [
             (height, width)
-            for lane in self.placed
-            if lane.decoder is not None
-            for height, width in lane.decoder.keys()
+            for computation in self.placed
+            if computation.decoder is not None
+            for height, width in computation.decoder.keys()
             if layout.sequence_length(height, width) <= steps
         ]
         if graphs:
@@ -998,7 +1011,7 @@ class ImageExecutor:
             )
         return warmups
 
-    # The text lanes' questions.
+    # The text computations' questions.
 
     def facts(self) -> ImageFacts:
         """The image facts text prompts are laid out with."""
@@ -1006,20 +1019,22 @@ class ImageExecutor:
 
     def denoiser(self) -> Denoiser | None:
         """The image denoiser that writes latent conditioning, if any."""
-        for lane in self.placed:
-            if lane.denoiser is not None:
-                return lane.denoiser
+        for computation in self.placed:
+            if computation.denoiser is not None:
+                return computation.denoiser
         return None
 
-    def attach_text(self, lanes: Mapping[str, Any]) -> None:
-        """Take each denoiser's component's text lane.
+    def attach_text(self, computations: Mapping[str, Any]) -> None:
+        """Take each denoiser's component's text computation.
 
-        The text lane prefills the denoiser's guidance prefixes
-        (``TextLane.prefill_cache``).
+        The text computation prefills the denoiser's guidance prefixes
+        (``TextComputation.prefill_cache``).
         """
-        for lane in self.placed:
-            if lane.denoiser is not None:
-                lane.denoiser.attach_text(lanes.get(lane.component))
+        for computation in self.placed:
+            if computation.denoiser is not None:
+                computation.denoiser.attach_text(
+                    computations.get(computation.component)
+                )
 
     # Warmup.
 
@@ -1028,7 +1043,7 @@ class ImageExecutor:
 
         Vision buckets, latent encode sizes, then the denoiser's steps and
         condition writes over scratch tables, then the decoder's sizes;
-        each names its lane (in this executor's lane order), the scratch
+        each names its computation (its index in this executor), the scratch
         lengths of slots ``1..`` (``null`` for a phase over no prefix
         cache), each step's attention rows and whether they write.
         """
@@ -1040,12 +1055,16 @@ class ImageExecutor:
             key=lambda item: (order[item[1].role], item[0]),
         )
         decoders = []
-        for index, lane in indexed:
-            if lane.role in (VISION, LATENT):
-                phases.append({"lane": index, "lengths": None, "steps": []})
-                self._phases.append((lane, lane.role, None))
-            if lane.denoiser is not None:
-                steps, conditions = lane.denoiser.warm_forwards(self.slots)
+        for index, computation in indexed:
+            if computation.role in (VISION, LATENT):
+                phases.append(
+                    {"computation": index, "lengths": None, "steps": []}
+                )
+                self._phases.append((computation, computation.role, None))
+            if computation.denoiser is not None:
+                steps, conditions = computation.denoiser.warm_forwards(
+                    self.slots
+                )
                 for name, forwards, writes in (
                     ("steps", steps, False),
                     ("conditions", conditions, True),
@@ -1063,7 +1082,7 @@ class ImageExecutor:
                     )
                     phases.append(
                         {
-                            "lane": index,
+                            "computation": index,
                             "lengths": [length] * used,
                             "steps": [
                                 forward.attention() for forward in forwards
@@ -1071,29 +1090,29 @@ class ImageExecutor:
                             "writes": writes,
                         }
                     )
-                    self._phases.append((lane, name, forwards))
-            if lane.decoder is not None:
-                decoders.append((index, lane))
-        for index, lane in decoders:
-            phases.append({"lane": index, "lengths": None, "steps": []})
-            self._phases.append((lane, DECODER, None))
+                    self._phases.append((computation, name, forwards))
+            if computation.decoder is not None:
+                decoders.append((index, computation))
+        for index, computation in decoders:
+            phases.append({"computation": index, "lengths": None, "steps": []})
+            self._phases.append((computation, DECODER, None))
         return phases
 
     def warmup_phase(self, index: int, *pages: torch.Tensor) -> None:
         """Run warmup phase ``index`` with each step's page columns."""
-        lane, name, forwards = self._phases[int(index)]
+        computation, name, forwards = self._phases[int(index)]
         if name == VISION:
-            assert lane.vision is not None
-            lane.vision.warm()
+            assert computation.vision is not None
+            computation.vision.warm()
         elif name == LATENT:
-            assert lane.latent is not None
-            lane.latent.warm(self._warm_side())
+            assert computation.latent is not None
+            computation.latent.warm(self._warm_side())
         elif name == DECODER:
-            assert lane.decoder is not None and self.layout is not None
+            assert computation.decoder is not None and self.layout is not None
             side = self._warm_side()
-            lane.decoder.warm(side, self.layout.latent_rows(side, side))
+            computation.decoder.warm(side, self.layout.latent_rows(side, side))
         else:
-            denoiser = lane.denoiser
+            denoiser = computation.denoiser
             assert denoiser is not None and forwards is not None
             if len(pages) != len(forwards):
                 raise ValueError(
@@ -1113,14 +1132,14 @@ class ImageExecutor:
 
     def warmup_finish(self) -> None:
         """Wait for the warmup's device work; every capture ran in a phase."""
-        for lane in self.placed:
-            if lane.stream is not None:
-                lane.stream.synchronize()
+        for computation in self.placed:
+            if computation.stream is not None:
+                computation.stream.synchronize()
 
     def seal(self) -> None:
         """Refuse captures from now on: serving replays only."""
-        for lane in self.placed:
-            for module in lane.modules():
+        for computation in self.placed:
+            for module in computation.modules():
                 module.seal()
 
     # Requests.
@@ -1160,9 +1179,9 @@ class ImageExecutor:
         self._forget([int(slot) for slot in slots])
 
     def _forget(self, slots: Sequence[int]) -> None:
-        for lane in self.placed:
-            if lane.denoiser is not None:
-                lane.denoiser.release(slots)
+        for computation in self.placed:
+            if computation.denoiser is not None:
+                computation.denoiser.release(slots)
 
     def _request(self, entry: Mapping[str, Any]) -> _Request:
         record = self.requests.get(int(entry["slot"]))
@@ -1179,10 +1198,10 @@ class ImageExecutor:
     # Preparation.
 
     def prepare(
-        self, lane: int, step: Mapping[str, Any]
+        self, computation: int, step: Mapping[str, Any]
     ) -> list[dict[str, Any]]:
         """What each call of a batch reads and writes, in call order."""
-        placed = self.placed[int(lane)]
+        placed = self.placed[int(computation)]
         result = []
         for entry in step["calls"]:
             if entry["refused"] or not entry["active"]:
@@ -1190,7 +1209,9 @@ class ImageExecutor:
                 continue
             kind = str(entry["call"]["kind"])
             if kind not in placed.kinds:
-                raise ValueError(f"lane {lane} serves no {kind} calls")
+                raise ValueError(
+                    f"computation {computation} serves no {kind} calls"
+                )
             result.append(self._preparations[kind](placed, entry).to_json())
         return result
 
@@ -1227,9 +1248,9 @@ class ImageExecutor:
         ]
 
     def _prepare_vision(
-        self, lane: _Lane, entry: Mapping[str, Any]
+        self, computation: _Computation, entry: Mapping[str, Any]
     ) -> PlanEntry:
-        module = self._module(lane, "patch_encoder", PatchEncoder)
+        module = self._module(computation, "patch_encoder", PatchEncoder)
         value = self._input(entry)
         if "inline" in value:
             facts = value["inline"]
@@ -1255,9 +1276,11 @@ class ImageExecutor:
         )
 
     def _prepare_latent(
-        self, lane: _Lane, entry: Mapping[str, Any]
+        self, computation: _Computation, entry: Mapping[str, Any]
     ) -> PlanEntry:
-        module = self._module(lane, "patch_autoencoder", PatchAutoencoder)
+        module = self._module(
+            computation, "patch_autoencoder", PatchAutoencoder
+        )
         value = self._input(entry)
         if "inline" in value:
             facts = value["inline"]
@@ -1279,16 +1302,16 @@ class ImageExecutor:
         )
 
     def _prepare_trajectory(
-        self, lane: _Lane, entry: Mapping[str, Any]
+        self, computation: _Computation, entry: Mapping[str, Any]
     ) -> PlanEntry:
         """A latent preparation or denoising step: a ledger binding."""
         self._image_params(entry)
         return PlanEntry(latent=True)
 
     def _prepare_decoding(
-        self, lane: _Lane, entry: Mapping[str, Any]
+        self, computation: _Computation, entry: Mapping[str, Any]
     ) -> PlanEntry:
-        decoder = self._module(lane, "image_decoder", ImageDecoder)
+        decoder = self._module(computation, "image_decoder", ImageDecoder)
         call = entry["call"]
         value_range = range_name(decoder.decoder.value_range)
         if call.get("latent_input") is not None:
@@ -1321,7 +1344,7 @@ class ImageExecutor:
 
     def execute(
         self,
-        lane: int,
+        computation: int,
         step: Mapping[str, Any],
         tensors: Sequence[torch.Tensor],
     ) -> list[int]:
@@ -1335,7 +1358,7 @@ class ImageExecutor:
         ``int64 [5 + 2G, R]`` attention rows. Returns each call's graph
         mode.
         """
-        placed = self.placed[int(lane)]
+        placed = self.placed[int(computation)]
         calls = step["calls"]
         prepared = step["prepared"]
         cursor = sum(
@@ -1376,14 +1399,17 @@ class ImageExecutor:
 
     def _resident_pixels(
         self,
-        lane: _Lane,
+        computation: _Computation,
         tower: Tower,
         image: torch.Tensor,
         entry: Mapping[str, Any],
     ) -> PreparedImage:
-        """A resident image prepared for ``tower`` on the lane's device."""
+        """A resident image prepared for ``tower``.
+
+        It is prepared on the device ``computation`` runs on.
+        """
         resident = self._input(entry)["resident"]
-        with torch.inference_mode(), torch.cuda.stream(lane.stream):
+        with torch.inference_mode(), torch.cuda.stream(computation.stream):
             return prepare_tensor_image(
                 self.loaded.image_processor,
                 tower,
@@ -1392,14 +1418,16 @@ class ImageExecutor:
                 signed_unit=resident["value_range"] == "signed_unit",
             )
 
-    def _encode_vision(self, lane, bound, modes) -> None:
-        encoder = lane.vision
+    def _encode_vision(self, computation, bound, modes) -> None:
+        encoder = computation.vision
         assert encoder is not None
         images = []
         for entry, plan, tensors in bound:
             source, out = tensors[0], tensors[-1]
             if plan.read:
-                prepared = self._resident_pixels(lane, "vit", source, entry)
+                prepared = self._resident_pixels(
+                    computation, "vit", source, entry
+                )
                 pixels, grid = prepared.pixels, prepared.grid_shape
             else:
                 pixels = source
@@ -1415,14 +1443,14 @@ class ImageExecutor:
         for entry, _, _ in bound:
             modes[int(entry["index"])] = mode
 
-    def _encode_latents(self, lane, bound, modes) -> None:
-        encoder = lane.latent
+    def _encode_latents(self, computation, bound, modes) -> None:
+        encoder = computation.latent
         assert encoder is not None
         for entry, plan, tensors in bound:
             source, out = tensors[0], tensors[-1]
             if plan.read:
                 pixels = self._resident_pixels(
-                    lane, "vae", source, entry
+                    computation, "vae", source, entry
                 ).pixels
             else:
                 pixels = source
@@ -1433,8 +1461,8 @@ class ImageExecutor:
                 pixels, out, seed=request.seed, draw=draw
             )
 
-    def _prepare_latents(self, lane, bound, modes) -> None:
-        denoiser = lane.denoiser
+    def _prepare_latents(self, computation, bound, modes) -> None:
+        denoiser = computation.denoiser
         assert denoiser is not None
         for entry, _, _ in bound:
             request = self._request(entry)
@@ -1451,8 +1479,10 @@ class ImageExecutor:
                 LatentBinding.from_json(entry["latent"]),
             )
 
-    def _denoise(self, lane, bound, forward: torch.Tensor, modes) -> None:
-        denoiser = lane.denoiser
+    def _denoise(
+        self, computation, bound, forward: torch.Tensor, modes
+    ) -> None:
+        denoiser = computation.denoiser
         assert denoiser is not None
         calls = []
         for entry, _, _ in bound:
@@ -1478,17 +1508,20 @@ class ImageExecutor:
         for call, mode in zip(calls, ran, strict=True):
             modes[call.index] = mode
 
-    def _decode(self, lane, bound, modes) -> None:
-        decoder = lane.decoder
+    def _decode(self, computation, bound, modes) -> None:
+        decoder = computation.decoder
         assert decoder is not None
         for entry, plan, tensors in bound:
             out = tensors[-1]
             if plan.latent:
                 latent = LatentBinding.from_json(entry["latent"])
                 product = tensors[0] if plan.writes else None
-                rows, banks = lane.rows, lane.banks
+                rows, banks = computation.rows, computation.banks
                 assert rows is not None and banks is not None
-                with torch.inference_mode(), torch.cuda.stream(lane.stream):
+                with (
+                    torch.inference_mode(),
+                    torch.cuda.stream(computation.stream),
+                ):
                     banks.gather(latent.read, latent.pages, rows)
                 mode = decoder.decode(
                     rows[: latent.units],
@@ -1509,34 +1542,46 @@ class ImageExecutor:
     def kernels(self) -> list[tuple[str, list[str]]]:
         """Each module's kernel-table label and selected kernels."""
         listed = []
-        for lane in self.placed:
-            if lane.vision is not None:
+        for computation in self.placed:
+            if computation.vision is not None:
                 listed.append(
-                    (lane.label("patch_encoder"), lane.vision.kernels())
+                    (
+                        computation.label("patch_encoder"),
+                        computation.vision.kernels(),
+                    )
                 )
-            if lane.latent is not None:
+            if computation.latent is not None:
                 listed.append(
-                    (lane.label("patch_autoencoder"), lane.latent.kernels())
+                    (
+                        computation.label("patch_autoencoder"),
+                        computation.latent.kernels(),
+                    )
                 )
-            if lane.denoiser is not None:
+            if computation.denoiser is not None:
                 listed.append(
-                    (lane.label("image_denoiser"), lane.denoiser.kernels())
+                    (
+                        computation.label("image_denoiser"),
+                        computation.denoiser.kernels(),
+                    )
                 )
-            if lane.decoder is not None:
+            if computation.decoder is not None:
                 listed.append(
-                    (lane.label("image_decoder"), lane.decoder.kernels())
+                    (
+                        computation.label("image_decoder"),
+                        computation.decoder.kernels(),
+                    )
                 )
         return listed
 
     def close(self, aborted: bool) -> None:
-        """Release every lane's modules, newest first.
+        """Release every computation's modules, newest first.
 
         The worker drained the streams. Every release is attempted before
         the first failure is raised.
         """
         failure: BaseException | None = None
-        for lane in reversed(self.placed):
-            for module in reversed(lane.modules()):
+        for computation in reversed(self.placed):
+            for module in reversed(computation.modules()):
                 try:
                     module.close(bool(aborted))
                 except Exception as error:  # noqa: BLE001 - close every part

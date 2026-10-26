@@ -108,14 +108,14 @@ class LatentEncoder(_Codec):
     Args:
         module: The latent encoder.
         owner: Its component and path, naming it.
-        stream: The lane stream.
+        stream: The primary stream.
         device: The CUDA ordinal ``stream`` belongs to, -1 for the host.
         scratch: The stream's shared work areas.
         attention: The attention backend the model loaded with.
         sizes: The ``(height, width)`` prepared pixel sizes captured under
             graphs: those of the configured generated image sizes.
         pixel_dtype: The dtype of the pixels the image policy prepares.
-        pool: The lane stream's graph pool, ``None`` without graphs.
+        pool: The primary stream's graph pool, ``None`` without graphs.
         peers: ``(ordinal, pool)`` of each other device it computes on.
     """
 
@@ -315,7 +315,7 @@ class PixelDecoder(_Codec):
     Args:
         module: The image decoder.
         owner: Its component and path, naming it.
-        stream: The lane stream.
+        stream: The primary stream.
         device: The CUDA ordinal ``stream`` belongs to, -1 for the host.
         scratch: The stream's shared work areas.
         attention: The attention backend the model loaded with.
@@ -323,7 +323,7 @@ class PixelDecoder(_Codec):
             captured under graphs.
         latent_width: Values per latent row.
         latent_dtype: The dtype of the latent rows.
-        pool: The lane stream's graph pool, ``None`` without graphs.
+        pool: The primary stream's graph pool, ``None`` without graphs.
         peers: ``(ordinal, pool)`` of each other device it computes on.
     """
 

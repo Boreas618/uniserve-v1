@@ -13,7 +13,7 @@
 //! every failing rank reports identically, while no succeeding rank holds an
 //! unjoined call, retires only its batch unless it is fatal, is coded as a
 //! scheduler bug or invariant violation, or failed a batch carrying a `Free`
-//! command (`join_worker_errors`); rank loss, a lane a rank reports stalled,
+//! command (`join_worker_errors`); rank loss, a job a rank reports stalled,
 //! protocol violations, and every other error replace the whole rank group
 //! (`recover_workers`) and invalidate every request resident on it. A
 //! parked standby replaces the group within the call (`standby`); otherwise
@@ -977,7 +977,7 @@ impl WorkerGroup {
     /// error that `join_worker_errors` retires with its batch is returned as is
     /// and the group stays usable. Any other error, including rank loss, a
     /// protocol violation, an agreed error `join_worker_errors` does not retire,
-    /// a lane a rank reports stalled, and an expired
+    /// a job a rank reports stalled, and an expired
     /// `WorkerProcessArgs::watchdog_timeout` (measured from the group's last
     /// progress and enforced only while a batch is pending), replaces the
     /// rank group and returns the recovery's `WorkerFailure`. While its

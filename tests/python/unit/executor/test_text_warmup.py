@@ -1,10 +1,10 @@
-"""The order and contents of a text lane's warmup phases.
+"""The order and contents of a text computation's warmup phases.
 
-A lane's phases depend only on its graph catalogs, its pool and model
-facts, so every rank of a group runs the same forwards in the same order.
-The catalogs here are those of a lane with decode sizes 1, 2 and 4, prefill
-token sizes 16 and 32 within 64 batch tokens, and pages of four tokens over
-a pool of 96 units.
+A computation's phases depend only on its graph catalogs, its pool and
+model facts, so every rank of a group runs the same forwards in the same
+order. The catalogs here are those of a computation with decode sizes 1, 2
+and 4, prefill token sizes 16 and 32 within 64 batch tokens, and pages of
+four tokens over a pool of 96 units.
 """
 
 from __future__ import annotations

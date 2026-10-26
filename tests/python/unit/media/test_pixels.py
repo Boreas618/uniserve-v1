@@ -55,7 +55,7 @@ _DIFFUSION_GEMMA_TOKEN_CASES = json.loads(
 
 
 def _prepare(processor, tower, payload, *, input_images=1):
-    """Prepare a request input image on the host, as a host lane does."""
+    """Prepare a request input image on the host, as a host-pool task does."""
     return prepare_host_image(
         processor, tower, payload, input_images=input_images, pin=False
     )

@@ -1,63 +1,66 @@
 //! Video media scheduling: a video request runs the calls of its graph
 //! (`graph::VideoGraph`, built at admission from its task and conditions),
 //! offered by `ready_calls` as their inputs become available. Calls occupy
-//! device lanes and, for media reading, encoding and muxing, host lanes,
-//! tracked by the lane ledger ([`LaneLedger`]); `plan_media_call` builds one
-//! call with its products, buffer bindings, latent pages and reading
-//! components, and `prepare_media_batches` forms the media batches a refill
-//! dispatches.
+//! their components' capacity on their workers and, for media reading,
+//! encoding and muxing, host task pools, tracked by the media occupancy
+//! ([`Occupancy`]); `plan_media_call` builds one call with its products,
+//! buffer bindings, latent pages and reading components, and
+//! `prepare_media_batches` forms the media batches a refill dispatches.
 
 use super::*;
 use ipc::MediaCall;
 
-/// The lanes one media call occupies while it is in flight.
+/// What one media call occupies while it is in flight.
 ///
-/// A component lane measured in media units carries `units`; a demand with
-/// zero `units` holds its component lane exclusively, one request at a time.
-/// `cpu_workers` names the host lanes the call places tasks on.
-pub(in crate::scheduler) struct LaneDemand {
-    /// The worker and component whose device lane the call occupies, taken
+/// On a component whose capacity is measured in media units the call
+/// carries `units`; a demand with zero `units` holds its component
+/// exclusively, one request at a time. `cpu_workers` names the host task
+/// pools the call places tasks on.
+pub(in crate::scheduler) struct Demand {
+    /// The worker and component whose capacity the call occupies, taken
     /// from the request's placement (`Placement::affinity`). Admission places
     /// a media request on a worker for every media component, so a request's
-    /// first call is checked against its lane too. `None` when no component
-    /// serves the call or the request holds no placement for it.
+    /// first call is checked against its component too. `None` when no
+    /// component serves the call or the request holds no placement for it.
     component: Option<(crate::WorkerGroupId, String)>,
     units: u32,
-    /// Host lanes this call occupies, each named by its worker and rank with
-    /// the number of tasks the call places on it: one per media unit the
-    /// rank encodes, one for any other host call.
+    /// Host task pools this call occupies, each named by its worker and rank
+    /// with the number of tasks the call places on it: one per media unit
+    /// the rank encodes, one for any other host call.
     cpu_workers: Vec<(crate::WorkerGroupId, usize, u32)>,
 }
 
-/// Lane occupancy across the media calls in flight.
+/// What the media calls in flight occupy of their components and of the
+/// ranks' host task pools.
 ///
-/// `lane_occupancy` rebuilds it from the in-flight calls at the start of each
+/// `media_occupancy` rebuilds it from the in-flight calls at the start of each
 /// media pass, and at the first inline-image encoder call of a generation
 /// pass; the pass charges each call it selects.
 #[derive(Default)]
-pub(in crate::scheduler) struct LaneLedger {
-    /// The request holding each exclusive component lane.
+pub(in crate::scheduler) struct Occupancy {
+    /// The request holding each exclusively held component.
     exclusive: HashMap<(crate::WorkerGroupId, String), RequestId>,
-    /// Media units in flight on each unit-measured component lane.
+    /// Media units in flight on each unit-measured component.
     units: HashMap<(crate::WorkerGroupId, String), u32>,
-    /// A CPU worker owns one host lane, so occupancy is counted per rank of
-    /// each worker.
+    /// Each rank owns one host task pool, so occupancy is counted per rank
+    /// of each worker.
     host: HashMap<(crate::WorkerGroupId, usize), u32>,
 }
 
-impl LaneLedger {
-    /// Returns whether one request's call fits the lanes it occupies.
+impl Occupancy {
+    /// Returns whether one request's call fits what it occupies.
     ///
-    /// Every CPU worker must have room for the call's tasks. An exclusive
-    /// component lane admits further calls of the request already holding it.
+    /// Every host task pool the call places tasks on must have room for
+    /// them. An exclusively held component admits further calls of the
+    /// request already holding it.
     pub(in crate::scheduler) fn admits(
         &self,
-        demand: &LaneDemand,
+        demand: &Demand,
         request: RequestId,
         scheduler: &Scheduler,
     ) -> bool {
         if demand.cpu_workers.iter().any(|(worker, rank, tasks)| {
-            let capacity = scheduler.host_lane_capacity(worker);
+            let capacity = scheduler.host_task_capacity(worker);
             let key = (worker.clone(), *rank);
             self.host.get(&key).copied().unwrap_or(0) + tasks > capacity
         }) {
@@ -67,7 +70,7 @@ impl LaneLedger {
             return true;
         };
         if demand.units > 0 {
-            let capacity = scheduler.device_lane_units(worker, component).unwrap_or(1);
+            let capacity = scheduler.component_units(worker, component).unwrap_or(1);
             self.units
                 .get(&(worker.clone(), component.clone()))
                 .copied()
@@ -81,8 +84,8 @@ impl LaneLedger {
         }
     }
 
-    /// Marks the lanes one request's call occupies until it completes.
-    pub(in crate::scheduler) fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
+    /// Marks what one request's call occupies until it completes.
+    pub(in crate::scheduler) fn occupy(&mut self, demand: &Demand, request: RequestId) {
         for (worker, rank, tasks) in &demand.cpu_workers {
             *self.host.entry((worker.clone(), *rank)).or_default() += tasks;
         }
@@ -114,7 +117,7 @@ impl Scheduler {
     /// Lists every call of one request that can be scheduled now.
     ///
     /// A request is a graph of calls with data dependencies, so a tick offers
-    /// all of them and the lane ledger decides which ones fit. At most one
+    /// all of them and the media occupancy decides which ones fit. At most one
     /// call of each kind is ready at once: the cursors this returns against
     /// advance as calls are scheduled, so a unit group only becomes ready
     /// once its predecessor is submitted.
@@ -249,7 +252,7 @@ impl Scheduler {
         )
     }
 
-    /// Returns the component whose lanes one media call occupies.
+    /// Returns the component that serves one media call.
     fn media_component(&self, media_call: MediaCall) -> Option<String> {
         self.info.media_components.get(&media_call).cloned()
     }
@@ -394,15 +397,15 @@ impl Scheduler {
         Some((units, free[..holders].to_vec()))
     }
 
-    /// Returns a component's device lane capacity in media units.
+    /// Returns a component's capacity on `worker` in media units.
     ///
-    /// A component that distributes its work measures its lane in the units its
-    /// ranks reconstruct together; every other component's lane is exclusive
-    /// and admits one request at a time.
+    /// A component that distributes its work measures its capacity in the
+    /// units its ranks reconstruct together; every other component is held
+    /// exclusively and admits one request at a time.
     ///
-    /// Returns `None` for an exclusive lane, and when `worker` was launched
-    /// without a component named `component`.
-    fn device_lane_units(&self, worker: &crate::WorkerGroupId, component: &str) -> Option<u32> {
+    /// Returns `None` for an exclusively held component, and when `worker`
+    /// was launched without a component named `component`.
+    fn component_units(&self, worker: &crate::WorkerGroupId, component: &str) -> Option<u32> {
         let config = self.executor.info().component_config(worker, component)?;
         config
             .distribution
@@ -410,12 +413,13 @@ impl Scheduler {
             .map(|_| (config.ranks.len() * config.units_per_rank.max(1)) as u32)
     }
 
-    /// Returns the lanes one media call occupies and how much of each.
+    /// Returns what one media call occupies and how much of each.
     ///
-    /// Only decoding calls on a unit-measured lane charge media units; every
-    /// other placed call holds its component lane exclusively. Media
-    /// reading, encoding and muxing calls also place tasks on host lanes.
-    fn lane_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> LaneDemand {
+    /// Only decoding calls on a unit-measured component charge media units;
+    /// every other placed call holds its component exclusively. Media
+    /// reading, encoding and muxing calls also place tasks on host task
+    /// pools.
+    fn media_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> Demand {
         let component = self.media_component(media_call);
         let placed_component = component.as_ref().and_then(|component| {
             self.placement
@@ -424,13 +428,14 @@ impl Scheduler {
                 .map(|worker| (worker.clone(), component.clone()))
         });
         let device_units = match media_call {
-            // A device lane is occupied by a decode round. Encoding a media
-            // unit is admitted on its rank's host lane, so it overlaps the
-            // decode round that follows it rather than excluding it, and the
-            // post-processing it begins with rides on the same admission.
+            // A decode round occupies the component's media units. Encoding
+            // a media unit is admitted on its rank's host task pool, so it
+            // overlaps the decode round that follows it rather than
+            // excluding it, and the post-processing it begins with rides on
+            // the same admission.
             MediaCall::VideoDecoding | MediaCall::AudioDecoding => placed_component
                 .as_ref()
-                .and_then(|(worker, name)| self.device_lane_units(worker, name))
+                .and_then(|(worker, name)| self.component_units(worker, name))
                 .map_or(0, |_| units.max(1)),
             _ => 0,
         };
@@ -438,19 +443,19 @@ impl Scheduler {
             MediaCall::MediaReading
             | MediaCall::VideoEncoding
             | MediaCall::AudioEncoding
-            | MediaCall::Muxing => self.host_lane_workers(request, component.as_deref(), units),
+            | MediaCall::Muxing => self.host_task_workers(request, component.as_deref(), units),
             _ => Vec::new(),
         };
-        LaneDemand {
+        Demand {
             component: placed_component,
             units: device_units,
             cpu_workers,
         }
     }
 
-    /// Returns the host lanes one call of a component occupies, each named by
-    /// the worker holding the component and the rank within it, with the
-    /// tasks the call places there.
+    /// Returns the host task pools one call of a component occupies, each
+    /// named by the worker holding the component and the rank within it,
+    /// with the tasks the call places there.
     ///
     /// A distributed component's round runs on as many of its ranks as it has
     /// media units, each rank taking one task per unit it encodes; any other
@@ -458,9 +463,9 @@ impl Scheduler {
     ///
     /// The worker is the request's owner of the component, or the first
     /// loaded worker holding it before the request is placed. Returns no
-    /// lanes when `component` is `None` or that worker is not loaded or does
+    /// pools when `component` is `None` or that worker is not loaded or does
     /// not hold the component.
-    fn host_lane_workers(
+    fn host_task_workers(
         &self,
         request: RequestKey,
         component: Option<&str>,
@@ -505,51 +510,52 @@ impl Scheduler {
             .collect()
     }
 
-    /// Returns the host lane capacity of one worker's ranks.
-    fn host_lane_capacity(&self, worker: &crate::WorkerGroupId) -> u32 {
+    /// Returns how many tasks the host task pool of each rank of one worker
+    /// admits at once.
+    fn host_task_capacity(&self, worker: &crate::WorkerGroupId) -> u32 {
         self.executor
             .info()
             .workers
             .iter()
             .find(|(id, _)| id == worker)
-            .map_or(1, |(_, info)| info.host_lane_capacity.max(1))
+            .map_or(1, |(_, info)| info.host_task_capacity.max(1))
     }
 
-    /// Returns the host lanes one encoder call carrying inline image bytes
-    /// occupies.
+    /// Returns the host task pools one encoder call carrying inline image
+    /// bytes occupies.
     ///
     /// The worker prepares an inline input image (decoding, resizing,
     /// normalization) as one host task on each rank of the component that
     /// encodes it, and the call holds those tasks until its result returns.
     /// The component is the one the worker routes `media_call` to, or the
     /// default component, as `Placement::worker_target` resolves it.
-    pub(in crate::scheduler) fn image_lane_demand(
+    pub(in crate::scheduler) fn image_demand(
         &self,
         request: RequestKey,
         media_call: MediaCall,
-    ) -> LaneDemand {
+    ) -> Demand {
         let component = self
             .media_component(media_call)
             .unwrap_or_else(|| DEFAULT_COMPONENT.to_owned());
-        LaneDemand {
+        Demand {
             component: None,
             units: 0,
-            cpu_workers: self.host_lane_workers(request, Some(&component), 1),
+            cpu_workers: self.host_task_workers(request, Some(&component), 1),
         }
     }
 
-    /// Accumulates the lanes the media calls in flight occupy, including the
-    /// host tasks preparing the inline images of generation encoder calls.
-    pub(in crate::scheduler) fn lane_occupancy(&self) -> LaneLedger {
-        let mut ledger = LaneLedger::default();
+    /// Accumulates what the media calls in flight occupy, including the host
+    /// tasks preparing the inline images of generation encoder calls.
+    pub(in crate::scheduler) fn media_occupancy(&self) -> Occupancy {
+        let mut occupancy = Occupancy::default();
         for (id, queue) in &self.inflight.pending_calls {
             for inflight in queue {
                 let CallKind::Media(media_call) = inflight.call.kind else {
                     continue;
                 };
                 if inflight.call.input_image.is_some() {
-                    ledger.occupy(
-                        &self.image_lane_demand(inflight.call.request_key, media_call),
+                    occupancy.occupy(
+                        &self.image_demand(inflight.call.request_key, media_call),
                         *id,
                     );
                     continue;
@@ -560,13 +566,13 @@ impl Scheduler {
                     } => range.max_units,
                     _ => 1,
                 };
-                ledger.occupy(
-                    &self.lane_demand(inflight.call.request_key, media_call, units),
+                occupancy.occupy(
+                    &self.media_demand(inflight.call.request_key, media_call, units),
                     *id,
                 );
             }
         }
-        ledger
+        occupancy
     }
 
     /// Returns whether the rank group that owns one call can accept a batch.
@@ -594,11 +600,11 @@ impl Scheduler {
 
     /// Returns the media units one scheduled call of this kind would occupy.
     ///
-    /// A video decode round occupies its component's whole lane
-    /// (`device_lane_units`) unless the track has fewer units left; an audio
-    /// decode round always claims the whole lane. The lane width counts as
-    /// one when the component has no unit-measured lane or the request is not
-    /// yet placed on it.
+    /// A video decode round occupies its component's whole capacity
+    /// (`component_units`) unless the track has fewer units left; an audio
+    /// decode round always claims the whole capacity. The capacity counts as
+    /// one when the component is not measured in media units or the request
+    /// is not yet placed on it.
     fn call_units(&self, state: &MediaFlowState, media_call: MediaCall) -> u32 {
         let width = || {
             self.media_component(media_call)
@@ -608,7 +614,7 @@ impl Scheduler {
                         .placement
                         .affinity
                         .get(&(state.admission.request_key, name.to_owned()))?;
-                    self.device_lane_units(worker, name)
+                    self.component_units(worker, name)
                 })
                 .unwrap_or(1)
         };
@@ -1062,10 +1068,11 @@ impl Scheduler {
     /// planning finds a broken invariant, which latches engine-fatal.
     pub(in crate::scheduler) fn prepare_media_batches(&mut self) -> Vec<ExecutionBatch> {
         // Every resident request, in `running_order`, offers each call
-        // `ready_calls` lists, and a call is selected when the lanes it
-        // occupies have free capacity and its worker's queue can accept a
-        // batch. No per-request cap applies beyond the lanes and rank queues.
-        let mut ledger = self.lane_occupancy();
+        // `ready_calls` lists, and a call is selected when the components and
+        // host task pools it occupies have free capacity and its worker's
+        // queue can accept a batch. No per-request cap applies beyond that
+        // capacity and the rank queues.
+        let mut occupancy = self.media_occupancy();
         let mut candidates = Vec::new();
         for id in self.running_order.clone() {
             let Some(state) = self.media_state(id) else {
@@ -1080,17 +1087,17 @@ impl Scheduler {
                 continue;
             }
             for media_call in self.ready_calls(state) {
-                let demand = self.lane_demand(
+                let demand = self.media_demand(
                     state.admission.request_key,
                     media_call,
                     self.call_units(state, media_call),
                 );
-                if !ledger.admits(&demand, id, self)
+                if !occupancy.admits(&demand, id, self)
                     || !self.call_has_queue_capacity(state.admission.request_key, media_call)
                 {
                     continue;
                 }
-                ledger.occupy(&demand, id);
+                occupancy.occupy(&demand, id);
                 candidates.push((id, media_call));
             }
         }

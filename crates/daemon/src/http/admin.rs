@@ -654,9 +654,9 @@ struct CuptiBody {
 /// `POST /admin/cupti`: every worker attaches CUPTI
 /// (`uniserve.attach_cupti`) or detaches it (`uniserve.detach_cupti`) at the
 /// engine's next step boundary, and answers whether it is attached and
-/// records its lanes' device time. Attached, the workers count the driver
-/// calls that make their threads wait for the device and report their lane
-/// streams' busy and idle time.
+/// records its streams' device time. Attached, the workers count the driver
+/// calls that make their threads wait for the device and report the busy
+/// and idle time of their primary and copy streams.
 async fn cupti(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body: CuptiBody = match serde_json::from_slice(&body) {
         Ok(body) => body,

@@ -1,6 +1,6 @@
 //! Bounded host work: input preparation, copies and media codecs.
 
 pub(crate) mod image;
-mod lane;
+mod pool;
 
-pub(crate) use lane::{HostAction, HostLane, HostTask};
+pub(crate) use pool::{HostAction, HostPool, HostTask};

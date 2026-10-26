@@ -1,4 +1,4 @@
-//! Relay lanes: scalar products stored per request slot and lane.
+//! Relay entries: scalar products stored per request slot and depth index.
 
 use super::*;
 use crate::ffi::{DType, MemoryKind};
@@ -9,19 +9,19 @@ use ipc::{RequestKey, TensorRef};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// A relay lane: its memory, request slot and lane index.
-pub(crate) type LaneKey = (MemoryKind, usize, usize);
+/// A relay entry: its memory, request slot and depth index.
+pub(crate) type EntryKey = (MemoryKind, usize, usize);
 
-/// A relay element: its lane, the field's dtype and index.
-pub(crate) type RelayKey = (LaneKey, DType, usize);
+/// A relay element: its entry, the field's dtype and index.
+pub(crate) type RelayKey = (EntryKey, DType, usize);
 
 /// A relay arena: its memory, dtype and field index.
 pub(crate) type ArenaKey = (MemoryKind, DType, usize);
 
 pub(super) type RelayCall = (MemoryKind, usize, RequestKey, CallId);
 
-/// A call holds its relay lane until all scalar fields have retired.
-pub(super) struct Lane {
+/// A call holds its relay entry until all scalar fields have retired.
+pub(super) struct Entry {
     pub(super) call: CallKey,
     pub(super) fields: HashSet<(DType, usize)>,
 }
@@ -81,8 +81,8 @@ impl ProductStore {
                 let field = fields.entry((call, dtype)).or_default();
                 let field_index = *field;
                 *field += 1;
-                let lane = state.relay_lane(id, device, slot)?;
-                let relay = ((device, slot, lane), dtype, field_index);
+                let index = state.relay_entry(id, device, slot)?;
+                let relay = ((device, slot, index), dtype, field_index);
                 let view = match state.views.get(&relay) {
                     Some(view) => view.clone(),
                     None => {
@@ -111,7 +111,7 @@ impl ProductStore {
                         let arena = state.arenas.get(&arena_key).ok_or_else(|| {
                             Error::Invariant("request-relay arena disappeared".into())
                         })?;
-                        let view = arena.narrow(0, (slot * state.relay_depth + lane) as i64, 1)?;
+                        let view = arena.narrow(0, (slot * state.relay_depth + index) as i64, 1)?;
                         state.views.insert(relay, view.clone());
                         view
                     }
