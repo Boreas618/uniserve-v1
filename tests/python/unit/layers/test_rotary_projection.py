@@ -1009,3 +1009,26 @@ def test_cuda_rotary_calls_without_a_kernel_raise(case, reason):
             out=None if out is None else (out, value),
             rounding=Rounding.ONCE,
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("sections", [None, (24, 20, 20)])
+def test_host_positions_evaluate_without_reading_the_device(sections):
+    # A rank fills a request's tables on the host while the layer's buffers
+    # live on its device; evaluating them must not copy device memory, which
+    # would make the host wait for the device.
+    host = RotaryEmbedding(128, theta=5_000_000.0, sections=sections)
+    moved = RotaryEmbedding(128, theta=5_000_000.0, sections=sections).cuda()
+    positions = torch.arange(1000, 1313)
+    if sections is not None:
+        positions = torch.stack([positions, positions + 7, positions + 11])
+    expected = host(positions, dtype=torch.float32, sequence_length=313)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        actual = moved(positions, dtype=torch.float32, sequence_length=313)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    for value, wanted in zip(actual, expected, strict=True):
+        assert value.device.type == "cpu"
+        assert torch.equal(value, wanted)

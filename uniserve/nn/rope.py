@@ -252,15 +252,21 @@ class RotaryEmbedding(nn.Module):
             actual_device, sequence_length=0
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Host copies of the constants, which stay on the host when the
+        # buffers move to a device: positions on the host (a request's
+        # prepared tables) are evaluated without copying device memory,
+        # which would make the host wait for the device.
+        self._host_inv_freq = inv_freq.cpu()
+        self._host_frequency_axes: torch.Tensor | None = None
         if sections is not None:
             # [dim / 2] position axis of each compact frequency.
+            frequency_axes = torch.tensor(
+                _interleaved_axes(sections), dtype=torch.int64, device="cpu"
+            )
+            self._host_frequency_axes = frequency_axes
             self.register_buffer(
                 "frequency_axes",
-                torch.tensor(
-                    _interleaved_axes(sections),
-                    dtype=torch.int64,
-                    device=actual_device,
-                ),
+                frequency_axes.to(device=actual_device),
                 persistent=False,
             )
 
@@ -332,7 +338,13 @@ class RotaryEmbedding(nn.Module):
         cosine, sine = self._factors(
             positions, dtype=dtype, sequence_length=sequence_length
         )
-        axes = self.frequency_axes.to(device=positions.device)
+        host_axes = self._host_frequency_axes
+        assert host_axes is not None, "a sectioned rotary has its axes"
+        axes = (
+            host_axes
+            if positions.device.type == "cpu"
+            else self.frequency_axes.to(device=positions.device)
+        )
         selected_cosine, selected_sine = cosine[0], sine[0]
         for axis in range(1, len(self.sections)):
             chosen = axes == axis
@@ -362,7 +374,11 @@ class RotaryEmbedding(nn.Module):
                 positions.device, sequence_length=sequence_length
             )
         else:
-            frequencies = self.inv_freq.to(device=positions.device)
+            frequencies = (
+                self._host_inv_freq
+                if positions.device.type == "cpu"
+                else self.inv_freq.to(device=positions.device)
+            )
             scale = self._frequency_scale
 
         from uniserve_kernels.triton import require_kernel
