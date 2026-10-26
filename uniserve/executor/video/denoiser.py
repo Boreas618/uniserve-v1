@@ -516,12 +516,17 @@ class Denoiser:
         return self.conditioner is not None
 
     def condition(
-        self, layout: Layout, slot: int, features: torch.Tensor
+        self,
+        layout: Layout,
+        slot: int,
+        features: torch.Tensor,
+        predicate: torch.Tensor | None = None,
     ) -> int:
         """Refine a request's prompt features into its slot's conditioning.
 
-        The rows of the layout's conditioning past the prompt become zero.
-        Returns how the conditioner ran.
+        The rows of the layout's conditioning past the prompt become zero. A
+        false ``predicate`` (the call's ``uint8 [1]`` device predicate)
+        leaves the conditioning as it was. Returns how the conditioner ran.
         """
         conditioner = self.conditioner
         if conditioner is None:
@@ -553,8 +558,13 @@ class Denoiser:
             conditioner.input[count:capacity].zero_()
             conditioner.lengths.fill_(count)
             mode = self._run_conditioner(capacity)
-            target[:count].copy_(conditioner.output[:count])
-            target[count:].zero_()
+            if predicate is None:
+                target[:count].copy_(conditioner.output[:count])
+                target[count:].zero_()
+            else:
+                refined = torch.zeros_like(target)
+                refined[:count].copy_(conditioner.output[:count])
+                target.copy_(kept(predicate, refined, target))
         return mode
 
     def _run_conditioner(self, capacity: int) -> int:
@@ -573,12 +583,15 @@ class Denoiser:
         slot: int,
         size: VideoSize,
         latents: Sequence[Sequence[torch.Tensor]],
+        predicate: torch.Tensor | None = None,
     ) -> int:
         """Write a request's encoded conditions into its slot's conditioning.
 
         They follow the prompt's rows. ``latents`` are the condition
         latents in request order, a condition's visual rows before its audio
         rows, each as the row tensors that together hold its rows in order.
+        A false ``predicate`` (the call's ``uint8 [1]`` device predicate)
+        leaves the conditioning as it was.
 
         A condition set startup captured replays its encoding; any other is
         encoded eagerly.
@@ -614,8 +627,17 @@ class Denoiser:
                 width = prepared.fields.text_condition[1]
                 first = layout.text_rows * width
                 stop = first + layout.condition_rows * width
-                target[first:stop].copy_(self.condition_out[first:stop])
+                target[first:stop].copy_(
+                    kept(
+                        predicate,
+                        self.condition_out[first:stop],
+                        target[first:stop],
+                    )
+                )
                 return REPLAY
+            # A predicated encoding writes a copy of the conditioning, which
+            # replaces the slot's only where the predicate holds.
+            written = target if predicate is None else target.clone()
             size_list, conditions, spans = size_values(size)
             self.runner.encode_conditions(
                 prepared.handle,
@@ -623,10 +645,12 @@ class Denoiser:
                 conditions,
                 spans,
                 noise,
-                target,
+                written,
                 [len(parts) for parts in latents],
                 *(part for parts in latents for part in parts),
             )
+            if predicate is not None:
+                target.copy_(kept(predicate, written, target))
         return EAGER
 
     def denoise(
