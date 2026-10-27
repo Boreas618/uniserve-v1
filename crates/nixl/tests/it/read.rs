@@ -40,6 +40,12 @@ const SPANS: [(usize, usize, usize); 2] = [
     (13, (2 << 20) + 17, (256 << 10) + 5),
 ];
 
+/// The keys the source's and the destination's regions are registered
+/// under; a span names the key of the registration it lies in. The source's
+/// travels to the destination with its region.
+const SOURCE_KEY: u64 = 1;
+const DESTINATION_KEY: u64 = 2;
+
 /// Names the role a re-executed test process plays: `source` or
 /// `destination`.
 const ROLE: &str = "UNISERVE_NIXL_TEST_ROLE";
@@ -255,22 +261,24 @@ fn source_process() {
             allocation = DeviceAllocation::exportable(DEVICE, REGION_BYTES, &[]).unwrap();
             upload(allocation.address(), &bytes);
             Region {
-                memory: Memory::Device(0),
+                memory: Memory::Device,
                 address: allocation.address(),
                 len: REGION_BYTES,
+                key: SOURCE_KEY,
             }
         }
         _ => Region {
             memory: Memory::Host,
             address: bytes.as_ptr() as u64,
             len: REGION_BYTES,
+            key: SOURCE_KEY,
         },
     };
     // SAFETY: `allocation` or `bytes` outlives the registration, and only
     // peers read the region while it is registered.
     let _registration = unsafe { agent.register(region) }.unwrap();
 
-    println!("@region {} {}", region.address, region.len);
+    println!("@region {} {} {}", region.address, region.len, region.key);
     println!("@metadata {}", hex(&agent.metadata().unwrap()));
     std::io::stdout().flush().unwrap();
 
@@ -287,19 +295,21 @@ fn destination_process() {
         return;
     }
     let mut source_address = 0;
+    let mut source_key = 0;
     let mut metadata = Vec::new();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
         if let Some(value) = line.strip_prefix("@region ") {
-            let (address, len) = value.split_once(' ').unwrap();
-            assert_eq!(len.parse::<usize>().unwrap(), REGION_BYTES);
-            source_address = address.parse().unwrap();
+            let fields: Vec<&str> = value.split(' ').collect();
+            assert_eq!(fields[1].parse::<usize>().unwrap(), REGION_BYTES);
+            source_address = fields[0].parse().unwrap();
+            source_key = fields[2].parse().unwrap();
         } else if let Some(value) = line.strip_prefix("@metadata ") {
             metadata = unhex(value);
         }
     }
     let source_memory = match std::env::var(SOURCE_MEMORY).unwrap().as_str() {
-        "device" => Memory::Device(0),
+        "device" => Memory::Device,
         _ => Memory::Host,
     };
     let agent = new_agent("destination");
@@ -321,9 +331,10 @@ fn destination_process() {
     let before: Vec<u8> = (0..REGION_BYTES).map(destination_byte).collect();
     upload(allocation.address(), &before);
     let destination = Region {
-        memory: Memory::Device(0),
+        memory: Memory::Device,
         address: mapping.address(),
         len: REGION_BYTES,
+        key: DESTINATION_KEY,
     };
     // SAFETY: `mapping` outlives the registration, and the host reads the
     // memory only after the READ completed.
@@ -336,11 +347,13 @@ fn destination_process() {
             memory: source_memory,
             address: source_address + source as u64,
             len,
+            key: source_key,
         },
         destination: Region {
-            memory: Memory::Device(0),
+            memory: Memory::Device,
             address: mapping.address() + destination as u64,
             len,
+            key: DESTINATION_KEY,
         },
     });
     agent.read(&peer, &spans).unwrap().wait().unwrap();

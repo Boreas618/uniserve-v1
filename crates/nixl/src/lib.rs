@@ -6,10 +6,11 @@
 //!
 //! 1. each process creates an [`Agent`] and registers the memory a transfer
 //!    reads or writes ([`Agent::register`]), device memory (including
-//!    memory `cuda::vmm` maps) or host memory;
+//!    memory `cuda::vmm` maps) or host memory, each region under a key of
+//!    its own ([`Region::key`]);
 //! 2. the source's metadata ([`Agent::metadata`]) and the source regions
-//!    travel to the destination over the caller's channel, and the
-//!    destination loads the metadata ([`Agent::load_peer`]);
+//!    with their keys travel to the destination over the caller's channel,
+//!    and the destination loads the metadata ([`Agent::load_peer`]);
 //! 3. the destination posts a READ of spans of the source's regions into its
 //!    own ([`Agent::read`]) and waits for it ([`Transfer::wait`]).
 //!

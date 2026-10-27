@@ -7,43 +7,45 @@ use nixl_sys::{MemType, MemoryRegion, NixlDescriptor, RegistrationHandle};
 pub enum Memory {
     /// Host memory of the process (NIXL `DRAM_SEG`).
     Host,
-    /// Memory of the CUDA device with this ordinal in the process
-    /// (NIXL `VRAM_SEG`), which UCX addresses through the unified address.
-    Device(u32),
+    /// CUDA device memory (NIXL `VRAM_SEG`), named by its unified address,
+    /// from which UCX finds its device.
+    Device,
 }
 
 impl Memory {
     pub(crate) fn kind(self) -> MemType {
         match self {
             Self::Host => MemType::Dram,
-            Self::Device(_) => MemType::Vram,
-        }
-    }
-
-    /// The device identifier NIXL keeps with a descriptor. NIXL matches a
-    /// transfer's descriptors to registered memory by address, length and
-    /// this identifier, so a region is named by the same value in its
-    /// registration and in every transfer.
-    pub(crate) fn device_id(self) -> u64 {
-        match self {
-            Self::Host => 0,
-            Self::Device(ordinal) => u64::from(ordinal),
+            Self::Device => MemType::Vram,
         }
     }
 }
 
 /// `len` bytes of `memory` from `address`, a host pointer or a CUDA device
-/// address in the process that registers the region.
+/// address in the process that registers the region, registered under
+/// `key`.
+///
+/// NIXL files a registration under its descriptor's device identifier and
+/// address range, in that order, and finds the registration a transfer's
+/// descriptor lies in by the same three values: every transfer names a
+/// region by the key it was registered under. The UCX backend reads no
+/// device from the identifier, so it is free to be a key. Registrations
+/// under distinct keys never shadow one another, even at one address: a
+/// peer that loaded the metadata of a registration since deregistered, and
+/// then of another at the same address, keeps the two apart, where NIXL
+/// would otherwise refuse the second or find the first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Region {
     pub memory: Memory,
     pub address: u64,
     pub len: usize,
+    pub key: u64,
 }
 
 /// One contiguous piece of a READ: the bytes of `source`, which lies in
 /// memory a peer registered, into `destination`, which lies in memory this
-/// agent registered. Both have the same, nonzero length.
+/// agent registered. Both have the same, nonzero length, and each names the
+/// key of the registration it lies in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Span {
     pub source: Region,
@@ -93,6 +95,6 @@ impl NixlDescriptor for Described {
     }
 
     fn device_id(&self) -> u64 {
-        self.0.memory.device_id()
+        self.0.key
     }
 }

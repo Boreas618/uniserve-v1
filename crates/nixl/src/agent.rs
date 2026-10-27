@@ -124,6 +124,19 @@ impl Agent {
             .map_err(Error::nixl("loading peer metadata"))
     }
 
+    /// Forgets `peer`'s metadata and its connection: a peer whose process
+    /// ended is not read again, and a later agent of that name is loaded
+    /// afresh.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no metadata of `peer` is loaded.
+    pub fn forget_peer(&self, peer: &str) -> Result<()> {
+        self.agent
+            .invalidate_remote_md(peer)
+            .map_err(Error::nixl("forgetting a peer"))
+    }
+
     /// Posts one READ of every span's source, in memory `peer` registered,
     /// into its destination, in memory this agent registered. All sources
     /// lie in one kind of memory (host or device), and so do all
@@ -138,8 +151,8 @@ impl Agent {
     /// # Errors
     ///
     /// Fails for an empty span list, spans of unequal or zero length or of
-    /// mixed memory kinds, and spans NIXL does not find within registered
-    /// memory of this agent or of `peer`.
+    /// mixed memory kinds, and spans NIXL does not find within memory this
+    /// agent or `peer` registered under the span's key.
     pub fn read(&self, peer: &str, spans: &[Span]) -> Result<Transfer> {
         let Some(first) = spans.first() else {
             return Err(Error::Invalid("a READ has at least one span".to_owned()));
@@ -165,15 +178,11 @@ impl Agent {
                     "the spans of one READ read one kind of memory into one kind".to_owned(),
                 ));
             }
-            sources.add_desc(
-                source.address as usize,
-                source.len,
-                source.memory.device_id(),
-            );
+            sources.add_desc(source.address as usize, source.len, source.key);
             destinations.add_desc(
                 destination.address as usize,
                 destination.len,
-                destination.memory.device_id(),
+                destination.key,
             );
         }
 
