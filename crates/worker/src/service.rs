@@ -104,6 +104,9 @@ pub(crate) struct Maintenance {
     /// (`kv_cache_config.max_tokens`), which bounds a successor world's
     /// pool as it bounds this one's; `None` for a pool sized by memory.
     pub(crate) max_total_tokens: Option<usize>,
+    /// The request slots the rank was configured for, whose state
+    /// checkpoints a token capacity also holds (`CachePlan::token_units`).
+    pub(crate) request_slots: usize,
     /// The rank's CUDA devices, whose contexts the rank probes while jobs
     /// are in flight (`Service::watch_jobs`).
     pub(crate) devices: Vec<cuda::DeviceId>,
@@ -700,15 +703,11 @@ impl Service<'_> {
                 // The units a configured token capacity holds, which bound a
                 // successor's head and inherited segments together.
                 let capacity_units = match (planes.as_ref(), self.maintenance.max_total_tokens) {
-                    (Some(planes), Some(tokens)) => {
-                        let pages: Vec<(u32, u32)> = planes
+                    (Some(planes), Some(tokens)) => Some(
+                        planes
                             .plan()
-                            .groups
-                            .iter()
-                            .map(|group| (group.block_size, group.units_per_page))
-                            .collect();
-                        Some(crate::capacity::units_for_tokens(&pages, tokens as u64))
-                    }
+                            .token_units(tokens as u64, self.maintenance.request_slots as u64),
+                    ),
                     _ => None,
                 };
                 serde_json::json!({
@@ -1120,6 +1119,7 @@ mod tests {
                 cupti: crate::profiling::cupti::Cupti::new(Vec::new()),
                 predecessor: None,
                 max_total_tokens: None,
+                request_slots: 0,
                 devices: Vec::new(),
                 host_cache: None,
             },

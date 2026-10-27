@@ -26,8 +26,10 @@ use super::*;
 ///
 /// `unit_ids` lists the units of logical pages `start_page..`, page-major:
 /// the group's `units_per_page` units of page `start_page` come first. Pages
-/// before `start_page` have been released by a sliding-window group, and a
-/// worker reads none of them. `allocated_tokens` is the absolute token extent
+/// before `start_page` have been released by a sliding-window or state
+/// group, and a worker reads none of them. A state group's page that holds
+/// no checkpoint names the padding sentinel, unit 0, for each of its units;
+/// a worker reads and writes none of them. `allocated_tokens` is the absolute token extent
 /// the table covers, up to the end of its last page; the worker checks it
 /// against the group's page shape, which this record does not carry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,16 +98,20 @@ fn distinct_units(units: &[UnitId]) -> bool {
 }
 
 impl BlockTable {
-    /// Validates table identity and unit uniqueness.
+    /// Validates table identity and unit uniqueness: a real unit appears
+    /// once, and the padding sentinel only for a page without units.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.request_pool_idx > 0,
             "block table request slot must be positive"
         );
-        ensure_valid!(
-            distinct_units(&self.unit_ids),
-            "block table repeats a unit or carries unit zero"
-        );
+        let held: Vec<UnitId> = self
+            .unit_ids
+            .iter()
+            .copied()
+            .filter(|unit| unit.0 > 0)
+            .collect();
+        ensure_valid!(distinct_units(&held), "block table repeats a unit");
         Ok(())
     }
 }

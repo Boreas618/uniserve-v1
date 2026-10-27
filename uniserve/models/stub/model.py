@@ -38,7 +38,7 @@ from uniserve.nn.attention import Attention
 from uniserve.nn.functional import patchify
 from uniserve.nn.vae.layers import DiagonalGaussian
 from uniserve.nn.vae.patch import PatchAutoencoder, RGBDecoder
-from uniserve.prefix_cache import State, StateConfig, slots
+from uniserve.prefix_cache import State, StateConfig, checkpoints, slots
 from uniserve.tensors import BufferConfig
 
 from .config import Config
@@ -158,12 +158,15 @@ class _Counter(nn.Module):
     """Count the tokens of each request in its request slot.
 
     A forward sets every row's count to its prefix plus its query tokens,
-    row after row, as a recurrent state advances over consecutive chunks of
-    one request in one forward. On a CPU rank it first refuses a row that
-    continues a prefix from another count: the count it continues from is
-    the one the request's previous chunk left in its slot, so the forward
-    fails when a request's state did not carry from one forward to the next
-    or a prefix was reused that its slot never counted.
+    as a recurrent state advances over consecutive chunks of one request
+    (a chain of rows of one request ends at its last row's count), and
+    checkpoints the count at the row's last page boundary into the page its
+    tables name there (``uniserve.prefix_cache.checkpoints``). A row
+    continues from the checkpoint its tables name at its prefix, else from
+    its slot's count. On a CPU rank it first refuses a row that starts a
+    chain at a prefix of another count, so the forward fails when a
+    request's state did not carry from one forward to the next, or a prefix
+    was reused whose checkpoint the request did not resume from.
     """
 
     function = "models.stub.model._Counter/1"
@@ -180,26 +183,52 @@ class _Counter(nn.Module):
         rows = slots.rows()
         if binding is None or rows is None:
             return
-        entry = attention.entry(None)
-        count = binding.state.tensors["count"]
-        prefixes = entry.prefixes.values[: rows.shape[0]].to(torch.int64)
-        queries = entry.queries.values[: rows.shape[0]].to(torch.int64)
-        if count.device.type == "cpu":
-            for slot, prefix, query in zip(
-                rows.tolist(), prefixes.tolist(), queries.tolist()
+        count = attention.queries.batch_size
+        slot_rows = rows[:count]
+        entry = next(iter(attention.entries.values()))
+        prefixes = entry.prefixes.values[:count].to(torch.int64)
+        queries = entry.queries.values[:count].to(torch.int64)
+        # Consecutive rows of one request continue each other: a chain
+        # starts from its first row's count and ends at its last row's.
+        first = checkpoints.chains(slot_rows, prefixes, queries)
+        resumed = checkpoints.resume(binding, attention, slot_rows)
+        if prefixes.device.type == "cpu":
+            for row, (slot, prefix, counted) in enumerate(
+                zip(
+                    slot_rows.tolist(),
+                    prefixes.tolist(),
+                    resumed["count.values"].tolist(),
+                    strict=True,
+                )
             ):
-                if slot == 0:
-                    continue
-                if prefix and int(count[slot]) != prefix:
+                if (
+                    slot != 0
+                    and prefix
+                    and int(first[row]) == row
+                    and counted != prefix
+                ):
                     raise RuntimeError(
-                        f"request slot {slot} counted {int(count[slot])} "
-                        f"tokens, not its prefix {prefix}"
+                        f"request slot {slot} counted {counted} tokens, not "
+                        f"its prefix {prefix}"
                     )
-                count[slot] = prefix + query
-            return
-        # Padding rows write zero into the padding slot.
-        live = rows > 0
-        count.index_copy_(0, rows, torch.where(live, prefixes + queries, 0))
+        ends = prefixes + queries
+        final = torch.zeros_like(ends).scatter_reduce_(
+            0, first, ends, reduce="amax"
+        )[first]
+        flags = torch.ones_like(prefixes, dtype=torch.bool)
+        if binding.checkpoints is not None:
+            boundary, units = binding.checkpoints.boundary(attention)
+            binding.checkpoints.write(
+                units,
+                {"count.values": boundary, "count.initialized": flags},
+                boundary >= 0,
+            )
+        # Padding rows count into the padding slot, which no request reads.
+        checkpoints.keep(
+            binding,
+            slot_rows,
+            {"count.values": final, "count.initialized": flags},
+        )
 
 
 class _Layer(nn.Module):

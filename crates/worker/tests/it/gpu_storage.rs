@@ -180,6 +180,7 @@ fn fp8_plan() -> CachePlan {
         dtype: PrefixCacheDtype::Float8E4m3Fn,
         groups: vec![CacheGroupPlan {
             window: None,
+            state: false,
             block_size: 8,
             units_per_page: 1,
             layers: vec!["a".into(), "b".into()],

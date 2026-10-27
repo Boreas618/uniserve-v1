@@ -915,6 +915,9 @@ message KvCache {
   // The bytes of the deployment's host KV cache on each host, over the
   // ranks there, in place of `host_ratio`; absent to size it by the ratio.
   optional uint64 host_bytes = 10;
+  // The decoded tokens between two checkpoints of a request's state kept
+  // per request slot; absent for the engine's default.
+  optional uint32 state_interval = 11;
 }
 
 message Mooncake {

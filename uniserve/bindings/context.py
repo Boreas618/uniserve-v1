@@ -914,6 +914,7 @@ class ExecutionContext:
                     self._cache[id(child)] = CacheBinding(
                         self.cache.state(name),
                         self.cache.table(name) if paged else None,
+                        None if paged else self.cache.checkpoints(name),
                     )
 
     def _bind_matmul(self, factory, layer, dtype, rows, merged) -> None:

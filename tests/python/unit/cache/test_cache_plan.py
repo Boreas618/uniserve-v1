@@ -317,12 +317,25 @@ def _counted():
     return CausalLM(backbone, nn.Identity())
 
 
-def test_layers_kept_per_request_stay_out_of_the_pool_and_bind_beside_it():
+def test_layers_kept_per_request_bind_slots_and_checkpoint_in_the_state_group():
     model = _counted()
     plan = cache.cache_plan(model, 16, "")
-    # The pool holds the attention layer's pages alone.
-    assert plan.layers() == ["backbone.layers.0.attention"]
-    assert model.backbone.cache_names == ("backbone.layers.0.attention",)
+    # The attention group, then the state group of the layer kept per
+    # request slot, whose pages are checkpoints a K/V page apart.
+    assert plan.kinds() == ["attention", "state"]
+    assert plan.layers() == [
+        "backbone.layers.0.attention",
+        "backbone.layers.0.count",
+    ]
+    assert model.backbone.cache_names == (
+        "backbone.layers.0.attention",
+        "backbone.layers.0.count",
+    )
+    assert plan.layer_ids() == [0, 1]
+    assert plan.block_sizes() == [16, 16]
+    assert plan.dtypes() == ["float32", "uint8"]
+    # A count and its flag fit one plane: one unit per checkpoint.
+    assert plan.units_per_page() == [1, 1]
     assert json.loads(plan.state_fields()) == [
         {
             "name": "backbone.layers.0.count/count.values",
@@ -349,6 +362,24 @@ def test_layers_kept_per_request_stay_out_of_the_pool_and_bind_beside_it():
     )
     assert pool.paged("backbone.layers.0.attention")
     assert not pool.paged("backbone.layers.0.count")
+
+    # A checkpoint written into unit 2 reads back from it; a row the write
+    # leaves out keeps the bytes of the padding sentinel, unit 0.
+    counts = pool.checkpoints("backbone.layers.0.count")
+    assert counts.interval == 16
+    sentinel = fields["key.values"][:, 0].clone()
+    counts.write(
+        torch.tensor([[2], [3]]),
+        {
+            "count.values": torch.tensor([48, 7]),
+            "count.initialized": torch.tensor([True, True]),
+        },
+        torch.tensor([True, False]),
+    )
+    read = counts.read(torch.tensor([[2], [3]]))
+    assert read["count.values"].tolist() == [48, 0]
+    assert read["count.initialized"].tolist() == [True, False]
+    assert torch.equal(fields["key.values"][:, 0], sentinel)
 
     # A bank of another shape is refused.
     fields["backbone.layers.0.count/count.values"] = torch.zeros(4, 2)

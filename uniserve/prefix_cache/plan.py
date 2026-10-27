@@ -7,8 +7,11 @@ what only the numerical library knows: the pool's layout for a loaded model
 passes back unchanged), whether the layers' readers read a page shape
 (``reads_pages``) and the layers' view of the pool (``pool``). Cache layers
 of a type indexed by request slot (``StateConfig.indexing == "states"``)
-stay out of the pool: the plan lists their fields (``state_fields``), which
-the worker allocates per request slot and binds with the pool.
+keep a request's state out of the pool: the plan lists their fields
+(``state_fields``), which the worker allocates per request slot and binds
+with the pool. Their checkpoints at token prefixes fill the pool's state
+group (:mod:`uniserve.prefix_cache.checkpoints`), whose pages the worker
+copies and the engine publishes as it does K/V pages.
 The scattered unit resets are :class:`uniserve.prefix_cache.units.UnitResets`
 and the dtype/FP8 conversion of imported pages is
 :class:`uniserve.prefix_cache.conversion.PageConversion`. Importing this
@@ -107,7 +110,9 @@ def _states(model: CausalLM) -> dict[str, StateConfig]:
 
 
 def _plan(model: CausalLM, block_size: int, prefix_cache_dtype: str) -> Planes:
-    """Plan the pool with ``block_size``-token pages of the widest rows."""
+    """Plan the pool with ``block_size``-token pages of the widest rows and
+    the state group of the layers kept per request slot.
+    """  # noqa: D205
     layers = _paged(model)
     if not layers:
         raise ValueError(
@@ -115,7 +120,7 @@ def _plan(model: CausalLM, block_size: int, prefix_cache_dtype: str) -> Planes:
         )
     dtype, fp8 = _storage(prefix_cache_dtype)
     return plan_units(
-        Config(layers),
+        Config({**layers, **_states(model)}),
         block_size=block_size,
         dtype=dtype,
         quantization={name: Quantizer("fp8", axis=0) for name in layers}
@@ -138,15 +143,13 @@ def _group_layers(model: CausalLM, planes: Planes) -> list[list[int]]:
     """
     backbone = model.backbone
     names = backbone.cache_names
-    layouts = model.cache_config.layers
     result = []
     for group in planes.groups:
-        layout = layouts[group.layers[0]]
-        key = (layout.window, layout.num_kv_heads, layout.head_dim)
+        key = backbone.cache_layers[names.index(group.layers[0])]
         members = [
             index
             for index, layer in enumerate(backbone.cache_layers)
-            if (layer.window, layer.num_kv_heads, layer.head_dim) == key
+            if layer == key
         ]
         local = {names.index(name) for name in group.layers}
         if not local.issubset(members):
@@ -171,11 +174,12 @@ class CachePlan:
     ``dtype`` describe the pool. Every other method returns one value per
     cache group, in table order, except ``layers`` and ``layer_ids``, which
     concatenate the groups' resident layers (``layer_counts`` of them per
-    group, in column order).
+    group, in column order). The state group of the layers kept per request
+    slot, when there is one, is the last group (``kinds``).
     """
 
     planes: Planes
-    # Each resident cache layer's layout.
+    # Each resident K/V cache layer's layout.
     configs: Mapping[str, mha.Config]
     # The published stored element type.
     stored: torch.dtype
@@ -188,9 +192,28 @@ class CachePlan:
     # Each resident cache layer kept per request slot, by name.
     states: Mapping[str, StateConfig]
 
-    def _layouts(self) -> list[mha.Config]:
-        """Each group's layer layout; a group's layers share one."""
-        return [self.configs[group.layers[0]] for group in self.planes.groups]
+    def _heads(self) -> list[tuple[int, tuple[int, ...]]]:
+        """Each group's logical heads and the heads this rank keeps: a K/V
+        group's K/V heads, the state group's state partition.
+        """  # noqa: D205
+        result = []
+        for group in self.planes.groups:
+            if group.states:
+                layout = self.states[group.layers[0]]
+                result.append((layout.heads, layout.state_heads))
+                continue
+            config = self.configs[group.layers[0]]
+            result.append((config.num_kv_heads, config.head_indices))
+        return result
+
+    def kinds(self) -> list[str]:
+        """Each group's kind: ``"attention"`` for K/V rows, ``"state"`` for
+        the checkpoints of the layers kept per request slot.
+        """  # noqa: D205
+        return [
+            "state" if group.states else "attention"
+            for group in self.planes.groups
+        ]
 
     def columns(self) -> int:
         """Columns per unit."""
@@ -213,7 +236,9 @@ class CachePlan:
         return _dtype_name(self.stored)
 
     def windows(self) -> list[int]:
-        """Each group's history window in tokens; -1 for full attention."""
+        """Each group's history window in tokens; -1 for full attention and
+        the state group.
+        """  # noqa: D205
         return [
             -1 if group.window is None else int(group.window)
             for group in self.planes.groups
@@ -248,16 +273,16 @@ class CachePlan:
         return [size for _, size in self.axes]
 
     def num_kv_heads(self) -> list[int]:
-        """K/V heads each group stores per layer on this rank."""
-        return [len(layout.head_indices) for layout in self._layouts()]
+        """Heads each group stores per layer on this rank."""
+        return [len(local) for _, local in self._heads()]
 
     def total_kv_heads(self) -> list[int]:
-        """Logical K/V heads of each group's layers."""
-        return [int(layout.num_kv_heads) for layout in self._layouts()]
+        """Logical heads of each group's layers."""
+        return [int(total) for total, _ in self._heads()]
 
     def kv_head_offsets(self) -> list[int]:
-        """The first logical K/V head each group stores on this rank."""
-        return [int(layout.head_indices[0]) for layout in self._layouts()]
+        """The first logical head each group stores on this rank."""
+        return [int(local[0]) for _, local in self._heads()]
 
     def head_dims(self) -> list[int]:
         """Each group's head width."""
@@ -268,8 +293,18 @@ class CachePlan:
         return [_dtype_name(group.dtype) for group in self.planes.groups]
 
     def compute_dtypes(self) -> list[str]:
-        """The compute element type of each group's layers."""
-        return [_dtype_name(layout.compute_dtype) for layout in self._layouts()]
+        """The compute element type of each group's layers; the state
+        group's is the first K/V group's.
+        """  # noqa: D205
+        first = self.configs[self.planes.groups[0].layers[0]].compute_dtype
+        return [
+            _dtype_name(
+                first
+                if group.states
+                else self.configs[group.layers[0]].compute_dtype
+            )
+            for group in self.planes.groups
+        ]
 
     def state_fields(self) -> str:
         """The fields of every layer kept per request slot, as JSON: a list
@@ -307,12 +342,17 @@ def cache_plan(loaded, block_size: int, prefix_cache_dtype: str) -> CachePlan:
     planes = _plan(model, block_size, prefix_cache_dtype)
     names = model.backbone.cache_names
     layouts = _paged(model)
+    states = _states(model)
 
     ids, axes = [], []
     for group, axis in zip(
         planes.groups, _group_layers(model, planes), strict=True
     ):
-        heads = layouts[group.layers[0]].head_indices
+        heads = (
+            states[group.layers[0]].state_heads
+            if group.states
+            else layouts[group.layers[0]].head_indices
+        )
         if heads != tuple(range(heads[0], heads[0] + len(heads))):
             raise ValueError(
                 "the worker K/V protocol requires consecutive logical cache "
@@ -338,11 +378,11 @@ def cache_plan(loaded, block_size: int, prefix_cache_dtype: str) -> CachePlan:
         else layouts[planes.groups[0].layers[0]].compute_dtype
     )
     configs = {
-        name: layouts[name] for group in planes.groups for name in group.layers
+        name: layouts[name]
+        for group in planes.attention
+        for name in group.layers
     }
-    return CachePlan(
-        planes, configs, stored, tuple(ids), tuple(axes), _states(model)
-    )
+    return CachePlan(planes, configs, stored, tuple(ids), tuple(axes), states)
 
 
 def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
@@ -383,7 +423,7 @@ def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
         )
     device = next(model.parameters()).device
     provider = resolve(backend, device=device)
-    for group in plan.planes.groups:
+    for group in plan.planes.attention:
         pages = CachePages(
             int(group.block_size), group.dtype, plan.planes.quantized
         )

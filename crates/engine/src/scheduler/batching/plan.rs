@@ -142,7 +142,7 @@ impl Scheduler {
                 let pos = logical_position;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let capacity_target = decode_capacity_target(pos as usize, 0);
-                if !self.ensure_request_capacity(id, cache_visible_len as usize, capacity_target) {
+                if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
                     return None;
                 }
 
@@ -153,7 +153,7 @@ impl Scheduler {
             Phase::CloseCache => {
                 let token = self.running.get(&id)?.next_token;
                 let capacity_target = decode_capacity_target(cache_visible_len as usize, 0);
-                if !self.ensure_request_capacity(id, cache_visible_len as usize, capacity_target) {
+                if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
                     return None;
                 }
 

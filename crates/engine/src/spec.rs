@@ -207,6 +207,12 @@ impl EngineConfig {
                 .map_or(crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL, |interval| {
                     interval as usize
                 }),
+            state_interval: kv_cache
+                .state_interval
+                .filter(|interval| *interval > 0)
+                .map_or(crate::kv_cache::DEFAULT_STATE_INTERVAL, |interval| {
+                    interval as usize
+                }),
             host_cache: crate::kv_cache::HostCacheSize::new(
                 kv_cache.host_ratio,
                 kv_cache.host_bytes,

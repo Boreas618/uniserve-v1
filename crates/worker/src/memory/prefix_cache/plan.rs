@@ -54,10 +54,15 @@ pub struct GroupAxis {
     pub total: u32,
 }
 
-/// One cache group: layers sharing a history window and a K/V page shape.
+/// One cache group: layers sharing a history window and a K/V page shape,
+/// or the state group, whose pages hold the checkpoints of the layers kept
+/// per request slot (`state`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheGroupPlan {
     pub window: Option<u32>,
+    /// Whether the group's pages hold state checkpoints: each of its layers'
+    /// state after the page's last token, in bytes the library lays out.
+    pub state: bool,
     pub block_size: u32,
     pub units_per_page: u32,
     /// Resident layer names in column order: layer `k` lies in column
@@ -83,7 +88,21 @@ impl CacheGroupPlan {
     }
 
     pub(crate) fn shape(&self) -> Result<GroupShape> {
-        GroupShape::new(self.block_size, self.units_per_page, self.window)
+        // A state checkpoint's reader continuing from token `t` reads the
+        // page ending at `t`, the page holding token `t - 1`: the pages a
+        // one-token window reads.
+        let window = if self.state { Some(1) } else { self.window };
+        GroupShape::new(self.block_size, self.units_per_page, window)
+    }
+
+    /// The group as the engine sees it.
+    fn kind(&self) -> CacheGroupKind {
+        if self.state {
+            return CacheGroupKind::State;
+        }
+        self.window.map_or(CacheGroupKind::Full, |window| {
+            CacheGroupKind::SlidingWindow { window }
+        })
     }
 }
 
@@ -185,6 +204,7 @@ impl CachePlan {
         // One value per group; a window of -1 keeps the whole history.
         let windows =
             integers(call("windows")?).map_err(|error| Error::numerical("windows", &error))?;
+        let kinds = names("kinds")?;
         let block_sizes = counts("block_sizes")?;
         let units_per_page = counts("units_per_page")?;
         let (axis_offsets, axis_sizes) = (counts("axis_offsets")?, counts("axis_sizes")?);
@@ -200,6 +220,7 @@ impl CachePlan {
             .enumerate()
             .map(|(group, layer_count)| CacheGroupPlan {
                 window: u32::try_from(windows[group]).ok(),
+                state: kinds[group] == "state",
                 block_size: block_sizes[group],
                 units_per_page: units_per_page[group],
                 layers: layers.by_ref().take(layer_count as usize).collect(),
@@ -268,9 +289,7 @@ impl CachePlan {
                 .groups
                 .iter()
                 .map(|group| CacheGroup {
-                    kind: group.window.map_or(CacheGroupKind::Full, |window| {
-                        CacheGroupKind::SlidingWindow { window }
-                    }),
+                    kind: group.kind(),
                     block_size: group.block_size,
                     units_per_page: group.units_per_page,
                     layer_ids: group.layer_ids.clone(),
@@ -290,7 +309,6 @@ impl CachePlan {
             inherited_units: 0,
             // The worker reports its identity once it loaded the model.
             identity: String::new(),
-            request_states: !self.states.is_empty(),
             // The rank reports what its host KV cache takes once the engine
             // copies its pages through one.
             host_token_bytes: 0,
@@ -298,12 +316,46 @@ impl CachePlan {
         }
     }
 
-    /// Elements `E` and scale entries `S` of the largest group page, which
-    /// size a cache import workspace: `E = block_size * layers * heads * dim`
-    /// and `S = block_size * layers * heads`, maximized over groups.
+    /// Whether the model keeps layers per request slot, whose checkpoints
+    /// fill the state group.
+    pub(crate) fn states(&self) -> bool {
+        self.groups.iter().any(|group| group.state)
+    }
+
+    /// The units a token capacity of `tokens` takes: the whole pages of
+    /// those tokens in every K/V group, and one checkpoint of the state
+    /// group per request slot of `request_slots`, the latest each running
+    /// request keeps.
+    pub(crate) fn token_units(&self, tokens: u64, request_slots: u64) -> u64 {
+        self.groups
+            .iter()
+            .map(|group| {
+                let pages = if group.state {
+                    request_slots
+                } else {
+                    tokens / u64::from(group.block_size)
+                };
+                pages * u64::from(group.units_per_page)
+            })
+            .sum()
+    }
+
+    /// Planes of one field one page of `group` spans: every column of every
+    /// unit of the page. A K/V group's page holds one plane per layer and
+    /// field (its layers fill whole units); the state group's checkpoints
+    /// fill the planes of its units in page order.
+    pub(crate) fn page_planes(&self, group: &CacheGroupPlan) -> u64 {
+        u64::from(group.units_per_page) * u64::from(self.columns)
+    }
+
+    /// Elements `E` and scale entries `S` of the largest K/V group page,
+    /// which size a cache import workspace: `E = block_size * layers *
+    /// heads * dim` and `S = block_size * layers * heads`, maximized over
+    /// groups. Imports carry K/V pages alone.
     pub(crate) fn page_extents(&self) -> (u64, u64) {
         self.groups
             .iter()
+            .filter(|group| !group.state)
             .fold((0, 0), |(elements, scales), group| {
                 let rows = u64::from(group.block_size)
                     * group.layers.len() as u64

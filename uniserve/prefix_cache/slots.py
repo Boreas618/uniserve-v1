@@ -6,8 +6,10 @@ which the worker allocates beside the unit pool and the block tables (slot
 0 is the padding slot padding rows address). A request keeps its slot from
 its first forward to its end, so its state carries from one forward to the
 next; a forward whose row has no prefix (its first) starts the row's state
-afresh, whatever an earlier request left in the slot. :func:`rows` gives
-the slot of every row (sequence) of the causal LM forward running.
+afresh, whatever an earlier request left in the slot, and a row whose
+tables name a checkpoint at its prefix starts from that checkpoint
+(:mod:`uniserve.prefix_cache.checkpoints`). :func:`rows` gives the slot of
+every row (sequence) of the causal LM forward running.
 """
 
 from __future__ import annotations

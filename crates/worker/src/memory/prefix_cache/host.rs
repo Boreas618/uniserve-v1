@@ -8,16 +8,22 @@
 //! on the rank's copy stream as soon as the batch arrives
 //! (`PrefixCache::issue_pages`).
 //!
-//! A page is one page of one group on this rank, layer-major:
+//! A page is one page of one group on this rank, plane by plane: the key
+//! planes of every unit and column of the page, in unit then column order,
+//! the value planes in the same order, and for FP8 pools the scales `[2,
+//! planes]` as `f32`. A K/V group's layer `k` lies in column `k % columns`
+//! of the page's unit `k / columns`, and one layer of one page fills exactly
+//! one plane of the unit pool (a group's block size is the plane over its
+//! row bytes), so a K/V page is layer-major:
 //!
 //! 1. keys `[layers, block_size, kv_heads, head_dim]`;
 //! 2. values, in the same shape;
 //! 3. for FP8 pools, the scales `[2, layers]` as `f32`.
 //!
-//! One layer of one page fills exactly one plane of the unit pool (a
-//! group's block size is the plane over its row bytes), so a page copies as
-//! one plane-sized run per field and layer, and one scale per field and
-//! layer.
+//! The state group's page holds its layers' checkpoints in the same planes,
+//! in the order the library lays them out. A page copies as one plane-sized
+//! run per field, unit and column, and one scale per field, unit and
+//! column.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -46,7 +52,8 @@ struct GroupPool {
     memory: Arc<Storage>,
     slots: u64,
     page_bytes: u64,
-    layers: u32,
+    /// Planes of one field a page spans (`CachePlan::page_planes`).
+    planes: u32,
 }
 
 /// The rank's page pools, by cache group.
@@ -56,19 +63,33 @@ pub(crate) struct HostKvCache {
 
 /// The bytes of one page of `group` on a pool of `plan`'s layout.
 fn page_bytes(plan: &CachePlan, group: &CacheGroupPlan) -> u64 {
-    let layers = group.layer_ids.len() as u64;
-    let scales = if plan.quantized { 2 * layers * 4 } else { 0 };
-    2 * layers * plan.plane_bytes + scales
+    let planes = plan.page_planes(group);
+    let scales = if plan.quantized { 2 * planes * 4 } else { 0 };
+    2 * planes * plan.plane_bytes + scales
+}
+
+/// The pages of the state group's block size between the checkpoints the
+/// host KV cache keeps of a long prompt: the engine offloads a state
+/// group's checkpoint before every aligned boundary, those of the default
+/// `kv_cache_config.boundary_interval`, and before a prompt's last ones.
+const STATE_SPACING: u64 = 64;
+
+/// The tokens one host page of `group` stands for: a K/V group's page holds
+/// its block size's, and a state group keeps one checkpoint per
+/// [`STATE_SPACING`] pages.
+fn page_tokens(group: &CacheGroupPlan) -> u64 {
+    let pages = if group.state { STATE_SPACING } else { 1 };
+    u64::from(group.block_size) * pages
 }
 
 /// The bytes one token of `plan`'s pages takes over every cache group: each
-/// group's page bytes over its block size, rounded up, so that the pools of
-/// `tokens` tokens ([`HostKvCache::start`]) take at most `tokens` times as
-/// many bytes.
+/// group's page bytes over the tokens a page stands for, rounded up, so that
+/// the pools of `tokens` tokens ([`HostKvCache::start`]) take at most
+/// `tokens` times as many bytes.
 pub(crate) fn token_bytes(plan: &CachePlan) -> u64 {
     plan.groups
         .iter()
-        .map(|group| page_bytes(plan, group).div_ceil(u64::from(group.block_size)))
+        .map(|group| page_bytes(plan, group).div_ceil(page_tokens(group)))
         .sum()
 }
 
@@ -93,6 +114,12 @@ fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
         digest.update(entry.head_dim.to_le_bytes());
         digest.update(entry.dtype.name().as_bytes());
         digest.update([0]);
+        // A state group's pages are its units' bytes, as many as its
+        // checkpoints fill.
+        if entry.state {
+            digest.update(b"state\0");
+            digest.update(entry.units_per_page.to_le_bytes());
+        }
     }
     digest.update((group as u64).to_le_bytes());
     digest.finalize().into()
@@ -191,7 +218,7 @@ impl HostKvCache {
                 kv_head_count: group.num_kv_heads,
                 page_bytes: page_bytes(plan, group),
             };
-            let slots = tokens / u64::from(group.block_size);
+            let slots = tokens / page_tokens(group);
             if slots == 0 {
                 return Err(Error::Resource(
                     "the host KV cache holds no page of each cache group",
@@ -240,7 +267,7 @@ impl HostKvCache {
                     memory,
                     slots,
                     page_bytes,
-                    layers: group.layer_ids.len() as u32,
+                    planes: plan.page_planes(group) as u32,
                 },
             );
             infos.push(PagePoolInfo {
@@ -254,7 +281,7 @@ impl HostKvCache {
     }
 
     /// One page's copies between its slot and its units: `(device, host,
-    /// bytes)` for every field and layer, then every scale.
+    /// bytes)` for every field and plane, then every scale.
     fn runs(&self, planes: &CachePlanes, copy: &PageCopy) -> Result<Vec<(u64, u64, usize)>> {
         let pool = self
             .pools
@@ -274,33 +301,33 @@ impl HostKvCache {
         }
         let plan = planes.plan();
         let columns = plan.columns;
-        if copy.units.len() as u32 * columns != pool.layers {
+        if copy.units.len() as u32 * columns != pool.planes {
             return Err(Error::Invalid(format!(
-                "a page of {} layers spans {} units of {columns} columns, not {}",
-                pool.layers,
-                pool.layers.div_ceil(columns),
+                "a page of {} planes spans {} units of {columns} columns, not {}",
+                pool.planes,
+                pool.planes.div_ceil(columns),
                 copy.units.len()
             )));
         }
         let plane = plan.plane_bytes;
         let slot = pool.memory.address() + copy.slot * pool.page_bytes;
-        let layers = u64::from(pool.layers);
-        let mut runs = Vec::with_capacity(2 * pool.layers as usize * 2);
+        let count = u64::from(pool.planes);
+        let mut runs = Vec::with_capacity(2 * pool.planes as usize * 2);
         for field in 0..2 {
-            for layer in 0..pool.layers {
-                let unit = copy.units[(layer / columns) as usize].0;
-                let device = planes.plane_address(field, layer % columns, unit)?;
-                let host = slot + (field as u64 * layers + u64::from(layer)) * plane;
+            for index in 0..pool.planes {
+                let unit = copy.units[(index / columns) as usize].0;
+                let device = planes.plane_address(field, index % columns, unit)?;
+                let host = slot + (field as u64 * count + u64::from(index)) * plane;
                 runs.push((device, host, plane as usize));
             }
         }
         if plan.quantized {
             for field in 0..2 {
-                for layer in 0..pool.layers {
-                    let unit = copy.units[(layer / columns) as usize].0;
-                    let device = planes.scale_address(field, layer % columns, unit)?;
+                for index in 0..pool.planes {
+                    let unit = copy.units[(index / columns) as usize].0;
+                    let device = planes.scale_address(field, index % columns, unit)?;
                     let host =
-                        slot + 2 * layers * plane + (field as u64 * layers + u64::from(layer)) * 4;
+                        slot + 2 * count * plane + (field as u64 * count + u64::from(index)) * 4;
                     runs.push((device, host, 4));
                 }
             }

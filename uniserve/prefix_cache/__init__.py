@@ -4,17 +4,20 @@ from typing import NamedTuple
 
 from torch import nn
 
+from .checkpoints import Checkpoints
 from .state import Config, State, StateConfig, block_spans
 
 
 class CacheBinding(NamedTuple):
-    """A cache layer's state in the active execution context, and the block
+    """A cache layer's state in the active execution context, the block
     table its pages are addressed through (``None`` for a ``"states"``
-    layer, addressed by request slot).
+    layer, addressed by request slot), and a ``"states"`` layer's
+    checkpoints in the pool's state group (``None`` without one).
     """  # noqa: D205
 
     state: State
     table: int | None
+    checkpoints: Checkpoints | None = None
 
 
 def bound(module: nn.Module) -> CacheBinding | None:
@@ -28,6 +31,7 @@ def bound(module: nn.Module) -> CacheBinding | None:
 
 __all__ = [
     "CacheBinding",
+    "Checkpoints",
     "Config",
     "State",
     "StateConfig",

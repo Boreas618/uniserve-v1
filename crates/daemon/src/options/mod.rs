@@ -373,6 +373,10 @@ pub struct KvCacheOptions {
     /// a long prompt offloads its sliding windows before; the engine's
     /// default when unset.
     pub boundary_interval: Option<NonZeroU32>,
+    /// The decoded tokens between two checkpoints of the state a model
+    /// keeps per request slot (a recurrent state); the engine's default
+    /// when unset.
+    pub state_interval: Option<NonZeroU32>,
 }
 
 impl Default for KvCacheOptions {
@@ -387,6 +391,7 @@ impl Default for KvCacheOptions {
             host_gib: None,
             mooncake: None,
             boundary_interval: None,
+            state_interval: None,
         }
     }
 }
@@ -1183,6 +1188,7 @@ impl ServeConfig {
                     library: text(&mooncake.library),
                 }),
                 boundary_interval: kv_cache.boundary_interval.map(NonZeroU32::get),
+                state_interval: kv_cache.state_interval.map(NonZeroU32::get),
                 host_ratio: kv_cache.host_ratio,
                 host_bytes: kv_cache.host_gib.map(|gib| gib.get() << 30),
             }),

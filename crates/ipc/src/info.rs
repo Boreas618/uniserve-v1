@@ -59,12 +59,6 @@ pub struct PrefixCacheInfo {
     /// world's. Empty for a rank that reports none.
     #[serde(default)]
     pub identity: String,
-    /// Whether the rank also keeps cache layers per request slot (a cache
-    /// layer type indexed by request, as a recurrent state): a page does not
-    /// hold the state a request reached, so no prefix is reused and no page
-    /// is copied through the host KV cache.
-    #[serde(default)]
-    pub request_states: bool,
     /// The bytes one token of the rank's pages takes in the host KV cache,
     /// over every cache group (a group's page bytes over its block size,
     /// rounded up); zero for a rank that copies no page through it. The
@@ -197,8 +191,11 @@ impl PrefixCacheInfo {
             0
         };
 
+        // Exports carry K/V pages alone: a worker refuses to export the
+        // cache of a model that keeps state per request slot.
         self.groups
             .iter()
+            .filter(|group| !group.kind.is_state())
             .map(|group| {
                 let published = group
                     .kind
@@ -327,7 +324,6 @@ impl PrefixCacheInfo {
             // The stages of one world inherit the same predecessor units.
             inherited_start: self.inherited_start,
             inherited_units: self.inherited_units,
-            request_states: self.request_states || other.request_states,
             // Each stage's pages are its own (`page_pools`); the merged view
             // copies none.
             host_token_bytes: 0,
@@ -838,7 +834,6 @@ impl Default for WorkerInfo {
                 held_segments: 0,
                 inherited_start: 0,
                 inherited_units: 0,
-                request_states: false,
                 identity: String::new(),
                 host_token_bytes: 0,
                 storage_endpoint: None,

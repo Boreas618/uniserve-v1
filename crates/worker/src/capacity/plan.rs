@@ -389,7 +389,8 @@ impl TokenLayout {
         });
         let mut capacity = CacheCapacity::derive(&CacheDemand {
             pages: &pages,
-            tokens,
+            token_units: tokens
+                .map(|tokens| cache.token_units(tokens, config.max_request_pool_size as u64)),
             units: adopted,
             unit_bytes,
             available_bytes: available,
@@ -504,12 +505,7 @@ impl TokenLayout {
         let page_units: u32 = cache.groups.iter().map(|group| group.units_per_page).sum();
         let full = match (config.max_total_tokens, config.pool_storage_full_bytes) {
             (Some(tokens), _) => {
-                let pages: Vec<(u32, u32)> = cache
-                    .groups
-                    .iter()
-                    .map(|group| (group.block_size, group.units_per_page))
-                    .collect();
-                super::units_for_tokens(&pages, tokens as u64)
+                cache.token_units(tokens as u64, config.max_request_pool_size as u64)
             }
             (None, Some(bytes)) => (bytes as u64 / unit_bytes).saturating_sub(reserved_units),
             (None, None) => u64::from(now) + u64::from(inherited),
@@ -745,6 +741,7 @@ pub(crate) mod tests {
             dtype: ipc::PrefixCacheDtype::BFloat16,
             groups: vec![crate::memory::CacheGroupPlan {
                 window: None,
+                state: false,
                 block_size: 64,
                 units_per_page: 2,
                 layers: vec!["layers.0".into(), "layers.1".into()],

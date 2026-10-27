@@ -20,17 +20,20 @@ from uniserve.prefix_cache import mha
 
 @dataclass(frozen=True, slots=True)
 class CacheLayer:
-    """Logical K/V geometry of one cache layer, before any partitioning.
+    """Logical geometry of one cache layer, before any partitioning.
 
-    ``window`` is the layer's attention history bound (``None`` reads the
-    whole history), and ``num_kv_heads`` counts every KV head of the
-    architecture. Cache layers that agree on all three share one cache
-    group of the unit pool.
+    A K/V layer's ``window`` is its attention history bound (``None`` reads
+    the whole history), and ``num_kv_heads`` counts every KV head of the
+    architecture. A layer kept per request slot (``state``) has no window,
+    its state's logical heads and a head width of one: its checkpoints fill
+    the pool's state group. Cache layers that agree on all four share one
+    cache group of the unit pool.
     """
 
     window: int | None
     num_kv_heads: int
     head_dim: int
+    state: bool = False
 
 
 def _cache_layers(layers) -> dict[str, prefix_cache.StateConfig]:
@@ -155,24 +158,32 @@ class TransformerDecoder(nn.Module):
         self.hidden_size = embedding.embedding_dim
         self.vocab_size = embedding.num_embeddings
         # Logical cache identities and geometry survive pipeline pruning.
-        # Resource owners use this order to describe global K/V transfers,
+        # Resource owners use this order to describe global cache transfers,
         # including each cache group's complete layer axis, without retaining
-        # parameters or modules belonging to another pipeline stage. Only
-        # paged layers transfer; a request's per-slot states do not.
-        paged: list[tuple[str, mha.Config]] = []
+        # parameters or modules belonging to another pipeline stage. The
+        # layers kept per request slot follow in the same order, as the
+        # state group's layers.
+        described: list[tuple[str, CacheLayer]] = []
         for name, layout in _cache_layers(layers).items():
-            if layout.indexing != "tokens":
+            if layout.indexing == "states":
+                described.append(
+                    (name, CacheLayer(None, layout.heads, 1, state=True))
+                )
                 continue
             if not isinstance(layout, mha.Config):
                 raise TypeError(
                     "a paged cache layer type subclasses mha.Config"
                 )
-            paged.append((name, layout))
-        self.cache_names = tuple(name for name, _ in paged)
-        self.cache_layers = tuple(
-            CacheLayer(layout.window, layout.num_kv_heads, layout.head_dim)
-            for _, layout in paged
-        )
+            described.append(
+                (
+                    name,
+                    CacheLayer(
+                        layout.window, layout.num_kv_heads, layout.head_dim
+                    ),
+                )
+            )
+        self.cache_names = tuple(name for name, _ in described)
+        self.cache_layers = tuple(layer for _, layer in described)
         if default_route is not None and (
             not isinstance(norm, nn.ModuleDict) or default_route not in norm
         ):
