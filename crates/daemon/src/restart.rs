@@ -130,6 +130,10 @@ struct Takeover {
     /// The configurations a rollback marked unavailable.
     #[serde(default)]
     unavailable: Vec<crate::worlds::Unavailable>,
+    /// The change the successor applies once it serves: the rest of a change
+    /// whose daemon options this hot restart applies.
+    #[serde(default)]
+    then: Option<crate::worlds::ApplyRequest>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -187,6 +191,7 @@ impl Restarter {
         &self,
         executable: Option<String>,
         config: Option<crate::options::ServeConfig>,
+        then: Option<Box<crate::worlds::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -293,6 +298,7 @@ impl Restarter {
                 sleep_paused: handoff.sleep_paused,
                 adapters: handoff.adapters,
                 unavailable: handoff.unavailable,
+                then: then.map(|request| *request),
             })),
             &borrowed,
         )?;
@@ -528,6 +534,7 @@ async fn prepared_successor(
         sleep_paused,
         adapters,
         unavailable,
+        then,
     } = *takeover;
     let mut descriptors = descriptors.into_iter();
     let mut next = || {
@@ -587,6 +594,9 @@ async fn prepared_successor(
         format!("serving {} after a hot restart", leader.served_model_name()),
     );
     admin.watch(&leader);
+    if let Some(request) = then {
+        crate::http::admin::apply_after_restart(&admin, &leader, request);
+    }
     let video_jobs = Arc::new(VideoJobs::new(
         config.video_job_config.clone(),
         shutdown.child_token(),

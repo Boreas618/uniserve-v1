@@ -813,6 +813,26 @@ impl Default for MigrationOptions {
     }
 }
 
+/// `current` with `target`'s daemon options (those `daemon_options_differ`
+/// compares): the configuration a hot restart of the daemon serves when an
+/// update changes both the daemon and what a world executes, before the
+/// daemon's successor changes the world.
+pub fn with_daemon_options(current: &ServeConfig, target: &ServeConfig) -> ServeConfig {
+    ServeConfig {
+        server_config: target.server_config.clone(),
+        logging_config: target.logging_config.clone(),
+        chat_config: target.chat_config.clone(),
+        image_fetch_config: target.image_fetch_config.clone(),
+        media_config: target.media_config.clone(),
+        video_job_config: target.video_job_config.clone(),
+        readout_config: target.readout_config,
+        migration_config: target.migration_config.clone(),
+        mm_processor_kwargs: target.mm_processor_kwargs.clone(),
+        diffusion_generation_config: target.diffusion_generation_config,
+        ..current.clone()
+    }
+}
+
 /// Whether `current` and `target` differ in the options the daemon reads
 /// alone (its HTTP server, the request and output processing, the media
 /// and video jobs, logging and migration), which a hot restart of the

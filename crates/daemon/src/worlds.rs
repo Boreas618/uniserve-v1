@@ -65,7 +65,7 @@ pub enum InFlight {
 }
 
 /// A change of the deployment's configuration (`PUT /admin/config`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApplyRequest {
     /// The whole target configuration as TOML, as `--config` reads it;
     /// `None` takes the current one.
@@ -91,10 +91,14 @@ pub enum Applied {
     /// The plan of a dry run, which changed nothing.
     Planned(serde_json::Value),
     /// The daemon's own options or executable change: a hot restart of the
-    /// daemon with the target configuration applies them.
+    /// daemon with the target configuration applies them. When the change
+    /// also changes what a world executes, the daemon's successor applies
+    /// `then`, the same change, which then changes the world alone: the
+    /// orchestrator changes before what it orchestrates.
     Daemon {
         config: Box<ServeConfig>,
         executable: Option<String>,
+        then: Option<Box<ApplyRequest>>,
     },
     /// A new world executes on trial.
     World(serde_json::Value),
@@ -432,10 +436,22 @@ impl Leader {
                 return Ok(Applied::Daemon {
                     config: Box::new(target),
                     executable: None,
+                    then: None,
                 });
             }
             *locked(&self.engines.config) = target;
             return Ok(Applied::InPlace(plan));
+        }
+        // The daemon orchestrates what changes in its world, its scheduling
+        // limits included: a hot restart applies its own options first, and
+        // its successor applies the change again, which then leaves the
+        // daemon's options as they are.
+        if daemon_changes {
+            return Ok(Applied::Daemon {
+                config: Box::new(crate::options::with_daemon_options(&current, &target)),
+                executable: None,
+                then: Some(Box::new(request)),
+            });
         }
         // Scheduling alone, within the batch the serving world's workers
         // were started for, changes in place at the schedulers' next step.
@@ -455,13 +471,6 @@ impl Leader {
             *locked(&self.engines.served) = Some(spec);
             *locked(&self.engines.config) = target;
             return Ok(Applied::InPlace(plan));
-        }
-        if daemon_changes {
-            return Err(UpdateError::Refused(
-                "the update changes both the daemon's own options and what a world executes: \
-                 apply the daemon's options first, which restarts the daemon, then the rest"
-                    .to_owned(),
-            ));
         }
         if !unmapped.is_empty() {
             return Err(UpdateError::Refused(format!(
