@@ -69,7 +69,7 @@ use storage::protocol::{Event, PageAnchor, PageLevel, PageSlot, PageWindow, Repl
 use storage::{Client, Key, Role, Scope};
 
 use super::manager::{self, AttentionManager};
-use super::{GroupShape, PageRef};
+use super::{CachedTokens, GroupShape, PageRef};
 use crate::executor::WorkerGroupId;
 
 /// The fewest tokens an L3 hit must add to the pools' hit to be prefetched:
@@ -527,40 +527,63 @@ impl KvOffloadManager {
         let Some(pools) = self.workers.get(worker) else {
             return Vec::new();
         };
-        let prompt = &prompt[..tokens.min(prompt.len())];
-        pools
-            .groups
-            .iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let mut digest = Sha256::new();
-                digest.update(b"uniserve-page");
-                digest.update(group.content);
-                match isolation_key {
-                    Some(key) => {
-                        digest.update([1]);
-                        digest.update(key.to_le_bytes());
-                    }
-                    None => digest.update([0]),
-                }
-                let mut chain: [u8; 32] = digest.finalize().into();
-                prompt
-                    .chunks_exact(group.manager.block_size())
-                    .map(|tokens| {
-                        let mut digest = Sha256::new();
-                        digest.update(chain);
-                        // The group, and text (`TEXT_MODALITY_TAG`).
-                        digest.update((index as u32).to_le_bytes());
-                        digest.update([0_u8]);
-                        for token in tokens {
-                            digest.update(token.to_le_bytes());
+        let mut keys = vec![Vec::new(); pools.groups.len()];
+        self.extend_page_keys(
+            worker,
+            &mut keys,
+            CachedTokens::prompt(&prompt[..tokens.min(prompt.len())]),
+            isolation_key,
+        );
+        keys
+    }
+
+    /// Extends each group's key chain in `keys` over the full pages of
+    /// `tokens` it does not cover yet, as [`Self::page_keys`] chains a
+    /// prompt's pages, so that the pages a request generated carry the keys
+    /// of the same pages of its migration's prompt. `keys` holds one chain
+    /// per group of `worker`, each a prefix of the chain over `tokens`; it is
+    /// left as it is for a worker the host KV cache does not serve.
+    pub(crate) fn extend_page_keys(
+        &self,
+        worker: &WorkerGroupId,
+        keys: &mut [Vec<Key>],
+        tokens: CachedTokens<'_>,
+        isolation_key: Option<u64>,
+    ) {
+        let Some(pools) = self.workers.get(worker) else {
+            return;
+        };
+        for (index, (group, chain)) in pools.groups.iter().zip(keys.iter_mut()).enumerate() {
+            let block = group.manager.block_size();
+            let mut parent: [u8; 32] = match chain.last() {
+                Some(last) => last.0,
+                None => {
+                    let mut digest = Sha256::new();
+                    digest.update(b"uniserve-page");
+                    digest.update(group.content);
+                    match isolation_key {
+                        Some(key) => {
+                            digest.update([1]);
+                            digest.update(key.to_le_bytes());
                         }
-                        chain = digest.finalize().into();
-                        Key(chain)
-                    })
-                    .collect()
-            })
-            .collect()
+                        None => digest.update([0]),
+                    }
+                    digest.finalize().into()
+                }
+            };
+            for page in chain.len()..tokens.len() / block {
+                let mut digest = Sha256::new();
+                digest.update(parent);
+                // The group, and text (`TEXT_MODALITY_TAG`).
+                digest.update((index as u32).to_le_bytes());
+                digest.update([0_u8]);
+                for token in tokens.page(page, block).iter() {
+                    digest.update(token.to_le_bytes());
+                }
+                parent = digest.finalize().into();
+                chain.push(Key(parent));
+            }
+        }
     }
 
     fn submit(&mut self, client: usize, request: &Request, purpose: Purpose) -> bool {
@@ -1762,6 +1785,44 @@ mod tests {
                 (1, 5)
             ]
         );
+    }
+
+    /// Keys extended over the tokens a request generated are the keys of
+    /// its migration's prompt, which continues with them.
+    #[test]
+    fn keys_extended_over_generated_tokens_are_the_migrations_keys() {
+        let server = Running::start();
+        let (_worker, pools) = worker_pools(&server, &[4, 5]);
+        let mut kv_offload =
+            KvOffloadManager::connect(&server.socket, "model", DEFAULT_BOUNDARY_INTERVAL).unwrap();
+        let cache = report(
+            vec![cache_group(None), cache_group(Some(128))],
+            &pools,
+            &[4, 5],
+        );
+        let text = WorkerGroupId("text".into());
+        assert!(kv_offload.add_worker(
+            &text,
+            &[RankCache {
+                local: true,
+                cache: &cache,
+            }]
+        ));
+        let prompt: Vec<u32> = (0..200).collect();
+        let generated: Vec<u32> = (500..700).collect();
+        let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
+        let mut keys = kv_offload.page_keys(&text, &prompt, Some(3), prompt.len());
+        kv_offload.extend_page_keys(
+            &text,
+            &mut keys,
+            CachedTokens::new(&prompt, &generated),
+            Some(3),
+        );
+        assert_eq!(
+            keys,
+            kv_offload.page_keys(&text, &migrated, Some(3), migrated.len())
+        );
+        assert!(keys.iter().all(|group| !group.is_empty()));
     }
 
     /// A prompt offloads its sliding windows before every interval of pages

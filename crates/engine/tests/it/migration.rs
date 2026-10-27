@@ -207,3 +207,61 @@ fn migrating_ends_running_and_queued_requests_as_migratable() {
     handle.shutdown();
     thread.join().unwrap();
 }
+
+/// The pages of the tokens a request generated serve its migration: the
+/// scheduler publishes each page of generated tokens once a decode wrote
+/// it, so the migrated request, whose prompt continues with those tokens,
+/// computes only what follows the last complete page.
+#[test]
+fn a_migration_reuses_the_pages_of_the_tokens_it_generated() {
+    use std::sync::atomic::Ordering;
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000);
+    sim.set_block_size(4);
+    let scheduler = support::scheduler_with(
+        Box::new(SimExecutor::new(sim)),
+        SimEngine::special_tokens(),
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    let stats = scheduler.stats_handle();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let thread = thread::spawn(move || {
+        let _ = scheduler.run(rx);
+    });
+    let handle = CommandSender::new(tx);
+
+    // Three prompt tokens and twenty generated ones: the cache holds the
+    // first twenty-two, five complete pages of four.
+    let mut first = handle
+        .submit(request(1, Vec::new(), SamplingParams::default(), 20))
+        .unwrap();
+    let (generated, terminal) = drain(&mut first);
+    assert!(
+        matches!(terminal, Some(Event::Finished { .. })),
+        "{terminal:?}"
+    );
+    assert_eq!(generated.len(), 20);
+    let hits_before = stats.prefix.hit_tokens.load(Ordering::Relaxed);
+
+    // Its migration's prompt is the twenty-three tokens: it reuses the five
+    // pages, all but the prompt's last token being cached, and computes the
+    // rest.
+    let mut migrated = handle
+        .submit(request(2, generated, SamplingParams::default(), 24))
+        .unwrap();
+    let (tokens, terminal) = drain(&mut migrated);
+    handle.shutdown();
+    thread.join().unwrap();
+
+    assert!(
+        matches!(terminal, Some(Event::Finished { .. })),
+        "{terminal:?}"
+    );
+    assert_eq!(tokens.len(), 4);
+    assert_eq!(
+        stats.prefix.hit_tokens.load(Ordering::Relaxed) - hits_before,
+        20
+    );
+}

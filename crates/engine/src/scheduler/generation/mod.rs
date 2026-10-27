@@ -1575,6 +1575,14 @@ impl RequestState {
         !self.req.multimodal_inputs.images.is_empty()
     }
 
+    /// Returns whether the request's cache holds its prompt and then the
+    /// tokens it generates, in order: a request that generates text alone
+    /// from a prompt without context images, whose migration resumes from
+    /// its generated tokens and finds their pages as its prompt's.
+    pub(super) fn caches_generated_text(&self) -> bool {
+        self.req.is_migratable() && !self.has_context_images() && self.replayable
+    }
+
     /// Returns whether execution continues after committing generation output.
     pub(super) fn continues_after_gen_commit(&self) -> bool {
         self.req.continues_after_image()
