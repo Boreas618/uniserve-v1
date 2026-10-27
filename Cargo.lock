@@ -3752,6 +3752,7 @@ dependencies = [
  "cuda",
  "libc",
  "mooncake_store",
+ "nixl",
  "rustix",
  "serde",
  "signal-hook-registry",

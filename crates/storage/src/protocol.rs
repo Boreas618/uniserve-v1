@@ -50,6 +50,14 @@
 //! keeps a task's sources unchanged and its destinations unread until the
 //! task ends; the Transfer Server reports the end only after it saw every
 //! copy complete on the host.
+//!
+//! A span's source may lie on another host ([`Region::Remote`]): the
+//! destination host's Transfer Server READs it through NIXL. It asks the
+//! source host's server, over that server's TCP endpoint as a
+//! [`Role::Peer`], to expose the regions ([`Request::Expose`]); that server
+//! has its own Transfer Server register their allocations with its NIXL
+//! agent ([`Event::Register`], [`Request::Registered`]) and answers with the
+//! agent's metadata and each region's address ([`Reply::Exposed`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -57,14 +65,18 @@ use serde::{Deserialize, Serialize};
 /// worker's role and of a claim, and a claim's `retire`); 6 adds the world
 /// of a head's role, whose page requests read and publish that world's
 /// pages; 7 adds transfers (the Transfer Server's role, its requests and
-/// events, and the listing's `transfer`).
-pub const VERSION: u32 = 7;
+/// events, and the listing's `transfer`); 8 adds transfers from other hosts
+/// (the remote region, allocation and link end, another host's Transfer
+/// Server's role and its exposures, and the registrations of the Transfer
+/// Server's NIXL agent).
+pub const VERSION: u32 = 8;
 
 /// The earliest client version the server serves: a client of version 4
 /// knows no worlds, and its requests act on world 0; a client of version 4
 /// or 5 states no world as a head, which reads and publishes world 0's
 /// pages; a client before version 7 makes no transfer request and reads no
-/// transfer event.
+/// transfer event; a client before version 8 names no memory of another
+/// host.
 pub const MIN_VERSION: u32 = 4;
 
 /// A content address: the 32-byte digest of everything that determines a
@@ -149,6 +161,11 @@ pub enum Role {
     /// The Transfer Server the server runs, which copies bytes between the
     /// memory the server holds.
     Transfer,
+    /// Another host's Transfer Server, which READs memory of this host
+    /// through NIXL for the tasks of its own host: it asks the server to
+    /// expose regions ([`Request::Expose`]). It connects to the server's
+    /// TCP endpoint.
+    Peer,
     /// An operator's client, which lists what the server holds and retires
     /// deployments that are no longer served.
     Operator,
@@ -305,7 +322,7 @@ pub enum Mode {
 }
 
 /// Memory a transfer copies from or into, as its client names it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Region {
     /// The storage of the retained tensor `key`, which a scope of the
@@ -332,6 +349,20 @@ pub enum Region {
         gpu: [u8; 16],
         bytes: u64,
         offset: u64,
+    },
+    /// Memory of another host that this host's Transfer Server READs
+    /// through NIXL: `region`, a retained tensor or a page pool of the
+    /// caller's deployment, as a client of that host names it, at the
+    /// Storage Server listening at `endpoint` (that server's
+    /// [`Request::Endpoint`]). Offsets count as they do in `region`. Only a
+    /// span's source lies on another host, since the destination's host
+    /// posts the READ. That host's server checks the region and its
+    /// Transfer Server registers it once the task runs, so a region of
+    /// another deployment, or a span past its end, fails the task instead
+    /// of refusing it.
+    Remote {
+        endpoint: String,
+        region: Box<Region>,
     },
 }
 
@@ -378,8 +409,9 @@ impl Priority {
     }
 }
 
-/// One end of a [`Link`]: host memory, or the memory of one GPU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// One end of a [`Link`]: host memory, the memory of one GPU, or memory of
+/// another host.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Memory {
     Host,
@@ -387,12 +419,21 @@ pub enum Memory {
     Device {
         gpu: [u8; 16],
     },
+    /// Memory of another host, which a READ reaches through the network
+    /// adapters: the host whose Storage Server listens at `endpoint`, and
+    /// there the GPU `gpu`, or host memory when `None`.
+    Remote {
+        endpoint: String,
+        gpu: Option<[u8; 16]>,
+    },
 }
 
 /// The path a copy takes, from the memory it reads to the memory it writes.
-/// The Transfer Server measures each link's bandwidth when it starts, cuts
-/// copies into chunks by it, and keeps a byte budget per link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// The Transfer Server measures each link within its host when it starts,
+/// and a link from another host by its first copy long enough to time; it
+/// cuts copies into chunks by the bandwidth, and keeps a byte budget per
+/// link.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Link {
     pub source: Memory,
     pub destination: Memory,
@@ -439,10 +480,20 @@ pub enum Allocation {
         gpu: [u8; 16],
         bytes: u64,
     },
+    /// The region `region` of `deployment` at the Storage Server of another
+    /// host listening at `endpoint`, as a [`Region::Remote`] names it: the
+    /// Transfer Server has that server expose it ([`Request::Expose`]) and
+    /// READs it.
+    Remote {
+        endpoint: String,
+        deployment: String,
+        region: Box<Region>,
+    },
 }
 
 /// One copy the server gives its Transfer Server: a [`Span`] with its
-/// regions resolved to allocations, and offsets from their first byte.
+/// regions resolved to allocations, and offsets from their first byte (from
+/// the region's first byte, for another host's region).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Move {
     pub source: Allocation,
@@ -452,11 +503,30 @@ pub struct Move {
     pub bytes: u64,
 }
 
-/// A link's bandwidth as the Transfer Server measured it when it started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A link's bandwidth as the Transfer Server measured it: when it started,
+/// or by the first copy long enough to time, for a link from another host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkBandwidth {
     pub link: Link,
     pub bytes_per_second: u64,
+}
+
+/// A range of memory a Transfer Server registered with its NIXL agent, as a
+/// peer's READ names it: NIXL finds the registration in the agent's
+/// metadata by the range's key, address and length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Registered {
+    /// Host memory, or the GPU with this UUID, of the registering host.
+    pub memory: Memory,
+    /// The key the agent registered the range under, which no other
+    /// registration of the agent takes, so that a peer that loaded the
+    /// metadata of a registration since undone at the same address does not
+    /// mistake it for this one.
+    pub key: u64,
+    /// The address of the range's first byte in the registering process.
+    pub address: u64,
+    /// The range's length in bytes.
+    pub bytes: u64,
 }
 
 /// The device memory the Transfer Server's CUDA context takes on one GPU,
@@ -469,7 +539,8 @@ pub struct ContextBytes {
 
 /// A client's request. Head requests come from a [`Role::Head`] client and
 /// worker requests from a [`Role::Worker`] client; `List` from any. The
-/// connector's and the Transfer Server's requests say which they are.
+/// connector's, the Transfer Server's and a peer's requests say which they
+/// are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
@@ -605,8 +676,9 @@ pub enum Request {
     /// copies and [`Event::Transferred`] when it ends. Refused, copying
     /// nothing, when no Transfer Server runs, when a region is not memory
     /// of the caller's deployment, or when a span reaches past its region
-    /// or writes a read-only tensor. A task ends with its submitter's
-    /// connection, cancelled.
+    /// or writes a read-only tensor; a region of another host is checked
+    /// by that host once the task runs ([`Region::Remote`]). A task ends
+    /// with its submitter's connection, cancelled.
     Transfer {
         spans: Vec<Span>,
         priority: Priority,
@@ -628,8 +700,11 @@ pub enum Request {
         links: Vec<Link>,
         throttle: Throttle,
     },
-    /// From the Transfer Server, once after it connected: each link's
-    /// bandwidth and the device memory its CUDA context takes on each GPU.
+    /// From the Transfer Server: each link's bandwidth and the device
+    /// memory its CUDA context takes on each GPU, once after it connected,
+    /// for every link within its host, and again for a link from another
+    /// host once a copy timed it. The server keeps the latest report of
+    /// each link and each GPU.
     Measured {
         links: Vec<LinkBandwidth>,
         contexts: Vec<ContextBytes>,
@@ -640,6 +715,31 @@ pub enum Request {
         task: u64,
         bytes: u64,
         end: Option<TransferEnd>,
+    },
+    /// From another host's Transfer Server ([`Role::Peer`]): have this
+    /// host's Transfer Server register `regions`, retained tensors or page
+    /// pools of `deployment` on this host, with its NIXL agent, for that
+    /// Transfer Server's READs. Answered with [`Reply::Exposed`] once they
+    /// are registered; refused when a region is not memory of the
+    /// deployment, when no Transfer Server is connected, or when it cannot
+    /// register them. A region stays registered until the server releases
+    /// its allocation or its Transfer Server ends. Whoever reads it keeps
+    /// it retained and unchanged until the read ends: the submitter of the
+    /// task that reads it.
+    Expose {
+        deployment: String,
+        regions: Vec<Region>,
+    },
+    /// From the Transfer Server: the allocations of the server's
+    /// [`Event::Register`] `request` are registered with its NIXL agent:
+    /// each allocation's range, in the order the event listed them, and
+    /// the agent's `metadata` taken after the registrations; or `failure`
+    /// says why they are not.
+    Registered {
+        request: u64,
+        metadata: Vec<u8>,
+        ranges: Vec<Registered>,
+        failure: Option<String>,
     },
 }
 
@@ -657,7 +757,8 @@ pub enum ErrorKind {
     /// A previous writer did not leave the GPU after its shoot-down; the GPU
     /// needs a reset.
     ShootDown,
-    /// The server failed to hold or pass a descriptor.
+    /// The server failed to hold or pass a descriptor, or its Transfer
+    /// Server to register memory with its NIXL agent.
     Resource,
     /// No Transfer Server is connected: it has not started yet, or it
     /// ended and the server starts it again.
@@ -734,8 +835,16 @@ pub enum Reply {
     },
     Throttled,
     /// The server took a report of its Transfer Server's
-    /// ([`Request::Measured`], [`Request::Copied`]).
+    /// ([`Request::Measured`], [`Request::Copied`], [`Request::Registered`]).
     Noted,
+    /// The regions of a [`Request::Expose`], registered with the NIXL agent
+    /// of this host's Transfer Server: the agent's `metadata`, which a READ's
+    /// agent loads to reach them, and each region's range, in order, from
+    /// the region's first byte to the end of its allocation.
+    Exposed {
+        metadata: Vec<u8>,
+        regions: Vec<Registered>,
+    },
     Error {
         kind: ErrorKind,
         message: String,
@@ -901,6 +1010,13 @@ pub enum Event {
     Throttle {
         links: Vec<Link>,
         throttle: Throttle,
+    },
+    /// To the Transfer Server: register `allocations`, each given before,
+    /// with its NIXL agent for another host's READs, and report with
+    /// [`Request::Registered`].
+    Register {
+        request: u64,
+        allocations: Vec<Allocation>,
     },
     /// To a head: the prefetch `tag` ended. `results[i]` is whether the pool
     /// holds the page of the prefetch's key `i`.

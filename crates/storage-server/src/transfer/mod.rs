@@ -14,8 +14,8 @@
 //! memory to itself) and the device memory its context takes on each GPU
 //! ([`devices`]), connects as [`Role::Transfer`] and reports both
 //! ([`Request::Measured`]). It then runs the server's tasks
-//! ([`Event::Transfer`]): every move goes to the lane of its link and of the
-//! GPU whose copy engine runs it ([`lanes`]), by path:
+//! ([`Event::Transfer`]): every move goes to the lane of its link and of
+//! what runs its copies ([`lanes`]), by path:
 //!
 //! | Source → destination | Runs on |
 //! | --- | --- |
@@ -24,47 +24,63 @@
 //! | host → GPU, GPU → host | the GPU's copy engines, with the host memory registered |
 //! | another host's GPU of the NVLink fabric ↔ this host | the local GPU's copy engines (the first GPU's for host memory), with the fabric handle imported |
 //! | host → host | the CPU |
+//! | another host's GPU or host memory → this host | NIXL READs this host's agent posts, through the network adapters ([`network`]) |
 //!
-//! No compute kernel runs: copies use copy engines only, so the world
-//! executing beside them keeps its compute units. A same-GPU read-only
-//! mapping instead of a copy is the worker's own (it maps the storage from
-//! the server). The path between hosts outside one NVLink fabric reads
-//! through NIXL, posted by the destination host's Transfer Server; it
-//! takes the same tasks, with regions of the source host that host's
-//! server registers with its own agent, and a lane per remote link.
+//! No compute kernel runs: copies use copy engines or the network adapters
+//! only, so the world executing beside them keeps its compute units. A
+//! same-GPU read-only mapping instead of a copy is the worker's own (it
+//! maps the storage from the server). A link from another host has a lane
+//! of its own, measured by its first copies long enough to time and then
+//! reported ([`Request::Measured`]), with the chunks, priorities and
+//! budget of every lane.
+//!
+//! The same agent serves other hosts' READs of this host's memory: the
+//! server has it register the allocations a peer asks to expose
+//! ([`Event::Register`]), and it reports the ranges and its metadata
+//! ([`Request::Registered`]). What waits on another host or on such a
+//! registration runs on a helper thread, so the main thread keeps taking
+//! the server's events and the lanes' reports meanwhile.
 //!
 //! It reports each task's progress and end ([`Request::Copied`]) only
-//! after the host saw the copies complete (an event its lane queried), so
-//! no CUDA event crosses a process. It ends when the server closes its
-//! connection.
+//! after the host saw the copies complete (an event its lane queried, or a
+//! READ it polled), so no CUDA event crosses a process. It ends when the
+//! server closes its connection.
 
 mod devices;
 mod lanes;
 mod memory;
+mod network;
 
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, poll};
 use storage::client::Client;
-use storage::protocol::{Allocation, Event, Link, Memory, Move, Priority, Reply, Request, Role};
+use storage::protocol::{
+    Allocation, Event, Link, Memory, Move, Priority, Registered, Reply, Request, Role, TransferEnd,
+};
 
 use devices::Gpus;
 use lanes::{End, LaneKey, Lanes, Piece, Runner};
 use memory::{Fabric, Mapped};
+use network::{Inbound, Network};
 
 /// How the Transfer Server copies.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Options {
     /// How long one chunk of a copy lasts at its link's bandwidth: far
     /// below one scheduler step of the world that executes beside the
     /// copies, so a copy engine turns to that world's copies, and to
     /// higher-priority tasks, between chunks.
     pub chunk: Duration,
+    /// NIXL's C API library (`libnixl_capi.so`) of the release `nixl-sys`
+    /// pins, which the agent of the path between hosts loads; the loader's
+    /// search path finds it when `None`.
+    pub nixl_library: Option<PathBuf>,
 }
 
 /// Why the Transfer Server stopped.
@@ -90,7 +106,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
     let (links, contexts) = devices::measure(&gpus)?;
     let bandwidths = links
         .iter()
-        .map(|measured| (measured.link, measured.bytes_per_second as f64))
+        .map(|measured| (measured.link.clone(), measured.bytes_per_second as f64))
         .collect();
 
     let mut client = Client::connect(socket, Role::Transfer)?;
@@ -98,10 +114,19 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
     )
     .map_err(io::Error::from)?;
+    let network = Arc::new(Network::new(options.nixl_library.clone()));
+    let (sender, finished) = mpsc::channel();
     let mut server = Served {
         gpus,
         allocations: HashMap::new(),
-        lanes: Lanes::new(wake_writer, options.chunk, bandwidths),
+        helpers: Helpers {
+            sender,
+            wake: Arc::new(wake_writer.try_clone()?),
+        },
+        lanes: Lanes::new(wake_writer, options.chunk, bandwidths, Arc::clone(&network)),
+        network,
+        finished,
+        exposing: HashMap::new(),
         replies: Vec::new(),
     };
     server.send(&mut client, &Request::Measured { links, contexts })?;
@@ -135,10 +160,66 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         while let Some((event, descriptors)) = client.next_event() {
             server.handle(event, descriptors);
         }
+        while let Ok(done) = server.finished.try_recv() {
+            if let Some(report) = server.finish(done) {
+                server.send(&mut client, &report)?;
+            }
+        }
         for (task, bytes, end) in server.lanes.reports() {
             server.send(&mut client, &Request::Copied { task, bytes, end })?;
         }
+        let links = server.lanes.measured();
+        if !links.is_empty() {
+            let measured = Request::Measured {
+                links,
+                contexts: Vec::new(),
+            };
+            server.send(&mut client, &measured)?;
+        }
         server.collect(&mut client);
+    }
+}
+
+/// What a helper thread finished, for the main thread.
+enum Done {
+    /// The pieces of task `task`, its moves from other hosts among them
+    /// once those hosts exposed their sources, or why it cannot run.
+    Sources {
+        task: u64,
+        priority: Priority,
+        pieces: Result<Vec<(LaneKey, Piece)>, String>,
+    },
+    /// The registrations of the server's `request`: the agent's metadata
+    /// and each allocation's range, or why they failed.
+    Registered {
+        request: u64,
+        registered: Result<(Vec<u8>, Vec<Registered>), String>,
+    },
+}
+
+/// Runs work that waits on another host, or on registering memory, off
+/// the main thread, and wakes the main thread with its outcome.
+struct Helpers {
+    sender: mpsc::Sender<Done>,
+    /// The write end of the main thread's wake pipe.
+    wake: Arc<OwnedFd>,
+}
+
+impl Helpers {
+    fn spawn(&self, work: impl FnOnce() -> Done + Send + 'static) {
+        let sender = self.sender.clone();
+        let wake = Arc::clone(&self.wake);
+        let spawned = std::thread::Builder::new()
+            .name("uniserve-transfer-helper".into())
+            .spawn(move || {
+                // The main thread ends only with the process, so its
+                // receiver outlives every helper.
+                let _ = sender.send(work());
+                let _ = rustix::io::write(&*wake, b"x");
+            });
+        if let Err(error) = spawned {
+            lanes::fatal("starting a helper thread", &error);
+        }
     }
 }
 
@@ -148,6 +229,15 @@ struct Served {
     /// The allocations the server gave, until it takes them back.
     allocations: HashMap<Allocation, Arc<Mapped>>,
     lanes: Lanes,
+    /// The NIXL agent of the path between hosts, which the lanes and the
+    /// helpers share.
+    network: Arc<Network>,
+    helpers: Helpers,
+    /// What the helpers finished.
+    finished: mpsc::Receiver<Done>,
+    /// The tasks whose sources other hosts are exposing, and whether the
+    /// server cancelled each meanwhile.
+    exposing: HashMap<u64, bool>,
     /// Requests sent and not answered yet.
     replies: Vec<u64>,
 }
@@ -190,6 +280,8 @@ impl Served {
             }
             Event::AllocationReleased { allocation } => {
                 // A task that copies it holds it until its copies complete.
+                // Its NIXL registration ends with its mapping, so another
+                // host's READ of it fails from then on.
                 self.allocations.remove(&allocation);
             }
             Event::Transfer {
@@ -197,11 +289,20 @@ impl Served {
                 priority,
                 moves,
             } => self.transfer(task, priority, &moves),
-            Event::Cancel { task } => self.lanes.cancel(task),
+            Event::Cancel { task } => match self.exposing.get_mut(&task) {
+                // Its pieces are not queued yet: it ends, cancelled, once
+                // the other hosts answered.
+                Some(cancelled) => *cancelled = true,
+                None => self.lanes.cancel(task),
+            },
             Event::Throttle { links, throttle } => {
                 tracing::info!(links = links.len(), ?throttle, "changing link budgets");
                 self.lanes.throttle(&links, throttle);
             }
+            Event::Register {
+                request,
+                allocations,
+            } => self.register(request, &allocations),
             Event::TransferProgress { .. }
             | Event::Transferred { .. }
             | Event::Prefetched { .. }
@@ -214,26 +315,121 @@ impl Served {
     }
 
     /// Queue task `task`'s moves on their lanes, or fail it whole when one
-    /// cannot run here.
+    /// cannot run here. A task with moves from other hosts queues once a
+    /// helper had those hosts expose their sources.
     fn transfer(&mut self, task: u64, priority: Priority, moves: &[Move]) {
         let mut pieces = Vec::with_capacity(moves.len());
-        // Another host's allocation is imported once per task and GPU,
-        // whatever number of its moves read or write it.
+        let mut inbound = Vec::new();
+        // Another host's allocation of the fabric is imported once per task
+        // and GPU, whatever number of its moves read or write it.
         let mut imports = HashMap::new();
         for copy in moves {
-            match self.piece(task, copy, &mut imports) {
-                Ok(piece) => pieces.push(piece),
-                Err(message) => {
-                    self.lanes.fail(task, message);
-                    return;
-                }
+            let taken = match &copy.source {
+                Allocation::Remote {
+                    endpoint,
+                    deployment,
+                    region,
+                } => self.given(&copy.destination).map(|destination| {
+                    inbound.push(Inbound {
+                        endpoint: endpoint.clone(),
+                        deployment: deployment.clone(),
+                        region: (**region).clone(),
+                        source_offset: copy.source_offset,
+                        destination,
+                        destination_offset: copy.destination_offset,
+                        bytes: copy.bytes,
+                    });
+                }),
+                _ => self
+                    .piece(task, copy, &mut imports)
+                    .map(|piece| pieces.push(piece)),
+            };
+            if let Err(message) = taken {
+                self.lanes.end(task, TransferEnd::Failed { message });
+                return;
             }
         }
-        self.lanes.submit(task, priority, pieces);
+        if inbound.is_empty() {
+            self.lanes.submit(task, priority, pieces);
+            return;
+        }
+
+        self.exposing.insert(task, false);
+        let network = Arc::clone(&self.network);
+        self.helpers.spawn(move || {
+            let pieces = network.pieces(task, inbound).map(|remote| {
+                pieces.extend(remote);
+                pieces
+            });
+            Done::Sources {
+                task,
+                priority,
+                pieces,
+            }
+        });
     }
 
-    /// The lane and the piece of one move; `imports` holds the task's
-    /// imports of other hosts' allocations.
+    /// Register `allocations` with the NIXL agent for another host's READs,
+    /// on a helper: registering pins the memory, which takes a while for a
+    /// large page pool.
+    fn register(&mut self, request: u64, allocations: &[Allocation]) {
+        let mapped: Result<Vec<Arc<Mapped>>, String> = allocations
+            .iter()
+            .map(|allocation| self.given(allocation))
+            .collect();
+        let network = Arc::clone(&self.network);
+        self.helpers.spawn(move || Done::Registered {
+            request,
+            registered: mapped.and_then(|mapped| network::register(&network, &mapped)),
+        });
+    }
+
+    /// Take what a helper finished; returns the report it makes to the
+    /// server.
+    fn finish(&mut self, done: Done) -> Option<Request> {
+        match done {
+            Done::Sources {
+                task,
+                priority,
+                pieces,
+            } => {
+                let cancelled = self.exposing.remove(&task).unwrap_or(false);
+                match pieces {
+                    _ if cancelled => self.lanes.end(task, TransferEnd::Cancelled),
+                    Ok(pieces) => self.lanes.submit(task, priority, pieces),
+                    Err(message) => {
+                        tracing::warn!(task, message, "a task's sources on other hosts failed");
+                        self.lanes.end(task, TransferEnd::Failed { message });
+                    }
+                }
+                None
+            }
+            Done::Registered {
+                request,
+                registered,
+            } => Some(match registered {
+                Ok((metadata, ranges)) => Request::Registered {
+                    request,
+                    metadata,
+                    ranges,
+                    failure: None,
+                },
+                Err(message) => {
+                    tracing::warn!(message, "registering memory for another host failed");
+                    Request::Registered {
+                        request,
+                        metadata: Vec::new(),
+                        ranges: Vec::new(),
+                        failure: Some(message),
+                    }
+                }
+            }),
+        }
+    }
+
+    /// The lane and the piece of one move between allocations of this host
+    /// and of the fabric; `imports` holds the task's imports of other
+    /// hosts' allocations.
     fn piece(
         &self,
         task: u64,
@@ -258,6 +454,16 @@ impl Served {
         Ok((LaneKey { link, runner }, piece))
     }
 
+    /// An allocation the server gave.
+    fn given(&self, allocation: &Allocation) -> Result<Arc<Mapped>, String> {
+        match self.side(allocation)? {
+            Side::Given(mapped) => Ok(mapped),
+            Side::Fabric { .. } => {
+                Err("another host's memory of the fabric is neither READ into nor exposed".into())
+            }
+        }
+    }
+
     fn side(&self, allocation: &Allocation) -> Result<Side, String> {
         match allocation {
             Allocation::Storage { .. } | Allocation::Pool { .. } => self
@@ -273,6 +479,9 @@ impl Served {
                 gpu: *gpu,
                 bytes: *bytes,
             }),
+            Allocation::Remote { endpoint, .. } => Err(format!(
+                "memory of {endpoint} is read by a READ into this host, never copied otherwise"
+            )),
         }
     }
 
@@ -305,11 +514,11 @@ impl Served {
                 {
                     let reader = self.gpus.by_device(device).map_or_else(
                         || device.to_string(),
-                        |gpu| devices::memory_name(Memory::Device { gpu: gpu.uuid }),
+                        |gpu| memory_name(&Memory::Device { gpu: gpu.uuid }),
                     );
                     return Err(format!(
                         "{reader} cannot address the memory of {}",
-                        devices::memory_name(mapped.memory)
+                        memory_name(&mapped.memory)
                     ));
                 }
             }
@@ -335,7 +544,7 @@ enum Side {
 impl Side {
     fn memory(&self) -> Memory {
         match self {
-            Side::Given(mapped) => mapped.memory,
+            Side::Given(mapped) => mapped.memory.clone(),
             Side::Fabric { gpu, .. } => Memory::Device { gpu: *gpu },
         }
     }
@@ -355,10 +564,23 @@ impl Side {
                     .or_insert_with(|| Arc::new(Fabric::new(*handle, *bytes, device)));
                 Ok(End::Fabric(Arc::clone(import)))
             }
-            (Side::Fabric { .. }, Runner::Host) => {
+            (Side::Fabric { .. }, Runner::Host | Runner::Network) => {
                 Err("another host's GPU memory is copied by a GPU of this host".into())
             }
         }
+    }
+}
+
+/// A link end's name, for the log and the listing: `host`, a GPU's UUID,
+/// or another host's Storage Server endpoint with its GPU or `host`.
+pub(crate) fn memory_name(memory: &Memory) -> String {
+    match memory {
+        Memory::Host => "host".into(),
+        Memory::Device { gpu } => cuda::DeviceUuid(*gpu).to_string(),
+        Memory::Remote { endpoint, gpu } => match gpu {
+            Some(gpu) => format!("{endpoint} {}", cuda::DeviceUuid(*gpu)),
+            None => format!("{endpoint} host"),
+        },
     }
 }
 

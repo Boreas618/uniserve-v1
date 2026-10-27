@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The Storage Server of one host and its Mooncake connector. It links no
-# CUDA runtime: it holds device memory only through descriptors, and asks
-# NVML (`cuda`) which processes a GPU still lists.
+# The Storage Server of one host, its Mooncake connector and its Transfer
+# Server. It links no CUDA runtime: the server holds device memory only
+# through descriptors and asks NVML (`cuda`) which processes a GPU still
+# lists, and the Transfer Server loads the CUDA driver, and NIXL for copies
+# between hosts (`nixl`), at run time.
 [dependencies]
 anyhow.workspace = true
 cuda.workspace = true
 libc.workspace = true
 mooncake_store.workspace = true
+nixl.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }
 serde.workspace = true
 signal-hook-registry.workspace = true

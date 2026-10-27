@@ -310,7 +310,8 @@ impl Connection {
     }
 
     /// Block until a frame arrives and return it. Fails with
-    /// `UnexpectedEof` when the peer closes first.
+    /// `UnexpectedEof` when the peer closes first, and with `TimedOut` when
+    /// the socket's receive timeout (`SO_RCVTIMEO`) passes without a byte.
     pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<(T, Vec<OwnedFd>)> {
         loop {
             if let Some(frame) = self.next_frame()? {
@@ -322,7 +323,14 @@ impl Connection {
                     "the storage server connection closed",
                 ));
             }
-            self.receive()?;
+            // A blocking read returns nothing without the peer closing only
+            // when the socket's receive timeout passed.
+            if !self.receive()? && !self.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the storage server did not answer within the connection's timeout",
+                ));
+            }
         }
     }
 }

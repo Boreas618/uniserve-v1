@@ -100,13 +100,14 @@ struct Client {
     pid: i32,
     /// The peer process, held so that its identity cannot be reused; `None`
     /// for a connection from another host, which may only make a head's
-    /// page and transfer requests.
+    /// page and transfer requests or another host's Transfer Server's
+    /// exposures.
     pidfd: Option<Arc<OwnedFd>>,
     role: Option<Role>,
     /// Requests received and not yet answered, in arrival order.
     queue: VecDeque<(u64, Request, Vec<OwnedFd>)>,
-    /// Whether a request taken from the queue waits for the connector, which
-    /// holds the queue until it is answered.
+    /// Whether a request taken from the queue waits for the connector or
+    /// the Transfer Server, which holds the queue until it is answered.
     held: bool,
 }
 
@@ -167,6 +168,9 @@ enum Outcome {
     Wait(Vec<Holder>),
     /// The request is answered when the connector finishes this task.
     KvStorage(Task),
+    /// A peer's exposure, answered once the Transfer Server registered its
+    /// regions.
+    Exposing(transfers::Exposing),
 }
 
 /// A descriptor that travels with a reply.
@@ -500,9 +504,10 @@ impl Server {
                     message: "the connection already said hello".into(),
                 };
             }
-            if client.pidfd.is_none() && !matches!(hello.role, Role::Head { .. }) {
+            if client.pidfd.is_none() && !matches!(hello.role, Role::Head { .. } | Role::Peer) {
                 return Welcome::Refused {
-                    message: "a connection from another host is a head's".into(),
+                    message: "a connection from another host is a head's or a Transfer Server's"
+                        .into(),
                 };
             }
             if matches!(hello.role, Role::Connector) {
@@ -565,6 +570,12 @@ impl Server {
                     self.assign(task);
                     self.send_events();
                     return;
+                }
+                Ok(Outcome::Exposing(exposing)) => {
+                    // Holds the connection until the Transfer Server
+                    // reports, unless it is refused at once.
+                    self.begin_exposure(id, request_id, exposing);
+                    self.send_events();
                 }
                 Ok(Outcome::Wait(victims)) => {
                     for victim in victims {
@@ -653,9 +664,17 @@ impl Server {
                 Request::Transfer { .. } | Request::Cancel { .. } | Request::Throttle { .. },
                 role,
             ) => self.transfer_request(id, request, &role),
-            (Request::Measured { .. } | Request::Copied { .. }, Role::Transfer) => {
-                self.transfer_report(request)
-            }
+            (
+                Request::Measured { .. } | Request::Copied { .. } | Request::Registered { .. },
+                Role::Transfer,
+            ) => self.transfer_report(request),
+            (
+                Request::Expose {
+                    deployment,
+                    regions,
+                },
+                Role::Peer,
+            ) => self.expose(deployment, regions),
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
                 // A download that failed freed the slots it had reserved.
@@ -2202,6 +2221,8 @@ fn request_name(request: &Request) -> &'static str {
         Request::Throttle { .. } => "throttle",
         Request::Measured { .. } => "measured",
         Request::Copied { .. } => "copied",
+        Request::Expose { .. } => "expose",
+        Request::Registered { .. } => "registered",
     }
 }
 
