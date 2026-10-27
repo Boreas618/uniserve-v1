@@ -950,19 +950,25 @@ impl Service<'_> {
                 // update: the checkpoint loads beside the cache, in the
                 // graph memory as well when the free memory alone does not
                 // hold it.
-                let suspended = payload["keep"].as_bool().unwrap_or(false)
-                    && !self.maintenance.asleep
-                    && self.make_room_for_weights()?;
+                let keep = payload["keep"].as_bool().unwrap_or(false) && !self.maintenance.asleep;
+                let suspended = keep && self.make_room_for_weights()?;
                 let updated = match (self.maintenance.weights.as_mut(), retained.as_deref()) {
                     (Some(weights), Some(retained)) => {
                         weights.apply(path, retained, plan.as_deref(), copies_pages)
                     }
                     _ => Ok(serde_json::json!({ "group": null, "page_contents": [] })),
                 };
+                // The checkpoint copy is gone: its staging booking ends, and
+                // the graph memory given back for it returns and is booked
+                // again.
+                if keep {
+                    self.book_staging(&BTreeMap::new())?;
+                }
                 if suspended {
                     for pool in &self.maintenance.pools {
                         pool.restore()?;
                     }
+                    self.book_memory(true)?;
                 }
                 updated?
             }
@@ -1000,15 +1006,18 @@ impl Service<'_> {
 
     /// Makes the device memory beside the KV cache hold a checkpoint of the
     /// rank's weights, which an update keeping the requests in flight loads
-    /// into new memory before it copies each tensor into place: the graph
-    /// memory is given back when the free memory alone does not hold it.
-    /// Returns whether it was given back, for the caller to restore once the
-    /// update ends.
+    /// into new memory before it copies each tensor into place. The copy is
+    /// booked in each device's ledger as the rank's staging, within the
+    /// deployment's quota, and must fit the device's free memory; the graph
+    /// memory is given back (and its booking ended) when the quota or the
+    /// free memory does not hold the copy beside it. Returns whether it was
+    /// given back, for the caller to restore once the update ends.
     ///
     /// # Errors
     ///
-    /// Refuses, with the graph memory restored, when even the free memory
-    /// and the graph memory together do not hold the checkpoint.
+    /// Refuses, with the graph memory restored and booked and the staging
+    /// unbooked, when even without the graph memory the quota or the free
+    /// memory does not hold the checkpoint.
     fn make_room_for_weights(&mut self) -> crate::Result<bool> {
         let Some(weights) = self.maintenance.weights.as_ref() else {
             return Ok(false);
@@ -1028,24 +1037,55 @@ impl Service<'_> {
             }
             Ok(None)
         };
-        if short(&needed)?.is_none() {
+        if self.book_staging(&needed).is_ok() && short(&needed)?.is_none() {
             return Ok(false);
         }
         for pool in &self.maintenance.pools {
             pool.suspend()?;
         }
-        if let Some((device, bytes, free)) = short(&needed)? {
+        self.book_memory(false)?;
+        let refusal = match self.book_staging(&needed) {
+            Err(error) => Some(format!("{error}")),
+            Ok(()) => short(&needed)?.map(|(device, bytes, free)| {
+                format!(
+                    "the checkpoint's {bytes} bytes on {device} exceed the {free} bytes free with \
+                     the graph memory given back"
+                )
+            }),
+        };
+        if let Some(refusal) = refusal {
+            self.book_staging(&BTreeMap::new())?;
             for pool in &self.maintenance.pools {
                 pool.restore()?;
             }
+            self.book_memory(true)?;
             return Err(Error::Unsupported(format!(
-                "keeping the requests in flight through the weight update loads the checkpoint's \
-                 {bytes} bytes on {device} beside their KV cache, where {free} bytes are free with \
-                 the graph memory given back: update with the requests in flight recomputed or \
-                 aborted instead"
+                "keeping the requests in flight through the weight update loads the checkpoint \
+                 beside their KV cache: {refusal}; update with the requests in flight \
+                 recomputed or aborted instead"
             )));
         }
         Ok(true)
+    }
+
+    /// Books `bytes` of staging on each device of the rank's ledger
+    /// bookings, those `bytes` does not name at 0: a transient copy the rank
+    /// holds beside its other memory. Refused, past the quota, with the
+    /// ledger's entries.
+    fn book_staging(&self, bytes: &BTreeMap<cuda::DeviceId, u64>) -> crate::Result<()> {
+        let Some(retained) = self.maintenance.retained.as_deref() else {
+            return Ok(());
+        };
+        for booking in &self.maintenance.bookings {
+            let staging = bytes.get(&booking.device).copied().unwrap_or(0);
+            retained.book(
+                booking.device,
+                booking.total,
+                booking.quota,
+                vec![(storage::Item::Staging, staging)],
+            )?;
+        }
+        Ok(())
     }
 }
 
