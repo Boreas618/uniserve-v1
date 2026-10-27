@@ -2,15 +2,20 @@
 //!
 //! An engine asks every node's daemon to claim the deployment before a worker
 //! starts there (`Claim`): the daemon starts the node's Storage Server when
-//! it has none, claims the scopes the deployment places on the node, and
+//! it has none, claims the scopes the engine's world places on the node, and
 //! holds the claiming connection for as long as it runs. The claim therefore
-//! outlives every engine: the engine of a hot update, whose workers stand by
-//! under the running engine's claim, asks for the same scopes and is answered
-//! with the claim held. A claim of other scopes is a new placement: it
-//! replaces the claim, and the server releases the scopes no longer listed
-//! and shoots down the workers of the previous claim.
+//! outlives every engine and every world: an engine that succeeds another
+//! claims the scopes of its own world under the same claim, and its workers
+//! hold the same token as the running world's, so neither world's memory is
+//! touched by the other's claim. A claim names the worlds whose memory on
+//! the node ends (`retire`): the world a commit superseded, or the world a
+//! rollback discarded.
+//!
+//! A server of an earlier protocol than this build's is restarted with this
+//! daemon's executable before the deployment is claimed: the successor goes
+//! on with every connection and every allocation it holds.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
@@ -19,12 +24,18 @@ use proto::process::{Claim, Claimed};
 /// Longest a Storage Server this daemon starts takes to listen.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longest the successor of a Storage Server restart takes to serve.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often a restart checks whether the successor serves.
+const RESTART_POLL: Duration = Duration::from_millis(50);
+
 /// One deployment's claim on this node.
 struct Held {
     /// The connection that holds the claim; the claim ends with it.
     client: storage::Client,
-    /// The scopes claimed, sorted.
-    scopes: Vec<(String, u32)>,
+    /// The scopes each world claimed, sorted.
+    worlds: BTreeMap<u64, Vec<(String, u32)>>,
     claimed: Claimed,
 }
 
@@ -54,14 +65,15 @@ impl ClaimHolder {
         }
     }
 
-    /// Claims `claim`'s deployment at this node's Storage Server, starting
-    /// the server when the node has none, or answers the claim held for the
-    /// same scopes.
+    /// Claims `claim`'s deployment for its world at this node's Storage
+    /// Server, starting the server when the node has none and restarting it
+    /// when it speaks an earlier protocol, or answers the claim held when the
+    /// world claimed the same scopes and retires nothing.
     ///
     /// # Errors
     ///
-    /// Fails when the server cannot be started or reached, or refuses the
-    /// claim because another head of the deployment holds it.
+    /// Fails when the server cannot be started, restarted or reached, or
+    /// refuses the claim because another head of the deployment holds it.
     pub(crate) fn claim(&mut self, claim: &Claim) -> anyhow::Result<Claimed> {
         use anyhow::Context as _;
 
@@ -71,9 +83,37 @@ impl ClaimHolder {
             .map(|scope| (scope.group.clone(), scope.rank))
             .collect();
         scopes.sort();
-        if let Some(held) = self.held.get(&claim.deployment)
-            && held.scopes == scopes
-        {
+        let as_scopes = |deployment: &str| {
+            scopes
+                .iter()
+                .map(|(group, rank)| storage::Scope {
+                    deployment: deployment.to_owned(),
+                    group: group.clone(),
+                    rank: *rank,
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(held) = self.held.get_mut(&claim.deployment) {
+            if claim.retire.is_empty() && held.worlds.get(&claim.world) == Some(&scopes) {
+                return Ok(held.claimed.clone());
+            }
+            held.client
+                .claim(
+                    claim.world,
+                    as_scopes(&claim.deployment),
+                    claim.retire.clone(),
+                )
+                .with_context(|| format!("claiming deployment {}", claim.deployment))?;
+            for world in &claim.retire {
+                held.worlds.remove(world);
+            }
+            held.worlds.insert(claim.world, scopes);
+            tracing::info!(
+                deployment = %claim.deployment,
+                world = claim.world,
+                retired = ?claim.retire,
+                "claimed the deployment's storage for a world"
+            );
             return Ok(held.claimed.clone());
         }
 
@@ -84,9 +124,7 @@ impl ClaimHolder {
         }
         storage::socket::ensure(&self.executable, &socket, START_TIMEOUT, &arguments)
             .context("starting this node's storage server")?;
-        // A previous claim of the deployment ends before the new one is made,
-        // so the server sees no other head connected.
-        self.held.remove(&claim.deployment);
+        self.restart_earlier(&socket)?;
         let mut client = storage::Client::connect(
             &socket,
             storage::Role::Head {
@@ -96,14 +134,9 @@ impl ClaimHolder {
         .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
         let token = client
             .claim(
-                scopes
-                    .iter()
-                    .map(|(group, rank)| storage::Scope {
-                        deployment: claim.deployment.clone(),
-                        group: group.clone(),
-                        rank: *rank,
-                    })
-                    .collect(),
+                claim.world,
+                as_scopes(&claim.deployment),
+                claim.retire.clone(),
             )
             .with_context(|| format!("claiming deployment {}", claim.deployment))?;
         // A server another process started may accept no other node.
@@ -124,16 +157,56 @@ impl ClaimHolder {
             claim: token.0.to_vec(),
             tcp,
         };
-        tracing::info!(deployment = %claim.deployment, scopes = scopes.len(), "claimed the deployment's storage");
+        tracing::info!(deployment = %claim.deployment, world = claim.world, scopes = scopes.len(), "claimed the deployment's storage");
         self.held.insert(
             claim.deployment.clone(),
             Held {
                 client,
-                scopes,
+                worlds: BTreeMap::from([(claim.world, scopes)]),
                 claimed: claimed.clone(),
             },
         );
         Ok(claimed)
+    }
+
+    /// Restarts the server at `socket` with this daemon's executable when it
+    /// speaks an earlier protocol than this build, which needs this build's,
+    /// and waits until the successor serves: it goes on with every
+    /// connection and allocation, so no deployment of the host notices.
+    fn restart_earlier(&self, socket: &std::path::Path) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let mut operator = storage::Client::connect_operator(socket)
+            .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
+        if operator.version() >= storage::protocol::VERSION {
+            return Ok(());
+        }
+        let earlier = operator.version();
+        let pid = operator
+            .restart(Some(self.executable.to_string_lossy().into_owned()))
+            .context("restarting a storage server of an earlier protocol")?;
+        tracing::info!(
+            earlier,
+            version = storage::protocol::VERSION,
+            pid,
+            "restarting the storage server, which speaks an earlier protocol"
+        );
+        drop(operator);
+        let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
+        loop {
+            if let Ok(client) = storage::Client::connect_operator(socket)
+                && client.version() >= storage::protocol::VERSION
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the storage server did not serve protocol {} within {RESTART_TIMEOUT:?} of its \
+                 restart",
+                storage::protocol::VERSION
+            );
+            std::thread::sleep(RESTART_POLL);
+        }
     }
 }
 
@@ -151,7 +224,11 @@ pub(crate) struct HandedClaims {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct HandedClaim {
     deployment: String,
+    /// The scopes of a predecessor that knew no worlds, which world 0 holds.
+    #[serde(default)]
     scopes: Vec<(String, u32)>,
+    #[serde(default)]
+    worlds: BTreeMap<u64, Vec<(String, u32)>>,
     socket: String,
     claim: Vec<u8>,
     tcp: String,
@@ -176,7 +253,8 @@ impl ClaimHolder {
             descriptors.push(descriptor);
             claims.push(HandedClaim {
                 deployment,
-                scopes: held.scopes,
+                scopes: Vec::new(),
+                worlds: held.worlds,
                 socket: held.claimed.socket,
                 claim: held.claimed.claim,
                 tcp: held.claimed.tcp,
@@ -206,7 +284,11 @@ impl ClaimHolder {
                 claim.deployment,
                 Held {
                     client: storage::Client::resume(descriptor, claim.next),
-                    scopes: claim.scopes,
+                    worlds: if claim.scopes.is_empty() {
+                        claim.worlds
+                    } else {
+                        BTreeMap::from([(0, claim.scopes)])
+                    },
                     claimed: Claimed {
                         socket: claim.socket,
                         claim: claim.claim,

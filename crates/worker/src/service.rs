@@ -96,6 +96,17 @@ pub(crate) struct Maintenance {
     /// CUPTI's attachment to the rank, which `uniserve.attach_cupti` and
     /// `uniserve.detach_cupti` change.
     pub(crate) cupti: crate::profiling::cupti::Cupti,
+    /// The KV cache of the predecessor world's worker of the rank's scope,
+    /// whose flags and scales `uniserve.adopt_cache` copies at the world's
+    /// promotion; `None` for a world that succeeds none.
+    pub(crate) predecessor: Option<ipc::PredecessorCache>,
+    /// The token capacity the deployment configured for the KV cache
+    /// (`kv_cache_config.max_tokens`), which bounds a successor world's
+    /// pool as it bounds this one's; `None` for a pool sized by memory.
+    pub(crate) max_total_tokens: Option<usize>,
+    /// The rank's CUDA devices, whose contexts the rank probes while jobs
+    /// are in flight (`Service::watch_jobs`).
+    pub(crate) devices: Vec<cuda::DeviceId>,
 }
 
 /// A standby worker parked until its promotion: its retained storages,
@@ -169,6 +180,9 @@ pub(crate) struct Service<'a> {
     /// A stalled job was reported. The engine fails the rank on the report, so
     /// it is made once.
     stalled: bool,
+    /// When the devices' contexts were last probed for an error that left
+    /// them unusable.
+    probed: Instant,
     /// The engine's channel failed: it closed, or a send or receive on it
     /// did.
     channel_failed: Cell<bool>,
@@ -200,6 +214,7 @@ impl<'a> Service<'a> {
             last_result: Instant::now(),
             stall_bound,
             stalled: false,
+            probed: Instant::now(),
             channel_failed: Cell::new(false),
             standby,
             maintenance,
@@ -519,8 +534,37 @@ impl<'a> Service<'a> {
             return Ok(None);
         };
         let running = since.elapsed();
+        // A context that an illegal memory access or a device-side assert
+        // left unusable runs none of the work behind the failure, so the
+        // completions of the jobs in flight never post: the rank fails with
+        // the driver's error, which leaves its context unusable, at once
+        // rather than at the stall bound.
+        if running >= CONTEXT_PROBE && self.probed.elapsed() >= CONTEXT_PROBE {
+            self.probed = Instant::now();
+            let failed = self
+                .maintenance
+                .devices
+                .iter()
+                .find_map(|device| device.context_error().err());
+            if let Some(error) = failed {
+                let error = WorkerError::classify(Error::Cuda(error), Some("a job in flight"));
+                // The engine reads the failure as the answer to the oldest
+                // batch it awaits and fails the rank with its error, before
+                // the connection closes as the rank ends.
+                let awaited = self.pending.iter().find_map(|pending| match pending {
+                    PendingResponse::Batch { message_id, .. } => Some(*message_id),
+                    PendingResponse::Ready(_) => None,
+                });
+                if let Some(message_id) = awaited {
+                    let response = self.error_response(message_id, error.clone())?;
+                    self.respond(&response)?;
+                    self.channel.flush().map_err(|e| self.channel_error(e))?;
+                }
+                return Err(error);
+            }
+        }
         if running < self.stall_bound {
-            return Ok(Some(self.stall_bound - running));
+            return Ok(Some((self.stall_bound - running).min(CONTEXT_PROBE)));
         }
 
         let batch = self.executor.batch_of(job);
@@ -550,6 +594,10 @@ impl Drop for Service<'_> {
         self.executor.set_completion_wake(None);
     }
 }
+
+/// How long a job stays in flight before the rank probes its devices'
+/// contexts, and how often it probes them while one does.
+const CONTEXT_PROBE: Duration = Duration::from_secs(1);
 
 /// The prefix of the hooks the worker runs itself, which no plugin may
 /// implement.
@@ -598,12 +646,10 @@ impl Service<'_> {
         let result = match name {
             "uniserve.cache_memory" => {
                 let device = planes.as_ref().and_then(|planes| planes.device());
-                let (segments, units) = planes
-                    .as_ref()
-                    .and_then(|planes| planes.segments())
-                    .unwrap_or((0, 0));
-                // A parked standby keeps the graph share of the device free
-                // beside the workers it stands by for (`park_memory`).
+                // A successor world needs the graph share of the device
+                // (`park_memory`), the memory the process holds beside the
+                // shared weights and the cache, and the exclusive storages
+                // its world creates for itself beside its cache planes.
                 let (free, process, reserve) = match device {
                     Some(device) => {
                         let memory = device.memory_info()?;
@@ -615,20 +661,58 @@ impl Service<'_> {
                     }
                     None => (0, 0, 0),
                 };
-                let plan = planes.as_ref().map(|planes| Arc::clone(planes.plan()));
-                let segment_bytes = plan.map_or(0, |plan| {
-                    2 * u64::from(plan.columns) * u64::from(units) * plan.plane_bytes
-                });
+                let exclusive = match (retained.as_deref(), device) {
+                    (Some(retained), Some(device)) => retained.exclusive_bytes(device)?,
+                    _ => 0,
+                };
+                let scratch = self
+                    .executor
+                    .backend()
+                    .worker_storage()
+                    .and_then(|storage| storage.prefix_cache.as_ref())
+                    .map_or(0, crate::memory::PrefixCache::scratch_lent);
+                // The head segment a successor creates beside its
+                // predecessor's: the sentinel, the scratch of a warmup like
+                // this rank's and one page of every group, in whole granules.
+                let head_bytes = match (planes.as_ref(), device) {
+                    (Some(planes), Some(device)) => {
+                        let plan = planes.plan();
+                        let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
+                        let page_units: u32 =
+                            plan.groups.iter().map(|group| group.units_per_page).sum();
+                        u64::from(crate::memory::PlaneLayout::whole_granules(
+                            1 + scratch + page_units,
+                            plan.plane_bytes,
+                            granularity,
+                        )) * planes.unit_bytes()
+                    }
+                    _ => 0,
+                };
+                // The units a configured token capacity holds, which bound a
+                // successor's head and inherited segments together.
+                let capacity_units = match (planes.as_ref(), self.maintenance.max_total_tokens) {
+                    (Some(planes), Some(tokens)) => {
+                        let pages: Vec<(u32, u32)> = planes
+                            .plan()
+                            .groups
+                            .iter()
+                            .map(|group| (group.block_size, group.units_per_page))
+                            .collect();
+                        Some(crate::capacity::units_for_tokens(&pages, tokens as u64))
+                    }
+                    _ => None,
+                };
                 serde_json::json!({
-                    "segments": segments,
-                    "segment_units": units,
-                    "segment_bytes": segment_bytes,
-                    "released_from": planes.as_ref().map_or(0, |planes| {
-                        planes.usable_units() / units.max(1)
-                    }),
+                    "segments": planes.as_ref().and_then(|planes| planes.segments()).unwrap_or_default(),
+                    "held": planes.as_ref().map_or(0, |planes| planes.held_segments()),
+                    "unit_bytes": planes.as_ref().map_or(0, |planes| planes.unit_bytes()),
+                    "head_bytes": head_bytes,
+                    "capacity_units": capacity_units,
+                    "scratch_units": scratch,
                     "free_bytes": free,
                     "process_bytes": process,
                     "reserve_bytes": reserve,
+                    "exclusive_bytes": exclusive,
                 })
             }
             "uniserve.release_cache" => {
@@ -636,14 +720,79 @@ impl Service<'_> {
                     .as_u64()
                     .and_then(|first| u32::try_from(first).ok())
                     .ok_or_else(|| Error::Invalid("release_cache names no segment".into()))?;
-                planes
-                    .ok_or_else(|| Error::State("the rank holds no cache"))?
-                    .release_segments(first, memory)?;
+                // A rank that holds no cache, such as an expert worker, has
+                // none to give back.
+                if let Some(planes) = planes {
+                    planes.release_segments(first, memory)?;
+                }
                 serde_json::Value::Null
             }
             "uniserve.restore_cache" => {
-                restore(planes.as_ref(), memory)?;
+                let limit = payload["segments"]
+                    .as_u64()
+                    .and_then(|count| u32::try_from(count).ok());
+                restore(planes.as_ref(), memory, limit)?;
                 serde_json::Value::Null
+            }
+            "uniserve.adopt_cache" => {
+                // The world's promotion: the predecessor parked, so the
+                // flags and scales of the units the planes inherit are
+                // final, and the rank copies them into its own.
+                let (Some(planes), Some(predecessor), Some(retained)) = (
+                    planes.as_ref(),
+                    self.maintenance.predecessor.as_ref(),
+                    retained.as_deref(),
+                ) else {
+                    return Ok(serde_json::Value::Null.to_string());
+                };
+                let device = planes
+                    .device()
+                    .ok_or_else(|| Error::State("a host pool inherits no cache"))?;
+                let plan = planes.plan();
+                let cells = plan.columns as usize * predecessor.num_units as usize;
+                let peers = crate::memory::allocation::Storage::peers(device)?;
+                let mut names = Vec::new();
+                for field in crate::memory::prefix_cache::planes::FIELDS {
+                    names.push((format!("prefix_cache.{field}.initialized"), cells));
+                    if plan.quantized {
+                        names.push((format!("prefix_cache.{field}.scale"), cells * 4));
+                    }
+                }
+                let specs: Vec<crate::memory::retained::ExclusiveSpec<'_>> = names
+                    .iter()
+                    .map(|(name, bytes)| crate::memory::retained::ExclusiveSpec {
+                        name,
+                        device,
+                        bytes: *bytes,
+                        access: &peers,
+                    })
+                    .collect();
+                let mapped = retained.map_inherited(&specs, predecessor.world)?;
+                let storages: Vec<_> = mapped
+                    .iter()
+                    .map(|(_, storage)| Arc::clone(storage))
+                    .collect();
+                let stream = cuda::Stream::new(device)?;
+                planes.adopt_inherited(&storages, predecessor.num_units, &stream)?;
+                let keys: Vec<_> = mapped.iter().map(|(key, _)| *key).collect();
+                drop(storages);
+                drop(mapped);
+                retained.forget(&keys)?;
+                let inherited = planes.inherited();
+                tracing::info!(
+                    units = inherited.end - inherited.start,
+                    "adopted the predecessor world's cache flags"
+                );
+                serde_json::json!({ "inherited": inherited.end - inherited.start })
+            }
+            "uniserve.take_cache" => {
+                // The world's commit: its predecessor is gone, and the rank
+                // takes the segments it mapped read-only.
+                let taken = match (planes.as_ref(), retained.as_deref()) {
+                    (Some(planes), Some(retained)) => planes.take_inherited(retained)?,
+                    _ => 0,
+                };
+                serde_json::json!({ "segments": taken })
             }
             "uniserve.sleep" => {
                 // Asleep from the start: a wake restores whatever a sleep
@@ -665,7 +814,7 @@ impl Service<'_> {
                     for pool in &self.maintenance.pools {
                         pool.restore()?;
                     }
-                    restore(planes.as_ref(), memory)?;
+                    restore(planes.as_ref(), memory, None)?;
                     self.maintenance.asleep = false;
                     tracing::info!("the worker woke: its graph memory and cache are restored");
                 }
@@ -711,6 +860,7 @@ impl Service<'_> {
 fn restore(
     planes: Option<&Arc<crate::memory::CachePlanes>>,
     memory: &mut dyn crate::memory::retained::ExclusiveMemory,
+    limit: Option<u32>,
 ) -> crate::Result<()> {
     let Some(planes) = planes else {
         return Ok(());
@@ -722,7 +872,7 @@ fn restore(
         return Ok(());
     }
     let stream = cuda::Stream::new(device)?;
-    planes.restore_segments(memory, &stream)
+    planes.restore_segments(memory, &stream, limit)
 }
 
 /// Runs the worker hook `name` with `payload` (`uniserve.hooks.call`) and
@@ -873,6 +1023,9 @@ mod tests {
                 pools: Vec::new(),
                 asleep: false,
                 cupti: crate::profiling::cupti::Cupti::new(Vec::new()),
+                predecessor: None,
+                max_total_tokens: None,
+                devices: Vec::new(),
             },
         )
         .run()

@@ -143,7 +143,7 @@ fn an_engine_takes_its_processes_with_it() {
     let directory = tempfile::tempdir().unwrap();
     let daemon = start(&directory, "node");
 
-    // Two engines of one deployment, as during a hot update, name the same
+    // Two engines of one deployment, as during a world change, name the same
     // groups and ranks.
     let mut leaving = Engine::connect(daemon.address().unwrap());
     let mut staying = Engine::connect(daemon.address().unwrap());

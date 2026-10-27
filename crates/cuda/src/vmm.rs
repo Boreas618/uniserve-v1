@@ -593,9 +593,11 @@ pub struct SegmentedMapping {
     bytes: usize,
     /// The devices granted access, `device` first.
     access: Vec<DeviceId>,
+    /// The protection a segment is mapped with unless it states its own.
     protection: Protection,
-    /// Each segment's offset and length, and its handle while mapped.
-    segments: Vec<(usize, usize, Option<u64>)>,
+    /// Each segment's offset and length, its handle while mapped, and the
+    /// protection it is mapped with.
+    segments: Vec<(usize, usize, Option<u64>, Protection)>,
     // Declared last so that the fields above stay valid until teardown.
     range: VirtualRange,
 }
@@ -624,7 +626,7 @@ impl SegmentedMapping {
         let mut segments = Vec::with_capacity(lengths.len());
         let mut total = 0_usize;
         for bytes in lengths {
-            segments.push((total, *bytes, None));
+            segments.push((total, *bytes, None, Protection::ReadWrite));
             total = total
                 .checked_add(*bytes)
                 .ok_or_else(|| Error::invalid("the segmented range's size overflows"))?;
@@ -670,14 +672,16 @@ impl SegmentedMapping {
 
     /// Segment `index`'s length; zero for a segment that does not exist.
     pub fn segment_len(&self, index: usize) -> usize {
-        self.segments.get(index).map_or(0, |(_, bytes, _)| *bytes)
+        self.segments
+            .get(index)
+            .map_or(0, |(_, bytes, _, _)| *bytes)
     }
 
     /// Whether segment `index` is mapped.
     pub fn is_mapped(&self, index: usize) -> bool {
         self.segments
             .get(index)
-            .is_some_and(|(_, _, handle)| handle.is_some())
+            .is_some_and(|(_, _, handle, _)| handle.is_some())
     }
 
     /// Creates the physical memory of segment `index`, maps it with the
@@ -737,6 +741,24 @@ impl SegmentedMapping {
     ///
     /// Fails when the segment is mapped already or the driver refuses.
     pub fn import(&mut self, index: usize, descriptor: &OwnedFd) -> Result<()> {
+        self.import_protected(index, descriptor, self.protection)
+    }
+
+    /// Maps segment `index` from the POSIX descriptor of a physical
+    /// allocation of its length with `protection`, which the segment keeps
+    /// through later changes of the mapping's protection until
+    /// [`Self::protect_segment`] changes it: a segment another process
+    /// writes is mapped read-only, so a fault here cannot corrupt it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the segment is mapped already or the driver refuses.
+    pub fn import_protected(
+        &mut self,
+        index: usize,
+        descriptor: &OwnedFd,
+        protection: Protection,
+    ) -> Result<()> {
         let (offset, bytes) = self.unmapped(index)?;
         let context = PrimaryContext::retain(self.device)?;
         let _guard = context.enter()?;
@@ -744,7 +766,27 @@ impl SegmentedMapping {
             .try_clone()
             .map_err(|error| Error::invalid(format!("duplicating a descriptor: {error}")))?;
         let handle = ShareableHandle::Descriptor(duplicate).import()?;
+        self.segments[index].3 = protection;
         self.map(index, offset, bytes, handle)
+    }
+
+    /// Changes one mapped segment's access in place, at unchanged
+    /// addresses.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the segment is not mapped or the driver refuses.
+    pub fn protect_segment(&mut self, index: usize, protection: Protection) -> Result<()> {
+        let Some((offset, bytes, handle, _)) = self.segments.get(index).copied() else {
+            return Err(Error::invalid(format!("segment {index} does not exist")));
+        };
+        if handle.is_none() {
+            return Err(Error::invalid(format!("segment {index} is not mapped")));
+        }
+        self.segments[index].3 = protection;
+        let context = PrimaryContext::retain(self.device)?;
+        let _guard = context.enter()?;
+        self.grant(offset, bytes, protection)
     }
 
     /// Unmaps segment `index` and releases this process's reference to its
@@ -757,7 +799,7 @@ impl SegmentedMapping {
     ///
     /// Fails when the driver refuses.
     pub fn release(&mut self, index: usize) -> Result<()> {
-        let Some((offset, bytes, handle)) = self.segments.get_mut(index) else {
+        let Some((offset, bytes, handle, _)) = self.segments.get_mut(index) else {
             return Err(Error::invalid(format!("segment {index} does not exist")));
         };
         let Some(handle) = handle.take() else {
@@ -787,9 +829,10 @@ impl SegmentedMapping {
         let context = PrimaryContext::retain(self.device)?;
         let _guard = context.enter()?;
         for index in 0..self.segments.len() {
-            let (offset, bytes, handle) = self.segments[index];
+            self.segments[index].3 = protection;
+            let (offset, bytes, handle, _) = self.segments[index];
             if handle.is_some() {
-                self.grant(offset, bytes)?;
+                self.grant(offset, bytes, protection)?;
             }
         }
         Ok(())
@@ -799,8 +842,8 @@ impl SegmentedMapping {
     fn unmapped(&self, index: usize) -> Result<(usize, usize)> {
         match self.segments.get(index) {
             None => Err(Error::invalid(format!("segment {index} does not exist"))),
-            Some((_, _, Some(_))) => Err(Error::invalid(format!("segment {index} is mapped"))),
-            Some((offset, bytes, None)) => Ok((*offset, *bytes)),
+            Some((_, _, Some(_), _)) => Err(Error::invalid(format!("segment {index} is mapped"))),
+            Some((offset, bytes, None, _)) => Ok((*offset, *bytes)),
         }
     }
 
@@ -820,12 +863,12 @@ impl SegmentedMapping {
             return Err(error);
         }
         self.segments[index].2 = Some(handle);
-        self.grant(offset, bytes)
+        self.grant(offset, bytes, self.segments[index].3)
     }
 
-    /// Grants the mapping's protection over one mapped segment to every
-    /// device of `access`. Runs with the mapping's context current.
-    fn grant(&self, offset: usize, bytes: usize) -> Result<()> {
+    /// Grants `protection` over one mapped segment to every device of
+    /// `access`. Runs with the mapping's context current.
+    fn grant(&self, offset: usize, bytes: usize, protection: Protection) -> Result<()> {
         let descriptors = self
             .access
             .iter()
@@ -835,7 +878,7 @@ impl SegmentedMapping {
                         kind: CU_MEM_LOCATION_TYPE_DEVICE,
                         id: device.handle()?,
                     },
-                    flags: self.protection.flags(),
+                    flags: protection.flags(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -859,7 +902,7 @@ impl Drop for SegmentedMapping {
     fn drop(&mut self) {
         // The range's teardown unmaps and releases what is still mapped,
         // before it frees the addresses.
-        for (offset, bytes, handle) in &mut self.segments {
+        for (offset, bytes, handle, _) in &mut self.segments {
             if let Some(handle) = handle.take() {
                 self.range
                     .mapped

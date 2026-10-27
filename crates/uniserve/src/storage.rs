@@ -187,7 +187,8 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
         }
         StorageCommand::Restart { socket, executable } => {
             let socket = socket.unwrap_or_else(socket::default_socket);
-            storage::Client::connect(&socket, storage::Role::Operator)
+            // A server of an earlier protocol is restarted in its own.
+            storage::Client::connect_operator(&socket)
                 .and_then(|mut operator| operator.restart(executable))
                 .map(|pid| {
                     println!("the successor server {pid} takes over once nothing is in flight")

@@ -20,6 +20,7 @@ fn defaults() -> Value {
             "claim": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             "host_kv_cache": false,
             "host_kv_cache_bytes": null,
+            "world": 0,
             "standby": false,
             "standby_memory": "auto",
         },

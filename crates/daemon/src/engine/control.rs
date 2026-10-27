@@ -90,14 +90,25 @@ impl EngineControl {
     /// Fails when the daemon cannot start the process, the process exits or
     /// does not connect back, its build speaks another major version, or it
     /// reports that its start failed.
-    pub fn start(&self, spec: wire::EngineSpec, stats: StatsSink) -> anyhow::Result<EngineClient> {
+    pub fn start(
+        &self,
+        mut spec: wire::EngineSpec,
+        stats: StatsSink,
+    ) -> anyhow::Result<EngineClient> {
         let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
+        // A spec of no world starts a world of its own, which takes the
+        // identity of its first engine; an engine that replaces a lost one
+        // goes on with its world.
+        if spec.world == 0 {
+            spec.world = engine;
+        }
+        let world = spec.world;
         let executable = spec
             .workers
             .as_ref()
             .map(|workers| workers.executable.clone())
             .context("the engine spec states no workers")?;
-        let standby = spec.standby.is_some();
+        let standby = spec.predecessor.is_some();
         let mut control = self.spawn(engine, &executable)?;
         let stream = self.accept(engine, &mut control)?;
         let mut reader = Connection::from_unix(stream.try_clone()?)?;
@@ -140,7 +151,7 @@ impl EngineControl {
                     {
                         let info = state.info.context("the engine reported no info")?;
                         let state = if standby {
-                            tracing::info!(engine, "the engine stands by");
+                            tracing::info!(engine, "the engine is prepared beside its predecessor");
                             EngineState::Standby
                         } else {
                             tracing::info!(
@@ -160,7 +171,7 @@ impl EngineControl {
                             // connection.
                             Some(control),
                         )
-                        .map(|client| client.numbered(engine));
+                        .map(|client| client.numbered(engine).in_world(world));
                     }
                     Ok(wire::EngineState::Failed) => {
                         // The failed engine closes its workers and exits;
@@ -210,6 +221,7 @@ impl EngineControl {
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
+        let world = served.world;
         let stream = self.accept(engine, &mut control)?;
         let mut reader = Connection::from_unix(stream.try_clone()?)?;
         let mut writer = Connection::from_unix(stream)?;
@@ -261,7 +273,7 @@ impl EngineControl {
                     stats,
                     Some(control),
                 )
-                .map(|client| client.numbered(engine));
+                .map(|client| client.numbered(engine).in_world(world));
             }
         }
     }

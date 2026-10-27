@@ -1,6 +1,6 @@
 //! UniServe's interfaces across builds.
 //!
-//! A deployment's daemons outlive its engines: a hot update replaces the
+//! A deployment's daemons outlive its engines: a world change replaces the
 //! engine with one of another build while the daemons serve on. The
 //! interfaces between them are therefore Protobuf schemas that change only by
 //! additions (`process.proto`, `request.proto`), compiled into this crate:

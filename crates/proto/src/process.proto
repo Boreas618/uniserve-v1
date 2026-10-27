@@ -157,12 +157,18 @@ message Reserved {
 message Claim {
   string host = 1;
   string deployment = 2;
-  // The `(worker group, rank)` scopes the deployment keeps on the node; the
-  // server releases every other scope of the deployment.
+  // The `(worker group, rank)` scopes `world` keeps on the node; the world's
+  // retention of every other scope of the deployment ends.
   repeated Scope scopes = 3;
   // Arguments a server the daemon starts is given beyond its socket: the
   // deployment's Mooncake connector settings.
   repeated string server_arguments = 4;
+  // The world whose scopes these are: the daemon's identity of the
+  // processes that execute one configuration of the deployment.
+  uint64 world = 5;
+  // Worlds of the deployment whose memory on the node ends: a world the
+  // claiming one superseded at a commit, or one a rollback discarded.
+  repeated uint64 retire = 6;
 }
 
 message Scope {

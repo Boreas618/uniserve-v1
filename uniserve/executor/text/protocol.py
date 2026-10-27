@@ -260,9 +260,11 @@ class RecordField(IntEnum):
 CALL_WORDS = 16
 
 # Words of one task's sampling completion, one section per field: valid,
-# active, token and accepted drafts. A completion block of ``n`` tasks takes
+# active, token, accepted drafts and finite (1 while every source logit of
+# the task was finite; 0 marks a numerical fault of the forward, which no
+# request constraint causes). A completion block of ``n`` tasks takes
 # ``COMPLETION_FIELDS * n`` words, field-major.
-COMPLETION_FIELDS = 4
+COMPLETION_FIELDS = 5
 
 
 class RecordFlag(IntFlag):
@@ -280,7 +282,7 @@ class RecordFlag(IntFlag):
 
 
 # "TKRC" in the high word, the record layout version in the low word.
-RECORD_VERSION = 1
+RECORD_VERSION = 2
 RECORD_MAGIC = (0x544B_5243 << 32) | RECORD_VERSION
 
 

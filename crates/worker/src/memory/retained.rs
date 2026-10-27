@@ -3,11 +3,17 @@
 //! An owner whose contents must outlive the worker process takes its memory
 //! here instead of allocating it: the device prefix cache planes, the buffer
 //! pool and the latent banks are exclusive storages, one writer at a time,
-//! keyed by what determines their shape. A restarted worker of the same
-//! scope maps the memory its predecessor left, at whatever address, instead
-//! of allocating it again; the server first shoots the predecessor down if
-//! it still holds write access. A worker makes no Storage Server call while
-//! it serves: only at startup and at its orderly close.
+//! keyed by the world that created them and what determines their shape. A
+//! restarted worker of the same scope and world maps the memory its
+//! predecessor left, at whatever address, instead of allocating it again;
+//! the server first shoots the predecessor down if it still holds write
+//! access. A worker of a world that succeeds another maps the KV cache
+//! segments of the predecessor's worker of its scope read-only and creates
+//! everything else of its own, so neither world writes the other's memory;
+//! once the predecessor is gone, the successor takes write access to the
+//! segments it mapped. A worker makes no Storage Server call while it
+//! serves: only at startup, at its world's promotion and commit, and at its
+//! orderly close.
 //!
 //! The library loaded into another process (tests, harnesses) allocates the
 //! same owners locally ([`LocalMemory`]); their memory ends with the
@@ -49,28 +55,46 @@ pub struct Exclusive {
     pub created: bool,
 }
 
-/// One exclusive device storage of segments, each retained on its own, so
-/// that part of its memory is given back and created again at unchanged
+/// One exclusive device storage of segments, each part retained on its own,
+/// so that part of its memory is given back and created again at unchanged
 /// addresses (`Storage::segmented`).
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentedSpec<'a> {
-    /// The storage's name within the worker's scope; segment `i` is
-    /// retained as `{name}#{i}`.
+    /// The storage's name within the worker's scope; the part of segment `s`
+    /// that column `c` holds is retained as `{name}#{c}/{s.ordinal}` of
+    /// `s.world`.
     pub name: &'a str,
     pub device: DeviceId,
-    /// Each segment's length, a multiple of the allocation granularity.
-    pub segments: &'a [usize],
+    /// The storage's parts in address order.
+    pub parts: &'a [SegmentPart],
     /// Other local devices that address the storage.
     pub access: &'a [DeviceId],
+}
+
+/// One part of a segmented storage: what one column of a cache plane holds
+/// of one segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentPart {
+    /// Bytes, a multiple of the allocation granularity.
+    pub length: usize,
+    pub column: u32,
+    /// The segment: the world that created its memory and its ordinal there.
+    pub segment: ipc::CacheSegment,
+    /// Whether the segment is the predecessor world's: it is mapped
+    /// read-only and never created here.
+    pub inherited: bool,
+    /// Whether the part is created when its memory does not exist; one that
+    /// is not is left absent, as a segment given back.
+    pub create: bool,
 }
 
 /// A segmented storage an owner took.
 pub struct SegmentedExclusive {
     pub storage: Arc<Storage>,
-    /// For each segment, whether it was created for the owner: its contents
+    /// For each part, whether it was created for the owner: its contents
     /// are uninitialized.
     pub created: Vec<bool>,
-    /// For each segment, whether it is absent: a standby finds none for a
+    /// For each part, whether it is absent: a standby finds none for a
     /// segment its predecessor gave back, and leaves it unmapped.
     pub absent: Vec<bool>,
 }
@@ -116,6 +140,13 @@ pub(crate) struct ScopeBytes {
     pub reclaimable: u64,
 }
 
+impl SegmentedSpec<'_> {
+    /// Each part's length, in address order.
+    pub(crate) fn lengths(&self) -> Vec<usize> {
+        self.parts.iter().map(|part| part.length).collect()
+    }
+}
+
 /// Exclusive memory a process allocates for itself, which ends with it.
 pub struct LocalMemory;
 
@@ -133,14 +164,24 @@ impl ExclusiveMemory for LocalMemory {
     }
 
     fn segmented(&mut self, spec: &SegmentedSpec<'_>) -> Result<SegmentedExclusive> {
-        let storage = Storage::segmented(spec.device, spec.segments, spec.access)?;
-        for index in 0..spec.segments.len() {
-            storage.create_segment(index)?;
+        if spec.parts.iter().any(|part| part.inherited) {
+            return Err(Error::Invalid(
+                "memory local to a process inherits no other world's segments".into(),
+            ));
+        }
+        let storage = Storage::segmented(spec.device, &spec.lengths(), spec.access)?;
+        let mut absent = vec![false; spec.parts.len()];
+        for (index, part) in spec.parts.iter().enumerate() {
+            if part.create {
+                storage.create_segment(index)?;
+            } else {
+                absent[index] = true;
+            }
         }
         Ok(SegmentedExclusive {
             storage,
-            created: vec![true; spec.segments.len()],
-            absent: vec![false; spec.segments.len()],
+            created: absent.iter().map(|absent| !absent).collect(),
+            absent,
         })
     }
 
@@ -174,6 +215,9 @@ impl ExclusiveMemory for LocalMemory {
 /// the control thread calls it.
 pub(crate) struct Retained {
     scope: Scope,
+    /// The world the worker belongs to, which creates its exclusive
+    /// storages.
+    world: u64,
     state: Mutex<State>,
 }
 
@@ -196,6 +240,10 @@ struct State {
     /// A standby worker's exclusive storages, until it is promoted; `None`
     /// for a worker that takes write access at once.
     standby: Option<Standby>,
+    /// The predecessor world's segments the worker maps read-only, each
+    /// with the storage and part index that maps it, until the worker takes
+    /// them at its world's commit.
+    inherited: Vec<(Key, Arc<Storage>, usize)>,
 }
 
 impl State {
@@ -232,35 +280,44 @@ impl Retained {
                 scope: scope.clone(),
                 generation,
                 claim: Claim(launch.claim),
+                world: launch.world,
             },
         )
         .map_err(|error| storage_error("connecting to the storage server", error))?;
         Ok(Arc::new(Self {
             scope,
+            world: launch.world,
             state: Mutex::new(State {
                 client,
                 gpus: BTreeMap::new(),
                 written: BTreeSet::new(),
                 used: BTreeSet::new(),
                 standby: launch.standby.then(Standby::default),
+                inherited: Vec::new(),
             }),
         }))
     }
 
-    /// The key of an exclusive storage: the digest of its scope, name,
-    /// layout and GPU. It covers its shape only, so a restart reuses the
-    /// memory whatever else changed.
+    /// The key of an exclusive storage of the worker's world: the digest of
+    /// its scope, world, name, layout and GPU. It covers its shape only, so
+    /// a restart of the world reuses the memory whatever else changed.
     fn exclusive_key(&self, spec: &ExclusiveSpec<'_>, gpu: &[u8; 16]) -> Key {
-        self.storage_key(spec.name, spec.bytes, gpu)
+        self.storage_key(spec.name, spec.bytes, gpu, self.world)
     }
 
-    /// The key of segment `index` of a segmented storage, as the exclusive
-    /// storage `{name}#{index}` of the segment's length.
-    fn segment_key(&self, spec: &SegmentedSpec<'_>, index: usize, gpu: &[u8; 16]) -> Key {
-        self.storage_key(&format!("{}#{index}", spec.name), spec.segments[index], gpu)
+    /// The key of one part of a segmented storage, as the exclusive storage
+    /// `{name}#{column}/{ordinal}` of the part's length that the segment's
+    /// world created.
+    fn segment_key(&self, name: &str, part: &SegmentPart, gpu: &[u8; 16]) -> Key {
+        self.storage_key(
+            &segment_name(name, part),
+            part.length,
+            gpu,
+            part.segment.world,
+        )
     }
 
-    fn storage_key(&self, name: &str, bytes: usize, gpu: &[u8; 16]) -> Key {
+    fn storage_key(&self, name: &str, bytes: usize, gpu: &[u8; 16], world: u64) -> Key {
         let mut digest = Sha256::new();
         digest.update(b"uniserve-exclusive-storage\0");
         for part in [
@@ -272,6 +329,7 @@ impl Retained {
             digest.update(part);
         }
         digest.update(self.scope.rank.to_le_bytes());
+        digest.update(world.to_le_bytes());
         // A byte storage: dtype uint8, shape [bytes], stride 1.
         digest.update(b"uint8");
         digest.update((bytes as u64).to_le_bytes());
@@ -280,8 +338,8 @@ impl Retained {
         Key(digest.finalize().into())
     }
 
-    /// Publishes the memory of segment `index`, which `descriptor` maps, as
-    /// an exclusive tensor the worker writes.
+    /// Publishes the memory of part `index`, which `descriptor` maps, as an
+    /// exclusive tensor the worker writes.
     fn publish_segment(
         state: &mut State,
         spec: &SegmentedSpec<'_>,
@@ -290,14 +348,15 @@ impl Retained {
         gpu: [u8; 16],
         descriptor: &std::os::fd::OwnedFd,
     ) -> Result<()> {
-        let bytes = spec.segments[index] as u64;
+        let part = &spec.parts[index];
+        let bytes = part.length as u64;
         let record = StorageRecord {
             placement: Placement::Device { gpu },
             bytes,
         };
         let tensor = storage::TensorRecord {
             key,
-            name: format!("{}#{index}", spec.name),
+            name: segment_name(spec.name, part),
             storage: 0,
             offset: 0,
             dtype: "uint8".into(),
@@ -366,7 +425,7 @@ impl Retained {
             .tensors
             .iter()
             .filter(|tensor| {
-                tensor.scopes.contains(&self.scope)
+                self.retains(tensor)
                     && (tensor.access != Access::ReadOnly || state.used.contains(&tensor.key))
             })
             .map(|tensor| tensor.key)
@@ -394,18 +453,27 @@ impl Retained {
         let total: u64 = listing
             .device_bytes
             .iter()
-            .filter(|entry| entry.gpu == Some(gpu) && entry.scope == self.scope)
+            .filter(|entry| {
+                entry.gpu == Some(gpu) && entry.scope == self.scope && entry.world == self.world
+            })
             .map(|entry| entry.bytes)
             .sum();
-        // Every exclusive tensor is a storage of its own.
+        // Every exclusive tensor is a storage of its own. Those another
+        // world uses, as the predecessor segments a successor maps, are
+        // not free.
         let reclaimable: u64 = listing
             .tensors
             .iter()
             .filter(|tensor| {
                 tensor.access == Access::Exclusive
                     && tensor.placement == Placement::Device { gpu }
-                    && tensor.scopes.contains(&self.scope)
+                    && self.retains(tensor)
+                    && tensor
+                        .retainers
+                        .iter()
+                        .all(|retainer| retainer.world == self.world)
                     && !state.written.contains(&tensor.key)
+                    && !state.used.contains(&tensor.key)
             })
             .map(|tensor| tensor.storage_bytes)
             .sum();
@@ -428,13 +496,10 @@ impl Retained {
             .map_err(|error| storage_error("listing the storage server", error))?;
         let mut keep = Vec::new();
         let mut untaken = 0;
-        for tensor in listing
-            .tensors
-            .iter()
-            .filter(|tensor| tensor.scopes.contains(&self.scope))
-        {
+        for tensor in listing.tensors.iter().filter(|tensor| self.retains(tensor)) {
             if tensor.access == Access::Exclusive
                 && !state.written.contains(&tensor.key)
+                && !state.used.contains(&tensor.key)
                 && !taking.contains(&tensor.key)
             {
                 untaken += 1;
@@ -453,6 +518,39 @@ impl Retained {
             );
         }
         Ok(())
+    }
+
+    /// The device bytes of the exclusive storages the worker's world keeps
+    /// for its scope on `device` beside its KV cache's value planes: its
+    /// cache flags and scales, buffer pool and latent banks, which a world
+    /// that succeeds this one on the same device creates as many of.
+    pub(crate) fn exclusive_bytes(&self, device: DeviceId) -> Result<u64> {
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let listing = state
+            .client
+            .list()
+            .map_err(|error| storage_error("listing the storage server", error))?;
+        Ok(listing
+            .tensors
+            .iter()
+            .filter(|tensor| {
+                tensor.access == Access::Exclusive
+                    && tensor.placement == Placement::Device { gpu }
+                    && self.retains(tensor)
+                    && !tensor.name.starts_with("prefix_cache.key.values#")
+                    && !tensor.name.starts_with("prefix_cache.value.values#")
+            })
+            .map(|tensor| tensor.storage_bytes)
+            .sum())
+    }
+
+    /// Whether the worker's scope retains `tensor` in the worker's world.
+    fn retains(&self, tensor: &storage::protocol::ListedTensor) -> bool {
+        tensor
+            .retainers
+            .iter()
+            .any(|retainer| retainer.scope == self.scope && retainer.world == self.world)
     }
 
     /// Release every tensor of the scope the worker's startup did not use.
@@ -665,52 +763,82 @@ impl ExclusiveMemory for &Retained {
 }
 
 impl Retained {
-    /// Takes the segments of a segmented storage: as [`ExclusiveMemory::exclusive`]
-    /// takes whole ones, except that a standby leaves a segment its
-    /// predecessor gave back absent.
+    /// Takes the parts of a segmented storage: as
+    /// [`ExclusiveMemory::exclusive`] takes whole ones, except that a
+    /// standby leaves a part its predecessor gave back absent, and that the
+    /// parts of the predecessor world's segments are mapped read-only in
+    /// standby, never created: the predecessor's worker of the scope writes
+    /// them until the successor's commit.
     fn take_segmented(&self, spec: &SegmentedSpec<'_>) -> Result<SegmentedExclusive> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(spec.device)?;
-        let keys: Vec<Key> = (0..spec.segments.len())
-            .map(|index| self.segment_key(spec, index, &gpu))
+        let keys: Vec<Key> = spec
+            .parts
+            .iter()
+            .map(|part| self.segment_key(spec.name, part, &gpu))
             .collect();
         let standby = state.standby.is_some();
         let mode = if standby { Mode::Standby } else { Mode::Write };
-        let got = state
-            .client
-            .get(keys.clone(), mode)
-            .map_err(|error| storage_error("taking a segmented storage", error))?;
-        if !standby && !got.missing.is_empty() {
-            let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
-            self.release_untaken(&mut state, &taking)?;
-        }
-        let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
-            got.storages.into_iter().map(Some).collect();
+        let (inherited, own): (Vec<usize>, Vec<usize>) =
+            (0..spec.parts.len()).partition(|&index| spec.parts[index].inherited);
         let mut found = BTreeMap::new();
-        for tensor in &got.tensors {
-            let (record, descriptor) = storages
-                .get_mut(tensor.storage as usize)
-                .and_then(Option::take)
-                .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
-            if record.bytes as usize
-                != spec.segments[keys
+        for (indices, mode) in [(&own, mode), (&inherited, Mode::Standby)] {
+            if indices.is_empty() {
+                continue;
+            }
+            let asked: Vec<Key> = indices.iter().map(|&index| keys[index]).collect();
+            let got = state
+                .client
+                .get(asked, mode)
+                .map_err(|error| storage_error("taking a segmented storage", error))?;
+            if mode == Mode::Standby
+                && !standby
+                && let Some(missing) = got.missing.first()
+            {
+                let index = keys
+                    .iter()
+                    .position(|key| key == missing)
+                    .unwrap_or_default();
+                return Err(Error::Invalid(format!(
+                    "the predecessor world holds no {} any more",
+                    segment_name(spec.name, &spec.parts[index])
+                )));
+            }
+            if mode == Mode::Write && !got.missing.is_empty() {
+                let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
+                self.release_untaken(&mut state, &taking)?;
+            }
+            let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
+                got.storages.into_iter().map(Some).collect();
+            for tensor in &got.tensors {
+                let (record, descriptor) = storages
+                    .get_mut(tensor.storage as usize)
+                    .and_then(Option::take)
+                    .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
+                let index = keys
                     .iter()
                     .position(|key| *key == tensor.key)
-                    .ok_or_else(|| Error::Interface("an unasked segment was found".into()))?]
-            {
-                return Err(Error::Interface(
-                    "a retained segment has another length".into(),
-                ));
+                    .ok_or_else(|| Error::Interface("an unasked segment was found".into()))?;
+                if record.bytes as usize != spec.parts[index].length {
+                    return Err(Error::Interface(
+                        "a retained segment has another length".into(),
+                    ));
+                }
+                found.insert(tensor.key, descriptor);
             }
-            found.insert(tensor.key, descriptor);
         }
-        let storage = Storage::segmented(spec.device, spec.segments, spec.access)?;
+        let storage = Storage::segmented(spec.device, &spec.lengths(), spec.access)?;
         let mut created = vec![false; keys.len()];
         let mut absent = vec![false; keys.len()];
         for (index, key) in keys.iter().enumerate() {
+            let inherited = spec.parts[index].inherited;
             match found.remove(key) {
+                Some(descriptor) if inherited => {
+                    storage.import_segment_read_only(index, &descriptor)?;
+                    state.inherited.push((*key, Arc::clone(&storage), index));
+                }
                 Some(descriptor) => storage.import_segment(index, &descriptor)?,
-                None if standby => {
+                None if standby || !spec.parts[index].create => {
                     absent[index] = true;
                     continue;
                 }
@@ -723,6 +851,7 @@ impl Retained {
             state.used.insert(*key);
             match &mut state.standby {
                 Some(standby) => standby.keys.push(*key),
+                None if inherited => {}
                 None => {
                     state.written.insert(*key);
                 }
@@ -738,20 +867,23 @@ impl Retained {
         })
     }
 
-    /// Unmaps `segments` and has the Storage Server drop them.
+    /// Unmaps the parts `indices` and has the Storage Server drop them.
     fn give_back_segments(
         &self,
         spec: &SegmentedSpec<'_>,
         storage: &Storage,
-        segments: &[usize],
+        indices: &[usize],
     ) -> Result<()> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(spec.device)?;
-        for index in segments {
-            storage.release_segment(*index)?;
-            let key = self.segment_key(spec, *index, &gpu);
+        for &index in indices {
+            storage.release_segment(index)?;
+            let key = self.segment_key(spec.name, &spec.parts[index], &gpu);
             state.used.remove(&key);
             state.written.remove(&key);
+            state
+                .inherited
+                .retain(|(inherited, _, _)| *inherited != key);
         }
         let used: Vec<Key> = state.used.iter().copied().collect();
         state
@@ -761,24 +893,134 @@ impl Retained {
         Ok(())
     }
 
-    /// Creates `segments` again and publishes them.
+    /// Creates the parts `indices` again, as the worker's world's own
+    /// segments, and publishes them.
     fn create_segments(
         &self,
         spec: &SegmentedSpec<'_>,
         storage: &Storage,
-        segments: &[usize],
+        indices: &[usize],
     ) -> Result<()> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(spec.device)?;
-        for index in segments {
-            let key = self.segment_key(spec, *index, &gpu);
-            let descriptor = storage.create_segment(*index)?;
-            Self::publish_segment(&mut state, spec, *index, key, gpu, &descriptor)?;
+        for &index in indices {
+            let key = self.segment_key(spec.name, &spec.parts[index], &gpu);
+            let descriptor = storage.create_segment(index)?;
+            Self::publish_segment(&mut state, spec, index, key, gpu, &descriptor)?;
             state.used.insert(key);
             state.written.insert(key);
         }
         Ok(())
     }
+
+    /// Maps exclusive storages the predecessor world `world` created,
+    /// read-only, as the worker of its scope keeps them: a successor reads
+    /// the predecessor's cache flags and scales once it parked. Fails when
+    /// one is missing.
+    pub(crate) fn map_inherited(
+        &self,
+        specs: &[ExclusiveSpec<'_>],
+        world: u64,
+    ) -> Result<Vec<(Key, Arc<Storage>)>> {
+        let mut state = lock(&self.state);
+        let mut keys = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let gpu = state.gpu(spec.device)?;
+            keys.push(self.storage_key(spec.name, spec.bytes, &gpu, world));
+        }
+        let got = state
+            .client
+            .get(keys.clone(), Mode::Standby)
+            .map_err(|error| storage_error("mapping the predecessor's storages", error))?;
+        if let Some(missing) = got.missing.first() {
+            let name = keys
+                .iter()
+                .position(|key| key == missing)
+                .map_or("an exclusive storage", |index| specs[index].name);
+            return Err(Error::Invalid(format!(
+                "the predecessor world holds no {name} of this shape any more"
+            )));
+        }
+        let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
+            got.storages.into_iter().map(Some).collect();
+        let mut mapped = BTreeMap::new();
+        for tensor in &got.tensors {
+            let (record, descriptor) = storages
+                .get_mut(tensor.storage as usize)
+                .and_then(Option::take)
+                .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
+            let index = keys
+                .iter()
+                .position(|key| *key == tensor.key)
+                .ok_or_else(|| Error::Interface("an unasked storage was found".into()))?;
+            let spec = &specs[index];
+            mapped.insert(
+                tensor.key,
+                Storage::import(
+                    descriptor,
+                    record.bytes as usize,
+                    spec.device,
+                    spec.access,
+                    Protection::ReadOnly,
+                )?,
+            );
+        }
+        keys.iter()
+            .map(|key| {
+                let storage = mapped
+                    .remove(key)
+                    .ok_or_else(|| Error::Interface("a mapped storage is missing".into()))?;
+                Ok((*key, storage))
+            })
+            .collect()
+    }
+
+    /// Ends the worker's world's retention of storages `keys` it mapped from
+    /// its predecessor and no longer reads: the predecessor's world keeps
+    /// them until it is retired.
+    pub(crate) fn forget(&self, keys: &[Key]) -> Result<()> {
+        let mut state = lock(&self.state);
+        for key in keys {
+            state.used.remove(key);
+        }
+        let used: Vec<Key> = state.used.iter().copied().collect();
+        state
+            .client
+            .retain(used)
+            .map_err(|error| storage_error("forgetting the predecessor's storages", error))?;
+        Ok(())
+    }
+
+    /// Takes write access to the predecessor world's segments the worker
+    /// maps read-only, once their writer is gone, and makes them writable
+    /// at unchanged addresses: the world's commit, after which they are its
+    /// own. Returns how many segments it took.
+    pub(crate) fn take_inherited(&self) -> Result<usize> {
+        let mut state = lock(&self.state);
+        let inherited = std::mem::take(&mut state.inherited);
+        if inherited.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<Key> = inherited.iter().map(|(key, _, _)| *key).collect();
+        if let Err(error) = state.client.promote(keys.clone()) {
+            state.inherited = inherited;
+            return Err(storage_error("taking the predecessor's segments", error));
+        }
+        for (_, storage, index) in &inherited {
+            storage.protect_segment(*index, Protection::ReadWrite)?;
+        }
+        state.written.extend(keys);
+        tracing::info!(
+            segments = inherited.len(),
+            "took the predecessor world's cache segments"
+        );
+        Ok(inherited.len())
+    }
+}
+
+/// The name a part of a segmented storage is retained under.
+fn segment_name(name: &str, part: &SegmentPart) -> String {
+    format!("{name}#{}/{}", part.column, part.segment.ordinal)
 }
 
 /// A Storage Server failure while the worker was doing `what`.

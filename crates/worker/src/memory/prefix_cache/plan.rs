@@ -284,8 +284,10 @@ impl CachePlan {
             page_pools: Vec::new(),
             // The worker reports the units its warmup lent once it warmed up.
             scratch_units: 0,
-            segment_units: 0,
-            usable_units: num_units,
+            segments: Vec::new(),
+            held_segments: 0,
+            inherited_start: 0,
+            inherited_units: 0,
             request_states: !self.states.is_empty(),
         }
     }

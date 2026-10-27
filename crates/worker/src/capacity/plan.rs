@@ -29,6 +29,7 @@ use super::{
 };
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::graph_storage_budget_bytes;
+use crate::memory::prefix_cache::planes::PlaneLayout;
 use crate::memory::{CachePlan, LatentPlan};
 use crate::parallel::host::HostGroup;
 use crate::{Error, Result};
@@ -207,6 +208,9 @@ pub(crate) struct Plan {
     pub latent: Option<LatentPlan>,
     /// The cache layout, with the agreed unit count in `info.prefix_cache`.
     pub cache: Option<Arc<CachePlan>>,
+    /// The segments a device pool's planes are made of; `None` for planes
+    /// that do not split.
+    pub planes: Option<PlaneLayout>,
 }
 
 fn narrow(value: usize, name: &str) -> Result<u32> {
@@ -249,6 +253,7 @@ pub(crate) struct TokenLayout {
     fixed: BTreeMap<Device, u64>,
     feature_bytes: u64,
     latent: Option<LatentPlan>,
+    planes: Option<PlaneLayout>,
 }
 
 impl TokenLayout {
@@ -310,6 +315,7 @@ impl TokenLayout {
             fixed,
             feature_bytes,
             latent: facts.latent,
+            planes: None,
         })
     }
 
@@ -364,38 +370,98 @@ impl TokenLayout {
                 "automatic CUDA KV sizing requires a host storage grant".into(),
             ));
         }
+        // A successor world maps its predecessor's segments beside units of
+        // its own, which alone its grant pays for; a standby rank group's
+        // worker adopts the segments of the worker it stands by for.
+        let inherited: u64 = config.predecessor.as_ref().map_or(0, |predecessor| {
+            predecessor
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.units))
+                .sum()
+        });
+        let adopted = config.segments.as_ref().map(|table| {
+            table
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.units))
+                .sum::<u64>()
+        });
         let mut capacity = CacheCapacity::derive(&CacheDemand {
             pages: &pages,
             tokens,
-            units: config.cache_units.map(u64::from),
+            units: adopted,
             unit_bytes,
             available_bytes: available,
             reserved_units,
         })?;
+        // The units of a world's own: what a configured capacity leaves past
+        // the inherited units, or what the grant holds.
+        if tokens.is_some() && inherited > 0 {
+            let minimum = 1 + pages
+                .iter()
+                .map(|&(_, units)| u64::from(units))
+                .sum::<u64>();
+            capacity.num_units = capacity.num_units.saturating_sub(inherited).max(minimum);
+        }
         // Every member allocates the same logical unit ids, bounded by the
         // smallest grant.
         capacity.num_units = group.all_reduce_min(&[capacity.num_units as i64])?[0] as u64;
         // A device pool splits its value planes into segments of whole
-        // allocation granules, which give memory back: its units round down
-        // to them, alike on every member. An adopted pool split already.
-        if let (Some(granularity), None) = (granularity, config.cache_units) {
-            let units = u32::try_from(capacity.num_units)
+        // allocation granules, which give memory back: its own units round
+        // down to them, alike on every member. An adopted pool split
+        // already.
+        let mut planes = None;
+        if let Some(granularity) = granularity {
+            let own = u32::try_from(capacity.num_units)
                 .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
-            let rounded = crate::memory::prefix_cache::planes::segmented_units(
-                units,
-                cache.plane_bytes,
-                granularity,
-            );
-            tracing::info!(
-                fitted = units,
-                units = rounded,
-                "rounded the KV cache down to whole segments"
-            );
-            capacity.num_units = u64::from(rounded);
+            planes = match (&config.segments, &config.predecessor) {
+                (Some(table), _) => Some(PlaneLayout::adopted(table)),
+                (None, Some(predecessor)) => Some(self.successor_layout(
+                    cache,
+                    config,
+                    predecessor,
+                    own,
+                    unit_bytes,
+                    reserved_units,
+                    granularity,
+                    group,
+                )?),
+                (None, None) => {
+                    let rounded = crate::memory::prefix_cache::planes::segmented_units(
+                        own,
+                        cache.plane_bytes,
+                        granularity,
+                    );
+                    tracing::info!(
+                        fitted = own,
+                        units = rounded,
+                        "rounded the KV cache down to whole segments"
+                    );
+                    capacity.num_units = u64::from(rounded);
+                    PlaneLayout::own(config.world, rounded, cache.plane_bytes, granularity)
+                }
+            };
+            if let Some(layout) = &planes {
+                capacity.num_units = u64::from(layout.units());
+            }
+        } else if inherited > 0 {
+            return Err(Error::Invalid(
+                "a host pool inherits no predecessor's segments".into(),
+            ));
         }
         let num_units = u32::try_from(capacity.num_units)
             .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
-        self.info.prefix_cache = Some(cache.info(num_units));
+        let mut info = cache.info(num_units);
+        if let Some(layout) = &planes {
+            info.segments = layout.segments.iter().map(|laid| laid.segment).collect();
+            info.held_segments = layout.segments.len() as u32;
+            let inherited = layout.inherited();
+            info.inherited_start = inherited.start;
+            info.inherited_units = inherited.end - inherited.start;
+        }
+        self.info.prefix_cache = Some(info);
+        self.planes = planes;
         // The arena's slot counts and storage are independent of cache
         // capacity; only its transfer byte budget follows the fitted pool,
         // since one read may carry a whole pool's export. The budget is
@@ -408,6 +474,87 @@ impl TokenLayout {
         Ok(capacity)
     }
 
+    /// The planes of a world that succeeds `predecessor` on the same
+    /// devices: a head segment holding the sentinel and as much warmup
+    /// scratch as the predecessor's warmup lent, the predecessor's segments
+    /// read-only, and a tail of the world's own sized for the pool its full
+    /// grant holds once the predecessor is gone, whose first segments it
+    /// creates now, as many as `now` units of its present grant hold, and
+    /// the others as its memory frees. Every member agrees on each count.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one successor pool's plan, its grants and its group"
+    )]
+    fn successor_layout(
+        &self,
+        cache: &CachePlan,
+        config: &WorkerConfig,
+        predecessor: &ipc::PredecessorCache,
+        now: u32,
+        unit_bytes: u64,
+        reserved_units: u64,
+        granularity: u64,
+        group: &HostGroup,
+    ) -> Result<PlaneLayout> {
+        let inherited: u32 = predecessor
+            .segments
+            .iter()
+            .map(|segment| segment.units)
+            .sum();
+        let page_units: u32 = cache.groups.iter().map(|group| group.units_per_page).sum();
+        let full = match (config.max_total_tokens, config.pool_storage_full_bytes) {
+            (Some(tokens), _) => {
+                let pages: Vec<(u32, u32)> = cache
+                    .groups
+                    .iter()
+                    .map(|group| (group.block_size, group.units_per_page))
+                    .collect();
+                super::units_for_tokens(&pages, tokens as u64)
+            }
+            (None, Some(bytes)) => (bytes as u64 / unit_bytes).saturating_sub(reserved_units),
+            (None, None) => u64::from(now) + u64::from(inherited),
+        };
+        let agreed = group.all_reduce_min(&[full as i64])?;
+        let full = u32::try_from(agreed[0].max(0))
+            .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
+        let head = PlaneLayout::whole_granules(
+            1 + predecessor.scratch_units + page_units,
+            cache.plane_bytes,
+            granularity,
+        );
+        let tail = crate::memory::prefix_cache::planes::segmented_units(
+            full.saturating_sub(head + inherited),
+            cache.plane_bytes,
+            granularity,
+        );
+        let mut layout = PlaneLayout::successor(
+            config.world,
+            head,
+            tail,
+            cache.plane_bytes,
+            granularity,
+            predecessor,
+        )?;
+        let created = match layout.tail_segment_units() {
+            Some(units) => (now.saturating_sub(head) / units) as usize,
+            None => 0,
+        };
+        layout.defer_tail(created);
+        tracing::info!(
+            head,
+            inherited,
+            tail,
+            created_tail_segments = created,
+            "laid out a successor world's KV cache"
+        );
+        if now < head {
+            return Err(Error::Resource(
+                "the device holds less than a successor world's head cache segment",
+            ));
+        }
+        Ok(layout)
+    }
+
     pub(crate) fn finish(self, cache: Option<Arc<CachePlan>>) -> Plan {
         Plan {
             info: self.info,
@@ -415,6 +562,7 @@ impl TokenLayout {
             fixed_device_bytes: self.fixed,
             latent: self.latent,
             cache,
+            planes: self.planes,
         }
     }
 }
@@ -465,6 +613,7 @@ pub(crate) fn request_layout(
         fixed_device_bytes: BTreeMap::new(),
         latent: media.stored_latent(),
         cache: None,
+        planes: None,
     })
 }
 
@@ -537,7 +686,9 @@ pub(crate) mod tests {
             expert_microbatches: 1,
             block_size: None,
             max_total_tokens: None,
-            cache_units: None,
+            world: 0,
+            predecessor: None,
+            segments: None,
             attention_backend: "auto".into(),
             max_batch_calls: 1024,
             max_batch_tokens: 8192,
@@ -555,6 +706,7 @@ pub(crate) mod tests {
             encoder_cache_entries: 256,
             generation_device: None,
             pool_storage_bytes: None,
+            pool_storage_full_bytes: None,
             model_dtype: "bfloat16".into(),
             prefix_cache_dtype: None,
             mem_fraction_static: 0.7,
@@ -671,6 +823,7 @@ pub(crate) mod tests {
             max_batch_tokens: 2048,
             max_request_pool_size: 8,
             pool_storage_bytes: Some((20 * gib) as usize),
+            pool_storage_full_bytes: Some((20 * gib) as usize),
             ..cpu_config()
         };
         let facts = TokenFacts {

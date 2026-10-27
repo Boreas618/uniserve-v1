@@ -51,8 +51,8 @@ pub use serve::{ServeOptions, list, retire, run_connector, serve};
 use shoot::ShootDowns;
 use storage::protocol::{
     Access, Claim, ClientMessage, ErrorKind, Event, Hello, Key, ListedDeployment, ListedTensor,
-    Listing, Mode, PageLevel, Placement, Reply, Request, Role, Scope, ScopeBytes, ServerMessage,
-    StorageRecord, TensorRecord, VERSION, Welcome,
+    Listing, MIN_VERSION, Mode, PageLevel, Placement, Reply, Request, Retainer, Role, Scope,
+    ScopeBytes, ServerMessage, StorageRecord, TensorRecord, VERSION, Welcome,
 };
 use storage::transport::Connection;
 
@@ -73,6 +73,18 @@ struct Holder {
     scope: Scope,
     generation: u64,
     claim: Claim,
+    /// The world the process belongs to.
+    world: u64,
+}
+
+impl Holder {
+    /// The retention the holder's requests act under.
+    fn retainer(&self) -> Retainer {
+        Retainer {
+            scope: self.scope.clone(),
+            world: self.world,
+        }
+    }
 }
 
 struct Client {
@@ -108,8 +120,11 @@ struct TensorEntry {
     shape: Vec<u64>,
     strides: Vec<u64>,
     access: Access,
-    /// Scopes whose lifetime holds the tensor.
-    scopes: BTreeSet<Scope>,
+    /// The scopes of the worlds that retain the tensor. A world retains what
+    /// its workers use until they release it or the head retires the
+    /// world, so a world's memory outlives its processes and is released
+    /// with the world.
+    retainers: BTreeSet<Retainer>,
     /// The process that may write an exclusive tensor.
     writer: Option<Holder>,
     /// Processes that map an exclusive tensor in standby.
@@ -439,10 +454,10 @@ impl Server {
 
     /// Admit a client's role, or refuse it.
     fn welcome(&mut self, id: ClientId, hello: Hello) -> Welcome {
-        if hello.version != VERSION {
+        if !(MIN_VERSION..=VERSION).contains(&hello.version) {
             return Welcome::Refused {
                 message: format!(
-                    "the storage server speaks protocol {VERSION}, the client {}",
+                    "the storage server speaks protocols {MIN_VERSION} to {VERSION}, the client {}",
                     hello.version
                 ),
             };
@@ -604,15 +619,21 @@ impl Server {
                 .begin_restart(executable.as_deref())
                 .map(|pid| Outcome::Reply(Reply::Restarting { pid }, Vec::new()))
                 .map_err(resource),
-            (Request::Claim { scopes }, Role::Head { deployment }) => {
-                self.claim(id, &deployment, scopes)
-            }
+            (
+                Request::Claim {
+                    scopes,
+                    world,
+                    retire,
+                },
+                Role::Head { deployment },
+            ) => self.claim(id, &deployment, scopes, *world, retire),
             (
                 request,
                 Role::Worker {
                     scope,
                     generation,
                     claim,
+                    world,
                 },
             ) => {
                 let pidfd = client
@@ -626,6 +647,7 @@ impl Server {
                     scope,
                     generation,
                     claim,
+                    world,
                 };
                 match request {
                     Request::Retain { keys } => self.retain(&holder, keys),
@@ -655,6 +677,8 @@ impl Server {
         id: ClientId,
         deployment: &str,
         scopes: &[Scope],
+        world: u64,
+        retire: &[u64],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if let Some(entry) = self.deployments.get(deployment)
             && let Some(head) = entry.head
@@ -666,54 +690,68 @@ impl Server {
                 format!("deployment {deployment} has a connected head"),
             ));
         }
-        // Every process that holds access to the deployment's tensors under
-        // a previous claim, and every worker of a previous claim still
-        // connected, is out before the new claim stands.
-        let current = self.deployments.get(deployment).map(|entry| entry.claim);
-        let mut victims: Vec<Holder> = self
-            .tensors
-            .values()
-            .flat_map(|tensor| tensor.writer.iter().chain(&tensor.standby))
-            .filter(|holder| holder.scope.deployment == deployment)
-            .filter(|holder| Some(holder.claim) != current || current.is_none())
-            .cloned()
-            .collect();
-        victims.extend(
-            self.clients
-                .iter()
-                .filter(|(other, _)| **other != id)
-                .filter_map(|(other, client)| match (&client.role, &client.pidfd) {
-                    (
-                        Some(Role::Worker {
-                            scope,
-                            generation,
-                            claim,
+        // The head that holds the claim keeps it for every world it claims:
+        // its workers, of any world, stay current.
+        let held = self
+            .deployments
+            .get(deployment)
+            .filter(|entry| entry.head == Some(id))
+            .map(|entry| entry.claim);
+        if held.is_none() {
+            // Every process that holds access to the deployment's tensors
+            // under a previous claim, and every worker of a previous claim
+            // still connected, is out before the new claim stands.
+            let current = self.deployments.get(deployment).map(|entry| entry.claim);
+            let mut victims: Vec<Holder> = self
+                .tensors
+                .values()
+                .flat_map(|tensor| tensor.writer.iter().chain(&tensor.standby))
+                .filter(|holder| holder.scope.deployment == deployment)
+                .filter(|holder| Some(holder.claim) != current || current.is_none())
+                .cloned()
+                .collect();
+            victims.extend(
+                self.clients
+                    .iter()
+                    .filter(|(other, _)| **other != id)
+                    .filter_map(|(other, client)| match (&client.role, &client.pidfd) {
+                        (
+                            Some(Role::Worker {
+                                scope,
+                                generation,
+                                claim,
+                                world,
+                            }),
+                            Some(pidfd),
+                        ) if scope.deployment == deployment => Some(Holder {
+                            client: Some(*other),
+                            pid: client.pid,
+                            pidfd: Arc::clone(pidfd),
+                            scope: scope.clone(),
+                            generation: *generation,
+                            claim: *claim,
+                            world: *world,
                         }),
-                        Some(pidfd),
-                    ) if scope.deployment == deployment => Some(Holder {
-                        client: Some(*other),
-                        pid: client.pid,
-                        pidfd: Arc::clone(pidfd),
-                        scope: scope.clone(),
-                        generation: *generation,
-                        claim: *claim,
+                        _ => None,
                     }),
-                    _ => None,
-                }),
-        );
-        victims.retain(|victim| !self.shootdowns.finished(&victim.pidfd));
-        if let Some(failed) = victims
-            .iter()
-            .find(|victim| self.shootdowns.failed(&victim.pidfd))
-        {
-            return Err(shoot_down_failed(failed.pid));
-        }
-        dedup(&mut victims);
-        if !victims.is_empty() {
-            return Ok(Outcome::Wait(victims));
+            );
+            victims.retain(|victim| !self.shootdowns.finished(&victim.pidfd));
+            if let Some(failed) = victims
+                .iter()
+                .find(|victim| self.shootdowns.failed(&victim.pidfd))
+            {
+                return Err(shoot_down_failed(failed.pid));
+            }
+            dedup(&mut victims);
+            if !victims.is_empty() {
+                return Ok(Outcome::Wait(victims));
+            }
         }
 
-        let claim = Claim(random_token().map_err(resource)?);
+        let claim = match held {
+            Some(claim) => claim,
+            None => Claim(random_token().map_err(resource)?),
+        };
         self.deployments.insert(
             deployment.to_owned(),
             Deployment {
@@ -721,21 +759,33 @@ impl Server {
                 head: Some(id),
             },
         );
+        // The world's retention of the scopes it no longer places ends, and
+        // every retired world's retention ends.
         let listed: BTreeSet<&Scope> = scopes.iter().collect();
+        let retired: BTreeSet<u64> = retire.iter().copied().collect();
         let released: Vec<Key> = self
             .tensors
             .iter_mut()
             .filter_map(|(key, tensor)| {
-                tensor
-                    .scopes
-                    .retain(|scope| scope.deployment != deployment || listed.contains(scope));
-                tensor.scopes.is_empty().then_some(*key)
+                tensor.retainers.retain(|retainer| {
+                    retainer.scope.deployment != deployment
+                        || !(retired.contains(&retainer.world)
+                            || (retainer.world == world && !listed.contains(&retainer.scope)))
+                });
+                tensor.retainers.is_empty().then_some(*key)
             })
             .collect();
+        let count = released.len();
         for key in released {
             self.remove_tensor(&key);
         }
-        tracing::info!(deployment, "a head claimed the deployment");
+        tracing::info!(
+            deployment,
+            world,
+            ?retire,
+            released = count,
+            "a head claimed the deployment"
+        );
         // The host serves the deployments whose heads run on it: every
         // other one is retired, so its weights and caches do not outlive it.
         for other in self.idle_deployments(deployment) {
@@ -748,11 +798,12 @@ impl Server {
     /// page pool and whose head is not connected.
     fn idle_deployments(&self, except: &str) -> Vec<String> {
         let mut named: BTreeSet<String> = self.deployments.keys().cloned().collect();
-        named.extend(
-            self.tensors
-                .values()
-                .flat_map(|tensor| tensor.scopes.iter().map(|scope| scope.deployment.clone())),
-        );
+        named.extend(self.tensors.values().flat_map(|tensor| {
+            tensor
+                .retainers
+                .iter()
+                .map(|retainer| retainer.scope.deployment.clone())
+        }));
         named.extend(self.pages.deployments());
         named
             .into_iter()
@@ -775,8 +826,10 @@ impl Server {
             .tensors
             .iter_mut()
             .filter_map(|(key, tensor)| {
-                tensor.scopes.retain(|scope| scope.deployment != deployment);
-                tensor.scopes.is_empty().then_some(*key)
+                tensor
+                    .retainers
+                    .retain(|retainer| retainer.scope.deployment != deployment);
+                tensor.retainers.is_empty().then_some(*key)
             })
             .collect();
         let count = released.len() as u64;
@@ -858,17 +911,19 @@ impl Server {
     }
 
     /// `retain`: the listed keys that exist are held for the caller's
-    /// scope, and every other tensor of the scope is released.
+    /// scope in its world, and the world releases every other tensor of the
+    /// scope; other worlds keep theirs.
     fn retain(&mut self, holder: &Holder, keys: &[Key]) -> Result<Outcome, (ErrorKind, String)> {
         if !self.current(holder) {
             return Err(stale(holder));
         }
         let listed: BTreeSet<&Key> = keys.iter().collect();
+        let retainer = holder.retainer();
         let mut released = Vec::new();
         for (key, tensor) in &mut self.tensors {
             if listed.contains(key) {
-                tensor.scopes.insert(holder.scope.clone());
-            } else if tensor.scopes.remove(&holder.scope) && tensor.scopes.is_empty() {
+                tensor.retainers.insert(retainer.clone());
+            } else if tensor.retainers.remove(&retainer) && tensor.retainers.is_empty() {
                 released.push(*key);
             }
         }
@@ -972,7 +1027,7 @@ impl Server {
                     Mode::Read => {}
                 }
             }
-            tensor.scopes.insert(holder.scope.clone());
+            tensor.retainers.insert(holder.retainer());
             let index = match storages
                 .iter()
                 .position(|storage| *storage == tensor.storage)
@@ -1052,7 +1107,7 @@ impl Server {
             .collect();
         for tensor in tensors {
             if let Some(existing) = self.tensors.get_mut(&tensor.key) {
-                existing.scopes.insert(holder.scope.clone());
+                existing.retainers.insert(holder.retainer());
                 continue;
             }
             let storage = ids[tensor.storage as usize];
@@ -1069,7 +1124,7 @@ impl Server {
                     shape: tensor.shape.clone(),
                     strides: tensor.strides.clone(),
                     access: tensor.access,
-                    scopes: BTreeSet::from([holder.scope.clone()]),
+                    retainers: BTreeSet::from([holder.retainer()]),
                     writer: (tensor.access == Access::Exclusive).then(|| holder.clone()),
                     standby: Vec::new(),
                 },
@@ -1168,8 +1223,9 @@ impl Server {
                 return Err(invalid(&format!("{} is not read-only", tensor.name)));
             }
             if let Some(other) = tensor
-                .scopes
+                .retainers
                 .iter()
+                .map(|retainer| &retainer.scope)
                 .find(|scope| scope.deployment != holder.scope.deployment)
             {
                 return Err((
@@ -1298,31 +1354,38 @@ impl Server {
 
     /// See [`Request::List`].
     fn listing(&self) -> Listing {
-        let mut device = BTreeMap::<([u8; 16], Scope), u64>::new();
-        let mut host = BTreeMap::<Scope, u64>::new();
-        let mut counted = BTreeSet::<(StorageId, Scope)>::new();
+        let mut device = BTreeMap::<([u8; 16], Retainer), u64>::new();
+        let mut host = BTreeMap::<Retainer, u64>::new();
+        let mut counted = BTreeSet::<(StorageId, Retainer)>::new();
         let mut tensors = Vec::with_capacity(self.tensors.len());
         for (key, tensor) in &self.tensors {
             let Some(storage) = self.storages.get(&tensor.storage) else {
                 continue;
             };
-            for scope in &tensor.scopes {
-                if !counted.insert((tensor.storage, scope.clone())) {
+            for retainer in &tensor.retainers {
+                if !counted.insert((tensor.storage, retainer.clone())) {
                     continue;
                 }
                 match storage.record.placement {
                     Placement::Device { gpu } => {
-                        *device.entry((gpu, scope.clone())).or_default() += storage.record.bytes;
+                        *device.entry((gpu, retainer.clone())).or_default() += storage.record.bytes;
                     }
                     Placement::Host { .. } => {
-                        *host.entry(scope.clone()).or_default() += storage.record.bytes;
+                        *host.entry(retainer.clone()).or_default() += storage.record.bytes;
                     }
                 }
             }
             tensors.push(ListedTensor {
                 key: *key,
                 name: tensor.name.clone(),
-                scopes: tensor.scopes.iter().cloned().collect(),
+                scopes: tensor
+                    .retainers
+                    .iter()
+                    .map(|retainer| retainer.scope.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                retainers: tensor.retainers.iter().cloned().collect(),
                 placement: storage.record.placement,
                 storage_bytes: storage.record.bytes,
                 dtype: tensor.dtype.clone(),
@@ -1336,17 +1399,19 @@ impl Server {
             tensors,
             device_bytes: device
                 .into_iter()
-                .map(|((gpu, scope), bytes)| ScopeBytes {
+                .map(|((gpu, retainer), bytes)| ScopeBytes {
                     gpu: Some(gpu),
-                    scope,
+                    scope: retainer.scope,
+                    world: retainer.world,
                     bytes,
                 })
                 .collect(),
             host_bytes: host
                 .into_iter()
-                .map(|(scope, bytes)| ScopeBytes {
+                .map(|(retainer, bytes)| ScopeBytes {
                     gpu: None,
-                    scope,
+                    scope: retainer.scope,
+                    world: retainer.world,
                     bytes,
                 })
                 .collect(),

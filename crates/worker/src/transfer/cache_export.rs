@@ -526,6 +526,7 @@ mod tests {
             None,
             2,
             None,
+            None,
             &mut crate::memory::LocalMemory,
         )?;
         let mut tables = BlockTables::new(plan.group_shapes()?, 1, 1, 2)?;
@@ -694,10 +695,13 @@ mod tests {
                 states: Vec::new(),
                 handle: crate::ffi::Handle::none(),
             });
+            let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
+            let layout = crate::memory::PlaneLayout::own(0, 2, plan.plane_bytes, granularity);
             let planes = CachePlanes::allocate(
                 Arc::clone(&plan),
                 Some(device),
                 2,
+                layout.as_ref(),
                 Some(&stream),
                 &mut crate::memory::LocalMemory,
             )?;

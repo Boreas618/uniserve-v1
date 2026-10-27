@@ -1587,6 +1587,7 @@ mod tests {
                 scope,
                 generation: 1,
                 claim: Claim([0; 16]),
+                world: 0,
             },
         )
         .unwrap();
@@ -1649,8 +1650,10 @@ mod tests {
                 })
                 .collect(),
             scratch_units: 0,
-            segment_units: 0,
-            usable_units: 0,
+            segments: Vec::new(),
+            held_segments: 0,
+            inherited_start: 0,
+            inherited_units: 0,
             request_states: false,
         }
     }

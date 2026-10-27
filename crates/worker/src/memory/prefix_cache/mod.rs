@@ -165,6 +165,7 @@ impl PrefixCache {
     pub fn new(
         plan: Arc<CachePlan>,
         num_units: u32,
+        layout: Option<&planes::PlaneLayout>,
         request_pool_size: u32,
         width: u32,
         import_capacity: usize,
@@ -175,7 +176,7 @@ impl PrefixCache {
         let shapes = plan.group_shapes()?;
         let request_states = request_states(&plan, request_pool_size, device, stream)?;
         let planes = Arc::new(CachePlanes::allocate(
-            plan, device, num_units, stream, memory,
+            plan, device, num_units, layout, stream, memory,
         )?);
         let storage =
             BlockTableStorage::allocate(&shapes, request_pool_size, width, device, stream)?;

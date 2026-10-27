@@ -313,6 +313,26 @@ impl Storage {
         Ok(lock(&self.segments()?.mapping).import(index, descriptor)?)
     }
 
+    /// Maps segment `index` read-only from the descriptor of memory another
+    /// world writes: a fault of this process cannot change its bytes.
+    pub(crate) fn import_segment_read_only(
+        &self,
+        index: usize,
+        descriptor: &OwnedFd,
+    ) -> Result<()> {
+        Ok(lock(&self.segments()?.mapping).import_protected(
+            index,
+            descriptor,
+            Protection::ReadOnly,
+        )?)
+    }
+
+    /// Changes segment `index`'s access in place, as a world takes the
+    /// memory of a segment it mapped read-only once its writer is gone.
+    pub(crate) fn protect_segment(&self, index: usize, protection: Protection) -> Result<()> {
+        Ok(lock(&self.segments()?.mapping).protect_segment(index, protection)?)
+    }
+
     /// Unmaps segment `index` at once, as its memory is given back: no
     /// device work may access it any more.
     pub(crate) fn release_segment(&self, index: usize) -> Result<()> {

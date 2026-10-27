@@ -30,6 +30,7 @@ use storage::transport::{Connection, Socket};
 use crate::kv_storage::KvStorage;
 use crate::pages::{HandedPools, Pools};
 use crate::{ClientId, ConnectorLaunch, Deployment, Holder, Server, StorageEntry, TensorEntry};
+use storage::protocol::Retainer;
 
 /// The descriptor a successor finds the handoff socket at.
 pub const TAKEOVER_DESCRIPTOR: i32 = 3;
@@ -100,7 +101,12 @@ struct HandedTensor {
     shape: Vec<u64>,
     strides: Vec<u64>,
     access: Access,
+    /// The scopes a predecessor that knew no worlds handed over, which
+    /// retain the tensor in world 0.
+    #[serde(default)]
     scopes: BTreeSet<Scope>,
+    #[serde(default)]
+    retainers: BTreeSet<Retainer>,
     writer: Option<HandedHolder>,
     standby: Vec<HandedHolder>,
 }
@@ -113,6 +119,8 @@ struct HandedHolder {
     scope: Scope,
     generation: u64,
     claim: Claim,
+    #[serde(default)]
+    world: u64,
 }
 
 /// The pidfds a handoff names, each once.
@@ -142,6 +150,7 @@ impl Pidfds {
             scope: holder.scope.clone(),
             generation: holder.generation,
             claim: holder.claim,
+            world: holder.world,
         }
     }
 }
@@ -252,7 +261,8 @@ impl Server {
                     shape: tensor.shape,
                     strides: tensor.strides,
                     access: tensor.access,
-                    scopes: tensor.scopes,
+                    scopes: BTreeSet::new(),
+                    retainers: tensor.retainers,
                     writer: tensor.writer.as_ref().map(|holder| pidfds.holder(holder)),
                     standby: tensor
                         .standby
@@ -471,6 +481,7 @@ impl Server {
                 scope: holder.scope,
                 generation: holder.generation,
                 claim: holder.claim,
+                world: holder.world,
             })
         };
         let mut tensors = HashMap::with_capacity(handed.tensors.len());
@@ -485,7 +496,16 @@ impl Server {
                     shape: tensor.shape,
                     strides: tensor.strides,
                     access: tensor.access,
-                    scopes: tensor.scopes,
+                    retainers: tensor
+                        .retainers
+                        .into_iter()
+                        .chain(
+                            tensor
+                                .scopes
+                                .into_iter()
+                                .map(|scope| Retainer { scope, world: 0 }),
+                        )
+                        .collect(),
                     writer: tensor.writer.map(holder).transpose()?,
                     standby: tensor
                         .standby
@@ -620,13 +640,14 @@ mod tests {
             },
         )
         .unwrap();
-        let claim = head.claim(vec![scope.clone()]).unwrap();
+        let claim = head.claim(0, vec![scope.clone()], Vec::new()).unwrap();
         let mut worker = Client::connect(
             &path,
             Role::Worker {
                 scope: scope.clone(),
                 generation: 1,
                 claim,
+                world: 0,
             },
         )
         .unwrap();

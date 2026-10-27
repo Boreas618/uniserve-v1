@@ -10,8 +10,21 @@
 //! The protocol is versioned independently of the build ([`VERSION`]),
 //! because a Storage Server outlives builds of the head and the workers. The
 //! encoding is MessagePack with named fields, so a field added in a later
-//! version of a message is ignored by an older peer; a change an older peer
-//! cannot read takes a new version, which the server refuses at `Hello`.
+//! version of a message is ignored by an older peer, and a field a client of
+//! an earlier version leaves out takes its default. A server serves clients
+//! of its version and of every earlier one from [`MIN_VERSION`] on, and
+//! refuses a client of a later version at `Hello`: a component that needs a
+//! later protocol than the running server speaks restarts the server with
+//! its own build first, which goes on with every connection.
+//!
+//! Memory belongs to worlds: a world is the set of processes that executes
+//! one configuration of a deployment (an engine and its workers, relaunched
+//! or not), and a deployment runs at most two at once while it updates. Each
+//! tensor is retained by the `(scope, world)` pairs that use it: a worker's
+//! requests retain and release under its own world alone, so a world that
+//! starts beside another neither takes nor releases the other's memory,
+//! and a world's memory outlives its processes until the head retires the
+//! world.
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean.
@@ -29,8 +42,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The protocol version this build speaks.
-pub const VERSION: u32 = 4;
+/// The protocol version this build speaks: 5 adds worlds (the `world` of a
+/// worker's role and of a claim, and a claim's `retire`).
+pub const VERSION: u32 = 5;
+
+/// The earliest client version the server serves: a client of version 4
+/// knows no worlds, and its requests act on world 0.
+pub const MIN_VERSION: u32 = 4;
 
 /// A content address: the 32-byte digest of everything that determines a
 /// tensor's bytes, computed by the client.
@@ -72,10 +90,11 @@ impl std::fmt::Display for Scope {
     }
 }
 
-/// The token a deployment's claim carries: the server issues a new one with
-/// every `claim`, and the head hands it to its workers, which state it in
-/// their [`Role`]. A worker that states another token belongs to a previous
-/// head of the deployment.
+/// The token a deployment's claim carries: the server issues one when a head
+/// first claims the deployment and keeps it for every later claim of that
+/// head, of whatever world, and the head hands it to its workers, which
+/// state it in their [`Role`]. A worker that states another token belongs to
+/// a previous head of the deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Claim(pub [u8; 16]);
 
@@ -86,12 +105,16 @@ pub enum Role {
     /// The holder of a deployment's claim on this host: the host's daemon,
     /// for the head of the deployment.
     Head { deployment: String },
-    /// A worker of `scope`, started by the launch `generation` of its group,
-    /// for the head that holds `claim`.
+    /// A worker of `scope` in `world`, started by the launch `generation` of
+    /// its group, for the head that holds `claim`.
     Worker {
         scope: Scope,
         generation: u64,
         claim: Claim,
+        /// The world the worker belongs to: the head's identity of the
+        /// processes that execute one configuration of the deployment.
+        #[serde(default)]
+        world: u64,
     },
     /// The Mooncake connector the server runs.
     Connector,
@@ -255,14 +278,24 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
-    /// Make the caller the head of its deployment and release every scope of
-    /// the deployment it does not list. Refused while a previous head of the
-    /// deployment is connected. Every process of the deployment that
-    /// belongs to no current worker is shot down. Every other deployment
-    /// whose head is not connected is retired: a host serves the
-    /// deployments whose heads run on it.
-    Claim { scopes: Vec<Scope> },
-    /// Release every tensor of the caller's scope that `keys` does not list.
+    /// Make the caller the head of its deployment, keeping the claim it holds
+    /// already, and state the scopes `world` places on the host: the world's
+    /// retention of every other scope ends. Every world of `retire` ends on
+    /// the host: its retention of every tensor ends, and a tensor no world
+    /// retains is released. Refused while a previous head of the deployment
+    /// is connected. Every process of the deployment that belongs to no
+    /// current worker is shot down. Every other deployment whose head is not
+    /// connected is retired: a host serves the deployments whose heads run
+    /// on it.
+    Claim {
+        scopes: Vec<Scope>,
+        #[serde(default)]
+        world: u64,
+        #[serde(default)]
+        retire: Vec<u64>,
+    },
+    /// Release every tensor the caller's scope retains in the caller's world
+    /// that `keys` does not list.
     Retain { keys: Vec<Key> },
     /// The tensors of `keys` that exist, with their storages' descriptors,
     /// and the keys that do not.
@@ -481,6 +514,9 @@ pub struct ListedTensor {
     pub key: Key,
     pub name: String,
     pub scopes: Vec<Scope>,
+    /// The `(scope, world)` pairs that retain the tensor.
+    #[serde(default)]
+    pub retainers: Vec<Retainer>,
     pub placement: Placement,
     /// Bytes of the tensor's storage.
     pub storage_bytes: u64,
@@ -492,13 +528,23 @@ pub struct ListedTensor {
     pub writer: Option<i32>,
 }
 
-/// Storage bytes one scope holds on one placement.
+/// Storage bytes one scope of one world holds on one placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeBytes {
     /// The GPU's UUID for device bytes; `None` for host bytes.
     pub gpu: Option<[u8; 16]>,
     pub scope: Scope,
+    /// The world whose scope holds the bytes.
+    #[serde(default)]
+    pub world: u64,
     pub bytes: u64,
+}
+
+/// One use that keeps a tensor: a scope of one world.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Retainer {
+    pub scope: Scope,
+    pub world: u64,
 }
 
 /// One claimed deployment in a [`Listing`].

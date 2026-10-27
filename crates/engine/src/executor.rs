@@ -1349,6 +1349,34 @@ pub struct WorkerExecError {
     pub calls: Vec<ipc::ErrorCallIdentity>,
 }
 
+impl WorkerExecError {
+    /// The classification of a batch some of whose calls computed
+    /// non-finite logits (`ErrorCode::NumericalFault`), which fails a world
+    /// on trial as a whole; `None` for a batch whose failed calls failed
+    /// otherwise, whose failure the scheduler reconciles by their requests
+    /// alone.
+    pub fn non_finite<'a>(
+        batch_id: u64,
+        outputs: impl IntoIterator<Item = &'a ipc::CallOutput>,
+    ) -> Option<Self> {
+        let code = ipc::ErrorCode::NumericalFault;
+        outputs
+            .into_iter()
+            .any(|output| {
+                output.status == ipc::CallStatus::Error && output.error_code == Some(code)
+            })
+            .then(|| Self {
+                batch_id: Some(batch_id),
+                fatal: false,
+                code: Some(code),
+                message: format!("calls of batch {batch_id} computed non-finite logits"),
+                phase: None,
+                route: None,
+                calls: Vec::new(),
+            })
+    }
+}
+
 /// Terminal work abandoned by one Worker, with the exact invalidated ownership.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -1403,12 +1431,32 @@ pub trait Executor: Send {
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
     /// Closes the executor and its physical workers.
     fn close(&mut self) -> Result<(), ExecutorError>;
-    /// Promotes workers that started standing by for those of another
-    /// engine: each takes write access to the storages it mapped and
-    /// serves. The default suits an executor whose workers serve from the
-    /// start.
-    fn promote(&mut self) -> Result<(), ExecutorError> {
+    /// Commits the workers' world: each worker takes the predecessor
+    /// world's memory it mapped read-only, and its group relaunches on a
+    /// loss and keeps its standby from then on. Returns what each worker
+    /// reported. The default suits an executor whose workers succeed no
+    /// world.
+    fn commit(&mut self) -> Result<Vec<String>, ExecutorError> {
+        Ok(Vec::new())
+    }
+    /// Ends the memory of every world of `worlds` on the nodes of the
+    /// executor's workers (`Claims::retire`). The default suits an executor
+    /// that retains no memory.
+    fn retire(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
+        let _ = worlds;
         Ok(())
+    }
+    /// Runs the worker hook `name` with `payload` on every worker while
+    /// none runs a batch, and returns each worker group's identity with its
+    /// ranks' results, in rank order. The default refuses: the executor has
+    /// no workers to run hooks on.
+    fn hook_groups(
+        &mut self,
+        name: &str,
+        payload: &str,
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+        let _ = payload;
+        anyhow::bail!("this executor runs no worker hook ({name})")
     }
     /// Runs the worker hook `name` with `payload` on every worker while
     /// none runs a batch, and returns each worker's result. The default

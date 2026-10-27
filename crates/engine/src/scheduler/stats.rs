@@ -28,6 +28,9 @@ pub struct GeneralStats {
     /// their final result or a worker failure that empties them, including
     /// batches still awaiting submission.
     pub in_flight: AtomicUsize,
+    /// Cumulative calls whose forward produced non-finite logits
+    /// (`ErrorCode::NumericalFault`).
+    pub numerical_faults: AtomicU64,
 }
 
 /// Cache unit-pool observability.

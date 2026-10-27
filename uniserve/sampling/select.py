@@ -121,6 +121,9 @@ class Selection:
             transition output).
         scored: The source logits row whose distribution produced the
             emitted token, which reported logprobs score.
+        finite: Every source logit of the task's rows is finite: a NaN or
+            infinity there is a numerical fault of the forward, which no
+            request constraint causes.
     """
 
     tokens: torch.Tensor
@@ -133,6 +136,7 @@ class Selection:
     points: torch.Tensor
     transition: torch.Tensor
     scored: torch.Tensor
+    finite: torch.Tensor
 
 
 Broadcast = Callable[[torch.Tensor], object] | None
@@ -227,6 +231,7 @@ def select(
     )
     blocked = masked.unsqueeze(1) & ~allowed
     first = torch.arange(tasks, device=source.device) * width
+    finite = torch.isfinite(source).all(dim=-1).view(tasks, width).all(dim=-1)
 
     # Greedy: the argmax of each task's first row with its excluded tokens
     # masked.
@@ -374,6 +379,7 @@ def select(
         points,
         transition,
         scored,
+        finite,
     )
 
 

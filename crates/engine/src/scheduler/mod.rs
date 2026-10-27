@@ -49,6 +49,7 @@ pub use stats::{
     SchedulerStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedulerStatsReporter;
+pub use world::GroupCache;
 
 mod admission;
 mod allocation;
@@ -64,6 +65,7 @@ mod inflight;
 pub(crate) mod output;
 mod placement;
 mod run;
+mod world;
 
 pub(crate) use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement,
@@ -433,6 +435,21 @@ pub struct Scheduler {
     /// The workers gave back the cache and graph memory: the scheduler
     /// admits and runs nothing until it wakes.
     asleep: bool,
+    /// A park waiting for the scheduler's requests to end
+    /// (`Scheduler::park`).
+    parking: Option<world::Parking>,
+    /// The scheduler parked: it admits and executes nothing until it
+    /// resumes, and keeps its memory and prefix cache index.
+    parked: bool,
+    /// The scheduler's world is on trial until its commit
+    /// (`Scheduler::commit`): any fault, non-finite logits included, fails
+    /// the world as a whole, which the daemon rolls back rather than
+    /// repairs, and the requests that resume from their generated tokens
+    /// leave as migratable for the previous world.
+    trial: bool,
+    /// The first error of a fatal stop, which the scheduler's handle reports
+    /// (`SchedulerHandle::failure`); set once.
+    failure: Arc<std::sync::OnceLock<String>>,
 }
 
 impl Scheduler {
@@ -443,7 +460,14 @@ impl Scheduler {
     /// worker dies. The caller abandons the operation that found the violation.
     fn invariant_broken(&mut self, invariant: &str) {
         tracing::error!(invariant, "scheduler invariant broken; stopping the engine");
+        self.fail(format!("a scheduler invariant broke: {invariant}"));
+    }
+
+    /// Latches engine-fatal for `reason`, which is kept as the stop's first
+    /// error unless an earlier one is.
+    fn fail(&mut self, reason: String) {
         self.fatal = true;
+        let _ = self.failure.set(reason);
     }
 }
 

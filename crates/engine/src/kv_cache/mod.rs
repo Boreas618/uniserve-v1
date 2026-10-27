@@ -103,6 +103,16 @@ pub(crate) enum UnitState {
     Cached,
 }
 
+/// One published page as a world hands its prefix cache index to its
+/// successor: its group, chained hash, tokens and units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedPage {
+    pub group: u32,
+    pub hash: u64,
+    pub tokens: Vec<u32>,
+    pub units: Vec<u32>,
+}
+
 /// Aggregate cache counters retained by the block pool.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlockPoolStats {
@@ -154,6 +164,11 @@ struct PoolInner {
     /// units from it on is given back (`BlockPool::withdraw`); the unit
     /// count while none is.
     withdrawn: u32,
+    /// The units the workers map read-only from the predecessor world's
+    /// planes (`BlockPool::inherit`): never queued or allocated, their
+    /// imported pages acquired and released, until the world takes them
+    /// (`BlockPool::take_inherited`).
+    inherited: std::ops::Range<u32>,
 }
 
 impl PoolInner {
@@ -248,6 +263,16 @@ impl PoolInner {
                 self.meta[unit.0 as usize].state = UnitState::Free;
                 continue;
             }
+            // An inherited unit keeps its page for later readers and is
+            // never allocated: the world does not write it.
+            if self.inherited.contains(&unit.0) {
+                meta.state = if meta.published.is_some() {
+                    UnitState::Cached
+                } else {
+                    UnitState::Free
+                };
+                continue;
+            }
             let meta = &mut self.meta[unit.0 as usize];
             meta.state = if meta.published.is_some() {
                 UnitState::Cached
@@ -265,6 +290,15 @@ impl PoolInner {
             .iter()
             .filter(|meta| meta.ref_cnt > 0)
             .count()
+    }
+
+    /// Recounts the allocatable units: those below the first withdrawn,
+    /// beside the sentinel, the scratch and the inherited units.
+    fn recount(&mut self) {
+        let inherited =
+            self.inherited.end.min(self.withdrawn) - self.inherited.start.min(self.withdrawn);
+        self.stats.total = (self.withdrawn.saturating_sub(1 + self.scratch) - inherited) as usize;
+        self.stats.free = self.free_count;
     }
 
     /// Returns the first unit of a published copy with this exact identity.
@@ -355,6 +389,7 @@ impl BlockPool {
             },
             scratch,
             withdrawn: num_units,
+            inherited: 0..0,
         };
 
         // Unit zero is the worker's padding sentinel and is never queued,
@@ -387,8 +422,7 @@ impl BlockPool {
             }
             inner.fq_unlink(unit);
         }
-        inner.stats.total = (first.saturating_sub(1 + inner.scratch)) as usize;
-        inner.stats.free = inner.free_count;
+        inner.recount();
         inner.withdrawn_held()
     }
 
@@ -412,9 +446,20 @@ impl BlockPool {
     /// again and reset. A unit a request still holds, as when a restore
     /// cancels a shrink, is queued once its holder lets it go.
     pub(crate) fn restore(&self) {
+        let end = lock(&self.inner).meta.len() as u32;
+        self.restore_to(end);
+    }
+
+    /// Returns the withdrawn units below `end` to allocation, as
+    /// [`Self::restore`] returns them all: the memory of the segments
+    /// holding them was created.
+    pub(crate) fn restore_to(&self, end: u32) {
         let mut inner = lock(&self.inner);
-        let end = inner.meta.len() as u32;
+        let end = end.min(inner.meta.len() as u32);
         let from = inner.withdrawn;
+        if end <= from {
+            return;
+        }
         inner.withdrawn = end;
         for unit in from..end {
             let meta = &mut inner.meta[unit as usize];
@@ -425,8 +470,113 @@ impl BlockPool {
             meta.published = None;
             inner.fq_push_back(unit);
         }
-        inner.stats.total = (end - 1 - inner.scratch) as usize;
-        inner.stats.free = inner.free_count;
+        inner.recount();
+    }
+
+    /// Takes units `range` out of allocation: the workers map them
+    /// read-only from the predecessor world's planes, whose pages the pool
+    /// imports ([`Self::import`]) and which the world never writes until it
+    /// takes them ([`Self::take_inherited`]).
+    pub(crate) fn inherit(&self, range: std::ops::Range<u32>) {
+        let mut inner = lock(&self.inner);
+        for unit in range.clone() {
+            inner.fq_unlink(unit);
+        }
+        inner.inherited = range;
+        inner.recount();
+    }
+
+    /// The units mapped read-only from the predecessor world.
+    pub(crate) fn inherited(&self) -> std::ops::Range<u32> {
+        lock(&self.inner).inherited.clone()
+    }
+
+    /// Returns the inherited units to allocation: the predecessor world is
+    /// gone and the workers took its memory. Their pages stay published.
+    pub(crate) fn take_inherited(&self) {
+        let mut inner = lock(&self.inner);
+        let range = std::mem::replace(&mut inner.inherited, 0..0);
+        for unit in range {
+            let meta = &inner.meta[unit as usize];
+            if meta.ref_cnt > 0 || meta.in_fq || unit >= inner.withdrawn {
+                continue;
+            }
+            inner.fq_push_back(unit);
+        }
+        inner.recount();
+    }
+
+    /// The published pages whose units the pool holds (none withdrawn), as
+    /// a successor world imports them.
+    pub(crate) fn export(&self) -> Vec<IndexedPage> {
+        let inner = lock(&self.inner);
+        let mut pages: Vec<IndexedPage> = inner
+            .pages
+            .values()
+            .filter(|page| page.units.iter().all(|unit| unit.0 < inner.withdrawn))
+            .map(|page| IndexedPage {
+                group: page.group,
+                hash: page.hash,
+                tokens: page.tokens.clone(),
+                units: page.units.iter().map(|unit| unit.0).collect(),
+            })
+            .collect();
+        pages.sort_by_key(|page| page.units.first().copied());
+        pages
+    }
+
+    /// Imports the predecessor world's published pages, each unit `offset`
+    /// further into this pool, as unreferenced pages of `source`: requests
+    /// read them from the inherited units. A page whose units fall outside
+    /// the inherited units, or that holds a unit published already, is
+    /// left out. Returns how many pages it imported.
+    pub(crate) fn import(
+        &self,
+        pages: &[IndexedPage],
+        offset: u32,
+        source: &Arc<WorkerEndpoint>,
+    ) -> usize {
+        let mut inner = lock(&self.inner);
+        let mut imported = 0;
+        for page in pages {
+            let Some(units) = page
+                .units
+                .iter()
+                .map(|unit| unit.checked_add(offset))
+                .collect::<Option<Vec<u32>>>()
+            else {
+                continue;
+            };
+            if units.is_empty()
+                || units.iter().any(|unit| {
+                    !inner.inherited.contains(unit)
+                        || inner.meta[*unit as usize].published.is_some()
+                        || inner.meta[*unit as usize].ref_cnt > 0
+                })
+            {
+                continue;
+            }
+            let head = units[0];
+            for unit in &units {
+                let meta = &mut inner.meta[*unit as usize];
+                meta.published = Some(head);
+                meta.state = UnitState::Cached;
+            }
+            inner.pages.insert(
+                head,
+                PublishedPage {
+                    hash: page.hash,
+                    group: page.group,
+                    tokens: page.tokens.clone(),
+                    source: Arc::clone(source),
+                    units: units.into_iter().map(UnitId).collect(),
+                },
+            );
+            inner.hash_to_pages.entry(page.hash).or_default().push(head);
+            inner.stats.pages_stored += 1;
+            imported += 1;
+        }
+        imported
     }
 
     /// Returns the allocatable units, excluding the unit-zero sentinel.
@@ -569,9 +719,10 @@ impl BlockPool {
 
     /// Finds a prefix page of `group` retained by this exact loaded Worker.
     ///
-    /// Returns the page's first unit and whether the page is currently
-    /// unreferenced, in which case its units count as free capacity until
-    /// acquired. The lookup acquires nothing: the page can be evicted before
+    /// Returns the page's first unit and whether the free queue holds it:
+    /// the page is unreferenced and allocatable, and its units count as free
+    /// capacity until acquired. An inherited page's units are never queued,
+    /// since the world does not write them. The lookup acquires nothing: the page can be evicted before
     /// the caller acts on it, so reuse must go through [`BlockPool::acquire`],
     /// which checks the identity again.
     pub(crate) fn lookup(
@@ -583,10 +734,7 @@ impl BlockPool {
     ) -> Option<(UnitId, bool)> {
         let inner = lock(&self.inner);
         let head = inner.find_page(hash, group, tokens, source)?;
-        Some((
-            UnitId(head),
-            inner.meta[head as usize].state == UnitState::Cached,
-        ))
+        Some((UnitId(head), inner.meta[head as usize].in_fq))
     }
 
     /// Acquires an active reference to a published page that still matches
@@ -927,8 +1075,8 @@ pub(crate) struct PrefixHit {
     /// Leading prompt tokens every group can reuse; a multiple of the
     /// largest block size.
     pub(crate) cached_tokens: usize,
-    /// Units of the pages a hit would acquire that are currently
-    /// unreferenced (`Cached`).
+    /// Units of the pages a hit would acquire that the free queue holds:
+    /// unreferenced and allocatable, which an inherited unit never is.
     ///
     /// Those units count as free capacity until acquired, so admission
     /// subtracts them from the free units.
@@ -1999,6 +2147,34 @@ mod tests {
         // Unreferenced hits count as free: sliding page 3 and full pages 0
         // and 1.
         assert_eq!(hit.cached_free_units, 3);
+    }
+
+    /// A successor's pages imported into the units it inherits are hit like
+    /// its own, but are no free capacity until the commit returns those
+    /// units to allocation.
+    #[test]
+    fn imported_pages_count_as_free_only_once_their_units_are_taken() {
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let prompt = (1..=9).collect::<Vec<u32>>();
+        let predecessor = BlockPool::new(64, 0);
+        drop(publish(&coordinator, &predecessor, &prompt, &source));
+        let index = predecessor.export();
+        assert_eq!(index.len(), 2);
+
+        let successor = BlockPool::new(64, 0);
+        successor.inherit(16..32);
+        assert_eq!(successor.import(&index, 16, &source), 2);
+        let free = successor.free_units();
+        let hit = coordinator.probe_prefix(&successor, &prompt, true, false, None, &source);
+        assert_eq!(hit.cached_tokens, 8);
+        assert_eq!(hit.cached_free_units, 0);
+        assert_eq!(successor.free_units(), free);
+
+        successor.take_inherited();
+        let hit = coordinator.probe_prefix(&successor, &prompt, true, false, None, &source);
+        assert_eq!(hit.cached_tokens, 8);
+        assert_eq!(hit.cached_free_units, 2);
     }
 
     #[test]

@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Event, Request};
 use ipc::RequestId;
-use proto::request::MigrationCause;
 use tokio::sync::mpsc;
 
 use crate::lock;
@@ -488,12 +487,31 @@ pub enum Command {
     },
     /// Aborts a request immediately at the server boundary.
     Abort(RequestId),
-    /// Ends every token request that resumes from its generated tokens as
-    /// migratable, for the cause given; other requests go on.
-    Migrate(MigrationCause),
-    /// Promotes the executor's standing-by workers (`Executor::promote`)
-    /// and answers with the outcome.
-    Promote(crossbeam_channel::Sender<Result<(), String>>),
+    /// Parks the scheduler (`Scheduler::park`): ends every token request
+    /// that resumes from its generated tokens as migratable, lets the
+    /// others finish, and answers with the prefix cache index once nothing
+    /// runs; it executes nothing more until resumed.
+    Park(crossbeam_channel::Sender<Result<Vec<crate::kv_cache::IndexedPage>, String>>),
+    /// Resumes a parked scheduler, and answers whether it did.
+    Resume(crossbeam_channel::Sender<Result<(), String>>),
+    /// Promotes a successor scheduler (`Scheduler::promote`): imports its
+    /// predecessor's prefix cache index, and answers with the outcome.
+    Promote {
+        index: Vec<crate::kv_cache::IndexedPage>,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// Commits a successor scheduler (`Scheduler::commit`), and answers
+    /// with what each worker reported.
+    Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
+    /// Ends the memory of other worlds on the nodes of the scheduler's
+    /// workers (`Executor::retire`), and answers whether it did.
+    Retire {
+        worlds: Vec<u64>,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// Reports the KV cache each worker group holds now
+    /// (`Scheduler::describe_cache`).
+    DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
     /// Revokes every cached prefix page, so that later prompts compute
     /// their prefixes anew; requests in flight keep their pages.
     FlushCache,
@@ -530,10 +548,13 @@ pub enum Command {
 /// A change to the device memory of a scheduler's KV cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheChange {
-    /// Gives back the tail of the cache until each device has as much free
-    /// memory as its worker holds beside the weights and the cache, which a
-    /// standby engine needs; the requests that hold the tail are recomputed.
-    Shrink,
+    /// Gives back the tail of the cache until each device has the memory a
+    /// world succeeding this one needs beside the memory they share; the
+    /// requests that hold the tail run on, and are recomputed only once
+    /// `preempt_after` passed, when given.
+    Shrink {
+        preempt_after: Option<std::time::Duration>,
+    },
     /// Creates the given-back tail again.
     Restore,
     /// Gives back the whole cache and the CUDA graph memory, keeping the
@@ -542,6 +563,9 @@ pub enum CacheChange {
     Sleep,
     /// Restores what a sleep gave back.
     Wake,
+    /// Creates as many of the given-back segments as each device's free
+    /// memory holds.
+    Grow,
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the
@@ -673,10 +697,59 @@ impl CommandSender {
         let _ = self.send(Command::Abort(id));
     }
 
-    /// Ends every token request that resumes from its generated tokens as
-    /// migratable, for `cause`.
-    pub fn migrate(&self, cause: MigrationCause) {
-        let _ = self.send(Command::Migrate(cause));
+    /// Parks the scheduler (`Command::Park`); the receiver gets its
+    /// prefix cache index once it parked, or why it did not.
+    pub fn park(
+        &self,
+    ) -> crossbeam_channel::Receiver<Result<Vec<crate::kv_cache::IndexedPage>, String>> {
+        let (answer, parked) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Park(answer));
+        parked
+    }
+
+    /// Resumes a parked scheduler (`Command::Resume`); the receiver gets
+    /// whether it did.
+    pub fn resume(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, resumed) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Resume(answer));
+        resumed
+    }
+
+    /// Promotes a successor scheduler with its predecessor's prefix cache
+    /// index (`Command::Promote`); the receiver gets the outcome.
+    pub fn promote(
+        &self,
+        index: Vec<crate::kv_cache::IndexedPage>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, promoted) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Promote { index, answer });
+        promoted
+    }
+
+    /// Ends the memory of `worlds` on the nodes of the scheduler's workers
+    /// (`Command::Retire`); the receiver gets whether it did.
+    pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, retired) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Retire { worlds, answer });
+        retired
+    }
+
+    /// Reports the KV cache each worker group holds now
+    /// (`Command::DescribeCache`).
+    pub fn describe_cache(
+        &self,
+    ) -> crossbeam_channel::Receiver<Result<Vec<crate::scheduler::GroupCache>, String>> {
+        let (answer, described) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::DescribeCache(answer));
+        described
+    }
+
+    /// Commits a successor scheduler's world (`Command::Commit`); the
+    /// receiver gets what each worker reported.
+    pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, committed) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Commit(answer));
+        committed
     }
 
     /// Revokes every cached prefix page (`Command::FlushCache`).

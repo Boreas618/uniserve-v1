@@ -39,9 +39,10 @@ pub struct EngineInfo {
     pub latent_encoding_units: u32,
     /// The engine's schedulers, one per DP rank.
     pub schedulers: u32,
-    /// The prefix cache units of each worker group, which an engine
-    /// standing by for this one maps.
-    pub cache_units: Vec<wire::GroupCacheUnits>,
+    /// Each worker group's KV cache segments as the engine started with
+    /// them; a world succeeding this one maps those its engine describes
+    /// then ([`EngineClient::describe_cache`]).
+    pub segments: Vec<wire::CacheSegments>,
     /// The batch the workers were started for, within which the schedulers
     /// take scheduling limits in place; `None` from an engine that does not
     /// state it.
@@ -55,7 +56,7 @@ impl From<wire::EngineInfo> for EngineInfo {
             video_denoiser: info.video_denoiser,
             latent_encoding_units: info.latent_encoding_units,
             schedulers: info.schedulers,
-            cache_units: info.cache_units,
+            segments: info.segments,
             capacity: info.capacity,
         }
     }
@@ -72,14 +73,14 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// What an engine is, as its client knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineState {
-    /// It stands by for the running engine: its workers are loaded and
-    /// parked, and it serves once promoted.
+    /// It succeeds the serving engine and is prepared beside it: its
+    /// workers are loaded and captured, and it serves once promoted.
     Standby,
     /// It serves requests.
     Ready,
-    /// It admits nothing more: it ended its token requests as migratable
-    /// and finishes the rest.
-    Draining,
+    /// It preempted every request and executes nothing, keeping its memory
+    /// and prefix cache index until it resumes or shuts down.
+    Parked,
     /// It serves nothing more: its workers failed.
     Failed(String),
     /// Its connection closed.
@@ -96,7 +97,7 @@ pub enum SubmitError {
 
 /// Receives each scheduler's statistics: the scheduler's index and its
 /// snapshot of the last interval.
-pub type StatsSink = Box<dyn Fn(u32, SchedulerStats) + Send + Sync>;
+pub type StatsSink = Box<dyn Fn(u64, u32, SchedulerStats) + Send + Sync>;
 
 /// Why the consumer of a request's events closes them before the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -127,11 +128,24 @@ struct Shared {
     /// identity: a hook's answer is each worker's result, a configure's
     /// none.
     answers: Mutex<HashMap<u64, Answer>>,
+    /// The world the engine executes, which its statistics are recorded
+    /// under; 0 for an engine this daemon did not start.
+    world: AtomicU64,
 }
 
 /// Where an engine command's answer goes: each worker's result, or why the
 /// command failed.
-type Answer = oneshot::Sender<Result<Vec<String>, String>>;
+type Answer = oneshot::Sender<Result<Answered, String>>;
+
+/// What the engine answered a command with.
+enum Answered {
+    /// Each worker's JSON result (`Hooked`), or nothing (`Configured`).
+    Results(Vec<String>),
+    /// Each worker group's prefix cache index (`Parked`).
+    Index(Vec<wire::GroupIndex>),
+    /// Each worker group's KV cache segments (`CacheDescribed`).
+    Segments(Vec<wire::CacheSegments>),
+}
 
 impl Shared {
     /// Sends one frame to the engine; a closed connection is the reader's to
@@ -210,6 +224,7 @@ impl EngineClient {
             state,
             next_id: AtomicU64::new(1),
             answers: Mutex::default(),
+            world: AtomicU64::new(0),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -235,10 +250,23 @@ impl EngineClient {
         self
     }
 
+    /// The client of an engine that executes world `world`.
+    #[must_use]
+    pub fn in_world(self, world: u64) -> Self {
+        self.shared.world.store(world, Ordering::Relaxed);
+        self
+    }
+
     /// The engine's identity, when this daemon's engine control started or
     /// adopted it.
     pub fn engine(&self) -> Option<u64> {
         self.engine
+    }
+
+    /// The world the engine executes; 0 for an engine this daemon did not
+    /// start.
+    pub fn world(&self) -> u64 {
+        self.shared.world.load(Ordering::Relaxed)
     }
 
     /// What the engine reported it serves.
@@ -317,27 +345,29 @@ impl EngineClient {
         Ok((stream, scheduler))
     }
 
-    /// Promotes a standing-by engine: its workers take write access to the
-    /// storages they mapped and serve. Waits until the engine reports that
-    /// it serves; an engine that serves already is left as it is.
+    /// Promotes a prepared engine, which succeeds a parked one: its workers
+    /// adopt the predecessor's cache flags, and it imports `index`, the
+    /// predecessor's prefix cache index, and serves. Waits until the engine
+    /// reports that it serves; an engine that serves already is left as it
+    /// is.
     ///
     /// # Errors
     ///
     /// Fails when the engine reports that its promotion failed, or its
     /// connection closes first.
-    pub async fn promote(&self) -> Result<(), SubmitError> {
+    pub async fn promote(&self, index: Vec<wire::GroupIndex>) -> Result<(), SubmitError> {
         let mut states = self.states();
         if *states.borrow_and_update() == EngineState::Standby {
             self.shared
                 .send(to_engine::Kind::Engine(wire::EngineCommand {
-                    kind: Some(wire::engine_command::Kind::Promote(wire::Promote {})),
+                    kind: Some(wire::engine_command::Kind::Promote(wire::Promote { index })),
                 }));
         }
         loop {
             match states.borrow_and_update().clone() {
                 EngineState::Ready => return Ok(()),
                 EngineState::Failed(reason) => return Err(SubmitError::Unavailable(reason)),
-                EngineState::Closed | EngineState::Draining => {
+                EngineState::Closed | EngineState::Parked => {
                     return Err(SubmitError::Unavailable(
                         "the engine ended before it served".to_owned(),
                     ));
@@ -391,38 +421,89 @@ impl EngineClient {
         lock(&self.shared.requests).len()
     }
 
-    /// Commands the engine to drain: it admits nothing more, ends every
-    /// token request that resumes from its generated tokens as migratable,
-    /// and finishes the rest. Waits until the engine reports
-    /// [`EngineState::Draining`]; the requests in flight end after that, as
-    /// [`Self::in_flight`] counts.
+    /// Sends `command`, built with the identity its answer matches, and
+    /// awaits the answer.
+    async fn ask(
+        &self,
+        command: impl FnOnce(u64) -> wire::engine_command::Kind,
+    ) -> Result<Answered, String> {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        lock(&self.shared.answers).insert(id, answer);
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(command(id)),
+            }));
+        answered
+            .await
+            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+    }
+
+    /// Parks the engine: at its next step boundary it ends every token
+    /// request that resumes from its generated tokens as migratable, lets
+    /// the others finish, and executes nothing more, keeping its memory and
+    /// prefix cache index. Returns that index once it parked.
     ///
     /// # Errors
     ///
-    /// Fails when the engine fails or its connection closes before it
-    /// drains.
-    pub async fn drain(&self) -> Result<(), SubmitError> {
-        let mut states = self.states();
-        self.shared
-            .send(to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::Drain(wire::Drain {})),
-            }));
-        loop {
-            match states.borrow_and_update().clone() {
-                EngineState::Draining => return Ok(()),
-                EngineState::Failed(reason) => return Err(SubmitError::Unavailable(reason)),
-                EngineState::Closed => {
-                    return Err(SubmitError::Unavailable(
-                        "the engine ended before it drained".to_owned(),
-                    ));
-                }
-                EngineState::Ready | EngineState::Standby => {}
-            }
-            if states.changed().await.is_err() {
-                return Err(SubmitError::Unavailable(
-                    "the engine's client closed".to_owned(),
-                ));
-            }
+    /// Fails with the reason a scheduler did not park, or when the engine
+    /// ends first.
+    pub async fn park(&self) -> Result<Vec<wire::GroupIndex>, String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::Park(wire::Park { id }))
+            .await?
+        {
+            Answered::Index(index) => Ok(index),
+            _ => Err("the engine answered a park with something else".to_owned()),
+        }
+    }
+
+    /// Resumes a parked engine, ending the memory of the worlds `retire`
+    /// names on its nodes first: the successor a rollback discards.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a scheduler did not resume, or when the engine
+    /// ends first.
+    pub async fn resume(&self, retire: Vec<u64>) -> Result<(), String> {
+        self.ask(|id| wire::engine_command::Kind::Resume(wire::Resume { id, retire }))
+            .await
+            .map(drop)
+    }
+
+    /// Commits the engine's world: ends the memory of the worlds `retire`
+    /// names (its predecessor, whose processes are gone) on its nodes, and
+    /// its workers take the predecessor's memory they mapped read-only.
+    /// Returns what each worker reported.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a worker did not commit, or when the engine
+    /// ends first.
+    pub async fn commit(&self, retire: Vec<u64>) -> Result<Vec<String>, String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::Commit(wire::Commit { id, retire }))
+            .await?
+        {
+            Answered::Results(results) => Ok(results),
+            _ => Err("the engine answered a commit with something else".to_owned()),
+        }
+    }
+
+    /// Each worker group's KV cache segments as the engine holds them now,
+    /// which a world succeeding it maps.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a scheduler did not describe its cache, or
+    /// when the engine ends first.
+    pub async fn describe_cache(&self) -> Result<Vec<wire::CacheSegments>, String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::DescribeCache(wire::DescribeCache { id }))
+            .await?
+        {
+            Answered::Segments(segments) => Ok(segments),
+            _ => Err("the engine answered a cache description with something else".to_owned()),
         }
     }
 
@@ -448,6 +529,7 @@ impl EngineClient {
         answered
             .await
             .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+            .map(Answered::results)
     }
 
     /// Gives every scheduler of the engine the scheduling limits and policy
@@ -482,19 +564,30 @@ impl EngineClient {
     /// Fails with the reason a scheduler could not make the change, or when
     /// the engine ends first.
     pub async fn resize_cache(&self, change: wire::CacheChange) -> Result<Vec<String>, String> {
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (answer, answered) = oneshot::channel();
-        lock(&self.shared.answers).insert(id, answer);
-        self.shared
-            .send(to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
-                    id,
-                    change: change as i32,
-                })),
-            }));
-        answered
-            .await
-            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+        self.resize_cache_within(change, None).await
+    }
+
+    /// Gives back the tail of the engine's KV cache as
+    /// [`Self::resize_cache`] does for a shrink, recomputing the requests
+    /// that still hold it once `preempt_after` passed, when given.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::resize_cache`] does.
+    pub async fn resize_cache_within(
+        &self,
+        change: wire::CacheChange,
+        preempt_after: Option<Duration>,
+    ) -> Result<Vec<String>, String> {
+        self.ask(|id| {
+            wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+                id,
+                change: change as i32,
+                preempt_after_ms: preempt_after.map(|after| after.as_millis() as u64),
+            })
+        })
+        .await
+        .map(Answered::results)
     }
 
     /// Has every worker rewrite its weights in place from the checkpoint at
@@ -520,6 +613,7 @@ impl EngineClient {
         answered
             .await
             .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+            .map(Answered::results)
     }
 
     /// Commands the engine to revoke every cached prefix page; requests in
@@ -599,6 +693,16 @@ impl Drop for EngineClient {
     }
 }
 
+impl Answered {
+    /// The results a `Hooked` answer carries; none for any other answer.
+    fn results(self) -> Vec<String> {
+        match self {
+            Self::Results(results) => results,
+            Self::Index(_) | Self::Segments(_) => Vec::new(),
+        }
+    }
+}
+
 /// Files the engine's frames until its connection closes, then ends every
 /// request still in flight.
 fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
@@ -650,7 +754,11 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             }
             Some(from_engine::Kind::Stats(report)) => {
                 match SchedulerStats::decode(&report.snapshot) {
-                    Ok(snapshot) => stats(report.scheduler, snapshot),
+                    Ok(snapshot) => stats(
+                        shared.world.load(Ordering::Relaxed),
+                        report.scheduler,
+                        snapshot,
+                    ),
                     Err(error) => tracing::debug!(%error, "the engine sent unreadable statistics"),
                 }
             }
@@ -663,22 +771,22 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::State(state))
                 if state.state == wire::EngineState::Ready as i32 =>
             {
-                // A standing-by engine was promoted.
+                // A prepared engine was promoted, or a parked one resumed.
                 shared.state.send_if_modified(|current| {
-                    let standby = *current == EngineState::Standby;
-                    if standby {
+                    let changes = matches!(*current, EngineState::Standby | EngineState::Parked);
+                    if changes {
                         *current = EngineState::Ready;
                     }
-                    standby
+                    changes
                 });
             }
             Some(from_engine::Kind::State(state))
-                if state.state == wire::EngineState::Draining as i32 =>
+                if state.state == wire::EngineState::Parked as i32 =>
             {
                 shared.state.send_if_modified(|current| {
                     let ready = *current == EngineState::Ready;
                     if ready {
-                        *current = EngineState::Draining;
+                        *current = EngineState::Parked;
                     }
                     ready
                 });
@@ -686,7 +794,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::Hooked(hooked)) => {
                 if let Some(answer) = lock(&shared.answers).remove(&hooked.id) {
                     let _ = answer.send(if hooked.error.is_empty() {
-                        Ok(hooked.results)
+                        Ok(Answered::Results(hooked.results))
                     } else {
                         Err(hooked.error)
                     });
@@ -695,9 +803,27 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::Configured(configured)) => {
                 if let Some(answer) = lock(&shared.answers).remove(&configured.id) {
                     let _ = answer.send(if configured.error.is_empty() {
-                        Ok(Vec::new())
+                        Ok(Answered::Results(Vec::new()))
                     } else {
                         Err(configured.error)
+                    });
+                }
+            }
+            Some(from_engine::Kind::Parked(parked)) => {
+                if let Some(answer) = lock(&shared.answers).remove(&parked.id) {
+                    let _ = answer.send(if parked.error.is_empty() {
+                        Ok(Answered::Index(parked.index))
+                    } else {
+                        Err(parked.error)
+                    });
+                }
+            }
+            Some(from_engine::Kind::CacheDescribed(described)) => {
+                if let Some(answer) = lock(&shared.answers).remove(&described.id) {
+                    let _ = answer.send(if described.error.is_empty() {
+                        Ok(Answered::Segments(described.segments))
+                    } else {
+                        Err(described.error)
                     });
                 }
             }

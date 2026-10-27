@@ -22,7 +22,7 @@ impl Scheduler {
     }
 
     /// Removes a queued token request while preserving admission order for its peers.
-    fn remove_waiting(&mut self, request_id: RequestId) -> Option<RequestState> {
+    pub(super) fn remove_waiting(&mut self, request_id: RequestId) -> Option<RequestState> {
         let index = self
             .waiting
             .iter()
@@ -104,13 +104,25 @@ impl Scheduler {
             } => self.acknowledge_output(request_id, output_token_count),
             Command::Stop(request_id) => self.mark_stopped(request_id),
             Command::Abort(id) => self.mark_cancelled(id, true),
-            Command::Migrate(cause) => self.migrate_requests(cause),
-            Command::Promote(answer) => {
-                let promoted = self
+            Command::Park(answer) => self.park(answer),
+            Command::Resume(answer) => {
+                let _ = answer.send(self.resume());
+            }
+            Command::Promote { index, answer } => {
+                let _ = answer.send(self.promote(&index));
+            }
+            Command::Commit(answer) => {
+                let _ = answer.send(self.commit());
+            }
+            Command::Retire { worlds, answer } => {
+                let retired = self
                     .executor
-                    .promote()
+                    .retire(&worlds)
                     .map_err(|error| format!("{error:#}"));
-                let _ = answer.send(promoted);
+                let _ = answer.send(retired);
+            }
+            Command::DescribeCache(answer) => {
+                let _ = answer.send(self.describe_cache());
             }
             Command::FlushCache => {
                 let pages = self.storage.flush_prefix_cache();

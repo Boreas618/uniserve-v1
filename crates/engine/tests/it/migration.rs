@@ -156,10 +156,11 @@ fn a_bad_word_continues_from_the_generated_tokens() {
     assert_eq!(tokens.first(), Some(&1234), "{tokens:?}");
 }
 
-/// Migrating ends a running token request after the tokens it generated, and
-/// a queued one at once, each with a migratable end in place of a finish.
+/// Parking ends a running token request after the tokens it generated, and
+/// a queued one at once, each with a migratable end in place of a finish,
+/// and answers with the scheduler's prefix cache index once nothing runs.
 #[test]
-fn migrating_ends_running_and_queued_requests_as_migratable() {
+fn parking_ends_running_and_queued_requests_as_migratable() {
     let (handle, thread) = start(100_000, 1);
     let mut events = handle
         .submit_all([
@@ -181,7 +182,7 @@ fn migrating_ends_running_and_queued_requests_as_migratable() {
         }
     }
     assert_eq!(before, 3, "the first request generates before it migrates");
-    handle.migrate(MigrationCause::Drain);
+    let parked = handle.park();
 
     let (_, terminal) = drain(&mut running);
     assert!(
@@ -204,6 +205,14 @@ fn migrating_ends_running_and_queued_requests_as_migratable() {
         ),
         "{terminal:?}"
     );
+    let index = parked
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler parked")
+        .expect("the scheduler parked without an error");
+    // The running request published the pages of its prompt and the tokens
+    // it generated, which a successor imports.
+    assert!(index.iter().all(|page| !page.units.is_empty()), "{index:?}");
+    assert!(handle.resume().recv().unwrap().is_ok());
     handle.shutdown();
     thread.join().unwrap();
 }
@@ -263,5 +272,204 @@ fn a_migration_reuses_the_pages_of_the_tokens_it_generated() {
     assert_eq!(
         stats.prefix.hit_tokens.load(Ordering::Relaxed) - hits_before,
         20
+    );
+}
+
+/// How the workers of [`FaultingExecutor`] fail once told to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// Every poll fails, as a worker process's exit does.
+    Lost,
+    /// Every call reports non-finite logits, as a worker whose forward
+    /// produced a NaN does (`ErrorCode::NumericalFault`).
+    NonFinite,
+}
+
+/// The simulator's workers, which fail as `fault` states from the moment it
+/// is set. A batch whose calls computed non-finite logits is reported as
+/// workers report one: the failure of the work that depends on its calls
+/// first, and the batch's result, its failed calls included, at the next
+/// poll.
+struct FaultingExecutor {
+    inner: SimExecutor,
+    fault: std::sync::Arc<std::sync::Mutex<Option<Fault>>>,
+    queued: Option<engine::BatchResult>,
+}
+
+impl engine::Executor for FaultingExecutor {
+    fn info(&self) -> &engine::ExecutorInfo {
+        self.inner.info()
+    }
+
+    fn is_ready(&self, worker: &engine::WorkerGroupId) -> bool {
+        self.inner.is_ready(worker)
+    }
+
+    fn has_capacity(&self, worker: &engine::WorkerGroupId) -> bool {
+        self.inner.has_capacity(worker)
+    }
+
+    fn command_has_capacity(&self, command: &ipc::BatchCommand) -> bool {
+        self.inner.command_has_capacity(command)
+    }
+
+    fn submit(&mut self, batch: engine::ExecutionBatch) -> Result<(), engine::ExecutorSubmitError> {
+        self.inner.submit(batch)
+    }
+
+    fn poll(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<engine::BatchResult>, engine::ExecutorError> {
+        if let Some(report) = self.queued.take() {
+            return Ok(Some(report));
+        }
+        let fault = *self.fault.lock().unwrap();
+        if fault == Some(Fault::Lost) {
+            return Err(anyhow::anyhow!("worker process exited"));
+        }
+        let report = self.inner.poll(timeout)?;
+        let Some(mut report) = report else {
+            return Ok(None);
+        };
+        if fault != Some(Fault::NonFinite) {
+            return Ok(Some(report));
+        }
+        for result in &mut report.results {
+            result.output.status = ipc::CallStatus::Error;
+            result.output.error_code = Some(ipc::ErrorCode::NumericalFault);
+            result.output.committed_tokens.clear();
+        }
+        let failure = engine::WorkerFailure {
+            worker_id: engine::WorkerGroupId("sim".to_owned()),
+            endpoints: Vec::new(),
+            requests: report
+                .results
+                .iter()
+                .map(|result| result.output.request_key)
+                .collect(),
+            refusals: Default::default(),
+            retired: Vec::new(),
+            buffers: Vec::new(),
+            execution: engine::WorkerExecError::non_finite(
+                report.batch_id,
+                report.results.iter().map(|result| &result.output),
+            ),
+            message: "call failed before its dependent work could complete".into(),
+        };
+        self.queued = Some(report);
+        Err(failure.into())
+    }
+
+    fn close(&mut self) -> Result<(), engine::ExecutorError> {
+        self.inner.close()
+    }
+}
+
+/// Runs a request on a scheduler, on trial or not, until it generated a few
+/// tokens, then fails its workers with `fault`. Returns the tokens the
+/// request delivered, its terminal event, whether the scheduler stopped on
+/// a fatal failure, and that failure's first error.
+fn fail_while_generating(
+    trial: bool,
+    fault: Fault,
+) -> (Vec<u32>, Option<Event>, bool, Option<String>) {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    let faults = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut scheduler = support::scheduler_with(
+        Box::new(FaultingExecutor {
+            inner: SimExecutor::new(sim),
+            fault: std::sync::Arc::clone(&faults),
+            queued: None,
+        }),
+        SimEngine::special_tokens(),
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    scheduler.set_trial(trial);
+    let failure = scheduler.failure_handle();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let thread = thread::spawn(move || scheduler.run(rx));
+    let handle = CommandSender::new(tx);
+
+    let mut events = handle
+        .submit(request(1, Vec::new(), SamplingParams::default(), 100_000))
+        .unwrap();
+    let mut tokens = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while tokens.len() < 4 && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(Event::TextToken { id, .. }) => tokens.push(id),
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(tokens.len(), 4, "the request generates before the fault");
+    *faults.lock().unwrap() = Some(fault);
+
+    let (after, terminal) = drain(&mut events);
+    tokens.extend(after);
+    let stopped = if trial {
+        thread.join().unwrap()
+    } else {
+        handle.shutdown();
+        thread.join().unwrap()
+    };
+    (tokens, terminal, stopped, failure.get().cloned())
+}
+
+/// A world on trial is not repaired: a lost worker stops its scheduler,
+/// which hands every request that resumes from its generated tokens back
+/// as migratable for a loss, after every token it delivered, and reports
+/// the loss as its first error.
+#[test]
+fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
+    let (tokens, terminal, stopped, failure) = fail_while_generating(true, Fault::Lost);
+    assert!(stopped, "a lost worker stops a scheduler on trial");
+    assert!(tokens.len() >= 4, "{tokens:?}");
+    assert!(
+        matches!(
+            terminal,
+            Some(Event::Migratable {
+                cause: MigrationCause::Loss
+            })
+        ),
+        "{terminal:?}"
+    );
+    let failure = failure.expect("the scheduler reports its first error");
+    assert!(failure.contains("worker process exited"), "{failure}");
+}
+
+/// Non-finite logits fail a world on trial as a whole: the scheduler stops
+/// and hands the request back as migratable, naming the batch and its
+/// requests as its first error. Outside a trial they fail the request
+/// alone, as any failed call does, and the scheduler serves on.
+#[test]
+fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
+    let (tokens, terminal, stopped, failure) = fail_while_generating(true, Fault::NonFinite);
+    assert!(stopped, "non-finite logits stop a scheduler on trial");
+    assert!(
+        matches!(
+            terminal,
+            Some(Event::Migratable {
+                cause: MigrationCause::Loss
+            })
+        ),
+        "{terminal:?}"
+    );
+    let failure = failure.expect("the scheduler reports its first error");
+    assert!(
+        failure.contains("non-finite logits for requests [1]"),
+        "{failure}"
+    );
+    assert!(tokens.len() >= 4, "{tokens:?}");
+
+    let (_, terminal, stopped, failure) = fail_while_generating(false, Fault::NonFinite);
+    assert!(!stopped, "a scheduler not on trial serves on");
+    assert!(failure.is_none(), "{failure:?}");
+    assert!(
+        matches!(terminal, Some(Event::Error { .. })),
+        "{terminal:?}"
     );
 }

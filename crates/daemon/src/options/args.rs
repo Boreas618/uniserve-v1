@@ -688,10 +688,14 @@ mod tests {
         assert!(error.to_string().contains("`model` is required"), "{error}");
     }
 
+    /// The model comes from the command line or the file; a single node's
+    /// daemon without one validates, and serves its admin API alone until a
+    /// configuration names it.
     #[test]
-    fn the_model_is_required_from_the_command_line_or_the_file() {
-        let error = lowered(&[]).unwrap_err();
-        assert!(error.to_string().contains("`model` is required"), "{error}");
+    fn the_model_comes_from_the_command_line_or_the_file() {
+        let (config, stated) = resolved(&[]).unwrap();
+        assert!(config.model.is_none());
+        config.validate(&stated).unwrap();
         let (config, engine) = lowered(&["/models/m"]).unwrap();
         assert_eq!(config.model(), "/models/m");
         assert_eq!(config.served_model_name(), "/models/m");

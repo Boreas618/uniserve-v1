@@ -25,7 +25,7 @@
 //!
 //! Every process is keyed by the engine connection that started it and by
 //! its group, rank and launch generation: two engines of one deployment (the
-//! running one and a standby of a hot update) name the same groups, and a
+//! serving world's and its successor's) name the same groups, and a
 //! group's standby ranks run beside its serving ones under a later
 //! generation. A `Stop` ends one group of one engine, every generation of
 //! it; an engine whose connection closes takes its remaining processes with

@@ -38,6 +38,7 @@ from uniserve.executor.text.philox import request_sampling_key, sampling_uniform
 from uniserve.executor.text.protocol import (
     CALL_FIELDS,
     CALL_WORDS,
+    COMPLETION_FIELDS,
     HEADER_WORDS,
     RECORD_MAGIC,
     CallField,
@@ -163,6 +164,7 @@ class Outcome:
     progress: Progress
     active: bool = True
     accepted: int = 0
+    finite: bool = True
     logprob_tokens: list[int] = field(default_factory=list)
     prompt_tokens: list[int] = field(default_factory=list)
     drafts: list[int] | None = None
@@ -536,7 +538,9 @@ class Worker:
             assert flags & RecordFlag.RAN and flags & RecordFlag.PROGRESS
             assert flags & RecordFlag.SAMPLING
             offset = int(fields[RecordField.SAMPLING_OFFSET])
-            tasks = int(fields[RecordField.SAMPLING_EXTENT]) // 4
+            tasks = (
+                int(fields[RecordField.SAMPLING_EXTENT]) // COMPLETION_FIELDS
+            )
             row = int(fields[RecordField.SAMPLING_ROW])
             outcome = Outcome(
                 flags=flags,
@@ -544,6 +548,7 @@ class Worker:
                 valid=bool(words[offset + row]),
                 active=bool(words[offset + tasks + row]),
                 accepted=int(words[offset + 3 * tasks + row]),
+                finite=bool(words[offset + 4 * tasks + row]),
                 progress=Progress(
                     logical=int(fields[RecordField.LOGICAL]),
                     rng=int(fields[RecordField.RNG]),
@@ -591,7 +596,8 @@ class Worker:
             batches.append(self.run(CallKind.DECODE, REQUESTS, progress))
         for outcomes in batches:
             for request, outcome in zip(REQUESTS, outcomes):
-                assert outcome.valid
+                # A real checkpoint's logits on these prompts are finite.
+                assert outcome.valid and outcome.finite
                 generated[request.slot].append(outcome.token)
         return generated, batches
 

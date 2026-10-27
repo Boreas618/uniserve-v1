@@ -2197,15 +2197,18 @@ fn a_prefill_group_hands_its_requests_to_a_decode_group() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// An engine standing by for a running one starts beside it on the same
-/// storages, serves once the running engine closed and it is promoted, and
-/// continues a request the running one generated part of: the continuation
-/// generates what the uninterrupted request generates after those tokens,
-/// and its usage is the uninterrupted request's.
+/// A world that succeeds a running one starts beside it under the same
+/// claim, serves once the running world parked and it is promoted with the
+/// running world's prefix cache index, commits once the running world
+/// closed, and continues a request the running one generated part of: the
+/// continuation generates what the uninterrupted request generates after
+/// those tokens, and its usage is the uninterrupted request's.
 #[test]
-fn a_standing_by_engine_continues_the_requests_of_the_engine_it_replaces() -> anyhow::Result<()> {
-    let deployment = format!("standby-{}", std::process::id());
-    let running = SchedulerHandle::start_all(stub_engine_config(&deployment))?.remove(0);
+fn a_successor_world_continues_the_requests_of_the_world_it_replaces() -> anyhow::Result<()> {
+    let deployment = format!("worlds-{}", std::process::id());
+    let mut first = stub_engine_config(&deployment);
+    first.world = 1;
+    let running = SchedulerHandle::start_all(first)?.remove(0);
     let result =
         (|| -> anyhow::Result<(Vec<u32>, Event, SchedulerHandle)> {
             let (reference, finished) =
@@ -2215,20 +2218,47 @@ fn a_standing_by_engine_continues_the_requests_of_the_engine_it_replaces() -> an
                 "the reference did not finish: {finished:?}"
             );
 
+            let caches = running
+                .describe_cache()
+                .recv()?
+                .map_err(|error| anyhow::anyhow!(error))?;
             let mut config = stub_engine_config(&deployment);
-            config.standby = Some(running.cache_units().clone());
-            let standby = SchedulerHandle::start_all(config)?.remove(0);
-            running.migrate(proto::request::MigrationCause::Drain);
+            config.world = 2;
+            config.predecessor = Some(
+                caches
+                    .into_iter()
+                    .map(|cache| {
+                        (
+                            cache.worker_group,
+                            ipc::PredecessorCache {
+                                world: 1,
+                                segments: cache.segments[..cache.held as usize].to_vec(),
+                                num_units: cache.units,
+                                scratch_units: cache.scratch,
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            let successor = SchedulerHandle::start_all(config)?.remove(0);
+            let index = running
+                .park()
+                .recv()?
+                .map_err(|error| anyhow::anyhow!(error))?;
+            successor.promote(index)?;
             running.shutdown();
-            standby.promote()?;
+            successor
+                .commit()
+                .recv()?
+                .map_err(|error| anyhow::anyhow!(error))?;
 
             let (continued, finished) = tokens_until_terminal(
-                &mut standby.submit(greedy_text(92, reference[..3].to_vec(), 8))?,
+                &mut successor.submit(greedy_text(92, reference[..3].to_vec(), 8))?,
             )?;
             let mut whole = reference[..3].to_vec();
             whole.extend(continued);
             anyhow::ensure!(whole == reference, "{whole:?} differs from {reference:?}");
-            Ok((reference, finished, standby))
+            Ok((reference, finished, successor))
         })();
     running.shutdown();
     let (_reference, finished, standby) = result?;
@@ -2708,7 +2738,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 },
             )
             .unwrap();
-            let claim = head.claim(Vec::new()).unwrap();
+            let claim = head.claim(0, Vec::new(), Vec::new()).unwrap();
             let launch = ipc::StorageLaunch {
                 socket: socket.to_string_lossy().into_owned(),
                 deployment: STUB_WORKER.into(),
@@ -2716,6 +2746,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 host_kv_cache: false,
                 host_kv_cache_bytes: None,
                 tcp: None,
+                world: 0,
                 standby: false,
                 standby_memory: proto::request::StandbyMemory::Auto,
             };
@@ -2764,7 +2795,8 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         prefix_cache_dtype: None,
         mem_fraction_static: 0.7,
         max_total_tokens: Some(4096),
-        cache_units: None,
+        predecessor: None,
+        segments: None,
         attention_backend: "torch".into(),
         block_size: Some(16),
         max_batch_calls: 8,

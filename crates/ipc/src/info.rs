@@ -34,16 +34,24 @@ pub struct PrefixCacheInfo {
     /// forwards. A standby worker warms up on them while its predecessor
     /// serves, so the engine never allocates them.
     pub scratch_units: u32,
-    /// The units of each segment the rank's value planes are made of, which
-    /// give memory back and are created again whole; zero for planes not
-    /// split.
+    /// The segments the rank's value planes are made of, in unit order, each
+    /// of whole units that give memory back and are created again whole;
+    /// empty for planes not split.
     #[serde(default)]
-    pub segment_units: u32,
-    /// The units below the first segment the planes gave back, which alone
-    /// the engine allocates; `num_units` while none is given back. A standby
-    /// adopts planes its predecessor shrank for it.
+    pub segments: Vec<CacheSegment>,
+    /// The segments the planes hold, `[0, held_segments)`: the engine
+    /// allocates no unit of the segments after, whose memory was given back.
     #[serde(default)]
-    pub usable_units: u32,
+    pub held_segments: u32,
+    /// The units the planes map read-only from the predecessor world's
+    /// planes, `[inherited_start, inherited_start + inherited_units)`: they
+    /// hold the predecessor's pages, which the engine reads once its index
+    /// is imported and allocates only once the predecessor is gone and the
+    /// rank took its memory; zero for planes of their own.
+    #[serde(default)]
+    pub inherited_start: u32,
+    #[serde(default)]
+    pub inherited_units: u32,
     /// Whether the rank also keeps cache layers per request slot (a cache
     /// layer type indexed by request, as a recurrent state): a page does not
     /// hold the state a request reached, so no prefix is reused and no page
@@ -53,15 +61,63 @@ pub struct PrefixCacheInfo {
 }
 
 impl PrefixCacheInfo {
-    /// The units the engine may allocate (`usable_units`, all of them when
-    /// unset).
+    /// The units below the first segment given back: every unit of planes
+    /// not split.
     pub fn allocatable_units(&self) -> u32 {
-        if self.usable_units == 0 {
-            self.num_units
-        } else {
-            self.usable_units.min(self.num_units)
+        if self.segments.is_empty() {
+            return self.num_units;
         }
+        self.segments
+            .iter()
+            .take(self.held_segments as usize)
+            .map(|segment| segment.units)
+            .sum::<u32>()
+            .min(self.num_units)
     }
+
+    /// The units the planes map read-only from the predecessor's planes.
+    pub fn inherited(&self) -> std::ops::Range<u32> {
+        self.inherited_start..self.inherited_start + self.inherited_units
+    }
+}
+
+/// One segment of a rank's KV cache planes: an allocation of whole units on
+/// every plane, which a world created and the Storage Server retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CacheSegment {
+    /// The world that created the segment's memory.
+    pub world: u64,
+    /// The segment's ordinal among those its world created.
+    pub ordinal: u32,
+    /// The units the segment holds.
+    pub units: u32,
+}
+
+/// The exact segments a rank's KV cache planes are made of, and how many of
+/// the leading ones exist: a relaunched rank of the same world, or a
+/// standby rank group's, lays its planes out alike and takes them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTable {
+    pub segments: Vec<CacheSegment>,
+    /// The segments `[0, held)` that exist; the others were given back.
+    pub held: u32,
+}
+
+/// What a rank of a world that succeeds another maps of the predecessor's
+/// KV cache: the predecessor's world, and the segments its rank of the same
+/// scope holds, in unit order, which the rank maps read-only after a head
+/// segment of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredecessorCache {
+    pub world: u64,
+    /// The segments the predecessor's planes hold.
+    pub segments: Vec<CacheSegment>,
+    /// The units of the predecessor's planes, those of the segments it gave
+    /// back included: its flags and scales are laid out over them.
+    pub num_units: u32,
+    /// The units `1..=scratch_units` the predecessor's warmup lent, which a
+    /// successor of the same configuration needs as many of.
+    pub scratch_units: u32,
 }
 
 /// The host page pool of one cache group on one rank: the Storage Server
@@ -229,15 +285,27 @@ impl PrefixCacheInfo {
             page_pools: Vec::new(),
             // A unit the warmup of any stage lends stays out of the pool.
             scratch_units: self.scratch_units.max(other.scratch_units),
-            // Stages whose planes split alike give memory back together.
-            segment_units: if self.segment_units == other.segment_units {
-                self.segment_units
+            // Stages whose planes split alike give memory back together;
+            // planes split otherwise hold every unit and give back none.
+            segments: if self.segments == other.segments {
+                self.segments.clone()
+            } else {
+                Vec::new()
+            },
+            held_segments: if self.segments == other.segments {
+                self.held_segments.min(other.held_segments)
             } else {
                 0
             },
-            usable_units: self.allocatable_units().min(other.allocatable_units()),
+            // The stages of one world inherit the same predecessor units.
+            inherited_start: self.inherited_start,
+            inherited_units: self.inherited_units,
             request_states: self.request_states || other.request_states,
         };
+        ensure_valid!(
+            self.inherited() == other.inherited(),
+            "the stages of one worker inherit different units of their predecessor"
+        );
         merged.validate()?;
         Ok(merged)
     }
@@ -735,8 +803,10 @@ impl Default for WorkerInfo {
                 }],
                 page_pools: Vec::new(),
                 scratch_units: 0,
-                segment_units: 0,
-                usable_units: 0,
+                segments: Vec::new(),
+                held_segments: 0,
+                inherited_start: 0,
+                inherited_units: 0,
                 request_states: false,
             }),
             latent_page_units: 0,

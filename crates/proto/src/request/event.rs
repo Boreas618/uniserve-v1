@@ -203,7 +203,7 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationCause {
-    /// The engine drains for a hot update.
+    /// The engine parks for a world change or a rollback.
     Drain,
     /// The workers that held the request were lost.
     Loss,

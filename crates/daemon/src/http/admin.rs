@@ -24,8 +24,9 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::leader::{Leader, LeaderStatus, UpdateError, UpdateRequest};
+use crate::leader::{Leader, LeaderStatus, UpdateError};
 use crate::openai::ApiError;
+use crate::worlds::{Applied, ApplyRequest, InFlight};
 
 /// Events the log keeps; older ones leave it.
 const EVENT_CAPACITY: usize = 1024;
@@ -52,10 +53,10 @@ pub(crate) struct AdminEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Operation {
     pub id: u64,
-    /// `update`, `update_weights`, `pause_generation`,
-    /// `continue_generation`, `flush_cache`, `sleep`, `wake_up`,
-    /// `load_lora_adapter`, `unload_lora_adapter`, `cupti`, `hook`,
-    /// `restart` or `shutdown`.
+    /// `config`, `commit`, `rollback`, `update_weights`,
+    /// `pause_generation`, `continue_generation`, `flush_cache`, `sleep`,
+    /// `wake_up`, `load_lora_adapter`, `unload_lora_adapter`, `cupti`,
+    /// `hook`, `restart` or `shutdown`.
     pub kind: String,
     /// `running`, `succeeded` or `failed`.
     pub state: String,
@@ -318,7 +319,9 @@ pub(crate) fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/status", get(status))
         .route("/admin/events", get(events))
-        .route("/admin/update", post(update))
+        .route("/admin/config", get(config).put(apply_config))
+        .route("/admin/config/commit", post(commit))
+        .route("/admin/config/rollback", post(rollback))
         .route("/admin/pause_generation", post(pause_generation))
         .route("/admin/continue_generation", post(continue_generation))
         .route("/admin/flush_cache", post(flush_cache))
@@ -414,48 +417,82 @@ where
     }
 }
 
-/// The body of `POST /admin/update`: an [`UpdateRequest`], and whether to
+/// The body of `PUT /admin/config`: an [`ApplyRequest`], and whether to
 /// answer once it ends.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UpdateBody {
+struct ConfigBody {
+    /// The whole target configuration as TOML; the current one when unset.
     #[serde(default)]
-    executable: Option<String>,
+    config: Option<String>,
     #[serde(default)]
     set: Vec<String>,
+    #[serde(default)]
+    in_flight: InFlight,
+    #[serde(default)]
+    dry_run: bool,
+    /// Apply a configuration a rollback marked unavailable.
+    #[serde(default)]
+    force: bool,
     #[serde(default = "yes")]
     wait: bool,
 }
 
-/// `POST /admin/update`: a hot update to another build and options
-/// (`Leader::update`).
-async fn update(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+/// `GET /admin/config`: the configuration, its digest, the two slots'
+/// worlds, the change in progress, the trial and the configurations a
+/// rollback marked unavailable (`Leader::config_status`).
+async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    Json(state.leader.config_status())
+}
+
+/// `PUT /admin/config`: changes the deployment to a configuration
+/// (`Leader::apply`), in place, by a hot restart of the daemon, or in a new
+/// world on trial.
+async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
-        UpdateBody {
-            executable: None,
-            set: Vec::new(),
+        ConfigBody {
             wait: true,
+            ..ConfigBody::default()
         }
     } else {
-        match serde_json::from_slice::<UpdateBody>(&body) {
+        match serde_json::from_slice::<ConfigBody>(&body) {
             Ok(body) => body,
             Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
         }
     };
     let leader = Arc::clone(&state.leader);
-    run(&state.admin, "update", body.wait, async move {
-        let request = UpdateRequest {
-            executable: body.executable,
+    let admin = Arc::clone(&state.admin);
+    let jobs = Arc::clone(&state.jobs);
+    let restarter = state.restarter.clone();
+    run(&state.admin, "config", body.wait, async move {
+        let request = ApplyRequest {
+            config: body.config,
             set: body.set,
+            in_flight: body.in_flight,
+            dry_run: body.dry_run,
+            force: body.force,
         };
-        match leader.update(request).await {
-            Ok(update) => Ok(json!({
-                "in_place": update.in_place,
-                "pause_seconds": update.pause.as_secs_f64(),
-                "drain_seconds": update.drain.as_secs_f64(),
-                "close_seconds": update.close.as_secs_f64(),
-                "promotion_seconds": update.promotion.as_secs_f64(),
-            })),
+        // The change's future holds the model files it resolves.
+        match Box::pin(leader.apply(request)).await {
+            Ok(Applied::Unchanged) => Ok(json!({ "change": "none" })),
+            Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
+            Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
+            Ok(Applied::World(report)) => Ok(json!({ "change": "world", "world": report })),
+            Ok(Applied::Daemon { config, executable }) => {
+                let Some(restarter) = restarter else {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "the change is of the daemon's own options, and this daemon does not \
+                         restart in place"
+                            .to_owned(),
+                    ));
+                };
+                restarter
+                    .restart(executable, Some(*config), &leader, &admin, &jobs)
+                    .await
+                    .map(|pid| json!({ "change": "daemon", "pid": pid }))
+                    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))
+            }
             Err(error) => Err((
                 update_status(&error),
                 format!("{:#}", anyhow::Error::from(error)),
@@ -465,10 +502,60 @@ async fn update(State(state): State<AdminState>, body: axum::body::Bytes) -> Res
     .await
 }
 
+/// `POST /admin/config/commit`: ends the trial of the world that executes
+/// (`Leader::commit`).
+async fn commit(State(state): State<AdminState>) -> Response {
+    let leader = Arc::clone(&state.leader);
+    run(&state.admin, "commit", true, async move {
+        leader.commit().await.map_err(|error| {
+            (
+                update_status(&error),
+                format!("{:#}", anyhow::Error::from(error)),
+            )
+        })
+    })
+    .await
+}
+
+/// The body of `POST /admin/config/rollback`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackBody {
+    /// Why the operator rolls back, which the unavailable mark records.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /admin/config/rollback`: rolls the world on trial back to the
+/// previous world (`Leader::rollback`).
+async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+    let body = if body.is_empty() {
+        RollbackBody::default()
+    } else {
+        match serde_json::from_slice::<RollbackBody>(&body) {
+            Ok(body) => body,
+            Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
+        }
+    };
+    let leader = Arc::clone(&state.leader);
+    run(&state.admin, "rollback", true, async move {
+        let reason = body
+            .reason
+            .unwrap_or_else(|| "the operator rolled the trial back".to_owned());
+        leader.rollback(reason).await.map_err(|error| {
+            (
+                update_status(&error),
+                format!("{:#}", anyhow::Error::from(error)),
+            )
+        })
+    })
+    .await
+}
+
 /// The status of a failed update.
 fn update_status(error: &UpdateError) -> StatusCode {
     match error {
-        UpdateError::InProgress => StatusCode::CONFLICT,
+        UpdateError::InProgress | UpdateError::OnTrial(_) => StatusCode::CONFLICT,
         UpdateError::Refused(_) => StatusCode::BAD_REQUEST,
         UpdateError::NoEngine => StatusCode::SERVICE_UNAVAILABLE,
         UpdateError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -762,7 +849,7 @@ async fn restart(State(state): State<AdminState>, body: axum::body::Bytes) -> Re
     let jobs = Arc::clone(&state.jobs);
     run(&state.admin, "restart", body.wait, async move {
         restarter
-            .restart(body.executable, &leader, &admin, &jobs)
+            .restart(body.executable, None, &leader, &admin, &jobs)
             .await
             .map(|pid| json!({ "pid": pid }))
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))

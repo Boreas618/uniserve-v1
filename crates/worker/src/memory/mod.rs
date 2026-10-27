@@ -21,7 +21,7 @@ pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
 pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, GroupAxis, StateField};
-pub use prefix_cache::planes::{CachePlanes, UnitColumn};
+pub use prefix_cache::planes::{CachePlanes, LaidSegment, PlaneLayout, UnitColumn};
 pub use prefix_cache::{PendingImport, PrefixCache};
 pub use products::{
     Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore, ValueRange,

@@ -191,13 +191,16 @@ impl PrefixCacheManager {
     pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
         info.prefix_cache.as_ref().map(|prefix_cache| {
             let block_pool = BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units);
-            // A standby adopts planes its predecessor shrank for it: the
-            // units of the segments given back stay withdrawn until they
-            // are created again.
+            // The units of the segments the planes do not hold (a
+            // successor's tail its memory does not hold yet, or what a
+            // standby's predecessor gave back) stay withdrawn until they are
+            // created; the units mapped from a predecessor world stay out of
+            // allocation until the world takes them.
             let usable = prefix_cache.allocatable_units();
             if usable < prefix_cache.num_units {
                 block_pool.withdraw(usable);
             }
+            block_pool.inherit(prefix_cache.inherited());
             let mut coordinator = PrefixCacheCoordinator::new(
                 prefix_cache
                     .groups

@@ -67,9 +67,9 @@ pub struct Leader {
     /// What the engine the model was bound to reported it serves.
     info: EngineInfo,
     /// Every request's way to the engine that serves, across engines.
-    migrator: Migrator,
+    pub(crate) migrator: Migrator,
     /// What starts and replaces the engine that serves.
-    engines: Arc<Engines>,
+    pub(crate) engines: Arc<Engines>,
     images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
     readout: Option<Arc<ReadoutEncoder>>,
@@ -94,11 +94,22 @@ pub enum Task {
     Readout,
 }
 
-/// Records each scheduler's statistics under `model_name`.
-pub(crate) fn stats_sink(model_name: String) -> StatsSink {
-    Box::new(move |scheduler, snapshot| {
+/// Records each scheduler's statistics under `model_name`, and with
+/// `observer`, which reads each world's rates.
+pub(crate) fn stats_sink(model_name: String, observer: Arc<crate::worlds::Observer>) -> StatsSink {
+    Box::new(move |world, scheduler, snapshot| {
+        observer.record(world, &snapshot);
         metrics::record_scheduler_stats(&METRICS.scheduler, &model_name, scheduler, &snapshot);
     })
+}
+
+/// How many requests ended since the daemon started, and how many failed.
+pub(crate) fn outcomes() -> (u64, u64) {
+    let outcomes = &metrics::OUTCOMES;
+    (
+        outcomes.ended.load(Ordering::Relaxed),
+        outcomes.failed.load(Ordering::Relaxed),
+    )
 }
 
 /// What a leader prepares before it has an engine (`Leader::prepare`).
@@ -142,7 +153,8 @@ impl Leader {
             config.host_identity.clone(),
             config.served_model_name().to_owned(),
         )?;
-        let sink = stats_sink(config.model().to_owned());
+        let observer = Arc::new(crate::worlds::Observer::default());
+        let sink = stats_sink(config.model().to_owned(), Arc::clone(&observer));
         let spec = prepared.spec.clone();
         let (client, control) = tokio::task::spawn_blocking(move || {
             control.start(spec, sink).map(|client| (client, control))
@@ -150,8 +162,9 @@ impl Leader {
         .await
         .context("the engine startup task did not complete")?
         .context("failed to start the UniServe engine")?;
-        let served = prepared.spec.clone();
-        Self::finish(config, prepared, control, client, served)
+        let mut served = prepared.spec.clone();
+        served.world = client.world();
+        Self::finish(config, prepared, control, client, served, observer)
     }
 
     /// What a leader prepares before it has an engine: the model's files
@@ -269,6 +282,7 @@ impl Leader {
         control: EngineControl,
         client: EngineClient,
         served: wire::EngineSpec,
+        observer: Arc<crate::worlds::Observer>,
     ) -> anyhow::Result<Self> {
         let Prepared {
             model_config,
@@ -363,7 +377,7 @@ impl Leader {
         .context("failed to bind the configured model description")?;
         let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
-        let engine = Self::new(
+        let engine = Self::observed(
             config.served_model_name().to_owned(),
             model_name,
             client,
@@ -371,6 +385,7 @@ impl Leader {
             images,
             readout,
             config,
+            observer,
         );
         let _ = engine.engines.control.set(Arc::new(control));
         *locked(&engine.engines.served) = Some(served);
@@ -393,6 +408,34 @@ impl Leader {
         readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
     ) -> Self {
+        Self::observed(
+            served_model_name,
+            model_name,
+            client,
+            processor,
+            images,
+            readout,
+            options,
+            Arc::default(),
+        )
+    }
+
+    /// As [`Self::new`], with `observer` reading the engine's statistics
+    /// for its world's trials.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a leader's model, engine and options, and its statistics' observer"
+    )]
+    fn observed(
+        served_model_name: String,
+        model_name: String,
+        client: EngineClient,
+        processor: InputProcessor,
+        images: MediaConnector,
+        readout: Option<ReadoutEncoder>,
+        options: &ServeConfig,
+        observer: Arc<crate::worlds::Observer>,
+    ) -> Self {
         let logging = &options.logging_config;
         let info = client.info().clone();
         let stats_logger = logging
@@ -409,6 +452,11 @@ impl Leader {
             asleep: AtomicBool::new(false),
             sleep_paused: AtomicBool::new(false),
             adapters: std::sync::Mutex::new(BTreeMap::new()),
+            worlds: std::sync::Mutex::new(crate::worlds::WorldState {
+                executing: client.world(),
+                ..Default::default()
+            }),
+            observer,
         });
         let client = Arc::new(client);
         tokio::spawn(watch_engine(Arc::clone(&engines), Arc::downgrade(&client)));
@@ -654,8 +702,9 @@ impl Leader {
             .context("the engine connection's close did not complete")
     }
 
-    /// Holds off engine replacements (hot updates and relaunches) while the
-    /// guard lives, as a hot restart hands the engine over.
+    /// Holds off engine replacements (world changes, rollbacks and
+    /// relaunches) while the guard lives, as a hot restart hands the engine
+    /// over.
     pub(crate) async fn quiesce(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.engines.replacing.lock().await
     }
@@ -668,6 +717,15 @@ impl Leader {
     ///
     /// Fails when no engine this leader started serves.
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<EngineHandoff> {
+        {
+            let worlds = locked(&self.engines.worlds);
+            if let Some(trial) = &worlds.trial {
+                anyhow::bail!(
+                    "world {} is on trial: commit it or roll it back before the daemon restarts",
+                    trial.world
+                );
+            }
+        }
         let client = self
             .migrator
             .hold()
@@ -694,7 +752,21 @@ impl Leader {
             asleep: self.engines.asleep.load(Ordering::Acquire),
             sleep_paused: self.engines.sleep_paused.load(Ordering::Acquire),
             adapters: locked(&self.engines.adapters).clone(),
+            unavailable: locked(&self.engines.worlds)
+                .unavailable
+                .values()
+                .cloned()
+                .collect(),
         })
+    }
+
+    /// Takes over the configurations a rollback marked unavailable on the
+    /// leader a hot restart replaced.
+    pub(crate) fn adopt_unavailable(&self, unavailable: Vec<crate::worlds::Unavailable>) {
+        let mut worlds = locked(&self.engines.worlds);
+        for mark in unavailable {
+            worlds.unavailable.insert(mark.digest.clone(), mark);
+        }
     }
 
     /// Takes over the pause, the sleep and the adapters of the leader a hot
@@ -731,6 +803,8 @@ pub(crate) struct EngineHandoff {
     pub(crate) sleep_paused: bool,
     /// The LoRA adapters the workers hold, by name.
     pub(crate) adapters: BTreeMap<String, Adapter>,
+    /// The configurations a rollback marked unavailable.
+    pub(crate) unavailable: Vec<crate::worlds::Unavailable>,
 }
 
 /// What the leader serves, for `GET /admin/status`.
@@ -759,47 +833,17 @@ pub struct LeaderStatus {
     pub executable: Option<String>,
 }
 
-/// What an update did, and how long each stage of its pause took.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EngineUpdate {
-    /// The schedulers took the new limits in place, at their next step;
-    /// nothing paused, and the stages below are zero.
-    pub in_place: bool,
-    /// How long requests waited for an engine: from holding them until the
-    /// promoted engine served them; the sum of the three stages below.
-    pub pause: std::time::Duration,
-    /// From holding requests until the running engine held none: its step
-    /// boundary, and the media requests it let finish.
-    pub drain: std::time::Duration,
-    /// The drained engine's close: its last pages written to the host KV
-    /// cache, its workers closed and its process exited.
-    pub close: std::time::Duration,
-    /// The standby's promotion, until it reported that it serves.
-    pub promotion: std::time::Duration,
-}
-
-/// What a hot update changes: the build, and options of the engine.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateRequest {
-    /// The `uniserve` executable of the build to update to; the running
-    /// engine's executable when unset.
-    #[serde(default)]
-    pub executable: Option<String>,
-    /// `PATH=VALUE` assignments over the serving options, as `--set` states
-    /// them; each must change only what a standby engine may serve with
-    /// differently ([`updated_spec`]).
-    #[serde(default)]
-    pub set: Vec<String>,
-}
-
-/// Why a hot update did not happen or did not complete.
+/// Why a change of the deployment did not happen or did not complete.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
-    /// Another update is in progress.
-    #[error("an engine update is in progress")]
+    /// Another change is in progress.
+    #[error("a change of the deployment is in progress")]
     InProgress,
-    /// The update asks for what a hot update cannot change.
+    /// A world is on trial: it is committed or rolled back first.
+    #[error("world {0} is on trial: commit it or roll it back first")]
+    OnTrial(u64),
+    /// The configuration is invalid, or asks for a change the deployment
+    /// does not make.
     #[error("{0}")]
     Refused(String),
     /// The leader runs no engine process of its own to update.
@@ -811,281 +855,12 @@ pub enum UpdateError {
     Failed(#[from] anyhow::Error),
 }
 
-impl Leader {
-    /// Updates the engine to the build `executable` runs, or to the build
-    /// the running engine's executable holds now when `None`, without
-    /// failing a request.
-    ///
-    /// A standby engine of that build starts beside the running one: its
-    /// workers map the running engine's weights and exclusive storages
-    /// without writing them and park. Once it stands by, the leader holds
-    /// new requests, drains the running engine (its token requests leave as
-    /// migratable and wait for the new engine; its other requests finish),
-    /// shuts it down, which writes its published pages to the host KV cache
-    /// and gives up its storages, promotes the standby, and has it serve
-    /// every held and migrated request.
-    ///
-    /// # Errors
-    ///
-    /// Fails when another update runs or the leader runs no engine process;
-    /// when the standby does not start, after which the running engine
-    /// serves on; and when the standby's promotion fails, after which no
-    /// engine serves and held requests fail.
-    pub async fn update(&self, request: UpdateRequest) -> Result<EngineUpdate, UpdateError> {
-        let _replacing = self
-            .engines
-            .replacing
-            .try_lock()
-            .map_err(|_| UpdateError::InProgress)?;
-        let control = self.engines.control.get().ok_or(UpdateError::NoEngine)?;
-        let served = locked(&self.engines.served)
-            .clone()
-            .ok_or(UpdateError::NoEngine)?;
-        let hold = Arc::clone(self.migrator.hold());
-        let running = hold.client().ok_or(UpdateError::NoEngine)?;
-        if self.engines.asleep.load(Ordering::Acquire) {
-            return Err(UpdateError::Refused(
-                "the engine sleeps: wake it (/admin/wake_up) before updating it".to_owned(),
-            ));
-        }
-
-        // The options the standby serves with, over those the running engine
-        // was started with.
-        let (config, mut spec) = if request.set.is_empty() {
-            (locked(&self.engines.config).clone(), served.clone())
-        } else {
-            let (config, paths) =
-                crate::options::overridden(&locked(&self.engines.config), &request.set)
-                    .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-            let recomputed = config
-                .engine_spec()
-                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-            let spec = updated_spec(&served, &recomputed).map_err(UpdateError::Refused)?;
-            if spec == served {
-                return Err(UpdateError::Refused(format!(
-                    "{} change nothing the engine serves with: the daemon reads them, \
-                     and changing them takes a restart of the daemon",
-                    paths.join(", ")
-                )));
-            }
-            (config, spec)
-        };
-        // Scheduling alone, within the batch the running engine's workers
-        // were started for, changes in place at the schedulers' next step.
-        if request.executable.is_none()
-            && configurable(&served, &spec, running.info().capacity.as_ref())
-        {
-            let scheduling = spec.scheduling.clone().unwrap_or_default();
-            running
-                .configure(scheduling)
-                .await
-                .map_err(|error| anyhow::anyhow!("the engine did not take the limits: {error}"))?;
-            info!("the engine took the new scheduling limits in place");
-            *locked(&self.engines.served) = Some(spec);
-            *locked(&self.engines.config) = config;
-            return Ok(EngineUpdate {
-                in_place: true,
-                pause: std::time::Duration::ZERO,
-                drain: std::time::Duration::ZERO,
-                close: std::time::Duration::ZERO,
-                promotion: std::time::Duration::ZERO,
-            });
-        }
-        if let (Some(executable), Some(workers)) = (request.executable, spec.workers.as_mut()) {
-            workers.executable = executable;
-        }
-        // Relaunches and later updates start from what the updated engine
-        // serves with.
-        let updated = spec.clone();
-        spec.standby = Some(wire::Standby {
-            cache_units: running.info().cache_units.clone(),
-        });
-        // The standby needs as much device memory beside the weights and the
-        // cache as the running engine's workers hold: the tail of the KV
-        // cache makes room for it, and the updated engine creates it again.
-        running
-            .resize_cache(wire::CacheChange::Shrink)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "the KV cache did not make room for the standby engine; the running engine \
-                     serves on: {error}"
-                )
-            })?;
-        let control = Arc::clone(control);
-        let sink = stats_sink(self.model_name.clone());
-        info!("starting a standby engine for a hot update");
-        let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
-            .await
-            .context("the standby engine's start did not complete")
-            .and_then(|started| started.context("the standby engine did not start"));
-        let standby = match started {
-            Ok(standby) => Arc::new(standby),
-            Err(error) => {
-                let restored = running.resize_cache(wire::CacheChange::Restore).await;
-                return Err(match restored {
-                    Ok(_) => error.context("the running engine serves on"),
-                    Err(restoring) => error.context(format!(
-                        "the running engine serves on without the tail of its KV cache, \
-                         which it did not create again: {restoring}"
-                    )),
-                }
-                .into());
-            }
-        };
-
-        // Requests wait from here until the standby serves.
-        let paused = Instant::now();
-        hold.hold();
-        // An engine lost before it drains ends its token requests as
-        // migratable on loss, and the standby replaces it all the same.
-        if let Err(error) = running.drain().await {
-            warn!("the running engine did not drain: {error}");
-        }
-        while running.in_flight() > 0 && running.state() == EngineState::Draining {
-            tokio::time::sleep(DRAIN_POLL).await;
-        }
-        let drain = paused.elapsed();
-        let drained = Arc::clone(&running);
-        let exit = tokio::task::spawn_blocking(move || {
-            drained.shutdown();
-            drained.await_exit(DRAINED_EXIT)
-        })
-        .await
-        .context("the drained engine's shutdown did not complete")?;
-        match exit {
-            Ok(Some(status)) => info!(%status, "the drained engine's process exited"),
-            Ok(None) => {}
-            Err(error) => warn!("the drained engine's process: {error:#}"),
-        }
-        let close = paused.elapsed() - drain;
-
-        if let Err(error) = standby.promote().await {
-            hold.close(format!("the updated engine did not serve: {error}"));
-            return Err(anyhow::anyhow!("promoting the standby engine: {error}").into());
-        }
-        *locked(&self.engines.served) = Some(updated);
-        *locked(&self.engines.config) = config;
-        tokio::spawn(watch_engine(
-            Arc::clone(&self.engines),
-            Arc::downgrade(&standby),
-        ));
-        reload_adapters(&self.engines, &standby).await;
-        hold.serve(Arc::clone(&standby));
-        let pause = paused.elapsed();
-        let promotion = pause - drain - close;
-        info!(
-            pause_ms = pause.as_millis() as u64,
-            drain_ms = drain.as_millis() as u64,
-            close_ms = close.as_millis() as u64,
-            promotion_ms = promotion.as_millis() as u64,
-            "the updated engine serves"
-        );
-        // The drained engine's memory is free: the updated engine creates
-        // the tail of the KV cache the standby went without.
-        standby
-            .resize_cache(wire::CacheChange::Restore)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "the updated engine serves without the tail of its KV cache, which it did \
-                     not create again: {error}"
-                )
-            })?;
-        Ok(EngineUpdate {
-            in_place: false,
-            pause,
-            drain,
-            close,
-            promotion,
-        })
-    }
-}
-
-/// The spec a standby engine serves with: `served`, with what `recomputed`
-/// (the spec of the overridden options) states for the parts a standby may
-/// serve with differently. A standby maps the running engine's weights and
-/// cache planes and serves its placement, so the model, the placement, the
-/// KV cache, the experts and how weights load and are stored stay; the
-/// scheduling, CUDA graphs, FlashInfer and the workers' other options may
-/// change.
-///
-/// # Errors
-///
-/// Names the parts `recomputed` changes that a standby must keep.
-fn updated_spec(
-    served: &wire::EngineSpec,
-    recomputed: &wire::EngineSpec,
-) -> Result<wire::EngineSpec, String> {
-    let mut kept = Vec::new();
-    let mut differs = |name: &str, same: bool| {
-        if !same {
-            kept.push(name.to_owned());
-        }
-    };
-    differs("the deployment", served.deployment == recomputed.deployment);
-    differs("the model", served.model == recomputed.model);
-    differs("the host", served.host == recomputed.host);
-    differs("the placement", served.placement == recomputed.placement);
-    differs(
-        "the product transport",
-        served.transfer == recomputed.transfer,
-    );
-    differs("the KV cache", served.kv_cache == recomputed.kv_cache);
-    differs("the experts", served.experts == recomputed.experts);
-    // The daemon clears the video canvases of models whose denoiser names
-    // them, as it starts the engine.
-    let video = |spec: &wire::EngineSpec| {
-        spec.video.clone().map(|mut video| {
-            if served.video.as_ref().is_some_and(|served| {
-                served.resolutions.is_empty() && served.aspect_ratios.is_empty()
-            }) {
-                video.resolutions.clear();
-                video.aspect_ratios.clear();
-            }
-            video
-        })
-    };
-    differs("the video options", video(served) == video(recomputed));
-    if let (Some(old), Some(new)) = (&served.workers, &recomputed.workers) {
-        differs("the worker mesh", old.mesh == new.mesh);
-        differs("the dtype", old.dtype == new.dtype);
-        differs(
-            "the quantization",
-            old.quantization_config == new.quantization_config,
-        );
-        differs("the load format", old.load_format == new.load_format);
-        differs("the standby groups", old.standby == new.standby);
-    }
-    if !kept.is_empty() {
-        return Err(format!(
-            "a hot update keeps {}: the standby engine maps the running engine's \
-             weights and caches and serves its placement",
-            kept.join(", ")
-        ));
-    }
-    let mut spec = served.clone();
-    spec.scheduling = recomputed.scheduling.clone();
-    spec.cuda_graphs = recomputed.cuda_graphs.clone();
-    spec.flashinfer = recomputed.flashinfer.clone();
-    if let (Some(workers), Some(new)) = (spec.workers.as_mut(), &recomputed.workers) {
-        workers.executable = new.executable.clone();
-        workers.watchdog_timeout_ms = new.watchdog_timeout_ms;
-        workers.distributed_backend = new.distributed_backend.clone();
-        workers.attention_backend = new.attention_backend.clone();
-        workers.download_dir = new.download_dir.clone();
-        workers.load_threads = new.load_threads;
-        workers.standby_memory = new.standby_memory.clone();
-    }
-    Ok(spec)
-}
-
 /// Whether `updated` differs from `served` in its scheduling alone, within
 /// `capacity`, the batch the running engine's workers were started for: at
 /// most as many calls and tokens a step and running requests. The
 /// schedulers take such limits in place; any other change starts a standby
 /// engine.
-fn configurable(
+pub(crate) fn configurable(
     served: &wire::EngineSpec,
     updated: &wire::EngineSpec,
     capacity: Option<&wire::BatchCapacity>,
@@ -1163,7 +938,7 @@ async fn same_processing(served: &str, path: &str) -> Result<(), String> {
 }
 
 /// The value behind `mutex`; every holder replaces whole values.
-fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1177,7 +952,7 @@ impl Leader {
             HoldState::Engine(state) => match state {
                 EngineState::Ready => ("ready", None),
                 EngineState::Standby => ("standby", None),
-                EngineState::Draining => ("draining", None),
+                EngineState::Parked => ("parked", None),
                 EngineState::Failed(reason) => ("failed", Some(reason)),
                 EngineState::Closed => ("closed", None),
             },
@@ -1484,40 +1259,37 @@ impl Leader {
     }
 }
 
-/// How often a hot update checks whether the drained engine's requests
-/// ended.
-const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// How long a hot update waits for the drained engine's process to exit
-/// once its connection closed; the daemon ends a process that outlives it
-/// with its control connection.
-const DRAINED_EXIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// What starts and replaces the leader's engines.
-struct Engines {
+/// What starts and replaces the leader's engines, and the deployment's
+/// worlds (`crate::worlds`).
+pub(crate) struct Engines {
     /// The hold every request passes.
-    hold: Arc<RequestHold>,
+    pub(crate) hold: Arc<RequestHold>,
     /// What starts the leader's engine processes; unset for an engine run
     /// elsewhere.
-    control: std::sync::OnceLock<Arc<EngineControl>>,
+    pub(crate) control: std::sync::OnceLock<Arc<EngineControl>>,
     /// The spec the serving engine serves with: the one it was started with
     /// and the scheduling it took in place since, which a relaunch and the
     /// next update start from; unset with `control`.
-    served: std::sync::Mutex<Option<wire::EngineSpec>>,
+    pub(crate) served: std::sync::Mutex<Option<wire::EngineSpec>>,
     /// The options the serving engine's spec was made from, which an update
     /// overrides.
-    config: std::sync::Mutex<ServeConfig>,
+    pub(crate) config: std::sync::Mutex<ServeConfig>,
     /// The model their statistics are labelled with.
-    model_name: String,
-    /// Held while an engine is replaced, by a hot update or a relaunch, so
-    /// that replacements do not overlap.
-    replacing: tokio::sync::Mutex<()>,
+    pub(crate) model_name: String,
+    /// Held while an engine is replaced, by a world change, a commit, a
+    /// rollback or a relaunch, so that replacements do not overlap.
+    pub(crate) replacing: tokio::sync::Mutex<()>,
     /// The engine gave back its KV cache and graph memory (`Leader::sleep`).
-    asleep: AtomicBool,
+    pub(crate) asleep: AtomicBool,
     /// The sleep paused new requests, which the wake lets through.
     sleep_paused: AtomicBool,
     /// The LoRA adapters the workers hold, by name (`Leader::load_adapter`).
     adapters: std::sync::Mutex<BTreeMap<String, Adapter>>,
+    /// The deployment's worlds: the executing one, a trial, a change in
+    /// progress and the configurations a rollback marked unavailable.
+    pub(crate) worlds: std::sync::Mutex<crate::worlds::WorldState>,
+    /// Every world's scheduler statistics, which a trial reads.
+    pub(crate) observer: Arc<crate::worlds::Observer>,
 }
 
 /// A LoRA adapter the workers hold.
@@ -1538,7 +1310,7 @@ pub(crate) struct Adapter {
 /// that replaces another starts without them. An adapter that does not load
 /// leaves the registry, so that requests naming it are refused instead of
 /// computing without it.
-async fn reload_adapters(engines: &Engines, client: &EngineClient) {
+pub(crate) async fn reload_adapters(engines: &Engines, client: &EngineClient) {
     let adapters: Vec<(String, Adapter)> = locked(&engines.adapters)
         .iter()
         .map(|(name, adapter)| (name.clone(), adapter.clone()))
@@ -1570,20 +1342,33 @@ async fn reload_adapters(engines: &Engines, client: &EngineClient) {
 /// token requests end as migratable and wait there, and the new engine
 /// serves them and every request that arrives meanwhile. The engine's
 /// workers find their weights retained at the Storage Servers. An engine the
-/// hold no longer serves, as after a hot update or a shutdown, is left as it
-/// is. Without an engine process of the leader's own, or when the new
+/// hold no longer serves, as after a world change or a shutdown, is left as
+/// it is. Without an engine process of the leader's own, or when the new
 /// engine does not start, the hold closes and held and later requests fail.
-async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineClient>) {
+pub(crate) async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineClient>) {
     loop {
         let Some(states) = client.upgrade().map(|client| client.states()) else {
             return;
         };
         let reason = lost(states).await;
         let _replacing = engines.replacing.lock().await;
-        if !client
-            .upgrade()
-            .is_some_and(|client| engines.hold.serves(&client))
-        {
+        let Some(lost_client) = client.upgrade() else {
+            return;
+        };
+        if !engines.hold.serves(&lost_client) {
+            return;
+        }
+        // A world on trial is not relaunched: the deployment rolls back to
+        // the previous world.
+        let on_trial = locked(&engines.worlds)
+            .trial
+            .as_ref()
+            .is_some_and(|trial| trial.world == lost_client.world());
+        drop(lost_client);
+        if on_trial {
+            if let Err(error) = crate::worlds::rollback(&engines, reason).await {
+                tracing::error!("the rollback failed: {error:#}");
+            }
             return;
         }
         let (Some(control), Some(spec)) = (engines.control.get(), locked(&engines.served).clone())
@@ -1595,7 +1380,7 @@ async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineC
         tracing::error!(%reason, "the engine was lost; starting another");
         engines.hold.hold();
         let control = Arc::clone(control);
-        let sink = stats_sink(engines.model_name.clone());
+        let sink = stats_sink(engines.model_name.clone(), Arc::clone(&engines.observer));
         let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
             .await
             .map_err(anyhow::Error::from)
@@ -1624,7 +1409,7 @@ async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineC
 async fn lost(mut states: watch::Receiver<EngineState>) -> String {
     loop {
         match states.borrow_and_update().clone() {
-            EngineState::Ready | EngineState::Draining | EngineState::Standby => {}
+            EngineState::Ready | EngineState::Parked | EngineState::Standby => {}
             EngineState::Failed(error) => return format!("the engine failed: {error}"),
             EngineState::Closed => return "the engine process ended".to_owned(),
         }

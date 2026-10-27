@@ -37,6 +37,10 @@ pub enum ErrorCode {
     InputError,
     /// Device or numerical computation failed.
     ComputeError,
+    /// The computation produced non-finite values (NaN or infinity) where
+    /// its numerics admit none, as among a forward's logits: a fault of the
+    /// computation, never of the request.
+    NumericalFault,
     /// A reserved or physical resource could not satisfy the work.
     ResourceError,
     /// An invariant the rank relies on is broken.
@@ -54,6 +58,7 @@ impl ErrorCode {
             Self::UnsupportedSetup => "unsupported_setup",
             Self::InputError => "input_error",
             Self::ComputeError => "compute_error",
+            Self::NumericalFault => "numerical_fault",
             Self::ResourceError => "resource_error",
             Self::InvariantViolation => "invariant_violation",
             Self::FatalWorkerFailure => "fatal_worker_failure",
