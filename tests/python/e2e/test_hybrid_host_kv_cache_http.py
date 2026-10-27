@@ -50,6 +50,7 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    gpu_device,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -176,7 +177,10 @@ def test_a_restarted_engine_loads_full_pages_and_aligned_windows(
         "--set",
         f"kv_cache_config.boundary_interval={BOUNDARY_INTERVAL}",
     ]
-    env = {"CUDA_VISIBLE_DEVICES": "0", "XDG_RUNTIME_DIR": str(runtime)}
+    env = {
+        "CUDA_VISIBLE_DEVICES": gpu_device(),
+        "XDG_RUNTIME_DIR": str(runtime),
+    }
     try:
         with server_process(
             command, base_url, tmp_path / "first.log", timeout_s=1800, env=env

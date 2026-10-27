@@ -32,6 +32,7 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    gpu_device,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -164,7 +165,10 @@ def test_a_restarted_engine_loads_a_prompts_pages_from_the_host_kv_cache(
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = _command(_checkpoint(), port)
-    env = {"CUDA_VISIBLE_DEVICES": "0", "XDG_RUNTIME_DIR": str(runtime)}
+    env = {
+        "CUDA_VISIBLE_DEVICES": gpu_device(),
+        "XDG_RUNTIME_DIR": str(runtime),
+    }
     try:
         with server_process(
             command, base_url, tmp_path / "first.log", timeout_s=900, env=env
@@ -196,7 +200,10 @@ def test_a_closing_engine_offloads_its_last_pages_to_the_host_kv_cache(
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = _command(_checkpoint(), port)
-    env = {"CUDA_VISIBLE_DEVICES": "0", "XDG_RUNTIME_DIR": str(runtime)}
+    env = {
+        "CUDA_VISIBLE_DEVICES": gpu_device(),
+        "XDG_RUNTIME_DIR": str(runtime),
+    }
     try:
         with server_process(
             command, base_url, tmp_path / "first.log", timeout_s=900, env=env

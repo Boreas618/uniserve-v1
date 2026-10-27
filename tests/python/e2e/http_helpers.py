@@ -44,6 +44,13 @@ def dedicated_experts(directory: Path) -> Path:
     return placement
 
 
+def gpu_device() -> str:
+    """The GPU a one-GPU server runs on (``UNISERVE_WORLD_DEVICE``, 0 by
+    default), so that one-GPU cases run beside each other on other GPUs.
+    """  # noqa: D205
+    return os.environ.get("UNISERVE_WORLD_DEVICE", "0")
+
+
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))

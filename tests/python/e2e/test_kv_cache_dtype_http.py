@@ -21,6 +21,7 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    gpu_device,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -86,7 +87,7 @@ def _generate(
         base_url,
         tmp_path / f"{label}.log",
         timeout_s=900,
-        env={"CUDA_VISIBLE_DEVICES": "0"},
+        env={"CUDA_VISIBLE_DEVICES": gpu_device()},
     ):
         for prompt in PROMPTS:
             response = httpx.post(
