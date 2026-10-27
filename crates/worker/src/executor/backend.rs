@@ -26,6 +26,7 @@ use crate::error::WorkerError;
 use crate::job::{Job, JobId, JobQueue};
 use crate::profiling::kernels::KernelWatch;
 use crate::profiling::profiler::Profiler;
+use crate::profiling::session::Session;
 use crate::request::RequestPool;
 use crate::worker::WorkerMemory;
 use crate::{Error, Result};
@@ -44,6 +45,8 @@ pub(crate) struct WorkerBackend {
     owners: Owners,
     components: Components,
     profiler: Option<Profiler>,
+    /// The profiling session that records this rank, while one does.
+    session: Option<Session>,
     kernels: Option<KernelWatch>,
     /// The rank's job queue: each forward runs as jobs the builder thread
     /// performs.
@@ -59,8 +62,8 @@ pub(crate) struct WorkerBackend {
     /// How the last such join ended, until the service takes it.
     joined: Option<std::result::Result<(bool, bool), WorkerError>>,
     /// The control thread's counts of driver calls that waited for the
-    /// device when the last batch result left ([`cuda::cupti::Calls`]).
-    control_calls: cuda::cupti::Calls,
+    /// device when the last batch result left ([`cuda::cupti::blocking::Calls`]).
+    control_calls: cuda::cupti::blocking::Calls,
 }
 
 /// What serves a rank's components and the storage it owns: the rank's storage
@@ -131,13 +134,14 @@ impl WorkerBackend {
             owners: Owners::default(),
             components,
             profiler: None,
+            session: None,
             kernels: None,
             jobs: JobQueue::default(),
             lifecycle: CommandJob::default(),
             lifecycle_jobs: HashSet::new(),
             joining: None,
             joined: None,
-            control_calls: cuda::cupti::Calls::default(),
+            control_calls: cuda::cupti::blocking::Calls::default(),
         })
     }
 
@@ -197,13 +201,16 @@ impl WorkerBackend {
         self.serve_events();
     }
 
-    /// End a batch's forward: close its profiler step and ask for the
-    /// count of kernel choices, which tells whether its calls selected new
-    /// kernels.
+    /// End a batch's forward: close its profiler and session step and ask
+    /// for the count of kernel choices, which tells whether its calls
+    /// selected new kernels.
     fn end_forward(&mut self, batch: &mut WorkerBatch) {
         if std::mem::take(&mut batch.stepping) {
             if let Some(profiler) = &mut self.profiler {
                 profiler.end();
+            }
+            if let Some(session) = &mut self.session {
+                session.end(batch.plan.batch_id);
             }
             if let Some(watch) = &mut self.kernels {
                 watch.count(&self.jobs);
@@ -371,6 +378,69 @@ impl WorkerBackend {
 
     pub(crate) fn set_profiler(&mut self, profiler: Option<Profiler>) {
         self.profiler = profiler;
+    }
+
+    /// Start the profiling session `start` on this rank, rank `rank` of
+    /// CUDA device `device`, while it runs no batch; answers the daemon.
+    /// A session that does not select the rank leaves it unrecorded.
+    ///
+    /// # Errors
+    ///
+    /// Fails when another session records the rank or the rank cannot
+    /// create its file.
+    pub(crate) fn start_session(
+        &mut self,
+        start: proto::profile::SessionStart,
+        rank: u32,
+        device: Option<cuda::DeviceId>,
+    ) -> Result<serde_json::Value> {
+        if let Some(session) = &self.session {
+            return Err(Error::Invalid(format!(
+                "profiling session {} records the rank",
+                session.id()
+            )));
+        }
+        let (session, answer) = Session::start(start, rank, device)?;
+        self.session = session;
+        Ok(answer)
+    }
+
+    /// End profiling session `session` for `reason`, while the rank runs no
+    /// batch; answers what its file holds. A rank the session did not
+    /// select answers so.
+    pub(crate) fn stop_session(
+        &mut self,
+        session: u64,
+        reason: &str,
+        rank: u32,
+    ) -> serde_json::Value {
+        match self.session.take() {
+            Some(running) if running.id() == session => {
+                let mut answer = running.stop(reason);
+                answer["rank"] = serde_json::json!(rank);
+                answer
+            }
+            other => {
+                self.session = other;
+                serde_json::json!({ "rank": rank, "session": session, "selected": false })
+            }
+        }
+    }
+
+    /// Turn `collector` of profiling session `session` off for `reason`.
+    pub(crate) fn release_collector(
+        &mut self,
+        session: u64,
+        collector: proto::profile::Collector,
+        reason: &str,
+        rank: u32,
+    ) -> serde_json::Value {
+        let mut answer = match &mut self.session {
+            Some(running) if running.id() == session => running.release(collector, reason),
+            _ => serde_json::json!({ "released": false }),
+        };
+        answer["rank"] = serde_json::json!(rank);
+        answer
     }
 
     /// Report kernel selections that change while serving.

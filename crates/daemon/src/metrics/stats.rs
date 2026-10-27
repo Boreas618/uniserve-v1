@@ -215,6 +215,25 @@ pub(crate) fn record_scheduler_stats(
                 })
                 .inc_by(*count);
         }
+        for (key, histogram) in &worker_stats.fence_us {
+            // Keys are `{stage}/{component}` (`ForwardStats::fence_us`).
+            let (stage, component) = key.split_once('/').unwrap_or(("", key.as_str()));
+            metrics
+                .worker_fence_step_seconds
+                .get_or_create(&crate::metrics::scheduler::EngineFenceLabels {
+                    model_name: model_name.clone(),
+                    engine,
+                    stage: stage.to_owned(),
+                    component: component.to_owned(),
+                })
+                .add(histogram);
+        }
+        if worker_stats.fence_records_lost > 0 {
+            metrics
+                .worker_fence_records_lost
+                .get_or_create(&labels)
+                .inc_by(worker_stats.fence_records_lost);
+        }
         for (backend, count) in &worker_stats.attention_backend_counts {
             metrics
                 .worker_attention_backend_counts

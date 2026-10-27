@@ -15,7 +15,7 @@
 
 mod forward;
 
-pub use forward::ForwardStats;
+pub use forward::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 use serde::{Deserialize, Serialize};
 
 /// Cache query and hit counters for one reporting interval.

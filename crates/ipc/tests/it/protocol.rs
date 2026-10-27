@@ -1901,6 +1901,16 @@ fn full_forward_stats() -> ForwardStats {
         component_us: map("component_us", 7),
         stream_us: map("stream_us", 9),
         blocking_calls: map("blocking_calls", 40),
+        fence_us: [(
+            "decode/step".to_owned(),
+            ipc::FenceHistogram {
+                buckets: vec![1; ipc::FENCE_BUCKETS_US.len() + 1],
+                sum_us: 41,
+            },
+        )]
+        .into(),
+        fence_records_lost: 42,
+        profile: map("profile", 43),
         attention_launches: 11,
         attention_us: 12,
         attention_backend_counts: map("backend", 13),

@@ -265,6 +265,18 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let fence_us = stats
+        .worker
+        .fence_us
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let profile = stats
+        .worker
+        .profile
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     let cuda_graph_runtime_mode_counts = stats
         .worker
         .cuda_graph_runtime_mode_counts
@@ -278,6 +290,9 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
         component_us,
         stream_us,
         blocking_calls,
+        fence_us,
+        fence_records_lost: stats.worker.fence_records_lost.load(Ordering::Relaxed),
+        profile,
         attention_launches: stats.worker.attention_launches.load(Ordering::Relaxed),
         attention_us: stats.worker.attention_us.load(Ordering::Relaxed),
         attention_backend_counts,
@@ -364,6 +379,21 @@ fn delta_worker_forward_stats(current: &ForwardStats, previous: &ForwardStats) -
         component_us: delta_map(&current.component_us, &previous.component_us),
         stream_us: delta_map(&current.stream_us, &previous.stream_us),
         blocking_calls: delta_map(&current.blocking_calls, &previous.blocking_calls),
+        fence_us: current
+            .fence_us
+            .iter()
+            .filter_map(|(key, histogram)| {
+                let delta = match previous.fence_us.get(key) {
+                    Some(earlier) => histogram.since(earlier),
+                    None => histogram.clone(),
+                };
+                (delta.count() > 0).then(|| (key.clone(), delta))
+            })
+            .collect(),
+        fence_records_lost: current
+            .fence_records_lost
+            .saturating_sub(previous.fence_records_lost),
+        profile: delta_map(&current.profile, &previous.profile),
         attention_launches: current
             .attention_launches
             .saturating_sub(previous.attention_launches),

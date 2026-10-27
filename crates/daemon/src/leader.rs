@@ -457,6 +457,7 @@ impl Leader {
                 ..Default::default()
             }),
             observer,
+            profiles: crate::profiling::Profiles::default(),
         });
         let client = Arc::new(client);
         tokio::spawn(watch_engine(Arc::clone(&engines), Arc::downgrade(&client)));
@@ -1313,6 +1314,9 @@ pub(crate) struct Engines {
     pub(crate) worlds: std::sync::Mutex<crate::worlds::WorldState>,
     /// Every world's scheduler statistics, which a trial reads.
     pub(crate) observer: Arc<crate::worlds::Observer>,
+    /// The profiling session that runs, or the last that ended
+    /// (`crate::profiling`).
+    pub(crate) profiles: crate::profiling::Profiles,
 }
 
 /// A LoRA adapter the workers hold.

@@ -186,6 +186,12 @@ impl Worker {
             }
             Device::Cpu => None,
         };
+        // CUPTI's one subscription, before the rank instantiates any CUDA
+        // graph: its graph instantiation guard lets a timeline trace every
+        // graph whole (`crate::profiling::counters`).
+        if context.is_some() {
+            crate::profiling::counters::subscribe();
+        }
         // The worker's memory that outlives it is kept at the host's
         // Storage Server, which first shoots down a predecessor still
         // holding it.
@@ -303,6 +309,9 @@ impl Worker {
         .map_err(phase("load"))?;
         drop(binding);
         let identity = weights::model_identity(model.handle()).map_err(phase("load"))?;
+        // The fence probes attach to the loaded modules before any forward
+        // is captured, so that warmup captures them into the graphs.
+        attach_fences(&launch, &model).map_err(phase("load"))?;
         // A loading worker's weights are put once the host regions of the
         // layers it streams from host memory joined them.
         let host_paths: Vec<String> = components
@@ -920,7 +929,7 @@ impl Worker {
             .observed()
             .map(|(name, stream)| Ok((name, stream.stream()?.clone())))
             .collect::<Result<Vec<_>>>()?;
-        let mut maintenance = crate::service::Maintenance {
+        let maintenance = crate::service::Maintenance {
             retained: Some(Arc::clone(&self.retained)),
             weights: Some(update::WeightUpdate {
                 launch: self.launch.clone(),
@@ -931,7 +940,11 @@ impl Worker {
             }),
             pools,
             asleep: false,
-            cupti: crate::profiling::cupti::Cupti::new(observed),
+            // The rank serves with CUPTI's counters on, unless a profiler
+            // holds CUPTI; the control thread's (this one's) waits for the
+            // device are counted while they are.
+            _counters: crate::profiling::counters::Counters::start(&observed),
+            rank: self.config.rank as u32,
             predecessor: self.config.predecessor.clone(),
             max_total_tokens: self.config.max_total_tokens,
             request_slots: self.config.max_request_pool_size,
@@ -941,13 +954,7 @@ impl Worker {
             graph_pools: self.graphs.pools(),
             capturable: self.capturable,
         };
-        // The rank serves with CUPTI attached (`crate::profiling::cupti`),
-        // unless a profiler holds it; the control thread's (this one's)
-        // waits for the device are counted while it is.
-        if let Err(error) = maintenance.cupti.attach() {
-            tracing::warn!("CUPTI is not attached: {error}");
-        }
-        let _control = cuda::cupti::Watched::enter();
+        let _control = cuda::cupti::blocking::Watched::enter();
         let served = Service::new(
             executor,
             channel,
@@ -1305,6 +1312,42 @@ impl Worker {
         self.graphs.seal();
         Ok(())
     }
+}
+
+/// Attach the fence probes the launch asks for to the loaded model's
+/// modules (`uniserve.loading.rank.attach_fences`) and install their device
+/// resources on the rank's CUDA devices (`crate::profiling::fences`); a
+/// launch without probe components, or a rank without a CUDA device,
+/// attaches none.
+fn attach_fences(launch: &WorkerLaunch, model: &LoadedModel) -> Result<()> {
+    let devices: Vec<DeviceId> = launch
+        .execution
+        .devices()
+        .filter_map(Device::cuda)
+        .collect();
+    if launch.fences.components.is_empty() || devices.is_empty() {
+        return Ok(());
+    }
+    let patterns = serde_json::to_string(&launch.fences.components)
+        .map_err(|error| Error::Invalid(error.to_string()))?;
+    let attached: tvm_ffi::String = Interpreter::import("uniserve.loading.rank.attach_fences")?
+        .call_values(&[
+            model.handle().to_any(),
+            Any::from(tvm_ffi::String::from(patterns.as_str())),
+        ])?
+        .try_into()
+        .map_err(|error| Error::numerical("attach_fences", &error))?;
+    let instances: Vec<crate::profiling::fences::Instance> =
+        serde_json::from_str(attached.as_str())
+            .map_err(|error| Error::Interface(format!("attach_fences: {error}")))?;
+    let count = instances.len();
+    crate::profiling::fences::Fences::install(&devices, instances, launch.fences.enabled)?;
+    tracing::info!(
+        instances = count,
+        enabled = launch.fences.enabled,
+        "attached fence probes"
+    );
+    Ok(())
 }
 
 /// Allocate every plugin's communication buffer on the rank's CUDA device

@@ -462,10 +462,11 @@ impl Executor for SimExecutor {
     }
 
     /// Answers the engine's own worker hooks as a worker without a device
-    /// does: its cache is not split into segments, it gives back no memory
-    /// and it has no CUPTI to attach. It loads and unloads LoRA adapters as a worker with a LoRA
-    /// plugin does, answering the slot; other plugin hooks fail, as no
-    /// plugin is loaded.
+    /// does: its cache is not split into segments, it gives back no memory,
+    /// it has no fence probes, and a profiling session it takes part in runs
+    /// no collector and writes no file. It loads and unloads LoRA adapters
+    /// as a worker with a LoRA plugin does, answering the slot; other plugin
+    /// hooks fail, as no plugin is loaded.
     fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
         let result = match name {
             "uniserve.cache_memory" => serde_json::json!({
@@ -481,8 +482,35 @@ impl Executor for SimExecutor {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;
                 serde_json::json!({ "eager": payload["eager"] })
             }
-            "uniserve.attach_cupti" | "uniserve.detach_cupti" => {
-                serde_json::json!({ "attached": false, "stream_activity": false })
+            "uniserve.profile_start" => {
+                let start: proto::profile::SessionStart = serde_json::from_str(payload)?;
+                let collectors: serde_json::Map<String, serde_json::Value> = start
+                    .request
+                    .collectors
+                    .iter()
+                    .map(|collector| {
+                        (
+                            collector.as_str().to_owned(),
+                            serde_json::json!("unavailable: the simulated worker has no device"),
+                        )
+                    })
+                    .collect();
+                serde_json::json!({ "rank": 0, "selected": true, "path": null, "collectors": collectors })
+            }
+            "uniserve.profile_stop" => {
+                let payload: serde_json::Value = serde_json::from_str(payload)?;
+                serde_json::json!({
+                    "rank": 0,
+                    "session": payload["session"],
+                    "steps": 0,
+                    "reason": payload["reason"],
+                    "file": null,
+                })
+            }
+            "uniserve.profile_release" => serde_json::json!({ "rank": 0, "released": false }),
+            "uniserve.fence_switch" => {
+                let payload: serde_json::Value = serde_json::from_str(payload)?;
+                serde_json::json!({ "probes": false, "enabled": payload["enabled"] })
             }
             "load_lora_adapter" | "unload_lora_adapter" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;

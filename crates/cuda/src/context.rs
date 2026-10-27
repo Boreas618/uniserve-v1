@@ -62,6 +62,11 @@ impl PrimaryContext {
         self.retained.raw
     }
 
+    /// The `CUcontext` handle, as the CUPTI profiling APIs take it.
+    pub fn handle(&self) -> usize {
+        self.retained.raw as usize
+    }
+
     /// Makes this context current on the calling thread until the guard drops.
     pub fn enter(&self) -> Result<DeviceGuard> {
         let driver = driver()?;

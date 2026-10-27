@@ -38,6 +38,7 @@ pub mod model;
 pub mod openai;
 pub mod options;
 pub mod output;
+pub mod profiling;
 pub mod restart;
 pub mod supervision;
 #[cfg(test)]

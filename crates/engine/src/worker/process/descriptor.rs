@@ -115,6 +115,8 @@ impl Default for WorkerProcessArgs {
             flashinfer_decode_split_tile_size: None,
             flashinfer_prefill_split_tile_size: None,
             flashinfer_split_kv: true,
+            fence_probes: false,
+            fence_components: Vec::new(),
             max_model_len: 8192,
             max_video_seconds: Self::DEFAULT_MAX_VIDEO_SECONDS,
             max_condition_rows: None,
@@ -300,6 +302,8 @@ impl WorkerProcessArgs {
             flashinfer_decode_split_tile_size: self.flashinfer_decode_split_tile_size,
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
             flashinfer_disable_split_kv: !self.flashinfer_split_kv,
+            fence_probes: self.fence_probes,
+            fence_components: self.fence_components.clone(),
         })
     }
 }

@@ -57,7 +57,7 @@ impl MethodCall {
 
     /// Mark a serving call: its run on the builder thread is watched for
     /// driver calls that make the host wait for the device
-    /// ([`cuda::cupti`]); such a call is counted
+    /// ([`cuda::cupti::blocking`]); such a call is counted
     /// ([`crate::profiling::blocking`]) and fails the call, before or past
     /// its batch's commit point as any failure of the call would.
     pub(crate) fn serving(mut self) -> Self {
@@ -94,7 +94,7 @@ impl MethodCall {
                     })
                 })
                 .collect::<Result<Vec<Any>>>()?;
-            let watched = self.serving.then(cuda::cupti::Watched::enter);
+            let watched = self.serving.then(cuda::cupti::blocking::Watched::enter);
             let result = self.function.call_values(&values);
             let Some(watched) = watched else {
                 return result;

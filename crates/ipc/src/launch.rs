@@ -202,6 +202,14 @@ pub struct LaunchDescriptor {
     pub flashinfer_decode_split_tile_size: Option<u32>,
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     pub flashinfer_disable_split_kv: bool,
+
+    /// Whether the fence probes record: the device switch's initial state.
+    #[serde(default)]
+    pub fence_probes: bool,
+    /// The components whose module instances carry fence probes, as name
+    /// patterns; none when empty.
+    #[serde(default)]
+    pub fence_components: Vec<String>,
 }
 
 /// One rank's place in the deployment's expert-parallel union.

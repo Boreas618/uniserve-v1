@@ -1,31 +1,31 @@
-//! Driver calls that make the host wait for the device, observed on marked
-//! threads through CUPTI's callback API.
+//! NVIDIA's CUPTI, loaded at runtime: one subscriber per process, shared by
+//! every collector that observes the process's CUDA work.
 //!
-//! [`BlockingWatch::start`] loads CUPTI and subscribes the process
-//! to every driver call that blocks its calling thread until device work
-//! completes: stream, event and context synchronization, synchronous
-//! copies, `cuMemFree` and `cuMemFreeHost` (which the driver documents as
-//! possibly synchronizing implicitly) and `cuMemUnmap`. Runtime API calls,
-//! PyTorch's included, reach these driver calls too, so the driver domain
-//! covers both.
+//! CUPTI admits one subscriber of its callback API per process, and one set
+//! of activity buffer callbacks. A process therefore subscribes once
+//! ([`subscriber::subscribe`]) and every collector reaches CUPTI through that
+//! subscription:
 //!
-//! CUPTI invokes the callback on the calling thread as the call is entered.
-//! A thread inside a [`Watched`] scope counts the call in its own counters
-//! by call, which the scope reads ([`Watched::blocking_calls`],
-//! [`Watched::calls`]) and a thread can snapshot at any time
-//! ([`Calls::current`]); a thread outside any scope is not counted. The
-//! callback only increments thread-local counters.
+//! - [`blocking`]: the driver calls that make a marked thread wait for the
+//!   device, counted by thread;
+//! - [`activity`]: the device time of registered streams, from activity
+//!   records;
+//! - [`timeline`]: every activity record and every runtime and driver API
+//!   call, delivered as decoded [`records`] to a recording's sink;
+//! - [`pm_sampling`], [`range_profiler`] and [`pc_sampling`]: hardware
+//!   counters sampled over time, counters per kernel or per user range in
+//!   one pass, and warp program counters with their stall reasons; the
+//!   counter configurations and their evaluation are [`metrics`].
 //!
-//! CUPTI admits one subscriber per process: a profiler that injected CUPTI
-//! (Nsight Systems) holds it, and [`BlockingWatch::start`] then fails with
-//! [`Error::Cupti`] (code 39); the caller goes on without the watch.
+//! A profiler that injected CUPTI (Nsight Systems) holds the subscription:
+//! [`subscriber::subscribe`] then fails with [`Error::Cupti`] (code 39) and
+//! none of these collectors is available.
 //!
-//! Dropping the watch ends the subscription; a later
-//! [`BlockingWatch::start`] subscribes again. The library stays loaded and
-//! initialized: `cuptiFinalize`, which would remove it, left the device work
-//! a serving worker submitted afterwards waiting forever once CUPTI had
-//! recorded its activity (CUPTI 2025.3.0 of the CUDA 13.0 toolkit, replaying
-//! CUDA graphs), so nothing here calls it.
+//! Nothing here calls `cuptiFinalize`: after CUPTI recorded a serving
+//! worker's activity, it left the device work submitted afterwards waiting
+//! forever (CUPTI 2025.3.0 of the CUDA 13.0 toolkit, replaying CUDA graphs).
+//! A collector that stops disables what it enabled; the library stays
+//! loaded.
 //!
 //! The process loads the CUPTI beside the CUDA runtime it already loaded
 //! ([`library`]): CUPTI belongs to a CUDA release, and both the toolkit and
@@ -35,15 +35,18 @@
 //! serving worker that replayed CUDA graphs while kernels were recorded,
 //! within a minute of load; the environment's `nvidia-cuda-cupti` 13.0.85
 //! served the same load.
-//!
-//! [`activity`] accounts the device time of registered streams from CUPTI's
-//! activity records.
 
 pub mod activity;
+pub mod blocking;
+pub mod metrics;
+pub mod pc_sampling;
+pub mod pm_sampling;
+pub mod range_profiler;
+pub mod records;
+pub mod subscriber;
+pub mod timeline;
 
-use std::cell::Cell;
-use std::ffi::{CStr, c_void};
-use std::marker::PhantomData;
+use std::ffi::{CStr, c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
@@ -54,12 +57,27 @@ use crate::{Error, Result};
 /// loaded no CUDA runtime.
 const LIBCUPTI: &str = "libcupti.so";
 
-/// The CUPTI library this process loads: `libcupti.so.N` in the directory of
-/// the `libcudart.so.N` the process loaded, when that file exists, and
-/// [`LIBCUPTI`] otherwise. Resolved once, at the first load.
+/// The CUPTI library this process loads: the CUPTI the process named as its
+/// NVTX injection library (`NVTX_INJECTION64_PATH`), which NVTX already
+/// loaded; else `libcupti.so.N` in the directory of the `libcudart.so.N` the
+/// process loaded, when that file exists; else [`LIBCUPTI`]. Resolved once,
+/// at the first load.
 pub fn library() -> &'static str {
     static LIBRARY: OnceLock<String> = OnceLock::new();
-    LIBRARY.get_or_init(|| beside_runtime().unwrap_or_else(|| LIBCUPTI.to_owned()))
+    LIBRARY.get_or_init(|| {
+        injected()
+            .or_else(beside_runtime)
+            .unwrap_or_else(|| LIBCUPTI.to_owned())
+    })
+}
+
+/// The CUPTI `NVTX_INJECTION64_PATH` names, if it names an existing
+/// `libcupti.so*` (a profiler's own injection library is not CUPTI).
+fn injected() -> Option<String> {
+    let path = std::env::var("NVTX_INJECTION64_PATH").ok()?;
+    let named = std::path::Path::new(&path);
+    let file = named.file_name()?.to_string_lossy();
+    (file.starts_with("libcupti.so") && named.is_file()).then_some(path)
 }
 
 /// `libcupti.so.N` beside the first `libcudart.so.N` among the objects the
@@ -96,81 +114,107 @@ fn beside_runtime() -> Option<String> {
     found.filter(|path| std::path::Path::new(path).is_file())
 }
 
-/// `CUPTI_CB_DOMAIN_DRIVER_API`.
-const DRIVER_DOMAIN: i32 = 1;
+pub(crate) type CuptiResult = i32;
+pub(crate) type Callback = unsafe extern "C" fn(*mut c_void, i32, u32, *const c_void);
+pub(crate) type BufferRequested = unsafe extern "C" fn(*mut *mut u8, *mut usize, *mut usize);
+pub(crate) type BufferCompleted = unsafe extern "C" fn(*mut c_void, u32, *mut u8, usize, usize);
 
-/// `CUPTI_API_ENTER`.
-const API_ENTER: i32 = 0;
+/// `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`: another CUPTI client,
+/// such as a profiler, holds the process's subscription.
+pub const MULTIPLE_SUBSCRIBERS: i32 = 39;
 
-/// The watched driver calls: `CUpti_driver_api_trace_cbid` and name. Every
-/// call here returns only once the device work it waits for completed.
-const WATCHED: &[(u32, &str)] = &[
-    (17, "cuCtxSynchronize"),
-    (800, "cuCtxSynchronize_v2"),
-    (121, "cuEventSynchronize"),
-    (126, "cuStreamSynchronize"),
-    (440, "cuStreamSynchronize_ptsz"),
-    (38, "cuMemFreeHost"),
-    (245, "cuMemFree_v2"),
-    (552, "cuMemUnmap"),
-    (43, "cuMemcpyHtoD"),
-    (45, "cuMemcpyDtoH"),
-    (47, "cuMemcpyDtoD"),
-    (49, "cuMemcpyDtoA"),
-    (51, "cuMemcpyAtoD"),
-    (53, "cuMemcpyHtoA"),
-    (54, "cuMemcpyAtoH"),
-    (55, "cuMemcpyAtoA"),
-    (56, "cuMemcpy2D"),
-    (57, "cuMemcpy2DUnaligned"),
-    (58, "cuMemcpy3D"),
-    (248, "cuMemcpy_v2"),
-    (276, "cuMemcpyHtoD_v2"),
-    (278, "cuMemcpyDtoH_v2"),
-    (280, "cuMemcpyDtoD_v2"),
-    (282, "cuMemcpyAtoH_v2"),
-    (284, "cuMemcpyAtoD_v2"),
-    (285, "cuMemcpyDtoA_v2"),
-    (286, "cuMemcpyAtoA_v2"),
-    (287, "cuMemcpy2D_v2"),
-    (288, "cuMemcpy2DUnaligned_v2"),
-    (290, "cuMemcpy3D_v2"),
-    (292, "cuMemcpyHtoA_v2"),
-    (305, "cuMemcpy"),
-    (318, "cuMemcpyPeer"),
-    (320, "cuMemcpy3DPeer"),
-    (397, "cuMemcpyHtoD_v2_ptds"),
-    (398, "cuMemcpyDtoH_v2_ptds"),
-    (399, "cuMemcpyDtoD_v2_ptds"),
-    (408, "cuMemcpy_ptds"),
-];
+/// Declares the CUPTI table: one typed field per entry point. The profiling
+/// entry points are lazy (`Result`s), so that a CUPTI without them still
+/// serves the callback and activity APIs and fails only the collector that
+/// needs them.
+macro_rules! cupti_table {
+    (
+        eager { $($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)* }
+        lazy { $($lazy:ident = $lazy_symbol:literal: fn($($lazy_arg:ty),* $(,)?);)* }
+    ) => {
+        /// The `libcupti.so` entry points this crate calls.
+        pub(crate) struct Cupti {
+            $(pub(crate) $field: unsafe extern "C" fn($($arg),*) -> CuptiResult,)*
+            $(pub(crate) $lazy: Result<unsafe extern "C" fn($($lazy_arg),*) -> CuptiResult>,)*
+            // Declared last: the library outlives every copied function pointer.
+            _library: Library,
+        }
 
-thread_local! {
-    /// How many [`Watched`] scopes the thread is inside.
-    static DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// The watched calls the thread made inside a scope, by entry of
-    /// [`WATCHED`].
-    static CALLS: [Cell<u64>; WATCHED.len()] = const { [const { Cell::new(0) }; WATCHED.len()] };
+        impl Cupti {
+            fn resolve(library: Library) -> Result<Self> {
+                // SAFETY: every signature is the C prototype of the named
+                // entry point in the CUPTI 13 headers.
+                unsafe {
+                    Ok(Self {
+                        $($field: symbol(&library, $symbol)?,)*
+                        $($lazy: symbol(&library, $lazy_symbol),)*
+                        _library: library,
+                    })
+                }
+            }
+        }
+    };
 }
 
-type CuptiResult = i32;
-type Callback = unsafe extern "C" fn(*mut c_void, i32, u32, *const c_void);
-
-/// The `libcupti.so` entry points the watch and the activity records use.
-struct Cupti {
-    _library: Library,
-    subscribe: unsafe extern "C" fn(*mut *mut c_void, Callback, *mut c_void) -> CuptiResult,
-    enable_callback: unsafe extern "C" fn(u32, *mut c_void, i32, u32) -> CuptiResult,
-    unsubscribe: unsafe extern "C" fn(*mut c_void) -> CuptiResult,
-    register_buffers:
-        unsafe extern "C" fn(activity::BufferRequested, activity::BufferCompleted) -> CuptiResult,
-    activity_enable: unsafe extern "C" fn(u32) -> CuptiResult,
-    activity_disable: unsafe extern "C" fn(u32) -> CuptiResult,
-    flush_all: unsafe extern "C" fn(u32) -> CuptiResult,
-    next_record: unsafe extern "C" fn(*mut u8, usize, *mut *mut u8) -> CuptiResult,
-    stream_id: unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *mut u32) -> CuptiResult,
-    context_id: unsafe extern "C" fn(*mut c_void, *mut u32) -> CuptiResult,
-    dropped_records: unsafe extern "C" fn(*mut c_void, u32, *mut usize) -> CuptiResult,
+cupti_table! {
+    eager {
+        subscribe = "cuptiSubscribe": fn(*mut *mut c_void, Callback, *mut c_void);
+        enable_callback = "cuptiEnableCallback": fn(u32, *mut c_void, i32, u32);
+        enable_domain = "cuptiEnableDomain": fn(u32, *mut c_void, i32);
+        register_buffers = "cuptiActivityRegisterCallbacks": fn(BufferRequested, BufferCompleted);
+        activity_enable = "cuptiActivityEnable": fn(u32);
+        activity_disable = "cuptiActivityDisable": fn(u32);
+        flush_all = "cuptiActivityFlushAll": fn(u32);
+        next_record = "cuptiActivityGetNextRecord": fn(*mut u8, usize, *mut *mut u8);
+        stream_id = "cuptiGetStreamIdEx": fn(*mut c_void, *mut c_void, u8, *mut u32);
+        context_id = "cuptiGetContextId": fn(*mut c_void, *mut u32);
+        dropped_records = "cuptiActivityGetNumDroppedRecords": fn(*mut c_void, u32, *mut usize);
+        timestamp = "cuptiGetTimestamp": fn(*mut u64);
+        version = "cuptiGetVersion": fn(*mut u32);
+    }
+    lazy {
+        profiler_initialize = "cuptiProfilerInitialize": fn(*mut c_void);
+        chip_name = "cuptiDeviceGetChipName": fn(*mut c_void);
+        counter_availability = "cuptiProfilerGetCounterAvailability": fn(*mut c_void);
+        host_initialize = "cuptiProfilerHostInitialize": fn(*mut c_void);
+        host_deinitialize = "cuptiProfilerHostDeinitialize": fn(*mut c_void);
+        host_add_metrics = "cuptiProfilerHostConfigAddMetrics": fn(*mut c_void);
+        host_config_size = "cuptiProfilerHostGetConfigImageSize": fn(*mut c_void);
+        host_config = "cuptiProfilerHostGetConfigImage": fn(*mut c_void);
+        host_passes = "cuptiProfilerHostGetNumOfPasses": fn(*mut c_void);
+        host_evaluate = "cuptiProfilerHostEvaluateToGpuValues": fn(*mut c_void);
+        range_enable = "cuptiRangeProfilerEnable": fn(*mut c_void);
+        range_disable = "cuptiRangeProfilerDisable": fn(*mut c_void);
+        range_set_config = "cuptiRangeProfilerSetConfig": fn(*mut c_void);
+        range_start = "cuptiRangeProfilerStart": fn(*mut c_void);
+        range_stop = "cuptiRangeProfilerStop": fn(*mut c_void);
+        range_push = "cuptiRangeProfilerPushRange": fn(*mut c_void);
+        range_pop = "cuptiRangeProfilerPopRange": fn(*mut c_void);
+        range_decode = "cuptiRangeProfilerDecodeData": fn(*mut c_void);
+        range_data_size = "cuptiRangeProfilerGetCounterDataSize": fn(*mut c_void);
+        range_data_initialize = "cuptiRangeProfilerCounterDataImageInitialize": fn(*mut c_void);
+        range_data_info = "cuptiRangeProfilerGetCounterDataInfo": fn(*mut c_void);
+        range_info = "cuptiRangeProfilerCounterDataGetRangeInfo": fn(*mut c_void);
+        pm_enable = "cuptiPmSamplingEnable": fn(*mut c_void);
+        pm_disable = "cuptiPmSamplingDisable": fn(*mut c_void);
+        pm_set_config = "cuptiPmSamplingSetConfig": fn(*mut c_void);
+        pm_start = "cuptiPmSamplingStart": fn(*mut c_void);
+        pm_stop = "cuptiPmSamplingStop": fn(*mut c_void);
+        pm_decode = "cuptiPmSamplingDecodeData": fn(*mut c_void);
+        pm_availability = "cuptiPmSamplingGetCounterAvailability": fn(*mut c_void);
+        pm_data_size = "cuptiPmSamplingGetCounterDataSize": fn(*mut c_void);
+        pm_data_initialize = "cuptiPmSamplingCounterDataImageInitialize": fn(*mut c_void);
+        pm_data_info = "cuptiPmSamplingGetCounterDataInfo": fn(*mut c_void);
+        pm_sample_info = "cuptiPmSamplingCounterDataGetSampleInfo": fn(*mut c_void);
+        pc_enable = "cuptiPCSamplingEnable": fn(*mut c_void);
+        pc_disable = "cuptiPCSamplingDisable": fn(*mut c_void);
+        pc_configure = "cuptiPCSamplingSetConfigurationAttribute": fn(*mut c_void);
+        pc_start = "cuptiPCSamplingStart": fn(*mut c_void);
+        pc_stop = "cuptiPCSamplingStop": fn(*mut c_void);
+        pc_get_data = "cuptiPCSamplingGetData": fn(*mut c_void);
+        pc_stall_count = "cuptiPCSamplingGetNumStallReasons": fn(*mut c_void);
+        pc_stall_reasons = "cuptiPCSamplingGetStallReasons": fn(*mut c_void);
+    }
 }
 
 // SAFETY: the table holds function pointers into a library that is never
@@ -181,7 +225,8 @@ unsafe impl Sync for Cupti {}
 
 static CUPTI: OnceLock<Result<Cupti>> = OnceLock::new();
 
-fn cupti() -> Result<&'static Cupti> {
+/// The process's CUPTI table, loading the library on first use.
+pub(crate) fn cupti() -> Result<&'static Cupti> {
     CUPTI
         .get_or_init(|| {
             // SAFETY: loading libcupti runs only CUPTI's own initializers.
@@ -189,23 +234,7 @@ fn cupti() -> Result<&'static Cupti> {
                 library: library(),
                 source: Arc::new(source),
             })?;
-            // SAFETY: each type is the C prototype of the named entry point.
-            unsafe {
-                Ok(Cupti {
-                    subscribe: symbol(&library, "cuptiSubscribe")?,
-                    enable_callback: symbol(&library, "cuptiEnableCallback")?,
-                    unsubscribe: symbol(&library, "cuptiUnsubscribe")?,
-                    register_buffers: symbol(&library, "cuptiActivityRegisterCallbacks")?,
-                    activity_enable: symbol(&library, "cuptiActivityEnable")?,
-                    activity_disable: symbol(&library, "cuptiActivityDisable")?,
-                    flush_all: symbol(&library, "cuptiActivityFlushAll")?,
-                    next_record: symbol(&library, "cuptiActivityGetNextRecord")?,
-                    stream_id: symbol(&library, "cuptiGetStreamIdEx")?,
-                    context_id: symbol(&library, "cuptiGetContextId")?,
-                    dropped_records: symbol(&library, "cuptiActivityGetNumDroppedRecords")?,
-                    _library: library,
-                })
-            }
+            Cupti::resolve(library)
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -224,7 +253,7 @@ unsafe fn symbol<T: Copy>(loaded: &Library, name: &'static str) -> Result<T> {
         })
 }
 
-fn check(code: CuptiResult, call: &'static str) -> Result<()> {
+pub(crate) fn check(code: CuptiResult, call: &'static str) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
@@ -232,187 +261,151 @@ fn check(code: CuptiResult, call: &'static str) -> Result<()> {
     }
 }
 
-/// The process's subscription to the watched driver calls; unsubscribes on
-/// drop.
-pub struct BlockingWatch {
-    subscriber: *mut c_void,
+/// Calls a lazy entry point with its parameter struct: fails when CUPTI
+/// lacks the entry point or the call fails.
+///
+/// # Safety
+/// `params` is the entry point's parameter struct, with every field the
+/// call reads set.
+pub(crate) unsafe fn call<P>(
+    entry: &Result<unsafe extern "C" fn(*mut c_void) -> CuptiResult>,
+    name: &'static str,
+    params: &mut P,
+) -> Result<()> {
+    let entry = entry.as_ref().map_err(Clone::clone)?;
+    // SAFETY: forwarded from the caller.
+    check(unsafe { entry((params as *mut P).cast()) }, name)
 }
 
-// SAFETY: the subscriber handle is an opaque CUPTI token valid on any thread.
-unsafe impl Send for BlockingWatch {}
+/// CUPTI's current timestamp, in nanoseconds: the clock of every activity
+/// record, PM sample and API record CUPTI and this crate produce.
+pub fn timestamp() -> Result<u64> {
+    let cupti = cupti()?;
+    let mut now = 0;
+    // SAFETY: CUPTI writes one value.
+    check(unsafe { (cupti.timestamp)(&mut now) }, "cuptiGetTimestamp")?;
+    Ok(now)
+}
 
-impl BlockingWatch {
-    /// Subscribe to the watched driver calls. Fails when `libcupti.so` is
-    /// missing or another CUPTI client holds the process's subscription.
-    pub fn start() -> Result<Self> {
-        let cupti = cupti()?;
-        let mut subscriber = std::ptr::null_mut();
-        // SAFETY: CUPTI writes the subscriber handle; the callback is a
-        // plain function that only touches atomics and thread locals.
-        let status =
-            unsafe { (cupti.subscribe)(&mut subscriber, on_driver_call, std::ptr::null_mut()) };
-        check(status, "cuptiSubscribe")?;
-        let watch = Self { subscriber };
-        for &(cbid, _) in WATCHED {
-            // SAFETY: the subscriber is live; the domain and ids are CUPTI's.
-            let status = unsafe { (cupti.enable_callback)(1, subscriber, DRIVER_DOMAIN, cbid) };
-            check(status, "cuptiEnableCallback")?;
+/// The CUPTI API version (`CUPTI_API_VERSION` of the loaded library).
+pub fn version() -> Result<u32> {
+    let cupti = cupti()?;
+    let mut version = 0;
+    // SAFETY: CUPTI writes one value.
+    check(unsafe { (cupti.version)(&mut version) }, "cuptiGetVersion")?;
+    Ok(version)
+}
+
+/// A C string CUPTI owns, copied; `None` for a null pointer.
+///
+/// # Safety
+/// `text` is null or a NUL-terminated string valid during the call.
+pub(crate) unsafe fn text(text: *const c_char) -> Option<String> {
+    if text.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded from the caller.
+    Some(
+        unsafe { CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// The size CUPTI's profiler parameter structs state in `structSize`: the
+/// offset of their last field plus its size (`CUPTI_PROFILER_STRUCT_SIZE`).
+macro_rules! struct_size {
+    ($type:ty, $last:ident) => {{
+        let probe = std::mem::MaybeUninit::<$type>::uninit();
+        let base = probe.as_ptr();
+        // SAFETY: only the field's address is taken, never its value.
+        let field = unsafe { &raw const (*base).$last };
+        const fn size_of_pointee<T>(_: *const T) -> usize {
+            std::mem::size_of::<T>()
         }
-        Ok(watch)
-    }
+        (field as usize - base as usize) + size_of_pointee(field)
+    }};
 }
-
-impl Drop for BlockingWatch {
-    fn drop(&mut self) {
-        if let Ok(cupti) = cupti() {
-            // SAFETY: the subscriber is live until this call.
-            let _ = unsafe { (cupti.unsubscribe)(self.subscriber) };
-        }
-    }
-}
-
-/// The CUPTI callback: counts a watched call entered on a watched thread.
-unsafe extern "C" fn on_driver_call(
-    _userdata: *mut c_void,
-    domain: i32,
-    cbid: u32,
-    data: *const c_void,
-) {
-    if domain != DRIVER_DOMAIN || data.is_null() || DEPTH.get() == 0 {
-        return;
-    }
-    // SAFETY: for the API domains `data` is a `CUpti_CallbackData`, whose
-    // first field is the `CUpti_ApiCallbackSite`.
-    if unsafe { *data.cast::<i32>() } != API_ENTER {
-        return;
-    }
-    if let Some(index) = WATCHED.iter().position(|&(watched, _)| watched == cbid) {
-        CALLS.with(|calls| calls[index].set(calls[index].get() + 1));
-    }
-}
-
-/// A snapshot of the calling thread's counters of watched calls.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Calls([u64; WATCHED.len()]);
-
-impl Default for Calls {
-    fn default() -> Self {
-        Self([0; WATCHED.len()])
-    }
-}
-
-impl Calls {
-    /// The calling thread's counters now.
-    pub fn current() -> Self {
-        Self(CALLS.with(|calls| std::array::from_fn(|index| calls[index].get())))
-    }
-
-    /// The calls counted between `earlier` and this snapshot of the same
-    /// thread, by call name; calls without any are left out.
-    pub fn since(&self, earlier: &Self) -> Vec<(&'static str, u64)> {
-        WATCHED
-            .iter()
-            .zip(self.0.iter().zip(&earlier.0))
-            .filter_map(|(&(_, name), (&now, &then))| {
-                let count = now.saturating_sub(then);
-                (count > 0).then_some((name, count))
-            })
-            .collect()
-    }
-}
-
-/// A scope in which the calling thread's watched driver calls are counted.
-/// It stays on the thread that entered it.
-pub struct Watched {
-    /// The thread's counters when the scope was entered.
-    entered: Calls,
-    _thread: PhantomData<*const ()>,
-}
-
-impl Watched {
-    /// Count the calling thread's watched calls until the scope ends.
-    pub fn enter() -> Self {
-        DEPTH.set(DEPTH.get() + 1);
-        Self {
-            entered: Calls::current(),
-            _thread: PhantomData,
-        }
-    }
-
-    /// Watched calls this thread made since the scope was entered.
-    pub fn blocking_calls(&self) -> u64 {
-        self.calls().iter().map(|&(_, count)| count).sum()
-    }
-
-    /// The watched calls this thread made since the scope was entered, by
-    /// call name; calls it did not make are left out.
-    pub fn calls(&self) -> Vec<(&'static str, u64)> {
-        Calls::current().since(&self.entered)
-    }
-}
-
-impl Drop for Watched {
-    fn drop(&mut self) {
-        DEPTH.set(DEPTH.get().saturating_sub(1));
-    }
-}
+pub(crate) use struct_size;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::ffi::c_void;
     use std::sync::Mutex;
 
-    use super::*;
-    use crate::{DeviceAllocation, DeviceId, Stream, lock, memset_d8};
+    use crate::{DeviceAllocation, Function, Module, Result, Stream};
 
     /// CUPTI is process-wide: its device tests run one at a time.
     pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn only_a_watched_thread_counts_its_waits_on_the_device() -> Result<()> {
-        let _serial = lock(&SERIAL);
-        let watch = BlockingWatch::start()?;
-        let stream = Stream::new(DeviceId(0))?;
+    /// A kernel whose every thread counts to its second parameter and stores
+    /// the count through its first.
+    const SPIN: &str = ".version 8.0\n.target sm_90\n.address_size 64\n\
+        .visible .entry spin(.param .u64 out, .param .u32 n) {\n\
+        .reg .u64 %rd<2>; .reg .u32 %r<3>; .reg .pred %p;\n\
+        ld.param.u64 %rd1, [out]; ld.param.u32 %r1, [n]; mov.u32 %r2, 0;\n\
+        LOOP: add.u32 %r2, %r2, 1; setp.lt.u32 %p, %r2, %r1; @%p bra LOOP;\n\
+        st.global.u32 [%rd1], %r2; ret; }\n";
 
-        // Outside a scope a wait is not counted.
-        let before = Calls::current();
-        stream.synchronize()?;
-        assert_eq!(Calls::current(), before);
-
-        let scope = Watched::enter();
-        stream.synchronize()?;
-        assert_eq!(scope.blocking_calls(), 1);
-        assert_eq!(scope.calls(), vec![("cuStreamSynchronize", 1)]);
-        drop(scope);
-        drop(watch);
-        Ok(())
+    /// The spin kernel of `stream`'s device, and the word it stores into.
+    pub(crate) struct Spin {
+        _module: Module,
+        function: Function,
+        out: DeviceAllocation,
     }
 
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn a_stopped_watch_counts_nothing_until_a_new_one_starts() -> Result<()> {
-        let _serial = lock(&SERIAL);
-        let stream = Stream::new(DeviceId(0))?;
-        let scope = Watched::enter();
-        let watch = BlockingWatch::start()?;
-        drop(activity::StreamActivity::start([("device", &stream)])?);
-        drop(watch);
-        stream.synchronize()?;
-        assert_eq!(scope.blocking_calls(), 0);
+    impl Spin {
+        pub(crate) fn load(stream: &Stream) -> Result<Self> {
+            let module = Module::load_ptx(stream.device(), SPIN)?;
+            let function = module.function("spin")?;
+            Ok(Self {
+                _module: module,
+                function,
+                out: DeviceAllocation::linear(stream.device(), 4)?,
+            })
+        }
 
-        let watch = BlockingWatch::start()?;
-        let recording = activity::StreamActivity::start([("device", &stream)])?;
-        let bytes = 256 << 20;
-        let memory = DeviceAllocation::linear(DeviceId(0), bytes)?;
-        // SAFETY: the allocation holds `bytes` and outlives the fill, which
-        // the synchronization waits for.
-        unsafe { memset_d8(memory.address(), 0, bytes, &stream)? };
-        stream.synchronize()?;
-        assert_eq!(scope.calls(), vec![("cuStreamSynchronize", 1)]);
-        let taken = activity::tests::taken_until("device", |taken| taken.busy_us > 0);
-        assert!(taken.busy_us > 0, "{taken:?}");
-        drop(recording);
-        drop(watch);
-        Ok(())
+        /// Launch it on `stream` with `blocks` blocks of 128 threads that
+        /// each count to `count`.
+        pub(crate) fn launch(&self, stream: &Stream, blocks: u32, mut count: u32) -> Result<()> {
+            let mut out = self.out.address();
+            let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut count).cast()];
+            // SAFETY: the parameters are the kernel's; the word outlives the
+            // launch, which the tests synchronize.
+            unsafe { self.function.launch(stream, blocks, 128, &mut parameters) }
+        }
+    }
+
+    /// A graph of what `issue` issues on `stream`, captured and instantiated.
+    pub(crate) fn captured(
+        stream: &Stream,
+        issue: impl FnOnce(&Stream) -> Result<()>,
+    ) -> Result<crate::GraphExec> {
+        type Capture = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+        type Captured = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
+        type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
+        // SAFETY: loading the driver runs only its initializers; each type is
+        // its symbol's C prototype.
+        let (begin, end, destroy) = unsafe {
+            let driver = Box::leak(Box::new(libloading::Library::new("libcuda.so.1").unwrap()));
+            (
+                *driver.get::<Capture>(b"cuStreamBeginCapture_v2").unwrap(),
+                *driver.get::<Captured>(b"cuStreamEndCapture").unwrap(),
+                *driver.get::<Destroy>(b"cuGraphDestroy").unwrap(),
+            )
+        };
+        let _context = stream.enter()?;
+        let mut graph = std::ptr::null_mut();
+        // SAFETY: the stream is live; `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`
+        // confines the capture to this thread, and the driver writes the
+        // captured graph, which is destroyed once instantiated.
+        unsafe {
+            assert_eq!(begin(stream.handle(), 1), 0);
+            issue(stream)?;
+            assert_eq!(end(stream.handle(), &mut graph), 0);
+            let graph_exec = crate::GraphExec::instantiate(stream.device(), graph as usize);
+            assert_eq!(destroy(graph), 0);
+            graph_exec
+        }
     }
 }

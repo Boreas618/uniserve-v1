@@ -2835,6 +2835,8 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         flashinfer_decode_split_tile_size: None,
         flashinfer_prefill_split_tile_size: None,
         flashinfer_disable_split_kv: false,
+        fence_probes: false,
+        fence_components: Vec::new(),
     }
 }
 

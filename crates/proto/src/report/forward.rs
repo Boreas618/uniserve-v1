@@ -42,6 +42,21 @@ pub struct ForwardStats {
     /// device, keyed `{thread}/{call}` (`builder`, `control`). A serving
     /// call of the executor that made one failed.
     pub blocking_calls: BTreeMap<String, u64>,
+    /// Per-step durations from the fence probes, keyed `{stage}/{component}`:
+    /// a step's summed durations of the component's probed instances, or
+    /// the step's span between its markers for component `step`, of the
+    /// steps of that stage (a call kind, such as `decode`).
+    #[serde(default)]
+    pub fence_us: BTreeMap<String, FenceHistogram>,
+    /// Fence probe records the rank's reader lost: overwritten before it
+    /// read them.
+    #[serde(default)]
+    pub fence_records_lost: u64,
+    /// A profiling session's progress on the rank, keyed `{session}/steps`
+    /// (the steps of its window the rank recorded), `{session}/bytes` (the
+    /// bytes of its file) and `{session}/ended` (1 once its window ended).
+    #[serde(default)]
+    pub profile: BTreeMap<String, u64>,
     /// Attention kernel launch count.
     pub attention_launches: u64,
     /// Cumulative attention kernel time in microseconds.
@@ -119,11 +134,18 @@ impl ForwardStats {
                 &mut self.spec_verify_path_counts,
                 &other.spec_verify_path_counts,
             ),
+            (&mut self.profile, &other.profile),
         ] {
             for (name, &value) in values {
                 let count = target.entry(name.clone()).or_default();
                 *count = count.saturating_add(value);
             }
+        }
+        for (name, histogram) in &other.fence_us {
+            self.fence_us
+                .entry(name.clone())
+                .or_default()
+                .merge(histogram);
         }
 
         for (target, value) in [
@@ -181,6 +203,7 @@ impl ForwardStats {
                 &mut self.flashinfer_decode_graph_plan_reuses,
                 other.flashinfer_decode_graph_plan_reuses,
             ),
+            (&mut self.fence_records_lost, other.fence_records_lost),
             (&mut self.spec_verify_rows, other.spec_verify_rows),
             (
                 &mut self.spec_verify_draft_tokens,
@@ -215,6 +238,9 @@ impl ForwardStats {
             && self.component_us.is_empty()
             && self.stream_us.is_empty()
             && self.blocking_calls.is_empty()
+            && self.fence_us.is_empty()
+            && self.fence_records_lost == 0
+            && self.profile.is_empty()
             && self.attention_launches == 0
             && self.attention_us == 0
             && self.attention_backend_counts.is_empty()
@@ -241,5 +267,113 @@ impl ForwardStats {
             && self.spec_verify_rejected_tokens == 0
             && self.spec_verify_committed_tokens == 0
             && self.spec_verify_path_counts.is_empty()
+    }
+}
+
+/// The upper bounds, in microseconds, of a [`FenceHistogram`]'s buckets; a
+/// last bucket holds what exceeds the largest.
+pub const FENCE_BUCKETS_US: [u64; 18] = [
+    10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000,
+    500_000, 1_000_000, 2_500_000, 10_000_000,
+];
+
+/// Durations in microseconds, counted per bucket of [`FENCE_BUCKETS_US`]:
+/// the counts of a span of steps, which add.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceHistogram {
+    /// The durations in each bucket (not cumulative), the last past the
+    /// largest bound; empty for none.
+    pub buckets: Vec<u64>,
+    /// The durations' sum.
+    pub sum_us: u64,
+}
+
+impl FenceHistogram {
+    /// Count one duration.
+    pub fn observe(&mut self, us: u64) {
+        if self.buckets.is_empty() {
+            self.buckets = vec![0; FENCE_BUCKETS_US.len() + 1];
+        }
+        let bucket = FENCE_BUCKETS_US
+            .iter()
+            .position(|&bound| us <= bound)
+            .unwrap_or(FENCE_BUCKETS_US.len());
+        self.buckets[bucket] += 1;
+        self.sum_us = self.sum_us.saturating_add(us);
+    }
+
+    /// Add another span's counts.
+    pub fn merge(&mut self, other: &Self) {
+        if other.buckets.is_empty() {
+            return;
+        }
+        if self.buckets.is_empty() {
+            self.buckets = vec![0; FENCE_BUCKETS_US.len() + 1];
+        }
+        for (count, &more) in self.buckets.iter_mut().zip(&other.buckets) {
+            *count = count.saturating_add(more);
+        }
+        self.sum_us = self.sum_us.saturating_add(other.sum_us);
+    }
+
+    /// The counts this histogram has beyond `earlier`, an earlier state of
+    /// the same accumulation.
+    pub fn since(&self, earlier: &Self) -> Self {
+        if earlier.buckets.is_empty() {
+            return self.clone();
+        }
+        Self {
+            buckets: self
+                .buckets
+                .iter()
+                .zip(&earlier.buckets)
+                .map(|(&now, &then)| now.saturating_sub(then))
+                .collect(),
+            sum_us: self.sum_us.saturating_sub(earlier.sum_us),
+        }
+    }
+
+    /// The durations counted.
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_duration_counts_in_the_first_bucket_that_bounds_it() {
+        let mut histogram = FenceHistogram::default();
+        histogram.observe(10);
+        histogram.observe(11);
+        histogram.observe(u64::MAX / 2);
+        assert_eq!(histogram.buckets[0], 1);
+        assert_eq!(histogram.buckets[1], 1);
+        assert_eq!(histogram.buckets[FENCE_BUCKETS_US.len()], 1);
+        assert_eq!(histogram.count(), 3);
+    }
+
+    #[test]
+    fn spans_merge_and_a_later_state_yields_the_difference() {
+        let mut first = FenceHistogram::default();
+        first.observe(30);
+        let mut total = first.clone();
+        let mut second = FenceHistogram::default();
+        second.observe(30);
+        second.observe(400);
+        total.merge(&second);
+        assert_eq!(total.count(), 3);
+        assert_eq!(total.sum_us, 460);
+        assert_eq!(total.since(&first), second);
+
+        let mut stats = ForwardStats::default();
+        assert!(stats.is_empty());
+        stats.merge(&ForwardStats {
+            fence_us: [("decode/step".to_owned(), second)].into(),
+            ..ForwardStats::default()
+        });
+        assert!(!stats.is_empty());
     }
 }

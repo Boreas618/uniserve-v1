@@ -372,6 +372,15 @@ def _expert_kernels(
     return "split" if attention_ranks else "megamoe"
 
 
+def attach_fences(loaded: Loaded, patterns: str) -> str:
+    """Attach the worker's fence probes to the rank's whole loaded model
+    (``uniserve.profiling.attach_fences`` of ``loaded.root``).
+    """  # noqa: D205
+    from uniserve.profiling import attach_fences as attach
+
+    return attach(loaded.root, patterns)
+
+
 def identity(loaded: Loaded) -> str:
     """The identity of what a rank's loaded model computes
     (``uniserve.numerics.identity`` of its whole model), which keys the

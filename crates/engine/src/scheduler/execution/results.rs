@@ -1029,6 +1029,22 @@ impl Scheduler {
         add_worker_forward_map(&self.stats.worker.forward_component_us, &stats.component_us);
         add_worker_forward_map(&self.stats.worker.stream_us, &stats.stream_us);
         add_worker_forward_map(&self.stats.worker.blocking_calls, &stats.blocking_calls);
+        add_worker_forward_map(&self.stats.worker.profile, &stats.profile);
+        {
+            let mut fence = self
+                .stats
+                .worker
+                .fence_us
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (key, histogram) in &stats.fence_us {
+                fence.entry(key.clone()).or_default().merge(histogram);
+            }
+        }
+        self.stats
+            .worker
+            .fence_records_lost
+            .fetch_add(stats.fence_records_lost, Ordering::Relaxed);
         add_worker_forward_map(
             &self.stats.worker.attention_backend_counts,
             &stats.attention_backend_counts,

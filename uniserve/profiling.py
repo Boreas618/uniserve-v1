@@ -3,9 +3,12 @@
 - :func:`profile_range` emits optional PyTorch and NVTX spans around
   numerical and infrastructure calls; :func:`ranges_active` tells a caller
   whose span name is costly to build whether a span would be emitted.
-  NVTX spans follow ``UNISERVE_NVTX`` (``1``, ``true``, ``yes`` or ``on``),
-  read once when this module is imported, as the native executor reads it
-  once per process.
+  NVTX spans follow a run-time switch, which starts as ``UNISERVE_NVTX``
+  states (``1``, ``true``, ``yes`` or ``on``) and which the worker sets with
+  its own (:func:`set_nvtx`): a timeline profiling session turns both on for
+  its span.
+- :func:`attach_fences` attaches the worker's fence probes to the modules
+  of the components it names, at each module's entry and exit.
 - :func:`start_profiler` and :func:`stop_profiler` open and close a torch
   profiler window. The worker owns capture windows, step counting and trace
   naming; these functions start the installed PyTorch profiler and export
@@ -21,6 +24,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import json
 import logging
@@ -30,13 +34,14 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
 import torch
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
-# Whether NVTX spans are requested for this process. The switch is the one
-# the native executor reads (``crates/worker/src/profiling``), with the same
-# accepted values.
-_NVTX_RANGES = os.environ.get("UNISERVE_NVTX", "").strip().lower() in {
+# Whether NVTX spans are emitted now. It starts as the native executor's
+# switch starts (``crates/worker/src/profiling``), with the same accepted
+# values, and the worker sets both while a timeline session records.
+_nvtx_ranges = os.environ.get("UNISERVE_NVTX", "").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -50,15 +55,21 @@ _profiler_enabled: Callable[[], bool] = torch.autograd._profiler_enabled
 _NULL_CONTEXT = nullcontext()
 
 
+def set_nvtx(enabled: bool) -> None:
+    """Emit NVTX spans from now on, or stop emitting them."""
+    global _nvtx_ranges
+    _nvtx_ranges = bool(enabled)
+
+
 def ranges_active() -> bool:
     """Whether :func:`profile_range` currently emits any span."""
-    return (_NVTX_RANGES and _nvtx_available()) or _profiler_enabled()
+    return (_nvtx_ranges and _nvtx_available()) or _profiler_enabled()
 
 
 def profile_range(debug_name: str):
     """Emit a torch-profiler span and/or NVTX range when profiling is active."""
     record = _profiler_enabled()
-    nvtx = _NVTX_RANGES and _nvtx_available()
+    nvtx = _nvtx_ranges and _nvtx_available()
     if not record and not nvtx:
         return _NULL_CONTEXT
     return _profile_range_impl(debug_name, record=record, nvtx=nvtx)
@@ -89,6 +100,68 @@ def _profile_range_impl(
             torch.cuda.nvtx.range_push(debug_name)
             stack.callback(torch.cuda.nvtx.range_pop)
         yield
+
+
+def attach_fences(model: nn.Module, patterns: str) -> str:
+    """Attach the worker's fence probes to ``model``'s components.
+
+    Every module of ``model`` whose component (the ``<component>`` of the
+    function its class declares, :func:`uniserve.numerics.function`)
+    matches one of ``patterns`` (a JSON list of names, ``*`` matching any
+    run of characters) gets a probe at its forward's entry and one at its
+    return: a launch of the worker library's ``fence_probe`` on the current
+    stream, which a CUDA graph captures with the forward. The hook passes
+    the stream's device ordinal with its handle, since asking the driver for
+    a capturing stream's device invalidates the capture. Module ``i`` in
+    the returned order is probed as ``2 * i`` at its entry and ``2 * i + 1``
+    at its exit.
+
+    Returns:
+        A JSON list of the probed modules, each ``{"path": ..., "component":
+        ...}``, in probe order.
+    """
+    from uniserve.errors import SetupError
+    from uniserve.numerics import function
+    from uniserve.worker import library
+
+    selected = [str(pattern) for pattern in json.loads(patterns)]
+    probe = library()["fence_probe"]
+    instances: list[dict[str, str]] = []
+    for path, module in model.named_modules():
+        try:
+            component = function(type(module)).split("/", 1)[0]
+        except SetupError:
+            # A container of no numerical component of its own.
+            continue
+        if not any(fnmatch.fnmatchcase(component, p) for p in selected):
+            continue
+        entry = 2 * len(instances)
+        instances.append({"path": path, "component": component})
+        module.register_forward_pre_hook(_entry_probe(probe, entry))
+        module.register_forward_hook(_exit_probe(probe, entry + 1))
+    return json.dumps(instances)
+
+
+def _entry_probe(probe: Callable[[int, int, int], Any], index: int):
+    """A forward pre-hook that launches probe ``index`` on the current
+    stream.
+    """  # noqa: D205
+
+    def hook(module: nn.Module, args: Any) -> None:
+        stream = torch.cuda.current_stream()
+        probe(stream.cuda_stream, stream.device_index, index)
+
+    return hook
+
+
+def _exit_probe(probe: Callable[[int, int, int], Any], index: int):
+    """A forward hook that launches probe ``index`` on the current stream."""
+
+    def hook(module: nn.Module, args: Any, output: Any) -> None:
+        stream = torch.cuda.current_stream()
+        probe(stream.cuda_stream, stream.device_index, index)
+
+    return hook
 
 
 def start_profiler(

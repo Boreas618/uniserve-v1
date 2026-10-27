@@ -1,23 +1,96 @@
 # Execution profiling
 
-UniServe's execution sanitizer reads profiler captures and produces hints about host waits, GIL ownership, copies and language crossings. It does not change execution, reject a request or establish that an operation is unnecessary. Inspect each hint in its workload context, then measure any optimization without the diagnostic instrumentation.
+A serving deployment profiles itself without restarting a process or pausing service. Every worker subscribes its process to NVIDIA's CUPTI once, as it starts, and every collector below shares that subscription: two counters and the fence probes are always on and exported as Prometheus metrics, and a profiling session (`/admin/profile`) attaches further collectors to the executing world at a step boundary and detaches them at another, writing one SQLite file per worker that `uniserve_eval.profile` reads and converts to a Perfetto trace. Captures of Nsight Systems and cProfile are read by the execution sanitizer, which produces hints about host waits, GIL ownership, copies and language crossings. Neither changes execution, rejects a request or establishes that an operation is unnecessary: inspect each finding in its workload context, then measure any optimization without the diagnostic instrumentation.
+
+## CUPTI in a worker
+
+A worker loads the CUPTI library that sits beside the CUDA runtime it loaded, which is the `nvidia-cuda-cupti` package of its Python environment; the CUDA 13.0 toolkit's own CUPTI (2025.3.0) stalls a worker that replays CUDA graphs while kernels are recorded. CUPTI accepts one subscriber per process, so the worker subscribes once, before it loads its model, and the counters and every session collector enable the callbacks and activity records they need on that subscription and release them when they stop. A worker whose process a profiler already subscribed, such as Nsight Systems tracing CUDA, logs that CUPTI is not subscribed: it reports neither counter, and a session reports every CUPTI collector unavailable on it; the fence probes do not use CUPTI and stay on. The CUPTI library stays loaded in the process: removing it (`cuptiFinalize`) after it recorded a serving worker's activity leaves the device work the worker submits afterwards waiting forever.
+
+CUPTI's whole-graph records (`CUPTI_ACTIVITY_KIND_GRAPH_TRACE`) crash the process at the launch of a graph instantiated while they were disabled (`nvidia-cuda-cupti` 13.0.85 on GB200), and trace a graph instantiated while they were enabled correctly whether they are enabled at its launch or not. The subscription therefore enables them from the entry of every graph instantiation to its exit, so that a session can trace every graph the worker instantiated whole.
 
 ## Watch host waits and stream idle time while serving
 
-A serving worker attaches NVIDIA's CUPTI to its process and reports two counters with every batch result, which the daemon exports as Prometheus metrics:
+A serving worker reports two counters from CUPTI with every batch result, which the daemon exports as Prometheus metrics:
 
 | Metric | Labels | What it counts |
 | --- | --- | --- |
 | `uniserve:worker_blocking_calls` | `thread`, `call` | Driver calls that made a serving thread wait for the device: stream, event and context synchronization, synchronous copies, `cuMemFree`, `cuMemFreeHost` and `cuMemUnmap`. Runtime and PyTorch calls reach these driver calls and are counted too. `thread` is `builder` (the jobs it performs, the executor's Python calls among them) or `control` |
-| `uniserve:worker_stream_us` | `stream`, `state` | Microseconds of the device time of each observed stream, `device` (the primary stream) and `copy` (the host KV cache's copy stream), from CUPTI's activity records of the kernels, copies and fills on the stream, graph nodes included: `busy` is the length of the union of their intervals, `gap` the time the stream had nothing to run between its first operation and its latest end, whether it waited for the host, for another stream or for any work, and `late` the time of records that arrived after the two seconds of device time the union keeps behind the stream's latest end, counted in neither |
+| `uniserve:worker_stream_us` | `stream`, `state` | Microseconds of the device time of each observed stream, `device` (the primary stream) and `copy` (the host KV cache's copy stream), from CUPTI's activity records of the kernels, copies and fills on the stream, graph nodes included (a graph's launch is one record while a session traces graphs whole): `busy` is the length of the union of their intervals, `gap` the time the stream had nothing to run between its first operation and its latest end, whether it waited for the host, for another stream or for any work, and `late` the time of records that arrived after the two seconds of device time the union keeps behind the stream's latest end, counted in neither |
 
-A serving call of the executor (`start`, `prepare`, `execute`, `commit`, `join_expert_step`, `release`) that makes the host wait for the device fails with `InvariantViolation`, naming the calls. The rest of a job and the control thread are counted without failing, since some of their reads still wait for their producers.
+A serving call of the executor (`start`, `prepare`, `execute`, `commit`, `join_expert_step`, `release`) that makes the host wait for the device fails with `InvariantViolation`, naming the calls. The rest of a job and the control thread are counted without failing, since some of their reads still wait for their producers. Both counters stay on while the worker serves.
 
-A worker loads the CUPTI library that sits beside the CUDA runtime it loaded, which is the `nvidia-cuda-cupti` package of its Python environment; the CUDA 13.0 toolkit's own CUPTI (2025.3.0) stalls a worker that replays CUDA graphs while kernels are recorded. CUPTI accepts one subscriber per process. A worker whose process a profiler already subscribed, such as Nsight Systems tracing CUDA, logs that CUPTI is not attached and reports neither counter. `POST /admin/cupti` with `{"attached": false}` detaches CUPTI from every worker at the engine's next step boundary, and `{"attached": true}` attaches it again (`docs/admin.md`). Detached, a worker has no CUPTI callback subscription and no activity record enabled, and reports neither counter. The CUPTI library stays loaded in the process: removing it (`cuptiFinalize`) after it recorded a serving worker's activity leaves the device work the worker submits afterwards waiting forever.
+## Fence probes
 
-## Capture and inspect a CUDA timeline
+Fence probes time the model's components on the device, inside CUDA graphs, at every step. Every module class of the numerical library declares its component as the `<component>` of its function (`function = "<component>/<revision>"`, `uniserve/numerics.py`); a worker attaches a probe at the entry and one at the return of every module whose component matches `profiling_config.fence_components` (`docs/configuration.md`). A probe is a single-thread kernel launched on the module's current stream: a forward captured into a CUDA graph at warmup captures its probes, which each replay runs. The worker brackets each batch's execution with step markers of the same kernel on the computation's stream, which store the batch's id where the probes between them read it, so every record names its step.
 
-Set `UNISERVE_NVTX=1` before starting the worker. The native executor emits synchronous ranges named `uniserve.worker.admit`, `prepare`, `inputs`, `execute`, `retire`, `poll`, `result` and `close`, with the batch ID as a numeric payload. Shared resource reclamation uses `uniserve.worker.reap` without a batch payload. Startup phases emit `uniserve.worker.describe`, `load`, `plan`, `bind`, `warmup` and `capture` without a payload. The switch is read once per process: by the native executor on first use and by the Python library when `uniserve.profiling` is imported. Python numerical ranges, such as `uniserve.collective` launches, remain nested within those stages. Native ranges use the NVIDIA NVTX SDK directly and issue no Python callbacks or CUDA operations.
+A probe first reads a device switch, a word per component and a master word in device memory; off, it returns at once. On, it reads `%globaltimer` and writes its time, its probe and its step into the next slot of a double buffer in pinned host memory the worker allocated, 4096 records of 16 bytes a half; the probe that completes a half publishes it. The worker's control thread reads every complete half, and at most once a second the half being filled, without any device synchronization; a record tags its half's fill, so one the device overwrote before the host read it is counted as lost (`uniserve:worker_fence_records_lost`). At each step's end marker the worker pairs each module instance's entry and exit in time order, sums the durations of a component's instances in the step, and counts the sum in the histogram of the step's stage and the component, beside the step's span between its markers (component `step`):
+
+| Metric | Labels | What it counts |
+| --- | --- | --- |
+| `uniserve:worker_fence_step_seconds` | `stage`, `component` | A histogram of per-step durations on the device: for each step of the stage (its call kind, such as `prefill` or `decode`), the summed time of the component's probed instances, or the step's span for `step`; buckets from 10 µs to 10 s |
+| `uniserve:worker_fence_records_lost` | | Probe records overwritten before the worker read them |
+
+`profiling_config.fence_probes = false` switches every probe off in place: `PUT /admin/config` with that assignment has every worker write its device switch at the engine's next step boundary, and the graphs keep their probes, each of which then returns at once. Changing `fence_components` changes which modules carry probes in the captured graphs, which is a new world (`docs/admin.md`).
+
+## Profiling sessions
+
+A session attaches collectors to every worker of the executing world for a window of steps or seconds, and leaves one SQLite file per worker in a directory it names. One session runs at a time:
+
+```bash
+curl -X POST http://127.0.0.1:8000/admin/profile -H 'Content-Type: application/json' -d '{
+  "collectors": ["timeline", "fence_timeline", "pm_sampling"],
+  "stages": ["decode"], "start_step": 10, "steps": 200,
+  "output_dir": "/data/profiles", "max_slowdown": 0.1}'
+curl http://127.0.0.1:8000/admin/profile             # its state
+curl -X DELETE http://127.0.0.1:8000/admin/profile   # end it now
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `collectors` | Required | The collectors below, at least one |
+| `steps` | Unbounded | The steps of the selected stages each worker records |
+| `start_step` | `0` | The steps of the selected stages each worker skips before its window opens |
+| `seconds` | Unbounded | How long the session lasts from its start |
+| `stages` | Every stage | The steps recorded, by call kind (`prefill`, `decode`, `verify`, `denoising`, ...) |
+| `workers` | Every worker | The workers recorded, by rank |
+| `components` | Every probed component | Name patterns (`*` matches any run) of the components whose fence records `fence_timeline` keeps |
+| `output_dir` | Required | The directory each worker writes `profile-SESSION-worldWORLD-rankRANK.sqlite` into; it is created |
+| `timeline`, `pm_sampling`, `range_metrics`, `pc_sampling` | Below | Each collector's options |
+| `max_slowdown` | Unguarded | The quality-of-service guard's bound, a fraction of the step time before the session |
+
+The session starts at the engine's next step boundary: the workers prepare their collectors and create their files, and answer with each collector's state, `prepared` or `unavailable` with the reason (a worker without CUPTI's subscription, a metric set that needs more than one pass). Each worker arms its collectors before the forward of the first step its window takes and disarms them after the forward of the last, as jobs that step's forward waits for, so that what CUPTI records begins and ends at step boundaries; it disarms them before a step of another stage and arms them again before the next selected one. A step is one batch's forward; every step during the session is listed in the file with whether the window took it. A session ends when every selected worker's window of steps ended, its seconds passed, the operator ends it, the quality-of-service guard ends it, or its world stops executing: a world change ends it before it parks the serving world, and a rollback ends the session of the world on trial; neither carries a session into the next world. Ending has every worker of a serving world disarm, release its collectors, write what remains and close its file.
+
+`GET /admin/profile` answers with the running session, or the last that ended: its state, each worker's collectors and, once it ended, why and each worker's file and its rows by table; the steps and the bytes the workers recorded so far (`steps`, `bytes_written`), reported with their batch results; the step time before the session and over the session's last 10 seconds (`overhead`); and the quality-of-service guard's actions.
+
+| Collector | Mechanism | Options | What its file holds |
+| --- | --- | --- | --- |
+| `timeline` | CUPTI's activity records of kernels (`CONCURRENT_KERNEL`, which keeps kernels concurrent), copies, fills, NVTX marks and their data, memory allocations and the NVLink and PCIe topology, and the callbacks of every runtime and driver API call; a CUDA graph's launch is one record, or one per node | `graphs`: `whole` (default) or `nodes` | `kernel`, `copy`, `fill`, `graph`, `marker`, `marker_data`, `memory`, `nvlink`, `pcie`, `api` |
+| `fence_timeline` | Every fence probe record the worker reads, of the selected components and the step markers | | `fence`, with `fence_probe` |
+| `pm_sampling` | CUPTI's PM sampling: hardware counters of the whole device every interval of device time, in one pass | `metrics` (PM sampling metric names; default `gr__cycles_active.avg`, `sm__cycles_active.avg`, `dram__throughput.avg.pct_of_peak_sustained_elapsed`), `interval_ns` (default 100000) | `pm_sample` |
+| `range_metrics` | CUPTI's range profiler with metrics one pass collects, never replaying work | `metrics` (default `gpu__time_duration.sum`), `ranges`: `kernel` (a range per launch, a CUDA graph's launch being one) or `component` (a range per probed module instance's call, which only calls outside a CUDA graph's replay push: a replay runs no host code) | `range_metric` |
+| `pc_sampling` | CUPTI's PC sampling in continuous mode, which samples warps without serializing kernels | `period`: each SM samples a warp every `2^(5 + period)` cycles (default 12) | `pc_sample`, `pc_take`, `pc_stall_reason` |
+
+
+**Quality-of-service guard.** The daemon averages the executing world's step time over the minute before the session and, every half second, over the session's last 10 seconds. With `max_slowdown`, a step time past the earlier one by more than that fraction turns off the costliest collector still running, at most once every 10 seconds so that each change is measured; a slowdown that remains with no collector left ends the session. The collectors are turned off in this order: `range_metrics`, `pc_sampling`, `timeline`, `pm_sampling`, `fence_timeline`. Every action, with the slowdown that caused it, is in the session's state.
+
+**NVTX.** The worker's `uniserve.worker.*` ranges and the library's ranges follow a run-time switch, which starts as `UNISERVE_NVTX` states and which a `timeline` collector turns on while it records and restores after. NVTX reaches CUPTI only through the injection library the process names in `NVTX_INJECTION64_PATH` at its first NVTX call (without it CUPTI records no mark), so a worker names its environment's CUPTI there as it starts, unless its environment names another library, as Nsight Systems does.
+
+### Session files
+
+Each worker writes one SQLite file per session, in UniServe's own schema: every raw record kind has a table, beside `metadata` (the session, the world, the rank, the device, its chip, the CUPTI library and version, the request, and `doc.*` entries stating what every table's identifiers and clocks mean), `strings` (kernel, API, NVTX and domain names by id), `clocks`, `steps` and `collectors` (each collector's state over the session, the guard's releases among them). The schema states its version (`schema_version`) and changes only by additions. A writer thread of the worker receives the records over a channel, commits them every 200 ms, and checkpoints the write-ahead log into the file when the session ends; a worker that exits during a session leaves what it committed in the file and its log.
+
+Every time is in nanoseconds of one of two clocks: CUPTI's (about `CLOCK_REALTIME`), for CUPTI's records, the steps and PM samples; and each device's `%globaltimer`, for the fence records. `clocks` holds samples of them at the session's start and end: CUPTI's clock with `CLOCK_REALTIME` and `CLOCK_MONOTONIC`, and each device's `%globaltimer`, read by a kernel that stores it into pinned host memory while the host times its appearance, with half that time as the sample's uncertainty. A client aligns a clock through the sample of least uncertainty. CUPTI's records carry the correlation id of the API call that issued them, a graph's nodes that of its launch.
+
+```bash
+.venv/bin/python -m uniserve_eval.profile summary /data/profiles/profile-1-world1-rank0.sqlite
+.venv/bin/python -m uniserve_eval.profile perfetto /data/profiles/profile-1-*.sqlite -o trace.json
+```
+
+`summary` states each file's session, worker, collectors and rows by table. `perfetto` writes one trace of a session's files in the Trace Event Format, which the Perfetto UI opens: a process per worker, with a track per CUDA stream, host thread and device's fence probes (each probed component instance's call a slice, nested as the calls nest), the steps, and counter tracks for PM samples, all on CUPTI's clock. `uniserve_eval.profile.ProfileFile` reads a file from Python.
+
+## Capture and inspect a CUDA timeline with Nsight Systems
+
+Set `UNISERVE_NVTX=1` before starting the worker to start its ranges on. The native executor emits synchronous ranges named `uniserve.worker.admit`, `prepare`, `inputs`, `execute`, `retire`, `poll`, `result` and `close`, with the batch ID as a numeric payload. Shared resource reclamation uses `uniserve.worker.reap` without a batch payload. Startup phases emit `uniserve.worker.describe`, `load`, `plan`, `bind`, `warmup` and `capture` without a payload. Python numerical ranges, such as `uniserve.collective` launches, remain nested within those stages. Native ranges use the NVIDIA NVTX SDK directly and issue no Python callbacks or CUDA operations. Nsight Systems holds CUPTI's subscription in the processes it traces, so their sessions run no CUPTI collector.
 
 Capture a representative workload with Nsight Systems. `CAPTURE` is an output prefix and `WORKLOAD` is the caller's Python entry point; select both explicitly. For serving, replace the Python command with the normal `uniserve serve` command and run the fixed workload against it.
 

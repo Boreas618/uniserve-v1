@@ -159,6 +159,19 @@ pub struct WorkerLaunch {
     pub stub: bool,
     /// Placed components by name; empty for an expert-only rank.
     pub components: BTreeMap<String, ComponentConfig>,
+    /// The fence probes: whether they record, and the components that carry
+    /// them (`crate::profiling::fences`).
+    pub fences: FenceOptions,
+}
+
+/// The rank's fence probes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FenceOptions {
+    /// The device switch's state at start.
+    pub enabled: bool,
+    /// Name patterns of the components whose module instances carry probes;
+    /// no probe when empty.
+    pub components: Vec<String>,
 }
 
 impl WorkerLaunch {
@@ -248,6 +261,10 @@ pub fn resolve(
         attention,
         load,
         stub,
+        fences: FenceOptions {
+            enabled: descriptor.fence_probes,
+            components: descriptor.fence_components.clone(),
+        },
         components: descriptor.components,
     })
 }

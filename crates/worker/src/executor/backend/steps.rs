@@ -18,6 +18,7 @@ use crate::executor::lifecycle::Retirement;
 use crate::executor::python::PythonExecutor;
 use crate::executor::{BatchResult, Submission};
 use crate::job::{Completion, Job, JobId};
+use crate::profiling::session::Session;
 use crate::{Error, Result};
 
 /// Where a batch's host KV cache copies stand on the copy stream
@@ -65,6 +66,9 @@ pub(crate) struct WorkerBatch {
     pub(super) stepping: bool,
     /// The job of the profiler's window this batch's forward waits for.
     profiling: Option<JobId>,
+    /// The job that switches the profiling session's collectors this
+    /// batch's forward waits for.
+    session: Option<JobId>,
     /// The computation's or the transfer runtime's launched work awaiting
     /// materialization.
     running: Option<Launched>,
@@ -101,6 +105,7 @@ impl WorkerBatch {
             transfer: None,
             stepping: false,
             profiling: None,
+            session: None,
             running: None,
             image_inputs: None,
             starting: false,
@@ -454,6 +459,9 @@ impl WorkerBackend {
                     if let Some(profiler) = &mut self.profiler {
                         profiler.begin();
                     }
+                    if let Some(session) = &mut self.session {
+                        session.begin(batch.plan.batch_id, kind.as_str());
+                    }
                 }
                 batch::Stage::Forward => {}
                 batch::Stage::Done => self.end_forward(batch),
@@ -467,6 +475,16 @@ impl WorkerBackend {
                 && let Some(job) = profiler.next(&queue)
             {
                 batch.profiling = Some(job);
+                return Ok(Some(job));
+            }
+            // The session's collectors are armed before the forward of the
+            // first step its window takes and disarmed after the last: each
+            // switch is a job the batch waits for.
+            if stage != batch::Stage::Inputs
+                && let Some(session) = &mut self.session
+                && let Some(job) = session.next(&queue)
+            {
+                batch.session = Some(job);
                 return Ok(Some(job));
             }
             if stage == batch::Stage::Done {
@@ -504,6 +522,13 @@ impl WorkerBackend {
             batch.profiling = None;
             if let Some(profiler) = &mut self.profiler {
                 profiler.complete(completion);
+            }
+            return Ok(());
+        }
+        if batch.session == Some(job) {
+            batch.session = None;
+            if let Some(session) = &mut self.session {
+                session.complete(completion);
             }
             return Ok(());
         }
@@ -672,7 +697,7 @@ impl WorkerBackend {
         // waited for the device, since the last result, travel with this one;
         // the engine adds every result's into its counters. This runs on the
         // control thread, whose own calls are counted here.
-        let control = cuda::cupti::Calls::current();
+        let control = cuda::cupti::blocking::Calls::current();
         crate::profiling::blocking::add("control", &control.since(&self.control_calls));
         self.control_calls = control;
         let activity = cuda::cupti::activity::take();
@@ -696,7 +721,26 @@ impl WorkerBackend {
             .filter(|&(_, us)| us > 0)
             .collect();
         let blocking = crate::profiling::blocking::take();
-        if !stream_us.is_empty() || !blocking.is_empty() {
+        // The fence probes' complete steps, read without waiting for the
+        // device, and the session's progress travel with the result too.
+        let (fence_us, fence_lost) = match crate::profiling::fences::Fences::installed() {
+            Some(fences) => {
+                fences.poll(false);
+                fences.take()
+            }
+            None => Default::default(),
+        };
+        let profile = self
+            .session
+            .as_mut()
+            .map(Session::progress)
+            .unwrap_or_default();
+        if !stream_us.is_empty()
+            || !blocking.is_empty()
+            || !fence_us.is_empty()
+            || fence_lost > 0
+            || !profile.is_empty()
+        {
             let stats = result
                 .output
                 .forward_stats
@@ -706,6 +750,13 @@ impl WorkerBackend {
             }
             for (key, count) in blocking {
                 *stats.blocking_calls.entry(key).or_default() += count;
+            }
+            for (key, histogram) in fence_us {
+                stats.fence_us.entry(key).or_default().merge(&histogram);
+            }
+            stats.fence_records_lost += fence_lost;
+            for (key, value) in profile {
+                *stats.profile.entry(key).or_default() += value;
             }
         }
         Ok(result)

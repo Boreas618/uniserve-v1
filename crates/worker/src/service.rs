@@ -96,9 +96,11 @@ pub(crate) struct Maintenance {
     /// Whether the worker sleeps: its graph memory suspended and its cache
     /// given back.
     pub(crate) asleep: bool,
-    /// CUPTI's attachment to the rank, which `uniserve.attach_cupti` and
-    /// `uniserve.detach_cupti` change.
-    pub(crate) cupti: crate::profiling::cupti::Cupti,
+    /// CUPTI's always-on counters of the rank, kept while it serves; `None`
+    /// without a CUPTI subscription.
+    pub(crate) _counters: Option<crate::profiling::counters::Counters>,
+    /// The rank, as a profiling session selects ranks.
+    pub(crate) rank: u32,
     /// The KV cache of the predecessor world's worker of the rank's scope,
     /// whose flags and scales `uniserve.adopt_cache` copies at the world's
     /// promotion; `None` for a world that succeeds none.
@@ -655,9 +657,16 @@ impl Service<'_> {
     ///   weights in place from the checkpoint at `path`
     ///   (`crate::worker::update`), and answers the rank's worker group and
     ///   the new key seed of each host page pool;
-    /// - `uniserve.attach_cupti`, `uniserve.detach_cupti`: attach CUPTI to the
-    ///   process and detach it (`crate::profiling::cupti`), and answer whether
-    ///   it is attached and records the streams' device time.
+    /// - `uniserve.profile_start` (a `proto::profile::SessionStart`): starts
+    ///   a profiling session on the rank (`crate::profiling::session`) and
+    ///   answers whether the session selects the rank, its file and its
+    ///   collectors' states;
+    /// - `uniserve.profile_stop` (`{"session": id, "reason": text}`): ends
+    ///   it and answers what its file holds;
+    /// - `uniserve.profile_release` (`{"session": id, "collector": name,
+    ///   "reason": text}`): turns one collector of it off;
+    /// - `uniserve.fence_switch` (`{"enabled": bool}`): turns the fence
+    ///   probes on or off (`crate::profiling::fences`).
     fn built_in(&mut self, name: &str, payload: &str) -> crate::Result<String> {
         let payload: serde_json::Value = if payload.is_empty() {
             serde_json::Value::Null
@@ -977,13 +986,50 @@ impl Service<'_> {
                 }
                 updated?
             }
-            "uniserve.attach_cupti" => {
-                self.maintenance.cupti.attach()?;
-                self.maintenance.cupti.state()
+            "uniserve.profile_start" => {
+                let start: proto::profile::SessionStart = serde_json::from_value(payload)
+                    .map_err(|error| Error::Invalid(format!("profile_start: {error}")))?;
+                let device = self.maintenance.devices.first().copied();
+                self.executor
+                    .backend_mut()
+                    .start_session(start, self.maintenance.rank, device)?
             }
-            "uniserve.detach_cupti" => {
-                self.maintenance.cupti.detach()?;
-                self.maintenance.cupti.state()
+            "uniserve.profile_stop" => {
+                let session = payload["session"]
+                    .as_u64()
+                    .ok_or_else(|| Error::Invalid("profile_stop names no session".into()))?;
+                let reason = payload["reason"].as_str().unwrap_or("stopped");
+                self.executor
+                    .backend_mut()
+                    .stop_session(session, reason, self.maintenance.rank)
+            }
+            "uniserve.profile_release" => {
+                let session = payload["session"]
+                    .as_u64()
+                    .ok_or_else(|| Error::Invalid("profile_release names no session".into()))?;
+                let collector: proto::profile::Collector =
+                    serde_json::from_value(payload["collector"].clone())
+                        .map_err(|error| Error::Invalid(format!("profile_release: {error}")))?;
+                let reason = payload["reason"].as_str().unwrap_or("released");
+                self.executor.backend_mut().release_collector(
+                    session,
+                    collector,
+                    reason,
+                    self.maintenance.rank,
+                )
+            }
+            "uniserve.fence_switch" => {
+                let enabled = payload["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Invalid("fence_switch states no enabled".into()))?;
+                let switched = match crate::profiling::fences::Fences::installed() {
+                    Some(fences) => {
+                        fences.switch(enabled)?;
+                        true
+                    }
+                    None => false,
+                };
+                serde_json::json!({ "probes": switched, "enabled": enabled })
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -1260,7 +1306,8 @@ mod tests {
                 weights: None,
                 pools: Vec::new(),
                 asleep: false,
-                cupti: crate::profiling::cupti::Cupti::new(Vec::new()),
+                _counters: None,
+                rank: 0,
                 predecessor: None,
                 max_total_tokens: None,
                 request_slots: 0,

@@ -225,6 +225,11 @@ pub struct WorkerProcessArgs {
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     /// Whether FlashInfer may split the KV sequence across thread blocks.
     pub flashinfer_split_kv: bool,
+    /// Whether the fence probes record (`profiling_config.fence_probes`).
+    pub fence_probes: bool,
+    /// The components whose module instances carry fence probes, as name
+    /// patterns (`profiling_config.fence_components`).
+    pub fence_components: Vec<String>,
     /// Maximum model context length in tokens.
     pub max_model_len: u32,
     /// Maximum accepted video duration in seconds. The frontend states it

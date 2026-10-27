@@ -10,6 +10,8 @@
 //! - [`request`]: what the leader daemon submits to an engine process and the
 //!   events it receives back, as the Rust values both ends work with.
 //! - [`report`]: the schedulers' statistics an engine reports to its daemon.
+//! - [`profile`]: the profiling sessions the leader daemon starts on the
+//!   workers, JSON in worker hooks.
 //!
 //! Each connection opens with a hello exchange that compares
 //! [`PROTOCOL_MAJOR`]; a peer never sends a field the other's
@@ -18,6 +20,7 @@
 
 mod connection;
 mod media;
+pub mod profile;
 pub mod report;
 pub mod request;
 mod shared_memory;
