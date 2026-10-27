@@ -94,6 +94,8 @@ This policy covers tests, builds, lint, type checks, benchmarks, smoke tests, he
 - Tests must be behavior-oriented, deterministic where appropriate, isolated, maintainable, precise, proportionate to the risk, and scoped so that a failure identifies the contract under test. Prefer adequate existing coverage; strengthen a behavioral test when it can cover a necessary additional path without duplication.
 - Add or update a qualified behavioral test when changed behavior has a material correctness condition that is not self-evident and could plausibly regress. Relevant cases include boundary inputs, state transitions, contract enforcement, branching, and error handling.
 - Each additional validation stage requires its own justification. Do not turn one necessary check into an expanding pipeline or let validation displace, narrow, or replace the requested implementation.
+- Run independent test cases concurrently whenever their resources allow, such as one single-GPU case per free GPU, each with its own ports, runtime directory and Storage Server; the serial execution of the benchmark policy governs benchmarks and measurement points, not tests. A case that observes host-wide state, such as the host's shared memory, runs alone.
+- Rerun only what a change can affect: after a fix, rerun the failed case and the cases whose code path the change touched, and keep a record of which cases passed on which code. Rerunning cases that already passed on code a change leaves unaffected wastes time and hardware and is prohibited.
 
 ### Observable Behavior and Test Boundaries
 
