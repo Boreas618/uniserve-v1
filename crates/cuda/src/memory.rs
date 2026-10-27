@@ -369,21 +369,24 @@ impl HostRegistration {
     }
 
     /// Registers `[pointer, pointer + bytes)` in `device`'s primary context
-    /// as memory devices only read (`CU_MEMHOSTREGISTER_READ_ONLY`), such as
-    /// a read-only mapping of retained host storage.
+    /// as memory devices only read, such as a read-only mapping of retained
+    /// host storage: with `CU_MEMHOSTREGISTER_READ_ONLY` where the device
+    /// supports it (`ReadOnlyHostRegisterSupported`), as a plain
+    /// registration where it does not (GB200 reports 0 and refuses the
+    /// flag, and a read-only mapping registers there only without it). The
+    /// caller's devices read the range alone either way.
     ///
     /// # Safety
     /// As for [`HostRegistration::new`].
     pub unsafe fn read_only(device: DeviceId, pointer: *mut u8, bytes: usize) -> Result<Self> {
+        let supported = device.attribute(crate::DeviceAttribute::ReadOnlyHostRegisterSupported)?;
+        let flags = if supported != 0 {
+            CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_READ_ONLY
+        } else {
+            CU_MEMHOSTREGISTER_PORTABLE
+        };
         // SAFETY: forwarded from the caller.
-        unsafe {
-            Self::register(
-                device,
-                pointer,
-                bytes,
-                CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_READ_ONLY,
-            )
-        }
+        unsafe { Self::register(device, pointer, bytes, flags) }
     }
 
     /// # Safety
