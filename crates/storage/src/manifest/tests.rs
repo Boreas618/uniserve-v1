@@ -1,0 +1,722 @@
+//! Manifests applied to byte images of both worlds: the target's bytes
+//! after the mappings, conversions, copies and fills equal what the
+//! target holds when it loads its regions directly.
+
+use std::collections::BTreeMap;
+
+use super::*;
+
+/// The allocation granularity of these worlds: small, so that shards of a
+/// few kilobytes lie on chunk bounds as gigabyte shards do on devices.
+const GRANULE: u64 = 256;
+
+/// The element of logical tensor `tensor` at `index`, as the bytes every
+/// world holding it stores.
+fn element(tensor: &str, index: &[u64]) -> [u8; 4] {
+    let mut value: u32 = tensor
+        .bytes()
+        .fold(17, |hash, byte| hash.wrapping_mul(31) ^ u32::from(byte));
+    for coordinate in index {
+        value = value
+            .wrapping_mul(1_000_003)
+            .wrapping_add(*coordinate as u32 + 1);
+    }
+    value.to_le_bytes()
+}
+
+/// A row-major `u32` field holding the segments `segments` of a logical
+/// tensor of `shape`, at `offset`.
+fn field(
+    tensor: &str,
+    offset: u64,
+    shape: &[u64],
+    segments: Vec<Vec<Segment>>,
+    units: Vec<u64>,
+) -> Field {
+    let local: Vec<u64> = segments
+        .iter()
+        .map(|segments| {
+            segments
+                .iter()
+                .map(|segment| segment.local + segment.span.count)
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut strides = vec![1; local.len()];
+    for dim in (0..local.len().saturating_sub(1)).rev() {
+        strides[dim] = strides[dim + 1] * local[dim + 1];
+    }
+    Field {
+        tensor: tensor.into(),
+        source: "model".into(),
+        dtype: "uint32".into(),
+        element: 4,
+        offset,
+        shape: local,
+        strides,
+        logical: Logical {
+            shape: shape.to_vec(),
+            dims: (0..shape.len()).map(|dim| format!("d{dim}")).collect(),
+            units,
+            segments,
+        },
+        encoding: Encoding::Affine,
+    }
+}
+
+fn whole(extent: u64) -> Vec<Segment> {
+    vec![Segment {
+        span: Span::range(0, extent),
+        local: 0,
+    }]
+}
+
+fn part(start: u64, count: u64) -> Vec<Segment> {
+    vec![Segment {
+        span: Span::range(start, count),
+        local: 0,
+    }]
+}
+
+/// Lay fields out back to back in one storage each `per_storage` fields,
+/// aligning each storage's fields to 64 bytes.
+fn storage(mut fields: Vec<Field>) -> Storage {
+    let mut offset = 0;
+    for field in &mut fields {
+        field.offset = offset;
+        offset = (field.bytes().end).next_multiple_of(64);
+    }
+    let layout = StorageLayout {
+        bytes: offset,
+        fields,
+    };
+    Storage::chunked(layout, GRANULE, &[1, 2, 4], &|_| Some([3; 32])).unwrap()
+}
+
+/// What a rank of a small mixture-of-experts model holds under tensor
+/// parallelism `tp` (rank `t`) and expert parallelism `ep` (rank `e`):
+/// queries split by heads, an output projection split by columns, eight
+/// experts whose up and gate rows split by channels without expert
+/// parallelism, a padded vocabulary
+/// split by rows and a replicated norm.
+fn moe_rank(tp: u64, t: u64, ep: u64, e: u64) -> Vec<Storage> {
+    let (heads, head_dim, hidden) = (8, 4, 16);
+    let q_rows = heads * head_dim / tp;
+    let q = field(
+        "q",
+        0,
+        &[heads * head_dim, hidden],
+        vec![part(t * q_rows, q_rows), whole(hidden)],
+        vec![head_dim, 0],
+    );
+    let o_columns = heads * head_dim / tp;
+    let o = field(
+        "o",
+        0,
+        &[hidden, heads * head_dim],
+        vec![whole(hidden), part(t * o_columns, o_columns)],
+        vec![0, head_dim],
+    );
+    let (experts, intermediate) = (8, 8);
+    let local_experts = experts / ep;
+    // An expert layer is partitioned over one group at a time: its
+    // channels split over the tensor-parallel ranks without expert
+    // parallelism only.
+    let (channels, channel) = if ep > 1 { (1, 0) } else { (tp, t) };
+    let width = intermediate / channels;
+    let up_gate = field(
+        "up_gate",
+        0,
+        &[experts, 2 * intermediate, hidden],
+        vec![
+            part(e * local_experts, local_experts),
+            vec![
+                Segment {
+                    span: Span::range(channel * width, width),
+                    local: 0,
+                },
+                Segment {
+                    span: Span::range(intermediate + channel * width, width),
+                    local: width,
+                },
+            ],
+            whole(hidden),
+        ],
+        vec![1, 1, 0],
+    );
+    let down = field(
+        "down",
+        0,
+        &[experts, hidden, intermediate],
+        vec![
+            part(e * local_experts, local_experts),
+            whole(hidden),
+            part(channel * width, width),
+        ],
+        vec![1, 0, 1],
+    );
+    // 50 tokens padded to 52 rows: the last shard ends in padding.
+    let vocabulary: u64 = 50;
+    let rows = 52 / tp;
+    let held = rows.min(vocabulary.saturating_sub(t * rows));
+    let mut embedding = field(
+        "embedding",
+        0,
+        &[vocabulary, hidden],
+        vec![part(t * rows, held), whole(hidden)],
+        vec![1, 0],
+    );
+    embedding.shape[0] = rows;
+    embedding.strides = vec![hidden, 1];
+    let norm = field("norm", 0, &[hidden], vec![whole(hidden)], vec![0]);
+    vec![
+        storage(vec![q]),
+        storage(vec![o]),
+        storage(vec![up_gate]),
+        storage(vec![down]),
+        storage(vec![embedding]),
+        storage(vec![norm]),
+    ]
+}
+
+fn gpu(index: usize) -> String {
+    format!("host/GPU-{index}")
+}
+
+fn links(gpus: usize) -> Vec<Link> {
+    let mut links = Vec::new();
+    for source in 0..gpus {
+        for target in 0..gpus {
+            links.push(Link {
+                source: gpu(source),
+                target: gpu(target),
+                // A copy within a GPU is faster than one between GPUs.
+                bytes_per_second: if source == target { 4e12 } else { 4e11 },
+            });
+        }
+    }
+    links
+}
+
+/// The canonical bytes of an encoded field stored as this test's encoding:
+/// elements in reverse order, each byte inverted.
+fn encode(canonical: &[u8]) -> Vec<u8> {
+    canonical
+        .chunks(4)
+        .rev()
+        .flat_map(|element| element.iter().map(|byte| !byte))
+        .collect()
+}
+
+fn decode(stored: &[u8]) -> Vec<u8> {
+    encode(stored)
+}
+
+/// The bytes of a field as loading writes them: each held element its
+/// logical value, padding zero.
+fn field_image(field: &Field, canonical: bool) -> Vec<u8> {
+    let (shape, strides, logical) = match (&field.encoding, canonical) {
+        (
+            Encoding::Encoded {
+                canonical: Some(canonical),
+                ..
+            },
+            true,
+        ) => (&canonical.shape, &canonical.strides, &canonical.logical),
+        _ => (&field.shape, &field.strides, &field.logical),
+    };
+    let numel: u64 = shape.iter().product();
+    // The bytes from the first element to the last, gaps between rows of
+    // a view included (their contents are no field's, left zero).
+    let extent = shape
+        .iter()
+        .zip(strides)
+        .map(|(size, stride)| size.saturating_sub(1) * stride)
+        .sum::<u64>()
+        + 1;
+    let mut bytes = vec![0; (extent * field.element) as usize];
+    let mut index = vec![0_u64; shape.len()];
+    for _ in 0..numel {
+        let held: Option<Vec<u64>> = index
+            .iter()
+            .enumerate()
+            .map(|(dim, local)| {
+                logical.segments[dim].iter().find_map(|segment| {
+                    segment
+                        .locals()
+                        .contains(local)
+                        .then(|| segment.span.index(local - segment.local))
+                })
+            })
+            .collect();
+        if let Some(logical_index) = held {
+            let at = index.iter().zip(strides).map(|(i, s)| i * s).sum::<u64>() as usize * 4;
+            bytes[at..at + 4].copy_from_slice(&element(&field.tensor, &logical_index));
+        }
+        for dim in (0..index.len()).rev() {
+            index[dim] += 1;
+            if index[dim] < shape[dim] {
+                break;
+            }
+            index[dim] = 0;
+        }
+    }
+    if matches!(field.encoding, Encoding::Encoded { .. }) && !canonical {
+        return encode(&field_image(field, true));
+    }
+    bytes
+}
+
+/// A world's storages as loading writes them.
+fn image(world: &World) -> Vec<Vec<Vec<u8>>> {
+    world
+        .ranks
+        .iter()
+        .map(|rank| {
+            rank.storages
+                .iter()
+                .map(|storage| {
+                    let mut bytes = vec![0xAB; storage.layout.padded(GRANULE) as usize];
+                    for field in &storage.layout.fields {
+                        let range = field.bytes();
+                        bytes[range.start as usize..range.end as usize]
+                            .copy_from_slice(&field_image(field, false));
+                    }
+                    bytes
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The target world's storages after executing `manifest` on the source
+/// world's bytes, starting from garbage.
+fn apply(request: &Request, manifest: &Manifest) -> Vec<Vec<Vec<u8>>> {
+    let source = image(&request.source);
+    let mut target: Vec<Vec<Vec<u8>>> = request
+        .target
+        .ranks
+        .iter()
+        .map(|rank| {
+            rank.storages
+                .iter()
+                .map(|storage| vec![0xCD; storage.layout.padded(GRANULE) as usize])
+                .collect()
+        })
+        .collect();
+    let mut stagings: Vec<Vec<u8>> = manifest
+        .stagings
+        .iter()
+        .map(|staging| vec![0xEF; staging.bytes as usize])
+        .collect();
+    for mapping in &manifest.mappings {
+        let from = &request.source.ranks[mapping.source_rank as usize].storages
+            [mapping.source_storage as usize];
+        let chunk = &from.chunks[mapping.source_chunk as usize];
+        let into = &request.target.ranks[mapping.rank as usize].storages[mapping.storage as usize]
+            .chunks[mapping.chunk as usize];
+        assert_eq!(chunk.key, into.key);
+        let bytes = source[mapping.source_rank as usize][mapping.source_storage as usize]
+            [chunk.offset as usize..(chunk.offset + chunk.length) as usize]
+            .to_vec();
+        target[mapping.rank as usize][mapping.storage as usize]
+            [into.offset as usize..(into.offset + into.length) as usize]
+            .copy_from_slice(&bytes);
+    }
+    let fields_of = |world: &World, rank: u32, conversion: &Conversion| -> Vec<(u32, Field)> {
+        conversion
+            .fields
+            .iter()
+            .map(|(storage, tensor)| {
+                let field = world.ranks[rank as usize].storages[*storage as usize]
+                    .layout
+                    .fields
+                    .iter()
+                    .find(|field| field.tensor == *tensor)
+                    .unwrap()
+                    .clone();
+                (*storage, field)
+            })
+            .collect()
+    };
+    for conversion in &manifest.encodes {
+        let staging = &manifest.stagings[conversion.staging as usize];
+        for (storage, field) in fields_of(&request.source, staging.rank, conversion) {
+            let range = field.bytes();
+            let stored = &source[staging.rank as usize][storage as usize]
+                [range.start as usize..range.end as usize];
+            let Encoding::Encoded {
+                canonical: Some(canonical),
+                ..
+            } = &field.encoding
+            else {
+                panic!("an encode converts encoded fields");
+            };
+            let canonical_bytes = decode(stored);
+            let at = canonical.offset as usize;
+            stagings[conversion.staging as usize][at..at + canonical_bytes.len()]
+                .copy_from_slice(&canonical_bytes);
+        }
+    }
+    for copy in &manifest.copies {
+        for row in 0..copy.rows {
+            let from = copy.source.offset + row * copy.source_pitch;
+            let bytes = match copy.source.space {
+                Space::Storage { storage } => source[copy.source.rank as usize][storage as usize]
+                    [from as usize..(from + copy.length) as usize]
+                    .to_vec(),
+                Space::Staging { staging } => stagings[staging as usize]
+                    [from as usize..(from + copy.length) as usize]
+                    .to_vec(),
+            };
+            let to = (copy.target.offset + row * copy.target_pitch) as usize;
+            match copy.target.space {
+                Space::Storage { storage } => target[copy.target.rank as usize][storage as usize]
+                    [to..to + bytes.len()]
+                    .copy_from_slice(&bytes),
+                Space::Staging { staging } => {
+                    stagings[staging as usize][to..to + bytes.len()].copy_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    for conversion in &manifest.decodes {
+        let staging = &manifest.stagings[conversion.staging as usize];
+        for (storage, field) in fields_of(&request.target, staging.rank, conversion) {
+            let Encoding::Encoded {
+                canonical: Some(canonical),
+                ..
+            } = &field.encoding
+            else {
+                panic!("a decode converts encoded fields");
+            };
+            let length = (canonical.shape.iter().product::<u64>() * field.element) as usize;
+            let at = canonical.offset as usize;
+            let stored = encode(&stagings[conversion.staging as usize][at..at + length]);
+            let range = field.bytes();
+            target[staging.rank as usize][storage as usize]
+                [range.start as usize..range.end as usize]
+                .copy_from_slice(&stored);
+        }
+    }
+    for fill in &manifest.fills {
+        for row in 0..fill.rows {
+            let at = (fill.offset + row * fill.pitch) as usize;
+            target[fill.rank as usize][fill.storage as usize][at..at + fill.length as usize]
+                .fill(0);
+        }
+    }
+    target
+}
+
+/// Assert that every target field holds the bytes loading would write.
+fn assert_fields_equal(request: &Request, applied: &[Vec<Vec<u8>>]) {
+    let expected = image(&request.target);
+    for (rank, storages) in request.target.ranks.iter().enumerate() {
+        for (storage, held) in storages.storages.iter().enumerate() {
+            for field in &held.layout.fields {
+                // Every element of the field; the gaps of a view are no
+                // field's bytes.
+                let mut index = vec![0_u64; field.shape.len()];
+                for _ in 0..field.numel() {
+                    let at = field.address(&index) as usize;
+                    let range = at..at + field.element as usize;
+                    assert!(
+                        applied[rank][storage][range.clone()] == expected[rank][storage][range],
+                        "rank {rank} field {} differs at {index:?}",
+                        field.tensor
+                    );
+                    for dim in (0..index.len()).rev() {
+                        index[dim] += 1;
+                        if index[dim] < field.shape[dim] {
+                            break;
+                        }
+                        index[dim] = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn world(ranks: Vec<(Option<String>, Vec<Storage>)>) -> World {
+    World {
+        ranks: ranks
+            .into_iter()
+            .map(|(gpu, storages)| Rank { gpu, storages })
+            .collect(),
+    }
+}
+
+#[test]
+fn tensor_parallel_replicas_become_expert_parallel_ranks() {
+    // Two replicas of tensor parallelism 2 on GPUs 0..4, then each GPU a
+    // data-parallel rank of the four-way expert partition.
+    let source = world(
+        (0..4)
+            .map(|index| (Some(gpu(index)), moe_rank(2, index as u64 % 2, 1, 0)))
+            .collect(),
+    );
+    let target = world((0..4).map(|rank| (None, moe_rank(1, 0, 4, rank))).collect());
+    let request = Request {
+        source,
+        target,
+        gpus: (0..4).map(gpu).collect(),
+        links: links(4),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert!(manifest.missing.is_empty());
+    assert!(manifest.verify(&manifest.digest));
+    assert_fields_equal(&request, &apply(&request, &manifest));
+    // The query rows and the norm each target finds on its GPU are mapped.
+    let mapped: BTreeMap<u32, u64> =
+        manifest
+            .mappings
+            .iter()
+            .fold(BTreeMap::new(), |mut sum, mapping| {
+                let chunk = &request.target.ranks[mapping.rank as usize].storages
+                    [mapping.storage as usize]
+                    .chunks[mapping.chunk as usize];
+                *sum.entry(mapping.rank).or_default() += chunk.length;
+                sum
+            });
+    assert_eq!(mapped.len(), 4);
+    // Every task stays inside its regions and moves the copies' bytes.
+    let tasks: Vec<CopyTask> = manifest.tasks(&request, 1).collect::<Result<_>>().unwrap();
+    assert_eq!(
+        tasks.iter().map(|task| task.length).sum::<u64>(),
+        manifest.copied_bytes()
+    );
+}
+
+#[test]
+fn ranks_take_the_gpus_that_hold_their_experts() {
+    // Two expert-parallel ranks on GPUs 0 and 1, then four ranks with
+    // tensor-parallel attention and four-way experts on GPUs 0..4: the
+    // ranks whose experts GPUs 0 and 1 hold take them.
+    let source = world(vec![
+        (Some(gpu(0)), moe_rank(1, 0, 2, 0)),
+        (Some(gpu(1)), moe_rank(1, 0, 2, 1)),
+    ]);
+    let target = world(
+        (0..4)
+            .map(|rank| (None, moe_rank(4, rank, 4, rank)))
+            .collect(),
+    );
+    let request = Request {
+        source,
+        target,
+        gpus: (0..4).map(gpu).collect(),
+        links: links(4),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert!(manifest.missing.is_empty());
+    assert_fields_equal(&request, &apply(&request, &manifest));
+    let holder = |rank: usize| manifest.gpus[rank].clone();
+    assert!(
+        [holder(0), holder(1)].contains(&gpu(0)) && [holder(2), holder(3)].contains(&gpu(1)),
+        "{:?}",
+        manifest.gpus
+    );
+    // Each kept GPU maps its rank's experts instead of copying them.
+    for rank in 0..4 {
+        let on_kept_gpu = [gpu(0), gpu(1)].contains(&holder(rank));
+        let experts_mapped = manifest
+            .mappings
+            .iter()
+            .any(|mapping| mapping.rank == rank as u32 && mapping.storage == 2);
+        assert_eq!(experts_mapped, on_kept_gpu, "rank {rank}");
+    }
+}
+
+#[test]
+fn planning_is_cached_and_digests_cover_the_directions() {
+    let source = world(vec![(Some(gpu(0)), moe_rank(1, 0, 1, 0))]);
+    let target = world(vec![
+        (None, moe_rank(2, 0, 1, 0)),
+        (None, moe_rank(2, 1, 1, 0)),
+    ]);
+    let request = Request {
+        source,
+        target,
+        gpus: (0..2).map(gpu).collect(),
+        links: links(2),
+    };
+    let mut planner = Planner::default();
+    let first = planner.manifest(&request).unwrap();
+    let second = planner.manifest(&request).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    let mut altered = (*first).clone();
+    altered.copies[0].length += 4;
+    assert!(!altered.verify(&first.digest));
+    assert_fields_equal(&request, &apply(&request, &first));
+}
+
+/// A `u32` field of `tokens` positions of 8 channels holding `segments`.
+fn tokens(tensor: &str, total: u64, segments: Vec<Segment>) -> Field {
+    field(tensor, 0, &[total, 8], vec![segments, whole(8)], vec![1, 0])
+}
+
+#[test]
+fn position_mod_n_and_strided_indices_redistribute() {
+    // 32 positions split contiguously over two ranks become position-mod-2
+    // shares, and a compressed index of one entry per 4 positions, split
+    // contiguously, lies with the positions its entries stand for.
+    let contiguous = |rank: u64| {
+        vec![
+            storage(vec![tokens("kv", 32, part(16 * rank, 16))]),
+            storage(vec![tokens("index", 8, part(4 * rank, 4))]),
+        ]
+    };
+    let cyclic = |rank: u64| {
+        vec![
+            storage(vec![tokens(
+                "kv",
+                32,
+                vec![Segment {
+                    span: Span {
+                        start: rank,
+                        count: 16,
+                        step: 2,
+                    },
+                    local: 0,
+                }],
+            )]),
+            // Entry j stands for position 4j + 1, which lies on rank
+            // (4j + 1) mod 2 = 1: rank 0 holds no entry.
+            storage(vec![tokens(
+                "index",
+                8,
+                if rank == 1 { part(0, 8) } else { Vec::new() },
+            )]),
+        ]
+    };
+    let mut target_ranks = Vec::new();
+    for rank in 0..2 {
+        let mut storages = cyclic(rank);
+        if storages[1].layout.fields[0].logical.segments[0].is_empty() {
+            storages.pop();
+        }
+        target_ranks.push((None, storages));
+    }
+    let request = Request {
+        source: world(vec![
+            (Some(gpu(0)), contiguous(0)),
+            (Some(gpu(1)), contiguous(1)),
+        ]),
+        target: world(target_ranks),
+        gpus: (0..2).map(gpu).collect(),
+        links: links(2),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert!(manifest.missing.is_empty());
+    assert_fields_equal(&request, &apply(&request, &manifest));
+}
+
+/// The columns `first..first + count` of a `[rows, columns]` matrix as a
+/// view of the whole matrix's storage: rows `columns` elements apart, the
+/// other columns between them.
+fn column_view(rows: u64, columns: u64, first: u64, count: u64) -> Storage {
+    let mut view = field(
+        "o",
+        0,
+        &[rows, columns],
+        vec![whole(rows), part(first, count)],
+        vec![0, 1],
+    );
+    view.offset = first * view.element;
+    view.strides = vec![columns, 1];
+    let layout = StorageLayout {
+        bytes: rows * columns * view.element,
+        fields: vec![view],
+    };
+    Storage::chunked(layout, GRANULE, &[1, 2, 4], &|_| Some([3; 32])).unwrap()
+}
+
+#[test]
+fn column_views_with_gaps_between_rows_redistribute() {
+    // Quarters of a matrix's columns, each a view into a storage of the
+    // whole matrix, become halves; the gaps are no field's bytes.
+    let request = Request {
+        source: world(
+            (0..4)
+                .map(|rank| {
+                    (
+                        Some(gpu(rank as usize)),
+                        vec![column_view(64, 32, 8 * rank, 8)],
+                    )
+                })
+                .collect(),
+        ),
+        target: world(
+            (0..2)
+                .map(|rank| (None, vec![column_view(64, 32, 16 * rank, 16)]))
+                .collect(),
+        ),
+        gpus: (0..4).map(gpu).collect(),
+        links: links(4),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert!(manifest.missing.is_empty());
+    assert_fields_equal(&request, &apply(&request, &manifest));
+}
+
+/// A field stored in this test's encoding, whose canonical form is the
+/// affine field itself at offset zero of its group's staging space.
+fn encoded(mut field: Field, group: &str) -> Field {
+    field.encoding = Encoding::Encoded {
+        name: "reversed".into(),
+        group: group.into(),
+        canonical: Some(Canonical {
+            offset: 0,
+            shape: field.shape.clone(),
+            strides: field.strides.clone(),
+            logical: field.logical.clone(),
+        }),
+    };
+    field
+}
+
+#[test]
+fn encoded_fields_move_in_canonical_form() {
+    // An encoded matrix split by rows over two ranks becomes the whole
+    // matrix: each source converts to canonical, the target converts back.
+    let rows = |start: u64, count: u64| {
+        encoded(
+            field(
+                "scales",
+                0,
+                &[64, 16],
+                vec![part(start, count), whole(16)],
+                vec![1, 0],
+            ),
+            "scales",
+        )
+    };
+    let request = Request {
+        source: world(vec![
+            (Some(gpu(0)), vec![storage(vec![rows(0, 32)])]),
+            (Some(gpu(1)), vec![storage(vec![rows(32, 32)])]),
+        ]),
+        target: world(vec![(None, vec![storage(vec![rows(0, 64)])])]),
+        gpus: vec![gpu(0)],
+        links: links(2),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert_eq!(manifest.encodes.len(), 2);
+    assert_eq!(manifest.decodes.len(), 1);
+    assert!(manifest.mappings.is_empty());
+    assert_fields_equal(&request, &apply(&request, &manifest));
+
+    // The same encoded region on another GPU moves as it is stored.
+    let request = Request {
+        source: world(vec![(Some(gpu(1)), vec![storage(vec![rows(0, 64)])])]),
+        target: world(vec![(None, vec![storage(vec![rows(0, 64)])])]),
+        gpus: vec![gpu(0)],
+        links: links(2),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert!(manifest.encodes.is_empty() && manifest.decodes.is_empty());
+    assert_fields_equal(&request, &apply(&request, &manifest));
+}

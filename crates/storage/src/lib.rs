@@ -23,6 +23,7 @@
 
 pub mod client;
 pub mod connector;
+pub mod manifest;
 pub mod protocol;
 pub mod socket;
 pub mod transport;
