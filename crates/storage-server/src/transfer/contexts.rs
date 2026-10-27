@@ -41,7 +41,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::Instant;
 
-use cuda::{DeviceAttribute, DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
+use cuda::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
 
 use super::memory::{HostMap, Mapped};
 
@@ -410,16 +410,11 @@ impl Session {
                 let length = mapped.length()?;
                 let map = HostMap::new(mapped.descriptor(), length, mapped.writable())
                     .map_err(|error| format!("mapping host memory: {error}"))?;
-                let reads_alone = !mapped.writable()
-                    && self
-                        .device
-                        .attribute(DeviceAttribute::ReadOnlyHostRegisterSupported)
-                        .is_ok_and(|supported| supported != 0);
                 let pointer = map.address() as *mut u8;
                 // SAFETY: `map` maps the whole range and is kept beside the
                 // registration, which is undone first.
                 let registered = unsafe {
-                    if reads_alone {
+                    if !mapped.writable() {
                         HostRegistration::read_only(self.device, pointer, length)
                     } else {
                         HostRegistration::new(self.device, pointer, length)
