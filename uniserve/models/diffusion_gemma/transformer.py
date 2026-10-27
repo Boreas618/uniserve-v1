@@ -43,6 +43,8 @@ class Attention(nn.Module):
     rotation turns only the leading fraction of the channel pairs.
     """
 
+    function = "models.diffusion_gemma.transformer.Attention/1"
+
     def __init__(self, config: TextConfig, layer: LayerAttention, index: int):
         super().__init__()
         self.head_dim = layer.head_dim
@@ -155,6 +157,8 @@ class Router(nn.Module):
     Returns int32 expert ids and FP32 weights, both ``[tokens, top_k]``.
     """
 
+    function = "models.diffusion_gemma.transformer.Router/1"
+
     def __init__(self, config: TextConfig):
         super().__init__()
         size = config.hidden_size
@@ -186,6 +190,8 @@ class MoE(nn.Module):
     all three in its sandwich normalizations. Every expert is a tanh-GELU
     gated MLP.
     """
+
+    function = "models.diffusion_gemma.transformer.MoE/1"
 
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -227,6 +233,8 @@ class Layer(PhasedLayer):
     evaluates the rest token by token, starting with the first sandwich
     normalization.
     """
+
+    function = "models.diffusion_gemma.transformer.Layer/1"
 
     def __init__(self, config: TextConfig, index: int):
         super().__init__()
@@ -318,6 +326,8 @@ class Backbone(TransformerDecoder):
     its resident layers, so parameter paths stay aligned with checkpoint
     names.
     """
+
+    function = "models.diffusion_gemma.transformer.Backbone/1"
 
     def __init__(self, config: TextConfig):
         super().__init__(

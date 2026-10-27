@@ -1654,6 +1654,7 @@ mod tests {
             held_segments: 0,
             inherited_start: 0,
             inherited_units: 0,
+            identity: String::new(),
             request_states: false,
         }
     }

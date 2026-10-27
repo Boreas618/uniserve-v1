@@ -45,6 +45,8 @@ class Dense(nn.Module):
     shard of the whole sequence and back.
     """
 
+    function = "models.minimax_h3.attention.Dense/1"
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.head_dim = config.head_dim
@@ -125,6 +127,8 @@ class Sparse(nn.Module):
     normalization and rotation round after every operation, as the released
     network evaluates them.
     """
+
+    function = "models.minimax_h3.attention.Sparse/1"
 
     def __init__(self, config: TransformerConfig):
         super().__init__()

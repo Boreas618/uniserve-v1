@@ -6,10 +6,7 @@ the manifest and the server's records (``Retained``). The test plays the
 worker's part with one CUDA byte tensor as the retained memory.
 """
 
-import json
-import sys
 import time
-import types
 from pathlib import Path
 
 import pytest
@@ -232,65 +229,3 @@ def test_a_hugging_face_cache_file_is_its_blob(tmp_path):
     # A file named otherwise in a directory named so is any other file.
     (blobs / "notes.txt").write_text("x")
     assert not retained._identity(blobs / "notes.txt").startswith("blob:")
-
-
-def _numerical_package(tmp_path, monkeypatch):
-    """Make a numerical package of two modules and a kernel source.
-
-    The process has loaded the first module alone.
-    """
-    from uniserve.loading import retained
-
-    root = tmp_path / "numerics"
-    root.mkdir()
-    (root / "loaded.py").write_text("SCALE = 1\n")
-    (root / "unloaded.py").write_text("SCALE = 2\n")
-    (root / "kernel.cu").write_text("// kernel\n")
-    monkeypatch.setattr(retained, "_PACKAGES", ("numerics",))
-    monkeypatch.setattr(
-        retained,
-        "_root",
-        lambda package: root if package == "numerics" else None,
-    )
-    module = types.ModuleType("numerics.loaded")
-    module.__file__ = str(root / "loaded.py")
-    monkeypatch.setitem(sys.modules, "numerics.loaded", module)
-    retained._beside_modules.cache_clear()
-    monkeypatch.setattr(retained.plugins, "versions", lambda: [])
-    return root
-
-
-def test_the_loaded_numerics_cover_the_modules_the_process_loaded(
-    tmp_path, monkeypatch
-):
-    from uniserve.loading import retained
-
-    root = _numerical_package(tmp_path, monkeypatch)
-    before = retained.loaded_numerics()
-    # A module the process never loaded computed nothing.
-    (root / "unloaded.py").write_text("SCALE = 3\n")
-    assert retained.loaded_numerics() == before
-    # A loaded module's change, or a kernel source's, does change it.
-    (root / "loaded.py").write_text("SCALE = 4\n")
-    changed = retained.loaded_numerics()
-    assert changed != before
-    (root / "kernel.cu").write_text("// another kernel\n")
-    retained._beside_modules.cache_clear()
-    assert retained.loaded_numerics() != changed
-
-
-def test_weights_bind_only_while_the_modules_that_loaded_them_are_unchanged(
-    tmp_path, monkeypatch
-):
-    from uniserve.loading import retained
-
-    root = _numerical_package(tmp_path, monkeypatch)
-    manifest = json.dumps({"modules": retained.module_digests()})
-    assert set(json.loads(manifest)["modules"]) == {"numerics/loaded.py"}
-    assert retained.modules_current(manifest)
-    (root / "unloaded.py").write_text("SCALE = 3\n")
-    assert retained.modules_current(manifest)
-    (root / "loaded.py").write_text("SCALE = 4\n")
-    assert not retained.modules_current(manifest)
-    # A manifest that records no modules binds nothing.
-    assert not retained.modules_current(json.dumps({"tensors": []}))

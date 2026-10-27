@@ -937,15 +937,23 @@ impl SchedulerHandle {
 
     /// Promotes the scheduler, whose world succeeds another: its workers
     /// adopt the predecessor's cache flags of the units they inherit, and
-    /// its pool imports `index`, the predecessor's published pages, from
-    /// which requests reuse their prefixes. Blocks until it is done.
+    /// its pool imports the predecessor's published pages, from which
+    /// requests reuse their prefixes. Blocks until it is done.
     ///
     /// # Errors
     ///
-    /// Fails when a worker refuses or dies, or the scheduler has stopped.
-    pub fn promote(&self, index: Vec<crate::kv_cache::IndexedPage>) -> anyhow::Result<()> {
+    /// Fails when the world's own cache, grown into the predecessor's memory
+    /// freed at once when it `grows`, cannot hold the requests the
+    /// predecessor hands over (which `recompute` from their tokens or not),
+    /// a worker refuses or dies, or the scheduler has stopped.
+    pub fn promote(
+        &self,
+        parked: crate::scheduler::ParkedCache,
+        recompute: bool,
+        grows: bool,
+    ) -> anyhow::Result<()> {
         self.commands
-            .promote(index)
+            .promote(parked, recompute, grows)
             .recv()
             .map_err(|_| anyhow::anyhow!("the scheduler stopped while it promoted"))?
             .map_err(|error| anyhow::anyhow!(error))
@@ -1047,10 +1055,11 @@ impl SchedulerHandle {
     /// migratable, a queued one at once, a running one once its calls in
     /// flight drain, after every token it generated; the other requests
     /// finish; then it executes nothing more until resumed. The receiver
-    /// gets its prefix cache index once it parked.
+    /// gets its prefix cache index and what its migrating requests held
+    /// once it parked.
     pub fn park(
         &self,
-    ) -> crossbeam_channel::Receiver<Result<Vec<crate::kv_cache::IndexedPage>, String>> {
+    ) -> crossbeam_channel::Receiver<Result<crate::scheduler::ParkedCache, String>> {
         self.commands.park()
     }
 

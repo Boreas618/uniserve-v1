@@ -109,6 +109,8 @@ class SelfConditioning(nn.Module):
     evaluates that case as ``post_norm(embeddings)``.
     """
 
+    function = "models.diffusion_lm.SelfConditioning/1"
+
     def __init__(
         self, pre_norm: nn.Module, mlp: nn.Module, post_norm: nn.Module
     ) -> None:
@@ -140,6 +142,8 @@ class DiffusionLM(nn.Module):
     Concrete models supply only the ``SelfConditioning`` modules, the head's
     mathematics and the canvas tokens.
     """
+
+    function = "models.diffusion_lm.DiffusionLM/1"
 
     # Pipeline binding drops the head outside the last stage.
     lm_head: nn.Module | None

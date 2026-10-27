@@ -100,6 +100,8 @@ class Config:
 class Encoder(nn.Module):
     """Compress NCHW pixels to concatenated posterior mean/log-variance."""
 
+    function = "models.bagel.vae.Encoder/1"
+
     def __init__(self, config: Config):
         super().__init__()
         channels = config.base_channels
@@ -138,6 +140,8 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     """Reconstruct NCHW pixels from unnormalized spatial latents."""
+
+    function = "models.bagel.vae.Decoder/1"
 
     def __init__(self, config: Config):
         super().__init__()
@@ -179,6 +183,8 @@ class Decoder(nn.Module):
 # VAE.
 class Model(nn.Module):
     """Encode normalized posterior samples and decode their inverse transform."""  # noqa: E501
+
+    function = "models.bagel.vae.Model/1"
 
     def __init__(self, config: Config):
         super().__init__()

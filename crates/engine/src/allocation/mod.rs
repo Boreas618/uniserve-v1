@@ -208,6 +208,7 @@ impl PrefixCacheManager {
                     .map(GroupShape::from_group)
                     .collect(),
             );
+            coordinator.set_seed(crate::kv_cache::prefix_seed(&prefix_cache.identity));
             let reusable = !prefix_cache.request_states;
             coordinator.set_prefix_enabled(reusable);
             PrefixCacheManager {

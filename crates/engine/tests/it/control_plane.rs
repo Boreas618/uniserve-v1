@@ -1996,6 +1996,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
             read,
             write,
             isolation_key: Some(isolation_key),
+            state_seed: None,
         };
         let mut events = handle.submit(request).expect("submit cache request");
         let deadline = Instant::now() + Duration::from_secs(10);

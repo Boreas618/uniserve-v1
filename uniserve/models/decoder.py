@@ -22,6 +22,8 @@ class ImageDecoder(nn.Module):
     While preserving the caller's sample order.
     """
 
+    function = "models.decoder.ImageDecoder/1"
+
     def __init__(self, decoder: PatchAutoencoder | RGBDecoder):
         super().__init__()
         self.decoder = decoder
@@ -79,6 +81,8 @@ class VideoDecoder(nn.Module):
     rather than per video size, and unpacks each clip outside them. Decoder
     inputs and scratch remain borrowed.
     """
+
+    function = "models.decoder.VideoDecoder/1"
 
     def __init__(self, decoder: LatentDecoder):
         super().__init__()
@@ -223,6 +227,8 @@ class AudioDecoder(nn.Module):
     so a unit's result depends on no sample outside the context it was given.
     """
 
+    function = "models.decoder.AudioDecoder/1"
+
     def __init__(self, decoder: LatentDecoder, *, sample_rate: int):
         super().__init__()
         if type(sample_rate) is not int or sample_rate < 1:
@@ -363,6 +369,8 @@ class VideoPostprocessor(nn.Module):
     reconstruction. A video's size is its frame count and raster
     (``uniserve.media.video.Config``).
     """
+
+    function = "models.decoder.VideoPostprocessor/1"
 
     overlap_weights: torch.Tensor
 

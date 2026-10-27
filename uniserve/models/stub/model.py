@@ -61,6 +61,8 @@ _HIDDEN_SIZE = 4
 class _Embedding(nn.Module):
     """Represent token IDs exactly using three base-128 BF16 digits."""
 
+    function = "models.stub.model._Embedding/1"
+
     # ``TransformerDecoder`` reads these as its hidden and vocabulary sizes.
     embedding_dim = _HIDDEN_SIZE
     num_embeddings = _VOCAB_SIZE
@@ -99,6 +101,8 @@ class _Embedding(nn.Module):
 
 class _Head(nn.Module):
     """Project the fixed multimodal successor cycle from numerical features."""
+
+    function = "models.stub.model._Head/1"
 
     def __init__(self):
         super().__init__()
@@ -162,6 +166,8 @@ class _Counter(nn.Module):
     or a prefix was reused that its slot never counted.
     """
 
+    function = "models.stub.model._Counter/1"
+
     def __init__(self, cache_name: str):
         super().__init__()
         self.cache_name = cache_name
@@ -199,6 +205,8 @@ class _Counter(nn.Module):
 class _Layer(nn.Module):
     """Preserve features while publishing zero scalar K/V at supplied indices."""  # noqa: E501
 
+    function = "models.stub.model._Layer/1"
+
     def __init__(self, request_state: bool = False):
         super().__init__()
 
@@ -233,6 +241,8 @@ class _Layer(nn.Module):
 class _Vision(nn.Module):
     """Reduce each patch to its pixel mean, broadcast to the hidden width."""
 
+    function = "models.stub.model._Vision/1"
+
     def __init__(self, patch_size: int):
         super().__init__()
         self.patch_size = patch_size
@@ -260,6 +270,8 @@ class _Scale(nn.Module):
     BF16.
     """
 
+    function = "models.stub.model._Scale/1"
+
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(
@@ -273,6 +285,8 @@ class _Scale(nn.Module):
 class _Moments(_Scale):
     """Emit (mean, zero log-variance) pairs for a deterministic latent."""
 
+    function = "models.stub.model._Moments/1"
+
     def forward(self, pixels):
         means = super().forward(pixels)
         return torch.cat((means, torch.zeros_like(means)), dim=1)
@@ -280,6 +294,8 @@ class _Moments(_Scale):
 
 class Model(CausalLM):
     """Compose deterministic text, vision, latent and image capabilities."""
+
+    function = "models.stub.model.Model/1"
 
     def __init__(self, config: Config = Config()):
         backbone = TransformerDecoder(

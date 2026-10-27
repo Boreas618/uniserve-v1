@@ -44,6 +44,8 @@ class Model(nn.Module):
     image input.
     """
 
+    function = "models.sensenova_u1.model.Model/1"
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config

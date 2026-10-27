@@ -36,6 +36,8 @@ from .config import TransformerConfig
 class TransformerLayer(MoTLayer):
     """Compose route-specific experts around three-axis token attention."""
 
+    function = "models.sensenova_u1.transformer.TransformerLayer/1"
+
     def __init__(self, config: TransformerConfig, index: int):
         hidden, dim, eps = (
             config.hidden_size,
@@ -154,6 +156,8 @@ class Transformer(MoTDecoder):
 
     Calls without explicit routes take the ``text`` route.
     """
+
+    function = "models.sensenova_u1.transformer.Transformer/1"
 
     def __init__(self, config: TransformerConfig):
         super().__init__(

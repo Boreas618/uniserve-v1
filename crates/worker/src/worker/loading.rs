@@ -176,13 +176,10 @@ fn quantization(launch: &WorkerLaunch) -> &str {
 impl LoadedModel {
     /// The digests of what determines this rank's loaded weights besides
     /// its placement and GPUs (`fingerprint`); `None` for the stub model,
-    /// whose weights are not retained. `numerics` is the digest of the code
-    /// the weights were loaded with ([`Fingerprints::numerics`]), `None`
-    /// before loading.
+    /// whose weights are not retained.
     pub(crate) fn fingerprint(
         description: &Description,
         launch: &WorkerLaunch,
-        numerics: Option<&str>,
     ) -> Result<Option<Fingerprints>> {
         let (modules, excluded) = selection(description, launch);
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
@@ -197,7 +194,6 @@ impl LoadedModel {
                 union.map(|union| text(&union.exchange)).unwrap_or_default(),
                 Any::from(union.map_or(0, |union| union.attention_ranks as i64)),
                 weights(launch),
-                numerics.map(text).unwrap_or_default(),
             ])?
             .try_into()
             .map_err(|error| Error::numerical("fingerprint", &error))?;

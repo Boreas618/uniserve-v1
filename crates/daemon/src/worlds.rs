@@ -487,6 +487,7 @@ impl Leader {
                 target_spec,
                 target_digest,
                 &update,
+                request.in_flight,
             )
             .await?;
         Ok(Applied::World(report))
@@ -508,6 +509,7 @@ impl Leader {
         mut spec: wire::EngineSpec,
         target_digest: String,
         update: &crate::options::UpdateOptions,
+        in_flight: InFlight,
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
         let previous_world = running.world();
@@ -574,7 +576,15 @@ impl Leader {
                 window,
             )
         });
+        // A successor computing other numerics than the serving world (its
+        // pages' prefix seed differs) reads none of its pages, but the
+        // requests in flight continue with the state they reached unless
+        // the change recomputes them.
+        let numerics_change = running.info().prefix_seed != successor.info().prefix_seed;
         let hold = Arc::clone(self.migrator.hold());
+        if numerics_change && in_flight == InFlight::Keep {
+            hold.keep(Some((previous_world, running.info().prefix_seed)));
+        }
         let paused = Instant::now();
         hold.hold();
         let index = match running.park().await {
@@ -582,18 +592,26 @@ impl Leader {
             Err(error) => {
                 // The serving world serves on: it resumes, and the successor
                 // closes with its memory.
+                hold.keep(None);
                 let _ = running.resume(vec![world]).await;
                 hold.serve(Arc::clone(running));
                 self.close(&successor).await;
+                self.restore_tail(running).await;
                 self.progress_done();
                 return Err(anyhow::anyhow!("the serving world did not park: {error}").into());
             }
         };
         let parked = paused.elapsed();
-        if let Err(error) = successor.promote(index).await {
+        // A previous world kept parked keeps its memory until the commit; one
+        // kept as its weights frees the rest as the successor serves.
+        let recompute = numerics_change && in_flight == InFlight::Recompute;
+        let grows = update.previous_world != PreviousWorld::Parked;
+        if let Err(error) = successor.promote(index, recompute, grows).await {
+            hold.keep(None);
             let _ = running.resume(vec![world]).await;
             hold.serve(Arc::clone(running));
             self.close(&successor).await;
+            self.restore_tail(running).await;
             self.progress_done();
             return Err(anyhow::anyhow!(
                 "the successor world was not promoted; the previous world resumed: {error}"
@@ -645,6 +663,8 @@ impl Leader {
             "park_seconds": parked.as_secs_f64(),
             "pause_seconds": pause.as_secs_f64(),
             "previous_world_kept": update.previous_world,
+            "numerics": if numerics_change { "changed" } else { "unchanged" },
+            "in_flight": if numerics_change { Some(in_flight) } else { None },
         });
         {
             let mut worlds = locked(&self.engines.worlds);
@@ -724,6 +744,9 @@ impl Leader {
             spec.predecessor = None;
             spec.segments = segments;
         }
+        // The requests that migrate from now on continue as any request
+        // does.
+        self.migrator.hold().keep(None);
         let report = serde_json::json!({
             "world": trial.world,
             "previous_world": trial.previous_world,
@@ -841,6 +864,14 @@ impl Leader {
     async fn close(&self, client: &Arc<EngineClient>) {
         close(client).await;
     }
+
+    /// Creates again the tail of the KV cache the serving world gave back for
+    /// a successor that did not take over, once the successor is closed.
+    async fn restore_tail(&self, running: &Arc<EngineClient>) {
+        if let Err(error) = running.resize_cache(wire::CacheChange::Restore).await {
+            warn!("the serving world did not create the tail of its KV cache again: {error}");
+        }
+    }
 }
 
 /// Shuts the engine `client` serves down and waits for its process.
@@ -870,6 +901,9 @@ pub(crate) async fn rollback(
         .ok_or_else(|| UpdateError::Refused("no world is on trial".to_owned()))?;
     warn!(world = trial.world, previous_world = trial.previous_world, %reason, "rolling back");
     let hold = Arc::clone(&engines.hold);
+    // The requests returning to the previous world recompute what the world
+    // on trial computed for them.
+    hold.keep(None);
     let paused = Instant::now();
     // The hold names no engine while it holds: the world on trial is taken
     // first.

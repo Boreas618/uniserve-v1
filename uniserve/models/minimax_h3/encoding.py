@@ -59,6 +59,8 @@ class VideoEncoder(BaseVideoEncoder):
     frame-major, then row-major 2x2 patches with channel-major features.
     """
 
+    function = "models.minimax_h3.encoding.VideoEncoder/1"
+
     pixel_mean: torch.Tensor
     pixel_std: torch.Tensor
 
@@ -216,6 +218,8 @@ class AudioEncoder(BaseAudioEncoder):
     right: ``[2 * frames, channels]``, the order of the denoiser's audio
     rows.
     """
+
+    function = "models.minimax_h3.encoding.AudioEncoder/1"
 
     def __init__(self, config: audio_vae.Config, *, sample_rate: int):
         channels = config.latent_channels

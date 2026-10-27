@@ -288,6 +288,8 @@ impl CachePlan {
             held_segments: 0,
             inherited_start: 0,
             inherited_units: 0,
+            // The worker reports its identity once it loaded the model.
+            identity: String::new(),
             request_states: !self.states.is_empty(),
         }
     }

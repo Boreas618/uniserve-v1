@@ -275,6 +275,8 @@ class SegmentAttention(nn.Module):
     declares their groups in ``communication_groups``.
     """
 
+    function = "nn.attention.vsa.segments.SegmentAttention/1"
+
     # Recorded by parallelize_ once the layer is bound to its partition.
     _parallel_mesh: DeviceMesh
     _attention_parallel: AttentionParallelConfig

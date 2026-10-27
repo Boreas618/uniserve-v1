@@ -95,6 +95,8 @@ class _Network(nn.Module):
     to one backbone token.
     """
 
+    function = "models.sensenova_u1.vision._Network/1"
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
@@ -130,6 +132,8 @@ class Encoder(_Network):
     ``[tokens, output_size]`` with each image's downsampled grid in raster
     order, images concatenated.
     """
+
+    function = "models.sensenova_u1.vision.Encoder/1"
 
     def forward(
         self,
@@ -285,6 +289,8 @@ class TokenEncoder(_Network):
     call, it reaches a tower placed on another device through the execution
     context's transfers.
     """
+
+    function = "models.sensenova_u1.vision.TokenEncoder/1"
 
     def forward(
         self, token_pixels: torch.Tensor, token_rc: torch.Tensor

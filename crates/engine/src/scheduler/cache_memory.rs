@@ -289,10 +289,23 @@ impl Scheduler {
         Ok(results)
     }
 
-    /// Gives the host KV cache each worker group's page key seeds that the
-    /// weight update `results` report (one per worker), which the ranks of a
-    /// group agree on.
+    /// Roots the prefix hash chains at the identity the weight update
+    /// `results` report (one per worker), and gives the host KV cache each
+    /// worker group's page key seeds they report, which the ranks of a group
+    /// agree on.
     fn reseed_pages(&mut self, results: &[String]) -> Result<(), String> {
+        let identity = results.iter().find_map(|result| {
+            serde_json::from_str::<serde_json::Value>(result)
+                .ok()?
+                .get("identity")?
+                .as_str()
+                .map(str::to_owned)
+        });
+        if let (Some(identity), Some(cache)) = (identity, self.storage.cache.as_mut()) {
+            cache
+                .coordinator
+                .set_seed(crate::kv_cache::prefix_seed(&identity));
+        }
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return Ok(());
         };

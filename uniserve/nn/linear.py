@@ -120,6 +120,8 @@ class Linear(nn.Module):
     without retaining an execution context.
     """
 
+    function = "nn.linear.Linear/1"
+
     # Recorded by parallelize_ once the layer is bound to its partition.
     _parallel_mesh: DeviceMesh
     _attention_parallel: AttentionParallelConfig
@@ -211,6 +213,8 @@ def _check_output(out, shape, dtype, device):
 class ColumnParallelLinear(Linear):
     """Project replicated channels into the local output-channel shard."""
 
+    function = "nn.linear.ColumnParallelLinear/1"
+
     # Input token axes this projection gathers. parallelize_ binds them when
     # interleaved branches project directly into Ulysses heads; otherwise
     # every sharded input token axis gathers.
@@ -271,6 +275,8 @@ class ColumnParallelLinear(Linear):
 
 class RowParallelLinear(Linear):
     """Sum local contraction shards, then add the replicated bias once."""
+
+    function = "nn.linear.RowParallelLinear/1"
 
     def __init__(
         self,
@@ -413,6 +419,8 @@ class ProjectionExchange:
 
 class MergedColumnParallelLinear(nn.Module):
     """Fuse named column projections while preserving each logical parameter."""
+
+    function = "nn.linear.MergedColumnParallelLinear/1"
 
     def __init__(
         self,
@@ -636,6 +644,8 @@ class QKVParallelLinear(MergedColumnParallelLinear):
     replication.
     """  # noqa: D205
 
+    function = "nn.linear.QKVParallelLinear/1"
+
     def __init__(
         self,
         in_features: int,
@@ -689,6 +699,8 @@ def _vocabulary(size: int, group: Communicator):
 
 class VocabParallelEmbedding(nn.Module):
     """Embed owned vocabulary IDs, masking padding before a numerical sum."""
+
+    function = "nn.linear.VocabParallelEmbedding/1"
 
     # Recorded by parallelize_ once the layer is bound to its partition.
     _parallel_mesh: DeviceMesh
@@ -750,6 +762,8 @@ class VocabParallelHead(ColumnParallelLinear):
     one pass over the projected logits on CUDA), and capped logits are FP32
     unless the caller asks for another ``output_dtype``.
     """  # noqa: D205
+
+    function = "nn.linear.VocabParallelHead/1"
 
     def __init__(
         self,

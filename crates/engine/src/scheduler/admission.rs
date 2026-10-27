@@ -18,6 +18,7 @@
 //! its route.
 
 use super::*;
+use crate::kv_cache::PrefixScope;
 use ipc::ForwardMode;
 
 /// One product a video request reserves: its declared name, the component
@@ -1264,11 +1265,14 @@ impl Scheduler {
                     .max(1);
                 let cached_tokens = prefix_hit.cached_tokens.min(n);
                 // The host KV cache may hold the reusable pages that follow
-                // the device match; the head waits for its pins.
+                // the device match; the head waits for its pins. A request
+                // continuing another world's state reads none: the host's
+                // pages are keyed by the world that serves.
                 let mut host_tokens = 0;
                 if let Some(kv_offload) = self.kv_offload.as_mut()
                     && let Some(step) = kv_offload.step(&target.0)
                     && head.req.cache.read
+                    && head.req.cache.state_seed.is_none()
                     && !head.has_context_images()
                 {
                     // Reusable pages leave one prompt token to compute, as
@@ -1375,7 +1379,7 @@ impl Scheduler {
                     &state.req.prompt_token_ids,
                     state.req.cache.read,
                     state.has_context_images(),
-                    state.req.cache.isolation_key,
+                    PrefixScope::of(&state.req.cache),
                     &info.endpoint,
                 );
                 ((worker.clone(), component.to_owned()), hit)
@@ -1603,7 +1607,7 @@ fn acquire_cached_prefix(
     let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images();
     let cache_read = state.req.cache.read;
-    let isolation_key = state.req.cache.isolation_key;
+    let scope = PrefixScope::of(&state.req.cache);
     let allocation = state
         .prefix_cache_mut()
         .ok_or("an admitted request holds its block tables")?;
@@ -1614,7 +1618,7 @@ fn acquire_cached_prefix(
             &prompt,
             cache_read,
             has_context_images,
-            isolation_key,
+            scope,
             source,
         )
         .ok_or("an admitted request's block tables cover every cache group")?;

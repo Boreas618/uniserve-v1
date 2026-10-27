@@ -108,8 +108,13 @@ impl Scheduler {
             Command::Resume(answer) => {
                 let _ = answer.send(self.resume());
             }
-            Command::Promote { index, answer } => {
-                let _ = answer.send(self.promote(&index));
+            Command::Promote {
+                cache,
+                recompute,
+                grows,
+                answer,
+            } => {
+                let _ = answer.send(self.promote(&cache, recompute, grows));
             }
             Command::Commit(answer) => {
                 let _ = answer.send(self.commit());

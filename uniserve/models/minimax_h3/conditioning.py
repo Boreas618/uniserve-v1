@@ -41,6 +41,8 @@ from .config import TransformerConfig
 class RefinerBlock(nn.Module):
     """Refine each document with dense attention and a pre-normalized SwiGLU."""
 
+    function = "models.minimax_h3.conditioning.RefinerBlock/1"
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.head_dim = config.head_dim
@@ -114,6 +116,8 @@ class RefinerBlock(nn.Module):
 class TokenRefiner(nn.Module):
     """Project Qwen features, refine their document, and normalize the result."""  # noqa: E501
 
+    function = "models.minimax_h3.conditioning.TokenRefiner/1"
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.input = Linear(config.text_dim, config.hidden_size)
@@ -170,6 +174,8 @@ class Conditioner(TextConditioner):
     ``TextConditioner`` owns homogeneous batching, the padding contract and
     the caller's sample order.
     """
+
+    function = "models.minimax_h3.conditioning.Conditioner/1"
 
     network: TokenRefiner
 

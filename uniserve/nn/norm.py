@@ -15,6 +15,8 @@ class RMSNorm(nn.Module):
     normalization primitive and multiplying by one leaves every value exact.
     """
 
+    function = "nn.norm.RMSNorm/1"
+
     def __init__(
         self,
         hidden_size: int,

@@ -52,6 +52,13 @@ pub struct PrefixCacheInfo {
     pub inherited_start: u32,
     #[serde(default)]
     pub inherited_units: u32,
+    /// The identity of the model the rank computes the pages with and of
+    /// what its forwards compute (the weights' fingerprint and
+    /// `uniserve.numerics.identity`), which roots the prefix hash chains of
+    /// its pages: the pages of a world whose identity differs are not this
+    /// world's. Empty for a rank that reports none.
+    #[serde(default)]
+    pub identity: String,
     /// Whether the rank also keeps cache layers per request slot (a cache
     /// layer type indexed by request, as a recurrent state): a page does not
     /// hold the state a request reached, so no prefix is reused and no page
@@ -285,6 +292,15 @@ impl PrefixCacheInfo {
             page_pools: Vec::new(),
             // A unit the warmup of any stage lends stays out of the pool.
             scratch_units: self.scratch_units.max(other.scratch_units),
+            // The stages compute the pages together: every stage's identity
+            // roots them.
+            identity: if self.identity == other.identity {
+                self.identity.clone()
+            } else {
+                let mut identities = [self.identity.as_str(), other.identity.as_str()];
+                identities.sort_unstable();
+                identities.join("+")
+            },
             // Stages whose planes split alike give memory back together;
             // planes split otherwise hold every unit and give back none.
             segments: if self.segments == other.segments {
@@ -808,6 +824,7 @@ impl Default for WorkerInfo {
                 inherited_start: 0,
                 inherited_units: 0,
                 request_states: false,
+                identity: String::new(),
             }),
             latent_page_units: 0,
             latent_pages: 0,

@@ -141,9 +141,9 @@ pub(crate) struct Worker {
     weights: Vec<Arc<Storage>>,
     /// Their keys; `None` for weights the worker does not retain.
     weight_keys: Option<WeightKeys>,
-    /// The digest of the code the worker loaded its weights with
-    /// ([`weights::Fingerprints::numerics`]).
-    weight_numerics: Option<String>,
+    /// The identity of what the loaded model's forwards compute
+    /// ([`weights::model_identity`]), which keys its cache pages.
+    identity: String,
     /// The launch the worker loaded its model with.
     launch: WorkerLaunch,
     /// What holds the plugins' communication buffers, which serve for the
@@ -263,6 +263,7 @@ impl Worker {
         )
         .map_err(phase("load"))?;
         drop(binding);
+        let identity = weights::model_identity(model.handle()).map_err(phase("load"))?;
         // A loading worker's weights are put once the host regions of the
         // layers it streams from host memory joined them.
         let host_paths: Vec<String> = components
@@ -477,12 +478,18 @@ impl Worker {
             .map_err(phase("storage"))?;
         // The engine copies the cache's pages through the host KV cache when
         // it says so; pages are keyed by the whole model's fingerprint and
-        // all the numerical code installed.
+        // the identity of what its forwards compute.
         let model_fingerprint = fingerprints
             .as_ref()
-            .map(weights::Fingerprints::pages)
-            .transpose()
-            .map_err(phase("storage"))?;
+            .map(|fingerprints| fingerprints.pages(&identity));
+        // The engine roots the prefix hash chains of the rank's pages at the
+        // same identity, so a world computing other numerics, or with other
+        // weights, hits none of them.
+        if let Some(reported) = info.prefix_cache.as_mut() {
+            reported.identity = model_fingerprint
+                .clone()
+                .unwrap_or_else(|| identity.clone());
+        }
         if let (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) = (
             launch.storage.host_kv_cache,
             model_fingerprint.as_deref(),
@@ -658,7 +665,7 @@ impl Worker {
             retained,
             weights: weight_storages,
             weight_keys: keys,
-            weight_numerics: fingerprints.map(|fingerprints| fingerprints.numerics),
+            identity,
             launch,
             _plugin_buffers: plugin_buffers,
             warmed: false,
@@ -811,7 +818,7 @@ impl Worker {
                 model: self.model.handle().clone(),
                 storages: self.weights.clone(),
                 keys: self.weight_keys.clone(),
-                numerics: self.weight_numerics.clone(),
+                identity: self.identity.clone(),
             }),
             pools,
             asleep: false,
@@ -1206,7 +1213,7 @@ fn model_fingerprints(
         return Ok(None);
     }
     let started = std::time::Instant::now();
-    let fingerprints = LoadedModel::fingerprint(description, launch, None)?;
+    let fingerprints = LoadedModel::fingerprint(description, launch)?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "fingerprinted the model's weights"

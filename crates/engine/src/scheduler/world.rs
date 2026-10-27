@@ -53,29 +53,63 @@ struct CacheReport {
     scratch_units: u32,
 }
 
+/// What a parked scheduler hands the world that succeeds it: its prefix
+/// cache index, and the units and count of the requests it ended as
+/// migratable, which the successor's cache must hold to continue them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParkedCache {
+    pub pages: Vec<IndexedPage>,
+    /// The cache units the migrating requests held: those a successor
+    /// recomputing them computes again.
+    pub held_units: u32,
+    pub requests: u32,
+}
+
 /// A park waiting for the scheduler's requests to end.
 pub(super) struct Parking {
-    answer: crossbeam_channel::Sender<Result<Vec<IndexedPage>, String>>,
+    answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
+    held_units: u32,
+    requests: u32,
 }
 
 impl Scheduler {
     /// Parks the scheduler (see the module documentation), answering with
     /// its prefix cache index once it is parked.
-    pub(super) fn park(
-        &mut self,
-        answer: crossbeam_channel::Sender<Result<Vec<IndexedPage>, String>>,
-    ) {
+    pub(super) fn park(&mut self, answer: crossbeam_channel::Sender<Result<ParkedCache, String>>) {
         if self.parked {
-            let _ = answer.send(Ok(self.index()));
+            let _ = answer.send(Ok(ParkedCache {
+                pages: self.index(),
+                ..ParkedCache::default()
+            }));
             return;
         }
         if self.parking.is_some() {
             let _ = answer.send(Err("the scheduler parks already".to_owned()));
             return;
         }
+        // What the requests that leave as migratable hold, before they let
+        // it go.
+        let migrating: Vec<u32> = self
+            .running
+            .values()
+            .filter(|state| state.req.is_migratable() && !state.terminal_intent.is_terminal())
+            .map(|state| {
+                state.allocations.as_ref().map_or(0, |allocations| {
+                    allocations
+                        .block_tables()
+                        .iter()
+                        .map(|table| table.unit_ids().len() as u32)
+                        .sum()
+                })
+            })
+            .collect();
         tracing::info!("parking: the requests that resume elsewhere end as migratable");
         self.migrate_requests(MigrationCause::Drain);
-        self.parking = Some(Parking { answer });
+        self.parking = Some(Parking {
+            answer,
+            held_units: migrating.iter().sum(),
+            requests: migrating.len() as u32,
+        });
         self.poll_park();
     }
 
@@ -102,8 +136,17 @@ impl Scheduler {
         self.flush_offloads();
         self.parked = true;
         let index = self.index();
-        tracing::info!(pages = index.len(), "the scheduler parked");
-        let _ = parking.answer.send(Ok(index));
+        tracing::info!(
+            pages = index.len(),
+            held_units = parking.held_units,
+            requests = parking.requests,
+            "the scheduler parked"
+        );
+        let _ = parking.answer.send(Ok(ParkedCache {
+            pages: index,
+            held_units: parking.held_units,
+            requests: parking.requests,
+        }));
     }
 
     /// Whether admission and scheduling wait for a park: the scheduler
@@ -126,13 +169,53 @@ impl Scheduler {
     }
 
     /// Promotes a successor scheduler: its workers adopt the predecessor's
-    /// cache flags of the units they inherit, and its pool imports
-    /// `index`, the predecessor's published pages, each unit moved to where
-    /// the workers map it.
-    pub(super) fn promote(&mut self, index: &[IndexedPage]) -> Result<(), String> {
+    /// cache flags of the units they inherit, and its pool imports the
+    /// predecessor's published pages, each unit moved to where the workers
+    /// map it.
+    ///
+    /// Fails, changing nothing, when the units the world's own segments
+    /// hold free, and those of the segments it creates as it `grows` into
+    /// the predecessor's memory freed at once, cannot hold what the
+    /// requests the predecessor hands over compute: all the units they held
+    /// when they `recompute` from their tokens, beside a page each, the last
+    /// they continue. The world has no more until its commit gives it the
+    /// predecessor's segments, and the requests would wait for it.
+    pub(super) fn promote(
+        &mut self,
+        parked: &ParkedCache,
+        recompute: bool,
+        grows: bool,
+    ) -> Result<(), String> {
         let Some(cache) = self.storage.cache() else {
             return Ok(());
         };
+        let page_units: u32 = cache
+            .coordinator
+            .groups()
+            .iter()
+            .map(|group| group.units_per_page as u32)
+            .sum();
+        let needed = parked.requests * page_units + if recompute { parked.held_units } else { 0 };
+        let free = cache.block_pool.free_units()
+            + if grows {
+                cache.block_pool.withdrawn_units()
+            } else {
+                0
+            };
+        let free = free as u32;
+        if needed > free {
+            return Err(format!(
+                "the successor world's KV cache holds {free} free units of its own until its \
+                 commit, and the {} requests in flight need {needed}{}",
+                parked.requests,
+                if recompute {
+                    ", recomputing the units they held"
+                } else {
+                    ""
+                },
+            ));
+        }
+        let index = &parked.pages;
         let inherited = cache.block_pool.inherited();
         if inherited.is_empty() {
             return Ok(());

@@ -35,6 +35,8 @@ class Denoiser(ImageDenoiser):
     produces and ``Model.image_decoder`` consumes.
     """
 
+    function = "models.stub.denoiser.Denoiser/1"
+
     framing_tokens = 2
     rope_advance = 2
 

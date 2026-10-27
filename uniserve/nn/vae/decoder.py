@@ -14,6 +14,8 @@ class LatentDecoder(nn.Module):
     during meta construction; loading moves their backing with the decoder.
     """
 
+    function = "nn.vae.decoder.LatentDecoder/1"
+
     mean: torch.Tensor
     std: torch.Tensor
 

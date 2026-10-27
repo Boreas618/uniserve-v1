@@ -12,6 +12,8 @@ from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 class ResidualBlock(nn.Module):
     """Apply two normalized convolutions and an optional channel projection."""
 
+    function = "nn.vae.layers.ResidualBlock/1"
+
     def __init__(
         self,
         in_channels: int,
@@ -56,6 +58,8 @@ class AttentionBlock(nn.Module):
     component partitions neither its head nor its spatial tokens.
     """
 
+    function = "nn.vae.layers.AttentionBlock/1"
+
     def __init__(self, channels: int, *, groups: int = 32, eps: float = 1e-6):
         super().__init__()
         self.norm = nn.GroupNorm(groups, channels, eps=eps)
@@ -99,6 +103,8 @@ class Downsample(nn.Module):
     pad.
     """  # noqa: D205
 
+    function = "nn.vae.layers.Downsample/1"
+
     def __init__(self, channels: int):
         super().__init__()
         self.convolution = nn.Conv2d(channels, channels, 3, stride=2)
@@ -112,6 +118,8 @@ class Upsample(nn.Module):
     """Double the spatial extent with nearest interpolation and a
     convolution.
     """  # noqa: D205
+
+    function = "nn.vae.layers.Upsample/1"
 
     def __init__(self, channels: int):
         super().__init__()
@@ -134,6 +142,8 @@ class DiagonalGaussian(nn.Module):
     draw, such as one fixed-seed host draw over a longer timeline than these
     moments cover, supplies its share of that draw.
     """
+
+    function = "nn.vae.layers.DiagonalGaussian/1"
 
     def __init__(
         self,

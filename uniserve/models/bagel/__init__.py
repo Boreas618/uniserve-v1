@@ -20,6 +20,11 @@ from .weights import (
     precisions,
 )
 
+# The revision of how this package derives its parameters from its
+# checkpoint: its tensor mappings, fusions and conversions
+# (`uniserve.numerics.loading`).
+LOADING = "models.bagel/1"
+
 __all__ = [
     "config_sources",
     "image_processor",

@@ -41,6 +41,8 @@ class VisionEncoder(PatchEncoder):
     processors do on the host.
     """
 
+    function = "models.qwen3_vl.encoder.VisionEncoder/1"
+
     network: VisionTower
 
     def __init__(
@@ -143,6 +145,8 @@ class TextEncoder(BaseTextEncoder):
     embedding followed by its DeepStack features. Prompts mark those tokens with
     ``image_token_id`` or ``video_token_id``.
     """
+
+    function = "models.qwen3_vl.encoder.TextEncoder/1"
 
     network: Transformer
 

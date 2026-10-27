@@ -23,6 +23,8 @@ class TimestepEmbedding(nn.Module):
     schedule, then releases it.
     """
 
+    function = "models.minimax_h3.modulation.TimestepEmbedding/1"
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.frequency_dim = config.frequency_dim
@@ -50,6 +52,8 @@ class TimestepEmbedding(nn.Module):
 
 class OutputNorm(nn.Module):
     """Apply per-token shift and scale after the final RMS normalization."""
+
+    function = "models.minimax_h3.modulation.OutputNorm/1"
 
     def __init__(self, config: TransformerConfig):
         super().__init__()

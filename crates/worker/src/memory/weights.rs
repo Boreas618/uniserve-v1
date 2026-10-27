@@ -8,8 +8,9 @@
 //! What determines the bytes is the fingerprint of the checkpoint source the
 //! tensor is loaded from (its files, with the structure below), or, for a
 //! tensor no source loads, the structure fingerprint: the normalized
-//! configuration, the weight choices and the numerics of the code that
-//! loads and lays them out. A manifest, a host storage keyed by the
+//! configuration, the weight choices, the revisions of how the weights
+//! derive from the checkpoint and what selects the providers whose layouts
+//! encoded weights are stored in. A manifest, a host storage keyed by the
 //! structure, names each tensor's source and representation, from which
 //! binding rebuilds it.
 //!
@@ -51,6 +52,17 @@ const RETAINED: &str = "uniserve.loading.retained";
 /// the alignment torch's allocator gives a storage.
 const PACK_ALIGNMENT: usize = 512;
 
+/// The identity of what `model`'s forwards compute: its components'
+/// functions and formats (`uniserve.loading.rank.identity`), which keys
+/// the cache pages they write.
+pub(crate) fn model_identity(model: &Handle) -> Result<String> {
+    let identity: tvm_ffi::String = Interpreter::import("uniserve.loading.rank.identity")?
+        .call_values(&[model.to_any()])?
+        .try_into()
+        .map_err(|error| Error::numerical("identity", &error))?;
+    Ok(identity.as_str().to_owned())
+}
+
 /// What determines a rank's retained bytes besides its placement and GPUs,
 /// as `uniserve.loading.retained.fingerprints` states it.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -61,42 +73,18 @@ pub(crate) struct Fingerprints {
     /// Each checkpoint source's fingerprint, by source name: it keys the
     /// tensors loaded from that source.
     pub sources: BTreeMap<String, String>,
-    /// The digest of the numerical code the structure covers: the code a
-    /// process loaded before it loaded the weights.
-    pub numerics: String,
+    /// What determines the weights' values, regardless of the layouts their
+    /// bytes take: it keys what forwards compute from them.
+    pub values: String,
 }
 
 impl Fingerprints {
-    /// The digest that keys the model's cache pages: the whole model's
-    /// ([`Self::model`]) and that of all the numerical code installed
-    /// (`uniserve.loading.retained.numerics`), since a forward may run code
-    /// loaded after the weights were.
-    pub(crate) fn pages(&self) -> Result<String> {
-        let numerics: tvm_ffi::String = Interpreter::import(&format!("{RETAINED}.numerics"))?
-            .call_values(&[])?
-            .try_into()
-            .map_err(|error| Error::numerical("numerics", &error))?;
-        Ok(format!("{}:{}", self.model(), numerics.as_str()))
-    }
-
-    /// One digest of the whole model, its structure and every source: what
-    /// depends on all of its weights is keyed by it.
-    pub(crate) fn model(&self) -> String {
-        let mut digest = Sha256::new();
-        digest.update(b"uniserve-model\0");
-        for part in std::iter::once(&self.structure).chain(
-            self.sources
-                .iter()
-                .flat_map(|(source, fingerprint)| [source, fingerprint]),
-        ) {
-            digest.update((part.len() as u64).to_le_bytes());
-            digest.update(part.as_bytes());
-        }
-        digest
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+    /// The digest that keys the model's cache pages: what determines the
+    /// weights' values and the identity of what its forwards compute
+    /// (`uniserve.numerics.identity`, [`model_identity`]); neither the
+    /// layouts the weights' bytes take nor the code that computes them.
+    pub(crate) fn pages(&self, identity: &str) -> String {
+        format!("{}:{identity}", self.values)
     }
 }
 
@@ -369,15 +357,6 @@ impl WeightKeys {
             tracing::info!("the retained weight manifest is of another version; loading");
             return Ok(None);
         };
-        // The key covers the code loaded before loading; the manifest, every
-        // module loaded by the time the weights were published.
-        let current: bool = Interpreter::import(&format!("{RETAINED}.modules_current"))?
-            .call_as(&[(&Any::from(tvm_ffi::String::from(manifest.as_str()))).into()])?;
-        if !current {
-            tracing::info!("code that loaded the retained weights changed since; loading");
-            return Ok(None);
-        }
-
         // Every field of every tensor, keyed by the tensor's source.
         let fields: Vec<(usize, String, Option<Key>)> = tensors
             .iter()
@@ -833,7 +812,7 @@ fn host_bytes(bytes: &[u8]) -> Result<OwnedFd> {
 
 /// The version of the manifest `uniserve.loading.retained` writes; a
 /// manifest of another version names no tensor this worker binds.
-const MANIFEST_VERSION: u64 = 3;
+const MANIFEST_VERSION: u64 = 4;
 
 /// The tensors a manifest names, in order; `None` for a manifest of
 /// another version.

@@ -59,6 +59,8 @@ class MoTLayer(nn.Module):
     A subclass implements ``position_embeddings``.
     """
 
+    function = "models.mot.MoTLayer/1"
+
     def __init__(
         self,
         *,
@@ -133,6 +135,8 @@ class MoTDecoder(TransformerDecoder):
     Every route has its own output norm, and calls without routes run every
     token through the first route.
     """
+
+    function = "models.mot.MoTDecoder/1"
 
     def __init__(
         self,

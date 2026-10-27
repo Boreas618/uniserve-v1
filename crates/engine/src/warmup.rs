@@ -228,6 +228,7 @@ fn warmup_request(
             read: false,
             write: false,
             isolation_key: None,
+            state_seed: None,
         },
         include_stop_token: false,
         image_generation: ImageGenerationConfig {

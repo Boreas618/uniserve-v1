@@ -151,6 +151,8 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     ``mesh`` states the network's mathematical partitioning.
     """
 
+    function = "models.denoiser.Denoiser/1"
+
     def __init__(
         self,
         *,
@@ -262,6 +264,8 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     outputs that the caller's storage holds; the caller advances the fixed
     schedule and supplies each step's borrowed tensors to ``bind_inputs``.
     """
+
+    function = "models.denoiser.VideoDenoiser/1"
 
     @property
     def canvases(self) -> Mapping[tuple[int, str], image.Config]:
@@ -482,6 +486,8 @@ class ImageDenoiser(Denoiser[PackedImageInput, image.Config]):
     needs one declares it an eager per-image region, which reads the rows'
     host ``regions`` and runs between the captured segments around it.
     """
+
+    function = "models.denoiser.ImageDenoiser/1"
 
     framing_tokens: int = 0
     image_unconditional: BranchSource = BranchSource.START

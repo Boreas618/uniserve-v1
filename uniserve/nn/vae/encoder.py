@@ -22,6 +22,8 @@ class LatentEncoder(nn.Module):
     construction; loading moves their backing with the encoder.
     """
 
+    function = "nn.vae.encoder.LatentEncoder/1"
+
     mean: torch.Tensor
     std: torch.Tensor
 

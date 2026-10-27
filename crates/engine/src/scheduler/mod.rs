@@ -49,7 +49,7 @@ pub use stats::{
     SchedulerStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedulerStatsReporter;
-pub use world::GroupCache;
+pub use world::{GroupCache, ParkedCache};
 
 mod admission;
 mod allocation;

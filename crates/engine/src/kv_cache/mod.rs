@@ -436,6 +436,13 @@ impl BlockPool {
         lock(&self.inner).withdrawn
     }
 
+    /// How many units are withdrawn: those of the segments a growth or a
+    /// restore creates.
+    pub(crate) fn withdrawn_units(&self) -> usize {
+        let inner = lock(&self.inner);
+        inner.meta.len() - inner.withdrawn as usize
+    }
+
     /// Whether some units are withdrawn.
     pub(crate) fn has_withdrawn(&self) -> bool {
         let inner = lock(&self.inner);
@@ -1093,6 +1100,39 @@ struct PrefixSelection {
     pages: Vec<(usize, Vec<(UnitId, bool)>)>,
 }
 
+/// The namespace a request's prefix pages are hashed in: its isolation key
+/// (`CachePolicy::isolation_key`), and the seed of the world whose state it
+/// continues with (`CachePolicy::state_seed`) in place of the pool's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrefixScope {
+    pub(crate) isolation_key: Option<u64>,
+    pub(crate) state_seed: Option<u64>,
+}
+
+impl PrefixScope {
+    /// The scope `cache` states.
+    pub(crate) fn of(cache: &proto::request::CachePolicy) -> Self {
+        Self {
+            isolation_key: cache.isolation_key,
+            state_seed: cache.state_seed,
+        }
+    }
+}
+
+/// The seed of the prefix hash chains of the pages a worker computes, from
+/// the identity it reports of its model and of what its forwards compute
+/// (`PrefixCacheInfo::identity`): the first eight bytes of its SHA-256, so
+/// that every build derives the same seed from the same identity. Zero for
+/// a worker that reports none.
+pub(crate) fn prefix_seed(identity: &str) -> u64 {
+    use sha2::Digest as _;
+    if identity.is_empty() {
+        return 0;
+    }
+    let digest = sha2::Sha256::digest(identity.as_bytes());
+    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
+}
+
 /// Coordinates capacity, window release and prefix state across cache
 /// groups.
 ///
@@ -1102,7 +1142,8 @@ struct PrefixSelection {
 pub(crate) struct PrefixCacheCoordinator {
     groups: Vec<GroupShape>,
     prefix_enabled: bool,
-    /// Root of every hash chain; an isolation key is mixed into it.
+    /// Root of every hash chain: the seed of what the pool's workers compute
+    /// (`prefix_seed`); an isolation key is mixed into it.
     hash_seed: u64,
 }
 
@@ -1115,6 +1156,12 @@ impl PrefixCacheCoordinator {
             prefix_enabled: true,
             hash_seed: 0,
         }
+    }
+
+    /// Roots the hash chains of the pages hashed from now on at `seed`, the
+    /// seed of what the pool's workers compute (`prefix_seed`).
+    pub(crate) fn set_seed(&mut self, seed: u64) {
+        self.hash_seed = seed;
     }
 
     /// Returns the cache groups in table order.
@@ -1309,14 +1356,15 @@ impl PrefixCacheCoordinator {
     /// Computes group-specific chained hashes for each complete prompt page.
     ///
     /// A trailing partial page is not hashed, so only complete pages are ever
-    /// published. An isolation key is rotated and XORed into the chain seed,
-    /// so requests with different keys compute different hash chains and,
-    /// barring a hash collision, reuse none of each other's pages. A key of
-    /// zero leaves the seed unchanged and therefore shares pages with
-    /// requests that carry no key.
-    fn prefix_hashes(&self, prompt: &[u32], isolation_key: Option<u64>) -> Vec<Vec<u64>> {
+    /// published. The chains are rooted at the pool's seed, or at the seed
+    /// of the world whose state the request continues with. An isolation key
+    /// is rotated and XORed into the root, so requests with different keys
+    /// compute different hash chains and, barring a hash collision, reuse
+    /// none of each other's pages. A key of zero leaves the root unchanged
+    /// and therefore shares pages with requests that carry no key.
+    fn prefix_hashes(&self, prompt: &[u32], scope: PrefixScope) -> Vec<Vec<u64>> {
         let mut hashes = vec![Vec::new(); self.groups.len()];
-        self.extend_hashes(&mut hashes, CachedTokens::prompt(prompt), isolation_key);
+        self.extend_hashes(&mut hashes, CachedTokens::prompt(prompt), scope);
         hashes
     }
 
@@ -1330,9 +1378,12 @@ impl PrefixCacheCoordinator {
         &self,
         hashes: &mut [Vec<u64>],
         tokens: CachedTokens<'_>,
-        isolation_key: Option<u64>,
+        scope: PrefixScope,
     ) {
-        let seed = isolation_key.map_or(self.hash_seed, |key| self.hash_seed ^ key.rotate_left(17));
+        let root = scope.state_seed.unwrap_or(self.hash_seed);
+        let seed = scope
+            .isolation_key
+            .map_or(root, |key| root ^ key.rotate_left(17));
         for (group, (shape, chain)) in self.groups.iter().zip(hashes.iter_mut()).enumerate() {
             let complete = tokens.len() / shape.block_size;
             let mut parent = chain.last().copied().unwrap_or(seed);
@@ -1425,7 +1476,7 @@ impl PrefixCacheCoordinator {
         prompt: &[u32],
         cache_read: bool,
         has_images: bool,
-        isolation_key: Option<u64>,
+        scope: PrefixScope,
         source: &WorkerEndpoint,
     ) -> PrefixHit {
         // Prefix hashes cover token ids only, not image content, so requests
@@ -1433,7 +1484,7 @@ impl PrefixCacheCoordinator {
         if !self.prefix_enabled || !cache_read || has_images {
             return PrefixHit::default();
         }
-        let hashes = self.prefix_hashes(prompt, isolation_key);
+        let hashes = self.prefix_hashes(prompt, scope);
         let selection = self.select_prefix(pool, prompt, &hashes, source);
         let cached_free_units = selection
             .pages
@@ -1470,7 +1521,7 @@ impl PrefixCacheCoordinator {
         prompt: &[u32],
         cache_read: bool,
         has_images: bool,
-        isolation_key: Option<u64>,
+        scope: PrefixScope,
         source: &WorkerEndpoint,
     ) -> Option<PrefixLookup> {
         if !self.matches(allocation)
@@ -1487,7 +1538,7 @@ impl PrefixCacheCoordinator {
         if !self.prefix_enabled || has_images {
             return Some(PrefixLookup::default());
         }
-        let hashes = self.prefix_hashes(prompt, isolation_key);
+        let hashes = self.prefix_hashes(prompt, scope);
         let mut result = PrefixLookup {
             page_hashes: hashes,
             cached_tokens: 0,
@@ -1697,7 +1748,15 @@ mod tests {
     ) -> CacheAllocation {
         let mut allocation = coordinator.empty();
         let lookup = coordinator
-            .acquire_prefix(pool, &mut allocation, prompt, false, false, None, source)
+            .acquire_prefix(
+                pool,
+                &mut allocation,
+                prompt,
+                false,
+                false,
+                PrefixScope::default(),
+                source,
+            )
             .unwrap();
         coordinator
             .ensure_capacity(pool, &mut allocation, 0, prompt.len())
@@ -1727,7 +1786,7 @@ mod tests {
         source: &Arc<WorkerEndpoint>,
     ) -> Vec<PageRef> {
         let shape = coordinator.groups()[group];
-        let hashes = coordinator.prefix_hashes(prompt, None);
+        let hashes = coordinator.prefix_hashes(prompt, PrefixScope::default());
         pages
             .iter()
             .map(|page| {
@@ -1755,14 +1814,45 @@ mod tests {
         let generated: Vec<u32> = (100..107).collect();
         let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
 
-        let mut hashes = coordinator.prefix_hashes(&prompt, Some(7));
-        coordinator.extend_hashes(&mut hashes, CachedTokens::new(&prompt, &generated), Some(7));
-        assert_eq!(hashes, coordinator.prefix_hashes(&migrated, Some(7)));
+        let mut hashes = coordinator.prefix_hashes(
+            &prompt,
+            PrefixScope {
+                isolation_key: Some(7),
+                state_seed: None,
+            },
+        );
+        coordinator.extend_hashes(
+            &mut hashes,
+            CachedTokens::new(&prompt, &generated),
+            PrefixScope {
+                isolation_key: Some(7),
+                state_seed: None,
+            },
+        );
+        assert_eq!(
+            hashes,
+            coordinator.prefix_hashes(
+                &migrated,
+                PrefixScope {
+                    isolation_key: Some(7),
+                    state_seed: None
+                }
+            )
+        );
         assert_eq!(hashes[0].len(), 4);
         assert_eq!(hashes[1].len(), 8);
 
         // Another isolation key chains other pages.
-        assert_ne!(hashes, coordinator.prefix_hashes(&migrated, Some(8)));
+        assert_ne!(
+            hashes,
+            coordinator.prefix_hashes(
+                &migrated,
+                PrefixScope {
+                    isolation_key: Some(8),
+                    state_seed: None
+                }
+            )
+        );
     }
 
     /// A page that spans the prompt's end reads both halves, in order.
@@ -1793,12 +1883,20 @@ mod tests {
 
         let mut allocation = coordinator.empty();
         let mut lookup = coordinator
-            .acquire_prefix(&pool, &mut allocation, &prompt, false, false, None, &source)
+            .acquire_prefix(
+                &pool,
+                &mut allocation,
+                &prompt,
+                false,
+                false,
+                PrefixScope::default(),
+                &source,
+            )
             .unwrap();
         coordinator
             .ensure_capacity(&pool, &mut allocation, 0, tokens.len())
             .unwrap();
-        coordinator.extend_hashes(&mut lookup.page_hashes, tokens, None);
+        coordinator.extend_hashes(&mut lookup.page_hashes, tokens, PrefixScope::default());
         let mut published = Vec::new();
         assert!(coordinator.publish_computed(
             &pool,
@@ -1813,7 +1911,14 @@ mod tests {
         assert_eq!(published, vec![4]);
 
         let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
-        let hit = coordinator.probe_prefix(&pool, &migrated, true, false, None, &source);
+        let hit = coordinator.probe_prefix(
+            &pool,
+            &migrated,
+            true,
+            false,
+            PrefixScope::default(),
+            &source,
+        );
         assert_eq!(hit.cached_tokens, 16);
     }
 
@@ -1995,7 +2100,14 @@ mod tests {
                 .iter()
                 .all(|unit| pool.unit_state(*unit) == UnitState::Cached)
         );
-        let hit = coordinator.probe_prefix(&pool, &prompt[..13], true, false, None, &source);
+        let hit = coordinator.probe_prefix(
+            &pool,
+            &prompt[..13],
+            true,
+            false,
+            PrefixScope::default(),
+            &source,
+        );
         assert_eq!(hit.cached_tokens, 12);
 
         // Growth appends after the window and never moves the start back.
@@ -2053,12 +2165,21 @@ mod tests {
         let _first = publish_pages(&coordinator, &pool, &prompt, 0, &[1, 5], &source);
         let _second = publish_pages(&coordinator, &pool, &prompt, 1, &[0, 1, 3], &source);
 
-        let hit = coordinator.probe_prefix(&pool, &prompt, true, false, None, &source);
+        let hit =
+            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 8);
 
         let mut target = coordinator.empty();
         let lookup = coordinator
-            .acquire_prefix(&pool, &mut target, &prompt, true, false, None, &source)
+            .acquire_prefix(
+                &pool,
+                &mut target,
+                &prompt,
+                true,
+                false,
+                PrefixScope::default(),
+                &source,
+            )
             .unwrap();
         assert_eq!(lookup.cached_tokens, 8);
         assert_eq!(
@@ -2088,13 +2209,22 @@ mod tests {
 
         // Every hit page is unreferenced: two full units and two sliding
         // pages of two units each count as free until acquired.
-        let hit = coordinator.probe_prefix(&pool, &prompt, true, false, None, &source);
+        let hit =
+            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
         assert_eq!(hit.cached_free_units, 2 + 4);
 
         let mut target = coordinator.empty();
         let lookup = coordinator
-            .acquire_prefix(&pool, &mut target, &prompt, true, false, None, &source)
+            .acquire_prefix(
+                &pool,
+                &mut target,
+                &prompt,
+                true,
+                false,
+                PrefixScope::default(),
+                &source,
+            )
             .unwrap();
         assert_eq!(lookup.cached_tokens, 16);
         assert_eq!(
@@ -2138,15 +2268,43 @@ mod tests {
 
         // Only 16 prompt tokens were published: the full group limits every
         // group to 16 even though a longer prompt is probed.
-        let hit = coordinator.probe_prefix(&pool, &prompt, true, false, None, &source);
+        let hit =
+            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(hit.cached_tokens, 16);
         // Both groups' hit pages are referenced by the owner.
         assert_eq!(hit.cached_free_units, 0);
         drop(owner);
-        let hit = coordinator.probe_prefix(&pool, &prompt, true, false, None, &source);
+        let hit =
+            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
         // Unreferenced hits count as free: sliding page 3 and full pages 0
         // and 1.
         assert_eq!(hit.cached_free_units, 3);
+    }
+
+    /// Pages are rooted at the seed of what the workers that computed them
+    /// compute: a pool whose workers compute otherwise hits none of them,
+    /// but a request continuing the state those workers reached finds them
+    /// under their seed.
+    #[test]
+    fn a_request_continuing_another_worlds_state_finds_its_pages() {
+        let pool = BlockPool::new(64, 0);
+        let source = endpoint();
+        let prompt = (1..=9).collect::<Vec<u32>>();
+        let mut previous = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        previous.set_seed(prefix_seed("previous"));
+        drop(publish(&previous, &pool, &prompt, &source));
+
+        let mut serving = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        serving.set_seed(prefix_seed("serving"));
+        let own =
+            serving.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        assert_eq!(own.cached_tokens, 0);
+        let kept = PrefixScope {
+            isolation_key: None,
+            state_seed: Some(prefix_seed("previous")),
+        };
+        let continued = serving.probe_prefix(&pool, &prompt, true, false, kept, &source);
+        assert_eq!(continued.cached_tokens, 8);
     }
 
     /// A successor's pages imported into the units it inherits are hit like
@@ -2166,13 +2324,27 @@ mod tests {
         successor.inherit(16..32);
         assert_eq!(successor.import(&index, 16, &source), 2);
         let free = successor.free_units();
-        let hit = coordinator.probe_prefix(&successor, &prompt, true, false, None, &source);
+        let hit = coordinator.probe_prefix(
+            &successor,
+            &prompt,
+            true,
+            false,
+            PrefixScope::default(),
+            &source,
+        );
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 0);
         assert_eq!(successor.free_units(), free);
 
         successor.take_inherited();
-        let hit = coordinator.probe_prefix(&successor, &prompt, true, false, None, &source);
+        let hit = coordinator.probe_prefix(
+            &successor,
+            &prompt,
+            true,
+            false,
+            PrefixScope::default(),
+            &source,
+        );
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 2);
     }
@@ -2191,7 +2363,7 @@ mod tests {
             let allocation = publish(&coordinator, &pool, &prompt, source);
             assert_eq!(
                 coordinator
-                    .probe_prefix(&pool, &prompt, true, false, None, source)
+                    .probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), source)
                     .cached_tokens,
                 4
             );
@@ -2203,7 +2375,14 @@ mod tests {
         };
         assert_eq!(
             coordinator
-                .probe_prefix(&pool, &prompt, true, false, None, &replacement)
+                .probe_prefix(
+                    &pool,
+                    &prompt,
+                    true,
+                    false,
+                    PrefixScope::default(),
+                    &replacement
+                )
                 .cached_tokens,
             0
         );
@@ -2213,13 +2392,21 @@ mod tests {
         assert_eq!(pool.free_units(), free_before);
         assert_eq!(
             coordinator
-                .probe_prefix(&pool, &prompt, true, false, None, &first)
+                .probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &first)
                 .cached_tokens,
             0
         );
         let mut consumer = coordinator.empty();
         let reused = coordinator
-            .acquire_prefix(&pool, &mut consumer, &prompt, true, false, None, &second)
+            .acquire_prefix(
+                &pool,
+                &mut consumer,
+                &prompt,
+                true,
+                false,
+                PrefixScope::default(),
+                &second,
+            )
             .unwrap();
         assert_eq!(reused.cached_tokens, 4);
         assert_eq!(

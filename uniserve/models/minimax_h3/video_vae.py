@@ -409,6 +409,8 @@ def _feed_forward(mlp, hidden, maximum=None):
 class TransformerLayer(nn.Module):
     """Apply channel-scaled attention and feed-forward residual updates."""
 
+    function = "models.minimax_h3.video_vae.TransformerLayer/1"
+
     def __init__(self, config: Config):
         super().__init__()
         width = (
@@ -528,6 +530,8 @@ class TransformerLayer(nn.Module):
 
 class Transformer(nn.Module):
     """Decode latent tokens and register tokens into spatiotemporal RGB patches."""  # noqa: E501
+
+    function = "models.minimax_h3.video_vae.Transformer/1"
 
     def __init__(self, config: Config):
         super().__init__()
@@ -684,6 +688,8 @@ class Transformer(nn.Module):
 class Decoder(TiledDecoder):
     """Project latent channels and reconstruct overlapping spatial tiles."""
 
+    function = "models.minimax_h3.video_vae.Decoder/1"
+
     decoder: Transformer
 
     def __init__(self, config: Config):
@@ -713,6 +719,8 @@ class Model(LatentDecoder):
     The latent raster is the request's canvas divided by the spatial
     compression; spatial tiling covers any raster on that grid.
     """
+
+    function = "models.minimax_h3.video_vae.Model/1"
 
     decoder: Decoder
 
@@ -848,6 +856,8 @@ class CausalConv3d(nn.Conv3d):
     channels-last result channel-first and adds a residual in that pass.
     """
 
+    function = "models.minimax_h3.video_vae.CausalConv3d/1"
+
     def __init__(
         self,
         in_channels: int,
@@ -926,6 +936,8 @@ class FrameGroupNorm(nn.GroupNorm):
     reads that view directly instead of a contiguous copy.
     """
 
+    function = "models.minimax_h3.video_vae.FrameGroupNorm/1"
+
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         batch, channels, frames, height, width = values.shape
         # Fold time into the batch: [batch * frames, channels, height, width].
@@ -963,6 +975,8 @@ class CausalBlock(nn.Module):
     channel-first output is what the next normalization, residual, 1x1
     projection and downsampling padding read, without a copy.
     """
+
+    function = "models.minimax_h3.video_vae.CausalBlock/1"
 
     def __init__(self, in_channels: int, out_channels: int, config: Config):
         super().__init__()
@@ -1011,6 +1025,8 @@ class CausalBlock(nn.Module):
 class CausalDownsample(nn.Module):
     """Halve height and width and stride time with one causal convolution."""
 
+    function = "models.minimax_h3.video_vae.CausalDownsample/1"
+
     def __init__(
         self,
         channels: int,
@@ -1048,6 +1064,8 @@ class CausalDownsample(nn.Module):
 
 class EncoderStage(nn.Module):
     """Apply one encoder level's causal blocks, then its downsampling."""
+
+    function = "models.minimax_h3.video_vae.EncoderStage/1"
 
     def __init__(
         self,
@@ -1091,6 +1109,8 @@ class CausalCNN(nn.Module):
     17-frame clip becomes five latent frames and a single frame stays one.
     Spatial levels halve height and width.
     """
+
+    function = "models.minimax_h3.video_vae.CausalCNN/1"
 
     def __init__(self, config: Config):
         super().__init__()
@@ -1147,6 +1167,8 @@ class CausalCNN(nn.Module):
 
 class Encoder(TiledEncoder):
     """Encode overlapping spatial tiles of one clip into posterior moments."""
+
+    function = "models.minimax_h3.video_vae.Encoder/1"
 
     encoder: CausalCNN
 

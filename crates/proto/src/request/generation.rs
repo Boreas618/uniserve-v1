@@ -807,6 +807,14 @@ pub struct CachePolicy {
     pub write: bool,
     /// Optional tenant or request-group cache namespace.
     pub isolation_key: Option<u64>,
+    /// The prefix seed of the world whose state the request continues with:
+    /// a request a world change migrates with `in_flight = keep`, when the
+    /// new world computes other numerics. Its prefix lookups match the
+    /// pages that world computed, it reads no host KV cache, whose pages are
+    /// keyed by the world that serves, and a request continuing so writes
+    /// no page (`write`), since its pages are neither world's.
+    #[serde(default)]
+    pub state_seed: Option<u64>,
 }
 
 impl Default for CachePolicy {
@@ -816,6 +824,7 @@ impl Default for CachePolicy {
             read: true,
             write: true,
             isolation_key: None,
+            state_seed: None,
         }
     }
 }
@@ -1354,6 +1363,7 @@ mod tests {
                 read: false,
                 write: false,
                 isolation_key: Some(91),
+                state_seed: Some(5),
             },
             image_generation: policy,
             readout: Vec::new(),

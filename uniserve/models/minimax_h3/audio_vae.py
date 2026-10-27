@@ -198,6 +198,8 @@ class Config:
 class Model(LatentDecoder):
     """Invert audio latent statistics and reconstruct interleaved stereo PCM."""
 
+    function = "models.minimax_h3.audio_vae.Model/1"
+
     def __init__(self, config: Config):
         from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (  # noqa: E501
             MiniMaxH3AudioBigVGANDecoder,
@@ -295,6 +297,8 @@ def _normalized(convolution: nn.Conv1d) -> nn.Conv1d:
 class Snake(nn.Module):
     """Apply ``x + sin(alpha * x)^2 / alpha`` with one frequency per channel."""
 
+    function = "models.minimax_h3.audio_vae.Snake/1"
+
     def __init__(self, channels: int):
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(1, channels, 1))
@@ -308,6 +312,8 @@ class Snake(nn.Module):
 
 class ResidualUnit(nn.Module):
     """Add a dilated Snake convolution branch that preserves the length."""
+
+    function = "models.minimax_h3.audio_vae.ResidualUnit/1"
 
     def __init__(self, channels: int, dilation: int):
         super().__init__()
@@ -337,6 +343,8 @@ class EncoderBlock(nn.Module):
     ``stride``.
     """
 
+    function = "models.minimax_h3.audio_vae.EncoderBlock/1"
+
     def __init__(self, channels: int, stride: int):
         super().__init__()
         width = channels // 2
@@ -363,6 +371,8 @@ class EncoderBlock(nn.Module):
 class GeGLU(nn.Module):
     """Normalize, then apply a tanh-GELU gated linear unit and its output."""
 
+    function = "models.minimax_h3.audio_vae.GeGLU/1"
+
     def __init__(self, channels: int, hidden: int):
         super().__init__()
         self.norm = nn.LayerNorm(channels)
@@ -387,6 +397,8 @@ class AttentionProjection(nn.Module):
     earlier frames of the track. The key bias is the checkpoint's stored zero
     vector.
     """
+
+    function = "models.minimax_h3.audio_vae.AttentionProjection/1"
 
     def __init__(self, config: Config):
         super().__init__()
@@ -443,6 +455,8 @@ class Encoder(nn.Module):
     conditions H3. The log-scale head is never evaluated. ``samples`` must be
     a whole number of latent frames.
     """
+
+    function = "models.minimax_h3.audio_vae.Encoder/1"
 
     def __init__(self, config: Config):
         super().__init__()

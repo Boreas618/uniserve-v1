@@ -42,6 +42,8 @@ class Model(nn.Module):
     holds one set of weights.
     """
 
+    function = "models.bagel.model.Model/1"
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config

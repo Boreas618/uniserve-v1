@@ -164,6 +164,8 @@ class RotaryEmbedding(nn.Module):
     one-dimensional recipe.
     """
 
+    function = "nn.rope.RotaryEmbedding/1"
+
     # Registered when ``sections`` selects multimodal positions.
     frequency_axes: torch.Tensor
 

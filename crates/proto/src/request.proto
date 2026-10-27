@@ -115,6 +115,10 @@ message EngineInfo {
   // The KV cache segments of each worker group, which an engine that
   // succeeds this one on the same devices maps.
   repeated CacheSegments segments = 7;
+  // The root of the prefix hash chains of the pages the engine's workers
+  // compute: equal between worlds whose models and numerics agree, whose
+  // pages a successor reuses.
+  uint64 prefix_seed = 8;
 }
 
 // The batch an engine's workers were started for.
@@ -335,6 +339,14 @@ message Promote {
   // whose pages the promoted engine reads from the predecessor's segments
   // it maps read-only; empty for an engine without a predecessor.
   repeated GroupIndex index = 1;
+  // Whether the requests the predecessor hands over compute their state
+  // again from their tokens: the promoted engine computes other numerics,
+  // and the change recomputes them (`in_flight = recompute`).
+  bool recompute = 2;
+  // Whether the predecessor's memory frees once the engine is promoted
+  // (its processes exit), so that the cache grows into it at once and the
+  // requests it hands over wait for that rather than for a commit.
+  bool grows = 3;
 }
 
 // A request to park the engine.
@@ -390,6 +402,10 @@ message CacheDescribed {
 message GroupIndex {
   string worker_group = 1;
   repeated IndexedPage pages = 2;
+  // The cache units the requests the scheduler ended as migratable held,
+  // and how many requests they were.
+  uint32 held_units = 3;
+  uint32 requests = 4;
 }
 
 // One published page: its cache group, its chained hash, its tokens and its
@@ -522,6 +538,9 @@ message CachePolicy {
   bool read = 1;
   bool write = 2;
   optional uint64 isolation_key = 3;
+  // The prefix seed of the world whose state a migrated request continues
+  // with (a world change's `in_flight = keep`).
+  optional uint64 state_seed = 4;
 }
 
 message ImageGenerationConfig {

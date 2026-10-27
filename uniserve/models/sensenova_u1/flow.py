@@ -94,6 +94,8 @@ class Config:
 class _Residual(nn.Module):
     """Apply adaptive shift/scale and a gated residual MLP."""
 
+    function = "models.sensenova_u1.flow._Residual/1"
+
     def __init__(self, config: HeadConfig):
         super().__init__()
         self.norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -114,6 +116,8 @@ class _Residual(nn.Module):
 
 class _Output(nn.Module):
     """Project to patch values after adaptive shift/scale normalization."""
+
+    function = "models.sensenova_u1.flow._Output/1"
 
     def __init__(self, hidden_size: int, output_size: int):
         super().__init__()
@@ -138,6 +142,8 @@ class Head(nn.Module):
     ``TimestepEmbedding``, separate from the one the denoiser adds to the
     backbone input, and uses it to modulate every block.
     """
+
+    function = "models.sensenova_u1.flow.Head/1"
 
     def __init__(
         self, config: HeadConfig, *, input_size: int, output_size: int
@@ -170,6 +176,8 @@ class Decoder(nn.Module):
     a convolution to ``out_channels * final_upscale**2`` channels and a final
     ``final_upscale`` shuffle.
     """
+
+    function = "models.sensenova_u1.flow.Decoder/1"
 
     def __init__(
         self,
@@ -210,6 +218,8 @@ class Velocity(nn.Module):
     ``(prediction - sample) / (1 - t)`` with ``1 - t`` clamped to at least
     0.02, the reference implementation's default endpoint epsilon.
     """
+
+    function = "models.sensenova_u1.flow.Velocity/1"
 
     def __init__(self, head: nn.Module, decoder: nn.Module, *, patch_size: int):
         super().__init__()

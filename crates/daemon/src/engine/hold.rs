@@ -32,6 +32,9 @@ pub struct RequestHold {
     serving: watch::Sender<Serving>,
     /// Whether submissions wait although an engine serves.
     paused: watch::Sender<bool>,
+    /// The world whose requests continue with the state they reached when
+    /// they migrate, and the prefix seed of that state (`Self::kept`).
+    kept: std::sync::Mutex<Option<(u64, u64)>>,
 }
 
 /// What a hold does with a submission now.
@@ -57,7 +60,30 @@ impl RequestHold {
         Self {
             serving: watch::Sender::new(Serving::Holding),
             paused: watch::Sender::new(false),
+            kept: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Has the requests that migrate out of world `world` continue with the
+    /// state they reached there, whose pages are rooted at `seed`
+    /// (`CachePolicy::state_seed`): a world change's `in_flight = keep`
+    /// when the world that serves next computes other numerics. `None`
+    /// ends it.
+    pub fn keep(&self, kept: Option<(u64, u64)>) {
+        *self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = kept;
+    }
+
+    /// The prefix seed of the state a request migrating out of world `world`
+    /// continues with, if it keeps it.
+    pub fn kept(&self, world: u64) -> Option<u64> {
+        self.kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .filter(|(kept, _)| *kept == world)
+            .map(|(_, seed)| seed)
     }
 
     /// Holds later submissions until [`Self::resume`], whatever engine
