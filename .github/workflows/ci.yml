@@ -35,6 +35,37 @@ jobs:
       - run: python -m pytest -m "unit and not gpu"
       - run: python -m pytest -m "integration and not gpu"
 
+  # A pull request whose components keep their declared function and format
+  # identities must compute what its base computes, within the variation
+  # batching causes (tests/python/numerics/compare.py). The runner provides
+  # the checkpoint the comparison loads in UNISERVE_NUMERICS_MODEL.
+  numerics:
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e ./uniserve_kernels -e ".[test,gpu]"
+      - run: >-
+          python tests/python/numerics/compare.py
+          --base "origin/${{ github.base_ref }}"
+          --checkpoint "$UNISERVE_NUMERICS_MODEL"
+          --output artifacts/numerics
+        env:
+          MAX_JOBS: "8"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: numerics
+          path: artifacts/numerics/
+
   benchmark-smoke:
     runs-on: ubuntu-latest
     steps:
