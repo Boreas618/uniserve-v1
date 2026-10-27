@@ -60,7 +60,7 @@ use models::video::presentation;
 use models::video::{Canvas, Conditioning, DenoiserInfo, VideoTask};
 use proto::MediaSource;
 use proto::request::{ConditionExtent, DiffusionRequest};
-use proto::request::{DiffusionSamplingParams, RequestId};
+use proto::request::{DiffusionSamplingParams, RequestId, Trajectory};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -545,6 +545,9 @@ impl Presenter {
                 width: plan.canvas.width,
                 height: plan.canvas.height,
             },
+            // The migrator gives the request its trajectory's identity when
+            // it first submits it.
+            trajectory: Trajectory::default(),
         };
         let video = ProcessedVideo {
             duration_seconds: plan.duration_seconds,

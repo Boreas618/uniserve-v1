@@ -150,6 +150,32 @@ pub struct PagePoolInfo {
     pub endpoint: Option<String>,
 }
 
+/// The host latent pool of a video denoising rank: the Storage Server page
+/// pool its preempted trajectories are written to and restored from, one
+/// pool page per page of a request slot's latent banks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatentPoolInfo {
+    /// The pool's identity at the rank's host's Storage Server.
+    pub pool: u64,
+    /// The pages a request slot owns in the rank's latent banks, each a
+    /// pool page; an offload or restore copies every one of them.
+    pub slot_pages: u32,
+    /// The digest of what a page's bytes mean besides the denoiser's
+    /// numerics: the page geometry and element type, the video plan that
+    /// selects a request's layout, and the rank's share of the denoiser's
+    /// rows. The engine keys the rank's pages with it and the deployment's
+    /// latent seed.
+    pub region: [u8; 32],
+    /// The identity of what the rank's trajectories are computed with: the
+    /// weights' values and the declared function and format identities of
+    /// the model it loaded (`uniserve.numerics`), as its KV cache pages are
+    /// keyed.
+    pub identity: String,
+    /// Where an engine on another host reaches the pool's Storage Server
+    /// (`StorageLaunch::tcp`).
+    pub endpoint: Option<String>,
+}
+
 impl PrefixCacheInfo {
     /// Returns the units the scheduler may allocate: all but the sentinel.
     pub fn usable_units(&self) -> u32 {
@@ -647,6 +673,9 @@ pub struct WorkerInfo {
     /// Physical latent pages including the reserved sentinel page, which
     /// [`WorkerInfo::latent_capacity_units`] excludes.
     pub latent_pages: u32,
+    /// The host latent pool of a video denoising rank whose host runs a
+    /// Storage Server; `None` otherwise, and in the group's aggregate.
+    pub latent_pool: Option<LatentPoolInfo>,
     /// Bytes of the persistent buffer pool this rank backs, which the engine
     /// places this rank's buffers in: on a media rank the products of the
     /// components it executes and of the components that read them.
@@ -840,6 +869,7 @@ impl Default for WorkerInfo {
             }),
             latent_page_units: 0,
             latent_pages: 0,
+            latent_pool: None,
             buffer_pool_bytes: 0,
             encoder_cache_entries: 0,
             encoder_entry_bytes: 0,

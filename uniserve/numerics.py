@@ -26,10 +26,13 @@ the weights, cache pages and encoder outputs it derived:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import importlib
 import json
+import re
 from collections.abc import Iterable
+from importlib import metadata
 
 import torch
 from torch import nn
@@ -42,10 +45,34 @@ from uniserve.errors import SetupError
 LOADER = "loading.loader/1"
 
 
+@functools.cache
+def _dependencies() -> dict[str, str]:
+    """The installed version of each distribution uniserve depends on, by
+    the top-level package it provides.
+    """  # noqa: D205
+    required = {
+        re.split(r"[\s;<>=!~\[(]", requirement, maxsplit=1)[0]
+        .lower()
+        .replace("_", "-")
+        for requirement in metadata.requires("uniserve") or ()
+    }
+    versions = {}
+    for package, distributions in metadata.packages_distributions().items():
+        for distribution in distributions:
+            if distribution.lower().replace("_", "-") in required:
+                versions[package] = metadata.version(distribution)
+    return versions
+
+
 def function(cls: type) -> str:
     """The function ``cls`` declares, or one of its bases does.
 
-    A module of PyTorch's computes PyTorch's documented function.
+    A module of PyTorch's computes PyTorch's documented function. A module
+    of a library uniserve depends on (a model package composing a
+    library's network, as MiniMax-H3's audio decoder composes diffusers'
+    BigVGAN) computes what the library's installed version computes: its
+    function is the class's qualified name at that version, which a
+    library upgrade changes.
 
     Raises:
         SetupError: No class of ``cls``'s hierarchy declares one.
@@ -53,6 +80,9 @@ def function(cls: type) -> str:
     # PyTorch's own modules compute what PyTorch documents them to compute.
     if cls.__module__.startswith("torch.nn"):
         return f"torch.nn.{cls.__qualname__}/1"
+    version = _dependencies().get(cls.__module__.split(".")[0])
+    if version is not None and "function" not in vars(cls):
+        return f"{cls.__module__}.{cls.__qualname__}/{version}"
     declared = getattr(cls, "function", None)
     if not isinstance(declared, str) or "/" not in declared:
         raise SetupError(

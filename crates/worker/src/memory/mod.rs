@@ -28,7 +28,10 @@ pub use products::{
 };
 pub use retained::{Exclusive, ExclusiveMemory, ExclusiveSpec, LocalMemory};
 
-pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};
+pub(crate) use latent::{
+    LatentExport, LatentHostPool, LatentImport, LatentPool, LatentUpdate, SlotPages,
+    TrajectoryVersion,
+};
 pub(crate) use output::{OutputLease, OutputPool};
 pub use pinned_pool::PinnedPool;
 pub(crate) use prefix_cache::block_tables::AttentionRow;

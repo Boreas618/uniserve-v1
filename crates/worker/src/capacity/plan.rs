@@ -231,6 +231,9 @@ fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
         prefix_cache: None,
         latent_page_units: 0,
         latent_pages: 0,
+        // A video denoising rank maps its host latent pool once its ledger
+        // is bound.
+        latent_pool: None,
         buffer_pool_bytes: 0,
         encoder_cache_entries: 0,
         encoder_entry_bytes: 0,

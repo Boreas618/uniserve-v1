@@ -575,7 +575,8 @@ fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
         matches!(
             terminal(&mut holder),
             Some(Event::Migratable {
-                cause: MigrationCause::Drain
+                cause: MigrationCause::Drain,
+                ..
             })
         ),
         "the request holding the tail is recomputed"
@@ -779,7 +780,8 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
     assert!(matches!(
         terminal(&mut running),
         Some(Event::Migratable {
-            cause: MigrationCause::Drain
+            cause: MigrationCause::Drain,
+            ..
         })
     ));
     assert_eq!(
@@ -820,7 +822,8 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
     assert!(matches!(
         terminal(&mut running),
         Some(Event::Migratable {
-            cause: MigrationCause::Drain
+            cause: MigrationCause::Drain,
+            ..
         })
     ));
     assert_eq!(

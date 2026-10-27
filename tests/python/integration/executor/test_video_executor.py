@@ -16,6 +16,11 @@ conditions), a denoising step writes the samples it read, unadvanced. A
 true predicate runs the call as an ungated call does; the steps compare
 exactly, as the image executor's do, because a predicated call runs the
 same kernels on the same inputs and selects their result.
+
+A resumed request's latent preparation restores the trajectory stored at a
+step boundary, each page of its slot a float32 host page of the host latent
+pool: the steps that follow compute exactly what the uninterrupted
+trajectory computed from that step.
 """
 
 from __future__ import annotations
@@ -145,14 +150,16 @@ class Worker:
         self.keyframe_rows = (self.width // 32) * (self.height // 32)
         self.frames = min(int(frames) for frames in manifest["frame_counts"])
 
-        # The latent banks the worker allocates: page zero is padding, then
-        # each request slot's pages of ``page_units`` float32 elements.
+        # The latent banks the worker allocates, ``[pages, page_units,
+        # width]`` with a video model's width of one: page zero is padding,
+        # then each request slot's pages of ``page_units`` float32 values.
         self.slot_pages = int(manifest["pages"]["pages"])
         self.banks = tuple(
             torch.zeros(
                 (
                     1 + SLOTS * self.slot_pages,
                     int(manifest["pages"]["page_units"]),
+                    1,
                 ),
                 dtype=torch.float32,
                 device=DEVICE,
@@ -244,11 +251,13 @@ class Worker:
         latent: dict,
         reads: list[torch.Tensor],
         predicate: bool | None,
+        stored: list[torch.Tensor] = (),
     ) -> None:
         """Run one call of ``kind``, gated by a device predicate if given.
 
-        The worker appends a predicated call's ``uint8 [1]`` predicate after
-        the batch's other tensors and names its position in the call's entry.
+        The worker appends a restoring preparation's stored pages after its
+        reads, and a predicated call's ``uint8 [1]`` predicate after the
+        batch's other tensors, naming its position in the call's entry.
         """
         entry = {
             "index": 0,
@@ -264,7 +273,7 @@ class Worker:
             "output_names": [],
             "latent": latent,
         }
-        tensors = list(reads)
+        tensors = [*reads, *stored]
         if predicate is not None:
             entry["predicate"] = len(tensors)
             tensors.append(
@@ -277,6 +286,13 @@ class Worker:
 
     def prepare_latents(self, slot, write, reads, predicate=None) -> None:
         self.run("latent_preparation", slot, {"write": write}, reads, predicate)
+
+    def restore(self, slot, write, reads, stored, predicate=None) -> None:
+        """Prepare ``slot`` from ``reads`` and restore ``stored``, one host
+        page per page of the slot, into bank ``write``.
+        """  # noqa: D205
+        latent = {"write": write, "restore": list(range(len(stored)))}
+        self.run("latent_preparation", slot, latent, reads, predicate, stored)
 
     def denoise(self, slot, read, write, step, predicate=None) -> None:
         latent = {"read": read, "write": write, "step": step}
@@ -339,3 +355,34 @@ def test_false_predicates_leave_the_trajectory_as_it_was(worker, slot):
     # A true preparation writes the request's noise as an ungated one does.
     worker.prepare_latents(slot, 1, own, predicate=True)
     assert torch.equal(worker.bank(1, slot), noise)
+
+
+@pytest.mark.parametrize("slot", [1, 2], ids=["text_to_video", "first_frame"])
+@torch.inference_mode()
+def test_a_restored_trajectory_continues_as_the_uninterrupted_one(worker, slot):
+    own = [worker.features(5)]
+    if slot == 2:
+        own.append(worker.keyframe(6))
+
+    # The uninterrupted trajectory: the noise in bank 0, its first step in
+    # bank 1 and its second in bank 0.
+    worker.prepare_latents(slot, 0, own)
+    worker.denoise(slot, 0, 1, 0)
+    first = worker.bank(1, slot)
+    worker.denoise(slot, 1, 0, 1)
+    second = worker.bank(0, slot)
+    assert not torch.equal(second, first)
+
+    # The trajectory stored at its first step, as the host latent pool
+    # holds it: one page-locked ``[page_units]`` float32 page per page of
+    # the slot.
+    stored = [page.reshape(-1).cpu().pin_memory() for page in first]
+    # A skipped restoring preparation keeps the bank it would write.
+    worker.restore(slot, 0, own, stored, predicate=False)
+    assert torch.equal(worker.bank(0, slot), second)
+    # A restoring preparation leaves the stored step in the bank it
+    # initializes, from which the next step is the uninterrupted one.
+    worker.restore(slot, 0, own, stored)
+    assert torch.equal(worker.bank(0, slot), first)
+    worker.denoise(slot, 0, 1, 1)
+    assert torch.equal(worker.bank(1, slot), second)

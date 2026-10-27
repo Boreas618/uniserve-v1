@@ -78,14 +78,16 @@ impl Denoising {
     /// Returns the steps covered once the request's submitted calls complete.
     ///
     /// `pending` lists the request's submitted media calls in submission
-    /// order: latent preparation opens a trajectory and image decoding closes
-    /// one, both leaving it at step zero, and each denoising call covers the
-    /// next step of the schedule.
-    pub(crate) fn scheduled(&self, pending: impl IntoIterator<Item = MediaCall>) -> u32 {
+    /// order, each with the step a latent preparation opens its trajectory
+    /// at: zero, or the stored step it restores. Image decoding closes a
+    /// trajectory, leaving it at step zero, and each denoising call covers
+    /// the next step of the schedule.
+    pub(crate) fn scheduled(&self, pending: impl IntoIterator<Item = (MediaCall, u32)>) -> u32 {
         pending
             .into_iter()
-            .fold(self.completed, |steps, call| match call {
-                MediaCall::LatentPreparation | MediaCall::ImageDecoding => 0,
+            .fold(self.completed, |steps, (call, opened)| match call {
+                MediaCall::LatentPreparation => opened,
+                MediaCall::ImageDecoding => 0,
                 MediaCall::Denoising => steps.saturating_add(1),
                 _ => steps,
             })
@@ -114,10 +116,18 @@ impl Denoising {
         }
     }
 
-    /// Opens a trajectory at step zero with its prepared latent.
-    pub(crate) fn open(&mut self, latent: Option<TensorRef>) {
-        self.completed = 0;
+    /// Opens a trajectory at step `step`, with its prepared latent: zero, or
+    /// the stored step a video request's latent preparation restored.
+    /// Returns `false`, leaving progress unchanged, for a restored step that
+    /// leaves no denoising step of the schedule, which a preemption never
+    /// stores.
+    pub(crate) fn open(&mut self, step: u32, latent: Option<TensorRef>) -> bool {
+        if step > 0 && step >= self.steps {
+            return false;
+        }
+        self.completed = step;
         self.latent = latent;
+        true
     }
 
     /// Accepts a completed denoising call and its successor latent.

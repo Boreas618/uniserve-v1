@@ -6,6 +6,9 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod storage;
+pub(crate) mod video;
+
 use engine::{Executor, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use ipc::{CallKind, ForwardMode, MediaCall};

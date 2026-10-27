@@ -7,10 +7,14 @@
 //! other bank's pages, so a failed batch never disturbs the committed version.
 //! The executor reads and writes the banks itself; the computations' ledger
 //! (`crate::executor::latents`) decides which pages and banks each call
-//! addresses.
+//! addresses. A video denoising rank also maps a host latent pool
+//! ([`LatentHostPool`]), which a preempted request's trajectory is written to
+//! and a resumed one's is restored from.
 
+mod host;
 mod memory;
 mod pages;
 
+pub(crate) use host::{LatentHostPool, SlotPages};
 pub use memory::{LatentPlan, LatentStorage};
 pub(crate) use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};

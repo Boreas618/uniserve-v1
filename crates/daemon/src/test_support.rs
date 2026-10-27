@@ -180,6 +180,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         segments: Vec::new(),
         prefix_seed: 0,
         capacity: None,
+        latent_seed: 0,
     };
     let model_name = first.model_name().to_owned();
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");

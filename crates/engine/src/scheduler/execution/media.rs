@@ -10,6 +10,13 @@
 use super::*;
 use ipc::MediaCall;
 
+/// Denoising steps one video request keeps in flight: the step its
+/// denoiser runs and the next, queued behind it so that the denoiser never
+/// waits for the host between steps. A preemption (a park, a sleep, a
+/// weight update) therefore meets the request at a step boundary within
+/// that many steps, rather than after every step of its schedule.
+pub(in crate::scheduler) const DENOISING_LOOKAHEAD: usize = 2;
+
 /// What one media call occupies while it is in flight.
 ///
 /// On a component whose capacity is measured in media units the call
@@ -194,12 +201,31 @@ impl Scheduler {
         if !ready.is_empty() || encoding_remains || !state.text_encoding_scheduled {
             return ready;
         }
+        // A resumed request's preparation waits until its stored
+        // trajectory's pages are pinned, or found missing.
         if !state.latent_preparation_scheduled {
+            if state.restoring == Restoring::Pinning {
+                return Vec::new();
+            }
             return vec![MediaCall::LatentPreparation];
         }
         if self.scheduled_steps(state.request.request_id, &state.denoising)
             < state.denoising.steps()
         {
+            // A request keeps at most `DENOISING_LOOKAHEAD` steps in flight,
+            // so a preemption meets it at a step boundary within that many
+            // steps.
+            let in_flight = self
+                .inflight
+                .pending_calls
+                .get(&state.request.request_id)
+                .into_iter()
+                .flatten()
+                .filter(|pending| pending.call.kind == CallKind::Media(MediaCall::Denoising))
+                .count();
+            if in_flight >= DENOISING_LOOKAHEAD {
+                return Vec::new();
+            }
             return vec![MediaCall::Denoising];
         }
 
@@ -246,7 +272,14 @@ impl Scheduler {
                 .into_iter()
                 .flatten()
                 .filter_map(|pending| match pending.call.kind {
-                    CallKind::Media(media_call) => Some(media_call),
+                    CallKind::Media(media_call) => Some((
+                        media_call,
+                        pending
+                            .call
+                            .latent_restore
+                            .as_ref()
+                            .map_or(0, |restore| restore.steps),
+                    )),
                     _ => None,
                 }),
         )
@@ -882,6 +915,14 @@ impl Scheduler {
             output_starts.push((reservation.clone(), start));
         }
 
+        // A resumed request's preparation opens the stored trajectory its
+        // restore pinned.
+        let latent_restore = match &state.restoring {
+            Restoring::Ready(restore) if media_call == MediaCall::LatentPreparation => {
+                restore.clone()
+            }
+            _ => None,
+        };
         let completion_output = if outputs.is_empty() && stateful {
             Some(self.media_completion_product(request_key, call_id)?)
         } else {
@@ -894,6 +935,7 @@ impl Scheduler {
         call.outputs = outputs;
         call.completion_output = completion_output;
         call.predicate = predicate;
+        call.latent_restore = latent_restore;
 
         // Record what this call schedules: the admission it carries, the
         // reservation slice each product binds to, and the cursors that
@@ -940,7 +982,10 @@ impl Scheduler {
                     state.condition_audio_latents = Some(product);
                 }
             }
-            MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
+            MediaCall::LatentPreparation => {
+                state.latent_preparation_scheduled = true;
+                state.restoring = Restoring::Planned;
+            }
             // Submitted steps are derived from the pending denoising calls.
             MediaCall::Denoising => {}
             MediaCall::VideoDecoding => {

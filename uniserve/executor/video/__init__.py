@@ -20,6 +20,7 @@ reads and writes and its evaluation index.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import prod
@@ -353,9 +354,33 @@ class VideoExecutor:
             )
             + (overlap_bytes(model, plan) if self.decoding else 0),
             "stores_latent": self.denoising,
+            "latent_region": self._latent_region() if self.denoising else None,
             "units": len(model.unit_frames(plan.max_frames)),
             "frame_counts": plan.frame_counts,
         }
+
+    def _latent_region(self) -> str:
+        """What this rank's latent pages mean besides the denoiser's numerics.
+
+        A stored trajectory's pages are the rank's share of a request's
+        samples in the layout the plan admits the request to: the plan (its
+        canvases, frame counts, capacities and startup layouts), the slot's
+        pages and the rank's coordinates in the denoiser's mesh fix what
+        every value is. Lowercase hexadecimal SHA-256, which keys the
+        trajectories the rank stores in its host latent pool.
+        """
+        mesh = self.model.denoiser.mesh
+        digest = hashlib.sha256()
+        for part in (
+            "uniserve-latent-region/1",
+            repr(self.plan),
+            repr(self.pages),
+            repr((mesh.axes, mesh.shape, mesh.coordinate(mesh.rank))),
+        ):
+            encoded = part.encode()
+            digest.update(len(encoded).to_bytes(8, "little"))
+            digest.update(encoded)
+        return digest.hexdigest()
 
     # Startup.
 
@@ -769,7 +794,10 @@ class VideoExecutor:
         follow them all (:mod:`uniserve.executor.predicates`). A predicated
         call runs whatever its predicate holds: when it is false, latent
         preparation keeps the bank it would write and the slot's tables and
-        conditioning, and denoising writes the samples it read.
+        conditioning, and denoising writes the samples it read. A latent
+        preparation that restores a stored trajectory reads the stored
+        pages after its writes, one ``[page_units]`` float32 host tensor per
+        page its ``latent["restore"]`` lists.
         Returns how each call's forward ran.
         """
         tensors, predicates = split(step["calls"], tensors)
@@ -778,7 +806,8 @@ class VideoExecutor:
         for entry, prepared in zip(
             step["calls"], step["prepared"], strict=True
         ):
-            count = len(prepared["reads"]) + len(prepared["writes"])
+            restored = len((entry.get("latent") or {}).get("restore") or ())
+            count = len(prepared["reads"]) + len(prepared["writes"]) + restored
             own = list(tensors[cursor : cursor + count])
             cursor += count
             if entry["refused"]:
@@ -789,7 +818,11 @@ class VideoExecutor:
                 modes.append(EAGER)
                 continue
             reads = own[: len(prepared["reads"])]
-            writes = own[len(prepared["reads"]) :]
+            writes = own[len(prepared["reads"]) : len(own) - restored]
+            if restored:
+                # The stored pages follow the writes; only a latent
+                # preparation reads them.
+                entry = {**entry, "stored": own[len(own) - restored :]}
             run = getattr(self, f"_run_{kind}")
             predicate = predicates.get(int(entry["index"]))
             if kind in _PREDICATED_CALLS:
@@ -1010,11 +1043,21 @@ class VideoExecutor:
         layout = admission.layout
         denoiser = self.denoiser
         # The request's noise and the host sources its slot is initialized
-        # from.
+        # from. A resumed request's samples are then those of the stored
+        # step the worker commits it at; its tables and conditioning follow
+        # from the request as for step zero.
         denoiser.prepare_latents(layout, slot, admission.size, record.seed)
-        denoiser.initialize(
-            layout, slot, int(entry["latent"]["write"]), predicate
-        )
+        bank = int(entry["latent"]["write"])
+        denoiser.initialize(layout, slot, bank, predicate)
+        restore = entry["latent"].get("restore")
+        if restore:
+            denoiser.restore(
+                slot,
+                bank,
+                [int(page) for page in restore],
+                entry["stored"],
+                predicate,
+            )
         mode = EAGER
         conditions = reads
         if denoiser.conditions:

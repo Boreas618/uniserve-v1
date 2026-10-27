@@ -8,6 +8,7 @@ mod canvas;
 mod control_plane;
 mod image_ipc;
 mod media_occupancy;
+mod media_preemption;
 mod migration;
 mod multiproc_ipc;
 mod readout;

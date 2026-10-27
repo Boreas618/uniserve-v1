@@ -409,7 +409,8 @@ impl RequestState {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
                 if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
-                    self.denoising.open(call.latent_output.clone());
+                    // An image trajectory always opens at step zero.
+                    self.denoising.open(0, call.latent_output.clone());
                     self.phase = GenerationPhase::Denoising;
                 } else {
                     let accepted = self

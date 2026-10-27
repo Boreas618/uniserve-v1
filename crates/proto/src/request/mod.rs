@@ -21,6 +21,7 @@ pub use dtype::{ModelDtype, ModelDtypeParseError};
 pub use event::{
     ArtifactEvent, ArtifactMedia, ConditionExtent, DiffusionRequest, DiffusionRequestError, Event,
     FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind, Request, StopReason,
+    Trajectory,
 };
 pub use generation::{
     CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,

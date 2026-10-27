@@ -310,6 +310,17 @@ impl WorkerExecutor {
                 (id.clone(), caches)
             })
             .collect();
+        // Each video denoising rank reports its own host latent pool.
+        executor_info.rank_latents = workers
+            .iter()
+            .map(|(id, worker)| {
+                let pools = (0..)
+                    .map_while(|rank| worker.worker_info(rank))
+                    .map(|info| (info.endpoint.host.clone(), info.latent_pool.clone()))
+                    .collect();
+                (id.clone(), pools)
+            })
+            .collect();
         // The video graph may span workers, so each group learns the whole
         // deployment's routing to name the ranks that read its products.
         let media_routing = executor_info.media_routing()?;

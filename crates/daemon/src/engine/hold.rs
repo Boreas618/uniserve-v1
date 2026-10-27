@@ -32,9 +32,23 @@ pub struct RequestHold {
     serving: watch::Sender<Serving>,
     /// Whether submissions wait although an engine serves.
     paused: watch::Sender<bool>,
-    /// The world whose requests continue with the state they reached when
-    /// they migrate, and the prefix seed of that state (`Self::kept`).
-    kept: std::sync::Mutex<Option<(u64, u64)>>,
+    /// The state the requests migrating out of a world continue with
+    /// (`Self::kept`).
+    kept: std::sync::Mutex<Option<Kept>>,
+}
+
+/// The state the requests migrating out of world `world` continue with,
+/// although the world that serves next computes other numerics: a world
+/// change's `in_flight = keep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kept {
+    pub world: u64,
+    /// The prefix seed of the pages a token request continues with
+    /// (`CachePolicy::state_seed`), when the worlds' pages differ.
+    pub prefix_seed: Option<u64>,
+    /// The latent seed of the trajectories a video request continues with
+    /// (`Trajectory::state_seed`), when the worlds' trajectories differ.
+    pub latent_seed: Option<u64>,
 }
 
 /// What a hold does with a submission now.
@@ -64,26 +78,23 @@ impl RequestHold {
         }
     }
 
-    /// Has the requests that migrate out of world `world` continue with the
-    /// state they reached there, whose pages are rooted at `seed`
-    /// (`CachePolicy::state_seed`): a world change's `in_flight = keep`
-    /// when the world that serves next computes other numerics. `None`
-    /// ends it.
-    pub fn keep(&self, kept: Option<(u64, u64)>) {
+    /// Has the requests that migrate out of `kept.world` continue with the
+    /// state they reached there: a world change's `in_flight = keep` when
+    /// the world that serves next computes other numerics. `None` ends it.
+    pub fn keep(&self, kept: Option<Kept>) {
         *self
             .kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = kept;
     }
 
-    /// The prefix seed of the state a request migrating out of world `world`
-    /// continues with, if it keeps it.
-    pub fn kept(&self, world: u64) -> Option<u64> {
+    /// The state a request migrating out of world `world` continues with,
+    /// if it keeps it.
+    pub fn kept(&self, world: u64) -> Option<Kept> {
         self.kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .filter(|(kept, _)| *kept == world)
-            .map(|(_, seed)| seed)
+            .filter(|kept| kept.world == world)
     }
 
     /// Holds later submissions until [`Self::resume`], whatever engine

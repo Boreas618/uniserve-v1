@@ -330,6 +330,7 @@ mod tests {
                 width: 1344,
                 height: 768,
             },
+            trajectory: Default::default(),
         }
     }
 

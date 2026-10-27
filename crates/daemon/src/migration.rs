@@ -1,34 +1,41 @@
-//! Request migration: how a token request moves between engines.
+//! Request migration: how a token or video request moves between engines.
 //!
-//! An engine that parks for a world change or a rollback, or loses the
-//! workers that hold a request, ends the request as migratable (`Event::Migratable`) after every
-//! token it generated there. The leader submits every request through its
-//! [`Migrator`], which keeps each token request's generated tokens and, on
-//! that event, submits the request again with them
-//! (`GenerationRequest::generated_token_ids`) through the hold to the engine
-//! that serves next. The request's consumer reads one stream throughout
-//! ([`RequestEvents`]): the new engine continues after the last token it
-//! received and charges the request's whole usage, and the daemon's
-//! detokenizer, stop-string matcher and response assembly keep their state.
+//! An engine that parks for a world change or a rollback, sleeps, rewrites
+//! its weights in place, or loses the workers that hold a request, ends the
+//! request as migratable (`Event::Migratable`): a token request after every
+//! token it generated there, a video request at a denoising step boundary,
+//! with the steps of its trajectory the engine stored. The leader submits
+//! every request through its [`Migrator`], which keeps each token request's
+//! generated tokens and each video request's stored steps and, on that
+//! event, submits the request again with them
+//! (`GenerationRequest::generated_token_ids`, `Trajectory::denoised_steps`)
+//! through the hold to the engine that serves next. The request's consumer
+//! reads one stream throughout ([`RequestEvents`]): the new engine
+//! continues after the last token it received and charges the request's
+//! whole usage, or continues the trajectory from the stored step, and the
+//! daemon's detokenizer, stop-string matcher and response assembly keep
+//! their state.
 //!
 //! A migration caused by a drain is not counted. A request survives
 //! `max_migrations` migrations caused by losses and fails on the next one.
-//! A request that does not resume from its tokens (an image, a readout, a
-//! video) fails when its engine ends it as migratable.
+//! A request that does not resume (an image, a readout) fails when its
+//! engine ends it as migratable.
 //!
 //! The random stream of a migrated request continues as it began: the
 //! migrator gives a request that names no seed one of its own when it is
 //! first submitted, and every draw of a seeded request follows its seed and
-//! its token position alone.
+//! its token position alone. A video request's draws follow its seed, and
+//! the migrator gives it the identity that keys its stored trajectory
+//! (`Trajectory::id`) when it is first submitted.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use proto::request::{Event, GenerationRequest, MigrationCause, Request};
+use proto::request::{DiffusionRequest, Event, GenerationRequest, MigrationCause, Request};
 use tokio::sync::mpsc;
 
 use crate::engine::client::{EventStream, StreamCancelCause, SubmitError};
-use crate::engine::hold::RequestHold;
+use crate::engine::hold::{Kept, RequestHold};
 
 /// Submits the leader's requests and moves its token requests between
 /// engines.
@@ -55,9 +62,10 @@ impl Migrator {
 
     /// Submits `request` through the hold and returns its events and the
     /// scheduler serving it, as `RequestHold::submit` does. A token request
-    /// that resumes from its tokens is kept for a later migration; one that
-    /// names no seed takes one first, so that its draws repeat on the engine
-    /// that serves it next.
+    /// that resumes from its tokens, and a video request, are kept for a
+    /// later migration; a token request that names no seed takes one first,
+    /// so that its draws repeat on the engine that serves it next, and a
+    /// video request takes its trajectory's identity.
     ///
     /// # Errors
     ///
@@ -71,9 +79,15 @@ impl Migrator {
                 if generation.sampling.seed.is_none() {
                     generation.sampling.seed = Some(uuid::Uuid::new_v4().as_u64_pair().0);
                 }
-                Some((**generation).clone())
+                Some(Resumable::Generation(generation.clone()))
             }
-            Request::Generation(_) | Request::Diffusion(_) => None,
+            Request::Diffusion(diffusion) => {
+                if diffusion.trajectory.id == 0 {
+                    diffusion.trajectory.id = uuid::Uuid::new_v4().as_u64_pair().0;
+                }
+                Some(Resumable::Diffusion(diffusion.clone()))
+            }
+            Request::Generation(_) => None,
         };
         let (stream, scheduler) = self.hold.submit(request).await?;
         let events = RequestEvents {
@@ -92,6 +106,71 @@ impl Migrator {
     }
 }
 
+/// A request a migration submits again, as last submitted.
+#[derive(Clone)]
+enum Resumable {
+    /// A token request, with the tokens it generated before.
+    Generation(Box<GenerationRequest>),
+    /// A video request, naming the trajectory steps an engine stored.
+    Diffusion(DiffusionRequest),
+}
+
+impl Resumable {
+    /// The request a migration for `cause` submits again: a token request
+    /// with the tokens it generated, a video request naming the trajectory
+    /// steps its engine stored (`denoised_steps`, zero for none). `kept`
+    /// is the state a world change keeps of the requests in flight
+    /// (`in_flight = keep`), which the request continues with when the
+    /// world that serves next computes other numerics.
+    fn continuation(
+        &self,
+        cause: MigrationCause,
+        denoised_steps: u32,
+        kept: Option<Kept>,
+    ) -> Request {
+        match self {
+            Self::Generation(request) => {
+                let mut continuation = request.as_ref().clone();
+                // Its prompt's log-probabilities were reported where it began.
+                continuation.sampling.return_prompt_logprobs = false;
+                continuation.sampling.n_prompt_logprobs = 0;
+                // It reads the pages of the state it reached and writes none,
+                // since its later pages are neither world's.
+                if let Some(seed) = kept.and_then(|kept| kept.prefix_seed) {
+                    continuation.cache.state_seed = Some(seed);
+                    continuation.cache.write = false;
+                }
+                tracing::info!(
+                    ?cause,
+                    generated = request.generated_token_ids.len(),
+                    "a request migrated to the engine that serves next"
+                );
+                Request::Generation(Box::new(continuation))
+            }
+            Self::Diffusion(request) => {
+                let mut continuation = request.clone();
+                // The engine stored the trajectory at a step boundary, keyed
+                // by what it computes: the next engine reads it when it
+                // computes the same, or when a world change keeps the state
+                // the request reached. A request the engine stored nothing
+                // of names the trajectory it named before, which is the
+                // same at that step whenever it is read.
+                if denoised_steps > 0 {
+                    continuation.trajectory.denoised_steps = denoised_steps;
+                    continuation.trajectory.state_seed = kept.and_then(|kept| kept.latent_seed);
+                }
+                tracing::info!(
+                    ?cause,
+                    denoised_steps = continuation.trajectory.denoised_steps,
+                    stored = denoised_steps > 0,
+                    "a video request migrated to the engine that serves next"
+                );
+                Request::Diffusion(continuation)
+            }
+        }
+    }
+}
+
 /// One request's events across the engines that serve it.
 ///
 /// It offers what an `EventStream` offers. An `Event::Migratable` never
@@ -102,17 +181,19 @@ impl Migrator {
 pub struct RequestEvents {
     /// The events of the engine that serves the request now.
     stream: EventStream,
-    /// The request as last submitted, with the tokens it generated before;
-    /// `None` for a request that does not resume from its tokens.
-    request: Option<GenerationRequest>,
+    /// The request as last submitted, with the tokens it generated before
+    /// or the trajectory steps an engine stored; `None` for a request that
+    /// does not resume.
+    request: Option<Resumable>,
     /// The hold the request migrates through; `None` for a stream no
     /// engine feeds.
     hold: Option<Arc<RequestHold>>,
     max_migrations: u32,
     /// Migrations caused by losses so far.
     losses: u32,
-    /// A migration `try_recv` met, which the next `recv` carries out.
-    pending: Option<MigrationCause>,
+    /// A migration `try_recv` met, which the next `recv` carries out, with
+    /// the trajectory steps the engine stored.
+    pending: Option<(MigrationCause, u32)>,
     /// Whether the stream resumed on another engine, whose scheduling event
     /// repeats one the consumer received.
     resumed: bool,
@@ -151,15 +232,18 @@ impl RequestEvents {
     /// Receives the next event; `None` once the request ended.
     pub async fn recv(&mut self) -> Option<Event> {
         loop {
-            if let Some(cause) = self.pending.take() {
-                match self.migrate(cause).await {
+            if let Some((cause, denoised_steps)) = self.pending.take() {
+                match self.migrate(cause, denoised_steps).await {
                     Ok(()) => continue,
                     Err(event) => return self.deliver(Some(event)),
                 }
             }
             let event = self.stream.recv().await;
             match event {
-                Some(Event::Migratable { cause }) => self.pending = Some(cause),
+                Some(Event::Migratable {
+                    cause,
+                    denoised_steps,
+                }) => self.pending = Some((cause, denoised_steps)),
                 Some(event) if self.skips(&event) => {}
                 event => return self.deliver(event),
             }
@@ -185,7 +269,10 @@ impl RequestEvents {
                 return Err(mpsc::error::TryRecvError::Empty);
             }
             match self.stream.try_recv() {
-                Ok(Event::Migratable { cause }) => self.pending = Some(cause),
+                Ok(Event::Migratable {
+                    cause,
+                    denoised_steps,
+                }) => self.pending = Some((cause, denoised_steps)),
                 Ok(event) if self.skips(&event) => {}
                 Ok(event) => {
                     self.observe(&event);
@@ -259,20 +346,22 @@ impl RequestEvents {
                 "a migrated request generates on the engine that serves it"
             );
         }
-        if let Some(request) = &mut self.request {
+        if let Some(Resumable::Generation(request)) = &mut self.request {
             request.generated_token_ids.extend_from_slice(ids);
         }
     }
 
-    /// Submits the request again, with its generated tokens, to the engine
-    /// that serves next, and goes on with that engine's events.
+    /// Submits the request again, with its generated tokens or the
+    /// trajectory steps the engine stored (`denoised_steps`, zero for
+    /// none), to the engine that serves next, and goes on with that
+    /// engine's events.
     ///
     /// # Errors
     ///
     /// Returns the terminal event the consumer receives instead: the
-    /// request does not resume from its tokens, was cancelled, lost its
-    /// engine more often than it may, or could not be submitted again.
-    async fn migrate(&mut self, cause: MigrationCause) -> Result<(), Event> {
+    /// request does not resume, was cancelled, lost its engine more often
+    /// than it may, or could not be submitted again.
+    async fn migrate(&mut self, cause: MigrationCause, denoised_steps: u32) -> Result<(), Event> {
         let started = Instant::now();
         let failed = |message: String| Event::Error { message };
         if !self.open {
@@ -295,29 +384,23 @@ impl RequestEvents {
             self.losses += 1;
         }
         let hold = Arc::clone(hold);
-        let mut continuation = request.clone();
-        // Its prompt's log-probabilities were reported where it began.
-        continuation.sampling.return_prompt_logprobs = false;
-        continuation.sampling.n_prompt_logprobs = 0;
         // A request a world change moves to a world computing other
-        // numerics continues with the state it reached (`in_flight = keep`):
-        // it reads that state's pages and writes none, since its later pages
-        // are neither world's.
-        if cause == MigrationCause::Drain
-            && let Some(seed) = self.stream.world().and_then(|world| hold.kept(world))
-        {
-            continuation.cache.state_seed = Some(seed);
-            continuation.cache.write = false;
-        }
+        // numerics continues with the state it reached (`in_flight = keep`).
+        let kept = match cause {
+            MigrationCause::Drain => self.stream.world().and_then(|world| hold.kept(world)),
+            MigrationCause::Loss => None,
+        };
+        let continuation = request.continuation(cause, denoised_steps, kept);
         let (stream, _scheduler) = hold
-            .submit(Request::Generation(Box::new(continuation)))
+            .submit(continuation.clone())
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
-        tracing::info!(
-            ?cause,
-            generated = request.generated_token_ids.len(),
-            "a request migrated to the engine that serves next"
-        );
+        // The next migration submits the request as submitted now.
+        if let (Request::Diffusion(submitted), Some(Resumable::Diffusion(request))) =
+            (&continuation, &mut self.request)
+        {
+            *request = submitted.clone();
+        }
         // The previous engine's stream ended with its migratable event.
         self.stream = stream;
         self.resumed = true;
@@ -351,7 +434,8 @@ mod tests {
 
     use engine::{EngineConfig, SimEngine};
     use proto::request::{
-        GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, SamplingParams,
+        DiffusionSamplingParams, GenerationConstraint, GenerationRequest, ImageGenerationConfig,
+        ImageParams, SamplingParams, Trajectory,
     };
 
     use super::*;
@@ -461,7 +545,7 @@ mod tests {
     ) -> RequestEvents {
         RequestEvents {
             stream: EventStream::detached(events),
-            request: Some(request(8)),
+            request: Some(Resumable::Generation(Box::new(request(8)))),
             hold: Some(hold),
             max_migrations,
             losses: 0,
@@ -482,6 +566,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(Event::Migratable {
             cause: MigrationCause::Loss,
+            denoised_steps: 0,
         })
         .unwrap();
         let mut events = resumable(rx, hold, 0);
@@ -493,6 +578,75 @@ mod tests {
         }
     }
 
+    /// A video request leaves its engine naming the trajectory steps the
+    /// engine stored: it is submitted again with them and its trajectory's
+    /// identity, reading the stored trajectory under the next world's own
+    /// latent seed, or under the parked world's when a world change keeps
+    /// the state of the requests in flight. A migration that stored nothing
+    /// submits the request naming what it named before.
+    #[test]
+    fn a_video_request_migrates_with_the_steps_its_engine_stored() {
+        let video = DiffusionRequest {
+            request_id: Default::default(),
+            task: "t2va".to_owned(),
+            prompt_token_ids: vec![1, 2],
+            conditioning: Vec::new(),
+            conditions: Vec::new(),
+            priority: 0,
+            sampling: DiffusionSamplingParams {
+                num_frames: 25,
+                video_units: 1,
+                seed: 3,
+                width: 64,
+                height: 32,
+            },
+            trajectory: Trajectory {
+                id: 7,
+                ..Trajectory::default()
+            },
+        };
+        let trajectory = |request: Request| match request {
+            Request::Diffusion(request) => request.trajectory,
+            Request::Generation(_) => panic!("a video request migrates as one"),
+        };
+        let resumable = Resumable::Diffusion(video.clone());
+        let stored = trajectory(resumable.continuation(MigrationCause::Drain, 3, None));
+        assert_eq!(
+            stored,
+            Trajectory {
+                id: 7,
+                denoised_steps: 3,
+                state_seed: None,
+            }
+        );
+        let kept = Kept {
+            world: 1,
+            prefix_seed: None,
+            latent_seed: Some(11),
+        };
+        assert_eq!(
+            trajectory(resumable.continuation(MigrationCause::Drain, 3, Some(kept))).state_seed,
+            Some(11)
+        );
+
+        let named = Resumable::Diffusion(DiffusionRequest {
+            trajectory: Trajectory {
+                id: 7,
+                denoised_steps: 3,
+                state_seed: Some(11),
+            },
+            ..video
+        });
+        assert_eq!(
+            trajectory(named.continuation(MigrationCause::Loss, 0, None)),
+            Trajectory {
+                id: 7,
+                denoised_steps: 3,
+                state_seed: Some(11),
+            }
+        );
+    }
+
     /// A request that does not resume from its tokens fails when its engine
     /// ends it as migratable.
     #[tokio::test]
@@ -500,6 +654,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(Event::Migratable {
             cause: MigrationCause::Drain,
+            denoised_steps: 0,
         })
         .unwrap();
         let mut events = RequestEvents::detached(rx);

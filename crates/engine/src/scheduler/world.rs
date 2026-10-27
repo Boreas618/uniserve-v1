@@ -5,7 +5,9 @@
 //!
 //! - **Park** (the serving world, at a promotion): at its next step boundary
 //!   the scheduler ends every request that resumes from its generated tokens
-//!   as migratable, lets the others finish, and once nothing runs, offloads
+//!   as migratable, ends every video request as migratable at its next
+//!   denoising step boundary once its trajectory is stored (`preemption`),
+//!   lets the others finish, and once nothing runs, offloads
 //!   the pages it reserved for the host KV cache and executes nothing more.
 //!   It answers with its prefix cache index: every published page with its
 //!   units, which the successor reads from the planes it maps read-only.
@@ -105,6 +107,9 @@ impl Scheduler {
             .collect();
         tracing::info!("parking: the requests that resume elsewhere end as migratable");
         self.migrate_requests(MigrationCause::Drain);
+        // Video requests leave at their next denoising step boundary, their
+        // trajectories stored for the world that serves next.
+        self.preempt_media(MigrationCause::Drain, |_| true);
         self.parking = Some(Parking {
             answer,
             held_units: migrating.iter().sum(),

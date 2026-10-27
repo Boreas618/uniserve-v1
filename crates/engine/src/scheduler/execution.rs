@@ -186,6 +186,7 @@ impl Scheduler {
         // made, so subsequent ready completions are handled on successive turns.
         progressed |= self.poll_one_result();
         progressed |= self.poll_kv_offload();
+        progressed |= self.poll_trajectories();
 
         progressed |= self.refill_executor();
         self.poll_resize();

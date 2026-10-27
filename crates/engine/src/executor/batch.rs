@@ -106,12 +106,15 @@ pub struct ExecutionBatch {
 }
 
 /// Published pages one worker group writes to the host KV cache, for
-/// every rank of the group (`PageCopy::rank`). The group runs every call
-/// of a batch that carries them; a batch without calls carries only them.
+/// every rank of the group (`PageCopy::rank`), and preempted video
+/// trajectories it writes to its host latent pools (`LatentPageCopy::rank`).
+/// The group runs every call of a batch that carries them; a batch without
+/// calls carries only them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageOffloads {
     pub worker: WorkerGroupId,
     pub pages: Vec<ipc::PageCopy>,
+    pub latents: Vec<ipc::LatentOffload>,
 }
 
 impl ExecutionBatch {
@@ -300,6 +303,8 @@ impl ExecutionBatch {
             calls.push(call);
         }
 
+        let (page_offloads, latent_offloads) =
+            page_offloads.map_or_else(Default::default, |writes| (writes.pages, writes.latents));
         let batch = Batch {
             batch_id,
             collective_seq,
@@ -314,7 +319,8 @@ impl ExecutionBatch {
             input_products,
             cache_inputs,
             page_loads,
-            page_offloads: page_offloads.map_or_else(Vec::new, |writes| writes.pages),
+            page_offloads,
+            latent_offloads,
         };
         batch.validate_unplaced()?;
         Ok((batch, rank_buffers))

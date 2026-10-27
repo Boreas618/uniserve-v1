@@ -395,8 +395,11 @@ impl WorkerGroup {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
 
-        // Rank 0's report becomes the group's.
+        // Rank 0's report becomes the group's. A rank's host latent pool is
+        // its own, which the executor keeps rank by rank
+        // (`ExecutorInfo::rank_latents`).
         let mut info = workers[0].info().clone();
+        info.latent_pool = None;
 
         // A rank's product storage follows the components it holds, which an
         // asymmetric placement makes rank-specific: a rank that executes or

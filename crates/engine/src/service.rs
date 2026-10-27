@@ -1083,14 +1083,20 @@ fn wire_cache(group: crate::scheduler::GroupCache) -> wire::CacheSegments {
 }
 
 /// Answers the requests a parked engine is submitted: a token request that
-/// resumes from its generated tokens leaves at once as migratable, as the
-/// ones it held did, and any other is refused.
+/// resumes from its generated tokens, and a video request, leave at once as
+/// migratable, as the ones it held did, and any other is refused.
 fn refuse_parked(submit: wire::Submit, front: usize, routing: &Routing) {
     for message in submit.requests {
         let id = RequestId(message.id);
         let event = match Request::from_wire(message) {
             Ok(Request::Generation(request)) if request.is_migratable() => Event::Migratable {
                 cause: MigrationCause::Drain,
+                denoised_steps: 0,
+            },
+            // A video request leaves naming the trajectory it named.
+            Ok(Request::Diffusion(_)) => Event::Migratable {
+                cause: MigrationCause::Drain,
+                denoised_steps: 0,
             },
             Ok(_) => Event::Error {
                 message: "the engine is parked and admits no request".to_owned(),
@@ -1369,6 +1375,7 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
                 .as_ref()
                 .map_or("", |cache| cache.identity.as_str()),
         ),
+        latent_seed: first.latent_seed(),
     };
     // A successor prepared beside its predecessor serves once the daemon
     // promotes it, with the predecessor's prefix cache index.

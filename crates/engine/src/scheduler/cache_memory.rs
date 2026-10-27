@@ -14,9 +14,11 @@
 //! does). A restore creates the tail again, all of it or as many segments
 //! as the memory now holds. A sleep gives back every segment and the CUDA
 //! graph memory once no request runs, and admits nothing until a wake
-//! restores both. An in-place weight update recomputes the requests as a
-//! sleep does and rewrites the weights while the workers sleep, so that the
-//! cache's memory holds the new checkpoint as it loads.
+//! restores both; it preempts video requests at their next denoising step
+//! boundary, which resume from the trajectories stored there once it wakes.
+//! An in-place weight update recomputes the requests as a sleep does and
+//! rewrites the weights while the workers sleep, so that the cache's memory
+//! holds the new checkpoint as it loads.
 
 use super::ledger::{CacheMemory, Preparing, growable, preparing};
 use super::*;
@@ -171,6 +173,10 @@ impl Scheduler {
             crate::WeightsInFlight::Recompute => {}
         }
         self.withdraw_from(0, true);
+        // Video requests are preempted at their next denoising step boundary
+        // and resume on the new weights, which compute other trajectories:
+        // they start from noise.
+        self.preempt_media(MigrationCause::Drain, |_| true);
         self.resizing = Some(PendingResize {
             change: Pending::Weights(model_path),
             answer,
@@ -347,6 +353,26 @@ impl Scheduler {
             cache
                 .coordinator
                 .set_seed(crate::kv_cache::prefix_seed(&identity));
+        }
+        // The trajectories the new weights compute are keyed apart from the
+        // old ones.
+        if let Some(store) = self.trajectories.as_mut() {
+            let identities: Vec<String> = results
+                .iter()
+                .filter_map(|result| {
+                    let value: serde_json::Value = serde_json::from_str(result).ok()?;
+                    let group = value.get("group")?.as_str()?;
+                    store
+                        .serves(&crate::WorkerGroupId(group.to_owned()))
+                        .then(|| value.get("identity")?.as_str().map(str::to_owned))
+                        .flatten()
+                })
+                .collect();
+            if !identities.is_empty() {
+                store.reseed(crate::trajectories::latent_seed(
+                    identities.iter().map(String::as_str),
+                ));
+            }
         }
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return Ok(());
@@ -536,6 +562,9 @@ impl Scheduler {
             return None;
         }
         self.withdraw_from(0, true);
+        // Video requests are preempted at their next denoising step boundary
+        // and resume once the workers wake.
+        self.preempt_media(MigrationCause::Drain, |_| true);
         Some(Pending::Sleep)
     }
 

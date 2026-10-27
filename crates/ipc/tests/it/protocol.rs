@@ -78,6 +78,7 @@ fn ar_decode_call() -> Call {
         outputs: Vec::new(),
         predicate: None,
         image_index: (kind == CallKind::Media(MediaCall::LatentPreparation)).then_some(4),
+        latent_restore: None,
     }
 }
 
@@ -147,6 +148,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         outputs: Vec::new(),
         predicate: None,
         image_index: None,
+        latent_restore: None,
     }
 }
 
@@ -671,6 +673,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             outputs: Vec::new(),
             predicate: None,
             image_index: None,
+            latent_restore: None,
         };
         // A video decode range may start past the first unit, while an audio
         // decode range must start at it. Neither call may omit its range.
@@ -1332,6 +1335,7 @@ fn batch_rejects_two_calls_for_one_request() {
         cache_inputs: Vec::new(),
         page_loads: Vec::new(),
         page_offloads: Vec::new(),
+        latent_offloads: Vec::new(),
     };
     assert!(batch.validate().is_err());
 }
@@ -1353,6 +1357,7 @@ fn a_batch_may_carry_page_writes_alone() {
         cache_inputs: Vec::new(),
         page_loads: Vec::new(),
         page_offloads: Vec::new(),
+        latent_offloads: Vec::new(),
     };
     assert!(batch.validate().is_err());
     batch.page_offloads.push(PageCopy {
@@ -1796,6 +1801,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             )),
             image_index: (kind == CallKind::Media(MediaCall::LatentPreparation))
                 .then_some(4 + index as u32),
+            latent_restore: None,
         });
         // The admissions ride on the first batch of the pass, as a scheduler
         // places them ahead of the calls that use them.
