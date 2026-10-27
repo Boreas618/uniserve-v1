@@ -11,11 +11,16 @@
 //! - `status`: what each node serves.
 //! - `watch`: follows each node's event log until interrupted (attach and
 //!   detach).
-//! - `deploy`: brings a deployment up on an idle node (`uniserve node`).
+//! - `config`: each node's configuration, worlds and trial.
+//! - `apply`: changes each node's configuration (`PUT /admin/config`), one
+//!   node after another, stopping at the first that fails: an idle node
+//!   (`uniserve serve` without a model) brings the deployment up, a serving
+//!   one changes it in place or in a new world on trial, which
+//!   `--commit-after` commits once it served that long and before the next
+//!   node changes, so that every other node serves meanwhile.
+//! - `commit`, `rollback`: end each node's trial.
 //! - `shutdown`: brings each node's deployment down, releasing its memory
 //!   unless `--keep-memory`.
-//! - `update`: a rolling hot update, one node after another, stopping at the
-//!   first that fails.
 //! - `restart`: a rolling hot restart of each node's daemon, one node after
 //!   another, stopping at the first that fails.
 //! - `pause`, `continue`, `flush-cache`: the generation and cache operations
@@ -56,32 +61,46 @@ enum Command {
         #[arg(long)]
         from_start: bool,
     },
-    /// Bring a deployment up on each node, which must serve none.
-    Deploy {
-        /// The deployment's TOML configuration, as `uniserve serve --config`
-        /// reads it.
+    /// Each node's configuration, worlds and trial.
+    Config,
+    /// Change each node's configuration in turn, stopping at the first that
+    /// fails: an idle node brings the deployment up, a serving one changes
+    /// it in place or in a new world on trial.
+    Apply {
+        /// The whole TOML configuration, as `uniserve serve --config` reads
+        /// it; each node's current one when unset.
         #[arg(long)]
         config: Option<PathBuf>,
         /// `PATH=VALUE` assignments over it.
         #[arg(long = "set")]
         set: Vec<String>,
+        /// Continue the requests in flight at a promotion with the state
+        /// they reached (`keep`) or compute it again (`recompute`).
+        #[arg(long, default_value = "keep")]
+        in_flight: String,
+        /// Report each node's plan and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply a configuration a rollback marked unavailable.
+        #[arg(long)]
+        force: bool,
+        /// Commit a node's new world once it served on trial this many
+        /// seconds, before the next node changes; a node whose trial rolled
+        /// back meanwhile stops the roll. Without it, the first node that
+        /// changes world stays on trial and the roll stops there.
+        #[arg(long)]
+        commit_after: Option<u64>,
     },
+    /// Commit each node's world on trial.
+    Commit,
+    /// Roll each node's world on trial back to the previous world.
+    Rollback,
     /// Bring each node's deployment down.
     Shutdown {
         /// Keep the deployment's weights and caches retained for a restart
         /// of the same deployment.
         #[arg(long)]
         keep_memory: bool,
-    },
-    /// A rolling hot update: each node in turn, stopping at the first that
-    /// fails.
-    Update {
-        /// The `uniserve` executable of the build to update to.
-        #[arg(long)]
-        executable: Option<String>,
-        /// `PATH=VALUE` assignments over the serving options.
-        #[arg(long = "set")]
-        set: Vec<String>,
     },
     /// A rolling hot restart of each node's daemon, to its own build or the
     /// one `--executable` names: each node in turn, stopping at the first
@@ -148,8 +167,17 @@ impl Node {
 
     /// `POST path` with a JSON body; the answer, which must succeed.
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        self.send(reqwest::Method::POST, path, body).await
+    }
+
+    /// `PUT path` with a JSON body; the answer, which must succeed.
+    async fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        self.send(reqwest::Method::PUT, path, body).await
+    }
+
+    async fn send(&self, method: reqwest::Method, path: &str, body: &Value) -> Result<Value> {
         let response = self
-            .request(reqwest::Method::POST, path)
+            .request(method, path)
             .json(body)
             .send()
             .await
@@ -180,17 +208,91 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Status => status(&nodes).await,
         Command::Watch { from_start } => watch(nodes, from_start).await,
-        Command::Deploy { config, set } => {
-            let config = match config {
-                Some(path) => std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?,
-                None => String::new(),
-            };
+        Command::Config => {
             for node in &nodes {
-                let answer = node
-                    .post("/admin/deploy", &json!({ "config": config, "set": set }))
-                    .await?;
-                println!("{}: deploying {}", node.base, answer["deployment"]);
+                let config = node.get("/admin/config").await?.unwrap_or(Value::Null);
+                println!(
+                    "{}: {}",
+                    node.base,
+                    serde_json::to_string_pretty(&json!({
+                        "digest": config["digest"],
+                        "slots": config["slots"],
+                        "update": config["update"],
+                        "trial": config["trial"],
+                        "unavailable": config["unavailable"],
+                    }))?
+                );
+            }
+            Ok(())
+        }
+        Command::Apply {
+            config,
+            set,
+            in_flight,
+            dry_run,
+            force,
+            commit_after,
+        } => {
+            let config = match config {
+                Some(path) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?,
+                ),
+                None => None,
+            };
+            let body = json!({
+                "config": config,
+                "set": set,
+                "in_flight": in_flight,
+                "dry_run": dry_run,
+                "force": force,
+                "wait": true,
+            });
+            for node in &nodes {
+                println!("{}: applying", node.base);
+                let answer = node.put("/admin/config", &body).await.with_context(|| {
+                    format!("{} did not change; later nodes are untouched", node.base)
+                })?;
+                let result = &answer["result"];
+                println!("{}: {}", node.base, result);
+                if result["change"] != json!("world") {
+                    continue;
+                }
+                let Some(seconds) = commit_after else {
+                    println!(
+                        "{}: on trial; commit it (`commit`) or roll it back before the next node \
+                         changes",
+                        node.base
+                    );
+                    return Ok(());
+                };
+                tokio::time::sleep(Duration::from_secs(seconds)).await;
+                let world = &result["world"]["world"];
+                let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
+                if status["trial"]["world"] != *world {
+                    bail!(
+                        "{}: world {world} is no longer on trial (rolled back: {}); later nodes \
+                         are untouched",
+                        node.base,
+                        status["last"]
+                    );
+                }
+                let committed = node.post("/admin/config/commit", &json!({})).await?;
+                println!("{}: committed {}", node.base, committed["result"]);
+            }
+            Ok(())
+        }
+        Command::Commit => {
+            for node in &nodes {
+                let answer = node.post("/admin/config/commit", &json!({})).await?;
+                println!("{}: {}", node.base, answer["result"]);
+            }
+            Ok(())
+        }
+        Command::Rollback => {
+            for node in &nodes {
+                let answer = node.post("/admin/config/rollback", &json!({})).await?;
+                println!("{}: {}", node.base, answer["result"]);
             }
             Ok(())
         }
@@ -199,22 +301,6 @@ async fn main() -> Result<()> {
                 node.post("/admin/shutdown", &json!({ "retire": !keep_memory }))
                     .await?;
                 println!("{}: shutting down", node.base);
-            }
-            Ok(())
-        }
-        Command::Update { executable, set } => {
-            for node in &nodes {
-                println!("{}: updating", node.base);
-                let answer = node
-                    .post(
-                        "/admin/update",
-                        &json!({ "executable": executable, "set": set, "wait": true }),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("{} did not update; later nodes are untouched", node.base)
-                    })?;
-                println!("{}: updated: {}", node.base, answer["result"]);
             }
             Ok(())
         }
@@ -255,8 +341,8 @@ async fn each(nodes: &[Node], path: &str) -> Result<()> {
 /// Prints what each node serves.
 async fn status(nodes: &[Node]) -> Result<()> {
     for node in nodes {
-        // An idle node (`uniserve node`) states it; a serving one states
-        // its deployment.
+        // An idle node (`uniserve serve` without a model) states it; a
+        // serving one states its deployment.
         let idle = node.get("/admin/node").await?;
         let serving = node.get("/admin/status").await?;
         let line = match (&idle, &serving) {
@@ -360,12 +446,20 @@ mod tests {
             "http://10.0.0.2:8000",
             "--node",
             "http://10.0.0.3:8000",
-            "update",
+            "apply",
             "--set",
             "max_running_requests=8",
+            "--commit-after",
+            "60",
         ])
         .unwrap();
         assert_eq!(cli.nodes.len(), 2);
-        assert!(matches!(cli.command, Command::Update { .. }));
+        assert!(matches!(
+            cli.command,
+            Command::Apply {
+                commit_after: Some(60),
+                ..
+            }
+        ));
     }
 }

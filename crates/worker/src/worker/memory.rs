@@ -249,6 +249,7 @@ pub(super) fn allocate_storage(
         (Some(cache), Some(info)) => Some(PrefixCache::new(
             Arc::clone(cache),
             info.num_units,
+            plan.planes.as_ref(),
             plan.info.request_slots,
             cache_width(&cache.group_shapes()?, config.max_model_len),
             plan.info.max_unresolved_calls as usize,

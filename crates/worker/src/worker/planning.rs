@@ -156,8 +156,12 @@ pub(super) fn plan(
 ) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.device;
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
-        config.pool_storage_bytes =
-            Some(budget.budget(index, config.mem_fraction_static)?.available as usize);
+        let budget = budget.budget(index, config.mem_fraction_static)?;
+        config.pool_storage_bytes = Some(budget.available as usize);
+        config.pool_storage_full_bytes = Some(
+            ((budget.total as f64 * config.mem_fraction_static) as u64)
+                .saturating_sub(budget.process) as usize,
+        );
     }
     let block_size = config
         .block_size

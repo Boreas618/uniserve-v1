@@ -743,20 +743,25 @@ impl Worker {
             .worker_storage()
             .and_then(|storage| storage.prefix_cache.as_ref());
         let scratch = prefix_cache.map_or(0, crate::memory::PrefixCache::scratch_lent);
-        // The planes' segments, and the units below the first one a
-        // predecessor gave back, which alone the engine allocates.
+        // The planes' segments, the ones they hold (a successor creates its
+        // tail as its memory frees) and the units they map from the
+        // predecessor world, which the engine allocates only once the world
+        // took them.
         let segments = prefix_cache.map(|cache| {
             let planes = cache.planes();
             (
-                planes.segments().map_or(0, |(_, units)| units),
-                planes.usable_units(),
+                planes.segments().unwrap_or_default(),
+                planes.held_segments(),
+                planes.inherited(),
             )
         });
         if let Some(cache) = self.info.prefix_cache.as_mut() {
             cache.scratch_units = scratch;
-            if let Some((segment_units, usable_units)) = segments {
-                cache.segment_units = segment_units;
-                cache.usable_units = usable_units;
+            if let Some((segments, held, inherited)) = segments {
+                cache.segments = segments;
+                cache.held_segments = held;
+                cache.inherited_start = inherited.start;
+                cache.inherited_units = inherited.end - inherited.start;
             }
         }
         // A standby worker parks with its exclusive storages read-only until
@@ -811,6 +816,9 @@ impl Worker {
             pools,
             asleep: false,
             cupti: crate::profiling::cupti::Cupti::new(observed),
+            predecessor: self.config.predecessor.clone(),
+            max_total_tokens: self.config.max_total_tokens,
+            devices: self.config.devices().filter_map(Device::cuda).collect(),
         };
         // The rank serves with CUPTI attached (`crate::profiling::cupti`),
         // unless a profiler holds it; the control thread's (this one's)

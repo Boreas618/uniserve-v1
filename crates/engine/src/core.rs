@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::executor::{Executor, TransferConfig, WorkerGroupId};
-use crate::handle::{Command, CommandSender, EventRx, SubmitError};
+use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -39,7 +39,7 @@ use anyhow::Context as _;
 use ipc::ComponentDistribution;
 use ipc::WorkerInfo;
 use ipc::{ComponentConfig, ParallelConfig, RequestId};
-use proto::request::{ExpertExchange, MigrationCause, SchedulingPolicy};
+use proto::request::{ExpertExchange, SchedulingPolicy};
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -400,12 +400,21 @@ pub struct EngineConfig {
     pub eos: Vec<u32>,
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
-    /// The prefix cache units of each worker group of the engine this one
-    /// stands by for, by group identity; `None` for an engine that serves
-    /// at once. A standing-by engine's ranks map that engine's weights and
-    /// exclusive storages without writing them, park, and serve once
-    /// [`SchedulerHandle::promote`] promotes them.
-    pub standby: Option<BTreeMap<String, u32>>,
+    /// The world the engine executes (`EngineSpec::world`): its workers'
+    /// memory is keyed and retained under it.
+    pub world: u64,
+    /// The KV cache of each worker group of the predecessor world, by group
+    /// identity; `None` for an engine that succeeds none. The engine's
+    /// groups map those segments read-only, import the predecessor's prefix
+    /// cache index when promoted ([`SchedulerHandle::promote`]), and run on
+    /// trial until the commit ([`SchedulerHandle::commit`]): a lost group
+    /// fails the engine instead of being relaunched, and none keeps a
+    /// standby.
+    pub predecessor: Option<BTreeMap<String, ipc::PredecessorCache>>,
+    /// The KV cache segments each worker group's planes were made of, by
+    /// group identity, which an engine replacing a lost one of the world
+    /// takes as its own; empty to lay the planes out afresh.
+    pub segments: BTreeMap<String, ipc::CacheTable>,
 }
 
 impl EngineConfig {
@@ -458,7 +467,9 @@ impl EngineConfig {
             // scheduler must recognize it to finish a sim request.
             eos: vec![151645],
             end_of_image: 0,
-            standby: None,
+            world: 0,
+            predecessor: None,
+            segments: BTreeMap::new(),
         }
     }
 
@@ -490,14 +501,20 @@ pub struct SchedulerHandle {
     media_units: BTreeMap<MediaCall, u32>,
     stats: Arc<SchedulerStats>,
     generation_limits: GenerationLimits,
-    /// The prefix cache units of each of its worker groups
-    /// (`Scheduler::cache_units`).
-    cache_units: BTreeMap<String, u32>,
+    /// The worker group whose KV cache the scheduler's pool allocates, by
+    /// which a successor world matches the scheduler's prefix cache index;
+    /// `None` without a prefix cache.
+    cache_group: Option<String>,
     /// The served model identifier.
     model: String,
     /// Set after `Scheduler::run` returns a fatal exit (executor or worker
     /// failure). A scheduler thread panic does not set it.
     dead: Arc<AtomicBool>,
+    /// The first error of that fatal exit (`Scheduler::failure_handle`).
+    failure: Arc<std::sync::OnceLock<String>>,
+    /// Whether the scheduler started on trial, as a successor world's do;
+    /// its commit ends the trial.
+    trial: bool,
     next_id: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -716,13 +733,16 @@ impl SchedulerHandle {
             union_rank += worker.ranks.len();
         }
 
-        // A standing-by engine's ranks adopt the cache units of the groups
-        // they stand by for, so that they map those groups' cache planes.
-        if let Some(units) = &config.standby {
-            for args in &mut arguments {
-                args.standby = true;
-                args.cache_units = units.get(&args.worker_id).copied();
-            }
+        // Every rank belongs to the engine's world; a successor's ranks map
+        // the KV cache of their group's predecessor read-only.
+        for args in &mut arguments {
+            args.world = config.world;
+            args.predecessor = config
+                .predecessor
+                .as_ref()
+                .and_then(|groups| groups.get(&args.worker_id))
+                .cloned();
+            args.segments = config.segments.get(&args.worker_id).cloned();
         }
 
         // `spawn_all` returns groups in argument order, which pairs each group
@@ -774,12 +794,9 @@ impl SchedulerHandle {
             };
             let scheduler = Self::assemble(core_config.clone(), Box::new(executor), waker)?;
             // Each scheduler's serving path runs the requests its workers'
-            // reports call for before the scheduler serves. Standby ranks
-            // warmed up on their scratch units, and write nothing before
-            // they are promoted.
-            if config.standby.is_none() {
-                crate::warmup::warm(&scheduler, &core_config)?;
-            }
+            // reports call for before the scheduler serves; a successor's
+            // run on units of its own world while its predecessor serves.
+            crate::warmup::warm(&scheduler, &core_config)?;
             cores.push(scheduler);
         }
         Ok(cores)
@@ -820,6 +837,7 @@ impl SchedulerHandle {
             config.generation_limits,
         )?;
         scheduler.set_prefix_reuse(config.prefix_cache);
+        scheduler.set_trial(config.predecessor.is_some());
         scheduler.set_prefill_groups(
             config
                 .worker_groups
@@ -856,8 +874,10 @@ impl SchedulerHandle {
         let media_units = scheduler.media_units()?;
         let info = scheduler.info().clone();
         let generation_limits = scheduler.generation_limits().clone();
-        let cache_units = scheduler.cache_units();
+        let cache_group = scheduler.cache_group();
         let stats = scheduler.stats_handle();
+        let failure = scheduler.failure_handle();
+        let trial = scheduler.on_trial();
 
         let (sender, receiver) = crossbeam_channel::unbounded();
         let dead = Arc::new(AtomicBool::new(false));
@@ -878,9 +898,11 @@ impl SchedulerHandle {
             media_units,
             stats,
             generation_limits,
-            cache_units,
+            cache_group,
             model: model.into(),
             dead,
+            failure,
+            trial,
             next_id: AtomicU64::new(1),
             thread: Mutex::new(Some(thread)),
         })
@@ -906,27 +928,24 @@ impl SchedulerHandle {
         self.generation_limits.clone()
     }
 
-    /// Returns the prefix cache units of each of the scheduler's worker
-    /// groups with a prefix cache, by group identity, which an engine
-    /// standing by for this one adopts (`EngineConfig::standby`).
-    pub fn cache_units(&self) -> &BTreeMap<String, u32> {
-        &self.cache_units
+    /// Returns the worker group whose KV cache the scheduler's pool
+    /// allocates, which names its prefix cache index for a successor world;
+    /// `None` without a prefix cache.
+    pub fn cache_group(&self) -> Option<String> {
+        self.cache_group.clone()
     }
 
-    /// Promotes the scheduler's standing-by workers
-    /// (`EngineConfig::standby`): each takes write access to the storages it
-    /// mapped and serves. Blocks until every worker answered.
+    /// Promotes the scheduler, whose world succeeds another: its workers
+    /// adopt the predecessor's cache flags of the units they inherit, and
+    /// its pool imports `index`, the predecessor's published pages, from
+    /// which requests reuse their prefixes. Blocks until it is done.
     ///
     /// # Errors
     ///
-    /// Fails when a worker refuses, dies or does not answer within its
-    /// watchdog timeout, or the scheduler has stopped.
-    pub fn promote(&self) -> anyhow::Result<()> {
-        let (answer, promoted) = crossbeam_channel::bounded(1);
+    /// Fails when a worker refuses or dies, or the scheduler has stopped.
+    pub fn promote(&self, index: Vec<crate::kv_cache::IndexedPage>) -> anyhow::Result<()> {
         self.commands
-            .send(Command::Promote(answer))
-            .map_err(|_| anyhow::anyhow!("the scheduler has stopped"))?;
-        promoted
+            .promote(index)
             .recv()
             .map_err(|_| anyhow::anyhow!("the scheduler stopped while it promoted"))?
             .map_err(|error| anyhow::anyhow!(error))
@@ -951,9 +970,20 @@ impl SchedulerHandle {
     }
 
     /// Returns whether the scheduler stopped on a terminal worker or
-    /// executor failure.
+    /// executor failure: from its first fatal error on, before its thread
+    /// ends the requests it holds.
     pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::SeqCst)
+        self.dead.load(Ordering::SeqCst) || self.failure.get().is_some()
+    }
+
+    /// The first error of the scheduler's fatal stop, once it stops.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.get().cloned()
+    }
+
+    /// Whether the scheduler started on trial, as a successor world's do.
+    pub fn starts_on_trial(&self) -> bool {
+        self.trial
     }
 
     /// Submits a request and returns its bounded event stream.
@@ -1012,12 +1042,44 @@ impl SchedulerHandle {
         self.commands.abort(id);
     }
 
-    /// Ends every token request the scheduler holds that resumes from its
-    /// generated tokens (`GenerationRequest::is_migratable`) as migratable,
-    /// for `cause`: a queued one at once, a running one once its calls in
-    /// flight drain, after every token it generated. Other requests go on.
-    pub fn migrate(&self, cause: MigrationCause) {
-        self.commands.migrate(cause);
+    /// Parks the scheduler: every token request it holds that resumes from
+    /// its generated tokens (`GenerationRequest::is_migratable`) ends as
+    /// migratable, a queued one at once, a running one once its calls in
+    /// flight drain, after every token it generated; the other requests
+    /// finish; then it executes nothing more until resumed. The receiver
+    /// gets its prefix cache index once it parked.
+    pub fn park(
+        &self,
+    ) -> crossbeam_channel::Receiver<Result<Vec<crate::kv_cache::IndexedPage>, String>> {
+        self.commands.park()
+    }
+
+    /// Reports the KV cache each of the scheduler's worker groups holds now,
+    /// which a world succeeding this one maps; the receiver gets it.
+    pub fn describe_cache(
+        &self,
+    ) -> crossbeam_channel::Receiver<Result<Vec<crate::scheduler::GroupCache>, String>> {
+        self.commands.describe_cache()
+    }
+
+    /// Ends the memory of `worlds` on the nodes of the scheduler's workers,
+    /// which the deployment's claims cover; the receiver gets whether it
+    /// did.
+    pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.retire(worlds)
+    }
+
+    /// Resumes a parked scheduler; the receiver gets whether it did.
+    pub fn resume(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.resume()
+    }
+
+    /// Commits the scheduler's world, which succeeded another: its workers
+    /// take the predecessor's memory they mapped read-only, and its groups
+    /// relaunch on a loss from then on. The receiver gets what each worker
+    /// reported.
+    pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.commit()
     }
 
     /// Revokes every cached prefix page; requests in flight keep theirs.

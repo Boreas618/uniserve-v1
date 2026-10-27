@@ -42,6 +42,7 @@ pub mod supervision;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tokenizer;
+pub mod worlds;
 
 pub use crate::http::{node, serve};
 pub use crate::leader::{Leader, Task};

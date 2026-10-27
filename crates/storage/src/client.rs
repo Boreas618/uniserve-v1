@@ -52,6 +52,10 @@ pub struct Got {
 /// A connection to the Storage Server of this host.
 pub struct Client {
     connection: Connection,
+    /// The protocol version the connection speaks: this build's, or an
+    /// earlier one an operator's connection to an earlier server said hello
+    /// with ([`Client::connect_operator`]).
+    version: u32,
     next: u64,
     /// Answers received and not yet taken, by request.
     answers: HashMap<u64, Answer>,
@@ -74,17 +78,39 @@ impl Client {
         Self::open(Connection::new(stream), role)
     }
 
-    fn open(mut connection: Connection, role: Role) -> Result<Self> {
-        connection.send(
-            &ClientMessage::Hello(Hello {
-                version: VERSION,
-                role,
-            }),
-            &[],
-        )?;
+    /// Connect to the server at `socket` as an operator, in this build's
+    /// protocol or, when the server speaks an earlier one, in the latest
+    /// earlier version it serves, as the restart of a server whose protocol
+    /// predates this build's connects: an operator's requests (`List`,
+    /// `Retire`, `Restart`) read alike in every version.
+    pub fn connect_operator(socket: &Path) -> Result<Self> {
+        let mut refusal = None;
+        for version in (crate::protocol::MIN_VERSION..=VERSION).rev() {
+            let connection = Connection::new(UnixStream::connect(socket)?);
+            match Self::open_version(connection, Role::Operator, version) {
+                Ok(client) => return Ok(client),
+                Err(Error::Refused(message)) => refusal = Some(message),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Refused(refusal.unwrap_or_default()))
+    }
+
+    /// The protocol version the server accepted the connection in.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    fn open(connection: Connection, role: Role) -> Result<Self> {
+        Self::open_version(connection, role, VERSION)
+    }
+
+    fn open_version(mut connection: Connection, role: Role, version: u32) -> Result<Self> {
+        connection.send(&ClientMessage::Hello(Hello { version, role }), &[])?;
         match connection.recv::<ServerMessage>()?.0 {
             ServerMessage::Welcome(Welcome::Accepted { .. }) => Ok(Self {
                 connection,
+                version,
                 next: 1,
                 answers: HashMap::new(),
                 events: VecDeque::new(),
@@ -120,6 +146,7 @@ impl Client {
     pub fn resume(descriptor: OwnedFd, next: u64) -> Self {
         Self {
             connection: Connection::new(UnixStream::from(descriptor)),
+            version: VERSION,
             next,
             answers: HashMap::new(),
             events: VecDeque::new(),
@@ -219,10 +246,15 @@ impl Client {
         }
     }
 
-    /// See [`Request::Claim`]: become the deployment's head, keeping
-    /// `scopes`.
-    pub fn claim(&mut self, scopes: Vec<Scope>) -> Result<Claim> {
-        match Self::expect(self.call(&Request::Claim { scopes }, &[])?)?.reply {
+    /// See [`Request::Claim`]: become the deployment's head, `world`
+    /// placing `scopes` on the host, and end every world of `retire` there.
+    pub fn claim(&mut self, world: u64, scopes: Vec<Scope>, retire: Vec<u64>) -> Result<Claim> {
+        let request = Request::Claim {
+            scopes,
+            world,
+            retire,
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
             Reply::Claimed { claim } => Ok(claim),
             other => Err(unexpected("claim", &other)),
         }

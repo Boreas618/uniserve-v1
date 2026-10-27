@@ -1,7 +1,7 @@
 //! Request migration: how a token request moves between engines.
 //!
-//! An engine that drains for a hot update, or loses the workers that hold a
-//! request, ends the request as migratable (`Event::Migratable`) after every
+//! An engine that parks for a world change or a rollback, or loses the
+//! workers that hold a request, ends the request as migratable (`Event::Migratable`) after every
 //! token it generated there. The leader submits every request through its
 //! [`Migrator`], which keeps each token request's generated tokens and, on
 //! that event, submits the request again with them
@@ -395,7 +395,7 @@ mod tests {
     /// its consumer reads every token it generates, one scheduling event,
     /// and a finish that charges its whole usage.
     #[tokio::test]
-    async fn a_drained_request_continues_on_the_next_engine() {
+    async fn a_parked_engines_request_continues_on_the_next_engine() {
         let hold = Arc::new(RequestHold::new());
         let first = client();
         hold.serve(Arc::clone(&first));
@@ -411,11 +411,11 @@ mod tests {
                 Some(Event::TextToken { .. }) => tokens += 1,
                 Some(Event::Scheduled { .. }) => scheduled += 1,
                 Some(_) => {}
-                None => panic!("the request ended before its engine drained"),
+                None => panic!("the request ended before its engine parked"),
             }
         }
         hold.serve(client());
-        first.drain().await.unwrap();
+        first.park().await.unwrap();
 
         let finished = loop {
             match next(&mut events).await {

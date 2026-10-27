@@ -113,6 +113,7 @@ fn worker(socket: &Path, scope: Scope, generation: u64, claim: Claim) -> Client 
             scope,
             generation,
             claim,
+            world: 0,
         },
     )
     .unwrap()
@@ -170,7 +171,7 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head
-        .claim(vec![scope("text", 0), scope("text", 1)])
+        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
 
     // Two tensors packed in one storage, published by rank 0.
@@ -221,7 +222,7 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
 fn putting_a_retained_read_only_key_again_keeps_the_retained_bytes_for_both_scopes() {
     let server = Running::start();
     let claim = head(&server.socket)
-        .claim(vec![scope("text", 0), scope("text", 1)])
+        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
     let mut first = worker(&server.socket, scope("text", 0), 1, claim);
     let storage = memfd(b"abcd");
@@ -280,7 +281,7 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
     // one.
     let mut model_head = head(&server.socket);
     let claim = model_head
-        .claim(vec![scope("text", 0), scope("text", 1)])
+        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
     let mut first = worker(&server.socket, scope("text", 0), 1, claim);
     let storage = memfd(b"abcdefgh");
@@ -339,7 +340,7 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
     // A tensor another deployment holds as well is not the caller's to move.
     let other = scope_of("other");
     let other_claim = head_of(&server.socket, "other")
-        .claim(vec![other.clone()])
+        .claim(0, vec![other.clone()], Vec::new())
         .unwrap();
     let mut stranger = worker(&server.socket, other, 1, other_claim);
     stranger.get(vec![key(12)], Mode::Read).unwrap();
@@ -352,7 +353,9 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
 #[test]
 fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
     let server = Running::start();
-    let claim = head(&server.socket).claim(vec![scope("flow", 0)]).unwrap();
+    let claim = head(&server.socket)
+        .claim(0, vec![scope("flow", 0)], Vec::new())
+        .unwrap();
     let mut writer = worker(&server.socket, scope("flow", 0), 1, claim);
     let storage = memfd(&[0; 4]);
     writer
@@ -392,7 +395,7 @@ fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_
     let server = Running::start();
     let mut first = head(&server.socket);
     let claim = first
-        .claim(vec![scope("text", 0), scope("old", 0)])
+        .claim(0, vec![scope("text", 0), scope("old", 0)], Vec::new())
         .unwrap();
     for group in ["text", "old"] {
         let mut client = worker(&server.socket, scope(group, 0), 1, claim);
@@ -407,10 +410,13 @@ fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_
     }
 
     let mut second = head(&server.socket);
-    assert_eq!(server_error(second.claim(Vec::new())), ErrorKind::Claimed);
+    assert_eq!(
+        server_error(second.claim(0, Vec::new(), Vec::new())),
+        ErrorKind::Claimed
+    );
     drop(first);
     // The server notices the disconnect on its next turn.
-    let claim = retry(|| second.claim(vec![scope("text", 0)]));
+    let claim = retry(|| second.claim(0, vec![scope("text", 0)], Vec::new()));
     let names: Vec<String> = second
         .list()
         .unwrap()
@@ -464,7 +470,9 @@ fn stand_in_writer() {
 #[test]
 fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     let server = Running::start();
-    let claim = head(&server.socket).claim(vec![scope("flow", 0)]).unwrap();
+    let claim = head(&server.socket)
+        .claim(0, vec![scope("flow", 0)], Vec::new())
+        .unwrap();
     let encoded: Vec<String> = claim.0.iter().map(u8::to_string).collect();
     let forking = FORKING
         .lock()
@@ -526,7 +534,9 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     use storage::protocol::{PageLevel, PageShape, PageSlot, Reply, Request};
 
     let server = Running::start();
-    let claim = head(&server.socket).claim(vec![scope("text", 0)]).unwrap();
+    let claim = head(&server.socket)
+        .claim(0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
 
     // The worker maps its pool on the host.
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
@@ -587,7 +597,11 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     );
     // A connection from another host claims nothing.
     assert!(matches!(
-        ask(Request::Claim { scopes: Vec::new() }),
+        ask(Request::Claim {
+            scopes: Vec::new(),
+            world: 0,
+            retire: Vec::new(),
+        }),
         Reply::Error {
             kind: ErrorKind::Invalid,
             ..
@@ -602,6 +616,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
                 scope: scope("text", 0),
                 generation: 1,
                 claim,
+                world: 0,
             },
         ),
         Err(Error::Refused(_))
@@ -632,7 +647,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
 
     let server = Running::start();
     let mut head = head(&server.socket);
-    let claim = head.claim(vec![scope("text", 0)]).unwrap();
+    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let shape = PageShape {
         layout: key(3),
@@ -856,7 +871,9 @@ fn page_pools_belong_to_their_deployment_and_leave_with_it() {
     // The head stays connected, so another deployment's claim keeps this
     // one.
     let mut model_head = head_of(&server.socket, "model");
-    let claim = model_head.claim(vec![scope_of("model")]).unwrap();
+    let claim = model_head
+        .claim(0, vec![scope_of("model")], Vec::new())
+        .unwrap();
     let mut first = worker(&server.socket, scope_of("model"), 1, claim);
     // A worker sizes its pool: two pages of 16 bytes.
     let (pool, slots) = page_pool(&mut first, Some(32)).unwrap();
@@ -867,7 +884,9 @@ fn page_pools_belong_to_their_deployment_and_leave_with_it() {
     // Another deployment's workers of the same pages have a pool of their
     // own, which its head alone reaches.
     let mut other_head = head_of(&server.socket, "other");
-    let other_claim = other_head.claim(vec![scope_of("other")]).unwrap();
+    let other_claim = other_head
+        .claim(0, vec![scope_of("other")], Vec::new())
+        .unwrap();
     let mut second = worker(&server.socket, scope_of("other"), 1, other_claim);
     let (other_pool, other_slots) = page_pool(&mut second, None).unwrap();
     assert_ne!(other_pool, pool);
@@ -920,7 +939,7 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
     let server = Running::start();
     // A deployment whose head leaves keeps a tensor and a page pool.
     let mut gone = head_of(&server.socket, "gone");
-    let claim = gone.claim(vec![scope_of("gone")]).unwrap();
+    let claim = gone.claim(0, vec![scope_of("gone")], Vec::new()).unwrap();
     let mut gone_worker = worker(&server.socket, scope_of("gone"), 1, claim);
     let storage = memfd(&[1; 4]);
     gone_worker
@@ -934,7 +953,7 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
     drop(gone);
     // A deployment whose head stays keeps its pool.
     let mut kept = head_of(&server.socket, "kept");
-    let kept_claim = kept.claim(vec![scope_of("kept")]).unwrap();
+    let kept_claim = kept.claim(0, vec![scope_of("kept")], Vec::new()).unwrap();
     let mut kept_worker = worker(&server.socket, scope_of("kept"), 1, kept_claim);
     let (kept_pool, _) = page_pool(&mut kept_worker, None).unwrap();
 
@@ -953,7 +972,7 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
         std::thread::sleep(Duration::from_millis(10));
     }
     head_of(&server.socket, "new")
-        .claim(vec![scope_of("new")])
+        .claim(0, vec![scope_of("new")], Vec::new())
         .unwrap();
     let listing = operator.list().unwrap();
     assert!(listing.tensors.is_empty());
@@ -977,7 +996,9 @@ fn a_page_pool_the_hosts_memory_cannot_hold_is_refused() {
     use storage::protocol::{PageShape, Request};
 
     let server = Running::start();
-    let claim = head(&server.socket).claim(vec![scope("text", 0)]).unwrap();
+    let claim = head(&server.socket)
+        .claim(0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     // A million pages of a GiB: a pebibyte, beyond any host's memory.
     let shape = PageShape {
@@ -1005,4 +1026,157 @@ fn a_page_pool_the_hosts_memory_cannot_hold_is_refused() {
     ));
     let listing = worker.list().unwrap();
     assert!(listing.page_pools.is_empty());
+}
+
+/// A worker of `scope` in `world`.
+fn world_worker(socket: &Path, scope: Scope, world: u64, claim: Claim) -> Client {
+    Client::connect(
+        socket,
+        Role::Worker {
+            scope,
+            generation: 1,
+            claim,
+            world,
+        },
+    )
+    .unwrap()
+}
+
+/// The names of the tensors the server retains, sorted.
+fn retained_names(client: &mut Client) -> Vec<String> {
+    let mut names: Vec<String> = client
+        .list()
+        .unwrap()
+        .tensors
+        .into_iter()
+        .map(|tensor| tensor.name)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Two worlds of one deployment share a scope without touching each other's
+/// memory: the head keeps one claim token for both, each world's `retain`
+/// releases its own tensors alone, and a claim that retires a world releases
+/// the tensors no other world retains.
+#[test]
+fn worlds_retain_their_own_memory_and_a_claim_retires_one() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let first_claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+
+    // World 1's worker publishes shared weights, its exclusive planes and a
+    // buffer of its own.
+    let mut first = world_worker(&server.socket, scope("text", 0), 1, first_claim);
+    let storages = [memfd(&[1; 4]), memfd(&[2; 4]), memfd(&[3; 4])];
+    first
+        .put(
+            vec![
+                tensor(key(1), "weights", 0, 0, Access::ReadOnly),
+                tensor(key(2), "planes", 1, 0, Access::Exclusive),
+                tensor(key(3), "buffer", 2, 0, Access::Exclusive),
+            ],
+            &[
+                (host(4), storages[0].as_fd()),
+                (host(4), storages[1].as_fd()),
+                (host(4), storages[2].as_fd()),
+            ],
+        )
+        .unwrap();
+
+    // World 2 claims the same scope under the same token: world 1's worker
+    // stays current.
+    let second_claim = head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    assert_eq!(first_claim, second_claim);
+    let mut second = world_worker(&server.socket, scope("text", 0), 2, second_claim);
+    let got = second.get(vec![key(1)], Mode::Read).unwrap();
+    assert_eq!(got.tensors.len(), 1);
+    let got = second.get(vec![key(2)], Mode::Standby).unwrap();
+    assert_eq!(got.tensors.len(), 1);
+    let buffer = memfd(&[4; 4]);
+    second
+        .put(
+            vec![tensor(key(4), "buffer", 0, 0, Access::Exclusive)],
+            &[(host(4), buffer.as_fd())],
+        )
+        .unwrap();
+
+    // World 2's worker retains what it uses; world 1's buffer, which it
+    // never took, stays world 1's.
+    assert_eq!(second.retain(vec![key(1), key(2), key(4)]).unwrap(), 0);
+    assert_eq!(
+        retained_names(&mut head),
+        vec!["buffer", "buffer", "planes", "weights"]
+    );
+    let listing = head.list().unwrap();
+    let planes = listing
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "planes")
+        .unwrap();
+    let worlds: Vec<u64> = planes
+        .retainers
+        .iter()
+        .map(|retainer| retainer.world)
+        .collect();
+    assert_eq!(worlds, vec![1, 2]);
+
+    // World 1's worker keeps writing what it holds.
+    first.retain(vec![key(1), key(2), key(3)]).unwrap();
+
+    // The commit of world 2 retires world 1: its buffer goes, what world 2
+    // retains stays.
+    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    assert_eq!(
+        retained_names(&mut head),
+        vec!["buffer", "planes", "weights"]
+    );
+    let listing = head.list().unwrap();
+    assert!(
+        listing
+            .tensors
+            .iter()
+            .all(|tensor| tensor.retainers.iter().all(|retainer| retainer.world == 2)),
+        "{listing:?}"
+    );
+}
+
+/// A server serves clients of its protocol and of every earlier one from
+/// `MIN_VERSION` on, and refuses a later one, which restarts it with its
+/// own build first; an operator's connection speaks what the server serves.
+#[test]
+fn a_server_serves_earlier_clients_and_refuses_later_ones() {
+    use storage::protocol::{MIN_VERSION, VERSION};
+
+    let server = Running::start();
+    let operator = Client::connect_operator(&server.socket).unwrap();
+    assert_eq!(operator.version(), VERSION);
+    const { assert!(MIN_VERSION < VERSION) };
+
+    let welcome = |version: u32| {
+        let mut connection = storage::transport::Connection::new(
+            std::os::unix::net::UnixStream::connect(&server.socket).unwrap(),
+        );
+        connection
+            .send(
+                &storage::protocol::ClientMessage::Hello(storage::protocol::Hello {
+                    version,
+                    role: Role::Operator,
+                }),
+                &[],
+            )
+            .unwrap();
+        connection
+            .recv::<storage::protocol::ServerMessage>()
+            .unwrap()
+            .0
+    };
+    assert!(matches!(
+        welcome(MIN_VERSION),
+        storage::protocol::ServerMessage::Welcome(storage::protocol::Welcome::Accepted { .. })
+    ));
+    assert!(matches!(
+        welcome(VERSION + 1),
+        storage::protocol::ServerMessage::Welcome(storage::protocol::Welcome::Refused { .. })
+    ));
 }

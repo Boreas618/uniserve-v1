@@ -356,6 +356,19 @@ pub(crate) fn record_scheduler_stats(
         .inc_by(stats.batch_count);
 }
 
+/// How many requests ended since the daemon started, and how many of them
+/// failed, which a world's trial reads its failure rate from.
+pub(crate) struct Outcomes {
+    pub(crate) ended: std::sync::atomic::AtomicU64,
+    pub(crate) failed: std::sync::atomic::AtomicU64,
+}
+
+/// Every request's outcome, as [`RequestStats`] records it.
+pub(crate) static OUTCOMES: Outcomes = Outcomes {
+    ended: std::sync::atomic::AtomicU64::new(0),
+    failed: std::sync::atomic::AtomicU64::new(0),
+};
+
 /// The output stream of one request a scheduler accepted, recording the
 /// request into the request metric families once.
 ///
@@ -425,6 +438,17 @@ impl RequestStats {
     fn record(&mut self, finished_reason: &'static str, usage: Option<&RequestUsage>) {
         if std::mem::replace(&mut self.recorded, true) {
             return;
+        }
+        // A request the client abandoned neither served nor failed.
+        if finished_reason != "abort" {
+            OUTCOMES
+                .ended
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if finished_reason == "error" {
+                OUTCOMES
+                    .failed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         let elapsed_us = self.started.elapsed().as_micros() as u64;
         let metrics = &METRICS.request;

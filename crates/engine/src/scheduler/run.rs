@@ -235,6 +235,10 @@ impl Scheduler {
             closing: false,
             resizing: None,
             asleep: false,
+            parking: None,
+            parked: false,
+            trial: false,
+            failure: Arc::default(),
             stats,
         })
     }
@@ -263,7 +267,7 @@ impl Scheduler {
         let beyond = |name: &str, value: usize, capacity: usize| {
             format!(
                 "scheduler_config.{name} = {value} exceeds the {capacity} the workers were \
-                 started for; a hot update starts workers for it"
+                 started for; a world change starts workers for it"
             )
         };
         if limits.max_running_requests > running {
@@ -379,20 +383,16 @@ impl Scheduler {
         &self.info
     }
 
-    /// Returns the prefix cache units of each worker group with a prefix
-    /// cache, by group identity: what an engine standing by for this one
-    /// adopts.
-    pub fn cache_units(&self) -> BTreeMap<String, u32> {
+    /// Returns the first worker group with a prefix cache, whose units the
+    /// pool allocates and whose identity names its index for a successor
+    /// world.
+    pub fn cache_group(&self) -> Option<String> {
         self.executor
             .info()
             .workers
             .iter()
-            .filter_map(|(group, info)| {
-                info.prefix_cache
-                    .as_ref()
-                    .map(|cache| (group.to_string(), cache.num_units))
-            })
-            .collect()
+            .find(|(_, info)| info.prefix_cache.is_some())
+            .map(|(group, _)| group.to_string())
     }
 
     /// Returns the model limits supported by the loaded execution workers.
@@ -418,6 +418,23 @@ impl Scheduler {
     /// Returns a shared handle to scheduler counters.
     pub fn stats_handle(&self) -> Arc<SchedulerStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Puts the scheduler's world on trial until its commit
+    /// (`Scheduler::trial`): a successor world's schedulers start on trial.
+    pub fn set_trial(&mut self, trial: bool) {
+        self.trial = trial;
+    }
+
+    /// Whether the scheduler's world is on trial.
+    pub fn on_trial(&self) -> bool {
+        self.trial
+    }
+
+    /// The first error of the scheduler's fatal stop, once it stopped on
+    /// one; shared with whoever reports it.
+    pub fn failure_handle(&self) -> Arc<std::sync::OnceLock<String>> {
+        Arc::clone(&self.failure)
     }
 
     /// Returns shared access to a media request state.
@@ -484,23 +501,23 @@ impl Scheduler {
             }
 
             let progressed = self.step_nonblocking();
+            if !self.fatal && !progressed {
+                self.park_for_progress();
+            }
             if self.fatal {
-                tracing::error!("engine fatal: executor/worker died; stopping the control loop");
+                let _ = self
+                    .failure
+                    .set("the executor or a worker failed".to_owned());
+                tracing::error!(
+                    failure = self.failure.get().map_or("", String::as_str),
+                    "engine fatal: stopping the control loop"
+                );
+                if self.trial {
+                    self.hand_back_requests();
+                }
                 self.abort_all_requests();
                 let _ = self.executor.close();
                 return true;
-            }
-
-            if !progressed {
-                self.park_for_progress();
-                if self.fatal {
-                    tracing::error!(
-                        "engine fatal: executor/worker died during park; stopping the control loop"
-                    );
-                    self.abort_all_requests();
-                    let _ = self.executor.close();
-                    return true;
-                }
             }
         }
         // Finish everything still queued or running with `Aborted` before

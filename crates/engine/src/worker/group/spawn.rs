@@ -150,6 +150,7 @@ impl WorkerProcessArgs {
                 StorageLaunch {
                     standby: self.standby,
                     standby_memory: self.standby_memory,
+                    world: self.world,
                     ..claims.launch(&self.ranks[rank].host)?
                 },
                 rendezvous

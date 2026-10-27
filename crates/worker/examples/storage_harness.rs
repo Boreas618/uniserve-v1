@@ -144,6 +144,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let mut source = PrefixCache::new(
         Arc::clone(&source_plan),
         num_units,
+        None,
         2,
         width,
         1,
@@ -154,6 +155,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let mut destination = PrefixCache::new(
         Arc::clone(&destination_plan),
         num_units,
+        None,
         2,
         width,
         2,
@@ -305,6 +307,7 @@ fn lifecycle(config: Any) -> Result<Map<FfiString, Any>> {
     let mut cache = PrefixCache::new(
         Arc::clone(&plan),
         num_units,
+        None,
         LIFECYCLE_SLOTS,
         64,
         1,

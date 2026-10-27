@@ -50,6 +50,8 @@ message FromEngine {
     Stats stats = 4;
     Hooked hooked = 5;
     Configured configured = 6;
+    Parked parked = 7;
+    CacheDescribed cache_described = 8;
   }
 }
 
@@ -79,12 +81,16 @@ enum EngineState {
   ENGINE_STATE_READY = 2;
   // Its start failed or its workers are lost; it serves nothing more.
   ENGINE_STATE_FAILED = 3;
-  // Draining: it admits nothing more, has ended its token requests as
-  // migratable and finishes the rest.
-  ENGINE_STATE_DRAINING = 4;
-  // Standing by: its workers are loaded, mapped the running engine's
-  // storages without writing them and parked; it serves once promoted.
+  reserved 4;
+  reserved "ENGINE_STATE_DRAINING";
+  // Prepared: an engine that succeeds a serving one loaded its workers,
+  // mapped what it shares with its predecessor read-only, warmed up and
+  // captured its graphs; it executes nothing until promoted.
   ENGINE_STATE_STANDBY = 5;
+  // Parked: it preempted every request at a step boundary and executes
+  // nothing; it keeps its workers, memory and prefix cache index until it
+  // resumes or shuts down.
+  ENGINE_STATE_PARKED = 6;
 }
 
 // What a ready engine serves.
@@ -101,12 +107,14 @@ message EngineInfo {
   uint32 latent_encoding_units = 3;
   // The engine's schedulers, one per DP rank.
   uint32 schedulers = 4;
-  // The prefix cache units of each worker group, which an engine standing
-  // by for this one maps.
-  repeated GroupCacheUnits cache_units = 5;
+  reserved 5;
+  reserved "cache_units";
   // The largest scheduling limits the workers were started for: the
   // schedulers take any limits within them in place (`Configure`).
   BatchCapacity capacity = 6;
+  // The KV cache segments of each worker group, which an engine that
+  // succeeds this one on the same devices maps.
+  repeated CacheSegments segments = 7;
 }
 
 // The batch an engine's workers were started for.
@@ -119,10 +127,28 @@ message BatchCapacity {
   uint32 max_running_requests = 3;
 }
 
-// The prefix cache units one worker group holds.
-message GroupCacheUnits {
+// The segments of one worker group's KV cache planes, in plane order: each
+// an allocation of whole units that a world created, which the world that
+// holds the planes gives back or creates again as a whole.
+message CacheSegments {
   string worker_group = 1;
-  uint32 units = 2;
+  repeated CacheSegment segments = 2;
+  // The segments the group holds, `[0, held)`; those after were given back.
+  uint32 held = 3;
+  // The units of the group's planes, those of the segments given back
+  // included.
+  uint32 units = 4;
+  // The units `1..=scratch` the group's warmup lent.
+  uint32 scratch = 5;
+}
+
+message CacheSegment {
+  // The world that created the segment's memory.
+  uint64 world = 1;
+  // The segment's ordinal among those its world created.
+  uint32 ordinal = 2;
+  // The cache units the segment holds.
+  uint32 units = 3;
 }
 
 // Requests submitted together: the engine queues every one of them before it
@@ -184,13 +210,13 @@ message Consumed {
 
 // A command for the whole engine.
 message EngineCommand {
+  reserved 2;
+  reserved "drain";
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
-    // Admit nothing more and end every token request that resumes from its
-    // generated tokens as migratable; the other requests finish.
-    Drain drain = 2;
-    // A standing-by engine's workers take write access and serve.
+    // A prepared engine imports its predecessor's prefix cache index and
+    // serves.
     Promote promote = 3;
     // Revoke every cached prefix page; requests in flight keep theirs.
     FlushCache flush_cache = 4;
@@ -210,6 +236,18 @@ message EngineCommand {
     // Rewrite the weights in place from another checkpoint of the same
     // model, once no request runs; answered with `Hooked`.
     UpdateWeights update_weights = 9;
+    // Preempt every request at the next step boundary and execute nothing
+    // more; answered with `Parked`.
+    Park park = 10;
+    // A parked engine executes and admits again; answered with `Hooked`.
+    Resume resume = 11;
+    // Report the KV cache segments every worker group holds now; answered
+    // with `CacheDescribed`.
+    DescribeCache describe_cache = 13;
+    // The trial of a promoted engine ended: its predecessor is gone, so its
+    // workers take the predecessor's memory they mapped read-only, and a
+    // lost worker group is relaunched from then on; answered with `Hooked`.
+    Commit commit = 12;
   }
 }
 
@@ -258,12 +296,16 @@ message ResizeCache {
   // Matches the `Hooked` answer.
   uint64 id = 1;
   CacheChange change = 2;
+  // For a shrink: how long the requests that hold the tail may run on
+  // before they are recomputed; absent to let them run to their end.
+  optional uint64 preempt_after_ms = 3;
 }
 
 enum CacheChange {
-  // Give back the tail of the KV cache until each device has as much free
-  // memory as its worker holds beside the weights and the cache, which a
-  // standby engine needs: the requests that hold the tail are recomputed.
+  // Give back the tail of the KV cache until each device has the memory a
+  // world succeeding this one needs beside the memory they share: the
+  // requests that hold the tail run on, and are recomputed only past the
+  // shrink's `preempt_after_ms`.
   CACHE_CHANGE_SHRINK = 0;
   // Create the given-back tail again.
   CACHE_CHANGE_RESTORE = 1;
@@ -272,6 +314,10 @@ enum CacheChange {
   CACHE_CHANGE_SLEEP = 2;
   // Restore what a sleep gave back.
   CACHE_CHANGE_WAKE = 3;
+  // Create as many of the segments given back as each device's free memory
+  // holds: a successor world's cache grows as its predecessor's memory
+  // frees.
+  CACHE_CHANGE_GROW = 4;
 }
 
 // Where the daemon an engine attaches to listens.
@@ -281,9 +327,79 @@ message Attach {
 }
 
 message Shutdown {}
-message Drain {}
-message Promote {}
 message FlushCache {}
+
+// The promotion of a prepared engine.
+message Promote {
+  // The prefix cache index of the parked predecessor, by worker group,
+  // whose pages the promoted engine reads from the predecessor's segments
+  // it maps read-only; empty for an engine without a predecessor.
+  repeated GroupIndex index = 1;
+}
+
+// A request to park the engine.
+message Park {
+  // Matches the `Parked` answer.
+  uint64 id = 1;
+}
+
+// The answer to a `Park`: every request ended as migratable, or why the
+// engine did not park.
+message Parked {
+  uint64 id = 1;
+  // Empty when the engine parked.
+  string error = 2;
+  // The pages the engine's prefix cache index publishes, by worker group,
+  // which its successor reads from the segments it maps.
+  repeated GroupIndex index = 3;
+}
+
+// A request to resume a parked engine.
+message Resume {
+  // Matches the `Hooked` answer.
+  uint64 id = 1;
+  // Worlds whose memory ends on every node of the engine: the one a
+  // rollback discarded.
+  repeated uint64 retire = 2;
+}
+
+// The end of a promoted engine's trial.
+message Commit {
+  // Matches the `Hooked` answer.
+  uint64 id = 1;
+  // Worlds whose memory ends on every node of the engine: the predecessor,
+  // whose processes are gone.
+  repeated uint64 retire = 2;
+}
+
+// A request for the engine's KV cache segments.
+message DescribeCache {
+  // Matches the `CacheDescribed` answer.
+  uint64 id = 1;
+}
+
+// The answer to a `DescribeCache`.
+message CacheDescribed {
+  uint64 id = 1;
+  // Empty when every worker group reported.
+  string error = 2;
+  repeated CacheSegments segments = 3;
+}
+
+// The published pages of one worker group's prefix cache.
+message GroupIndex {
+  string worker_group = 1;
+  repeated IndexedPage pages = 2;
+}
+
+// One published page: its cache group, its chained hash, its tokens and its
+// units in the planes of the engine that published it.
+message IndexedPage {
+  uint32 group = 1;
+  uint64 hash = 2;
+  repeated uint32 tokens = 3;
+  repeated uint32 units = 4;
+}
 
 // One scheduler's statistics of the last reporting interval.
 message Stats {
@@ -696,17 +812,29 @@ message EngineSpec {
   Video video = 12;
   Experts experts = 13;
   ModelFacts model_facts = 14;
-  // Present for an engine that stands by for the running one: its workers
-  // map the running engine's weights and exclusive storages without writing
-  // them, park, and serve once the engine is promoted.
-  Standby standby = 15;
+  reserved 15;
+  reserved "standby";
+  // The world the engine executes: the daemon's identity of the processes
+  // that execute one configuration of the deployment, which keys the memory
+  // they create. An engine relaunched after a loss keeps its world.
+  uint64 world = 16;
+  // Present for an engine that succeeds the serving one on the same
+  // devices: it prepares beside it, mapping what it shares read-only, and
+  // serves once promoted.
+  Predecessor predecessor = 17;
+  // The KV cache segments each worker group's planes are made of, which an
+  // engine that replaces a lost one of its world (or restarts it at a
+  // rollback) takes as its own; empty to lay the planes out afresh.
+  repeated CacheSegments segments = 18;
 }
 
-// What a standing-by engine adopts of the engine it stands by for.
-message Standby {
-  // Each worker group's prefix cache units, whose cache planes the
-  // standby's ranks map.
-  repeated GroupCacheUnits cache_units = 1;
+// What an engine that succeeds another maps of it.
+message Predecessor {
+  // The predecessor's world.
+  uint64 world = 1;
+  // Each worker group's KV cache segments the predecessor holds, which the
+  // successor's ranks map read-only behind segments of their own.
+  repeated CacheSegments segments = 2;
 }
 
 // Where the ranks run: a deployment file, or the shorthand.

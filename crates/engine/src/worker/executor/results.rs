@@ -193,6 +193,10 @@ impl WorkerExecutor {
                     .remove(&(completion.output.request_key, completion.output.call_id));
             }
         }
+        let execution = crate::executor::WorkerExecError::non_finite(
+            batch_id,
+            report.results.iter().map(|completion| &completion.output),
+        );
         self.publish_result(report)?;
         if !failed_calls.is_empty() {
             // Keep the actual failed completion and all accepted independent work.
@@ -204,7 +208,7 @@ impl WorkerExecutor {
                 refusals,
                 retired: Vec::new(),
                 buffers: failed_buffers,
-                execution: None,
+                execution,
                 message: "call failed before its dependent work could complete".into(),
             }
             .into());

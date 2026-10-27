@@ -189,6 +189,7 @@ impl Scheduler {
 
         progressed |= self.refill_executor();
         self.poll_resize();
+        self.poll_park();
 
         self.stats
             .general

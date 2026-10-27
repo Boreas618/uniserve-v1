@@ -1,9 +1,11 @@
-//! A node that serves no deployment until asked (`uniserve node`).
+//! A daemon that serves no deployment until asked (`uniserve serve` without
+//! a model).
 //!
-//! The node's HTTP server starts at once and answers the admin API. `POST
-//! /admin/deploy` brings a deployment up on the node: its daemon, its engine
-//! and its routes, which the node then serves on the same address, admin
-//! routes included. The deployment's `POST /admin/shutdown` brings it down
+//! The daemon's HTTP server starts at once and answers the admin API. Its
+//! first `PUT /admin/config` brings a deployment up: its daemon, its first
+//! world and its routes, which the node then serves on the same address,
+//! admin routes included, so that every later `PUT /admin/config` is the
+//! deployment's. The deployment's `POST /admin/shutdown` brings it down
 //! and, by default, releases its memory at the host's Storage Server; the
 //! node then serves no deployment again and takes the next one. A node
 //! serves one single-node deployment at a time.
@@ -17,7 +19,7 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -64,8 +66,8 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Serves the admin API on `server`'s address, and the deployments `POST
-/// /admin/deploy` brings up, until `shutdown` is cancelled; the deployment
+/// Serves the admin API on `server`'s address, and the deployments its first
+/// `PUT /admin/config` brings up, until `shutdown` is cancelled; the deployment
 /// serving then is brought down and its memory released.
 ///
 /// # Errors
@@ -83,7 +85,7 @@ pub async fn node(server: ServerOptions, shutdown: CancellationToken) -> Result<
         server: server.clone(),
     });
     let mut app = Router::new()
-        .route("/admin/deploy", post(deploy))
+        .route("/admin/config", put(deploy).get(idle_config))
         .route("/admin/node", get(node_status))
         .fallback(dispatch)
         .with_state(Arc::clone(&node));
@@ -110,9 +112,9 @@ pub async fn node(server: ServerOptions, shutdown: CancellationToken) -> Result<
     served
 }
 
-/// The body of `POST /admin/deploy`.
+/// The body of the first `PUT /admin/config`, as a deployment's own reads
+/// it (`docs/admin.md`).
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct DeployBody {
     /// The deployment's configuration, as a `--config` TOML file states it.
     #[serde(default)]
@@ -120,11 +122,62 @@ struct DeployBody {
     /// `PATH=VALUE` assignments over it, as `--set` states them.
     #[serde(default)]
     set: Vec<String>,
+    /// Validate the configuration and start nothing.
+    #[serde(default)]
+    dry_run: bool,
 }
 
-/// `POST /admin/deploy`: brings a deployment up; answers once it starts
-/// (`202`), with its name. `409` while another deployment serves.
-async fn deploy(State(node): State<Arc<Node>>, Json(body): Json<DeployBody>) -> Response {
+/// `GET /admin/config` of a node that serves no deployment: no
+/// configuration and empty slots.
+async fn idle_config(State(node): State<Arc<Node>>) -> Response {
+    let routes = match &*locked(&node.serving) {
+        Serving::Deployment(_, routes) => Some(routes.clone()),
+        _ => None,
+    };
+    if let Some(routes) = routes {
+        let request = Request::builder()
+            .uri("/admin/config")
+            .body(axum::body::Body::empty())
+            .unwrap_or_default();
+        return match routes.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    Json(json!({
+        "config": null,
+        "digest": null,
+        "slots": [null, null],
+        "update": null,
+        "trial": null,
+        "unavailable": [],
+        "last": null,
+    }))
+    .into_response()
+}
+
+/// The first `PUT /admin/config`: brings a deployment up; answers once it
+/// starts (`202`), with its name. A node that serves a deployment hands
+/// the request to the deployment's own admin API.
+async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
+    let routes = match &*locked(&node.serving) {
+        Serving::Deployment(_, routes) => Some(routes.clone()),
+        _ => None,
+    };
+    if let Some(routes) = routes {
+        return match routes.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => return ApiError::invalid_request(error.to_string(), None).into_response(),
+    };
+    let body: DeployBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
+    };
     let (mut config, stated) = match resolve_text(&body.config, &body.set) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -144,7 +197,15 @@ async fn deploy(State(node): State<Arc<Node>>, Json(body): Json<DeployBody>) -> 
     if let Err(error) = config.validate(&stated) {
         return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
     }
+    if config.model.is_none() {
+        return ApiError::invalid_request("the configuration names no model", Some("config"))
+            .into_response();
+    }
     let name = config.served_model_name().to_owned();
+    if body.dry_run {
+        return Json(json!({ "change": "planned", "plan": { "deployment": name, "world": true } }))
+            .into_response();
+    }
     {
         let mut serving = locked(&node.serving);
         if !matches!(*serving, Serving::Idle) {
@@ -288,7 +349,7 @@ async fn dispatch(State(node): State<Arc<Node>>, request: Request) -> Response {
         },
         None => ApiError::service_unavailable(
             "no_deployment",
-            "the node serves no deployment; POST /admin/deploy brings one up",
+            "the node serves no deployment; PUT /admin/config brings one up",
         )
         .into_response(),
     }

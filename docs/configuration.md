@@ -142,11 +142,26 @@ retention = "30m"
 
 ### `migration_config`
 
-A token request that generates text moves to the engine that serves next when its engine drains for a hot update or loses the workers that hold it; it continues after the last token it delivered, with the same output and usage.
+A token request that generates text moves to the engine that serves next when its world parks for a world change or a rollback, or loses the workers that hold it; it continues after the last token it delivered, with the same output and usage.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `max_migrations` | `3` | Migrations caused by lost workers or a lost engine process that a request survives before it fails; migrations of a hot update are not counted |
+| `max_migrations` | `3` | Migrations caused by lost workers, a lost engine process or a failed world on trial that a request survives before it fails; migrations of a world change or a rollback are not counted |
+
+### `update_config`
+
+How the deployment moves to a configuration that a new world executes (`PUT /admin/config`, [admin API](admin.md#configuration-changes-and-worlds)). An option that an update's own `set` states governs that update alone; the configuration keeps its own.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `previous_world` | `"parked"` | What the previous world keeps while its successor is on trial: `parked`, its processes, communicators, graph memory and weights, so that a rollback resumes it at once; `weights`, its weights alone, its processes exiting at the promotion, so that a rollback starts it again on them. `host` (its weights in host memory) is refused, since it needs the host's Transfer Server |
+| `preempt_after` | Unset | How long the serving world's requests that hold the tail of the KV cache a successor needs run on before they are recomputed on the cache left; unset lets them run to their end |
+| `rollback.failure_rate` | Unset | The share of the requests that end during the trial, in (0, 1], past which a trial whose requests failed rolls back |
+| `rollback.step_time_regression` | Unset | How much longer than the previous world's average step before its promotion the successor's may take, as a fraction (`0.2` for 20%), before the trial rolls back |
+| `rollback.throughput_regression` | Unset | How much lower than the previous world's token throughput before its promotion the successor's may fall, as a fraction, before the trial rolls back |
+| `rollback.window` | Unset | The span step time and throughput are averaged over, before the promotion and during the trial; required with either regression |
+
+A trial also rolls back, whatever these state, on a fault of the successor: a worker error that leaves its workers unusable (an illegal memory access, a worker process's exit), a stalled job, non-finite logits, or its engine process's exit. None of the thresholds has a default: each is measured on the deployment's own workload.
 
 ### `placement_config`
 
@@ -197,7 +212,7 @@ A token request that generates text moves to the engine that serves next when it
 | `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
 | `distributed_backend` | Torch default | Torch process-group backend for the workers' collectives |
 | `standby` | `false` | Keep a standby beside every worker group. The standby maps the group's retained weights and cache, captures its graphs on warmup scratch units and parks; when the group fails, it is promoted in the group's place instead of a relaunch, and a new standby starts. A group whose ranks all run on the leader's host and that shares no expert world keeps a standby rank group of its own. The groups of an expert world, and a group on several nodes, keep a standby world: a second launch of every group of their failure domain, which forms communicators of its own and is promoted as a whole when any group of the domain fails. Each standby rank holds a CUDA context, graph pools and workspaces of its own, which the device memory `mem_fraction_static` leaves must hold |
-| `standby_memory` | `auto` | How a parked standby (a group's, a failure domain's standby world, or a hot update's engine's) keeps the device memory of its graph pools, operator scratch, expert all-to-all workspaces and NCCL communicators: `resident`; `suspended`, released on the device and restored at the promotion, before its graphs run (the graph memory is copied to host memory and back with its contents at unchanged addresses; the `alltoall` exchange's MNNVL workspace is unmapped and mapped again at its addresses by every rank of the world together; NCCL communicators are suspended and resumed, and such a standby captures their collectives without NCCL graph buffer registration; the `deepep` exchange's windows and the colocated `megamoe` exchange's NVSHMEM heap, which cannot keep their addresses, are freed, and the promotion creates them again and captures the graphs that run expert steps anew); or `auto`, resident while every device keeps beside it a tenth of its memory, the share a serving worker leaves for graphs and activations, and suspended otherwise. The ranks of a world or group take one mode: one rank's crowded device suspends them all. A standby that lacks that share even suspended fails, and none is kept |
+| `standby_memory` | `auto` | How a parked standby (a group's or a failure domain's standby world) keeps the device memory of its graph pools, operator scratch, expert all-to-all workspaces and NCCL communicators: `resident`; `suspended`, released on the device and restored at the promotion, before its graphs run (the graph memory is copied to host memory and back with its contents at unchanged addresses; the `alltoall` exchange's MNNVL workspace is unmapped and mapped again at its addresses by every rank of the world together; NCCL communicators are suspended and resumed, and such a standby captures their collectives without NCCL graph buffer registration; the `deepep` exchange's windows and the colocated `megamoe` exchange's NVSHMEM heap, which cannot keep their addresses, are freed, and the promotion creates them again and captures the graphs that run expert steps anew); or `auto`, resident while every device keeps beside it a tenth of its memory, the share a serving worker leaves for graphs and activations, and suspended otherwise. The ranks of a world or group take one mode: one rank's crowded device suspends them all. A standby that lacks that share even suspended fails, and none is kept |
 
 A worker compiles the kernels its model runs that its machine has not cached yet, on first use. The compilations run up to `MAX_JOBS` parallel jobs when the worker's environment, its host daemon's, sets it. Otherwise each worker takes an equal share, among the ranks of its launch on its host, of half of the host's available CPUs and of the host memory available as it starts, at 6.1 GiB per job (the peak of one compiler process of FlashInfer's fused-MoE kernels), and at least one job; its log states the number.
 

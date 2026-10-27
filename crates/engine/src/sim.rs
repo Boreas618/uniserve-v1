@@ -267,7 +267,10 @@ impl SimExecutor {
             refusals,
             retired: Vec::new(),
             buffers: buffers.into_iter().collect(),
-            execution: None,
+            execution: crate::executor::WorkerExecError::non_finite(
+                result.batch_id,
+                result.results.iter().map(|completion| &completion.output),
+            ),
             message: "call failed before its dependent work could complete".into(),
         })
     }

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use storage::connector::Settings;
-use storage::{Client, Role, socket};
+use storage::{Client, socket};
 
 use crate::{ConnectorLaunch, Server};
 
@@ -97,7 +97,7 @@ pub fn run_connector(socket: &Path, settings: &Settings) -> anyhow::Result<()> {
 ///
 /// Fails when the server cannot be reached or refuses the listing.
 pub fn list(socket: &Path) -> storage::Result<()> {
-    let mut client = Client::connect(socket, Role::Operator)?;
+    let mut client = Client::connect_operator(socket)?;
     let listing = client.list()?;
     for tensor in &listing.tensors {
         let scopes: Vec<String> = tensor.scopes.iter().map(ToString::to_string).collect();
@@ -157,7 +157,7 @@ pub fn list(socket: &Path) -> storage::Result<()> {
 /// Fails when the server cannot be reached, or refuses because the
 /// deployment's head is connected.
 pub fn retire(socket: &Path, deployment: &str) -> storage::Result<()> {
-    let mut client = Client::connect(socket, Role::Operator)?;
+    let mut client = Client::connect_operator(socket)?;
     let released = client.retire(deployment.to_owned())?;
     println!("released {released} tensors of {deployment}");
     Ok(())

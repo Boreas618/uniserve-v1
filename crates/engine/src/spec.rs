@@ -135,7 +135,9 @@ impl EngineConfig {
             } else {
                 named(&workers.standby_memory, "worker_config.standby_memory")?
             },
-            cache_units: None,
+            segments: None,
+            world: spec.world,
+            predecessor: None,
             model: spec.model.clone(),
             weights: stated(&workers.weights),
             host: spec.host.clone(),
@@ -218,13 +220,54 @@ impl EngineConfig {
             bos: facts.bos,
             eos: facts.eos.clone(),
             end_of_image: facts.end_of_image,
-            standby: spec.standby.as_ref().map(|standby| {
-                standby
-                    .cache_units
+            world: spec.world,
+            predecessor: spec.predecessor.as_ref().map(|predecessor| {
+                predecessor
+                    .segments
                     .iter()
-                    .map(|group| (group.worker_group.clone(), group.units))
+                    .map(|group| {
+                        (
+                            group.worker_group.clone(),
+                            ipc::PredecessorCache {
+                                world: predecessor.world,
+                                segments: group
+                                    .segments
+                                    .iter()
+                                    .take(group.held as usize)
+                                    .map(|segment| ipc::CacheSegment {
+                                        world: segment.world,
+                                        ordinal: segment.ordinal,
+                                        units: segment.units,
+                                    })
+                                    .collect(),
+                                num_units: group.units,
+                                scratch_units: group.scratch,
+                            },
+                        )
+                    })
                     .collect()
             }),
+            segments: spec
+                .segments
+                .iter()
+                .map(|group| {
+                    (
+                        group.worker_group.clone(),
+                        ipc::CacheTable {
+                            segments: group
+                                .segments
+                                .iter()
+                                .map(|segment| ipc::CacheSegment {
+                                    world: segment.world,
+                                    ordinal: segment.ordinal,
+                                    units: segment.units,
+                                })
+                                .collect(),
+                            held: group.held,
+                        },
+                    )
+                })
+                .collect(),
         })
     }
 }
@@ -355,7 +398,9 @@ mod tests {
                 ..wire::Experts::default()
             }),
             model_facts: Some(wire::ModelFacts::default()),
-            standby: None,
+            world: 0,
+            predecessor: None,
+            segments: Vec::new(),
         }
     }
 

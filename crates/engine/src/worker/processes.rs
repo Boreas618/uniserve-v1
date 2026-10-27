@@ -233,7 +233,9 @@ impl ProcessClient {
         &mut self,
         host: &str,
         deployment: &str,
+        world: u64,
         scopes: Vec<(String, u32)>,
+        retire: Vec<u64>,
         server_arguments: Vec<String>,
     ) -> anyhow::Result<ipc::StorageLaunch> {
         let claimed = match self
@@ -245,6 +247,8 @@ impl ProcessClient {
                     .map(|(group, rank)| Scope { group, rank })
                     .collect(),
                 server_arguments,
+                world,
+                retire,
             }))
             .with_context(|| format!("claiming the deployment's storage on host {host}"))?
         {
@@ -262,6 +266,7 @@ impl ProcessClient {
             host_kv_cache: false,
             host_kv_cache_bytes: None,
             tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
+            world,
             // The engine states whether a group stands by, and how.
             standby: false,
             standby_memory: proto::request::StandbyMemory::Auto,

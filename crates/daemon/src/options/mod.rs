@@ -204,6 +204,7 @@ pub struct ServeConfig {
     pub kv_cache_config: KvCacheOptions,
     pub scheduler_config: SchedulerOptions,
     pub migration_config: MigrationOptions,
+    pub update_config: UpdateOptions,
     pub placement_config: PlacementOptions,
     pub moe_config: MoeOptions,
     pub cuda_graph_config: CudaGraphOptions,
@@ -244,6 +245,7 @@ impl Default for ServeConfig {
             kv_cache_config: KvCacheOptions::default(),
             scheduler_config: SchedulerOptions::default(),
             migration_config: MigrationOptions::default(),
+            update_config: UpdateOptions::default(),
             placement_config: PlacementOptions::default(),
             moe_config: MoeOptions::default(),
             cuda_graph_config: CudaGraphOptions::default(),
@@ -800,9 +802,9 @@ impl Default for MediaOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MigrationOptions {
-    /// Migrations caused by lost workers or a lost engine process that a
-    /// request survives; it fails on the next. Migrations of a hot update
-    /// are not counted.
+    /// Migrations caused by lost workers, a lost engine process or a failed
+    /// world on trial that a request survives; it fails on the next.
+    /// Migrations of a world change or a rollback are not counted.
     pub max_migrations: u32,
 }
 
@@ -810,6 +812,92 @@ impl Default for MigrationOptions {
     fn default() -> Self {
         Self { max_migrations: 3 }
     }
+}
+
+/// Whether `current` and `target` differ in the options the daemon reads
+/// alone (its HTTP server, the request and output processing, the media
+/// and video jobs, logging and migration), which a hot restart of the
+/// daemon applies; the engine spec covers every other option.
+pub fn daemon_options_differ(current: &ServeConfig, target: &ServeConfig) -> bool {
+    current.server_config != target.server_config
+        || current.logging_config != target.logging_config
+        || current.chat_config != target.chat_config
+        || current.image_fetch_config != target.image_fetch_config
+        || current.media_config != target.media_config
+        || current.video_job_config != target.video_job_config
+        || current.readout_config != target.readout_config
+        || current.migration_config != target.migration_config
+        || current.mm_processor_kwargs != target.mm_processor_kwargs
+        || current.diffusion_generation_config != target.diffusion_generation_config
+}
+
+/// How the deployment moves to a new configuration in another world
+/// (`update_config`, `PUT /admin/config`): what of the previous world its
+/// trial keeps for a rollback, when the trial rolls back by itself, and how
+/// long the serving world's requests hold the cache a successor needs. A
+/// value an update states in its own assignments governs that update alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateOptions {
+    /// What the previous world keeps while the new one is on trial.
+    pub previous_world: PreviousWorld,
+    /// When a trial rolls back without the operator: a fatal worker error,
+    /// the engine process's exit, a stalled job and non-finite logits always
+    /// roll back; these thresholds, which have no default, add the rest.
+    pub rollback: RollbackOptions,
+    /// How long the serving world's requests that hold the KV cache's tail a
+    /// successor needs run on before they are recomputed; unset to let them
+    /// run to their end.
+    #[serde(with = "values::optional_duration")]
+    pub preempt_after: Option<Duration>,
+}
+
+impl Default for UpdateOptions {
+    fn default() -> Self {
+        Self {
+            previous_world: PreviousWorld::Parked,
+            rollback: RollbackOptions::default(),
+            preempt_after: None,
+        }
+    }
+}
+
+/// What the previous world keeps during its successor's trial
+/// (`update_config.previous_world`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviousWorld {
+    /// Its processes, communicators, graph memory, weights and the KV cache
+    /// its successor maps: a rollback resumes it at once.
+    Parked,
+    /// Its weights (and the KV cache its successor maps): a rollback starts
+    /// its processes again, which bind them.
+    Weights,
+    /// The KV cache its successor maps, and in host memory the weights its
+    /// successor does not map: a rollback copies them back and starts its
+    /// processes again.
+    Host,
+}
+
+/// The thresholds past which a trial rolls back by itself
+/// (`update_config.rollback`). None has a default: each is measured on the
+/// target workload before it is set.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RollbackOptions {
+    /// The share of the requests that end during the trial, in `(0, 1]`,
+    /// past which it rolls back when they failed.
+    pub failure_rate: Option<f64>,
+    /// How much longer than the previous world's before its promotion the
+    /// new world's average step may take, as a fraction (`0.2` for 20%).
+    pub step_time_regression: Option<f64>,
+    /// How much lower than the previous world's before its promotion the
+    /// new world's token throughput may fall, as a fraction.
+    pub throughput_regression: Option<f64>,
+    /// The span the step time and throughput are averaged over, before the
+    /// promotion and during the trial; required with either regression.
+    #[serde(with = "values::optional_duration")]
+    pub window: Option<Duration>,
 }
 
 /// Asynchronous video jobs (`video_job_config`).
@@ -890,9 +978,33 @@ impl ServeConfig {
             "a deployment of several nodes needs the leader's address: set `dist_init_addr`"
         );
         anyhow::ensure!(
-            !self.leads() || self.model.is_some(),
-            "`model` is required: name MODEL on the command line or set `model` in --config"
+            !self.leads() || self.model.is_some() || self.nnodes.get() == 1,
+            "`model` is required on the leader of several nodes: name MODEL on the command line \
+             or set `model` in --config"
         );
+        let rollback = &self.update_config.rollback;
+        if let Some(rate) = rollback.failure_rate {
+            anyhow::ensure!(
+                rate.is_finite() && rate > 0.0 && rate <= 1.0,
+                "invalid `update_config.rollback.failure_rate`: {rate} must be in (0, 1]"
+            );
+        }
+        for (name, ratio) in [
+            ("step_time_regression", rollback.step_time_regression),
+            ("throughput_regression", rollback.throughput_regression),
+        ] {
+            if let Some(ratio) = ratio {
+                anyhow::ensure!(
+                    ratio.is_finite() && ratio > 0.0,
+                    "invalid `update_config.rollback.{name}`: {ratio} must be positive"
+                );
+                anyhow::ensure!(
+                    rollback.window.is_some_and(|window| !window.is_zero()),
+                    "`update_config.rollback.{name}` is measured over \
+                     `update_config.rollback.window`: set it"
+                );
+            }
+        }
         // Each rank grants itself this share of every device's total
         // storage, so any finite value in (0, 1] is meaningful.
         anyhow::ensure!(
@@ -1113,7 +1225,9 @@ impl ServeConfig {
                 microbatches: self.moe_config.microbatches.get(),
             }),
             model_facts: None,
-            standby: None,
+            world: 0,
+            predecessor: None,
+            segments: Vec::new(),
         })
     }
 }

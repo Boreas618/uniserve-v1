@@ -4,8 +4,9 @@ Qwen3 serves on one GPU of the host, with a Storage Server of the test's
 own (``XDG_RUNTIME_DIR`` points the daemon at a directory of the test's,
 and the server the daemon starts there is stopped at the end).
 
-- A node (``uniserve node``) brings deployments up and down through its
-  admin API without restarting: each deployment's page pools and weights
+- A node (``uniserve serve`` without a model) brings deployments up
+  (``PUT /admin/config``) and down through its admin API without
+  restarting: each deployment's page pools and weights
   belong to it, so bringing it down returns the host's shared memory and
   the GPU's memory to what they were before it, and a deployment whose
   page pools the host's available memory cannot hold is refused with the
@@ -14,23 +15,25 @@ and the server the daemon starts there is stopped at the end).
   generation is paused and are served once it continues; a flush revokes
   the cached prefix pages; scheduling limits within the batch the workers
   were started for change in place while a request streams, and a change
-  of the decode batch sizes is a hot update under the same stream; a
-  worker hook no plugin implements fails with that reason; the manager
-  attaches to the node, follows its events and detaches while it serves.
-- A plugin installed beside the deployment's environment is taken up by a
-  hot update and dropped by the next one after its removal: the worker
-  hook it registers answers from every worker in between, and fails before
-  and after.
-- A hot update while another process holds the device's free memory gives
-  back the tail of the KV cache for the standby engine, recomputing the
-  requests that held it, and the updated engine creates the tail again.
+  of the decode batch sizes is a world change under the same stream,
+  which the operator commits; a worker hook no plugin implements fails
+  with that reason; the manager attaches to the node, follows its events
+  and detaches while it serves.
+- A plugin installed beside the deployment's environment is taken up by
+  the next world and dropped by the one after its removal: the worker hook
+  it registers answers from every worker in between, and fails before and
+  after.
+- A world change while another process holds the device's free memory
+  gives back the tail of the serving world's KV cache for the successor,
+  and the committed successor grows its cache into the memory the
+  previous world freed.
 - A sleeping deployment gives back its KV cache and graph memory, holds
   new requests and recomputes the ones it ran once it wakes, and answers
   as before.
 - A LoRA adapter loads into a slot the daemon assigns, through the plugin
   hooks of a plugin that holds the pool: requests naming it are served
-  under its name, the engine a hot update starts loads it again, and once
-  it is unloaded its name is no model's.
+  under its name, the world a world change starts loads it again, and
+  once it is unloaded its name is no model's.
 - A plugin's communication buffer is allocated before the KV cache is
   sized and counts against it: the cache takes as many units fewer as
   the buffer's bytes hold.
@@ -39,7 +42,7 @@ and the server the daemon starts there is stopped at the end).
   as a deployment started on that checkpoint does, and as before once it
   updates back. A plugin's weight source that streams the tensors of the
   other checkpoint does the same through the same layout conversion, and
-  a hot update after it binds the weights it left.
+  a world change after it binds the weights it left.
   ``UNISERVE_QWEN3_UPDATED_MODEL`` names the other checkpoint.
 """
 
@@ -55,6 +58,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -82,6 +86,9 @@ OPTIONS = (
     "cuda_graph_config.prefill_token_sizes=[512]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
 )
+# A change of the options that only a new world executes: graphs of other
+# decode batch sizes.
+CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
 # Each worker's host KV cache, in GiB.
 HOST_GIB = 8
 PROMPT = (
@@ -170,6 +177,16 @@ def _storage_list(runtime: Path) -> str:
     ).stdout
 
 
+def _held(runtime: Path) -> list[str]:
+    """What the test's Storage Server holds, its page pools without their
+    slot counters, which the deployment's offloads move as it serves.
+    """  # noqa: D205
+    return sorted(
+        line.split(": ", 1)[0] if line.startswith("page pool") else line
+        for line in _storage_list(runtime).splitlines()
+    )
+
+
 @pytest.fixture
 def runtime(tmp_path: Path) -> Iterator[Path]:
     """The runtime directory of the test's own Storage Server, whose log
@@ -255,7 +272,7 @@ def _node(runtime: Path, device: str, log: Path) -> Iterator[tuple[str, int]]:
     process = start_server(
         [
             str(require_uniserve_binary()),
-            "node",
+            "serve",
             "--host",
             "127.0.0.1",
             "--port",
@@ -288,8 +305,8 @@ def _node_state(base_url: str) -> dict:
 
 
 def _deploy(base_url: str, name: str, *assignments: str) -> None:
-    response = httpx.post(
-        f"{base_url}/admin/deploy",
+    response = httpx.put(
+        f"{base_url}/admin/config",
         json={
             "config": "",
             "set": [
@@ -427,6 +444,28 @@ def _admin(
     return httpx.post(f"{base_url}/admin/{path}", json=body or {}, timeout=1800)
 
 
+def _apply(base_url: str, *assignments: str) -> dict:
+    """Applies `assignments` (``PUT /admin/config``); returns its result."""
+    response = httpx.put(
+        f"{base_url}/admin/config",
+        json={"set": list(assignments)},
+        timeout=1800,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["result"]
+
+
+def _change_world(base_url: str, *assignments: str) -> dict:
+    """Applies `assignments` as a world change and commits the successor;
+    returns the change's report.
+    """  # noqa: D205
+    result = _apply(base_url, *assignments)
+    assert result["change"] == "world", result
+    committed = _admin(base_url, "config/commit")
+    assert committed.status_code == 200, committed.text
+    return result["world"]
+
+
 def test_a_serving_deployment_answers_its_admin_api(
     tmp_path: Path, runtime: Path
 ):
@@ -467,7 +506,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         )
 
         # Scheduling limits change in place under a streaming request, and
-        # other decode batch sizes by a hot update under the same stream.
+        # other decode batch sizes by a world change under the same stream.
         read: list[str] = []
         done = threading.Event()
         streaming = threading.Thread(
@@ -475,25 +514,11 @@ def test_a_serving_deployment_answers_its_admin_api(
         )
         streaming.start()
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
-        in_place = _admin(
-            base_url,
-            "update",
-            {"set": ["max_running_requests=4"]},
-        )
-        assert in_place.status_code == 200, in_place.text
-        result = in_place.json()["result"]
-        assert result["in_place"] is True, result
-        assert result["pause_seconds"] == 0, result
+        in_place = _apply(base_url, "max_running_requests=4")
+        assert in_place["change"] == "in_place", in_place
         before_update = len(read)
-        hot = _admin(
-            base_url,
-            "update",
-            {"set": ["cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"]},
-        )
-        assert hot.status_code == 200, hot.text
-        hot_result = hot.json()["result"]
-        assert hot_result["in_place"] is False, hot_result
-        print(f"hot update pause: {hot_result['pause_seconds']:.3f} s")
+        report = _change_world(base_url, CHANGE)
+        print(f"world change pause: {report['pause_seconds']:.3f} s")
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         text = "".join(read)
@@ -535,7 +560,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         output, _ = watching.communicate(timeout=60)
         assert watching.returncode == 0, output
         assert (
-            "update" in output and "detached; the nodes serve on" in output
+            "config" in output and "detached; the nodes serve on" in output
         ), output
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
@@ -547,7 +572,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         assert "operation" in kinds, events
 
 
-def test_a_hot_update_takes_up_and_drops_a_plugin(
+def test_a_world_change_takes_up_and_drops_a_plugin(
     tmp_path: Path, runtime: Path
 ):
     name = "qwen3-live-plugin"
@@ -574,9 +599,7 @@ def test_a_hot_update_takes_up_and_drops_a_plugin(
         metadata.mkdir()
         (metadata / "METADATA").write_text(PLUGIN_METADATA)
         (metadata / "entry_points.txt").write_text(PLUGIN_ENTRY_POINTS)
-        installed = _admin(base_url, "update")
-        assert installed.status_code == 200, installed.text
-        assert installed.json()["result"]["in_place"] is False
+        _change_world(base_url, CHANGE)
 
         answered = probe()
         assert answered.status_code == 200, answered.text
@@ -590,8 +613,7 @@ def test_a_hot_update_takes_up_and_drops_a_plugin(
 
         shutil.rmtree(package)
         shutil.rmtree(metadata)
-        removed = _admin(base_url, "update")
-        assert removed.status_code == 200, removed.text
+        _change_world(base_url, OPTIONS[-1])
         after = probe()
         assert after.status_code >= 400, after.text
         reply = _chat(base_url, name, "Say hello.")
@@ -710,7 +732,7 @@ def _restart_while_streaming(
         messages
     )
 
-    # The successor restarts in turn, and serves an update.
+    # The successor restarts in turn, and takes a change in place.
     again = _admin(base_url, "restart")
     assert again.status_code == 200, again.text
     successors.append(again.json()["result"]["pid"])
@@ -721,9 +743,29 @@ def _restart_while_streaming(
     )
     reply = _chat(base_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
-    update = _admin(base_url, "update", {"set": ["max_running_requests=8"]})
-    assert update.status_code == 200, update.text
-    assert update.json()["result"]["in_place"] is True
+    update = _apply(base_url, "max_running_requests=8")
+    assert update["change"] == "in_place", update
+
+    # A change of the listening address restarts the daemon on it: the new
+    # address serves, and the old one closes once the replaced daemon exits.
+    previous = successors[-1]
+    port = find_free_port()
+    moved = _apply(base_url, f"server_config.port={port}")
+    assert moved["change"] == "daemon", moved
+    successors.append(moved["pid"])
+    moved_url = f"http://127.0.0.1:{port}"
+    reply = _chat(moved_url, name, "Say hello.")
+    assert reply["choices"][0]["message"]["content"]
+    _wait_until(
+        lambda: not _runs(previous),
+        120,
+        "the daemon on the previous address did not exit",
+    )
+    with pytest.raises(httpx.ConnectError):
+        httpx.get(f"{base_url}/health", timeout=5)
+    status = httpx.get(f"{moved_url}/admin/config", timeout=10).json()
+    server = tomllib.loads(status["config"])["server_config"]
+    assert server["port"] == port, server
 
 
 def _storage_pid(runtime: Path) -> int:
@@ -749,7 +791,7 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
     with _serve(runtime, log, name) as base_url:
         prompt = "Describe the sea in one sentence. " * 40
         _chat(base_url, name, prompt)
-        before = sorted(_storage_list(runtime).splitlines())
+        before = _held(runtime)
         old_server = _storage_pid(runtime)
 
         read: list[str] = []
@@ -776,10 +818,10 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
             "the replaced Storage Server did not exit",
         )
         assert _storage_pid(runtime) == successor
-        assert sorted(_storage_list(runtime).splitlines()) == before
+        assert _held(runtime) == before
 
         # The deployment serves throughout: the count goes on, a new
-        # request is answered, and a hot update maps the weights the
+        # request is answered, and a world change maps the weights the
         # successor holds.
         reply = _chat(base_url, name, prompt)
         assert reply["choices"][0]["message"]["content"]
@@ -787,8 +829,7 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         assert done.is_set(), "the count did not end"
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
-        hot = _admin(base_url, "update")
-        assert hot.status_code == 200, hot.text
+        _change_world(base_url, CHANGE)
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
         lines = _log_lines(log)
@@ -805,7 +846,7 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         assert any(
             re.search(r"mapped the retained weights .*missing=0", line)
             for line in lines
-        ), "the updated engine did not map the retained weights"
+        ), "the successor world did not map the retained weights"
 
 
 # The options of a deployment whose KV cache takes the device memory its
@@ -850,7 +891,7 @@ def _ballast(device: str, leave_gib: float) -> Iterator[int]:
         process.wait(timeout=120)
 
 
-def test_a_hot_update_under_memory_pressure_shrinks_the_kv_cache(
+def test_a_world_change_under_memory_pressure_shrinks_the_kv_cache(
     tmp_path: Path, runtime: Path
 ):
     name = "qwen3-live-pressure"
@@ -870,21 +911,10 @@ def test_a_hot_update_under_memory_pressure_shrinks_the_kv_cache(
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
         with _ballast(device, leave_gib=2.0) as held:
             print(f"ballast holds {held / (1 << 30):.1f} GiB; GPU free 2 GiB")
-            hot = _admin(
-                base_url,
-                "update",
-                {
-                    "set": [
-                        "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
-                    ]
-                },
-            )
-            assert hot.status_code == 200, hot.text
-            result = hot.json()["result"]
-            assert result["in_place"] is False, result
+            report = _change_world(base_url, CHANGE)
             print(
-                "hot update under pressure, pause: "
-                f"{result['pause_seconds']:.3f} s"
+                "world change under pressure, pause: "
+                f"{report['pause_seconds']:.3f} s"
             )
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
@@ -902,12 +932,16 @@ def test_a_hot_update_under_memory_pressure_shrinks_the_kv_cache(
             for line in lines
             if "gave back the tail of the KV cache" in line
         ]
-        restored = [line for line in lines if "restored the KV cache" in line]
-        for line in withdrew + gave + restored:
+        grew = [
+            line
+            for line in lines
+            if "growing the KV cache into the memory freed" in line
+        ]
+        for line in withdrew + gave + grew:
             print(line)
-        assert withdrew, "the running engine did not shrink its KV cache"
-        assert gave, "the running engine's workers did not give the tail back"
-        assert restored, "the updated engine did not create the tail again"
+        assert withdrew, "the serving world did not shrink its KV cache"
+        assert gave, "the serving world's workers did not give the tail back"
+        assert grew, "the committed successor did not grow its KV cache"
         after = _chat(base_url, name, prompt, 32)["choices"][0]["message"][
             "content"
         ]
@@ -1128,14 +1162,13 @@ def test_a_weight_update_answers_as_the_new_checkpoint_does(
         )
         assert streamed.status_code == 200, streamed.text
         assert answers(base_url) == expected
-        # A hot update's standby binds the weights the source left.
-        hot = _admin(base_url, "update")
-        assert hot.status_code == 200, hot.text
+        # A world change's successor binds the weights the source left.
+        _change_world(base_url, CHANGE)
         assert answers(base_url) == expected
         assert any(
             re.search(r"mapped the retained weights .*missing=0", line)
             for line in _log_lines(log)
-        ), "the standby did not map the streamed weights"
+        ), "the successor did not map the streamed weights"
         back = _admin(base_url, "update_weights", {"model_path": _checkpoint()})
         assert back.status_code == 200, back.text
         assert answers(base_url) == original
@@ -1179,7 +1212,7 @@ def probe(payload, models):
 """
 
 
-def test_a_lora_adapter_is_served_under_its_name_across_a_hot_update(
+def test_a_lora_adapter_is_served_under_its_name_across_a_world_change(
     tmp_path: Path, runtime: Path
 ):
     name = "qwen3-live-lora"
@@ -1244,9 +1277,8 @@ def test_a_lora_adapter_is_served_under_its_name_across_a_hot_update(
             == base.json()["choices"][0]["message"]["content"]
         )
 
-        # The engine a hot update starts loads the adapter again.
-        updated = _admin(base_url, "update")
-        assert updated.status_code == 200, updated.text
+        # The world a world change starts loads the adapter again.
+        _change_world(base_url, CHANGE)
         assert probe() == [[["tuned", 1]]]
         assert ask("tuned").status_code == 200
 

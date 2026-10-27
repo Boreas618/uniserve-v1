@@ -177,14 +177,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
             .media_units(ipc::MediaCall::LatentEncoding)
             .unwrap_or(0),
         schedulers: cores.len() as u32,
-        cache_units: cores
-            .iter()
-            .flat_map(|core| core.cache_units())
-            .map(|(group, units)| proto::request::wire::GroupCacheUnits {
-                worker_group: group.clone(),
-                units: *units,
-            })
-            .collect(),
+        segments: Vec::new(),
         capacity: None,
     };
     let model_name = first.model_name().to_owned();
@@ -193,7 +186,12 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         .name("sim-engine".into())
         .spawn(move || engine::serve_requests(engine, cores))
         .expect("start the simulated engine");
-    EngineClient::over(daemon, info, crate::leader::stats_sink(model_name)).expect("a client")
+    EngineClient::over(
+        daemon,
+        info,
+        crate::leader::stats_sink(model_name, std::sync::Arc::default()),
+    )
+    .expect("a client")
 }
 
 /// The simulated model's facts.

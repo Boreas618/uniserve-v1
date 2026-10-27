@@ -153,6 +153,9 @@ pub struct SchedulerStats {
     /// `batch_roundtrip_us` in this interval.
     #[serde(default)]
     pub batch_count: u64,
+    /// Calls whose forward produced non-finite logits in the interval.
+    #[serde(default)]
+    pub numerical_faults: u64,
     /// Per-domain accounting, in `prefill`, `decode`, `flow` order.
     #[serde(default)]
     pub domain_stats: Vec<DomainSchedulerStats>,

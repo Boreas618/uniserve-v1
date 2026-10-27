@@ -476,8 +476,8 @@ class CausalLMRunner:
                 ``candidates``).
             params: ``[T, PARAMETER_COLUMNS]`` float32, each row's sampling
                 parameters (read with ``candidates``).
-            completion: ``[4, R]`` int64 output: valid, active, token,
-                accepted drafts (zero).
+            completion: ``[5, R]`` int64 output: valid, active, token,
+                accepted drafts (zero), finite logits.
             continuation: ``[R]`` uint8 output, the row continues.
             tagged: ``[R]`` int64 output, the token with
                 ``TOKEN_CONTINUATION_BIT`` where the row continues.
@@ -519,20 +519,25 @@ class CausalLMRunner:
                 ).clamp_min(0)
                 values = self._project(hidden, indices, rows, logits[:rows])
                 if int(candidates):
+                    gathered = self._gathered(values)
                     tokens, valid = sample_top_k(
-                        self._gathered(values),
+                        gathered,
                         draws[:rows],
                         params[:rows],
                         int(candidates),
                         self._penalty_counts,
                         slots[:rows],
                     )
+                    finite = torch.isfinite(gathered).all(dim=-1)
                     # Every tensor-parallel rank installs the source rank's
                     # selection.
                     self._broadcast(tokens)
                 else:
                     maxima, tokens = greedy(values, self._vocab)
+                    # A greedy row constrains nothing: a non-finite maximum
+                    # is a NaN or infinity among its logits.
                     valid = torch.isfinite(maxima)
+                    finite = valid
 
                 active = self._predicates.index_select(0, slots[:rows])
                 eligible = valid & active
@@ -546,6 +551,7 @@ class CausalLMRunner:
                 completion[1, :rows].copy_(active)
                 completion[2, :rows].copy_(tokens)
                 completion[3, :rows].zero_()
+                completion[4, :rows].copy_(finite)
                 points[:rows].fill_(1)
                 continuation[:rows].view(torch.bool).copy_(continues)
                 tagged[:rows].copy_(
@@ -811,6 +817,7 @@ class CausalLMRunner:
         completion[1, :end].copy_(selection.active)
         completion[2, :end].copy_(selection.tokens)
         completion[3, :end].copy_(selection.accepted)
+        completion[4, :end].copy_(selection.finite)
         continuation[:end].copy_(selection.continuation)
         tagged[:end].copy_(selection.tagged)
         points[:end].copy_(selection.points)
@@ -870,8 +877,8 @@ class CausalLMRunner:
             biased: ``[R]`` uint8, tasks that add their slot's logit biases.
             force: ``[R]`` uint8, tasks that finish whatever they select.
             finish, transitions: ``[R, words]`` int32 token sets.
-            completion: ``[4, R]`` int64 output: valid, active, token,
-                accepted drafts.
+            completion: ``[5, R]`` int64 output: valid, active, token,
+                accepted drafts, finite logits.
             continuation: ``[R]`` uint8 output, the task continues.
             tagged: ``[R]`` int64 output, the token with
                 ``TOKEN_CONTINUATION_BIT`` where the task continues.
@@ -968,7 +975,7 @@ class CausalLMRunner:
             tasks: ``[R]`` int64, the task each row scores.
             counts: ``[R]`` int64, each row's top count, -1 for padding.
             scored: ``[R]`` int64, each task's scored row of ``logits``.
-            completion: ``[4, R]`` int64, the selection's outputs.
+            completion: ``[5, R]`` int64, the selection's outputs.
             logprobs: ``[L]`` int64 output.
         """
         rows = int(rows)

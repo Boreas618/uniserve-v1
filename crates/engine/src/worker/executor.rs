@@ -1471,28 +1471,60 @@ impl Executor for WorkerExecutor {
         })
     }
 
-    /// Promotes every group's standing-by ranks together
-    /// (`WorkerGroup::promote_ranks`).
-    fn promote(&mut self) -> anyhow::Result<()> {
+    /// Retires `worlds` through the deployment's claims, which every group
+    /// shares.
+    fn retire(&mut self, worlds: &[u64]) -> anyhow::Result<()> {
+        match self.workers.first() {
+            Some((_, group)) => group.claims().retire(worlds),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs the worker hook on every group, the groups together, and
+    /// returns each group's identity with its ranks' results.
+    fn hook_groups(
+        &mut self,
+        name: &str,
+        payload: &str,
+    ) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>> {
         std::thread::scope(|scope| {
-            let promoting = self
+            let running = self
                 .workers
                 .iter_mut()
-                .map(|worker| scope.spawn(|| worker.1.promote_ranks()))
+                .map(|worker| {
+                    let id = worker.0.clone();
+                    scope.spawn(move || worker.1.hook(name, payload).map(|results| (id, results)))
+                })
                 .collect::<Vec<_>>();
-            let mut first_error = None;
-            for handle in promoting {
-                let result = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("worker promotion thread panicked"))
-                    .and_then(|result| result);
-                if let Err(error) = result
-                    && first_error.is_none()
-                {
-                    first_error = Some(error);
-                }
+            running
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("worker hook thread panicked"))?
+                })
+                .collect()
+        })
+    }
+
+    /// Commits every group's world together (`WorkerGroup::commit`), and
+    /// returns every rank's report, group by group.
+    fn commit(&mut self) -> anyhow::Result<Vec<String>> {
+        std::thread::scope(|scope| {
+            let committing = self
+                .workers
+                .iter_mut()
+                .map(|worker| scope.spawn(|| worker.1.commit()))
+                .collect::<Vec<_>>();
+            let mut results = Vec::new();
+            for handle in committing {
+                results.extend(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("worker commit thread panicked"))??,
+                );
             }
-            first_error.map_or(Ok(()), Err)
+            Ok(results)
         })
     }
 }

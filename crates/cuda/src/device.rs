@@ -141,6 +141,14 @@ impl DeviceId {
         Ok(accessible != 0)
     }
 
+    /// Fails with the error that left the device's primary context
+    /// unusable, such as an illegal memory access or a device-side assert,
+    /// which the driver returns from every call after it; passes while the
+    /// context is usable. Waits for nothing on the device.
+    pub fn context_error(self) -> Result<()> {
+        self.memory_info().map(drop)
+    }
+
     /// Free and total device memory, queried in the device's primary context.
     pub fn memory_info(self) -> Result<MemoryInfo> {
         let _guard = DeviceGuard::new(self)?;

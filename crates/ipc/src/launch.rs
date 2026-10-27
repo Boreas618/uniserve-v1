@@ -40,6 +40,9 @@ pub struct StorageLaunch {
     /// page requests; `None` on the engine's host, or when the server accepts
     /// no other host.
     pub tcp: Option<String>,
+    /// The world the worker belongs to: the exclusive storages it creates
+    /// are its world's, and it retains what it uses in its world.
+    pub world: u64,
     /// Whether the worker stands by for the worker of its scope: it maps
     /// the exclusive storages that worker holds without taking write
     /// access, warms up on scratch units, parks with the storages read-only
@@ -132,9 +135,15 @@ pub struct LaunchDescriptor {
     pub mem_fraction_static: f64,
     /// Prefix cache capacity in tokens; `None` sizes it from memory.
     pub max_total_tokens: Option<u64>,
-    /// The exact prefix cache units of a standby worker: those of the
-    /// worker it stands by for, whose cache planes it maps.
-    pub cache_units: Option<u32>,
+    /// The KV cache of the rank of the same scope in the world this one
+    /// succeeds, whose segments the rank maps read-only behind a head
+    /// segment of its own; `None` for a world that succeeds none.
+    pub predecessor: Option<crate::PredecessorCache>,
+    /// The exact KV cache segments the rank's planes are made of: those of
+    /// the worker a standby rank group's worker stands by for, or those a
+    /// world's rank held before its relaunch; `None` lays the planes out
+    /// afresh.
+    pub segments: Option<crate::CacheTable>,
     /// Attention provider name of the rank's model, as `attention_backend`
     /// gave it. The rank's attention registry (`uniserve.backends.attention`)
     /// owns the names and refuses one it does not provide when the model

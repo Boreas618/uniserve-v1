@@ -95,6 +95,10 @@ struct Prepare {
     /// The daemon's process socket, which the successor serves from the
     /// handoff on and its engines and workers connect to.
     processes: String,
+    /// Whether the configuration listens on another address than the
+    /// daemon's listener: the successor binds it before the handover.
+    #[serde(default)]
+    rebind: bool,
 }
 
 /// What a daemon hands its successor. The descriptors travel in this
@@ -123,6 +127,9 @@ struct Takeover {
     asleep: bool,
     sleep_paused: bool,
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
+    /// The configurations a rollback marked unavailable.
+    #[serde(default)]
+    unavailable: Vec<crate::worlds::Unavailable>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -179,6 +186,7 @@ impl Restarter {
     pub(crate) async fn restart(
         &self,
         executable: Option<String>,
+        config: Option<crate::options::ServeConfig>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -187,7 +195,7 @@ impl Restarter {
             Some(executable) => std::path::PathBuf::from(executable),
             None => std::env::current_exe().context("finding this daemon's executable")?,
         };
-        // No hot update or relaunch replaces the engine meanwhile.
+        // No world change, rollback or relaunch replaces the engine meanwhile.
         let _quiet = leader.quiesce().await;
         let handoff = leader.engine_handoff()?;
         let (ours, theirs) = UnixStream::pair().context("creating the handoff socket")?;
@@ -195,7 +203,14 @@ impl Restarter {
         info!(pid = successor, executable = %executable.display(), "started the successor daemon");
         let mut channel = Channel::new(ours);
 
-        let config = crate::options::printed(&handoff.config)?;
+        // The successor serves with the daemon's options the change
+        // states, over the configuration the engine serves.
+        let options = config.unwrap_or_else(|| handoff.config.clone());
+        let address = |server: &crate::options::ServerOptions| {
+            (server.host.clone(), server.port, server.uds.clone())
+        };
+        let rebind = address(&options.server_config) != address(&handoff.config.server_config);
+        let config = crate::options::printed(&options)?;
         let processes = self
             .daemon
             .lock()
@@ -209,8 +224,9 @@ impl Restarter {
             &Message::Prepare(Box::new(Prepare {
                 config,
                 stated: self.stated.paths(),
-                api_key: handoff.config.server_config.api_key.clone(),
+                api_key: options.server_config.api_key.clone(),
                 processes,
+                rebind,
             })),
             &[],
         )?;
@@ -276,6 +292,7 @@ impl Restarter {
                 asleep: handoff.asleep,
                 sleep_paused: handoff.sleep_paused,
                 adapters: handoff.adapters,
+                unavailable: handoff.unavailable,
             })),
             &borrowed,
         )?;
@@ -464,6 +481,18 @@ async fn prepared_successor(
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
     let prepared = Leader::prepare(&config, &stated).await?;
+    // Another listening address is bound before the handover, so that a
+    // refused bind leaves the previous daemon serving; the listener it hands
+    // over then closes once the previous daemon stops accepting.
+    let rebound = if prepare.rebind {
+        let listener = Listener::bind(&config.server_config)
+            .await
+            .context("binding the configuration's listening address")?;
+        info!(address = %listener.local_addr()?, "listening on the configuration's address");
+        Some(listener)
+    } else {
+        None
+    };
     let control = EngineControl::new(
         &config.request_socket(),
         prepare.processes.clone(),
@@ -498,6 +527,7 @@ async fn prepared_successor(
         asleep,
         sleep_paused,
         adapters,
+        unavailable,
     } = *takeover;
     let mut descriptors = descriptors.into_iter();
     let mut next = || {
@@ -505,7 +535,14 @@ async fn prepared_successor(
             .next()
             .context("the takeover lacks a descriptor")
     };
-    let listener = Listener::resume(listener, next()?)?;
+    let handed = Listener::resume(listener, next()?)?;
+    let listener = match rebound {
+        Some(rebound) => {
+            drop(handed);
+            rebound
+        }
+        None => handed,
+    };
     let control_connection = Connection::resume(Handed {
         descriptor: next()?,
         unix: control_unix,
@@ -526,7 +563,8 @@ async fn prepared_successor(
         service_fds,
     )?;
     let served = wire::EngineSpec::decode(served.as_slice())?;
-    let sink = stats_sink(config.model().to_owned());
+    let observer = Arc::new(crate::worlds::Observer::default());
+    let sink = stats_sink(config.model().to_owned(), Arc::clone(&observer));
     let spec = served.clone();
     let (client, control) = tokio::task::spawn_blocking(move || {
         control
@@ -536,8 +574,11 @@ async fn prepared_successor(
     .await
     .context("the engine's adoption did not complete")??;
     client.number_requests_from(first_request);
-    let leader = Arc::new(Leader::finish(&config, prepared, control, client, served)?);
+    let leader = Arc::new(Leader::finish(
+        &config, prepared, control, client, served, observer,
+    )?);
     leader.adopt_pause(paused, asleep, sleep_paused, adapters);
+    leader.adopt_unavailable(unavailable);
 
     let retire = Arc::new(AtomicBool::new(false));
     let admin = Admin::resume(shutdown.clone(), Arc::clone(&retire), admin);

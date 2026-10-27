@@ -46,12 +46,17 @@ impl WorkerGroup {
     /// follows them. A standby that cannot start is reported and left out:
     /// the group is then replaced by a relaunch when it fails.
     pub(super) fn start_standby(&mut self) {
-        if self.closed || self.standby.is_some() || !self.process_args.keep_standby {
+        // A world on trial keeps no standby: a fault rolls it back.
+        if self.closed
+            || self.standby.is_some()
+            || !self.process_args.keep_standby
+            || self.process_args.predecessor.is_some()
+        {
             return;
         }
         let mut args = self.process_args.clone();
         args.standby = true;
-        args.cache_units = self.info.prefix_cache.as_ref().map(|cache| cache.num_units);
+        args.segments = self.cache_table();
         if !self.keeps_standby() {
             // The group's failure domain keeps the standby world.
             let (domain, index) = &self.relaunch;
@@ -150,19 +155,46 @@ impl WorkerGroup {
         }
     }
 
-    /// Promotes the group's own ranks, which started standing by for those of
-    /// the engine this one replaces (`WorkerProcessArgs::standby`): each
-    /// takes write access to the storages it mapped, once the Storage Server
-    /// has the previous writer out, and serves. A group whose ranks serve
-    /// already is left as it is; the group's later launches serve at once.
-    pub(crate) fn promote_ranks(&mut self) -> anyhow::Result<()> {
-        if !self.process_args.standby {
-            return Ok(());
+    /// The segments the group's planes are made of, as its ranks reported
+    /// them; `None` for planes not split.
+    fn cache_table(&self) -> Option<ipc::CacheTable> {
+        self.info
+            .prefix_cache
+            .as_ref()
+            .filter(|cache| !cache.segments.is_empty())
+            .map(|cache| ipc::CacheTable {
+                segments: cache.segments.clone(),
+                held: cache.held_segments,
+            })
+    }
+
+    /// The deployment's storage claims.
+    pub(crate) fn claims(&self) -> &crate::worker::claims::StorageClaims {
+        &self.claims
+    }
+
+    /// Commits the group's world, which succeeded another
+    /// (`WorkerProcessArgs::predecessor`): each rank takes the
+    /// predecessor's segments it mapped read-only, once the Storage Server
+    /// has their writer out (the predecessor's processes are gone), and the
+    /// group relaunches on a loss and keeps its standby from then on.
+    /// Returns each rank's report; a group of a world that succeeded none
+    /// reports nothing.
+    pub(crate) fn commit(&mut self) -> anyhow::Result<Vec<String>> {
+        if self.process_args.predecessor.is_none() {
+            return Ok(Vec::new());
         }
-        crate::worker::process::promote_all(&mut self.workers, self.process_args.watchdog_timeout)?;
-        self.process_args.standby = false;
-        tracing::info!(worker = %self.process_args.worker_id, "the standing-by ranks serve");
-        Ok(())
+        let results = self.hook("uniserve.take_cache", "")?;
+        self.process_args.predecessor = None;
+        // A relaunch lays the planes out as they are now: the predecessor's
+        // segments are the world's own.
+        self.process_args.segments = self.cache_table();
+        tracing::info!(
+            worker = %self.process_args.worker_id,
+            "the group's world is committed: it relaunches on a loss from now on"
+        );
+        self.start_standby();
+        Ok(results)
     }
 
     /// Runs the worker hook `name` on the group's serving ranks; each rank's

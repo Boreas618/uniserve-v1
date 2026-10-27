@@ -327,6 +327,26 @@ impl WorkerGroup {
             .into()
         };
 
+        // A world on trial is not repaired: a fault of its workers fails the
+        // engine, and the daemon rolls the deployment back to the
+        // predecessor world, which never gave up its memory.
+        if self.process_args.predecessor.is_some() {
+            if let Err(error) = super::processes::lock(&self.processes)
+                .and_then(|mut processes| processes.stop(&self.process_args.worker_id))
+            {
+                tracing::warn!(
+                    worker = %self.process_args.worker_id,
+                    "stopping the group's workers: {error:#}"
+                );
+            }
+            self.closed = true;
+            return failure(format!(
+                "WorkerGroup {} failed during its world's trial, which is rolled back rather than \
+                 relaunched: {cause:#}",
+                self.process_args.worker_id
+            ));
+        }
+
         // A parked standby replaces the failed ranks within the step: it
         // captured its graphs already and maps the group's storages.
         match self.promote_standby() {

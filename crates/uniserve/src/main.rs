@@ -109,25 +109,6 @@ fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     let args = match cli.command {
         Command::Serve(args) => args,
-        Command::Node(node) => {
-            logging::init_tracing(
-                "Daemon",
-                cli.log.log_level.as_deref(),
-                cli.log.log_level_http.as_deref(),
-            );
-            runtime()?.block_on(async {
-                let server = options::ServerOptions {
-                    host: node.host,
-                    port: node.port,
-                    uds: node.uds,
-                    api_key: options::configured_api_key(None),
-                    shutdown_timeout: std::time::Duration::from_secs(node.shutdown_timeout),
-                    ..options::ServerOptions::default()
-                };
-                daemon::node(server, shutdown_signal()).await
-            })?;
-            return Ok(std::process::ExitCode::SUCCESS);
-        }
         Command::Engine(engine) => {
             follow_lifeline(lifeline);
             logging::init_tracing(
@@ -236,6 +217,16 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 /// Serves the configuration `args` resolve until Ctrl-C or SIGTERM.
 async fn async_main(args: options::ServeArgs) -> Result<()> {
     let (config, stated) = args.resolve()?;
+    // Without a model the daemon serves its admin API alone, and its first
+    // `PUT /admin/config` brings a deployment up.
+    if config.model.is_none() {
+        info!(
+            host = %config.server_config.host,
+            port = config.server_config.port,
+            "serving no deployment until PUT /admin/config"
+        );
+        return daemon::node(config.server_config, shutdown_signal()).await;
+    }
     info!(model = %config.model(),
         resident_requests = config.max_running_requests,
         worker_executable = %config.worker_config.executable.display(), "resolved serving options");

@@ -328,6 +328,13 @@ impl PendingOutput {
                 self.output.status = CallStatus::Predicated;
                 return Ok(());
             }
+            // A NaN or infinity among the source logits is a fault of the
+            // forward, whatever the request asked.
+            if values[count * 4 + row] == 0 {
+                self.output.status = CallStatus::Error;
+                self.output.error_code = Some(ErrorCode::NumericalFault);
+                return Ok(());
+            }
             if values[row] == 0 {
                 // The request's constraints left no valid distribution.
                 self.output.status = CallStatus::Error;
@@ -754,10 +761,10 @@ mod tests {
     const DRAFTS: [u32; 3] = [11, 12, 13];
 
     /// A verification call's completion as the executor writes it into
-    /// the lent words: one valid, active row whose sampled token is `token`
-    /// after `accepted` accepted drafts.
+    /// the lent words: one valid, active row of finite logits whose sampled
+    /// token is `token` after `accepted` accepted drafts.
     fn sampling(token: i64, accepted: i64) -> Result<OutputBuffer> {
-        written(&[1_i64, 1, token, accepted])
+        written(&[1_i64, 1, token, accepted, 1])
     }
 
     /// An output buffer whose lent words the producer wrote as `words`, read

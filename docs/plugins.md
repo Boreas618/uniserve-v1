@@ -50,4 +50,4 @@ A plugin's provider serves where the configuration names a provider of its famil
 
 ## Updating
 
-The installed plugins' distributions and versions enter the weights' fingerprint, since a provider declares the layout of the weights it serves. Installing, removing or upgrading a plugin is therefore an engine update (`POST /admin/update`, `specs/live-updates.md`): the standby engine imports the new plugin, loads the weights the plugin's providers read in their own layout, captures its graphs, and takes over without a restart.
+The installed plugins' distributions and versions enter the weights' fingerprint, since a provider declares the layout of the weights it serves. A plugin installed, removed or upgraded is taken up by the next world (`PUT /admin/config`, `docs/admin.md`): the new world's processes import the plugins installed when they start, load the weights the plugin's providers read in their own layout, capture their graphs, and take over without a restart.

@@ -52,9 +52,15 @@ pub struct WorkerConfig {
     /// Tokens per cache page in the group with the widest token rows; unset until binding.
     pub block_size: Option<usize>,
     pub max_total_tokens: Option<usize>,
-    /// The exact prefix cache units of a standby worker
-    /// (`LaunchDescriptor::cache_units`).
-    pub cache_units: Option<u32>,
+    /// The world the worker belongs to (`StorageLaunch::world`).
+    pub world: u64,
+    /// The KV cache of the predecessor world's worker of the same scope,
+    /// whose segments the planes map read-only after the world's own
+    /// (`LaunchDescriptor::predecessor`).
+    pub predecessor: Option<ipc::PredecessorCache>,
+    /// The exact KV cache segments the rank's planes are made of
+    /// (`LaunchDescriptor::segments`).
+    pub segments: Option<ipc::CacheTable>,
     /// Attention provider name the model is loaded with, resolved by the
     /// attention registry (`uniserve.backends.attention.resolve`).
     pub attention_backend: String,
@@ -91,6 +97,11 @@ pub struct WorkerConfig {
     pub generation_device: Option<Device>,
     /// Device-storage grant after loaded weights and fixed overhead, in bytes.
     pub pool_storage_bytes: Option<usize>,
+    /// The bytes the rank's fraction of the device grants it once nothing
+    /// else holds the device: the grant before the device's free memory
+    /// bounds it, which a successor world's KV pool grows into once its
+    /// predecessor is gone.
+    pub pool_storage_full_bytes: Option<usize>,
     pub model_dtype: String,
     pub prefix_cache_dtype: Option<String>,
     /// Fraction of the device's total memory this process may hold for
@@ -142,7 +153,9 @@ impl WorkerConfig {
         }
         Ok(Self {
             max_total_tokens: None,
-            cache_units: None,
+            world: 0,
+            predecessor: None,
+            segments: None,
             generation_device: None,
             max_batch_calls: slots,
             max_batch_tokens: slots,

@@ -20,17 +20,22 @@
 //! native fills would cost one or more driver calls per run of consecutive
 //! units. Contiguous resets (startup scratch) are native fills.
 //!
-//! On a device, each value plane is made of [`SEGMENTS`] segments along the
-//! units, each column's part of a segment one allocation, mapped back to
-//! back so the plane keeps its layout and addresses
-//! ([`segment_layout`]). The last segments are given back to the device
-//! when a standby engine needs their memory, or all of them while the
-//! deployment sleeps ([`CachePlanes::release_segments`]), and created again
-//! at their addresses after ([`CachePlanes::restore_segments`]); the engine
-//! allocates none of their units meanwhile.
+//! On a device, each value plane is made of segments along the units, each
+//! column's part of a segment one allocation, mapped back to back so the
+//! plane keeps its layout and addresses ([`PlaneLayout`]). A world's own
+//! units come first, split into at most [`SEGMENTS`] segments; a world that
+//! succeeds another on the same devices maps, after them, the segments its
+//! predecessor's worker of the same scope holds, read-only, so it reads the
+//! predecessor's pages and cannot change them, and takes them once the
+//! predecessor is gone ([`CachePlanes::take_inherited`]). The last segments
+//! are given back to the device when a successor world needs their memory,
+//! or all of them while the deployment sleeps
+//! ([`CachePlanes::release_segments`]), and created again at their
+//! addresses after ([`CachePlanes::restore_segments`]); the engine allocates
+//! none of their units meanwhile.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use tvm_ffi::Any;
@@ -40,7 +45,7 @@ use crate::ffi::{
     Backing, DType, DeferredCall, Function, Handle, Interpreter, MemoryKind, strings,
 };
 use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::retained::{ExclusiveMemory, ExclusiveSpec, SegmentedSpec};
+use crate::memory::retained::{ExclusiveMemory, ExclusiveSpec, SegmentPart, SegmentedSpec};
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
@@ -99,15 +104,218 @@ fn granule_units(plane_bytes: u64, granularity: u64) -> Option<u32> {
     u32::try_from(granularity / a).ok()
 }
 
-/// The segments of a device pool's value planes: their count, the units
-/// each holds, and the first one given back (`count` while none is).
+/// How a device pool's value planes are laid out along its units: its
+/// segments in unit order, each of whole allocation granules on every
+/// column, and which of them the predecessor world's worker writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaneLayout {
+    pub(crate) segments: Vec<LaidSegment>,
+}
+
+/// One segment of a [`PlaneLayout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaidSegment {
+    pub(crate) segment: ipc::CacheSegment,
+    /// Whether the predecessor world's worker writes the segment: it is
+    /// mapped read-only until the world's commit.
+    pub(crate) inherited: bool,
+    /// Whether the planes create the segment when its memory does not exist:
+    /// a successor's tail segments that its memory does not hold yet are
+    /// left absent, given back from the start.
+    pub(crate) create: bool,
+}
+
+impl PlaneLayout {
+    /// A pool of `num_units` units that `world` creates whole: its units
+    /// split into at most [`SEGMENTS`] equal segments ([`segment_layout`]),
+    /// numbered from zero. `None` when the pool does not split.
+    pub(crate) fn own(
+        world: u64,
+        num_units: u32,
+        plane_bytes: u64,
+        granularity: u64,
+    ) -> Option<Self> {
+        let (count, units) = segment_layout(num_units, plane_bytes, granularity)?;
+        Some(Self {
+            segments: (0..count)
+                .map(|ordinal| LaidSegment {
+                    segment: ipc::CacheSegment {
+                        world,
+                        ordinal,
+                        units,
+                    },
+                    inherited: false,
+                    create: true,
+                })
+                .collect(),
+        })
+    }
+
+    /// The pool of a world that succeeds `predecessor`: a head segment of
+    /// its own of `head_units` (the sentinel and the warmup scratch), the
+    /// predecessor's segments, read-only, then `tail_units` of its own in
+    /// at most [`SEGMENTS`] equal segments, which the world creates as its
+    /// memory frees ([`CachePlanes::restore_segments`]) and takes in full
+    /// once its predecessor is gone.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the head does not fill whole granules.
+    pub(crate) fn successor(
+        world: u64,
+        head_units: u32,
+        tail_units: u32,
+        plane_bytes: u64,
+        granularity: u64,
+        predecessor: &ipc::PredecessorCache,
+    ) -> Result<Self> {
+        let granule = granule_units(plane_bytes, granularity).unwrap_or(1);
+        if head_units == 0 || !head_units.is_multiple_of(granule) {
+            return Err(Error::Invalid(format!(
+                "a head segment of {head_units} cache units fills no whole granules of {granule}"
+            )));
+        }
+        let mut segments = vec![LaidSegment {
+            segment: ipc::CacheSegment {
+                world,
+                ordinal: 0,
+                units: head_units,
+            },
+            inherited: false,
+            create: true,
+        }];
+        segments.extend(predecessor.segments.iter().map(|segment| LaidSegment {
+            segment: *segment,
+            inherited: true,
+            create: false,
+        }));
+        if let Some((count, units)) = segment_layout(tail_units, plane_bytes, granularity) {
+            segments.extend((0..count).map(|index| LaidSegment {
+                segment: ipc::CacheSegment {
+                    world,
+                    ordinal: 1 + index,
+                    units,
+                },
+                inherited: false,
+                create: true,
+            }));
+        }
+        Ok(Self { segments })
+    }
+
+    /// Leaves the tail segments past the first `count` of them to be
+    /// created once the world's memory holds them.
+    pub(crate) fn defer_tail(&mut self, count: usize) {
+        for laid in self
+            .segments
+            .iter_mut()
+            .skip_while(|laid| laid.segment.ordinal == 0 || laid.inherited)
+            .skip(count)
+        {
+            laid.create = false;
+        }
+    }
+
+    /// The units and segments of the tail the world creates at once.
+    pub(crate) fn tail_segment_units(&self) -> Option<u32> {
+        self.segments
+            .iter()
+            .find(|laid| !laid.inherited && laid.segment.ordinal > 0)
+            .map(|laid| laid.segment.units)
+    }
+
+    /// The fewest units of whole granules that hold `units`.
+    pub(crate) fn whole_granules(units: u32, plane_bytes: u64, granularity: u64) -> u32 {
+        let granule = granule_units(plane_bytes, granularity).unwrap_or(1).max(1);
+        units.div_ceil(granule).max(1) * granule
+    }
+
+    /// The exact segments a rank's planes were made of: as the serving
+    /// worker of a standby rank group's scope holds them, or as a world's
+    /// rank held them before its relaunch; its own world's, none inherited.
+    /// The segments past the ones held are left absent.
+    pub(crate) fn adopted(table: &ipc::CacheTable) -> Self {
+        Self {
+            segments: table
+                .segments
+                .iter()
+                .enumerate()
+                .map(|(index, segment)| LaidSegment {
+                    segment: *segment,
+                    inherited: false,
+                    create: (index as u32) < table.held,
+                })
+                .collect(),
+        }
+    }
+
+    /// The units the planes hold.
+    pub(crate) fn units(&self) -> u32 {
+        self.segments.iter().map(|laid| laid.segment.units).sum()
+    }
+
+    /// The units of the segments the predecessor writes:
+    /// `[start, start + units)`.
+    pub(crate) fn inherited(&self) -> std::ops::Range<u32> {
+        let mut first = 0;
+        let mut units = 0;
+        for laid in &self.segments {
+            if laid.inherited {
+                if units == 0 {
+                    first = self.first_unit(laid);
+                }
+                units += laid.segment.units;
+            }
+        }
+        first..first + units
+    }
+
+    fn first_unit(&self, target: &LaidSegment) -> u32 {
+        self.segments
+            .iter()
+            .take_while(|laid| !std::ptr::eq(*laid, target))
+            .map(|laid| laid.segment.units)
+            .sum()
+    }
+}
+
+/// The segments of a device pool's value planes and the first one given
+/// back (`segments.len()` while none is).
 struct Segmenting {
-    count: u32,
-    units: u32,
+    /// The segments in unit order, each with whether the predecessor world
+    /// still writes it.
+    segments: Vec<(ipc::CacheSegment, AtomicBool)>,
     released_from: AtomicU32,
-    /// Each value plane's segment lengths, column-major: segment `k` of
-    /// column `c` is `c * count + k`.
-    lengths: Vec<usize>,
+    /// Each value plane's parts, column-major: the part of segment `k` that
+    /// column `c` holds is `c * segments.len() + k`.
+    parts: Vec<SegmentPart>,
+}
+
+impl Segmenting {
+    fn count(&self) -> u32 {
+        self.segments.len() as u32
+    }
+
+    /// The first unit of segment `index`.
+    fn first_unit(&self, index: u32) -> u32 {
+        self.segments
+            .iter()
+            .take(index as usize)
+            .map(|(segment, _)| segment.units)
+            .sum()
+    }
+
+    /// The parts of segments `range`, every column's.
+    fn parts_of(&self, range: std::ops::Range<u32>) -> Vec<usize> {
+        let count = self.count();
+        (0..self.parts.len() as u32 / count.max(1))
+            .flat_map(|column| {
+                range
+                    .clone()
+                    .map(move |segment| (column * count + segment) as usize)
+            })
+            .collect()
+    }
 }
 /// The pool's storage on one device (or host memory for computations on the
 /// host).
@@ -147,9 +355,15 @@ impl CachePlanes {
         plan: Arc<CachePlan>,
         device: Option<DeviceId>,
         num_units: u32,
+        layout: Option<&PlaneLayout>,
         stream: Option<&Stream>,
         memory: &mut dyn ExclusiveMemory,
     ) -> Result<Self> {
+        if layout.is_some_and(|layout| layout.units() != num_units) {
+            return Err(Error::Invalid(
+                "a cache pool's segments do not hold its units".into(),
+            ));
+        }
         if num_units < 2 {
             return Err(Error::Invalid(
                 "a cache unit pool needs the sentinel and one usable unit".into(),
@@ -177,8 +391,6 @@ impl CachePlanes {
                     bytes,
                     access: &peers,
                 };
-                let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
-                let layout = segment_layout(num_units, plan.plane_bytes, granularity);
                 let mut specs = Vec::new();
                 if layout.is_none() {
                     specs.push(spec("prefix_cache.key.values", plane_bytes));
@@ -203,16 +415,25 @@ impl CachePlanes {
                         created[0] = key.created || value.created;
                         [key.storage, value.storage]
                     }
-                    Some((count, units)) => {
-                        let lengths = vec![
-                            units as usize * plan.plane_bytes as usize;
-                            plan.columns as usize * count as usize
-                        ];
+                    Some(layout) => {
+                        let count = layout.segments.len() as u32;
+                        let plane_bytes = plan.plane_bytes as usize;
+                        let parts: Vec<SegmentPart> = (0..plan.columns)
+                            .flat_map(|column| {
+                                layout.segments.iter().map(move |laid| SegmentPart {
+                                    length: laid.segment.units as usize * plane_bytes,
+                                    column,
+                                    segment: laid.segment,
+                                    inherited: laid.inherited,
+                                    create: laid.create,
+                                })
+                            })
+                            .collect();
                         let mut take = |name| {
                             memory.segmented(&SegmentedSpec {
                                 name,
                                 device,
-                                segments: &lengths,
+                                parts: &parts,
                                 access: &peers,
                             })
                         };
@@ -257,10 +478,13 @@ impl CachePlanes {
                             }
                         }
                         segmenting = Some(Segmenting {
-                            count,
-                            units,
+                            segments: layout
+                                .segments
+                                .iter()
+                                .map(|laid| (laid.segment, AtomicBool::new(laid.inherited)))
+                                .collect(),
                             released_from: AtomicU32::new(released_from),
-                            lengths,
+                            parts,
                         });
                         [key.storage, value.storage]
                     }
@@ -325,7 +549,8 @@ impl CachePlanes {
         }
         if let (Some(segmenting), Some(stream)) = (&planes.segmenting, stream) {
             for segment in fresh_segments {
-                planes.reset_units(segment * segmenting.units, segmenting.units, true, stream)?;
+                let units = segmenting.segments[segment as usize].0.units;
+                planes.reset_units(segmenting.first_unit(segment), units, true, stream)?;
             }
         }
         if let Some(stream) = stream {
@@ -334,22 +559,114 @@ impl CachePlanes {
         Ok(planes)
     }
 
-    /// The segments the value planes are made of and the units each holds;
-    /// `None` for planes that are not split.
-    pub(crate) fn segments(&self) -> Option<(u32, u32)> {
-        self.segmenting
-            .as_ref()
-            .map(|segmenting| (segmenting.count, segmenting.units))
+    /// The segments the value planes are made of, in unit order; `None` for
+    /// planes that are not split.
+    pub(crate) fn segments(&self) -> Option<Vec<ipc::CacheSegment>> {
+        self.segmenting.as_ref().map(|segmenting| {
+            segmenting
+                .segments
+                .iter()
+                .map(|(segment, _)| *segment)
+                .collect()
+        })
     }
 
-    /// The units the engine may allocate: those below the first segment
-    /// given back, or all of them.
-    pub(crate) fn usable_units(&self) -> u32 {
-        self.segmenting
-            .as_ref()
-            .map_or(self.num_units, |segmenting| {
-                segmenting.released_from.load(Ordering::Acquire) * segmenting.units
-            })
+    /// The segments the planes hold, `[0, held)`: the first given back.
+    pub(crate) fn held_segments(&self) -> u32 {
+        self.segmenting.as_ref().map_or(0, |segmenting| {
+            segmenting.released_from.load(Ordering::Acquire)
+        })
+    }
+
+    /// The units the planes map read-only from the predecessor world's
+    /// planes; empty once the world took them, or for planes of its own.
+    pub(crate) fn inherited(&self) -> std::ops::Range<u32> {
+        let Some(segmenting) = &self.segmenting else {
+            return 0..0;
+        };
+        let mut range: Option<std::ops::Range<u32>> = None;
+        for (index, (segment, inherited)) in segmenting.segments.iter().enumerate() {
+            if inherited.load(Ordering::Acquire) {
+                let first = segmenting.first_unit(index as u32);
+                range = Some(match range {
+                    Some(range) => range.start..first + segment.units,
+                    None => first..first + segment.units,
+                });
+            }
+        }
+        range.unwrap_or(0..0)
+    }
+
+    /// The device bytes one unit of every value plane and column holds.
+    pub(crate) fn unit_bytes(&self) -> u64 {
+        2 * u64::from(self.plan.columns) * self.plan.plane_bytes
+    }
+
+    /// Takes the segments mapped read-only from the predecessor world, whose
+    /// writer is gone, through `retained`: they become writable at unchanged
+    /// addresses and the world's own. Returns how many it took.
+    pub(crate) fn take_inherited(
+        &self,
+        retained: &crate::memory::retained::Retained,
+    ) -> Result<usize> {
+        let taken = retained.take_inherited()?;
+        if let Some(segmenting) = &self.segmenting {
+            for (_, inherited) in &segmenting.segments {
+                inherited.store(false, Ordering::Release);
+            }
+        }
+        Ok(taken)
+    }
+
+    /// Copies the predecessor's cache flags and scales of the units the
+    /// planes inherit from it into the planes' own, issued to `stream`,
+    /// which is synchronized before returning: the predecessor's planes
+    /// hold the flags and scales of `predecessor_units` units in
+    /// `predecessor` (each field's flags, then its scales when quantized),
+    /// and the predecessor parked, so they no longer change.
+    pub(crate) fn adopt_inherited(
+        &self,
+        predecessor: &[Arc<Storage>],
+        predecessor_units: u32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let inherited = self.inherited();
+        if inherited.is_empty() {
+            return Ok(());
+        }
+        let per_field = if self.scales.is_some() { 2 } else { 1 };
+        if predecessor.len() != 2 * per_field {
+            return Err(Error::Invariant(
+                "a predecessor's cache flags and scales are missing".into(),
+            ));
+        }
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        for field in 0..2 {
+            let mut targets = vec![(&self.initialized[field], 1_u64)];
+            if let Some(scales) = &self.scales {
+                targets.push((&scales[field], 4));
+            }
+            for (offset, (target, width)) in targets.into_iter().enumerate() {
+                let source = &predecessor[field * per_field + offset];
+                for column in 0..self.plan.columns {
+                    let from = (u64::from(column) * u64::from(predecessor_units)) * width;
+                    let to = (u64::from(column) * u64::from(self.num_units)
+                        + u64::from(inherited.start))
+                        * width;
+                    batch.push(
+                        target.address() + to,
+                        source.address() + from,
+                        (u64::from(inherited.end - inherited.start) * width) as usize,
+                    );
+                }
+            }
+        }
+        // SAFETY: every range lies inside its storage: the predecessor's
+        // planes hold `predecessor_units` units of every column and the
+        // inherited ones are their leading units; the stream is drained.
+        unsafe { stream.copy(&batch) }?;
+        stream.synchronize()?;
+        Ok(())
     }
 
     /// Gives back the memory of the value planes' segments from `first` on,
@@ -370,12 +687,16 @@ impl CachePlanes {
         if first >= from {
             return Ok(());
         }
+        if segmenting.segments[first as usize..from as usize]
+            .iter()
+            .any(|(_, inherited)| inherited.load(Ordering::Acquire))
+        {
+            return Err(Error::Invalid(
+                "the predecessor world's segments are not given back by its successor".into(),
+            ));
+        }
         let peers = Storage::peers(device)?;
-        let indices: Vec<usize> = (0..self.plan.columns)
-            .flat_map(|column| {
-                (first..from).map(move |segment| (column * segmenting.count + segment) as usize)
-            })
-            .collect();
+        let indices = segmenting.parts_of(first..from);
         for (name, storage) in ["prefix_cache.key.values", "prefix_cache.value.values"]
             .into_iter()
             .zip(&self.values)
@@ -384,7 +705,7 @@ impl CachePlanes {
                 &SegmentedSpec {
                     name,
                     device,
-                    segments: &segmenting.lengths,
+                    parts: &segmenting.parts,
                     access: &peers,
                 },
                 storage,
@@ -395,15 +716,16 @@ impl CachePlanes {
         tracing::info!(
             first,
             segments = from - first,
-            units = (from - first) * segmenting.units,
+            units = segmenting.first_unit(from) - segmenting.first_unit(first),
             "gave back cache segments"
         );
         Ok(())
     }
 
-    /// Creates the segments given back again at their addresses, through
-    /// `memory`, and resets their units on `stream`, which is synchronized
-    /// before returning: values and flags zero, scales one.
+    /// Creates the segments given back again at their addresses, the first
+    /// `limit` of them or all, through `memory`, and resets their units on
+    /// `stream`, which is synchronized before returning: values and flags
+    /// zero, scales one.
     ///
     /// # Errors
     ///
@@ -413,19 +735,18 @@ impl CachePlanes {
         &self,
         memory: &mut dyn ExclusiveMemory,
         stream: &Stream,
+        limit: Option<u32>,
     ) -> Result<()> {
         let (segmenting, device) = self.segmented()?;
         let from = segmenting.released_from.load(Ordering::Acquire);
-        if from == segmenting.count {
+        let count = limit.map_or(segmenting.count(), |limit| {
+            from.saturating_add(limit).min(segmenting.count())
+        });
+        if from == count {
             return Ok(());
         }
         let peers = Storage::peers(device)?;
-        let indices: Vec<usize> = (0..self.plan.columns)
-            .flat_map(|column| {
-                (from..segmenting.count)
-                    .map(move |segment| (column * segmenting.count + segment) as usize)
-            })
-            .collect();
+        let indices = segmenting.parts_of(from..count);
         for (name, storage) in ["prefix_cache.key.values", "prefix_cache.value.values"]
             .into_iter()
             .zip(&self.values)
@@ -434,22 +755,21 @@ impl CachePlanes {
                 &SegmentedSpec {
                     name,
                     device,
-                    segments: &segmenting.lengths,
+                    parts: &segmenting.parts,
                     access: &peers,
                 },
                 storage,
                 &indices,
             )?;
         }
-        let first_unit = from * segmenting.units;
-        self.reset_units(first_unit, self.num_units - first_unit, true, Some(stream))?;
+        let first_unit = segmenting.first_unit(from);
+        let units = segmenting.first_unit(count) - first_unit;
+        self.reset_units(first_unit, units, true, Some(stream))?;
         stream.synchronize()?;
-        segmenting
-            .released_from
-            .store(segmenting.count, Ordering::Release);
+        segmenting.released_from.store(count, Ordering::Release);
         tracing::info!(
             first = from,
-            segments = segmenting.count - from,
+            segments = count - from,
             "created the cache segments again"
         );
         Ok(())

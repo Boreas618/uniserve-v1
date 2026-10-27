@@ -17,17 +17,19 @@ impl Scheduler {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
             let execution = failure.execution.as_ref();
             let code = execution.and_then(|value| value.code);
-            if code == Some(ipc::ErrorCode::InvariantViolation) {
-                self.fatal = true;
-                tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
-            } else if code == Some(ipc::ErrorCode::InputError) {
-                tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
-            } else if !failure.refusals.is_empty()
+            let refused = !failure.refusals.is_empty()
                 && failure
                     .requests
                     .iter()
-                    .all(|request| failure.refusals.contains_key(request))
-            {
+                    .all(|request| failure.refusals.contains_key(request));
+            if code == Some(ipc::ErrorCode::InvariantViolation) {
+                self.fail(format!(
+                    "a worker's control-plane invariant failed: {error:#}"
+                ));
+                tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
+            } else if code == Some(ipc::ErrorCode::InputError) {
+                tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
+            } else if refused {
                 tracing::info!(
                     worker = %failure.worker_id,
                     refusals = ?failure.refusals,
@@ -37,6 +39,25 @@ impl Scheduler {
                 tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
             self.fail_after_worker_failure(failure);
+            // A world on trial is not repaired: a worker fault, rather than a
+            // request its workers rejected, fails it as a whole, and the
+            // daemon rolls back to the previous world.
+            if self.trial && !refused && code != Some(ipc::ErrorCode::InputError) {
+                self.fail(match (code, execution.and_then(|value| value.batch_id)) {
+                    (Some(ipc::ErrorCode::NumericalFault), Some(batch)) => {
+                        let requests: Vec<u64> = failure
+                            .requests
+                            .iter()
+                            .map(|request| request.request_id.0)
+                            .collect();
+                        format!(
+                            "batch {batch} computed non-finite logits for requests {requests:?}"
+                        )
+                    }
+                    _ => format!("a worker failed during the world's trial: {error:#}"),
+                });
+                return;
+            }
             // A lost group is replaced before its loss is reported, by its
             // standby, or later by its failure domain's relaunch, and its
             // requests wait for it meanwhile. Keep independent workers
@@ -49,11 +70,11 @@ impl Scheduler {
                 .iter()
                 .any(|(id, info)| !info.supported_calls.is_empty() && !self.executor.is_closed(id))
             {
-                self.fatal = true;
+                self.fail(format!("every model worker group closed: {error:#}"));
             }
             return;
         }
-        self.fatal = true;
+        self.fail(format!("the executor failed: {error:#}"));
         tracing::error!("fatal executor error: {error}");
         self.fail_all_inflight(&error.to_string());
     }
@@ -64,8 +85,9 @@ impl Scheduler {
     ///
     /// Every request owning an in-flight call fails with `msg`, but a token
     /// request that resumes from its generated tokens leaves as migratable
-    /// (`MigrationCause::Loss`) for the daemon to submit again; requests with
-    /// no call in flight stay queued or running. The lifecycle commands of
+    /// (`MigrationCause::Loss`) for the daemon to submit again, and one whose
+    /// migration began leaves for that migration's cause; requests with no
+    /// call in flight stay queued or running. The lifecycle commands of
     /// the dropped batches are acknowledged as if they had completed.
     pub(in crate::scheduler) fn fail_all_inflight(&mut self, msg: &str) {
         self.inflight.pending_submissions.clear();
@@ -75,8 +97,18 @@ impl Scheduler {
         let (ids, commands) = self.inflight.clear_failed_calls();
         self.acknowledge_commands(&commands);
         for id in ids {
+            // A request whose migration began ends as it began.
+            let migrating = self
+                .running
+                .get(&id)
+                .and_then(|state| match state.terminal_intent {
+                    TerminalIntent::Migrate(cause) => Some(cause),
+                    _ => None,
+                });
             if self.media_state(id).is_some() {
                 self.finish_media(id, DiffusionTerminal::Failed(msg.to_string()));
+            } else if let Some(cause) = migrating {
+                self.migrate_request(id, cause);
             } else if self.migrates_on_loss(id) {
                 self.migrate_request(id, MigrationCause::Loss);
             } else if self.running.contains_key(&id) {
@@ -88,6 +120,53 @@ impl Scheduler {
                 );
                 self.finish(id, FinishReason::Error);
             }
+        }
+    }
+
+    /// Hands every request that resumes from its generated tokens back to
+    /// the daemon after a fatal stop of a world on trial: the calls in
+    /// flight are dropped (`fail_all_inflight`), and each such request, queued
+    /// or running, ends as migratable now (`MigrationCause::Loss`), after
+    /// every token it generated, or for the cause a migration it already
+    /// began states. The daemon submits each again to the previous world,
+    /// which generates the dropped tokens again. The others are left to
+    /// `abort_all_requests`.
+    pub(in crate::scheduler) fn hand_back_requests(&mut self) {
+        if self.config.canvas.is_some() {
+            return;
+        }
+        let failure = self
+            .failure
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "the world on trial failed".to_owned());
+        self.fail_all_inflight(&failure);
+
+        let queued: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .filter(|st| st.req.is_migratable())
+            .map(|st| st.req.request_id)
+            .collect();
+        for id in queued {
+            if let Some(st) = self.remove_waiting(id) {
+                let _ = st.output.events.event_tx.send(Event::Migratable {
+                    cause: MigrationCause::Loss,
+                });
+            }
+        }
+
+        let running: Vec<(RequestId, MigrationCause)> = self
+            .running
+            .iter()
+            .filter_map(|(id, state)| match state.terminal_intent {
+                TerminalIntent::Migrate(cause) => Some((*id, cause)),
+                _ if self.migrates_on_loss(*id) => Some((*id, MigrationCause::Loss)),
+                _ => None,
+            })
+            .collect();
+        for (id, cause) in running {
+            self.migrate_request(id, cause);
         }
     }
 

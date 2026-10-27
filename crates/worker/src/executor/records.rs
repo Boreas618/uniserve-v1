@@ -40,7 +40,7 @@ use crate::{Error, Result};
 
 /// The first header word: `TKRC` in the high word, the record layout's
 /// version in the low word.
-pub(crate) const MAGIC: i64 = (0x544B_5243 << 32) | 1;
+pub(crate) const MAGIC: i64 = (0x544B_5243 << 32) | 2;
 
 /// Words of the header.
 pub(crate) const HEADER: usize = 12;
@@ -51,7 +51,7 @@ pub(crate) const CALL_WORDS: usize = 16;
 /// Fields of a sampling completion: valid, active, token and accepted
 /// drafts, each one word per task, field-major
 /// (`uniserve.executor.text.protocol.COMPLETION_FIELDS`).
-pub(crate) const COMPLETION_FIELDS: usize = 4;
+pub(crate) const COMPLETION_FIELDS: usize = 5;
 
 /// Bits of a call record's flags.
 pub(crate) mod flag {
@@ -605,7 +605,7 @@ mod tests {
                 (3, 11),
                 (4, 11),
                 (5, 0),
-                (6, 8),
+                (6, 2 * COMPLETION_FIELDS as i64),
                 (7, 0),
                 (8, 0),
                 (9, 0),
@@ -623,12 +623,13 @@ mod tests {
                 (3, 10),
                 (4, 14),
                 (5, 0),
-                (6, 8),
+                (6, 2 * COMPLETION_FIELDS as i64),
                 (7, 1),
             ],
         );
-        // One sampled row (request row 5) with two top tokens: 9 words.
-        writer.segment(8, &[5], &[2]);
+        // One sampled row (request row 5) with two top tokens: 9 words,
+        // after the two tasks' completion words.
+        writer.segment(10, &[5], &[2]);
         writer.tail(2, &[0, 3, 21, 22, 23, 2]);
         let (words, used) = writer.finish();
         let limits = [active(16, 1), CallLimits::default(), active(16, 3)];
@@ -642,7 +643,7 @@ mod tests {
             records.calls[2].speculation,
             Some((vec![21, 22, 23], Some(2)))
         );
-        assert_eq!(records.columns()[0].0, 8);
+        assert_eq!(records.columns()[0].0, 10);
 
         // Applied at lent word 4: ranges shift by it, progress replaces the
         // coordinates', and the verification keeps its drafts' base.
@@ -653,13 +654,13 @@ mod tests {
         );
         let mut output = PendingOutput::new(&call, RequestProgress::default(), 2)?;
         records.apply(2, &mut output, 4)?;
-        assert_eq!(output.sampling_range, Some((4, 8, 1)));
+        assert_eq!(output.sampling_range, Some((4, 2 * COMPLETION_FIELDS, 1)));
         assert_eq!(output.progress.cache_visible_len, 10);
         assert_eq!(output.progress.cache_computed_len, 14);
         assert!(output.progress.prompt_logits_ready);
         let mut decoded = PendingOutput::new(&call, RequestProgress::default(), 0)?;
         records.apply(0, &mut decoded, 4)?;
-        assert_eq!(decoded.logprob_range, Some((12, 9, 5)));
+        assert_eq!(decoded.logprob_range, Some((14, 9, 5)));
         assert!(decoded.prompt_logprob_ranges.is_empty());
         Ok(())
     }

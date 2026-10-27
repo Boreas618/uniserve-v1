@@ -38,7 +38,7 @@ use tracing::{info, warn};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::input::readout::SystemOneError;
-use crate::leader::{Leader, Task, UpdateError, UpdateRequest};
+use crate::leader::{Leader, Task};
 use crate::openai::video_jobs::VideoJobs;
 use crate::openai::{self, ApiError, chat_completions, images, videos};
 use crate::options::{MediaOptions, ServeConfig, ServerOptions, Stated};
@@ -426,17 +426,15 @@ pub(crate) fn router(
         .merge(readout.unwrap_or_default())
         .layer(from_fn(middleware::track_http_metrics));
 
-    // An update runs for as long as the standby engine takes to start, so
-    // the admin routes are held to no request timeout or concurrency limit.
-    let admin = Router::new()
-        .route("/engine/update", post(update_engine))
-        .with_state(Arc::clone(&engine))
-        .merge(admin::router(admin::AdminState {
-            leader: Arc::clone(&engine),
-            admin,
-            jobs: Arc::clone(&jobs),
-            restarter,
-        }));
+    // A world change runs for as long as the successor world takes to
+    // start, so the admin routes are held to no request timeout or
+    // concurrency limit.
+    let admin = admin::router(admin::AdminState {
+        leader: Arc::clone(&engine),
+        admin,
+        jobs: Arc::clone(&jobs),
+        restarter,
+    });
     let mut authenticated = Router::new()
         .route("/version", get(version))
         .merge(api)
@@ -471,51 +469,6 @@ async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
-    }
-}
-
-/// The body of `POST /engine/update`, which `POST /admin/update` extends;
-/// an empty body updates to the build the running engine's executable
-/// holds now.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EngineUpdateBody {
-    /// The `uniserve` executable of the build to update to.
-    executable: Option<String>,
-}
-
-/// Updates the engine to another build without failing a request
-/// (`Leader::update`), and answers once the updated engine serves, with
-/// how long requests waited for it and how long each stage of that pause
-/// took: `409` while another update runs.
-async fn update_engine(State(engine): State<Arc<Leader>>, body: Bytes) -> Response {
-    let request = if body.is_empty() {
-        EngineUpdateBody::default()
-    } else {
-        match serde_json::from_slice::<EngineUpdateBody>(&body) {
-            Ok(request) => request,
-            Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
-        }
-    };
-    let request = UpdateRequest {
-        executable: request.executable,
-        set: Vec::new(),
-    };
-    match engine.update(request).await {
-        Ok(update) => Json(json!({
-            "in_place": update.in_place,
-            "pause_seconds": update.pause.as_secs_f64(),
-            "drain_seconds": update.drain.as_secs_f64(),
-            "close_seconds": update.close.as_secs_f64(),
-            "promotion_seconds": update.promotion.as_secs_f64(),
-        }))
-        .into_response(),
-        Err(error @ UpdateError::InProgress) => {
-            ApiError::conflict(error.to_string()).into_response()
-        }
-        Err(error) => {
-            ApiError::server_error(format!("{:#}", anyhow::Error::from(error))).into_response()
-        }
     }
 }
 
@@ -645,11 +598,28 @@ mod tests {
                 "continue_generation 2 succeeded",
             ]
         );
-        // An update this leader cannot run (it has no engine process of its
-        // own) fails and is logged as failed.
-        let (status, _, body) = send(&app, post_json("/admin/update", &json!({}))).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // A world change this leader cannot run (it has no engine process
+        // of its own) fails and is logged as failed.
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/admin/config")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "set": ["worker_config.watchdog_timeout=301"] }).to_string(),
+            ))
+            .unwrap();
+        let (status, _, body) = send(&app, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["state"], json!("failed"));
+        // Its configuration and worlds read back.
+        let (status, _, body) = send(&app, get_request("/admin/config")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["config"]
+                .as_str()
+                .is_some_and(|config| !config.is_empty())
+        );
+        assert!(body["trial"].is_null());
     }
 
     /// A sleeping deployment holds new requests and serves them once it

@@ -45,24 +45,6 @@ pub(crate) struct EngineArgs {
     pub engine: u64,
 }
 
-/// Where an idle node serves its admin API (`uniserve node`).
-#[derive(Debug, Clone, Args)]
-pub(crate) struct NodeArgs {
-    /// TCP address the node listens on.
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
-    /// TCP port the node listens on.
-    #[arg(long, default_value_t = 8000)]
-    pub port: u16,
-    /// Unix domain socket to listen on instead of TCP.
-    #[arg(long)]
-    pub uds: Option<String>,
-    /// Longest drain of a deployment's requests in flight when it is
-    /// brought down, in seconds.
-    #[arg(long, default_value_t = 30)]
-    pub shutdown_timeout: u64,
-}
-
 /// The process's log levels, which every subcommand takes.
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = "Logging")]
@@ -80,15 +62,13 @@ pub(crate) struct LogLevels {
 pub(crate) enum Command {
     /// Run this node's daemon; on the leader (node rank 0), also the
     /// UniServe OpenAI server, whose Rust engine and scheduler run
-    /// in-process and drive forward-only workers.
+    /// in-process and drive forward-only workers. Without a model, a
+    /// single-node daemon serves its admin API alone until `PUT
+    /// /admin/config` brings a deployment up.
     #[command(
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Serve(Box<ServeArgs>),
-    /// Run this node's daemon serving no deployment: its admin API brings one
-    /// up (`POST /admin/deploy`) and down (`POST /admin/shutdown`). The API
-    /// key is `UNISERVE_API_KEY`, as `serve` reads it.
-    Node(NodeArgs),
     /// Run the engine process the leader daemon starts: its schedulers and
     /// the request interface.
     #[command(hide = true)]

@@ -456,6 +456,34 @@ impl Scheduler {
             return;
         }
 
+        // A call whose logits held a NaN or an infinity is a fault of the
+        // forward. Outside a trial it fails its request alone; a world on
+        // trial applies nothing of the batch and fails as a whole, and its
+        // requests continue on the previous world (`hand_back_requests`).
+        let faulted: Vec<u64> = report
+            .results
+            .iter()
+            .filter(|result| result.output.error_code == Some(ipc::ErrorCode::NumericalFault))
+            .map(|result| result.output.request_key.request_id.0)
+            .collect();
+        if !faulted.is_empty() {
+            self.stats
+                .general
+                .numerical_faults
+                .fetch_add(faulted.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if self.trial {
+                tracing::error!(
+                    batch_id = result_batch_id,
+                    requests = ?faulted,
+                    "the world on trial computed non-finite logits"
+                );
+                self.fail(format!(
+                    "batch {result_batch_id} computed non-finite logits for requests {faulted:?}"
+                ));
+                return;
+            }
+        }
+
         // Consume each expected call identity exactly once while folding the
         // rank-local timing records into their scheduler domains.
         for result in &report.results {

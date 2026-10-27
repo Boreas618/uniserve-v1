@@ -48,6 +48,7 @@ pub struct SchedulerStatsReporter {
     last_worker_exec_us_total: u64,
     last_batch_roundtrip_us_total: u64,
     last_batch_timing_count: u64,
+    last_numerical_faults: u64,
     // Indexed in the `ExecutionDomainStats::groups` order `domain_stats` reads.
     last_domains: [DomainCumulative; super::stats::ExecutionDomainStats::COUNT],
 }
@@ -100,6 +101,9 @@ impl SchedulerStatsReporter {
         self.last_worker_exec_us_total = worker_exec_us_total;
         self.last_batch_roundtrip_us_total = batch_roundtrip_us_total;
         self.last_batch_timing_count = batch_timing_count;
+        let numerical_faults = stats.general.numerical_faults.load(Ordering::Relaxed);
+        let delta_numerical_faults = numerical_faults.saturating_sub(self.last_numerical_faults);
+        self.last_numerical_faults = numerical_faults;
 
         // The scheduler tracks no DP waves, prefix-cache request counts, or
         // preemptions, so those fields are reported as zero.
@@ -128,6 +132,7 @@ impl SchedulerStatsReporter {
             batch_roundtrip_us: delta_batch_roundtrip_us,
             batch_count: delta_batch_count,
             domain_stats: self.domain_stats(stats),
+            numerical_faults: delta_numerical_faults,
         }
     }
 

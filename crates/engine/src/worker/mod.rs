@@ -71,8 +71,18 @@ pub struct WorkerProcessArgs {
     /// How a standby launch keeps its graph memory while it parks
     /// (`worker_config.standby_memory`).
     pub standby_memory: proto::request::StandbyMemory,
-    /// The cache units a standby launch adopts: the serving workers'.
-    pub cache_units: Option<u32>,
+    /// The exact KV cache segments the group's planes are made of: the
+    /// serving workers' for a standby launch, the world's own for a
+    /// relaunch of a world whose planes another world's segments began;
+    /// `None` lays them out afresh.
+    pub segments: Option<ipc::CacheTable>,
+    /// The world the group's workers belong to, which keys the memory they
+    /// create and retains what they use.
+    pub world: u64,
+    /// The KV cache of the predecessor world's group of the same identity,
+    /// whose segments the group's workers map read-only; `None` for a world
+    /// that succeeds none.
+    pub predecessor: Option<ipc::PredecessorCache>,
     /// Model identifier or local model path.
     pub model: String,
     /// A plugin's weight source (`scheme://...`) that streams the
