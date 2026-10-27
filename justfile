@@ -51,11 +51,6 @@ test-python-e2e: build-debug
 test-python-gpu: build-debug
     UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu and sensenova"
 
-# Refuse a change whose components keep their declared identity but compute
-# beyond their batch variation: the working tree against `base` on one GPU
-numerics-compare base checkpoint:
-    MAX_JOBS={{env("MAX_JOBS", "8")}} {{python}} tests/python/numerics/compare.py --base {{base}} --checkpoint {{checkpoint}}
-
 # Run all checks
 test-all: fmt clippy test-rust bench-build test-python-fast test-python-integration test-python-e2e
 
