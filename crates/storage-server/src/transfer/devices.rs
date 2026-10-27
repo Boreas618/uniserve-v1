@@ -15,7 +15,10 @@
 //! the measurement's memory is released: the contexts, their streams and
 //! the copy paths the measurement brought up. The memory the Transfer
 //! Server maps later belongs to its owners (NVML attributes an imported
-//! allocation to no importer).
+//! allocation to no importer). The measurement then releases the contexts:
+//! the Transfer Server holds a GPU's context only while it has work on the
+//! GPU ([`super::contexts`]), and the measured bytes are what each holding
+//! takes.
 
 use std::os::fd::OwnedFd;
 use std::time::Instant;
@@ -47,9 +50,6 @@ pub(super) struct Gpu {
     pub(super) numa_node: Option<u32>,
     /// The GPUs whose copy engines can address its memory, itself first.
     pub(super) readers: Vec<DeviceId>,
-    /// The device's primary context, held for the process's life: every
-    /// stream and mapping of the GPU lives in it.
-    _context: PrimaryContext,
 }
 
 /// The GPUs this process sees.
@@ -60,7 +60,8 @@ pub(super) struct Gpus {
 impl Gpus {
     /// The GPUs the driver shows this process. A host without a driver, or
     /// whose driver shows the process no GPU, has none: its Transfer
-    /// Server copies between host memory only.
+    /// Server copies between host memory only. Discovery creates no CUDA
+    /// context.
     pub(super) fn discover() -> Result<Self, cuda::Error> {
         let count = match DeviceId::count() {
             Ok(count) => count,
@@ -94,7 +95,6 @@ impl Gpus {
                     .ok()
                     .and_then(|node| u32::try_from(node).ok()),
                 readers,
-                _context: PrimaryContext::retain(device)?,
             });
         }
         Ok(Self { gpus })
@@ -112,6 +112,11 @@ impl Gpus {
     /// host memory and another host's GPU.
     pub(super) fn first(&self) -> Option<&Gpu> {
         self.gpus.first()
+    }
+
+    /// Every GPU, as (device, UUID).
+    pub(super) fn identities(&self) -> impl Iterator<Item = (DeviceId, [u8; 16])> + '_ {
+        self.gpus.iter().map(|gpu| (gpu.device, gpu.uuid))
     }
 }
 
@@ -146,8 +151,21 @@ impl Scratch {
 }
 
 /// Measure every link of `gpus` and the device memory of each GPU's
-/// context.
+/// context, then release the contexts: the process holds none when this
+/// returns.
 pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextBytes>), Error> {
+    // The contexts are held through the measurement and until their memory
+    // is measured, whatever objects of the measurement live in them.
+    let mut held = Vec::with_capacity(gpus.gpus.len());
+    for gpu in &gpus.gpus {
+        let started = Instant::now();
+        held.push(PrimaryContext::retain(gpu.device)?);
+        tracing::info!(
+            gpu = %memory_name(&Memory::Device { gpu: gpu.uuid }),
+            milliseconds = started.elapsed().as_secs_f64() * 1e3,
+            "created the GPU's CUDA context to measure its links"
+        );
+    }
     let mut links = Vec::new();
     links.push(LinkBandwidth {
         link: Link {
@@ -225,6 +243,8 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
             })
             .collect::<Result<_, cuda::Error>>()?
     };
+    drop(held);
+    cuda::reclaim::flush()?;
     for measured in &links {
         tracing::info!(
             source = %memory_name(&measured.link.source),

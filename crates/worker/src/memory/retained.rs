@@ -599,6 +599,7 @@ impl Retained {
                 total: 0,
                 quota: None,
                 entries: Vec::new(),
+                transfer_context: 0,
             })
     }
 

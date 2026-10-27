@@ -294,6 +294,26 @@ mod device {
                 measured.bytes_per_second as f64 / 1e9
             );
         }
+
+        // Once the tasks ended and their exposures with them, neither
+        // Transfer Server holds a GPU's context: NVML lists neither on a GPU
+        // either used.
+        let nvml = cuda::Nvml::init().unwrap();
+        let pids =
+            [&source_host, &destination_host].map(|host| transfer_pid(&host.socket, None) as u32);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        for device in [first, last] {
+            let uuid = device.uuid().unwrap();
+            for pid in pids {
+                while nvml.lists_process(uuid, pid).unwrap() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Transfer Server {pid} still holds a context on {device}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     #[test]

@@ -37,10 +37,10 @@
 //! workers configure (`mem_fraction_static`). The ledger books what the
 //! server derives from the storages it retains (the weights, each KV cache
 //! segment, the other exclusive storages), each storage once whatever
-//! number of worlds map it, the Transfer Server's CUDA context as it
-//! measured it, and what the processes book themselves ([`Request::Book`]):
-//! a worker's graph pool, process memory and staging, and the Transfer
-//! Server's staging. The server refuses a booking or a new device storage
+//! number of worlds map it, and what the processes book themselves
+//! ([`Request::Book`]): a worker's graph pool, process memory and staging,
+//! and the Transfer Server's staging and its CUDA context while it holds
+//! one on the GPU. The server refuses a booking or a new device storage
 //! that would take a ledger past its quota.
 //!
 //! Besides tensors, the server keeps host page pools (L2): one memfd of
@@ -71,7 +71,11 @@
 //! [`Role::Peer`], to expose the regions ([`Request::Expose`]); that server
 //! has its own Transfer Server register their allocations with its NIXL
 //! agent ([`Event::Register`], [`Request::Registered`]) and answers with the
-//! agent's metadata and each region's address ([`Reply::Exposed`]).
+//! agent's metadata and each region's address ([`Reply::Exposed`]). The
+//! exposure lasts until the reading Transfer Server ends it, once its task
+//! ended ([`Request::Unexpose`]), or its connection closes: the source's
+//! Transfer Server then lets the registrations go ([`Event::Deregister`]),
+//! and with them the GPU contexts they held.
 
 use serde::{Deserialize, Serialize};
 
@@ -268,17 +272,22 @@ pub enum Item {
     /// Device memory a process holds to stage transfers. Booked by the
     /// process.
     Staging,
-    /// The device memory of the Transfer Server's CUDA context, as it
-    /// measured it when it started ([`Request::Measured`]).
+    /// The device memory of the Transfer Server's CUDA context, at the
+    /// bytes it measured when it started ([`Request::Measured`]). Booked by
+    /// the Transfer Server before it retains the context on the GPU, which
+    /// it holds only while it has work there, and ended when it released
+    /// it.
     TransferContext,
 }
 
 impl Item {
     /// Whether a process books the item itself ([`Request::Book`]), rather
-    /// than the server deriving it from the storages it retains or from
-    /// what its Transfer Server measured.
+    /// than the server deriving it from the storages it retains.
     pub fn booked(self) -> bool {
-        matches!(self, Self::GraphPool | Self::Process | Self::Staging)
+        matches!(
+            self,
+            Self::GraphPool | Self::Process | Self::Staging | Self::TransferContext
+        )
     }
 
     /// The item's name, as listings print it.
@@ -311,6 +320,14 @@ pub struct GpuLedger {
     /// deployment states for the GPU; `None` until one states one.
     pub quota: Option<u64>,
     pub entries: Vec<LedgerEntry>,
+    /// The device memory the Transfer Server's CUDA context takes on the
+    /// GPU while it holds one, as it measured it when it started; 0 when no
+    /// Transfer Server measured the GPU. The ledger books it as an entry
+    /// ([`Item::TransferContext`]) only while the Transfer Server holds the
+    /// context, from its first work on the GPU to its last, so a plan that
+    /// leaves room for transfers counts it whether or not it is booked.
+    #[serde(default)]
+    pub transfer_context: u64,
 }
 
 /// One entry of a [`GpuLedger`].
@@ -899,10 +916,10 @@ pub enum Request {
     /// for its configured fraction. The processes of one scope and world (a
     /// rank, and the relaunch or standby that replaces it) serve in turn, so
     /// the larger of their bookings of an item counts. The Transfer Server
-    /// books [`Item::Staging`] in every ledger of the GPU, stating no quota
-    /// (its context is booked as it measured it, [`Request::Measured`]). A
-    /// booking ends with the connection of the process that made it, as that
-    /// process's memory ends with it. Refused, booking nothing, when it
+    /// books [`Item::Staging`] and [`Item::TransferContext`] in every ledger
+    /// of the GPU, stating no quota: its context before it retains it, which
+    /// a ledger without room refuses. A booking ends with the connection of
+    /// the process that made it, as that process's memory ends with it. Refused, booking nothing, when it
     /// would take a ledger past its quota; answered with the ledgers of the
     /// GPU the caller books in.
     Book {
@@ -968,14 +985,21 @@ pub enum Request {
     /// Transfer Server's READs. Answered with [`Reply::Exposed`] once they
     /// are registered; refused when a region is not memory of the
     /// deployment, when no Transfer Server is connected, or when it cannot
-    /// register them. A region stays registered until the server releases
-    /// its allocation or its Transfer Server ends. Whoever reads it keeps
-    /// it retained and unchanged until the read ends: the submitter of the
-    /// task that reads it.
+    /// register them. The regions stay registered for the exposure until
+    /// the peer ends it ([`Request::Unexpose`]) or its connection closes,
+    /// the server takes their allocations back, or its Transfer Server
+    /// ends. Whoever reads them keeps them retained and unchanged until the
+    /// read ends: the submitter of the task that reads them.
     Expose {
         deployment: String,
         regions: Vec<Region>,
     },
+    /// From another host's Transfer Server: the reads of the peer's exposure
+    /// `exposure` ended. This host's Transfer Server lets its registrations
+    /// go once no other exposure holds them. An exposure the server does
+    /// not hold for the caller (it ended with its Transfer Server, or the
+    /// caller's previous connection) is answered alike.
+    Unexpose { exposure: u64 },
     /// From the Transfer Server: the allocations of the server's
     /// [`Event::Register`] `request` are registered with its NIXL agent:
     /// each allocation's range, in the order the event listed them, and
@@ -1093,13 +1117,17 @@ pub enum Reply {
     /// ([`Request::Measured`], [`Request::Copied`], [`Request::Registered`]).
     Noted,
     /// The regions of a [`Request::Expose`], registered with the NIXL agent
-    /// of this host's Transfer Server: the agent's `metadata`, which a READ's
-    /// agent loads to reach them, and each region's range, in order, from
-    /// the region's first byte to the end of its allocation.
+    /// of this host's Transfer Server for the exposure `exposure`: the
+    /// agent's `metadata`, which a READ's agent loads to reach them, and
+    /// each region's range, in order, from the region's first byte to the
+    /// end of its allocation.
     Exposed {
+        exposure: u64,
         metadata: Vec<u8>,
         regions: Vec<Registered>,
     },
+    /// A [`Request::Unexpose`] was taken.
+    Unexposed,
     Error {
         kind: ErrorKind,
         message: String,
@@ -1276,6 +1304,9 @@ pub enum Event {
         request: u64,
         allocations: Vec<Allocation>,
     },
+    /// To the Transfer Server: the exposure its registrations of `request`
+    /// served ended; they go once no other exposure holds them.
+    Deregister { request: u64 },
     /// To a head: the prefetch `tag` ended. `results[i]` is whether the pool
     /// holds the page of the prefetch's key `i`.
     Prefetched { tag: u64, results: Vec<bool> },

@@ -33,7 +33,10 @@
 //! NIXL agent ([`Event::Register`]); the peer's request waits until the
 //! Transfer Server reports the ranges and its agent's metadata
 //! ([`Request::Registered`](storage::protocol::Request::Registered)), which
-//! answer it ([`Reply::Exposed`]).
+//! answer it ([`Reply::Exposed`]). The exposure lives until the peer ends it
+//! ([`Request::Unexpose`](storage::protocol::Request::Unexpose)) or its
+//! connection closes; the Transfer Server then lets its registrations go
+//! ([`Event::Deregister`]), and the GPU contexts they held with them.
 //!
 //! When the Transfer Server's connection closes, every task it held fails
 //! and the submitters learn it at once: the update a task served aborts,
@@ -84,6 +87,9 @@ pub(super) struct Transfers {
     /// the number of their [`Event::Register`].
     exposures: BTreeMap<u64, Exposure>,
     next_registration: u64,
+    /// Exposures registered and not ended, by that number, with the peer
+    /// that holds each.
+    live: BTreeMap<u64, ClientId>,
 }
 
 impl Transfers {
@@ -98,6 +104,7 @@ impl Transfers {
             contexts: Vec::new(),
             exposures: BTreeMap::new(),
             next_registration: 1,
+            live: BTreeMap::new(),
         }
     }
 }
@@ -343,7 +350,11 @@ impl Server {
         failure: Option<&str>,
     ) {
         let Some(exposure) = self.transfers.exposures.remove(&number) else {
-            // The peer disconnected meanwhile.
+            // The peer disconnected meanwhile: nobody reads what was
+            // registered for it.
+            if failure.is_none() {
+                self.deregister(number);
+            }
             return;
         };
         let reply = match failure {
@@ -365,18 +376,47 @@ impl Server {
                     })
                     .collect::<Option<Vec<_>>>();
                 match regions {
-                    Some(regions) => Reply::Exposed {
-                        metadata: metadata.to_vec(),
-                        regions,
-                    },
-                    None => error_reply((
-                        ErrorKind::Resource,
-                        "the Transfer Server reported no range for an exposed region".into(),
-                    )),
+                    Some(regions) => {
+                        self.transfers.live.insert(number, exposure.client);
+                        Reply::Exposed {
+                            exposure: number,
+                            metadata: metadata.to_vec(),
+                            regions,
+                        }
+                    }
+                    None => {
+                        self.deregister(number);
+                        error_reply((
+                            ErrorKind::Resource,
+                            "the Transfer Server reported no range for an exposed region".into(),
+                        ))
+                    }
                 }
             }
         };
         self.release_exposure(exposure, reply);
+    }
+
+    /// A peer's [`Request::Unexpose`](storage::protocol::Request::Unexpose):
+    /// its exposure `exposure` ends, unless it holds no such exposure.
+    pub(super) fn unexpose(&mut self, peer: ClientId, exposure: u64) -> Outcome {
+        if self.transfers.live.get(&exposure) == Some(&peer) {
+            self.transfers.live.remove(&exposure);
+            self.deregister(exposure);
+        }
+        Outcome::Reply(Reply::Unexposed, Vec::new())
+    }
+
+    /// Have the Transfer Server let the registrations of exposure `number`
+    /// go.
+    fn deregister(&mut self, number: u64) {
+        if let Some(transfer_server) = self.transfers.client {
+            self.events.push((
+                transfer_server,
+                Event::Deregister { request: number },
+                Vec::new(),
+            ));
+        }
     }
 
     /// Answer a peer's exposure with `reply` and serve its connection on.
@@ -668,11 +708,22 @@ impl Server {
     /// A client's connection closed: the tasks it submitted are cancelled,
     /// since nobody waits for them any more.
     pub(super) fn transfer_client_gone(&mut self, id: ClientId) {
-        // A peer that left waits for no exposure; what its Transfer Server
-        // registers stays registered, as any exposed region does.
+        // A peer that left waits for no exposure, and reads none any more:
+        // the registrations its exposures held go.
         self.transfers
             .exposures
             .retain(|_, exposure| exposure.client != id);
+        let ended: Vec<u64> = self
+            .transfers
+            .live
+            .iter()
+            .filter(|(_, peer)| **peer == id)
+            .map(|(number, _)| *number)
+            .collect();
+        for number in ended {
+            self.transfers.live.remove(&number);
+            self.deregister(number);
+        }
         let cancelled = self.cancel_where(|_, task| task.client == id);
         if cancelled > 0 {
             tracing::info!(
@@ -703,8 +754,10 @@ impl Server {
                 Vec::new(),
             ));
         }
-        // Its agent ended with it: the regions it was registering are
-        // refused, and the next one registers them when a peer asks again.
+        // Its agent ended with it: the exposures it held end, the regions it
+        // was registering are refused, and the next one registers them when
+        // a peer asks again.
+        self.transfers.live.clear();
         for (_, exposure) in std::mem::take(&mut self.transfers.exposures) {
             let reply = error_reply((
                 ErrorKind::Unavailable,
@@ -730,7 +783,8 @@ impl Server {
     }
 
     /// The device memory the connected Transfer Server's CUDA context takes
-    /// on each GPU, as it measured it, which every ledger of the GPU books.
+    /// on each GPU while it holds one, as it measured it; it books the
+    /// context itself while it holds it.
     pub(super) fn transfer_contexts(&self) -> Vec<([u8; 16], u64)> {
         self.transfers
             .contexts

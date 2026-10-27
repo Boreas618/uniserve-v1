@@ -61,7 +61,10 @@ pub(crate) fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
         arguments.push("CUDA_VISIBLE_DEVICES=".into());
     }
     arguments.push(format!("STORAGE_TEST_SOCKET={}", socket.display()).into());
-    arguments.push("UNISERVE_STORAGE_LOG=warn".into());
+    // Its log at the level the test's environment names, warnings when
+    // unset.
+    let level = std::env::var("UNISERVE_STORAGE_LOG").unwrap_or_else(|_| "warn".into());
+    arguments.push(format!("UNISERVE_STORAGE_LOG={level}").into());
     arguments.push(std::env::current_exe().unwrap().into());
     arguments.extend(
         [
@@ -566,13 +569,15 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
 pub(crate) mod device {
     use std::os::fd::{AsFd, OwnedFd};
 
+    use std::time::{Duration, Instant};
+
     use cuda::{
-        CopyBatch, DeviceAllocation, DeviceId, HandleType, PinnedBuffer, ShareableHandle,
+        CopyBatch, DeviceAllocation, DeviceId, HandleType, Nvml, PinnedBuffer, ShareableHandle,
         SourceOrder, Stream,
     };
     use storage::Access;
     use storage::protocol::{
-        Link, Memory, Placement, Priority, Region, StorageRecord, TransferEnd,
+        Event, Link, Memory, Placement, Priority, Region, StorageRecord, Throttle, TransferEnd,
     };
 
     use super::{Gpus, end_of, pattern, read, serving, span, tensor_region};
@@ -621,18 +626,11 @@ pub(crate) mod device {
         }
     }
 
-    /// The Transfer Server's CUDA context on a GPU, as it measured it, is
-    /// booked in every deployment's ledger of that GPU, beside what the
-    /// deployment's worlds hold within their quota; a worker's grant on the
-    /// GPU is what is left.
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn the_transfer_servers_context_is_in_every_ledger_of_its_gpu() {
-        let server = serving(Gpus::Visible);
-        let gpu = DeviceId(0).uuid().unwrap().0;
-        let mut operator =
-            storage::Client::connect(&server.socket, storage::Role::Operator).unwrap();
-        let context = operator
+    /// The context bytes the Transfer Server of the server on `socket`
+    /// measured on `gpu` when it started.
+    fn measured_context(socket: &std::path::Path, gpu: [u8; 16]) -> u64 {
+        let mut operator = storage::Client::connect(socket, storage::Role::Operator).unwrap();
+        operator
             .list()
             .unwrap()
             .transfer
@@ -643,36 +641,194 @@ pub(crate) mod device {
                     .find(|context| context.gpu == gpu)
                     .map(|context| context.bytes)
             })
-            .expect("the Transfer Server measured its context on the GPU");
+            .expect("the Transfer Server measured its context on the GPU")
+    }
+
+    /// The Transfer Server's context as the deployment's ledger of `gpu`
+    /// books it, if it does.
+    fn booked_context(client: &mut storage::Client, gpu: [u8; 16]) -> Option<u64> {
+        let (ledgers, _) = client.ledger(vec![gpu]).unwrap();
+        ledgers
+            .iter()
+            .flat_map(|ledger| &ledger.entries)
+            .find(|entry| entry.item == storage::Item::TransferContext)
+            .map(|entry| entry.bytes)
+    }
+
+    /// Whether NVML lists the Transfer Server `pid` on `device`: whether it
+    /// holds a context there.
+    fn holds_context(nvml: &Nvml, device: DeviceId, pid: i32) -> bool {
+        nvml.lists_process(device.uuid().unwrap(), pid as u32)
+            .unwrap()
+    }
+
+    /// Wait, at most ten seconds, until the Transfer Server `pid` holds no
+    /// context on `device`, and the ledger `client` reads books none.
+    fn await_release(nvml: &Nvml, client: &mut storage::Client, device: DeviceId, pid: i32) {
+        let gpu = device.uuid().unwrap().0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while holds_context(nvml, device, pid) || booked_context(client, gpu).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the Transfer Server still holds or books its context on {device}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The Transfer Server holds a GPU's CUDA context only while a task
+    /// needs the GPU: none once it started; while a task copies into the
+    /// GPU, the context, booked in the deployment's ledger of the GPU at the
+    /// bytes it measured; once the task ended, neither the context (NVML
+    /// lists the process on the GPU no more) nor its booking. A following
+    /// task on the GPU retains it again, and releases it in turn.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_gpu_holds_the_transfer_servers_context_only_while_a_task_needs_it() {
+        let server = serving(Gpus::Visible);
+        let pid = super::transfer_pid(&server.socket, None);
+        let nvml = Nvml::init().unwrap();
+        let first = DeviceId(0);
+        let gpu = first.uuid().unwrap().0;
+        let context = measured_context(&server.socket, gpu);
         assert!(context > 0);
+        assert!(!holds_context(&nvml, first, pid));
 
         let mut head = head(&server.socket);
         let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+        let bytes = 1 << 30;
+        let source_bytes = pattern(bytes, 17);
+        let source = memfd(&source_bytes);
+        let (destination, destination_fd) = device_storage(first, &vec![0; bytes]);
+        worker
+            .put(
+                vec![
+                    tensor(key(1), "offloaded", 0, 0, Access::ReadOnly),
+                    tensor(key(2), "cache", 1, 0, Access::Exclusive),
+                ],
+                &[
+                    (host(bytes as u64), source.as_fd()),
+                    (record(first, bytes), destination_fd.as_fd()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(booked_context(&mut head, gpu), None);
+
+        // The host link into the GPU at its floor, so that the task lasts
+        // long enough to observe.
+        let link = Link {
+            source: Memory::Host,
+            destination: Memory::Device { gpu },
+        };
+        for _ in 0..8 {
+            head.throttle(vec![link.clone()], Throttle::Halve).unwrap();
+        }
+        let task = worker
+            .transfer(
+                vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes as u64)],
+                Priority::Background,
+                1,
+            )
+            .unwrap();
+        loop {
+            match super::transfer_event(&mut worker) {
+                Event::TransferProgress { task: running, .. } if running == task => break,
+                Event::Transferred { end, .. } => panic!("the task ended at once: {end:?}"),
+                _ => {}
+            }
+        }
+        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        assert!(holds_context(&nvml, first, pid));
+        assert_eq!(
+            end_of(&mut worker, task),
+            (bytes as u64, TransferEnd::Complete)
+        );
+        await_release(&nvml, &mut head, first, pid);
+        assert_eq!(device_bytes(&destination), source_bytes);
+
+        // The next task retains the context again.
+        let tail: u64 = 2 << 20;
+        let task = worker
+            .transfer(
+                vec![span(tensor_region(1), 0, tensor_region(2), 0, tail)],
+                Priority::Background,
+                2,
+            )
+            .unwrap();
+        assert_eq!(end_of(&mut worker, task), (tail, TransferEnd::Complete));
+        await_release(&nvml, &mut head, first, pid);
+    }
+
+    /// A GPU whose memory ledger has no room for the Transfer Server's
+    /// context refuses the context: a task that needs the GPU fails, naming
+    /// the ledger, and the context is neither booked nor retained, so the
+    /// ledger stays within its quota.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_ledger_without_room_for_the_context_fails_the_task_that_needs_the_gpu() {
+        let server = serving(Gpus::Visible);
+        let pid = super::transfer_pid(&server.socket, None);
+        let nvml = Nvml::init().unwrap();
+        let first = DeviceId(0);
+        let gpu = first.uuid().unwrap().0;
+        let context = measured_context(&server.socket, gpu);
+
+        let mut head = head(&server.socket);
+        let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+        let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+        let granularity = DeviceAllocation::granularity(first).unwrap();
+        let source = memfd(&pattern(granularity, 5));
+        let (destination, destination_fd) = device_storage(first, &vec![0; granularity]);
+        worker
+            .put(
+                vec![
+                    tensor(key(1), "offloaded", 0, 0, Access::ReadOnly),
+                    tensor(key(2), "cache", 1, 0, Access::Exclusive),
+                ],
+                &[
+                    (host(granularity as u64), source.as_fd()),
+                    (record(first, granularity), destination_fd.as_fd()),
+                ],
+            )
+            .unwrap();
+        // The deployment's quota leaves room for half the context.
+        let quota = granularity as u64 + 4096 + context / 2;
         let total = 1 << 40;
-        let ledger = worker
+        worker
             .book(
                 gpu,
                 total,
-                Some(total / 2),
-                vec![(storage::Item::Process, 1000)],
+                Some(quota),
+                vec![(storage::Item::Process, 4096)],
             )
-            .unwrap()
-            .remove(0);
-        let booked = ledger
-            .entries
-            .iter()
-            .find(|entry| entry.item == storage::Item::TransferContext)
-            .expect("the ledger books the Transfer Server's context");
-        assert_eq!(
-            (
-                booked.scope.as_ref(),
-                booked.worlds.as_slice(),
-                booked.bytes
+            .unwrap();
+
+        let task = worker
+            .transfer(
+                vec![span(tensor_region(1), 0, tensor_region(2), 0, 4096)],
+                Priority::Background,
+                1,
+            )
+            .unwrap();
+        match end_of(&mut worker, task) {
+            (0, TransferEnd::Failed { message }) => assert!(
+                message.contains("ledger") && message.contains("quota"),
+                "{message}"
             ),
-            (None, &[][..], context)
+            other => panic!("a task without room for the context ended {other:?}"),
+        }
+        let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
+        let ledger = &ledgers[0];
+        assert!(
+            ledger
+                .entries
+                .iter()
+                .all(|entry| entry.item != storage::Item::TransferContext)
         );
-        assert_eq!(ledger.used(), context + 1000);
+        assert!(ledger.used() <= quota);
+        assert!(!holds_context(&nvml, first, pid));
+        assert_eq!(device_bytes(&destination), vec![0; granularity]);
     }
 
     #[test]

@@ -12,8 +12,11 @@
 //! When it starts it measures the bandwidth of every link (each GPU's own
 //! memory, each pair of GPUs, each GPU to and from host memory, and host
 //! memory to itself) and the device memory its context takes on each GPU
-//! ([`devices`]), connects as [`Role::Transfer`] and reports both
-//! ([`Request::Measured`]). It then runs the server's tasks
+//! ([`devices`]), then releases its contexts, connects as
+//! [`Role::Transfer`] and reports both ([`Request::Measured`]). It holds a
+//! GPU's context again only while it has work on the GPU, booked in the
+//! GPU's memory ledgers at the measured bytes meanwhile ([`contexts`]). It
+//! then runs the server's tasks
 //! ([`Event::Transfer`]): every move goes to the lane of its link and of
 //! what runs its copies ([`lanes`]), by path:
 //!
@@ -37,15 +40,20 @@
 //! The same agent serves other hosts' READs of this host's memory: the
 //! server has it register the allocations a peer asks to expose
 //! ([`Event::Register`]), and it reports the ranges and its metadata
-//! ([`Request::Registered`]). What waits on another host or on such a
-//! registration runs on a helper thread, so the main thread keeps taking
-//! the server's events and the lanes' reports meanwhile.
+//! ([`Request::Registered`]); the registrations, and the GPU contexts they
+//! need, stay until the peer ends the exposure ([`Event::Deregister`]). A
+//! task READing from another host ends its exposures there once it ended.
+//! What waits on another host, on a GPU's context or on a registration runs
+//! on a helper or lane thread, so the main thread keeps taking the server's
+//! events and the lanes' reports meanwhile, and places the bookings the
+//! other threads wait for.
 //!
 //! It reports each task's progress and end ([`Request::Copied`]) only
 //! after the host saw the copies complete (an event its lane queried, or a
 //! READ it polled), so no CUDA event crosses a process. It ends when the
 //! server closes its connection.
 
+mod contexts;
 mod devices;
 mod lanes;
 mod memory;
@@ -58,16 +66,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use cuda::DeviceId;
 use rustix::event::{PollFd, PollFlags, poll};
 use storage::client::Client;
 use storage::protocol::{
-    Allocation, Event, Link, Memory, Move, Priority, Registered, Reply, Request, Role, TransferEnd,
+    Allocation, ContextBytes, Event, Item, Link, Memory, Move, Priority, Registered, Reply,
+    Request, Role, TransferEnd,
 };
 
+use contexts::{Booked, Booking, Bookings, Contexts, Hold};
 use devices::Gpus;
 use lanes::{End, LaneKey, Lanes, Piece, Runner};
 use memory::{Fabric, Mapped};
-use network::{Inbound, Network};
+use network::{Exposed, Inbound, Lease, Network, Sources};
 
 /// How the Transfer Server copies.
 #[derive(Debug, Clone)]
@@ -103,33 +114,55 @@ pub enum Error {
 /// or the measurement) or the server cannot be reached.
 pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
     let gpus = Gpus::discover()?;
-    let (links, contexts) = devices::measure(&gpus)?;
+    let (links, context_bytes) = devices::measure(&gpus)?;
     let bandwidths = links
         .iter()
         .map(|measured| (measured.link.clone(), measured.bytes_per_second as f64))
         .collect();
+    let booked = booked(&gpus, &context_bytes)?;
 
     let mut client = Client::connect(socket, Role::Transfer)?;
     let (wake_reader, wake_writer) = rustix::pipe::pipe_with(
         rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
     )
     .map_err(io::Error::from)?;
+    let wake = Arc::new(wake_writer.try_clone()?);
+    let (booking_sender, bookings) = mpsc::channel();
+    let contexts = Arc::new(Contexts::new(
+        booked,
+        Bookings {
+            sender: booking_sender,
+            wake: Arc::clone(&wake),
+        },
+    ));
     let network = Arc::new(Network::new(options.nixl_library.clone()));
     let (sender, finished) = mpsc::channel();
     let mut server = Served {
         gpus,
+        contexts: Arc::clone(&contexts),
         allocations: HashMap::new(),
-        helpers: Helpers {
-            sender,
-            wake: Arc::new(wake_writer.try_clone()?),
-        },
-        lanes: Lanes::new(wake_writer, options.chunk, bandwidths, Arc::clone(&network)),
+        helpers: Helpers { sender, wake },
+        lanes: Lanes::new(
+            wake_writer,
+            options.chunk,
+            bandwidths,
+            Arc::clone(&network),
+            contexts,
+        ),
         network,
         finished,
+        bookings,
+        answers: HashMap::new(),
         exposing: HashMap::new(),
+        exposures: HashMap::new(),
+        leases: HashMap::new(),
         replies: Vec::new(),
     };
-    server.send(&mut client, &Request::Measured { links, contexts })?;
+    let measured = Request::Measured {
+        links,
+        contexts: context_bytes,
+    };
+    server.send(&mut client, &measured)?;
     tracing::info!("the Transfer Server serves");
 
     loop {
@@ -165,7 +198,13 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
                 server.send(&mut client, &report)?;
             }
         }
+        while let Ok(booking) = server.bookings.try_recv() {
+            server.book(&mut client, booking)?;
+        }
         for (task, bytes, end) in server.lanes.reports() {
+            if end.is_some() {
+                server.ended(task);
+            }
             server.send(&mut client, &Request::Copied { task, bytes, end })?;
         }
         let links = server.lanes.measured();
@@ -180,25 +219,54 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
     }
 }
 
+/// Each GPU as its context is booked: the context's bytes as measured, and
+/// the GPU's total memory as NVML reports it.
+fn booked(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Booked>, Error> {
+    let identities: Vec<(DeviceId, [u8; 16])> = gpus.identities().collect();
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let nvml = cuda::Nvml::init()?;
+    identities
+        .into_iter()
+        .map(|(device, uuid)| {
+            Ok(Booked {
+                device,
+                uuid,
+                total: nvml.memory_info(device)?.total,
+                context: measured
+                    .iter()
+                    .find(|context| context.gpu == uuid)
+                    .map_or(0, |context| context.bytes),
+            })
+        })
+        .collect()
+}
+
 /// What a helper thread finished, for the main thread.
 enum Done {
     /// The pieces of task `task`, its moves from other hosts among them
-    /// once those hosts exposed their sources, or why it cannot run.
+    /// once those hosts exposed their sources, with the exposures it ends
+    /// when it ends; or why it cannot run.
     Sources {
         task: u64,
         priority: Priority,
-        pieces: Result<Vec<(LaneKey, Piece)>, String>,
+        pieces: Result<Sources, String>,
     },
     /// The registrations of the server's `request`: the agent's metadata
-    /// and each allocation's range, or why they failed.
+    /// and each allocation's range, or why they failed; and the holds on
+    /// the GPUs of the exposed device allocations, which the exposure
+    /// keeps.
     Registered {
         request: u64,
+        holds: Vec<Hold>,
         registered: Result<(Vec<u8>, Vec<Registered>), String>,
     },
 }
 
-/// Runs work that waits on another host, or on registering memory, off
-/// the main thread, and wakes the main thread with its outcome.
+/// Runs work that waits on another host, on a GPU's context or on
+/// registering memory, off the main thread, and wakes the main thread with
+/// its outcome.
 struct Helpers {
     sender: mpsc::Sender<Done>,
     /// The write end of the main thread's wake pipe.
@@ -206,16 +274,18 @@ struct Helpers {
 }
 
 impl Helpers {
-    fn spawn(&self, work: impl FnOnce() -> Done + Send + 'static) {
+    fn spawn(&self, work: impl FnOnce() -> Option<Done> + Send + 'static) {
         let sender = self.sender.clone();
         let wake = Arc::clone(&self.wake);
         let spawned = std::thread::Builder::new()
             .name("uniserve-transfer-helper".into())
             .spawn(move || {
-                // The main thread ends only with the process, so its
-                // receiver outlives every helper.
-                let _ = sender.send(work());
-                let _ = rustix::io::write(&*wake, b"x");
+                if let Some(done) = work() {
+                    // The main thread ends only with the process, so its
+                    // receiver outlives every helper.
+                    let _ = sender.send(done);
+                    let _ = rustix::io::write(&*wake, b"x");
+                }
             });
         if let Err(error) = spawned {
             lanes::fatal("starting a helper thread", &error);
@@ -223,9 +293,14 @@ impl Helpers {
     }
 }
 
+/// The holds one task takes, one per GPU, which its pieces share.
+type TaskHolds = HashMap<DeviceId, Hold>;
+
 /// The Transfer Server's state on its main thread.
 struct Served {
     gpus: Gpus,
+    /// The GPUs' contexts, held while work needs them.
+    contexts: Arc<Contexts>,
     /// The allocations the server gave, until it takes them back.
     allocations: HashMap<Allocation, Arc<Mapped>>,
     lanes: Lanes,
@@ -235,9 +310,20 @@ struct Served {
     helpers: Helpers,
     /// What the helpers finished.
     finished: mpsc::Receiver<Done>,
+    /// The bookings of GPU contexts the main thread places in the server's
+    /// ledgers.
+    bookings: mpsc::Receiver<Booking>,
+    /// Bookings placed whose answer a thread waits for, by request.
+    answers: HashMap<u64, mpsc::SyncSender<Result<(), String>>>,
     /// The tasks whose sources other hosts are exposing, and whether the
     /// server cancelled each meanwhile.
     exposing: HashMap<u64, bool>,
+    /// Exposures to other hosts, by the server's register request, with the
+    /// holds on the GPUs of their device allocations.
+    exposures: HashMap<u64, Vec<Hold>>,
+    /// The exposures of other hosts each running task READs, which end
+    /// with it.
+    leases: HashMap<u64, Vec<Lease>>,
     /// Requests sent and not answered yet.
     replies: Vec<u64>,
 }
@@ -248,9 +334,40 @@ impl Served {
         Ok(())
     }
 
-    /// Take the server's answers; an error names a task it no longer holds,
-    /// which changes nothing here.
+    /// Place `booking` in the server's ledgers: a GPU's context, booked at
+    /// its bytes before a thread retains it, or ended once it was released.
+    fn book(&mut self, client: &mut Client, booking: Booking) -> Result<(), Error> {
+        let request = Request::Book {
+            gpu: booking.gpu,
+            total: booking.total,
+            quota: None,
+            items: vec![(Item::TransferContext, booking.bytes)],
+        };
+        let id = client.submit(&request, &[])?;
+        match booking.answer {
+            Some(answer) => {
+                self.answers.insert(id, answer);
+            }
+            None => self.replies.push(id),
+        }
+        Ok(())
+    }
+
+    /// Take the server's answers: a booking's answer goes to the thread that
+    /// waits for it; an error to a report names a task the server no longer
+    /// holds, which changes nothing here.
     fn collect(&mut self, client: &mut Client) {
+        self.answers.retain(|id, answer| match client.take(*id) {
+            Some(answered) => {
+                let outcome = match answered.reply {
+                    Reply::Error { message, .. } => Err(message),
+                    _ => Ok(()),
+                };
+                let _ = answer.send(outcome);
+                false
+            }
+            None => true,
+        });
         self.replies.retain(|id| match client.take(*id) {
             Some(answer) => {
                 if let Reply::Error { message, .. } = answer.reply {
@@ -275,13 +392,20 @@ impl Served {
                     tracing::warn!(?allocation, "an allocation came without its descriptor");
                     return;
                 };
-                let mapped = Mapped::new(memory, bytes, writable, descriptor, &self.gpus);
+                let mapped = Mapped::new(
+                    memory,
+                    bytes,
+                    writable,
+                    descriptor,
+                    &self.gpus,
+                    Arc::clone(&self.contexts),
+                );
                 self.allocations.insert(allocation, Arc::new(mapped));
             }
             Event::AllocationReleased { allocation } => {
-                // A task that copies it holds it until its copies complete.
-                // Its NIXL registration ends with its mapping, so another
-                // host's READ of it fails from then on.
+                // A task that copies it holds it until its copies complete;
+                // then its mappings and registrations go, so another host's
+                // READ of it fails from then on.
                 self.allocations.remove(&allocation);
             }
             Event::Transfer {
@@ -303,6 +427,16 @@ impl Served {
                 request,
                 allocations,
             } => self.register(request, &allocations),
+            Event::Deregister { request } => {
+                if let Some(holds) = self.exposures.remove(&request) {
+                    // The last hold of a GPU releases its context, which
+                    // waits for the driver: on a helper.
+                    self.helpers.spawn(move || {
+                        drop(holds);
+                        None
+                    });
+                }
+            }
             Event::TransferProgress { .. }
             | Event::Transferred { .. }
             | Event::Prefetched { .. }
@@ -321,27 +455,37 @@ impl Served {
         let mut pieces = Vec::with_capacity(moves.len());
         let mut inbound = Vec::new();
         // Another host's allocation of the fabric is imported once per task
-        // and GPU, whatever number of its moves read or write it.
+        // and GPU, whatever number of its moves read or write it; a GPU is
+        // held once per task, whatever number of its pieces need it.
         let mut imports = HashMap::new();
+        let mut holds = TaskHolds::new();
         for copy in moves {
             let taken = match &copy.source {
                 Allocation::Remote {
                     endpoint,
                     deployment,
                     region,
-                } => self.given(&copy.destination).map(|destination| {
+                } => self.given(&copy.destination).and_then(|destination| {
+                    let hold = match destination.memory {
+                        Memory::Device { .. } => {
+                            Some(self.hold(&mut holds, destination.device()?)?)
+                        }
+                        _ => None,
+                    };
                     inbound.push(Inbound {
                         endpoint: endpoint.clone(),
                         deployment: deployment.clone(),
                         region: (**region).clone(),
                         source_offset: copy.source_offset,
                         destination,
+                        hold,
                         destination_offset: copy.destination_offset,
                         bytes: copy.bytes,
                     });
+                    Ok(())
                 }),
                 _ => self
-                    .piece(task, copy, &mut imports)
+                    .piece(task, copy, &mut imports, &mut holds)
                     .map(|piece| pieces.push(piece)),
             };
             if let Err(message) = taken {
@@ -357,30 +501,60 @@ impl Served {
         self.exposing.insert(task, false);
         let network = Arc::clone(&self.network);
         self.helpers.spawn(move || {
-            let pieces = network.pieces(task, inbound).map(|remote| {
-                pieces.extend(remote);
-                pieces
+            let pieces = network.pieces(task, inbound).map(|mut sources| {
+                pieces.append(&mut sources.pieces);
+                Sources {
+                    pieces,
+                    leases: sources.leases,
+                }
             });
-            Done::Sources {
+            Some(Done::Sources {
                 task,
                 priority,
                 pieces,
-            }
+            })
         });
     }
 
+    /// Task `task` ended: the exposures of other hosts it READ from end, on
+    /// a helper, since each waits for its host's answer.
+    fn ended(&mut self, task: u64) {
+        if let Some(leases) = self.leases.remove(&task) {
+            let network = Arc::clone(&self.network);
+            self.helpers.spawn(move || {
+                network.unexpose(leases);
+                None
+            });
+        }
+    }
+
     /// Register `allocations` with the NIXL agent for another host's READs,
-    /// on a helper: registering pins the memory, which takes a while for a
-    /// large page pool.
+    /// on a helper: registering device memory retains its GPU's context and
+    /// pins the memory, which takes a while for a large page pool.
     fn register(&mut self, request: u64, allocations: &[Allocation]) {
-        let mapped: Result<Vec<Arc<Mapped>>, String> = allocations
+        let mut holds = TaskHolds::new();
+        let exposed: Result<Vec<Exposed>, String> = allocations
             .iter()
-            .map(|allocation| self.given(allocation))
+            .map(|allocation| {
+                let mapped = self.given(allocation)?;
+                let hold = match mapped.memory {
+                    Memory::Device { .. } => Some(self.hold(&mut holds, mapped.device()?)?),
+                    _ => None,
+                };
+                Ok((mapped, hold))
+            })
             .collect();
         let network = Arc::clone(&self.network);
-        self.helpers.spawn(move || Done::Registered {
-            request,
-            registered: mapped.and_then(|mapped| network::register(&network, &mapped)),
+        self.helpers.spawn(move || {
+            let registered = exposed
+                .as_deref()
+                .map_err(Clone::clone)
+                .and_then(|exposed| network::register(&network, exposed));
+            Some(Done::Registered {
+                request,
+                holds: holds.into_values().collect(),
+                registered,
+            })
         });
     }
 
@@ -395,8 +569,16 @@ impl Served {
             } => {
                 let cancelled = self.exposing.remove(&task).unwrap_or(false);
                 match pieces {
-                    _ if cancelled => self.lanes.end(task, TransferEnd::Cancelled),
-                    Ok(pieces) => self.lanes.submit(task, priority, pieces),
+                    Ok(sources) if cancelled => {
+                        self.lanes.end(task, TransferEnd::Cancelled);
+                        self.leases.insert(task, sources.leases);
+                        self.ended(task);
+                    }
+                    Ok(sources) => {
+                        self.leases.insert(task, sources.leases);
+                        self.lanes.submit(task, priority, sources.pieces);
+                    }
+                    Err(_) if cancelled => self.lanes.end(task, TransferEnd::Cancelled),
                     Err(message) => {
                         tracing::warn!(task, message, "a task's sources on other hosts failed");
                         self.lanes.end(task, TransferEnd::Failed { message });
@@ -406,16 +588,24 @@ impl Served {
             }
             Done::Registered {
                 request,
+                holds,
                 registered,
             } => Some(match registered {
-                Ok((metadata, ranges)) => Request::Registered {
-                    request,
-                    metadata,
-                    ranges,
-                    failure: None,
-                },
+                Ok((metadata, ranges)) => {
+                    self.exposures.insert(request, holds);
+                    Request::Registered {
+                        request,
+                        metadata,
+                        ranges,
+                        failure: None,
+                    }
+                }
                 Err(message) => {
                     tracing::warn!(message, "registering memory for another host failed");
+                    self.helpers.spawn(move || {
+                        drop(holds);
+                        None
+                    });
                     Request::Registered {
                         request,
                         metadata: Vec::new(),
@@ -427,14 +617,25 @@ impl Served {
         }
     }
 
+    /// The task's hold on `device`, taken at its first use.
+    fn hold(&self, holds: &mut TaskHolds, device: DeviceId) -> Result<Hold, String> {
+        if let Some(hold) = holds.get(&device) {
+            return Ok(hold.clone());
+        }
+        let hold = self.contexts.hold(device)?;
+        holds.insert(device, hold.clone());
+        Ok(hold)
+    }
+
     /// The lane and the piece of one move between allocations of this host
     /// and of the fabric; `imports` holds the task's imports of other
-    /// hosts' allocations.
+    /// hosts' allocations, and `holds` its holds on the GPUs.
     fn piece(
         &self,
         task: u64,
         copy: &Move,
         imports: &mut Imports,
+        holds: &mut TaskHolds,
     ) -> Result<(LaneKey, Piece), String> {
         let source = self.side(&copy.source)?;
         let destination = self.side(&copy.destination)?;
@@ -445,13 +646,52 @@ impl Served {
         let runner = self.runner(&source, &destination)?;
         let piece = Piece {
             task,
-            source: source.end(runner, imports)?,
+            source: self.end(&source, runner, imports, holds)?,
             source_offset: copy.source_offset,
-            destination: destination.end(runner, imports)?,
+            destination: self.end(&destination, runner, imports, holds)?,
             destination_offset: copy.destination_offset,
             bytes: copy.bytes,
         };
         Ok((LaneKey { link, runner }, piece))
+    }
+
+    /// A piece's end on `runner`, holding the GPU whose context reaches it:
+    /// a device allocation's own GPU, the runner's for host memory a GPU
+    /// copies and for another host's allocation of the fabric, which is
+    /// imported there once per task (`imports`).
+    fn end(
+        &self,
+        side: &Side,
+        runner: Runner,
+        imports: &mut Imports,
+        holds: &mut TaskHolds,
+    ) -> Result<End, String> {
+        match (side, runner) {
+            (Side::Given(mapped), _) => {
+                let gpu = match (&mapped.memory, runner) {
+                    (Memory::Device { .. }, _) => Some(mapped.device()?),
+                    (Memory::Host, Runner::Device(device)) => Some(device),
+                    _ => None,
+                };
+                let hold = gpu.map(|device| self.hold(holds, device)).transpose()?;
+                Ok(End::Given {
+                    mapped: Arc::clone(mapped),
+                    hold,
+                })
+            }
+            (Side::Fabric { handle, bytes, .. }, Runner::Device(device)) => {
+                let import = imports
+                    .entry((*handle, device))
+                    .or_insert_with(|| Arc::new(Fabric::new(*handle, *bytes, device)));
+                Ok(End::Fabric {
+                    import: Arc::clone(import),
+                    _hold: self.hold(holds, device)?,
+                })
+            }
+            (Side::Fabric { .. }, Runner::Host | Runner::Network) => {
+                Err("another host's GPU memory is copied by a GPU of this host".into())
+            }
+        }
     }
 
     /// An allocation the server gave.
@@ -529,7 +769,7 @@ impl Served {
 
 /// One task's imports of other hosts' allocations, by fabric handle and
 /// importing GPU.
-type Imports = HashMap<([u8; 64], cuda::DeviceId), Arc<Fabric>>;
+type Imports = HashMap<([u8; 64], DeviceId), Arc<Fabric>>;
 
 /// One side of a move, before the lane that copies it is known.
 enum Side {
@@ -551,23 +791,6 @@ impl Side {
 
     fn is_host(&self) -> bool {
         self.memory() == Memory::Host
-    }
-
-    /// The piece's end on `runner`: another host's allocation is imported
-    /// on the GPU that runs the copy, once per task (`imports`).
-    fn end(&self, runner: Runner, imports: &mut Imports) -> Result<End, String> {
-        match (self, runner) {
-            (Side::Given(mapped), _) => Ok(End::Given(Arc::clone(mapped))),
-            (Side::Fabric { handle, bytes, .. }, Runner::Device(device)) => {
-                let import = imports
-                    .entry((*handle, device))
-                    .or_insert_with(|| Arc::new(Fabric::new(*handle, *bytes, device)));
-                Ok(End::Fabric(Arc::clone(import)))
-            }
-            (Side::Fabric { .. }, Runner::Host | Runner::Network) => {
-                Err("another host's GPU memory is copied by a GPU of this host".into())
-            }
-        }
     }
 }
 

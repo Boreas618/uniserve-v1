@@ -48,6 +48,9 @@ struct Workers {
     process_bytes: u64,
     /// What the Transfer Server books on the GPU.
     transfer_bytes: u64,
+    /// What the Transfer Server's context takes on the GPU while held,
+    /// which the ledger reports booked or not.
+    transfer_context: u64,
     /// What another world's process books on the GPU.
     other_world_bytes: u64,
     /// Free device bytes.
@@ -141,6 +144,7 @@ impl Workers {
             total: 1 << 40,
             quota: Some(self.quota),
             entries,
+            transfer_context: self.transfer_context,
         }
     }
 }
@@ -258,6 +262,7 @@ impl Executor for Segmented {
                     segment: None,
                     bytes: process,
                 }],
+                transfer_context: 0,
             });
             results.push(
                 serde_json::json!({
@@ -676,8 +681,10 @@ fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
 /// then keeps the segments the plan named.
 #[test]
 fn a_plan_reports_each_devices_memory_and_withdraws_nothing() {
+    // The Transfer Server holds no context on the GPU while no transfer
+    // runs, so the ledger books none; the change's transfers will need it.
     let mut fill = Workers::filling(3_500);
-    fill.transfer_bytes = 1_500;
+    fill.transfer_context = 1_500;
     fill.quota += 1_500;
     let (handle, workers, thread) = start(fill);
     let plans = resize(&handle, CacheChange::Plan).unwrap();
@@ -690,7 +697,8 @@ fn a_plan_reports_each_devices_memory_and_withdraws_nothing() {
     };
     let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
     // 13000 bytes of quota, less 3500 of the serving world's process, 1500
-    // of the Transfer Server's and 3500 of the successor's process.
+    // of the Transfer Server's context, not booked yet, and 3500 of the
+    // successor's process.
     assert_eq!(plan["kv_limit"], 4_500);
     assert_eq!(plan["transfer"], 1_500);
     assert_eq!(plan["successor"]["process"], 3_500);

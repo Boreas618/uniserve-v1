@@ -681,6 +681,7 @@ impl Server {
                 },
                 Role::Peer,
             ) => self.expose(deployment, regions),
+            (Request::Unexpose { exposure }, Role::Peer) => Ok(self.unexpose(id, *exposure)),
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
                 // A download that failed freed the slots it had reserved.
@@ -1099,13 +1100,16 @@ impl Server {
     ) -> Result<Outcome, (ErrorKind, String)> {
         let deployment = match &booker {
             ledger::Booker::Worker { scope, .. } => {
-                if let Some(&(item, _)) = items.iter().find(|(item, _)| !item.booked()) {
+                let worker =
+                    |item: &Item| matches!(item, Item::GraphPool | Item::Process | Item::Staging);
+                if let Some(&(item, _)) = items.iter().find(|(item, _)| !worker(item)) {
                     return Err(invalid(&format!("a worker books no {}", item.name())));
                 }
                 Some(scope.deployment.clone())
             }
             ledger::Booker::Transfer => {
-                if let Some(&(item, _)) = items.iter().find(|(item, _)| *item != Item::Staging) {
+                let transfer = |item: &Item| matches!(item, Item::Staging | Item::TransferContext);
+                if let Some(&(item, _)) = items.iter().find(|(item, _)| !transfer(item)) {
                     return Err(invalid(&format!(
                         "the Transfer Server books no {}",
                         item.name()
@@ -2454,6 +2458,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Measured { .. } => "measured",
         Request::Copied { .. } => "copied",
         Request::Expose { .. } => "expose",
+        Request::Unexpose { .. } => "unexpose",
         Request::Registered { .. } => "registered",
     }
 }

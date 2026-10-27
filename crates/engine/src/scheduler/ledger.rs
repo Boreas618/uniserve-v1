@@ -12,7 +12,9 @@
 //!
 //! - **Preparation** ([`preparing`]): the serving world's KV cache may keep
 //!   the quota less everything else the ledger books (its own weights, graph
-//!   pool and fixed part, the Transfer Server's context and staging) and
+//!   pool and fixed part, the Transfer Server's context and staging; the
+//!   context counted even while the Transfer Server holds none, since it
+//!   books the context only from its first transfer on the GPU) and
 //!   less what its successor adds: a graph pool of its own, a fixed part as
 //!   large as the serving world's (process memory and exclusive storages,
 //!   for the same configuration), its head segment, and no weights or KV
@@ -225,8 +227,15 @@ pub(super) fn preparing(report: &CacheMemory, floor: u32) -> Result<Preparing, S
         staging: own(Item::Staging),
     };
     let serving_kv_cache = own(Item::CacheSegment);
-    let transfer = ledger.bytes(|entry| entry.scope.is_none() && entry.worlds.is_empty());
-    let others = ledger.used().saturating_sub(
+    // The Transfer Server books its context only while it holds it, and the
+    // change's transfers need it on the GPU: a context not booked yet counts
+    // beside what the ledger books.
+    let unbooked_context = ledger
+        .transfer_context
+        .saturating_sub(ledger.bytes(|entry| entry.item == Item::TransferContext));
+    let transfer =
+        ledger.bytes(|entry| entry.scope.is_none() && entry.worlds.is_empty()) + unbooked_context;
+    let others = (ledger.used() + unbooked_context).saturating_sub(
         serving.weights
             + serving.graph_pool
             + serving.process
@@ -243,7 +252,7 @@ pub(super) fn preparing(report: &CacheMemory, floor: u32) -> Result<Preparing, S
         head_segment: report.head_bytes,
         in_flight: 0,
     };
-    let beside = ledger.used() - serving_kv_cache + successor.total();
+    let beside = ledger.used() + unbooked_context - serving_kv_cache + successor.total();
     let kv_limit = quota as i64 - beside as i64;
 
     // The largest prefix of the held segments within the limit, at least

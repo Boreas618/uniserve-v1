@@ -7,10 +7,11 @@
 //! loads NIXL. The agent serves both ends of a READ:
 //!
 //! - **Source.** The server has the Transfer Server register allocations a
-//!   peer asked it to expose ([`Event::Register`]): each is registered once
-//!   ([`Mapped::nixl_region`]) and stays registered, with its mapping, until
-//!   the server takes the allocation back; the report carries each range and
-//!   the agent's metadata taken after the registrations ([`register`]).
+//!   peer asked it to expose ([`Event::Register`]): host memory with the
+//!   allocation ([`Mapped::nixl_host_region`]), device memory in its GPU's
+//!   session, which the exposure holds until the peer ends it
+//!   ([`Event::Deregister`]); the report carries each range and the agent's
+//!   metadata taken after the registrations ([`register`]).
 //! - **Destination.** A task's move from another host names that host's
 //!   Storage Server by its endpoint. Before the task's pieces are queued,
 //!   [`Network::pieces`] asks that server, over this process's connection to
@@ -18,7 +19,9 @@
 //!   ([`Request::Expose`]), loads the metadata of the agent that registered
 //!   them, checks each span against its region's range and registers each
 //!   destination with this agent; network lanes then post the READs
-//!   ([`super::lanes`]).
+//!   ([`super::lanes`]). Once the task ended, its exposures end
+//!   ([`Network::unexpose`]), so that the other host releases what it holds
+//!   for them, GPU contexts among them.
 //!
 //! An agent's name is unique to its process, so a peer whose Transfer
 //! Server restarted answers with another agent: its metadata is loaded and
@@ -28,6 +31,7 @@
 //! allocation, and its registration, may change between two tasks.
 //!
 //! [`Event::Register`]: storage::protocol::Event::Register
+//! [`Event::Deregister`]: storage::protocol::Event::Deregister
 //! [`Request::Expose`]: storage::protocol::Request::Expose
 //! [`Role::Peer`]: storage::protocol::Role::Peer
 
@@ -39,6 +43,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::Client;
 use storage::protocol::{Link, Memory, Region, Registered};
 
+use super::contexts::Hold;
 use super::lanes::{End, LaneKey, Piece, Runner};
 use super::memory::Mapped;
 
@@ -85,16 +90,35 @@ pub(super) struct Source {
 }
 
 /// A task's move from another host's memory into an allocation of this
-/// host's, before that host exposed its source.
+/// host's, before that host exposed its source; `hold` holds the GPU of a
+/// device destination.
 pub(super) struct Inbound {
     pub(super) endpoint: String,
     pub(super) deployment: String,
     pub(super) region: Region,
     pub(super) source_offset: u64,
     pub(super) destination: Arc<Mapped>,
+    pub(super) hold: Option<Hold>,
     pub(super) destination_offset: u64,
     pub(super) bytes: u64,
 }
+
+/// An exposure of another host a task READs, which it ends when it ends.
+pub(super) struct Lease {
+    endpoint: String,
+    exposure: u64,
+}
+
+/// A task's pieces from other hosts, each on its lane, and the exposures
+/// it ends when it ends.
+pub(super) struct Sources {
+    pub(super) pieces: Vec<(LaneKey, Piece)>,
+    pub(super) leases: Vec<Lease>,
+}
+
+/// An allocation exposed to another host, with the hold on its GPU for
+/// device memory.
+pub(super) type Exposed = (Arc<Mapped>, Option<Hold>);
 
 impl Network {
     pub(super) fn new(library: Option<PathBuf>) -> Self {
@@ -124,15 +148,31 @@ impl Network {
     }
 
     /// The pieces of task `task`'s moves from other hosts, each on the lane
-    /// of its link from the source host's memory: every host exposes the
-    /// task's regions there in one request per deployment, and every
-    /// destination is registered with this agent, so a task whose sources
-    /// or destinations cannot be read or written fails before its first
-    /// READ. Blocks on the other hosts' answers.
-    pub(super) fn pieces(
+    /// of its link from the source host's memory, and the exposures the task
+    /// ends when it ends: every host exposes the task's regions there in one
+    /// request per deployment, and every destination is registered with this
+    /// agent, so a task whose sources or destinations cannot be read or
+    /// written fails before its first READ, ending the exposures it got.
+    /// Blocks on the other hosts' answers and on the destinations' GPU
+    /// contexts.
+    pub(super) fn pieces(&self, task: u64, moves: Vec<Inbound>) -> Result<Sources, String> {
+        let mut leases = Vec::new();
+        let pieces = self.expose_moves(task, moves, &mut leases);
+        match pieces {
+            Ok(pieces) => Ok(Sources { pieces, leases }),
+            Err(message) => {
+                self.unexpose(leases);
+                Err(message)
+            }
+        }
+    }
+
+    /// [`Network::pieces`], adding each exposure it gets to `leases`.
+    fn expose_moves(
         &self,
         task: u64,
         moves: Vec<Inbound>,
+        leases: &mut Vec<Lease>,
     ) -> Result<Vec<(LaneKey, Piece)>, String> {
         let mut wanted: HashMap<(String, String), Vec<Region>> = HashMap::new();
         for copy in &moves {
@@ -146,7 +186,11 @@ impl Network {
 
         let mut sources: HashMap<(String, String, Region), Arc<Source>> = HashMap::new();
         for ((endpoint, deployment), regions) in wanted {
-            let (peer, ranges) = self.expose(&endpoint, &deployment, regions.clone())?;
+            let (peer, exposure, ranges) = self.expose(&endpoint, &deployment, regions.clone())?;
+            leases.push(Lease {
+                endpoint: endpoint.clone(),
+                exposure,
+            });
             if ranges.len() != regions.len() {
                 return Err(format!(
                     "{endpoint} exposed {} of {} regions",
@@ -193,7 +237,10 @@ impl Network {
                     copy.bytes, copy.source_offset, source.region.len, source.endpoint
                 ));
             }
-            copy.destination.nixl_region(agent)?;
+            match &copy.hold {
+                Some(hold) => hold.session()?.nixl_region(agent, &copy.destination)?,
+                None => copy.destination.nixl_host_region(agent)?,
+            };
             let link = Link {
                 source: source.memory.clone(),
                 destination: copy.destination.memory.clone(),
@@ -207,7 +254,10 @@ impl Network {
                     task,
                     source: End::Remote(Arc::clone(source)),
                     source_offset: copy.source_offset,
-                    destination: End::Given(copy.destination),
+                    destination: End::Given {
+                        mapped: copy.destination,
+                        hold: copy.hold,
+                    },
                     destination_offset: copy.destination_offset,
                     bytes: copy.bytes,
                 },
@@ -216,28 +266,51 @@ impl Network {
         Ok(pieces)
     }
 
-    /// Have the Storage Server at `endpoint` expose `regions` of
-    /// `deployment`, and load the metadata of the agent that registered
-    /// them: returns that agent's name and each region's range.
-    fn expose(
-        &self,
-        endpoint: &str,
-        deployment: &str,
-        regions: Vec<Region>,
-    ) -> Result<(String, Vec<Registered>), String> {
-        let host = Arc::clone(
+    /// End `leases`, the exposures of other hosts a task READ from. A host
+    /// that cannot be reached ended them already: its server ends a peer's
+    /// exposures when the peer's connection closes.
+    pub(super) fn unexpose(&self, leases: Vec<Lease>) {
+        for lease in leases {
+            let host = self.host(&lease.endpoint);
+            let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(client) = &mut host.client else {
+                continue;
+            };
+            if let Err(error) = client.unexpose(lease.exposure) {
+                tracing::warn!(%error, endpoint = lease.endpoint, "ending an exposure failed");
+                host.client = None;
+            }
+        }
+    }
+
+    /// The host whose Storage Server listens at `endpoint`.
+    fn host(&self, endpoint: &str) -> Arc<Mutex<Host>> {
+        Arc::clone(
             self.hosts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .entry(endpoint.to_owned())
                 .or_default(),
-        );
+        )
+    }
+
+    /// Have the Storage Server at `endpoint` expose `regions` of
+    /// `deployment`, and load the metadata of the agent that registered
+    /// them: returns that agent's name, the exposure and each region's
+    /// range.
+    fn expose(
+        &self,
+        endpoint: &str,
+        deployment: &str,
+        regions: Vec<Region>,
+    ) -> Result<(String, u64, Vec<Registered>), String> {
+        let host = self.host(endpoint);
         let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
-        let (metadata, ranges) = host
-            .expose(endpoint, deployment, regions)
-            .map_err(|error| {
-                format!("{endpoint} did not expose the regions of {deployment}: {error}")
-            })?;
+        let (exposure, metadata, ranges) =
+            host.expose(endpoint, deployment, regions)
+                .map_err(|error| {
+                    format!("{endpoint} did not expose the regions of {deployment}: {error}")
+                })?;
 
         let agent = self.agent()?;
         let peer = agent.load_peer(&metadata).map_err(|error| {
@@ -252,7 +325,7 @@ impl Network {
                 tracing::warn!(%error, peer = previous, "forgetting an ended NIXL agent failed");
             }
         }
-        Ok((peer, ranges))
+        Ok((peer, exposure, ranges))
     }
 }
 
@@ -265,7 +338,7 @@ impl Host {
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> storage::Result<(Vec<u8>, Vec<Registered>)> {
+    ) -> storage::Result<(u64, Vec<u8>, Vec<Registered>)> {
         let mut retry = self.client.is_some();
         loop {
             let client = match &mut self.client {
@@ -290,18 +363,22 @@ impl Host {
     }
 }
 
-/// Register `allocations` with `network`'s agent for other hosts' READs:
-/// each one's range, in order, and the agent's metadata taken after the
-/// registrations, which carries them.
+/// Register `allocations` with `network`'s agent for other hosts' READs,
+/// each with the hold on its GPU for device memory: each one's range, in
+/// order, and the agent's metadata taken after the registrations, which
+/// carries them.
 pub(super) fn register(
     network: &Network,
-    allocations: &[Arc<Mapped>],
+    allocations: &[Exposed],
 ) -> Result<(Vec<u8>, Vec<Registered>), String> {
     let agent = network.agent()?;
     let ranges = allocations
         .iter()
-        .map(|mapped| {
-            let region = mapped.nixl_region(agent)?;
+        .map(|(mapped, hold)| {
+            let region = match hold {
+                Some(hold) => hold.session()?.nixl_region(agent, mapped)?,
+                None => mapped.nixl_host_region(agent)?,
+            };
             Ok(Registered {
                 memory: mapped.memory.clone(),
                 key: region.key,

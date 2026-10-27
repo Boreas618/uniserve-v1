@@ -1,20 +1,24 @@
 //! The memory the Transfer Server copies between, mapped into its process.
 //!
 //! The server gives each allocation once, with its descriptor
-//! ([`Event::Allocation`](storage::protocol::Event::Allocation)), and the
-//! Transfer Server maps it at the first copy that needs it, then keeps the
-//! mapping until the server takes the allocation back and no copy holds it:
+//! ([`Event::Allocation`](storage::protocol::Event::Allocation)), and keeps
+//! it given until it takes the allocation back. What the Transfer Server
+//! maps of it depends on what reaches it:
 //!
-//! | Allocation | Mapping | For |
-//! | --- | --- | --- |
-//! | device storage | its CUDA VMM allocation imported on its GPU, every GPU that can address it granted access | copy engines |
-//! | host storage, page pool | the memfd mapped into the process | the CPU's copies |
-//! | the same | that mapping registered with CUDA (portable, so every context's copy engines reach it; for reads alone where the device supports it) | copy engines |
-//! | another host's device allocation | its fabric handle imported on the GPU that runs the copy | copy engines |
-//! | device or host allocation | the mapping above registered with this process's NIXL agent | READs from another host into it, and another host's READs of it |
+//! | Allocation | Mapping | For | Lives |
+//! | --- | --- | --- | --- |
+//! | host storage, page pool | the memfd mapped into the process | the CPU's copies | until the server takes it back and no copy holds it |
+//! | the same | that mapping registered with this process's NIXL agent | READs from another host into it, and another host's READs of it | the same |
+//! | device storage | its CUDA VMM allocation imported on its GPU, every GPU that can address it granted access | copy engines | while the GPU's context is held ([`super::contexts`]) |
+//! | the same | that mapping registered with the NIXL agent | READs, as above | the same |
+//! | host storage, page pool | a mapping of the GPU's own, registered in its context (for reads alone where the device supports it) | the GPU's copy engines | the same |
+//! | another host's device allocation | its fabric handle imported on the GPU that runs the copy | copy engines | the task |
 //!
-//! A mapping that fails stays failed for the allocation: the tasks that
-//! copy it fail, and the server's next allocation gives it afresh.
+//! What lives in a GPU's context belongs to that GPU's session, so that the
+//! context is released once no work needs it; a session drops what it made
+//! for an allocation once the allocation is taken back and no copy holds it
+//! ([`Mapped`]'s drop). A mapping that fails stays failed for the
+//! allocation, or for the session: the tasks that copy it fail.
 //! Read-only content (a storage of read-only tensors) is mapped read-only,
 //! a guard beside the server's check that no copy writes it; another host
 //! only READs what this host's agent registered.
@@ -22,12 +26,13 @@
 use std::ffi::c_void;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use cuda::{DeviceAttribute, DeviceId, HostRegistration, PeerMapping, Protection, ShareableHandle};
+use cuda::{DeviceId, PeerMapping, ShareableHandle};
 use storage::protocol::Memory;
 
+use super::contexts::Contexts;
 use super::devices::Gpus;
 
 /// A mapping made once, or why it could not be made.
@@ -37,8 +42,18 @@ type Made<T> = OnceLock<Result<T, String>>;
 /// keys are never reused while the process, and with it its agent, lives.
 static NIXL_KEYS: AtomicU64 = AtomicU64::new(1);
 
+/// A key for a new NIXL registration.
+pub(super) fn nixl_key() -> u64 {
+    NIXL_KEYS.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The id of the next allocation given, by which sessions keep what they
+/// made for it.
+static IDS: AtomicU64 = AtomicU64::new(1);
+
 /// One allocation the server gave.
 pub(super) struct Mapped {
+    id: u64,
     pub(super) memory: Memory,
     pub(super) bytes: u64,
     writable: bool,
@@ -46,19 +61,16 @@ pub(super) struct Mapped {
     /// every GPU that can address it; `None` when this process does not
     /// see the GPU.
     device: Option<(DeviceId, Vec<DeviceId>)>,
-    /// The allocation's registration with the process's NIXL agent, made
+    /// The sessions that may hold what they made for the allocation.
+    contexts: Arc<Contexts>,
+    /// A host allocation's registration with the process's NIXL agent, made
     /// at its first READ or exposure. It is undone before the mapping it
     /// registers is unmapped: fields drop in declaration order.
     nixl: Made<nixl::Registration>,
-    /// The device allocation's mapping.
-    mapping: Made<PeerMapping>,
-    // A registration is undone before its range is unmapped: fields drop
-    // in declaration order.
-    registration: Made<HostRegistration>,
     host: Made<HostMap>,
     /// The allocation's POSIX handle or memfd. Declared last: every
-    /// mapping above holds its own reference, so the descriptor only
-    /// needs to outlive their creation.
+    /// mapping holds its own reference, so the descriptor only needs to
+    /// outlive their creation.
     descriptor: OwnedFd,
 }
 
@@ -69,6 +81,7 @@ impl Mapped {
         writable: bool,
         descriptor: OwnedFd,
         gpus: &Gpus,
+        contexts: Arc<Contexts>,
     ) -> Self {
         let device = match &memory {
             Memory::Device { gpu } => gpus
@@ -77,16 +90,28 @@ impl Mapped {
             Memory::Host | Memory::Remote { .. } => None,
         };
         Self {
+            id: IDS.fetch_add(1, Ordering::Relaxed),
             memory,
             bytes,
             writable,
             device,
+            contexts,
             nixl: OnceLock::new(),
-            mapping: OnceLock::new(),
-            registration: OnceLock::new(),
             host: OnceLock::new(),
             descriptor,
         }
+    }
+
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(super) fn writable(&self) -> bool {
+        self.writable
+    }
+
+    pub(super) fn descriptor(&self) -> &OwnedFd {
+        &self.descriptor
     }
 
     /// The device this device allocation lies on; an error names a GPU this
@@ -105,43 +130,21 @@ impl Mapped {
         }
     }
 
-    /// Whether `reader`'s copy engines can address this device allocation.
-    pub(super) fn readable_by(&self, reader: DeviceId) -> bool {
+    /// The GPUs whose copy engines can address this device allocation,
+    /// its own first.
+    pub(super) fn readers(&self) -> &[DeviceId] {
         self.device
             .as_ref()
-            .is_some_and(|(_, readers)| readers.contains(&reader))
+            .map_or(&[], |(_, readers)| readers.as_slice())
     }
 
-    /// The device address of byte 0 of a device allocation.
-    pub(super) fn device_address(&self) -> Result<u64, String> {
-        let mapping = self.mapping.get_or_init(|| {
-            let device = self.device()?;
-            let readers = self
-                .device
-                .as_ref()
-                .map(|(_, readers)| readers.clone())
-                .unwrap_or_default();
-            let protection = if self.writable {
-                Protection::ReadWrite
-            } else {
-                Protection::ReadOnly
-            };
-            PeerMapping::import_retained(
-                device,
-                &self.descriptor,
-                self.length()?,
-                &readers,
-                protection,
-            )
-            .map_err(|error| format!("mapping a device allocation: {error}"))
-        });
-        mapping
-            .as_ref()
-            .map(PeerMapping::address)
-            .map_err(Clone::clone)
+    /// Whether `reader`'s copy engines can address this device allocation.
+    pub(super) fn readable_by(&self, reader: DeviceId) -> bool {
+        self.readers().contains(&reader)
     }
 
-    /// The address of byte 0 of a host allocation in this process.
+    /// The address of byte 0 of a host allocation in this process, for the
+    /// CPU's copies and NIXL.
     pub(super) fn host_address(&self) -> Result<u64, String> {
         let host = self.host.get_or_init(|| {
             HostMap::new(&self.descriptor, self.length()?, self.writable)
@@ -150,73 +153,28 @@ impl Mapped {
         host.as_ref().map(HostMap::address).map_err(Clone::clone)
     }
 
-    /// The address of byte 0 of a host allocation, registered so that copy
-    /// engines reach it; the first registration is made in `device`'s
-    /// context, and is portable to every other.
-    ///
-    /// A read-only allocation registers for reads alone where the device
-    /// supports it. A device that does not (GB200 reports
-    /// `ReadOnlyHostRegisterSupported` 0 and refuses the flag) registers its
-    /// read-only mapping as a plain registration. Either way the Transfer
-    /// Server only reads a read-only allocation: the server refuses it as a
-    /// destination.
-    pub(super) fn registered_address(&self, device: DeviceId) -> Result<u64, String> {
-        let address = self.host_address()?;
-        let length = self.length()?;
-        let registration = self.registration.get_or_init(|| {
-            let pointer = address as *mut u8;
-            let reads_alone = !self.writable
-                && device
-                    .attribute(DeviceAttribute::ReadOnlyHostRegisterSupported)
-                    .is_ok_and(|supported| supported != 0);
-            // SAFETY: `host` maps the whole range for as long as this
-            // allocation lives, and `registration` drops before it.
-            let registered = unsafe {
-                if reads_alone {
-                    HostRegistration::read_only(device, pointer, length)
-                } else {
-                    HostRegistration::new(device, pointer, length)
-                }
-            };
-            registered.map_err(|error| format!("registering host memory: {error}"))
-        });
-        registration.as_ref().map(|_| address).map_err(Clone::clone)
-    }
-
-    /// The whole allocation as NIXL names it, registered with `agent` at the
-    /// first call: the range this agent's READs write into, or another
-    /// host's READs read. The process has one agent, which every call names.
-    ///
-    /// A device allocation registers its device mapping, host memory its
-    /// host mapping, each under a key no other registration of the process
-    /// takes: an allocation the server gives later may be mapped at the
-    /// address of one it took back, whose registration a peer still knows.
-    /// A read-only mapping registers as one: another host only READs it.
-    pub(super) fn nixl_region(&self, agent: &nixl::Agent) -> Result<nixl::Region, String> {
+    /// A host allocation as NIXL names it, registered with `agent` at the
+    /// first call under a key of its own: the range this agent's READs write
+    /// into, or another host's READs read. The process has one agent, which
+    /// every call names. Registering host memory takes no CUDA context, so
+    /// it lasts as long as the allocation; a device allocation registers in
+    /// its GPU's session instead
+    /// ([`Session::nixl_region`](super::contexts::Session::nixl_region)).
+    pub(super) fn nixl_host_region(&self, agent: &nixl::Agent) -> Result<nixl::Region, String> {
+        if self.memory != Memory::Host {
+            return Err("a device allocation registers in its GPU's session".into());
+        }
         let registration = self.nixl.get_or_init(|| {
-            let len = self.length()?;
-            let key = NIXL_KEYS.fetch_add(1, Ordering::Relaxed);
-            let region = match self.memory {
-                Memory::Device { .. } => nixl::Region {
-                    memory: nixl::Memory::Device,
-                    address: self.device_address()?,
-                    len,
-                    key,
-                },
-                Memory::Host => nixl::Region {
-                    memory: nixl::Memory::Host,
-                    address: self.host_address()?,
-                    len,
-                    key,
-                },
-                Memory::Remote { .. } => {
-                    return Err("the server gives allocations of this host only".into());
-                }
+            let region = nixl::Region {
+                memory: nixl::Memory::Host,
+                address: self.host_address()?,
+                len: self.length()?,
+                key: nixl_key(),
             };
-            // SAFETY: the mapping the region lies in is a field declared
-            // after `nixl`, so it stays mapped until the registration
-            // dropped; the Transfer Server holds no Rust reference to the
-            // bytes, which its copies reach through raw addresses only.
+            // SAFETY: the host mapping is a field declared after `nixl`, so
+            // it stays mapped until the registration dropped; the Transfer
+            // Server holds no Rust reference to the bytes, which its copies
+            // reach through raw addresses only.
             unsafe { agent.register(region) }
                 .map_err(|error| format!("registering memory with NIXL: {error}"))
         });
@@ -226,8 +184,17 @@ impl Mapped {
             .map_err(Clone::clone)
     }
 
-    fn length(&self) -> Result<usize, String> {
+    pub(super) fn length(&self) -> Result<usize, String> {
         usize::try_from(self.bytes).map_err(|_| "the allocation exceeds the address space".into())
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // The server took the allocation back and no copy holds it: the
+        // sessions drop its mappings and registrations, which hold its
+        // physical memory.
+        self.contexts.forget(self.id);
     }
 }
 
