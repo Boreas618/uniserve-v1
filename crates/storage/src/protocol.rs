@@ -29,6 +29,20 @@
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean.
 //!
+//! The server keeps one memory ledger per GPU for each deployment that uses
+//! it ([`GpuLedger`]), so that the two worlds of a deployment and the host's
+//! Transfer Server stay within one quota on a GPU they share, rather than
+//! each sizing itself against what its own process holds. The quota is
+//! `⌊total × fraction⌋` of the whole GPU for the fraction the deployment's
+//! workers configure (`mem_fraction_static`). The ledger books what the
+//! server derives from the storages it retains (the weights, each KV cache
+//! segment, the other exclusive storages), each storage once whatever
+//! number of worlds map it, the Transfer Server's CUDA context as it
+//! measured it, and what the processes book themselves ([`Request::Book`]):
+//! a worker's graph pool, process memory and staging, and the Transfer
+//! Server's staging. The server refuses a booking or a new device storage
+//! that would take a ledger past its quota.
+//!
 //! Besides tensors, the server keeps host page pools (L2): one memfd of
 //! equal slots per deployment, NUMA node and [`PageShape`], shared by the
 //! deployment's workers whose pages have that shape, of the size the
@@ -68,15 +82,18 @@ use serde::{Deserialize, Serialize};
 /// events, and the listing's `transfer`); 8 adds transfers from other hosts
 /// (the remote region, allocation and link end, another host's Transfer
 /// Server's role and its exposures, and the registrations of the Transfer
-/// Server's NIXL agent).
-pub const VERSION: u32 = 8;
+/// Server's NIXL agent); 9 adds the GPUs' memory ledgers (`Book`, `Ledger`,
+/// a storage's KV cache `segment`, the listing's `ledgers`) and a world kept
+/// as its weights (`KeepWeights`).
+pub const VERSION: u32 = 9;
 
 /// The earliest client version the server serves: a client of version 4
 /// knows no worlds, and its requests act on world 0; a client of version 4
 /// or 5 states no world as a head, which reads and publishes world 0's
 /// pages; a client before version 7 makes no transfer request and reads no
 /// transfer event; a client before version 8 names no memory of another
-/// host.
+/// host; a client before version 9 books nothing in the ledgers and marks
+/// no storage as a KV cache segment.
 pub const MIN_VERSION: u32 = 4;
 
 /// A content address: the 32-byte digest of everything that determines a
@@ -159,7 +176,9 @@ pub enum Role {
     /// The Mooncake connector the server runs.
     Connector,
     /// The Transfer Server the server runs, which copies bytes between the
-    /// memory the server holds.
+    /// memory the server holds. Every ledger of a GPU it uses books its CUDA
+    /// context there, as it measured it ([`Request::Measured`]), and any
+    /// staging it books ([`Request::Book`]).
     Transfer,
     /// Another host's Transfer Server, which READs memory of this host
     /// through NIXL for the tasks of its own host: it asks the server to
@@ -210,6 +229,199 @@ pub struct StorageRecord {
     /// The allocation's size, a multiple of the device's allocation
     /// granularity for device memory.
     pub bytes: u64,
+    /// The KV cache segment the storage is part of, which its GPU's ledger
+    /// books as that segment ([`Item::CacheSegment`]); `None` for any other
+    /// storage, and for every storage of a client of protocol 5.
+    #[serde(default)]
+    pub segment: Option<Segment>,
+}
+
+/// One segment of a KV cache's value planes: the world that created its
+/// memory and its ordinal there. A segment is one storage per layer and
+/// plane, which a ledger books together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Segment {
+    pub world: u64,
+    pub ordinal: u32,
+}
+
+/// What one entry of a GPU's memory ledger is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Item {
+    /// Read-only device storages the server retains: a world's weights.
+    Weights,
+    /// The device storages of one KV cache segment.
+    CacheSegment,
+    /// Exclusive device storages the server retains beside the KV cache's
+    /// value planes: the cache's flags and scales, the buffer pool, the
+    /// latent banks.
+    Exclusive,
+    /// A worker's CUDA graph memory pool: the memory its captured graphs
+    /// address. Booked by the worker.
+    GraphPool,
+    /// What a worker process holds on the device beside the storages the
+    /// server retains and its graph pool: its CUDA context, communicator
+    /// buffers, PyTorch's allocations, Rust's arenas and tables, and the
+    /// product storage it has yet to make resident. Booked by the worker.
+    Process,
+    /// Device memory a process holds to stage transfers. Booked by the
+    /// process.
+    Staging,
+    /// The device memory of the Transfer Server's CUDA context, as it
+    /// measured it when it started ([`Request::Measured`]).
+    TransferContext,
+}
+
+impl Item {
+    /// Whether a process books the item itself ([`Request::Book`]), rather
+    /// than the server deriving it from the storages it retains or from
+    /// what its Transfer Server measured.
+    pub fn booked(self) -> bool {
+        matches!(self, Self::GraphPool | Self::Process | Self::Staging)
+    }
+
+    /// The item's name, as listings print it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Weights => "weights",
+            Self::CacheSegment => "cache_segment",
+            Self::Exclusive => "exclusive",
+            Self::GraphPool => "graph_pool",
+            Self::Process => "process",
+            Self::Staging => "staging",
+            Self::TransferContext => "transfer_context",
+        }
+    }
+}
+
+/// One deployment's memory ledger of one GPU: everything the deployment's
+/// worlds hold on it, and the Transfer Server's items there, beside which
+/// every deployment that uses the GPU holds its memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuLedger {
+    /// The GPU's UUID.
+    pub gpu: [u8; 16],
+    /// The deployment; empty for a GPU only the Transfer Server books.
+    pub deployment: String,
+    /// The GPU's total memory, as the processes that use it state it; 0
+    /// until one does.
+    pub total: u64,
+    /// `⌊total × fraction⌋` for the smallest fraction a world of the
+    /// deployment states for the GPU; `None` until one states one.
+    pub quota: Option<u64>,
+    pub entries: Vec<LedgerEntry>,
+}
+
+/// One entry of a [`GpuLedger`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub item: Item,
+    /// The worker scope that holds it; `None` for the Transfer Server's
+    /// items and for storages several scopes hold.
+    pub scope: Option<Scope>,
+    /// The worlds that hold it: one for a world's own, two for the storages
+    /// a successor world maps of its predecessor, which are booked once;
+    /// none for the Transfer Server's items.
+    pub worlds: Vec<u64>,
+    /// The segment of an [`Item::CacheSegment`].
+    pub segment: Option<Segment>,
+    pub bytes: u64,
+}
+
+impl GpuLedger {
+    /// The bytes every entry books.
+    pub fn used(&self) -> u64 {
+        self.bytes(|_| true)
+    }
+
+    /// The bytes of the entries `select` picks.
+    pub fn bytes(&self, select: impl Fn(&LedgerEntry) -> bool) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| select(entry))
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
+    /// Every entry, one per line, for a refusal or a log.
+    pub fn describe(&self) -> String {
+        let quota = self.quota.map_or_else(
+            || "no quota".to_owned(),
+            |quota| format!("a quota of {quota}"),
+        );
+        let holder = if self.deployment.is_empty() {
+            "the Transfer Server"
+        } else {
+            self.deployment.as_str()
+        };
+        let mut lines = vec![format!(
+            "GPU {} of {holder}: {} bytes booked of {quota}",
+            gpu_name(&self.gpu),
+            self.used(),
+        )];
+        for entry in &self.entries {
+            lines.push(format!("  {}", entry.describe()));
+        }
+        lines.join("\n")
+    }
+}
+
+impl LedgerEntry {
+    /// The entry on one line: its item, holder and bytes.
+    pub fn describe(&self) -> String {
+        let worlds: Vec<String> = self.worlds.iter().map(u64::to_string).collect();
+        let holder = match (&self.scope, worlds.is_empty()) {
+            (None, true) => "the Transfer Server".to_owned(),
+            (Some(scope), _) => format!("{scope} of world {}", worlds.join(" and ")),
+            (None, false) => format!("world {}", worlds.join(" and ")),
+        };
+        let segment = self
+            .segment
+            .map(|segment| format!(" {}/{}", segment.world, segment.ordinal))
+            .unwrap_or_default();
+        format!(
+            "{}{segment} of {holder}: {} bytes",
+            self.item.name(),
+            self.bytes
+        )
+    }
+}
+
+/// A GPU's UUID as `nvidia-smi` prints it: `GPU-` and its bytes in groups
+/// of 8, 4, 4, 4 and 12 hexadecimal digits.
+pub fn gpu_name(gpu: &[u8; 16]) -> String {
+    let hex: String = gpu.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// What a host's Storage Server admits of new host memory (page pools,
+/// staging, weights moved to the host): the host's available memory less
+/// the server's reserve and what its page pools have yet to allocate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMemory {
+    /// The host's `MemAvailable`.
+    pub available: u64,
+    /// What the server leaves to the host's other processes.
+    pub reserve: u64,
+    /// What the page pools have yet to allocate.
+    pub pools_unallocated: u64,
+}
+
+impl HostMemory {
+    /// The bytes of new host memory the server admits now.
+    pub fn room(&self) -> u64 {
+        self.available
+            .saturating_sub(self.reserve)
+            .saturating_sub(self.pools_unallocated)
+    }
 }
 
 /// How a tensor may be accessed.
@@ -563,6 +775,15 @@ pub enum Request {
     /// Release every tensor the caller's scope retains in the caller's world
     /// that `keys` does not list.
     Retain { keys: Vec<Key> },
+    /// Every world of `worlds` of the head's deployment keeps its weights
+    /// alone on the host: its retention of every exclusive tensor ends (its
+    /// KV cache segments, cache flags and scales, buffer pool, latent
+    /// banks), and an exclusive tensor no other world retains is released,
+    /// so that the GPU's ledger books it no more. A previous world kept as
+    /// its weights for a rollback, whose processes exited, keeps no more;
+    /// the segments its successor maps stay the successor's. Answered with
+    /// `Retained`.
+    KeepWeights { worlds: Vec<u64> },
     /// The tensors of `keys` that exist, with their storages' descriptors,
     /// and the keys that do not.
     Get { keys: Vec<Key>, mode: Mode },
@@ -670,6 +891,31 @@ pub enum Request {
     /// [`Event::Upload`] or [`Event::Download`]: one result per page of the
     /// task.
     Finished { task: u64, results: Vec<bool> },
+    /// Book the caller's own items on GPU `gpu` (of total memory `total`):
+    /// each item of `items` takes its bytes, 0 ending it; an item left out
+    /// keeps its booking. A worker books [`Item::GraphPool`],
+    /// [`Item::Process`] and [`Item::Staging`] in its deployment's ledger
+    /// under its scope and world, and states `quota`, `⌊total × fraction⌋`
+    /// for its configured fraction. The processes of one scope and world (a
+    /// rank, and the relaunch or standby that replaces it) serve in turn, so
+    /// the larger of their bookings of an item counts. The Transfer Server
+    /// books [`Item::Staging`] in every ledger of the GPU, stating no quota
+    /// (its context is booked as it measured it, [`Request::Measured`]). A
+    /// booking ends with the connection of the process that made it, as that
+    /// process's memory ends with it. Refused, booking nothing, when it
+    /// would take a ledger past its quota; answered with the ledgers of the
+    /// GPU the caller books in.
+    Book {
+        gpu: [u8; 16],
+        total: u64,
+        quota: Option<u64>,
+        items: Vec<(Item, u64)>,
+    },
+    /// The ledgers of `gpus` (of every GPU when empty) and what the host
+    /// admits of new host memory: of the caller's deployment for a worker
+    /// and a head, of every deployment for the Transfer Server and an
+    /// operator.
+    Ledger { gpus: Vec<[u8; 16]> },
     /// From a head or a worker: copy `spans` as one task of `update`, which
     /// takes its turn at `priority` on every link it uses. Answered with the
     /// task's number at once; [`Event::TransferProgress`] follows as it
@@ -763,6 +1009,9 @@ pub enum ErrorKind {
     /// No Transfer Server is connected: it has not started yet, or it
     /// ended and the server starts it again.
     Unavailable,
+    /// A booking or a new device storage would take a GPU's ledger past
+    /// its quota.
+    Quota,
 }
 
 /// The server's answer to one request.
@@ -825,6 +1074,12 @@ pub enum Reply {
         tokens: u64,
     },
     Finished,
+    /// The ledgers a `Book` or a `Ledger` names, and what the host admits
+    /// of new host memory.
+    Ledger {
+        ledgers: Vec<GpuLedger>,
+        host: HostMemory,
+    },
     /// The task a [`Request::Transfer`] submitted.
     Transferring {
         task: u64,
@@ -870,6 +1125,9 @@ pub struct Listing {
     /// The Transfer Server, while it is connected.
     #[serde(default)]
     pub transfer: Option<ListedTransfer>,
+    /// Every deployment's ledger of every GPU the server books.
+    #[serde(default)]
+    pub ledgers: Vec<GpuLedger>,
 }
 
 /// The Transfer Server in a [`Listing`].

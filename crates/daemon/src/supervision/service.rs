@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, Node, Reply, Request,
-    Spawned, Stopped, ToMember, Upstream, Welcome, downstream, event, from_member, hello, reply,
-    request, to_member, upstream,
+    Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node, Reply,
+    Request, Spawned, Stopped, ToMember, Upstream, WeightsKept, Welcome, downstream, event,
+    from_member, hello, reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
@@ -149,6 +149,18 @@ impl Local {
             }
             Some(request::Kind::Claim(claim)) => match self.claims.claim(claim) {
                 Ok(claimed) => reply.kind = Some(reply::Kind::Claimed(claimed)),
+                Err(error) => reply.error = format!("{error:#}"),
+            },
+            Some(request::Kind::KeepWeights(keep)) => {
+                match self.claims.keep_weights(&keep.deployment, &keep.worlds) {
+                    Ok(released) => {
+                        reply.kind = Some(reply::Kind::WeightsKept(WeightsKept { released }));
+                    }
+                    Err(error) => reply.error = format!("{error:#}"),
+                }
+            }
+            Some(request::Kind::Ledger(query)) => match self.claims.ledger(&query.deployment) {
+                Ok(ledgers) => reply.kind = Some(reply::Kind::Ledger(LedgerReport { ledgers })),
                 Err(error) => reply.error = format!("{error:#}"),
             },
             None => reply.error = "an empty request".to_owned(),
@@ -450,6 +462,8 @@ fn route(
         Some(request::Kind::Spawn(spawn)) => Some(spawn.host.as_str()),
         Some(request::Kind::Reserve(reserve)) => Some(reserve.host.as_str()),
         Some(request::Kind::Claim(claim)) => Some(claim.host.as_str()),
+        Some(request::Kind::Ledger(query)) => Some(query.host.as_str()),
+        Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
         Some(request::Kind::Stop(_)) | None => None,
     };
     let forward = |member: &mut Membership| {

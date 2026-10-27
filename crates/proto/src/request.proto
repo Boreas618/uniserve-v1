@@ -252,7 +252,16 @@ message EngineCommand {
     // workers take the predecessor's memory they mapped read-only, and a
     // lost worker group is relaunched from then on; answered with `Hooked`.
     Commit commit = 12;
+    // Read the memory ledgers every node's Storage Server keeps for the
+    // deployment, each node's daemon over its claim, without asking a
+    // worker; answered with `Hooked`, one JSON result per node.
+    DescribeMemory describe_memory = 14;
   }
+}
+
+message DescribeMemory {
+  // Matches the `Hooked` answer.
+  uint64 id = 1;
 }
 
 // A worker hook (`uniserve.hooks`), which a plugin implements.
@@ -315,6 +324,10 @@ message ResizeCache {
   // For a shrink: how long the requests that hold the tail may run on
   // before they are recomputed; absent to let them run to their end.
   optional uint64 preempt_after_ms = 3;
+  // Before the change: worlds of the deployment that keep their weights
+  // alone on every node (a previous world kept as its weights, whose
+  // processes exited), so that a growth takes the rest of their memory.
+  repeated uint64 keep_weights = 4;
 }
 
 enum CacheChange {
@@ -330,10 +343,14 @@ enum CacheChange {
   CACHE_CHANGE_SLEEP = 2;
   // Restore what a sleep gave back.
   CACHE_CHANGE_WAKE = 3;
-  // Create as many of the segments given back as each device's free memory
-  // holds: a successor world's cache grows as its predecessor's memory
-  // frees.
+  // Create as many of the segments given back as each device's memory
+  // ledger has room for: a successor world's cache grows as its
+  // predecessor's memory frees.
   CACHE_CHANGE_GROW = 4;
+  // Change nothing: answer, for each device, with the memory the serving
+  // world and a world succeeding it hold there and the KV cache limit that
+  // leaves the serving world, or fail with why such a world does not fit.
+  CACHE_CHANGE_PLAN = 5;
 }
 
 // Where the daemon an engine attaches to listens.

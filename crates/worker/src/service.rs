@@ -110,6 +110,10 @@ pub(crate) struct Maintenance {
     /// The rank's CUDA devices, whose contexts the rank probes while jobs
     /// are in flight (`Service::watch_jobs`).
     pub(crate) devices: Vec<cuda::DeviceId>,
+    /// What the warm rank books in each device's ledger: a promoted standby
+    /// books it, a sleep books its graph pools released and a wake books
+    /// them again.
+    pub(crate) bookings: Vec<crate::capacity::device::DeviceBooking>,
     /// What mapping the rank's host page pools needs, which
     /// `uniserve.host_cache` takes; `None` for a rank that copies no page
     /// through the host KV cache, and once mapped.
@@ -388,7 +392,12 @@ impl<'a> Service<'a> {
             }
             WorkerRequest::Promote { message_id } => {
                 let promoted = match self.standby.take() {
-                    Some(parked) => parked.promote(self.executor),
+                    // The promoted standby replaces the rank it stood by
+                    // for: it books its memory in the ledgers now, which the
+                    // larger of its scope's processes' bookings counts.
+                    Some(parked) => parked
+                        .promote(self.executor)
+                        .and_then(|()| self.book_memory(true).map_err(WorkerError::from)),
                     None => Err(WorkerError::from(Error::State(
                         "only a parked standby worker is promoted",
                     ))),
@@ -615,8 +624,10 @@ impl Service<'_> {
     /// runs no batch, and returns its JSON result:
     ///
     /// - `uniserve.cache_memory`: the cache planes' segments (count, units
-    ///   and bytes of each, the first given back) and the device's free
-    ///   memory and this process's, which a standby engine needs as much of;
+    ///   and bytes of each, the first given back), the head segment and
+    ///   graph share a successor world creates, the rank's scope, world and
+    ///   host, the deployment's ledger of the cache's GPU, what the host
+    ///   admits of new host memory, and the device's free memory;
     /// - `uniserve.release_cache` (`{"from": segment}`): gives back the
     ///   planes' segments from `segment` on, whose units the engine
     ///   withdrew;
@@ -657,25 +668,34 @@ impl Service<'_> {
         };
         let result = match name {
             "uniserve.cache_memory" => {
-                let device = planes.as_ref().and_then(|planes| planes.device());
-                // A successor world needs the graph share of the device
-                // (`park_memory`), the memory the process holds beside the
-                // shared weights and the cache, and the exclusive storages
-                // its world creates for itself beside its cache planes.
-                let (free, process, reserve) = match device {
+                // The cache's device; a rank without a cache (an expert
+                // worker) reports its primary device's memory.
+                let device = planes
+                    .as_ref()
+                    .and_then(|planes| planes.device())
+                    .or_else(|| self.maintenance.devices.first().copied());
+                // The device's free memory, which bounds what the cache
+                // creates, and the graph share a successor's warmup captures
+                // in (the share a serving worker's capacity plan keeps).
+                let (free, graph_share) = match device {
                     Some(device) => {
                         let memory = device.memory_info()?;
                         (
                             memory.free,
-                            cuda::Nvml::init()?.process_memory(device)?,
                             crate::cuda_graph::graph_storage_budget_bytes(memory.total as i64),
                         )
                     }
-                    None => (0, 0, 0),
+                    None => (0, 0),
                 };
-                let exclusive = match (retained.as_deref(), device) {
-                    (Some(retained), Some(device)) => retained.exclusive_bytes(device)?,
-                    _ => 0,
+                // The GPU's ledger, from which the engine computes what the
+                // cache may hold beside every world of the deployment, and
+                // what the host admits of new host memory.
+                let (ledger, host_memory) = match (retained.as_deref(), device) {
+                    (Some(retained), Some(device)) => {
+                        let (ledger, host) = retained.ledger(device)?;
+                        (Some(ledger), Some(host))
+                    }
+                    _ => (None, None),
                 };
                 let scratch = self
                     .executor
@@ -718,9 +738,12 @@ impl Service<'_> {
                     "capacity_units": capacity_units,
                     "scratch_units": scratch,
                     "free_bytes": free,
-                    "process_bytes": process,
-                    "reserve_bytes": reserve,
-                    "exclusive_bytes": exclusive,
+                    "graph_share_bytes": graph_share,
+                    "host": self.info.endpoint.host,
+                    "scope": retained.as_deref().map(|retained| retained.scope().clone()),
+                    "world": retained.as_deref().map(crate::memory::retained::Retained::world),
+                    "ledger": ledger,
+                    "host_memory": host_memory,
                 })
             }
             "uniserve.host_cache" => {
@@ -835,11 +858,16 @@ impl Service<'_> {
                 {
                     planes.release_segments(0, memory)?;
                 }
+                // The ledgers no longer book the released graph memory.
+                self.book_memory(false)?;
                 tracing::info!("the worker sleeps: its graph memory and cache are released");
                 serde_json::Value::Null
             }
             "uniserve.wake" => {
                 if self.maintenance.asleep {
+                    // The graph memory is booked again before it and the
+                    // cache are restored, refused past the quota.
+                    self.book_memory(true)?;
                     for pool in &self.maintenance.pools {
                         pool.restore()?;
                     }
@@ -899,6 +927,19 @@ impl Service<'_> {
 }
 
 impl Service<'_> {
+    /// Books the warm rank's memory in each device's ledger, its graph
+    /// pools while `graphs` are resident; a rank whose memory the server
+    /// does not keep (`LocalMemory`) books none.
+    fn book_memory(&self, graphs: bool) -> crate::Result<()> {
+        let Some(retained) = self.maintenance.retained.as_deref() else {
+            return Ok(());
+        };
+        for booking in &self.maintenance.bookings {
+            booking.submit(retained, graphs)?;
+        }
+        Ok(())
+    }
+
     /// Makes the device memory beside the KV cache hold a checkpoint of the
     /// rank's weights, which an update keeping the requests in flight loads
     /// into new memory before it copies each tensor into place: the graph
@@ -1121,6 +1162,7 @@ mod tests {
                 max_total_tokens: None,
                 request_slots: 0,
                 devices: Vec::new(),
+                bookings: Vec::new(),
                 host_cache: None,
             },
         )

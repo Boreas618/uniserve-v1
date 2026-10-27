@@ -152,6 +152,51 @@ impl Claims {
         Ok(())
     }
 
+    /// Keeps the weights alone of every world of `worlds` on each node of
+    /// the engine's: a previous world kept as its weights, whose processes
+    /// exited, keeps nothing else, so each GPU's ledger leaves the rest to
+    /// this world.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon or Storage Server refuses.
+    pub(crate) fn keep_weights(&self, worlds: &[u64]) -> anyhow::Result<()> {
+        if worlds.is_empty() {
+            return Ok(());
+        }
+        for host in self.scopes.keys() {
+            crate::worker::processes::lock(&self.processes)?.keep_weights(
+                host,
+                &self.deployment,
+                worlds,
+            )?;
+        }
+        tracing::info!(
+            deployment = %self.deployment,
+            ?worlds,
+            "worlds keep their weights alone on every node of the engine"
+        );
+        Ok(())
+    }
+
+    /// The memory ledgers of every node of the engine's: for each host, the
+    /// JSON of its Storage Server's ledgers of the deployment and what it
+    /// admits of new host memory, read by the node's daemon over its claim
+    /// (no worker is asked, so serving goes on).
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot read them.
+    pub(crate) fn ledgers(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut ledgers = Vec::with_capacity(self.scopes.len());
+        for host in self.scopes.keys() {
+            let ledger =
+                crate::worker::processes::lock(&self.processes)?.ledger(host, &self.deployment)?;
+            ledgers.push((host.clone(), ledger));
+        }
+        Ok(ledgers)
+    }
+
     /// The storage launch of the workers on `host`.
     pub(crate) fn launch(&self, host: &str) -> anyhow::Result<StorageLaunch> {
         self.launches

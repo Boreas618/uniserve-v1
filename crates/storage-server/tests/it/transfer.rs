@@ -617,7 +617,62 @@ pub(crate) mod device {
                 gpu: device.uuid().unwrap().0,
             },
             bytes: bytes as u64,
+            segment: None,
         }
+    }
+
+    /// The Transfer Server's CUDA context on a GPU, as it measured it, is
+    /// booked in every deployment's ledger of that GPU, beside what the
+    /// deployment's worlds hold within their quota; a worker's grant on the
+    /// GPU is what is left.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn the_transfer_servers_context_is_in_every_ledger_of_its_gpu() {
+        let server = serving(Gpus::Visible);
+        let gpu = DeviceId(0).uuid().unwrap().0;
+        let mut operator =
+            storage::Client::connect(&server.socket, storage::Role::Operator).unwrap();
+        let context = operator
+            .list()
+            .unwrap()
+            .transfer
+            .and_then(|transfer| {
+                transfer
+                    .contexts
+                    .iter()
+                    .find(|context| context.gpu == gpu)
+                    .map(|context| context.bytes)
+            })
+            .expect("the Transfer Server measured its context on the GPU");
+        assert!(context > 0);
+
+        let mut head = head(&server.socket);
+        let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+        let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+        let total = 1 << 40;
+        let ledger = worker
+            .book(
+                gpu,
+                total,
+                Some(total / 2),
+                vec![(storage::Item::Process, 1000)],
+            )
+            .unwrap()
+            .remove(0);
+        let booked = ledger
+            .entries
+            .iter()
+            .find(|entry| entry.item == storage::Item::TransferContext)
+            .expect("the ledger books the Transfer Server's context");
+        assert_eq!(
+            (
+                booked.scope.as_ref(),
+                booked.worlds.as_slice(),
+                booked.bytes
+            ),
+            (None, &[][..], context)
+        );
+        assert_eq!(ledger.used(), context + 1000);
     }
 
     #[test]

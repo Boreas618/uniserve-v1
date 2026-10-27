@@ -1091,6 +1091,23 @@ impl SchedulerHandle {
         self.commands.retire(worlds)
     }
 
+    /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
+    /// workers, which the deployment's claims cover; the receiver gets
+    /// whether it did.
+    pub fn keep_weights(
+        &self,
+        worlds: Vec<u64>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.keep_weights(worlds)
+    }
+
+    /// Reads the memory ledgers of the nodes of the scheduler's workers,
+    /// which the deployment's claims cover; the receiver gets each node's
+    /// as JSON.
+    pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.ledgers()
+    }
+
     /// Resumes a parked scheduler; the receiver gets whether it did.
     pub fn resume(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.resume()

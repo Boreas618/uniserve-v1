@@ -156,12 +156,12 @@ pub(super) fn plan(
 ) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.device;
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
+        // The grant is what the GPU's ledger leaves beside every world of
+        // the deployment; a successor's full grant is what it leaves once
+        // its predecessor is gone.
         let budget = budget.budget(index, config.mem_fraction_static)?;
         config.pool_storage_bytes = Some(budget.available as usize);
-        config.pool_storage_full_bytes = Some(
-            ((budget.total as f64 * config.mem_fraction_static) as u64)
-                .saturating_sub(budget.process) as usize,
-        );
+        config.pool_storage_full_bytes = Some(budget.full as usize);
     }
     let block_size = config
         .block_size

@@ -514,6 +514,16 @@ pub enum Command {
         worlds: Vec<u64>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
+    /// Reads the memory ledgers of the nodes of the scheduler's workers
+    /// (`Executor::ledgers`), and answers with each node's.
+    Ledgers(crossbeam_channel::Sender<Result<Vec<String>, String>>),
+    /// Keeps the weights alone of other worlds on the nodes of the
+    /// scheduler's workers (`Executor::keep_weights`), and answers whether
+    /// it did.
+    KeepWeights {
+        worlds: Vec<u64>,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
     /// Reports the KV cache each worker group holds now
     /// (`Scheduler::describe_cache`).
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
@@ -583,9 +593,13 @@ pub enum CacheChange {
     Sleep,
     /// Restores what a sleep gave back.
     Wake,
-    /// Creates as many of the given-back segments as each device's free
-    /// memory holds.
+    /// Creates as many of the given-back segments as each device's memory
+    /// ledger has room for.
     Grow,
+    /// Plans a shrink without withdrawing anything: answers with each
+    /// device's memory beside a world succeeding this one, or fails with
+    /// why such a world does not fit.
+    Plan,
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the
@@ -760,6 +774,25 @@ impl CommandSender {
         let (answer, retired) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Retire { worlds, answer });
         retired
+    }
+
+    /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
+    /// workers (`Command::KeepWeights`); the receiver gets whether it did.
+    pub fn keep_weights(
+        &self,
+        worlds: Vec<u64>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, kept) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::KeepWeights { worlds, answer });
+        kept
+    }
+
+    /// Reads the memory ledgers of the nodes of the scheduler's workers
+    /// (`Command::Ledgers`); the receiver gets each node's.
+    pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, read) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Ledgers(answer));
+        read
     }
 
     /// Reports the KV cache each worker group holds now

@@ -29,6 +29,7 @@ use storage::protocol::{Access, Claim, Key, Role, Scope, StorageRecord};
 use storage::transport::{Connection, Socket};
 
 use crate::kv_storage::KvStorage;
+use crate::ledger::Ledgers;
 use crate::pages::{HandedPools, Pools};
 use crate::transfers::Transfers;
 use crate::{ClientId, Deployment, Holder, Launch, Server, StorageEntry, TensorEntry};
@@ -86,6 +87,11 @@ struct HandedServer {
     pages: HandedPools,
     host_reserve: u64,
     relaunch: Vec<String>,
+    /// The GPUs' totals, the worlds' quotas and the bookings of the
+    /// clients the handoff carries; empty from a predecessor that kept no
+    /// ledgers, whose clients book again when they next book.
+    #[serde(default)]
+    ledgers: Ledgers,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -347,6 +353,7 @@ impl Server {
             pages,
             host_reserve: self.host_reserve,
             relaunch: std::mem::take(&mut self.relaunch),
+            ledgers: std::mem::take(&mut self.ledgers),
         };
 
         let Pending {
@@ -599,6 +606,7 @@ impl Server {
             shootdowns,
             pages,
             host_reserve: handed.host_reserve,
+            ledgers: handed.ledgers,
             kv_storage: KvStorage::new(connector),
             transfers: Transfers::new(transfer),
             events: Vec::new(),
@@ -643,7 +651,7 @@ mod tests {
     use std::os::fd::IntoRawFd as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use storage::protocol::{Mode, Placement, TensorRecord};
+    use storage::protocol::{Item, Mode, Placement, TensorRecord};
     use storage::{Client, socket};
 
     use super::*;
@@ -719,10 +727,16 @@ mod tests {
                     StorageRecord {
                         placement: Placement::Host { numa_node: None },
                         bytes: 4,
+                        segment: None,
                     },
                     memory.as_fd(),
                 )],
             )
+            .unwrap();
+        // The worker books its process memory on a GPU under a quota.
+        let gpu = [9; 16];
+        worker
+            .book(gpu, 1000, Some(700), vec![(Item::Process, 300)])
             .unwrap();
 
         // Stop the server between two rounds and hand it to a successor on
@@ -759,6 +773,22 @@ mod tests {
         let listing = operator.list().unwrap();
         assert_eq!(listing.tensors.len(), 1);
         assert_eq!(listing.deployments.len(), 1);
+        // The ledger goes on too: its quota and the worker's booking, which
+        // the successor holds against a booking past the quota.
+        let (ledgers, _) = worker.ledger(vec![gpu]).unwrap();
+        assert_eq!(ledgers.len(), 1);
+        assert_eq!((ledgers[0].quota, ledgers[0].used()), (Some(700), 300));
+        let refused = worker.book(gpu, 1000, None, vec![(Item::Staging, 401)]);
+        assert!(
+            matches!(
+                refused,
+                Err(storage::Error::Server {
+                    kind: storage::protocol::ErrorKind::Quota,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
 
         stop.store(true, Ordering::Release);
         (&waker).write_all(b"x").unwrap();

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use storage::protocol::ErrorKind;
+use storage::protocol::{ErrorKind, Item};
 use storage::{
     Access, Claim, Client, Error, Key, Mode, Placement, Role, Scope, StorageRecord, TensorRecord,
     socket,
@@ -170,6 +170,7 @@ pub(crate) fn host(bytes: u64) -> StorageRecord {
     StorageRecord {
         placement: Placement::Host { numa_node: None },
         bytes,
+        segment: None,
     }
 }
 
@@ -1553,4 +1554,275 @@ fn a_server_serves_earlier_clients_and_refuses_later_ones() {
         welcome(VERSION + 1),
         storage::protocol::ServerMessage::Welcome(storage::protocol::Welcome::Refused { .. })
     ));
+}
+
+/// The GPU the ledger tests book on, which no process touches: the server
+/// never interprets a storage, so a memfd stands for device memory.
+const GPU: [u8; 16] = [0x5a; 16];
+
+/// A storage of `bytes` on [`GPU`], of KV cache `segment` when given.
+fn device(bytes: u64, segment: Option<storage::Segment>) -> StorageRecord {
+    StorageRecord {
+        placement: Placement::Device { gpu: GPU },
+        bytes,
+        segment,
+    }
+}
+
+/// Segment `ordinal` of `world`.
+fn segment(world: u64, ordinal: u32) -> Option<storage::Segment> {
+    Some(storage::Segment { world, ordinal })
+}
+
+/// The deployment's ledger of [`GPU`] as `client` reads it.
+fn ledger(client: &mut Client) -> storage::GpuLedger {
+    let (ledgers, _) = client.ledger(vec![GPU]).unwrap();
+    assert_eq!(ledgers.len(), 1, "{ledgers:?}");
+    ledgers.into_iter().next().unwrap()
+}
+
+/// The bytes of `ledger`'s entries of `item` held by exactly `worlds`.
+fn booked(ledger: &storage::GpuLedger, item: Item, worlds: &[u64]) -> u64 {
+    ledger.bytes(|entry| entry.item == item && entry.worlds == worlds)
+}
+
+/// Waits until `client` reads `used` bytes booked in the ledger: a
+/// connection's end reaches the server a moment after the client drops it.
+fn await_used(client: &mut Client, used: u64) {
+    let mut booked = 0;
+    for _ in 0..200 {
+        booked = ledger(client).used();
+        if booked == used {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the ledger books {booked} bytes, not {used}");
+}
+
+/// Two worlds of a deployment share a GPU within one quota: each storage is
+/// booked once, however many worlds map it, a world's booked items end with
+/// its processes, nothing takes the ledger past its quota, and a commit
+/// hands the predecessor's segments the successor maps to the successor on
+/// the ledger, as a transfer rather than a release and an allocation.
+#[test]
+fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+
+    // World 1 states its quota of 700 bytes of the GPU's 1000 and books its
+    // process and graph pool, then publishes its weights, a KV cache
+    // segment and its buffer.
+    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    first
+        .book(
+            GPU,
+            1000,
+            Some(700),
+            vec![(Item::Process, 100), (Item::GraphPool, 100)],
+        )
+        .unwrap();
+    let storages = [memfd(&[1; 4]), memfd(&[2; 4]), memfd(&[3; 4])];
+    first
+        .put(
+            vec![
+                tensor(key(1), "weights", 0, 0, Access::ReadOnly),
+                tensor(key(2), "values#0/0", 1, 0, Access::Exclusive),
+                tensor(key(3), "buffer", 2, 0, Access::Exclusive),
+            ],
+            &[
+                (device(200, None), storages[0].as_fd()),
+                (device(50, segment(1, 0)), storages[1].as_fd()),
+                (device(20, None), storages[2].as_fd()),
+            ],
+        )
+        .unwrap();
+    let book = ledger(&mut head);
+    assert_eq!(
+        (book.quota, book.total, book.used()),
+        (Some(700), 1000, 470)
+    );
+    assert_eq!(booked(&book, Item::CacheSegment, &[1]), 50);
+    assert_eq!(booked(&book, Item::Exclusive, &[1]), 20);
+
+    // World 2 maps the weights and the segment: each is booked once, held
+    // by both worlds, beside the process and graph pool world 2 books.
+    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut second = world_worker(&server.socket, scope("text", 0), 2, claim);
+    second.get(vec![key(1)], Mode::Read).unwrap();
+    second.get(vec![key(2)], Mode::Standby).unwrap();
+    let book = second
+        .book(
+            GPU,
+            1000,
+            Some(700),
+            vec![(Item::Process, 100), (Item::GraphPool, 100)],
+        )
+        .unwrap()
+        .remove(0);
+    assert_eq!(book.used(), 670);
+    assert_eq!(booked(&book, Item::Weights, &[1, 2]), 200);
+    assert_eq!(booked(&book, Item::CacheSegment, &[1, 2]), 50);
+
+    // The successor's own segment takes the ledger to its quota; one byte
+    // more is refused, naming every entry of the ledger.
+    let own = memfd(&[4; 4]);
+    second
+        .put(
+            vec![tensor(key(4), "values#0/0", 0, 0, Access::Exclusive)],
+            &[(device(30, segment(2, 0)), own.as_fd())],
+        )
+        .unwrap();
+    let more = memfd(&[5; 4]);
+    let refused = second.put(
+        vec![tensor(key(5), "values#0/1", 0, 0, Access::Exclusive)],
+        &[(device(1, segment(2, 1)), more.as_fd())],
+    );
+    match refused {
+        Err(Error::Server {
+            kind: ErrorKind::Quota,
+            message,
+        }) => {
+            assert!(message.contains("past its quota of 700 bytes"), "{message}");
+            assert!(
+                message.contains("graph_pool of model/text/0 of world 1: 100 bytes"),
+                "{message}"
+            );
+            assert!(
+                message.contains("cache_segment 1/0 of model/text/0 of world 1 and 2: 50 bytes"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a refusal past the quota, got {other:?}"),
+    }
+    assert_eq!(ledger(&mut head).used(), 700);
+
+    // The commit: world 1's processes end, which ends what they booked, and
+    // the claim retires world 1, which releases its buffer. The segment
+    // world 2 maps is world 2's alone, its bytes unchanged.
+    drop(first);
+    await_used(&mut head, 500);
+    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    let book = ledger(&mut head);
+    assert_eq!(book.used(), 480);
+    assert_eq!(booked(&book, Item::CacheSegment, &[2]), 80);
+    assert_eq!(booked(&book, Item::Weights, &[2]), 200);
+    assert_eq!(booked(&book, Item::Exclusive, &[1]), 0);
+    assert_eq!(book.quota, Some(700));
+}
+
+/// A previous world kept as its weights keeps nothing else once its
+/// processes exited: what they booked ends with them, and the head ends its
+/// retention of every exclusive storage, so its buffer is released and the
+/// segment its successor maps is the successor's alone, while the weights
+/// both map stay booked once for both. The successor's room on the ledger
+/// grows by all of it.
+#[test]
+fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    first
+        .book(GPU, 1000, Some(700), vec![(Item::Process, 100)])
+        .unwrap();
+    let storages = [memfd(&[1; 4]), memfd(&[2; 4]), memfd(&[3; 4])];
+    first
+        .put(
+            vec![
+                tensor(key(1), "weights", 0, 0, Access::ReadOnly),
+                tensor(key(2), "values#0/0", 1, 0, Access::Exclusive),
+                tensor(key(3), "buffer", 2, 0, Access::Exclusive),
+            ],
+            &[
+                (device(200, None), storages[0].as_fd()),
+                (device(50, segment(1, 0)), storages[1].as_fd()),
+                (device(20, None), storages[2].as_fd()),
+            ],
+        )
+        .unwrap();
+    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut second = world_worker(&server.socket, scope("text", 0), 2, claim);
+    second.get(vec![key(1)], Mode::Read).unwrap();
+    second.get(vec![key(2)], Mode::Standby).unwrap();
+    assert_eq!(ledger(&mut head).used(), 370);
+
+    // The previous world's processes exit; the head keeps its weights.
+    drop(first);
+    await_used(&mut head, 270);
+    assert_eq!(head.keep_weights(vec![1]).unwrap(), 1);
+    let book = ledger(&mut head);
+    assert_eq!(book.used(), 250);
+    assert_eq!(booked(&book, Item::Weights, &[1, 2]), 200);
+    assert_eq!(booked(&book, Item::CacheSegment, &[2]), 50);
+    assert_eq!(booked(&book, Item::Exclusive, &[1]), 0);
+    // A worker is no head.
+    let refused = second
+        .call(
+            &storage::protocol::Request::KeepWeights { worlds: vec![1] },
+            &[],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            refused.reply,
+            storage::protocol::Reply::Error {
+                kind: ErrorKind::Invalid,
+                ..
+            }
+        ),
+        "{:?}",
+        refused.reply
+    );
+}
+
+/// The processes of one scope and world serve in turn: a standby or a
+/// relaunch that books beside the rank it replaces counts once, as the
+/// larger booking.
+#[test]
+fn the_processes_of_one_scope_count_as_their_largest_booking() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut rank = world_worker(&server.socket, scope("text", 0), 1, claim);
+    rank.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
+        .unwrap();
+    let mut standby = world_worker(&server.socket, scope("text", 0), 1, claim);
+    standby
+        .book(GPU, 1000, Some(700), vec![(Item::Process, 350)])
+        .unwrap();
+    assert_eq!(ledger(&mut head).used(), 350);
+    drop(standby);
+    await_used(&mut head, 300);
+}
+
+/// A worker books only its own items, and a booking that leaves a ledger
+/// past its quota (as a smaller fraction a world states since may) shrinks
+/// it but never grows it.
+#[test]
+fn a_ledger_past_its_quota_shrinks_but_never_grows() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    worker
+        .book(GPU, 1000, Some(700), vec![(Item::Process, 600)])
+        .unwrap();
+    for item in [Item::TransferContext, Item::Weights, Item::CacheSegment] {
+        assert_eq!(
+            server_error(worker.book(GPU, 1000, None, vec![(item, 1)])),
+            ErrorKind::Invalid
+        );
+    }
+
+    worker
+        .book(GPU, 1000, Some(500), vec![(Item::Process, 550)])
+        .unwrap();
+    assert_eq!(
+        server_error(worker.book(GPU, 1000, None, vec![(Item::Process, 560)])),
+        ErrorKind::Quota
+    );
+    let book = ledger(&mut worker);
+    assert_eq!((book.quota, book.used()), (Some(500), 550));
 }

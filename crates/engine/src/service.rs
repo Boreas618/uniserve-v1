@@ -521,6 +521,17 @@ fn read_requests(
                 Some(wire::engine_command::Kind::DescribeCache(describe)) => {
                     describe_caches(describe.id, front, routing);
                 }
+                Some(wire::engine_command::Kind::DescribeMemory(describe)) => {
+                    // The deployment's claims cover every node, so the first
+                    // scheduler reads them all.
+                    let answers: Vec<_> = routing
+                        .slots
+                        .first()
+                        .map(|slot| slot.handle.ledgers())
+                        .into_iter()
+                        .collect();
+                    answer_hooked(describe.id, answers, front, routing);
+                }
                 Some(wire::engine_command::Kind::FlushCache(_)) => {
                     for slot in &routing.slots {
                         slot.handle.flush_cache();
@@ -685,6 +696,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
             preempt_after: resize.preempt_after_ms.map(Duration::from_millis),
         },
         Ok(wire::CacheChange::Grow) => crate::CacheChange::Grow,
+        Ok(wire::CacheChange::Plan) => crate::CacheChange::Plan,
         Ok(wire::CacheChange::Restore) => crate::CacheChange::Restore,
         Ok(wire::CacheChange::Sleep) => crate::CacheChange::Sleep,
         Ok(wire::CacheChange::Wake) => crate::CacheChange::Wake,
@@ -701,12 +713,51 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         }
     };
     tracing::info!(?change, "changing the KV cache memory");
-    let answers: Vec<_> = routing
-        .slots
-        .iter()
-        .map(|slot| slot.handle.resize_cache(change))
-        .collect();
-    answer_hooked(resize.id, answers, front, routing);
+    if resize.keep_weights.is_empty() {
+        let answers: Vec<_> = routing
+            .slots
+            .iter()
+            .map(|slot| slot.handle.resize_cache(change))
+            .collect();
+        answer_hooked(resize.id, answers, front, routing);
+        return;
+    }
+    // The worlds that keep their weights alone release the rest of their
+    // memory on every node first (the deployment's claims cover them all,
+    // so the first scheduler asks), on a thread of its own: the change then
+    // finds it on each GPU's ledger.
+    let (id, worlds) = (resize.id, resize.keep_weights.clone());
+    let routing = Arc::clone(routing);
+    let spawned = std::thread::Builder::new()
+        .name("keep-weights".to_owned())
+        .spawn(move || {
+            let kept = routing.slots.first().map_or(Ok(()), |slot| {
+                match slot.handle.keep_weights(worlds).recv() {
+                    Ok(kept) => kept,
+                    Err(_) => Err("a scheduler stopped".to_owned()),
+                }
+            });
+            if let Err(error) = kept {
+                routing.send(
+                    front,
+                    Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
+                        id,
+                        results: Vec::new(),
+                        error,
+                    })),
+                );
+                return;
+            }
+            let answers: Vec<_> = routing
+                .slots
+                .iter()
+                .map(|slot| slot.handle.resize_cache(change))
+                .collect();
+            answer_hooked(id, answers, front, &routing);
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "the keep-weights thread did not start");
+    }
 }
 
 /// Answers the daemon `front` with `Hooked` once every scheduler answered,

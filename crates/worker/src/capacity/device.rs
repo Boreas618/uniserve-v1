@@ -1,34 +1,48 @@
-//! Device storage accounting for startup planning.
+//! Device storage accounting against the GPU's memory ledger.
 //!
-//! A rank's device budget is a fraction of the device's total memory minus
-//! what the process already holds, never more than the device has free. The
-//! process figure is NVML's per-process usage, which counts every allocation
-//! of the process's context: PyTorch's caching allocator (weights,
-//! activations, graph pools), Rust driver allocations (cache planes, arenas,
-//! workspaces), communicator buffers and loaded modules. The caching
-//! allocator first returns unused cached blocks, so reusable cache does not
-//! count against the grant.
+//! A deployment may use `⌊total × fraction⌋` of a GPU (its quota), and every
+//! world of the deployment that uses the GPU, with the host's Transfer
+//! Server, holds its memory within that one quota: the host's Storage Server
+//! keeps the GPU's ledger (`storage::GpuLedger`). A rank's grant is the
+//! quota less everything the ledger books beside the rank's own process
+//! (another world's weights, KV cache segments, graph pool and process, the
+//! Transfer Server's context, the storages this rank's scope retains) and
+//! less what the process holds now, never more than the device has free.
+//! In a deployment of one world this is the fraction of the device less
+//! what the process and its retained storages hold; beside a predecessor
+//! world it is also less everything the predecessor holds, so two worlds
+//! never each size themselves to the whole quota.
 //!
-//! NVML attributes memory held only through descriptors to no process, so
-//! the storages the worker's scope keeps at the host's Storage Server count
-//! as the worker's own on top of NVML's figure: its weights and the
-//! exclusive storages it took. Exclusive storages a predecessor left that
-//! the worker has not taken yet are about to be reused or released by its
-//! owners, so they count as free. Other scopes' retained memory is used
-//! memory the device no longer reports free. So does the part of the
-//! plugins' communication buffers NVML attributes to no process, which
-//! counts as the worker's own too.
+//! The process figure is NVML's per-process usage, which counts every
+//! allocation of the process's context: PyTorch's caching allocator
+//! (activations, graph pools), Rust driver allocations (arenas, workspaces),
+//! communicator buffers and loaded modules. The caching allocator first
+//! returns unused cached blocks, so reusable cache does not count against
+//! the grant. NVML attributes memory held only through descriptors to no
+//! process, so the storages the Storage Server retains count through the
+//! ledger instead: the weights, the exclusive storages and the KV cache
+//! segments. So does the part of the plugins' communication buffers NVML
+//! attributes to no process, which counts as the process's own.
+//!
+//! Exclusive storages a predecessor of the rank's scope and world left that
+//! the rank has not taken yet are about to be reused or released by its
+//! owners, so they count as free.
+//!
+//! Once warm, the rank books what the server cannot see in the ledger
+//! ([`DeviceBudget::book`]): its graph pools' memory and what its process
+//! holds beside them, with the product storage it has yet to make resident.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cuda::{DeviceId, Nvml};
+use storage::{GpuLedger, Item};
 
 use crate::ffi::Function;
 use crate::memory::retained::Retained;
 use crate::{Error, Result};
 
-/// Per-process device storage measurements.
+/// Per-process device storage measurements against the GPU's ledger.
 pub(crate) struct DeviceBudget {
     nvml: Nvml,
     retained: Arc<Retained>,
@@ -43,17 +57,24 @@ pub(crate) struct DeviceBudget {
 }
 
 /// A device's storage grant and its free bytes, at one measurement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Budget {
     /// Bytes the rank may still allocate on the device.
     pub available: u64,
+    /// Bytes the rank may hold beside its process once every other world
+    /// of its deployment has left the device: the quota less the process
+    /// and what the ledger books for the rank's own world and the Transfer
+    /// Server.
+    pub full: u64,
     /// Bytes the device reports free, with the scope's reclaimable
     /// retained bytes.
     pub free: u64,
-    /// Bytes the process holds.
+    /// Bytes the process holds, with the storages its scope retains.
     pub process: u64,
     /// Total device bytes.
     pub total: u64,
+    /// The deployment's ledger of the device's GPU at the measurement.
+    pub ledger: GpuLedger,
 }
 
 impl DeviceBudget {
@@ -72,12 +93,13 @@ impl DeviceBudget {
         })
     }
 
-    /// Device memory this process holds on `device`, after PyTorch returns
-    /// its unused cached blocks, with the storages its scope retains there.
+    /// Device memory this process holds on `device` after PyTorch returns
+    /// its unused cached blocks: NVML's figure with the plugins' buffers it
+    /// attributes to no process, without the storages the server retains.
     ///
     /// Fails when NVML attributes no usage on the device to this process, as
     /// inside a PID namespace NVML does not report.
-    pub(crate) fn process_bytes(&self, device: DeviceId) -> Result<u64> {
+    fn own_bytes(&self, device: DeviceId) -> Result<u64> {
         self.synchronize
             .invoke(&[(&tvm_ffi::Any::from(i64::from(device.0))).into()])?;
         self.empty_cache.invoke(&[])?;
@@ -90,23 +112,119 @@ impl DeviceBudget {
                 )),
                 error => Error::Cuda(error),
             })?;
-        Ok(process
-            + self.retained.scope_bytes(device)?.held
-            + self.unattributed.get(&device).copied().unwrap_or(0))
+        Ok(process + self.unattributed.get(&device).copied().unwrap_or(0))
     }
 
-    /// The storage grant on `device` for a rank allowed `fraction` of it.
+    /// Device memory this process holds on `device`, with the storages its
+    /// scope retains there.
+    pub(crate) fn process_bytes(&self, device: DeviceId) -> Result<u64> {
+        Ok(self.own_bytes(device)? + self.retained.scope_bytes(device)?.held)
+    }
+
+    /// The storage grant on `device` for a rank allowed `fraction` of it,
+    /// stating the rank's world's quota in the GPU's ledger.
     pub(crate) fn budget(&self, device: DeviceId, fraction: f64) -> Result<Budget> {
-        let process = self.process_bytes(device)?;
-        let reclaimable = self.retained.scope_bytes(device)?.reclaimable;
+        let own = self.own_bytes(device)?;
+        let scope = self.retained.scope_bytes(device)?;
         let memory = device.memory_info()?;
-        let free = memory.free + reclaimable;
+        // Stating the quota books nothing: the rank books its own items
+        // once it is warm.
+        let ledger = self.retained.book(
+            device,
+            memory.total,
+            quota(memory.total, fraction),
+            Vec::new(),
+        )?;
+        let quota = ledger.quota.unwrap_or(quota(memory.total, fraction));
+        // The measurement of the process stands for what it, or another
+        // process of its scope and world it replaces, booked; the
+        // reclaimable storages count as free.
+        let others = ledger
+            .used()
+            .saturating_sub(ledger.bytes(|entry| self.retained.books(entry)))
+            .saturating_sub(scope.reclaimable);
+        let world = self.retained.world();
+        let stays = ledger
+            .bytes(|entry| {
+                !self.retained.books(entry)
+                    && (entry.worlds.contains(&world) || entry.worlds.is_empty())
+            })
+            .saturating_sub(scope.reclaimable);
+        let free = memory.free + scope.reclaimable;
         Ok(Budget {
-            available: grant(memory.total, fraction, process, free),
+            available: quota.saturating_sub(own + others).min(free),
+            full: quota.saturating_sub(own + stays),
             free,
-            process,
+            process: own + scope.held,
             total: memory.total,
+            ledger,
         })
+    }
+
+    /// What the warm rank books on `device`, for `fraction` of it: its graph
+    /// pools' `graph` bytes, and what the process holds beside them and the
+    /// retained storages, with the `pending` bytes of product storage it
+    /// has yet to make resident.
+    pub(crate) fn booking(
+        &self,
+        device: DeviceId,
+        fraction: f64,
+        graph: u64,
+        pending: u64,
+    ) -> Result<DeviceBooking> {
+        let own = self.own_bytes(device)?;
+        let total = device.memory_info()?.total;
+        Ok(DeviceBooking {
+            device,
+            total,
+            quota: quota(total, fraction),
+            graph,
+            process: own.saturating_sub(graph) + pending,
+        })
+    }
+}
+
+/// What a warm rank books on one device: the items of its process the
+/// Storage Server cannot see.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceBooking {
+    pub device: DeviceId,
+    /// The device's total memory.
+    pub total: u64,
+    /// The deployment's quota of the device.
+    pub quota: u64,
+    /// The memory the rank's graph pools map ([`Item::GraphPool`]).
+    pub graph: u64,
+    /// What the process holds beside its graph pools and the retained
+    /// storages, with the product storage it has yet to make resident
+    /// ([`Item::Process`]).
+    pub process: u64,
+}
+
+impl DeviceBooking {
+    /// Books the items in the GPU's ledger, the graph pool only while
+    /// `graphs` are resident: a sleeping rank's graph memory is released.
+    /// Returns the ledger after the booking.
+    ///
+    /// Fails when the booking takes the ledger past its quota: the rank's
+    /// initialized runtime exceeds what the deployment may hold.
+    pub(crate) fn submit(&self, retained: &Retained, graphs: bool) -> Result<GpuLedger> {
+        let graph = if graphs { self.graph } else { 0 };
+        let ledger = retained.book(
+            self.device,
+            self.total,
+            self.quota,
+            vec![(Item::GraphPool, graph), (Item::Process, self.process)],
+        )?;
+        tracing::info!(
+            device = %self.device,
+            graph_pool = graph,
+            process = self.process,
+            booked = ledger.used(),
+            quota = ledger.quota,
+            "booked the worker's device memory"
+        );
+        Ok(ledger)
     }
 }
 
@@ -115,24 +233,8 @@ pub(crate) fn total_bytes(device: DeviceId) -> Result<u64> {
     Ok(device.memory_info()?.total)
 }
 
-/// `min(max(0, ⌊total × fraction⌋ − process), free)`.
-pub(crate) fn grant(total: u64, fraction: f64, process: u64, free: u64) -> u64 {
-    let limit = (total as f64 * fraction) as u64;
-    limit.saturating_sub(process).min(free)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_grant_is_the_fraction_left_after_process_storage() {
-        let gib = 1 << 30;
-        // 70% of 100 GiB minus 20 GiB held, within 60 GiB free.
-        assert_eq!(grant(100 * gib, 0.7, 20 * gib, 60 * gib), 50 * gib);
-        // Free memory bounds the grant when other processes hold storage.
-        assert_eq!(grant(100 * gib, 0.7, 20 * gib, 30 * gib), 30 * gib);
-        // A process beyond its fraction has no grant left.
-        assert_eq!(grant(100 * gib, 0.5, 60 * gib, 40 * gib), 0);
-    }
+/// A deployment's quota of a device of `total` bytes for `fraction` of it:
+/// `⌊total × fraction⌋`.
+pub(crate) fn quota(total: u64, fraction: f64) -> u64 {
+    (total as f64 * fraction) as u64
 }

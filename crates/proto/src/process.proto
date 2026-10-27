@@ -79,6 +79,8 @@ message Request {
     Stop stop = 3;
     Reserve reserve = 4;
     Claim claim = 5;
+    LedgerQuery ledger = 6;
+    KeepWeights keep_weights = 7;
   }
 }
 
@@ -92,6 +94,8 @@ message Reply {
     Stopped stopped = 4;
     Reserved reserved = 5;
     Claimed claimed = 6;
+    LedgerReport ledger = 7;
+    WeightsKept weights_kept = 8;
   }
 }
 
@@ -184,6 +188,36 @@ message Claimed {
   // `address:port` other nodes reach the server's page requests at; empty
   // when it accepts none.
   string tcp = 3;
+}
+
+// Read the memory ledgers the node's Storage Server keeps for the
+// deployment: one per GPU of the node it uses, with every item booked
+// there. The daemon reads them over the claim it holds.
+message LedgerQuery {
+  string host = 1;
+  string deployment = 2;
+}
+
+// Have a node's daemon keep the weights alone of `worlds` of the deployment
+// at its Storage Server: their retention of every other storage ends, as a
+// previous world kept as its weights for a rollback, whose processes exited,
+// keeps no more.
+message KeepWeights {
+  string host = 1;
+  string deployment = 2;
+  repeated uint64 worlds = 3;
+}
+
+message WeightsKept {
+  // The storages the server released.
+  uint64 released = 1;
+}
+
+message LedgerReport {
+  // The Storage Server's `Ledger` answer as JSON: `{"ledgers": [...],
+  // "host_memory": {...}}` (the `storage` crate's `GpuLedger` and
+  // `HostMemory`).
+  string ledgers = 1;
 }
 
 // What a daemon tells an engine, unasked.

@@ -18,57 +18,10 @@
 //! sleep does and rewrites the weights while the workers sleep, so that the
 //! cache's memory holds the new checkpoint as it loads.
 
+use super::ledger::{CacheMemory, Preparing, growable, preparing};
 use super::*;
 use crate::executor::WorkerGroupId;
 use crate::handle::CacheChange;
-
-/// What `uniserve.cache_memory` reports of one worker.
-#[derive(serde::Deserialize)]
-struct CacheMemory {
-    /// The segments of each cache plane, in unit order; empty when the
-    /// planes are not split.
-    #[serde(default)]
-    segments: Vec<ipc::CacheSegment>,
-    /// Segments the worker holds: the first given back.
-    #[serde(default)]
-    held: u32,
-    /// Device bytes of one unit across the worker's planes.
-    #[serde(default)]
-    unit_bytes: u64,
-    /// Device bytes of the head segment a successor creates beside this
-    /// cache's segments.
-    #[serde(default)]
-    head_bytes: u64,
-    /// The units a configured token capacity holds; a successor's head and
-    /// the segments it inherits fit in them together. `None` for a cache
-    /// sized by memory.
-    #[serde(default)]
-    capacity_units: Option<u64>,
-    /// Free bytes of the worker's device.
-    free_bytes: u64,
-    /// Device bytes the worker process holds beside the shared weights and
-    /// cache, which a successor world needs as much of.
-    process_bytes: u64,
-    /// Device bytes the share of the device a worker's capacity plan keeps
-    /// for graphs and activations, which a successor captures in.
-    #[serde(default)]
-    reserve_bytes: u64,
-    /// Device bytes of the exclusive storages the worker's world keeps
-    /// beside its value planes, which a successor creates as many of.
-    #[serde(default)]
-    exclusive_bytes: u64,
-}
-
-impl CacheMemory {
-    /// The first unit of segment `index`.
-    fn first_unit(&self, index: u32) -> u32 {
-        self.segments
-            .iter()
-            .take(index as usize)
-            .map(|segment| segment.units)
-            .sum()
-    }
-}
 
 /// A shrink, sleep or weight update that waits for the requests holding
 /// the withdrawn units to let them go (`Scheduler::resize_cache`,
@@ -83,13 +36,31 @@ pub(super) struct PendingResize {
 
 /// What a pending change does once its units are let go.
 enum Pending {
-    /// The workers give back the segments from this one on.
-    Shrink(u32),
+    /// The workers give back the segments from this one on; the shrink
+    /// answers with the plan of each device it made room on.
+    Shrink { from: u32, plan: Vec<String> },
     /// The workers sleep, once no request runs.
     Sleep,
     /// The workers rewrite the weights from the checkpoint at this path,
     /// once no request runs.
     Weights(String),
+}
+
+/// Every worker's `uniserve.cache_memory` report: of the workers that hold
+/// the cache, and of the others (`Scheduler::memory_reports`).
+struct MemoryReports {
+    cache: Vec<CacheMemory>,
+    beside: Vec<CacheMemory>,
+}
+
+/// The serving world's preparation for a world that succeeds it
+/// (`Scheduler::plan_preparation`).
+pub(super) struct Preparation {
+    /// The first segment every device gives back and its first unit;
+    /// `None` when each keeps all it holds.
+    tail: Option<(u32, u32)>,
+    /// Each device's plan, as JSON (`super::ledger::Preparing`).
+    plans: Vec<String>,
 }
 
 impl Pending {
@@ -114,8 +85,18 @@ impl Scheduler {
             return;
         }
         let started = match change {
-            CacheChange::Shrink { .. } => self.start_shrink(),
-            CacheChange::Sleep => self.start_sleep(),
+            CacheChange::Shrink { .. } => self.start_shrink().map(|(from, plan)| {
+                from.map(|from| Pending::Shrink {
+                    from,
+                    plan: plan.clone(),
+                })
+                .ok_or(plan)
+            }),
+            CacheChange::Plan => {
+                let _ = answer.send(self.plan_preparation().map(|preparation| preparation.plans));
+                return;
+            }
+            CacheChange::Sleep => Ok(self.start_sleep().ok_or_else(Vec::new)),
             CacheChange::Restore => {
                 let _ = answer.send(self.restore_cache(None));
                 return;
@@ -130,7 +111,7 @@ impl Scheduler {
             }
         };
         match started {
-            Ok(Some(from)) => {
+            Ok(Ok(pending)) => {
                 let preempt_at = match change {
                     CacheChange::Shrink {
                         preempt_after: Some(after),
@@ -138,18 +119,15 @@ impl Scheduler {
                     _ => None,
                 };
                 self.resizing = Some(PendingResize {
-                    change: if change == CacheChange::Sleep {
-                        Pending::Sleep
-                    } else {
-                        Pending::Shrink(from)
-                    },
+                    change: pending,
                     answer,
                     preempt_at,
                 });
                 self.poll_resize();
             }
-            Ok(None) => {
-                let _ = answer.send(Ok(Vec::new()));
+            // Nothing to give back: the change is done, with its plan.
+            Ok(Err(plan)) => {
+                let _ = answer.send(Ok(plan));
             }
             Err(error) => {
                 let _ = answer.send(Err(error));
@@ -264,16 +242,16 @@ impl Scheduler {
                     );
                 })
             }
-            Pending::Shrink(from) => {
+            Pending::Shrink { from, plan } => {
                 let payload = serde_json::json!({ "from": from }).to_string();
-                self.run_hook("uniserve.release_cache", &payload)
-                    .inspect(|_| {
-                        tracing::info!(
-                            from,
-                            units = self.storage.usable_units(),
-                            "gave back the tail of the KV cache"
-                        );
-                    })
+                self.run_hook("uniserve.release_cache", &payload).map(|_| {
+                    tracing::info!(
+                        from,
+                        units = self.storage.usable_units(),
+                        "gave back the tail of the KV cache"
+                    );
+                    plan
+                })
             }
             Pending::Weights(path) => self.apply_weights(&path),
         };
@@ -413,50 +391,74 @@ impl Scheduler {
     }
 
     /// The segments each worker that holds the cache reports, which agree
-    /// on their segments and the ones they hold; `None` when the cache is
-    /// not split into segments. A worker that holds no cache, such as an
-    /// expert worker, reports none and is left out.
-    fn cache_memory(&mut self) -> Result<Option<Vec<CacheMemory>>, String> {
+    /// on their segments and the ones they hold, with its device's ledger;
+    /// `None` when the cache is not split into segments. A worker that
+    /// holds no cache, such as an expert worker, reports none and is left
+    /// out.
+    pub(super) fn cache_memory(&mut self) -> Result<Option<Vec<CacheMemory>>, String> {
+        Ok(self.memory_reports()?.map(|reports| reports.cache))
+    }
+
+    /// Every worker's memory report: those of the workers that hold the
+    /// cache, which agree on their segments and the ones they hold, and
+    /// those of the others (an expert worker's, with its GPU's ledger when
+    /// it keeps memory at the Storage Server). `None` when the cache is not
+    /// split into segments.
+    fn memory_reports(&mut self) -> Result<Option<MemoryReports>, String> {
         if self.storage.cache().is_none() {
             return Ok(None);
         }
-        let reports = self
+        let (cache, beside): (Vec<CacheMemory>, Vec<CacheMemory>) = self
             .run_hook("uniserve.cache_memory", "")?
             .iter()
             .map(|report| serde_json::from_str::<CacheMemory>(report))
-            .filter(|report| {
-                report
-                    .as_ref()
-                    .map_or(true, |report| !report.segments.is_empty())
-            })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("a worker's cache memory report: {error}"))?;
-        let Some(first) = reports.first() else {
+            .map_err(|error| format!("a worker's cache memory report: {error}"))?
+            .into_iter()
+            .partition(|report| !report.segments.is_empty());
+        let Some(first) = cache.first() else {
             return Ok(None);
         };
-        if reports
+        if cache
             .iter()
             .any(|report| (&report.segments, report.held) != (&first.segments, first.held))
         {
             return Err("the workers split the KV cache into different segments".to_owned());
         }
-        Ok(Some(reports))
+        Ok(Some(MemoryReports { cache, beside }))
     }
 
-    /// Withdraws the tail that leaves each device the memory a world
-    /// succeeding this one needs beside what they share: as much as the
-    /// worker holds beside the weights and the cache, the graph share, the
-    /// exclusive storages beside the cache planes and a head segment. A
-    /// cache of a configured token capacity also withdraws what leaves the
-    /// successor's head room within that capacity beside the segments it
-    /// inherits, so that a world change never grows the cache past it. The
-    /// requests holding the tail run on. Returns the first segment to give
-    /// back, or `None` when every device has the room already. The first
-    /// segment, which holds the padding and warmup units, stays, as do the
-    /// segments the world inherited and does not own yet.
-    fn start_shrink(&mut self) -> Result<Option<u32>, String> {
-        let Some(reports) = self.cache_memory()? else {
-            return Ok(None);
+    /// The serving world's preparation for a world that succeeds it on the
+    /// same devices (`super::ledger::preparing`): for each worker that holds
+    /// the cache, its device's KV cache limit from the GPU's ledger, beside
+    /// everything else the deployment and the Transfer Server hold there
+    /// and what the successor adds, and the segments the cache keeps within
+    /// it. A cache of a configured token capacity also keeps no more than
+    /// leaves the successor's head room within that capacity beside the
+    /// segments it inherits, so that a world change never grows the cache
+    /// past it. Returns the first segment every device gives back with its
+    /// first unit (`None` when each keeps all it holds), and each device's
+    /// plan as JSON. The first segment, which holds the padding and warmup
+    /// units, stays, as do the segments the world inherited and does not
+    /// own yet.
+    ///
+    /// The devices of the workers that hold no cache (an expert worker's)
+    /// are planned too: their successor's graph pool and fixed part must
+    /// fit beside everything the ledger books there.
+    ///
+    /// Fails, changing nothing, when a device's limit cannot hold the
+    /// segments the cache keeps in any case: the error names every item of
+    /// every device and host.
+    pub(super) fn plan_preparation(&mut self) -> Result<Preparation, String> {
+        let Some(MemoryReports {
+            cache: reports,
+            beside,
+        }) = self.memory_reports()?
+        else {
+            return Ok(Preparation {
+                tail: None,
+                plans: Vec::new(),
+            });
         };
         let first = &reports[0];
         let held = first.held;
@@ -470,63 +472,71 @@ impl Scheduler {
             .find(|&index| first.first_unit(index) < inherited.end)
             .map_or(1, |index| index + 1);
         let mut keep = held;
+        let mut plans: Vec<Preparing> = Vec::new();
         for report in &reports {
-            let needed = report.process_bytes
-                + report.reserve_bytes
-                + report.exclusive_bytes
-                + report.head_bytes;
-            let mut short = needed.saturating_sub(report.free_bytes);
-            let head_units = report.head_bytes.div_ceil(report.unit_bytes.max(1));
-            let mut over = report.capacity_units.map_or(0, |capacity| {
-                (u64::from(report.first_unit(held)) + head_units).saturating_sub(capacity)
-            });
-            let mut released = held;
-            while (short > 0 || over > 0) && released > floor {
-                released -= 1;
-                let units = u64::from(report.segments[released as usize].units);
-                short = short.saturating_sub(units * report.unit_bytes);
-                over = over.saturating_sub(units);
+            let mut plan = preparing(report, floor)?;
+            let mut kept = plan.segments_kept;
+            if let Some(capacity) = report.capacity_units {
+                let head_units = report.head_bytes.div_ceil(report.unit_bytes.max(1));
+                while kept > floor && u64::from(report.first_unit(kept)) + head_units > capacity {
+                    kept -= 1;
+                }
+                if u64::from(report.first_unit(kept)) + head_units > capacity {
+                    return Err(format!(
+                        "the KV cache's configured capacity of {capacity} units cannot hold a \
+                         successor world's {head_units}-unit head segment beside the cache's \
+                         first segment"
+                    ));
+                }
             }
-            if over > 0 {
-                return Err(format!(
-                    "the KV cache's configured capacity of {} units cannot hold a successor \
-                     world's {head_units}-unit head segment beside the cache's first segment",
-                    report.capacity_units.unwrap_or_default(),
-                ));
-            }
-            if short > 0 {
-                return Err(format!(
-                    "the KV cache cannot make room for a successor world: it needs {needed} \
-                     bytes beside what the worlds share ({} the worker holds beside the weights \
-                     and the cache, {} of graph share, {} of exclusive storages and a {}-byte \
-                     head segment), {} bytes are free, and the cache's segments past its first \
-                     hold {} bytes",
-                    report.process_bytes,
-                    report.reserve_bytes,
-                    report.exclusive_bytes,
-                    report.head_bytes,
-                    report.free_bytes,
-                    u64::from(report.first_unit(held) - report.first_unit(floor))
-                        * report.unit_bytes,
-                ));
-            }
-            keep = keep.min(released);
+            plan.segments_kept = kept;
+            plan.kv_kept = (0..kept as usize)
+                .map(|index| report.segment_bytes(index))
+                .sum();
+            keep = keep.min(kept);
+            plans.push(plan);
         }
-        if keep == held {
-            return Ok(None);
+        // A worker without a cache that keeps its memory at the Storage
+        // Server: its successor adds beside it what it holds, and the limit
+        // left (of no cache) must not be negative.
+        for report in beside.iter().filter(|report| report.ledger.is_some()) {
+            plans.push(preparing(report, 0)?);
         }
-        self.withdraw_from(first.first_unit(keep), false);
-        Ok(Some(keep))
+        if plans.iter().any(|plan| !plan.feasible) {
+            return Err(super::ledger::refusal(&plans));
+        }
+        let plans = plans
+            .iter()
+            .map(|plan| serde_json::to_string(plan).unwrap_or_default())
+            .collect();
+        Ok(Preparation {
+            tail: (keep < held).then(|| (keep, first.first_unit(keep))),
+            plans,
+        })
+    }
+
+    /// Withdraws the tail past what each device's limit keeps
+    /// ([`Self::plan_preparation`]); the requests holding it run on.
+    /// Returns the first segment to give back, `None` when every device
+    /// keeps all its cache, and each device's plan.
+    fn start_shrink(&mut self) -> Result<(Option<u32>, Vec<String>), String> {
+        let Preparation { tail, plans } = self.plan_preparation()?;
+        let Some((segment, unit)) = tail else {
+            return Ok((None, plans));
+        };
+        self.withdraw_from(unit, false);
+        Ok((Some(segment), plans))
     }
 
     /// Withdraws every unit and lets the requests that run finish or
-    /// recompute; admission waits until a wake.
-    fn start_sleep(&mut self) -> Result<Option<u32>, String> {
+    /// recompute; admission waits until a wake. `None` for a scheduler
+    /// asleep already.
+    fn start_sleep(&mut self) -> Option<Pending> {
         if self.asleep {
-            return Ok(None);
+            return None;
         }
         self.withdraw_from(0, true);
-        Ok(Some(0))
+        Some(Pending::Sleep)
     }
 
     /// Withdraws the units from `first` on, revoking the cached pages they
@@ -603,29 +613,21 @@ impl Scheduler {
         Ok(results)
     }
 
-    /// Creates as many of the given-back segments as every device's free
-    /// memory holds, beside the graph share each keeps, and returns their
-    /// units to allocation.
+    /// Creates as many of the given-back segments as every device's ledger
+    /// has room for within its quota, beside everything the deployment's
+    /// worlds and the Transfer Server hold there (and its free memory
+    /// holds, beside processes outside the deployment), and returns their
+    /// units to allocation: what a previous world released is the
+    /// successor's on the ledger at once.
     fn grow_cache(&mut self) -> Result<Vec<String>, String> {
         let Some(reports) = self.cache_memory()? else {
             return Ok(Vec::new());
         };
-        let held = reports[0].held;
-        let count = reports[0].segments.len() as u32;
-        let mut fit = count - held;
-        for report in &reports {
-            let mut free = report.free_bytes;
-            let mut segments = 0;
-            for segment in &report.segments[held as usize..] {
-                let bytes = u64::from(segment.units) * report.unit_bytes;
-                if bytes > free {
-                    break;
-                }
-                free -= bytes;
-                segments += 1;
-            }
-            fit = fit.min(segments);
-        }
+        let fit = reports
+            .iter()
+            .map(|report| growable(report, false))
+            .min()
+            .unwrap_or(0);
         if fit == 0 {
             return Ok(Vec::new());
         }

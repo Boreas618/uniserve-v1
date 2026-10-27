@@ -173,12 +173,16 @@ impl Scheduler {
     /// predecessor's published pages, each unit moved to where the workers
     /// map it.
     ///
-    /// Fails, changing nothing, when the units the world's own segments
-    /// hold free, and those of the segments it creates as it `grows` into
-    /// the predecessor's memory freed at once, cannot hold what the
-    /// requests the predecessor hands over compute: all the units they held
-    /// when they `recompute` from their tokens, beside a page each, the last
-    /// they continue. The world has no more until its commit gives it the
+    /// Fails, changing nothing, when the world's KV cache limit in the
+    /// trial cannot hold what the requests the predecessor hands over
+    /// compute: all the units they held when they `recompute` from their
+    /// tokens, beside a page each, the last they continue. The limit is the
+    /// units its own segments hold free, and those of the segments it has
+    /// yet to create that every device's memory ledger has room for: the
+    /// quota less everything booked, the predecessor's kept memory
+    /// included, and, when the predecessor's processes exit at the
+    /// promotion (it `grows`), with what they booked transferred to this
+    /// world. The world has no more until its commit gives it the
     /// predecessor's segments, and the requests would wait for it.
     pub(super) fn promote(
         &mut self,
@@ -196,17 +200,30 @@ impl Scheduler {
             .map(|group| group.units_per_page as u32)
             .sum();
         let needed = parked.requests * page_units + if recompute { parked.held_units } else { 0 };
-        let free = cache.block_pool.free_units()
-            + if grows {
-                cache.block_pool.withdrawn_units()
-            } else {
-                0
-            };
-        let free = free as u32;
+        let own_free = cache.block_pool.free_units() as u32;
+        let growable = match self.cache_memory()? {
+            Some(reports) => {
+                let fit = reports
+                    .iter()
+                    .map(|report| super::ledger::growable(report, grows))
+                    .min()
+                    .unwrap_or(0);
+                let first = &reports[0];
+                first.segments[first.held as usize..]
+                    .iter()
+                    .take(fit as usize)
+                    .map(|segment| segment.units)
+                    .sum()
+            }
+            None => 0,
+        };
+        let free = own_free + growable;
         if needed > free {
             return Err(format!(
-                "the successor world's KV cache holds {free} free units of its own until its \
-                 commit, and the {} requests in flight need {needed}{}",
+                "the successor world's KV cache holds {free} free units within its memory \
+                 ledgers until its commit ({own_free} in its own segments, {growable} in the \
+                 segments the ledgers have room for), and the {} requests in flight need \
+                 {needed}{}",
                 parked.requests,
                 if recompute {
                     ", recomputing the units they held"
@@ -215,6 +232,9 @@ impl Scheduler {
                 },
             ));
         }
+        let Some(cache) = self.storage.cache() else {
+            return Ok(());
+        };
         let index = &parked.pages;
         let inherited = cache.block_pool.inherited();
         if inherited.is_empty() {

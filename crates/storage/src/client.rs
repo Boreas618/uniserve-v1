@@ -15,9 +15,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::protocol::{
-    Claim, ClientMessage, ErrorKind, Event, Hello, Key, Link, Listing, Mode, Priority, Region,
-    Registered, Reply, Request, Role, Scope, ServerMessage, Span, StorageRecord, TensorRecord,
-    Throttle, VERSION, Welcome,
+    Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostMemory, Item, Key, Link, Listing,
+    Mode, Priority, Region, Registered, Reply, Request, Role, Scope, ServerMessage, Span,
+    StorageRecord, TensorRecord, Throttle, VERSION, Welcome,
 };
 use crate::transport::Connection;
 
@@ -437,6 +437,45 @@ impl Client {
         match Self::expect(self.call(&Request::List, &[])?)?.reply {
             Reply::Listing(listing) => Ok(listing),
             other => Err(unexpected("list", &other)),
+        }
+    }
+
+    /// See [`Request::KeepWeights`]. Returns how many tensors were released.
+    pub fn keep_weights(&mut self, worlds: Vec<u64>) -> Result<u64> {
+        match Self::expect(self.call(&Request::KeepWeights { worlds }, &[])?)?.reply {
+            Reply::Retained { released } => Ok(released),
+            other => Err(unexpected("keep_weights", &other)),
+        }
+    }
+
+    /// See [`Request::Book`]. Returns the ledgers of `gpu` the caller books
+    /// in; a refusal is [`ErrorKind::Quota`], whose message names every
+    /// entry of the ledger it would overrun.
+    pub fn book(
+        &mut self,
+        gpu: [u8; 16],
+        total: u64,
+        quota: Option<u64>,
+        items: Vec<(Item, u64)>,
+    ) -> Result<Vec<GpuLedger>> {
+        let request = Request::Book {
+            gpu,
+            total,
+            quota,
+            items,
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
+            Reply::Ledger { ledgers, .. } => Ok(ledgers),
+            other => Err(unexpected("book", &other)),
+        }
+    }
+
+    /// See [`Request::Ledger`]: the ledgers of `gpus` (every GPU when empty)
+    /// and what the host admits of new host memory.
+    pub fn ledger(&mut self, gpus: Vec<[u8; 16]>) -> Result<(Vec<GpuLedger>, HostMemory)> {
+        match Self::expect(self.call(&Request::Ledger { gpus }, &[])?)?.reply {
+            Reply::Ledger { ledgers, host } => Ok((ledgers, host)),
+            other => Err(unexpected("ledger", &other)),
         }
     }
 }

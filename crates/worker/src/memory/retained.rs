@@ -26,7 +26,7 @@ use cuda::{DeviceId, Protection};
 use ipc::StorageLaunch;
 use sha2::{Digest, Sha256};
 use storage::protocol::Access;
-use storage::{Claim, Client, Key, Mode, Placement, Role, Scope, StorageRecord};
+use storage::{Claim, Client, GpuLedger, Item, Key, Mode, Placement, Role, Scope, StorageRecord};
 
 use crate::ffi::Backing;
 use crate::memory::allocation::Storage;
@@ -353,6 +353,11 @@ impl Retained {
         let record = StorageRecord {
             placement: Placement::Device { gpu },
             bytes,
+            // The ledgers book the segment's storages together, as the cache's.
+            segment: Some(storage::Segment {
+                world: part.segment.world,
+                ordinal: part.segment.ordinal,
+            }),
         };
         let tensor = storage::TensorRecord {
             key,
@@ -520,29 +525,81 @@ impl Retained {
         Ok(())
     }
 
-    /// The device bytes of the exclusive storages the worker's world keeps
-    /// for its scope on `device` beside its KV cache's value planes: its
-    /// cache flags and scales, buffer pool and latent banks, which a world
-    /// that succeeds this one on the same device creates as many of.
-    pub(crate) fn exclusive_bytes(&self, device: DeviceId) -> Result<u64> {
+    /// The worker's scope, which its world's ledger entries name.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// The worker's world.
+    pub(crate) fn world(&self) -> u64 {
+        self.world
+    }
+
+    /// Whether `entry` is one the worker's process books itself: an item of
+    /// its scope and world that a process books ([`Item::booked`]). A
+    /// measurement of the process stands for these.
+    pub(crate) fn books(&self, entry: &storage::LedgerEntry) -> bool {
+        entry.item.booked()
+            && entry.scope.as_ref() == Some(&self.scope)
+            && entry.worlds == [self.world]
+    }
+
+    /// The deployment's ledger of the GPU of `device`, and what the host
+    /// admits of new host memory.
+    pub(crate) fn ledger(&self, device: DeviceId) -> Result<(GpuLedger, storage::HostMemory)> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
-        let listing = state
+        let (ledgers, host) = state
             .client
-            .list()
-            .map_err(|error| storage_error("listing the storage server", error))?;
-        Ok(listing
-            .tensors
-            .iter()
-            .filter(|tensor| {
-                tensor.access == Access::Exclusive
-                    && tensor.placement == Placement::Device { gpu }
-                    && self.retains(tensor)
-                    && !tensor.name.starts_with("prefix_cache.key.values#")
-                    && !tensor.name.starts_with("prefix_cache.value.values#")
+            .ledger(vec![gpu])
+            .map_err(|error| storage_error("reading the memory ledger", error))?;
+        Ok((Self::of_deployment(&self.scope, gpu, ledgers), host))
+    }
+
+    /// Books `items` of the worker on the GPU of `device` of `total` bytes,
+    /// stating the world's quota there (see `Request::Book`), and returns
+    /// the deployment's ledger of the GPU after it. Fails with the server's
+    /// refusal, which names every entry of the ledger, when the booking
+    /// would take it past its quota.
+    pub(crate) fn book(
+        &self,
+        device: DeviceId,
+        total: u64,
+        quota: u64,
+        items: Vec<(Item, u64)>,
+    ) -> Result<GpuLedger> {
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let ledgers =
+            state
+                .client
+                .book(gpu, total, Some(quota), items)
+                .map_err(|error| match error {
+                    storage::Error::Server {
+                        kind: storage::protocol::ErrorKind::Quota,
+                        message,
+                    } => Error::Unsupported(format!(
+                        "the device memory the worker holds on {device} does not fit its quota: \
+                     {message}"
+                    )),
+                    error => storage_error("booking device memory", error),
+                })?;
+        Ok(Self::of_deployment(&self.scope, gpu, ledgers))
+    }
+
+    /// The ledger of `scope`'s deployment among `ledgers` of `gpu`; an
+    /// empty one when the server keeps none yet.
+    fn of_deployment(scope: &Scope, gpu: [u8; 16], ledgers: Vec<GpuLedger>) -> GpuLedger {
+        ledgers
+            .into_iter()
+            .find(|ledger| ledger.deployment == scope.deployment)
+            .unwrap_or(GpuLedger {
+                gpu,
+                deployment: scope.deployment.clone(),
+                total: 0,
+                quota: None,
+                entries: Vec::new(),
             })
-            .map(|tensor| tensor.storage_bytes)
-            .sum())
     }
 
     /// Whether the worker's scope retains `tensor` in the worker's world.
@@ -697,6 +754,7 @@ impl ExclusiveMemory for &Retained {
                     let bytes = storage.bytes() as u64;
                     let record = StorageRecord {
                         placement: Placement::Device { gpu: *gpu },
+                        segment: None,
                         bytes,
                     };
                     let tensor = storage::TensorRecord {

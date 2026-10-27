@@ -673,6 +673,7 @@ impl Published {
                     StorageRecord {
                         placement: *placement,
                         bytes: storage.bytes() as u64,
+                        segment: None,
                     },
                     descriptor.as_fd(),
                 )
@@ -682,6 +683,7 @@ impl Published {
             StorageRecord {
                 placement: Placement::Host { numa_node: None },
                 bytes: manifest_bytes.len() as u64,
+                segment: None,
             },
             manifest_memory.as_fd(),
         ));

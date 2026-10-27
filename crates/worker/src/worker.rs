@@ -47,7 +47,7 @@ use ipc::ComponentWeights;
 use ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;
-use crate::capacity::device::{DeviceBudget, total_bytes};
+use crate::capacity::device::{DeviceBooking, DeviceBudget, total_bytes};
 use crate::capacity::plan::Plan;
 use crate::config::placement::{Capability, Components, GroupPlacement};
 use crate::config::{Device, ExpertUnion, WorkerConfig, WorkerLaunch};
@@ -146,6 +146,9 @@ pub(crate) struct Worker {
     identity: String,
     /// The launch the worker loaded its model with.
     launch: WorkerLaunch,
+    /// What the warm rank books in each device's ledger ([`DeviceBooking`]),
+    /// which a sleep and a wake, and a standby's promotion, book again.
+    bookings: Vec<DeviceBooking>,
     /// What holds the plugins' communication buffers, which serve for the
     /// worker's lifetime.
     _plugin_buffers: Option<Handle>,
@@ -673,6 +676,7 @@ impl Worker {
             weight_keys: keys,
             identity,
             launch,
+            bookings: Vec::new(),
             _plugin_buffers: plugin_buffers,
             host_cache,
             warmed: false,
@@ -717,14 +721,18 @@ impl Worker {
         }
         self.complete_startup()?;
 
-        if let Some(budget) = &self.budget {
-            checks::startup(
-                &self.config,
-                self.plan.arena.deferred_device_bytes(),
-                |_| 0,
-                budget,
-            )
-            .map_err(phase("warmup"))?;
+        // The warm rank books what the Storage Server cannot see in each
+        // device's ledger, which refuses it past the deployment's quota. A
+        // standby lives beside the quota, on the memory the fraction leaves,
+        // until its promotion replaces the rank it stands by for: it books
+        // then.
+        self.bookings = self.measure_bookings().map_err(phase("warmup"))?;
+        if !self.retained.standing_by() {
+            for booking in &self.bookings {
+                booking
+                    .submit(&self.retained, true)
+                    .map_err(phase("warmup"))?;
+            }
         }
         // Serving runs Python only inside library calls; collection pauses
         // there would stall steps, so the heap built so far is collected and
@@ -834,6 +842,7 @@ impl Worker {
             max_total_tokens: self.config.max_total_tokens,
             request_slots: self.config.max_request_pool_size,
             devices: self.config.devices().filter_map(Device::cuda).collect(),
+            bookings: self.bookings.clone(),
             host_cache: self.host_cache.take(),
         };
         // The rank serves with CUPTI attached (`crate::profiling::cupti`),
@@ -1046,6 +1055,40 @@ impl Worker {
             record(cuda::reclaim::flush().map_err(|error| WorkerError::from(Error::from(error))));
         }
         failure.map_or(Ok(()), Err)
+    }
+
+    /// What the warm rank books on each CUDA device it uses: the memory its
+    /// graph pools map there, and what its process holds beside them, with
+    /// the product storage it has yet to make resident (on the primary
+    /// device). None on a CPU rank.
+    fn measure_bookings(&self) -> Result<Vec<DeviceBooking>> {
+        let Some(budget) = &self.budget else {
+            return Ok(Vec::new());
+        };
+        let pools = self.graphs.pools();
+        let mut bookings = Vec::new();
+        for device in self.config.devices() {
+            let Device::Cuda(index) = device else {
+                continue;
+            };
+            let graph: u64 = pools
+                .iter()
+                .filter(|pool| pool.device == index)
+                .map(|pool| pool.memory.mapped_bytes() as u64)
+                .sum();
+            let pending = if device == self.config.device {
+                self.plan.arena.deferred_device_bytes()
+            } else {
+                0
+            };
+            bookings.push(budget.booking(
+                index,
+                self.config.mem_fraction_static,
+                graph,
+                pending,
+            )?);
+        }
+        Ok(bookings)
     }
 
     /// Each CUDA device's graph pools may hold their current bytes plus the
