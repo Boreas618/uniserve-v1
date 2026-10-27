@@ -53,6 +53,12 @@ pub(crate) struct VideoManifest {
     pub(crate) state_bytes: u64,
     /// Whether this rank holds the denoiser and so stores the latent pool.
     pub(crate) stores_latent: bool,
+    /// On a denoising rank, the digest of what its latent pages mean
+    /// besides the denoiser's numerics: the video plan that selects a
+    /// request's layout and the rank's coordinates in the denoiser's mesh,
+    /// which keys the trajectories it stores in its host latent pool.
+    #[serde(default)]
+    pub(crate) latent_region: Option<String>,
     /// Media units of the longest admitted video.
     pub(crate) units: usize,
 }

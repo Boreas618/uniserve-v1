@@ -34,7 +34,8 @@ enum Pages {
 }
 
 /// The fences of a batch's page copies, recorded on the copy stream of the
-/// cache's `device`. A batch without copies has neither.
+/// cache's `device`, and of its trajectory offloads, recorded on the copy
+/// stream of the latent banks' device. A batch without copies has none.
 #[derive(Default)]
 struct PageFences {
     device: Option<cuda::DeviceId>,
@@ -42,6 +43,9 @@ struct PageFences {
     loads: Option<Arc<cuda::Event>>,
     /// Behind the offloads: the batch's output waits on it.
     offloads: Option<Arc<cuda::Event>>,
+    /// Behind the trajectory offloads, with the banks' device: the batch's
+    /// output waits on it.
+    latents: Option<(cuda::DeviceId, Arc<cuda::Event>)>,
 }
 
 /// A submitted batch with its lifecycle and numerical state.
@@ -284,32 +288,71 @@ impl WorkerBackend {
         admitted.map(|()| submitted)
     }
 
-    /// Record the batch's host KV cache copies on the copy stream and submit
-    /// them; `None` when the batch copies no page.
+    /// Record the batch's host KV cache copies and trajectory offloads on
+    /// the copy streams and submit them; `None` when the batch copies no
+    /// page.
     fn issue_pages(
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
         let plan = &batch.plan;
-        if plan.page_loads.is_empty() && plan.page_offloads.is_empty() {
+        if plan.page_loads.is_empty()
+            && plan.page_offloads.is_empty()
+            && plan.latent_offloads.is_empty()
+        {
             batch.pages = Pages::Issued(PageFences::default());
             return Ok(None);
         }
-        let prefix_cache = self
-            .owners
-            .worker_storage
-            .as_mut()
-            .and_then(|storage| storage.prefix_cache.as_mut())
-            .ok_or_else(|| {
-                Error::Invalid("a batch copies pages but the rank has no prefix cache".into())
-            })?;
-        let issued = prefix_cache.issue_pages(&plan.page_loads, &plan.page_offloads)?;
-        let job = self.jobs.start(issued.job, true);
-        batch.pages = Pages::Issuing(PageFences {
-            device: Some(issued.device),
-            loads: issued.loads,
-            offloads: issued.offloads,
-        });
+        let mut fences = PageFences::default();
+        let job = if plan.page_loads.is_empty() && plan.page_offloads.is_empty() {
+            Job::new()
+        } else {
+            let prefix_cache = self
+                .owners
+                .worker_storage
+                .as_mut()
+                .and_then(|storage| storage.prefix_cache.as_mut())
+                .ok_or_else(|| {
+                    Error::Invalid("a batch copies pages but the rank has no prefix cache".into())
+                })?;
+            let issued = prefix_cache.issue_pages(&plan.page_loads, &plan.page_offloads)?;
+            fences.device = Some(issued.device);
+            fences.loads = issued.loads;
+            fences.offloads = issued.offloads;
+            issued.job
+        };
+        if !plan.latent_offloads.is_empty() {
+            // Each trajectory is its request's slot on this rank.
+            let offloads = plan
+                .latent_offloads
+                .iter()
+                .map(|offload| {
+                    let request = self
+                        .requests
+                        .peek(offload.request_key.request_id.0)
+                        .filter(|request| request.key() == offload.request_key)
+                        .ok_or_else(|| {
+                            Error::Invalid(
+                                "a batch offloads the trajectory of a request the rank does not \
+                                 hold"
+                                    .into(),
+                            )
+                        })?;
+                    Ok((request.slot(), offload))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let ledger = self
+                .owners
+                .computations
+                .as_mut()
+                .and_then(|computations| computations.ledger_mut())
+                .ok_or_else(|| {
+                    Error::Invalid("a batch offloads a trajectory but the rank has none".into())
+                })?;
+            fences.latents = Some(ledger.offload(&offloads, &job)?);
+        }
+        let job = self.jobs.start(job, true);
+        batch.pages = Pages::Issuing(fences);
         Ok(Some(job))
     }
 
@@ -484,10 +527,18 @@ impl WorkerBackend {
                 .collect(),
             None => Vec::new(),
         };
-        // The output reports the batch's page offloads complete.
+        // The output reports the batch's page and trajectory offloads
+        // complete.
         if let Pages::Issued(PageFences {
             device: Some(device),
             offloads: Some(fence),
+            ..
+        }) = &batch.pages
+        {
+            fences.push((*device, Arc::clone(fence)));
+        }
+        if let Pages::Issued(PageFences {
+            latents: Some((device, fence)),
             ..
         }) = &batch.pages
         {

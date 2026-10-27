@@ -8,8 +8,8 @@ use proto::request::{
     DiffusionSamplingParams, Event, FeedbackNextToken, FeedbackSource, FinishReason,
     GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder,
     ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaKind,
-    MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind, Request, RequestId,
-    SamplingParams, StopReason, TokenLogprob, wire,
+    MigrationCause, MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
+    Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory, wire,
 };
 
 /// A generation request with every field away from its default.
@@ -143,6 +143,13 @@ fn requests_come_back_from_their_messages_unchanged() {
                 width: 64,
                 height: 32,
             },
+            // A resumed request names its trajectory, the steps an engine
+            // stored and the latent seed it continues with.
+            trajectory: Trajectory {
+                id: 11,
+                denoised_steps: 4,
+                state_seed: Some(13),
+            },
         }),
     ];
     for request in requests {
@@ -269,6 +276,10 @@ fn events_come_back_from_their_messages_unchanged() {
         },
         Event::Error {
             message: "lost".to_owned(),
+        },
+        Event::Migratable {
+            cause: MigrationCause::Drain,
+            denoised_steps: 3,
         },
     ];
     for event in events {

@@ -320,11 +320,17 @@ pub(super) fn rank_projection(
             .enumerate()
             .filter_map(|(index, members)| members.contains(&rank).then_some(index))
             .collect::<Vec<_>>();
-        // A rank also takes part to copy its share of the batch's pages.
+        // A rank also takes part to copy its share of the batch's pages and
+        // trajectories.
         let copies_pages = batch
             .page_offloads
             .iter()
-            .any(|copy| copy.rank as usize == rank);
+            .any(|copy| copy.rank as usize == rank)
+            || batch
+                .latent_offloads
+                .iter()
+                .flat_map(|offload| &offload.pages)
+                .any(|copy| copy.rank as usize == rank);
         if indices.is_empty() && batch.commands.is_empty() && !copies_pages {
             continue;
         }
@@ -375,6 +381,12 @@ pub(super) fn rank_projection(
         projection
             .page_offloads
             .retain(|copy| copy.rank as usize == rank);
+        for offload in &mut projection.latent_offloads {
+            offload.pages.retain(|copy| copy.rank as usize == rank);
+        }
+        projection
+            .latent_offloads
+            .retain(|offload| !offload.pages.is_empty());
         let identities = projection
             .calls
             .iter()
@@ -419,6 +431,7 @@ pub(super) fn rank_projection(
         if projection.calls.is_empty()
             && projection.commands.is_empty()
             && projection.page_offloads.is_empty()
+            && projection.latent_offloads.is_empty()
         {
             continue;
         }
@@ -430,11 +443,44 @@ pub(super) fn rank_projection(
 
 #[cfg(test)]
 mod tests {
-    use super::{output_owner, refuse_shared_storage_off_engine_host};
+    use super::{output_owner, rank_projection, refuse_shared_storage_off_engine_host};
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
     use ipc::MediaCall;
     use std::collections::BTreeMap;
+
+    /// A batch of trajectory offloads alone reaches each rank that copies
+    /// pages of it, with its own pages only, and no other rank.
+    #[test]
+    fn each_rank_receives_its_own_pages_of_a_trajectory_offload() {
+        let request_key = ipc::RequestKey::new(1, ipc::RequestId(9), 1);
+        let page = |rank: u32, page: u32| ipc::LatentPageCopy {
+            rank,
+            pool: 3,
+            slot: u64::from(rank * 2 + page),
+            page,
+        };
+        let mut batch = ipc::Batch::new(4, Vec::new(), Vec::new());
+        batch.latent_offloads = vec![ipc::LatentOffload {
+            request_key,
+            pages: vec![page(0, 0), page(0, 1), page(2, 0), page(2, 1)],
+        }];
+
+        let projections =
+            rank_projection(&batch, &BTreeMap::new(), 3, &[], |_, _, _| Vec::new()).unwrap();
+        let ranks: Vec<usize> = projections.iter().map(|(rank, _)| *rank).collect();
+        assert_eq!(ranks, [0, 2]);
+        for (rank, projection) in &projections {
+            let [offload] = projection.latent_offloads.as_slice() else {
+                panic!("rank {rank} offloads one trajectory: {projection:?}");
+            };
+            assert_eq!(offload.request_key, request_key);
+            assert_eq!(
+                offload.pages,
+                [page(*rank as u32, 0), page(*rank as u32, 1)]
+            );
+        }
+    }
 
     #[test]
     fn a_call_joins_on_the_first_component_rank_it_is_planned_on() {

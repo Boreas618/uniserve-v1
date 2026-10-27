@@ -93,6 +93,19 @@ def test_pytorch_modules_compute_their_documented_function():
     assert numerics.function(nn.Embedding) == "torch.nn.Embedding/1"
 
 
+def test_a_dependencys_modules_compute_its_installed_versions_function():
+    from importlib import metadata
+
+    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (
+        MiniMaxH3AudioBigVGANDecoder,
+    )
+
+    assert numerics.function(MiniMaxH3AudioBigVGANDecoder) == (
+        "diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio."
+        f"MiniMaxH3AudioBigVGANDecoder/{metadata.version('diffusers')}"
+    )
+
+
 def test_weight_loading_follows_the_package_and_the_quantizers_in_use(
     monkeypatch,
 ):

@@ -424,6 +424,9 @@ pub struct Call {
     pub cache_input: Option<BufferId>,
     /// Identity under which this call publishes or installs cache state.
     pub cache_output: Option<BufferId>,
+    /// The stored trajectory a resumed video request's latent preparation
+    /// opens at, instead of step zero; absent for every other call.
+    pub latent_restore: Option<LatentRestore>,
 }
 
 impl Call {
@@ -478,6 +481,7 @@ impl Call {
             input_image: None,
             cache_input: None,
             cache_output: None,
+            latent_restore: None,
         }
     }
 
@@ -781,6 +785,15 @@ impl Call {
             self.image_index.is_some() == prepares_image && self.image_index != Some(0),
             "exactly an image latent preparation names a positive image index"
         );
+        // Only a video latent preparation, whose rank holds the slot's
+        // pages, opens a stored trajectory.
+        if let Some(restore) = &self.latent_restore {
+            restore.validate()?;
+            ensure_valid!(
+                self.kind == CallKind::Media(MediaCall::LatentPreparation) && !prepares_image,
+                "only a video latent preparation restores a stored trajectory"
+            );
+        }
         Ok(())
     }
 }

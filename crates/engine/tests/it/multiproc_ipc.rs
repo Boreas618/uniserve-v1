@@ -2343,7 +2343,8 @@ fn a_request_on_a_lost_group_migrates_and_continues_after_the_relaunch() -> anyh
             matches!(
                 terminal,
                 Event::Migratable {
-                    cause: proto::request::MigrationCause::Loss
+                    cause: proto::request::MigrationCause::Loss,
+                    ..
                 }
             ),
             "the lost request did not leave as migratable: {terminal:?}"
@@ -2500,6 +2501,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                     width: 1344,
                     height: 768,
                 },
+                trajectory: Default::default(),
             }))?;
             requests.push((request_id, events));
         }

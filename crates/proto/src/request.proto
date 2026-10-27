@@ -119,6 +119,11 @@ message EngineInfo {
   // compute: equal between worlds whose models and numerics agree, whose
   // pages a successor reuses.
   uint64 prefix_seed = 8;
+  // The seed of the keys of the latent trajectories the engine's video
+  // denoiser stores at preemption: equal between worlds whose denoising
+  // computes the same, which continue each other's trajectories exactly;
+  // zero for an engine without a video denoiser.
+  uint64 latent_seed = 9;
 }
 
 // The batch an engine's workers were started for.
@@ -629,6 +634,21 @@ message DiffusionRequest {
   bytes conditioning = 3;
   repeated ConditionExtent conditions = 4;
   DiffusionSamplingParams sampling = 5;
+  // The identity of the request's latent trajectory, which keys the
+  // trajectory an engine stores when it preempts the request: the daemon
+  // gives a request one when it first submits it and keeps it across its
+  // migrations.
+  uint64 trajectory = 6;
+  // The denoising steps of the trajectory an engine stored when it
+  // preempted the request; zero for a request that starts from noise. The
+  // engine that serves it continues from that step when its store holds
+  // the trajectory, and from noise otherwise.
+  uint32 denoised_steps = 7;
+  // The latent seed of the world whose stored trajectory the request
+  // continues although the serving world's denoising computes other
+  // numerics (a world change's `in_flight = keep`); absent, the engine reads
+  // a trajectory of its own latent seed only.
+  optional uint64 state_seed = 8;
 }
 
 message ConditionExtent {
@@ -675,9 +695,14 @@ message Event {
 
 // The request ends on this engine without finishing: every token it
 // generated here has been sent, and the daemon may submit it again, with
-// those tokens, to the engine that serves next. A terminal event.
+// those tokens or the trajectory steps the engine stored, to the engine that
+// serves next. A terminal event.
 message Migratable {
   MigrationCause cause = 1;
+  // For a video request, the denoising steps of its trajectory the engine
+  // stored in its host latent pools at the step boundary it was preempted
+  // at, which the daemon submits it again with; zero when it stored none.
+  uint32 denoised_steps = 2;
 }
 
 enum MigrationCause {

@@ -16,7 +16,7 @@ use super::{
     GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder,
     ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaKind,
     MigrationCause, MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
-    Request, RequestId, SamplingParams, StopReason, TokenLogprob,
+    Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
 };
 
 /// A message that states no valid value.
@@ -527,6 +527,9 @@ impl From<&DiffusionRequest> for wire::DiffusionRequest {
                 width: sampling.width,
                 height: sampling.height,
             }),
+            trajectory: request.trajectory.id,
+            denoised_steps: request.trajectory.denoised_steps,
+            state_seed: request.trajectory.state_seed,
         }
     }
 }
@@ -562,6 +565,11 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
                 seed: sampling.seed,
                 width: sampling.width,
                 height: sampling.height,
+            },
+            trajectory: Trajectory {
+                id: request.trajectory,
+                denoised_steps: request.denoised_steps,
+                state_seed: request.state_seed,
             },
         })
     }
@@ -688,11 +696,15 @@ impl Event {
             Self::Error { message } => Kind::Error(wire::Failed {
                 message: message.clone(),
             }),
-            Self::Migratable { cause } => Kind::Migratable(wire::Migratable {
+            Self::Migratable {
+                cause,
+                denoised_steps,
+            } => Kind::Migratable(wire::Migratable {
                 cause: match cause {
                     MigrationCause::Drain => wire::MigrationCause::Drain,
                     MigrationCause::Loss => wire::MigrationCause::Loss,
                 } as i32,
+                denoised_steps: *denoised_steps,
             }),
         };
         let event = wire::Event {
@@ -813,6 +825,7 @@ impl Event {
                     wire::MigrationCause::Drain => MigrationCause::Drain,
                     wire::MigrationCause::Loss => MigrationCause::Loss,
                 },
+                denoised_steps: migratable.denoised_steps,
             },
         };
         Ok((request, event))

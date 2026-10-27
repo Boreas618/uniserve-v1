@@ -22,15 +22,28 @@
 //! model's denoiser and its decoder): each waits for the previous user on
 //! another stream ([`LatentLedger::enter`]) and records its end
 //! ([`LatentLedger::leave`]).
+//!
+//! A video denoising rank whose host maps a host latent pool
+//! ([`LatentHostPool`]) writes a preempted request's committed trajectory
+//! there, on a copy stream behind every batch that used the banks
+//! ([`LatentLedger::offload`]), and a resumed request's latent preparation
+//! copies the stored pages into the bank it initializes and commits the
+//! trajectory at the stored step ([`LatentLedger::bind_restore`]).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use ipc::{BufferId, Call, CallKind, ImageParams, LatentParams, MediaCall, RequestKey};
+use cuda::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
+use ipc::{
+    BufferId, Call, CallKind, ImageParams, LatentOffload, LatentParams, LatentRestore, MediaCall,
+    RequestKey,
+};
 
 use crate::Error;
 use crate::executor::batch::StreamOrder;
-use crate::memory::TrajectoryVersion;
+use crate::job::Job;
 use crate::memory::allocation::StorageView;
+use crate::memory::{LatentHostPool, TrajectoryVersion};
 use crate::stream::Issue;
 use crate::{LatentPool, LatentStorage, LatentUpdate, Result};
 
@@ -58,6 +71,26 @@ pub(crate) struct LatentLedger {
     canvases: HashMap<usize, (u32, u32)>,
     /// Orders batches addressing the banks across the computations' streams.
     order: StreamOrder,
+    /// The host latent pool of a video denoising rank that maps one, and the
+    /// copy stream its offloads run on.
+    host: Option<HostCopies>,
+}
+
+/// The host latent pool and the copy stream of the banks' device.
+struct HostCopies {
+    pool: LatentHostPool,
+    stream: Stream,
+    device: DeviceId,
+}
+
+/// What [`LatentLedger::bind_restore`] binds of a resumed request's latent
+/// preparation: its banks and commit, and the stored pages it copies.
+pub(crate) struct Restored {
+    pub(crate) banks: Banks,
+    pub(crate) update: LatentUpdate,
+    /// The index of each restored page among the slot's pages, with its
+    /// `[page_units]` float32 view in the host latent pool.
+    pub(crate) pages: Vec<(u32, StorageView)>,
 }
 
 /// What [`LatentLedger::bind`] binds of one call.
@@ -101,6 +134,7 @@ impl LatentLedger {
             layout: Layout::Slots { pages },
             canvases: HashMap::new(),
             order: StreamOrder::default(),
+            host: None,
         }
     }
 
@@ -115,7 +149,157 @@ impl LatentLedger {
             layout: Layout::Scheduled,
             canvases: HashMap::new(),
             order: StreamOrder::default(),
+            host: None,
         }
+    }
+
+    /// The pages each request slot owns, for a video model's ledger; `None`
+    /// for an image model's, whose trajectories the scheduler pages.
+    pub(crate) fn slot_pages(&self) -> Option<u32> {
+        match self.layout {
+            Layout::Slots { pages } => u32::try_from(pages).ok(),
+            Layout::Scheduled => None,
+        }
+    }
+
+    /// The values one page holds.
+    pub(crate) fn page_units(&self) -> u64 {
+        self.page_units
+    }
+
+    /// Write preempted trajectories to `pool` and restore resumed ones from
+    /// it from now on, the offloads on `stream`, a copy stream of the banks'
+    /// `device`.
+    pub(crate) fn attach_host(&mut self, pool: LatentHostPool, stream: Stream, device: DeviceId) {
+        self.host = Some(HostCopies {
+            pool,
+            stream,
+            device,
+        });
+    }
+
+    /// Record into `job` the copies of `offloads` on the copy stream, each
+    /// the committed trajectory of the request in the slot it names with
+    /// it: every page of the bank holding the committed step into the pool
+    /// slot the engine reserved for it. The copies wait for the last batch
+    /// that used the banks on another stream; the batch's output waits on
+    /// the returned fence, recorded on the copy stream of the returned
+    /// device, after which the engine commits the pool slots. The engine
+    /// sends them once every call of the requests completed, so no batch
+    /// writes the trajectories meanwhile.
+    ///
+    /// Fails for a rank that maps no latent pool, a request without a
+    /// committed step past zero, or a page or pool slot outside its pool.
+    pub(crate) fn offload(
+        &mut self,
+        offloads: &[(usize, &LatentOffload)],
+        job: &Job,
+    ) -> Result<(DeviceId, Arc<Event>)> {
+        let host = self.host.as_ref().ok_or_else(|| {
+            Error::Invalid("a batch offloads a trajectory but the rank maps no latent pool".into())
+        })?;
+        let Layout::Slots { pages } = self.layout else {
+            return Err(Error::Invariant(
+                "only a video trajectory is offloaded".into(),
+            ));
+        };
+        let mut batch = CopyBatch::new(SourceOrder::Stream);
+        for &(slot, offload) in offloads {
+            if self.pool.step_index(slot) < 1 {
+                return Err(Error::Invalid(
+                    "an offloaded trajectory has no committed step".into(),
+                ));
+            }
+            let bank = self.pool.committed_bank(slot);
+            let first = 1 + (slot as u64 - 1) * pages;
+            for copy in &offload.pages {
+                if u64::from(copy.page) >= pages {
+                    return Err(Error::Invalid(format!(
+                        "latent page {} is outside a slot of {pages} pages",
+                        copy.page
+                    )));
+                }
+                let device = self
+                    .storage
+                    .page_address(bank, first + u64::from(copy.page))?;
+                batch.push(
+                    host.pool.address(copy)?,
+                    device,
+                    host.pool.page_bytes() as usize,
+                );
+            }
+        }
+        let issue = job.on(Some(&host.stream));
+        self.order.wait(issue)?;
+        // SAFETY: the pool slots are reserved for this rank until the engine
+        // commits them after the batch's output, which waits for these
+        // copies; the banks outlive the rank's batches, and no batch writes
+        // the requests' pages before their slots retire.
+        unsafe { issue.copy(&batch) }?;
+        let fence = Arc::new(Event::new(EventFlags::default()));
+        issue.record(&fence)?;
+        self.order.record(issue)?;
+        tracing::debug!(
+            trajectories = offloads.len(),
+            "offloading preempted trajectories to the host latent pool"
+        );
+        Ok((host.device, fence))
+    }
+
+    /// The banks a resumed video request's latent preparation reads and
+    /// writes in `slot`, its commit at the stored step of `restore`, and the
+    /// views of the stored pages `rank` copies into the bank it initializes:
+    /// one for every page of the slot.
+    ///
+    /// Fails for a rank that maps no latent pool, an image model's ledger,
+    /// or a restore that does not name every page of the slot on `rank`
+    /// exactly once.
+    pub(crate) fn bind_restore(
+        &self,
+        slot: usize,
+        call: &Call,
+        restore: &LatentRestore,
+        rank: u32,
+    ) -> Result<Restored> {
+        let host = self.host.as_ref().ok_or_else(|| {
+            Error::Invalid("a call restores a trajectory but the rank maps no latent pool".into())
+        })?;
+        let Layout::Slots { pages } = self.layout else {
+            return Err(Error::Invariant(
+                "only a video trajectory is restored".into(),
+            ));
+        };
+        let canvas = *self
+            .canvases
+            .get(&slot)
+            .ok_or_else(|| Error::Invalid("a denoising request has no canvas".into()))?;
+        let params = self.slot_params(slot, call, canvas, pages);
+        let mut restored: Vec<(u32, StorageView)> = restore
+            .pages
+            .iter()
+            .filter(|copy| copy.rank == rank)
+            .map(|copy| Ok((copy.page, host.pool.view(copy)?)))
+            .collect::<Result<_>>()?;
+        restored.sort_by_key(|(page, _)| *page);
+        if !restored
+            .iter()
+            .map(|(page, _)| u64::from(*page))
+            .eq(0..pages)
+        {
+            return Err(Error::Invalid(
+                "a latent restore does not name every page of the slot on this rank".into(),
+            ));
+        }
+        let bound = self.initial(slot, call, params)?;
+        let update = LatentUpdate::restored(bound.update, i64::from(restore.steps))?;
+        Ok(Restored {
+            banks: Banks {
+                step: i64::from(restore.steps),
+                ..bound.banks
+            },
+            update,
+            pages: restored,
+        })
     }
 
     /// Note the canvas `(width, height)` of the video request admitted to
@@ -533,6 +717,36 @@ mod tests {
         ledger.admit(2, canvas);
         let (banks, _) = ledger.bind(2, &preparation, MediaCall::LatentPreparation)?;
         assert_eq!((banks.read, banks.write, banks.step), (1, 1, 0));
+        Ok(())
+    }
+
+    /// A resumed request's latent preparation commits the stored step it
+    /// restored: its first denoising call reads the bank the preparation
+    /// wrote, at that step. A restore at step zero is refused, and so is an
+    /// initialization that publishes another step without restoring.
+    #[test]
+    fn a_restored_trajectory_continues_from_its_stored_step() -> Result<()> {
+        let mut ledger = ledger()?;
+        ledger.admit(1, (1344, 768));
+        let preparation = call(1, MediaCall::LatentPreparation);
+        let (prepared, initial) = ledger.bind(1, &preparation, MediaCall::LatentPreparation)?;
+        assert!(LatentUpdate::restored(initial.clone(), 0).is_err());
+        let mut unrestored = initial.clone();
+        unrestored.step_index = 3;
+        assert!(ledger.validate(&[unrestored]).is_err());
+
+        let restored = LatentUpdate::restored(initial, 3)?;
+        ledger.validate(std::slice::from_ref(&restored))?;
+        ledger.apply(&[restored])?;
+        let (banks, update) =
+            ledger.bind(1, &call(1, MediaCall::Denoising), MediaCall::Denoising)?;
+        assert_eq!(
+            (banks.read, banks.write, banks.step),
+            (prepared.write, 1 - prepared.write, 3)
+        );
+        ledger.validate(std::slice::from_ref(&update))?;
+        ledger.apply(&[update])?;
+        assert_eq!(ledger.pool().step_index(1), 4);
         Ok(())
     }
 

@@ -47,6 +47,9 @@ pub(crate) struct LatentUpdate {
     pub generation: i64,
     pub step_index: i64,
     pub release: bool,
+    /// Whether an initialization commits a stored trajectory at
+    /// `step_index` rather than noise at step zero.
+    pub restored: bool,
 }
 
 impl LatentUpdate {
@@ -108,6 +111,25 @@ impl LatentUpdate {
             generation,
             step_index,
             release,
+            restored: false,
+        })
+    }
+
+    /// The initialization `initial` of a slot-local trajectory, committing
+    /// the stored trajectory a resumed request's latent preparation copied
+    /// in at `step` instead of noise at step zero. A slot-local trajectory's
+    /// generation is one past its step, as its denoising calls advance it.
+    pub(crate) fn restored(initial: Self, step: i64) -> Result<Self> {
+        if initial.expected_generation != 0 || initial.release || step < 1 {
+            return Err(Error::Invalid(
+                "a trajectory is restored by its initialization at a positive step".into(),
+            ));
+        }
+        Ok(Self {
+            generation: step + 1,
+            step_index: step,
+            restored: true,
+            ..initial
         })
     }
 }
@@ -293,6 +315,11 @@ impl LatentPool {
 
     pub(crate) fn next_bank(&self, slot: usize) -> u8 {
         1 - self.slots[slot].bank
+    }
+
+    /// The bank holding the slot's committed step.
+    pub(crate) fn committed_bank(&self, slot: usize) -> u8 {
+        self.slots[slot].bank
     }
 
     /// Prepare an export before the backend constructs its numerical views.
@@ -571,7 +598,9 @@ impl LatentPool {
 
             self.validate_metadata(&trajectory(update.step_index, update.generation))?;
             if update.expected_generation == 0 {
-                if update.expected_step_index != 0 || update.step_index != 0 {
+                // An initialization publishes step zero, or the stored step
+                // of the trajectory a resumed request restored.
+                if update.expected_step_index != 0 || (update.step_index != 0 && !update.restored) {
                     return Err(Error::Invalid(
                         "latent initialization must publish step zero".into(),
                     ));
@@ -876,6 +905,7 @@ mod tests {
             generation: 1,
             step_index: 0,
             release: false,
+            restored: false,
         }
     }
 

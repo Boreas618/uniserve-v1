@@ -202,8 +202,8 @@ class Denoiser:
         pool: The graph pool captures allocate in; ``None`` serves every
             step eagerly.
         transient: The transient layouts kept at once.
-        banks: The latent banks ``[pages, page_units]`` float32, bank 0 and
-            bank 1.
+        banks: The latent banks ``[pages, page_units, 1]`` float32, bank 0
+            and bank 1: a video model's latent width is one value per unit.
     """
 
     def __init__(
@@ -505,6 +505,51 @@ class Denoiser:
                         : field.elements
                     ],
                 )
+
+    def restore(
+        self,
+        slot: int,
+        bank: int,
+        pages: Sequence[int],
+        stored: Sequence[torch.Tensor],
+        predicate: torch.Tensor | None = None,
+    ) -> None:
+        """Copy a stored trajectory's pages into a request's slot.
+
+        ``stored`` holds each page of ``pages`` (its index among the slot's
+        pages) as the ``[page_units]`` float32 host tensor of the host latent
+        pool, which the engine keeps pinned until the call's result: the
+        values of one bank page, contiguous as the worker offloaded them.
+        Each replaces that page of ``bank``, after :meth:`initialize` wrote
+        the request's noise there. A false ``predicate`` (the call's
+        ``uint8 [1]`` device predicate) leaves the bank as it was.
+        """
+        span = self._slot_pages(slot)
+        target = self.banks[bank][span]
+        if len(pages) != len(stored) or len(pages) != target.shape[0]:
+            raise ValueError(
+                "a restored trajectory names every page of its slot once"
+            )
+        with torch.cuda.stream(self.stream):
+            for page, source in zip(pages, stored, strict=True):
+                # A bank page is contiguous, so its flat view is the run of
+                # values the host pool's page holds.
+                destination = target[page].view(-1)
+                if (
+                    source.dtype != destination.dtype
+                    or source.shape != destination.shape
+                ):
+                    raise ValueError(
+                        "a stored latent page differs from the slot's pages: "
+                        f"{source.dtype} {tuple(source.shape)} for "
+                        f"{destination.dtype} {tuple(destination.shape)}"
+                    )
+                if predicate is None:
+                    destination.copy_(source, non_blocking=True)
+                    continue
+                staged = torch.empty_like(destination)
+                staged.copy_(source, non_blocking=True)
+                destination.copy_(kept(predicate, staged, destination))
 
     @property
     def conditions(self) -> bool:

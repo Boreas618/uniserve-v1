@@ -124,9 +124,21 @@ impl Scheduler {
         };
         // The worker reports the steps it has completed; a denoising result
         // that does not advance the trajectory would be scheduled again
-        // without end.
-        let step_valid = call.kind != CallKind::Media(MediaCall::Denoising)
-            || record.step_index > state.denoising.completed();
+        // without end. A latent preparation opens the trajectory at the step
+        // it restored, or at zero.
+        let step_valid = match call.kind {
+            CallKind::Media(MediaCall::Denoising) => {
+                record.step_index > state.denoising.completed()
+            }
+            CallKind::Media(MediaCall::LatentPreparation) => {
+                record.step_index
+                    == call
+                        .latent_restore
+                        .as_ref()
+                        .map_or(0, |restore| restore.steps)
+            }
+            _ => true,
+        };
         let valid = record.status == CallStatus::Ok
             && record.request_key == call.request_key
             && record.call_id == call.call_id
@@ -189,7 +201,10 @@ impl Scheduler {
                         }
                     }
                     CallKind::Media(MediaCall::LatentPreparation) => {
-                        state.denoising.open(None);
+                        // `valid` requires the step to be the restored one,
+                        // which a preemption stored short of the schedule.
+                        let opened = state.denoising.open(record.step_index, None);
+                        debug_assert!(opened, "a restored trajectory has a step left");
                         consumed_products.extend(state.condition_video_latents.iter().cloned());
                         consumed_products.extend(state.condition_audio_latents.iter().cloned());
                     }
@@ -272,6 +287,11 @@ impl Scheduler {
                     .map(|product| product.buffer_id()),
             );
         }
+        // The latent preparation read the pages its restore pinned, or
+        // failed: either way the pins end.
+        if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
+            self.end_restore(id);
+        }
 
         // Retire the request only once none of its calls remain in flight. A
         // failure outranks a finish, which outranks a closed output; a muxed
@@ -314,6 +334,11 @@ impl Scheduler {
             return;
         };
         self.running_order.retain(|candidate| *candidate != id);
+        // The pins of its stored trajectory end, and a store not yet carried
+        // to its workers is aborted.
+        if let Some(store) = self.trajectories.as_mut() {
+            store.forget(id);
+        }
         match event {
             DiffusionTerminal::Completed(artifact) => {
                 let _ = state.output.enqueue(Event::Artifact(artifact));
@@ -341,6 +366,12 @@ impl Scheduler {
                     prompt_tokens: state.request.prompt_token_ids.len(),
                     completion_tokens: 0,
                     images: 0,
+                });
+            }
+            DiffusionTerminal::Migrated(cause, denoised_steps) => {
+                let _ = state.output.enqueue(Event::Migratable {
+                    cause,
+                    denoised_steps,
                 });
             }
         }
@@ -539,12 +570,16 @@ impl Scheduler {
         }
         // The page offloads the batch carried are committed when every call
         // ran, and aborted otherwise.
-        if batch_complete && let Some(kv_offload) = self.kv_offload.as_mut() {
-            let succeeded = report
-                .results
-                .iter()
-                .all(|result| result.output.status != ipc::CallStatus::Error);
-            kv_offload.completed(result_batch_id, succeeded && !invalid_result);
+        if batch_complete {
+            let succeeded = !invalid_result
+                && report
+                    .results
+                    .iter()
+                    .all(|result| result.output.status != ipc::CallStatus::Error);
+            if let Some(kv_offload) = self.kv_offload.as_mut() {
+                kv_offload.completed(result_batch_id, succeeded);
+            }
+            self.trajectory_batch_completed(result_batch_id, succeeded);
         }
         if invalid_result {
             self.fatal = true;

@@ -513,6 +513,9 @@ pub struct SchedulerHandle {
     /// which a successor world matches the scheduler's prefix cache index;
     /// `None` without a prefix cache.
     cache_group: Option<String>,
+    /// The latent seed of what the scheduler's video denoising computes,
+    /// which keys the trajectories it stores (`Scheduler::latent_seed`).
+    latent_seed: u64,
     /// The served model identifier.
     model: String,
     /// Set after `Scheduler::run` returns a fatal exit (executor or worker
@@ -865,6 +868,14 @@ impl SchedulerHandle {
                 )
                 .context("sizing the world's host KV cache")?;
         }
+        // Video denoising ranks that map host latent pools report them: a
+        // preempted request's trajectory is stored there.
+        scheduler.enable_trajectory_store(
+            &storage::socket::default_socket(),
+            &config.worker_process.deployment,
+            config.world,
+            &config.worker_process.host,
+        );
         Self::spawn(scheduler, config.worker_process.model, waker)
     }
 
@@ -888,6 +899,7 @@ impl SchedulerHandle {
         let info = scheduler.info().clone();
         let generation_limits = scheduler.generation_limits().clone();
         let cache_group = scheduler.cache_group();
+        let latent_seed = scheduler.latent_seed();
         let stats = scheduler.stats_handle();
         let failure = scheduler.failure_handle();
         let trial = scheduler.on_trial();
@@ -912,6 +924,7 @@ impl SchedulerHandle {
             stats,
             generation_limits,
             cache_group,
+            latent_seed,
             model: model.into(),
             dead,
             failure,
@@ -946,6 +959,13 @@ impl SchedulerHandle {
     /// `None` without a prefix cache.
     pub fn cache_group(&self) -> Option<String> {
         self.cache_group.clone()
+    }
+
+    /// Returns the latent seed of what the scheduler's video denoising
+    /// computes, which keys the trajectories it stores at preemption; zero
+    /// when it stores none.
+    pub fn latent_seed(&self) -> u64 {
+        self.latent_seed
     }
 
     /// Promotes the scheduler, whose world succeeds another: its workers

@@ -108,6 +108,7 @@ impl SimExecutor {
     pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
         let placement = engine.placement.clone();
+        let latent_pools = engine.latent_pools.clone();
         let results_on_wait = engine.results_on_wait;
         let depth = placement.queue_depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
@@ -148,7 +149,12 @@ impl SimExecutor {
                 let id = WorkerGroupId("sim".to_owned());
                 ExecutorInfo {
                     workers: vec![(id.clone(), info.clone())],
-                    placements: BTreeMap::from([(id, placement)]),
+                    placements: BTreeMap::from([(id.clone(), placement)]),
+                    rank_latents: if latent_pools.is_empty() {
+                        BTreeMap::new()
+                    } else {
+                        BTreeMap::from([(id, latent_pools)])
+                    },
                     ..ExecutorInfo::default()
                 }
             },
@@ -777,6 +783,9 @@ pub struct SimEngine {
     /// of their media calls completes with `ErrorCode::InputError`, as a
     /// rank reports a request whose size its model does not serve.
     refused: HashMap<RequestId, String>,
+    /// The host latent pools of the simulated pool's ranks, with each
+    /// rank's host (`ExecutorInfo::rank_latents`); empty without them.
+    latent_pools: Vec<(String, Option<ipc::LatentPoolInfo>)>,
 }
 
 impl SimEngine {
@@ -848,6 +857,7 @@ impl SimEngine {
             predicated_release: None,
             requests: HashMap::new(),
             refused: HashMap::new(),
+            latent_pools: Vec::new(),
         }
     }
 
@@ -1228,7 +1238,16 @@ impl SimEngine {
             | CallKind::Transfer(TransferMode::CacheInstall) => {
                 set_cache_lengths(&mut record, request.cache_visible_len);
             }
-            CallKind::Media(MediaCall::LatentPreparation) => {}
+            CallKind::Media(MediaCall::LatentPreparation) => {
+                // A restored trajectory opens at its stored step; any other
+                // at step zero.
+                let opened = call
+                    .latent_restore
+                    .as_ref()
+                    .map_or(0, |restore| restore.steps);
+                request.step_index = u16::try_from(opened).unwrap_or(u16::MAX);
+                record.step_index = opened;
+            }
             CallKind::Media(MediaCall::Denoising) => {
                 // A denoising call runs one step.
                 request.step_index = request.step_index.saturating_add(1);
@@ -1473,6 +1492,15 @@ impl SimEngine {
     /// Returns mutable access to the simulator's advertised capabilities.
     pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
         &mut self.info
+    }
+
+    /// States the host latent pool of each of the simulated pool's ranks,
+    /// with the rank's host, as video denoising ranks report them. The
+    /// simulator copies no bytes: an offload's batch completes, and a
+    /// restored latent preparation commits the trajectory at its stored
+    /// step, from which the request's denoising steps continue.
+    pub fn set_latent_pools(&mut self, pools: Vec<(String, Option<ipc::LatentPoolInfo>)>) {
+        self.latent_pools = pools;
     }
 }
 
@@ -1814,6 +1842,7 @@ mod tests {
             outputs: Vec::new(),
             predicate: None,
             image_index: None,
+            latent_restore: None,
         };
         ExecutionBatch::new(
             batch_id,

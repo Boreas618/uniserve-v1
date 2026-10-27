@@ -429,6 +429,7 @@ mod tests {
             generation: 1,
             step_index: 0,
             release: false,
+            restored: false,
         };
         pool.validate_updates(std::slice::from_ref(&update))?;
         pool.apply_updates(&[update]);

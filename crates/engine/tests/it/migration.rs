@@ -189,7 +189,8 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
         matches!(
             terminal,
             Some(Event::Migratable {
-                cause: MigrationCause::Drain
+                cause: MigrationCause::Drain,
+                ..
             })
         ),
         "{terminal:?}"
@@ -200,7 +201,8 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
         matches!(
             terminal,
             Some(Event::Migratable {
-                cause: MigrationCause::Drain
+                cause: MigrationCause::Drain,
+                ..
             })
         ),
         "{terminal:?}"
@@ -441,7 +443,8 @@ fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
         matches!(
             terminal,
             Some(Event::Migratable {
-                cause: MigrationCause::Loss
+                cause: MigrationCause::Loss,
+                ..
             })
         ),
         "{terminal:?}"
@@ -462,7 +465,8 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
         matches!(
             terminal,
             Some(Event::Migratable {
-                cause: MigrationCause::Loss
+                cause: MigrationCause::Loss,
+                ..
             })
         ),
         "{terminal:?}"

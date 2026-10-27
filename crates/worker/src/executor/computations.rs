@@ -801,6 +801,7 @@ fn record_last(
         let prepared = PreparedOwners {
             owners,
             info: parts.info,
+            rank: parts.rank as u32,
             ledger: computations.ledger.as_ref(),
             host_stream: computations.host_stream.clone(),
             borrowed: &inputs.imports.borrowed(),

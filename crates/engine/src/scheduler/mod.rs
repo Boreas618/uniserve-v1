@@ -65,6 +65,7 @@ mod inflight;
 mod ledger;
 pub(crate) mod output;
 mod placement;
+mod preemption;
 mod run;
 mod world;
 
@@ -341,6 +342,28 @@ struct MediaFlowState {
     predecessor: CallId,
     terminal_intent: TerminalIntent,
     artifact: Option<ArtifactEvent>,
+    /// Whether the request's trajectory continues from a stored step, which
+    /// its latent preparation waits for (`trajectories`).
+    restoring: Restoring,
+    /// Whether the host latent pools are storing the trajectory of the
+    /// request, which a preemption ends at a step boundary
+    /// (`TerminalIntent::Migrate`); it leaves once they stored it or failed
+    /// to.
+    offloading: bool,
+}
+
+/// What a video request's latent preparation opens its trajectory from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Restoring {
+    /// Its stored trajectory's pages are being pinned in the host latent
+    /// pools; the preparation waits for the answers.
+    Pinning,
+    /// The pages are pinned (`Some`), or the trajectory starts from noise:
+    /// the request names no stored steps, the host latent pools do not
+    /// serve its denoiser, or a page is missing. The preparation takes it.
+    Ready(Option<ipc::LatentRestore>),
+    /// The preparation was planned; the pins, if any, end with its result.
+    Planned,
 }
 
 /// Progress of a media request's worker admission (`NewRequest`).
@@ -361,6 +384,10 @@ enum DiffusionTerminal {
     Failed(String),
     Rejected(String),
     Finished(FinishReason),
+    /// The request leaves for the cause given, preempted at a denoising
+    /// step boundary, with the steps of its trajectory the host latent
+    /// pools stored (zero for none); the daemon submits it again.
+    Migrated(MigrationCause, u32),
 }
 
 struct PendingMedia {
@@ -429,6 +456,9 @@ pub struct Scheduler {
     /// The decoded tokens between two checkpoints of a request's state
     /// groups (`Scheduler::set_state_interval`).
     state_interval: usize,
+    /// The host latent pools of the video denoiser, when they serve its
+    /// worker group (`Scheduler::enable_trajectory_store`).
+    trajectories: Option<crate::trajectories::TrajectoryStore>,
     /// Set once the scheduler closes its workers: it admits and schedules
     /// nothing more while it offloads its last pages to the host KV cache
     /// (`Scheduler::flush_offloads`).

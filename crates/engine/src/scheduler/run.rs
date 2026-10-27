@@ -233,6 +233,7 @@ impl Scheduler {
             fatal: false,
             kv_offload: None,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
+            trajectories: None,
             closing: false,
             resizing: None,
             asleep: false,
@@ -440,6 +441,93 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Stores the trajectories of preempted video requests in the host
+    /// latent pools of the denoiser's worker group, reached through the
+    /// Storage Server at `socket` for the ranks on `host` (the engine's)
+    /// and over the TCP address another host's rank reports, when every
+    /// rank that executes the denoiser reports one
+    /// (`ExecutorInfo::rank_latents`), as a head of `deployment` in
+    /// `world`, whose trajectories the servers keep its own while it is on
+    /// trial. Without them a preempted request continues from noise
+    /// wherever it resumes.
+    pub fn enable_trajectory_store(
+        &mut self,
+        socket: &std::path::Path,
+        deployment: &str,
+        world: u64,
+        host: &str,
+    ) {
+        let Some(component) = self
+            .info
+            .media_components
+            .get(&MediaCall::Denoising)
+            .cloned()
+        else {
+            return;
+        };
+        let info = self.executor.info();
+        let mut denoisers = Vec::new();
+        for (worker, ranks) in &info.rank_latents {
+            // The ranks that hold trajectories: those the denoiser's component
+            // config assigns, or every rank of a group launched without one.
+            let holders: Vec<usize> = info
+                .component_config(worker, &component)
+                .map_or_else(|| (0..ranks.len()).collect(), |config| config.ranks.clone());
+            let reports: Option<Vec<(u32, crate::trajectories::RankLatents<'_>)>> = holders
+                .iter()
+                .map(|&rank| {
+                    let (rank_host, pool) = ranks.get(rank)?;
+                    Some((
+                        rank as u32,
+                        crate::trajectories::RankLatents {
+                            local: rank_host == host,
+                            pool: pool.as_ref()?,
+                        },
+                    ))
+                })
+                .collect();
+            match reports {
+                Some(reports) if !reports.is_empty() => denoisers.push((worker.clone(), reports)),
+                _ => {}
+            }
+        }
+        if denoisers.is_empty() {
+            return;
+        }
+        let mut store = match crate::trajectories::TrajectoryStore::connect(
+            socket, deployment, world,
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "preempted video trajectories are not stored: the storage server is unreachable"
+                );
+                return;
+            }
+        };
+        let mut served = false;
+        let mut identities = Vec::new();
+        for (worker, reports) in &denoisers {
+            identities.extend(reports.iter().map(|(_, rank)| rank.pool.identity.clone()));
+            served |= store.add_worker(worker, reports);
+        }
+        if served {
+            store.reseed(crate::trajectories::latent_seed(
+                identities.iter().map(String::as_str),
+            ));
+            self.trajectories = Some(store);
+        }
+    }
+
+    /// The latent seed of what the scheduler's video denoising computes,
+    /// which keys the trajectories it stores; zero when it stores none.
+    pub fn latent_seed(&self) -> u64 {
+        self.trajectories
+            .as_ref()
+            .map_or(0, crate::trajectories::TrajectoryStore::seed)
+    }
+
     /// Returns the executor's aggregate worker capabilities.
     pub fn info(&self) -> &WorkerInfo {
         &self.info
@@ -622,7 +710,11 @@ impl Scheduler {
                         return;
                     };
                     let pages = kv_offload.take_offloads(&worker, batch.id);
-                    batch.page_offloads = Some(crate::executor::PageOffloads { worker, pages });
+                    batch.page_offloads = Some(crate::executor::PageOffloads {
+                        worker,
+                        pages,
+                        latents: Vec::new(),
+                    });
                     self.inflight.pending_submissions.push_back(batch);
                 }
             }
@@ -680,8 +772,9 @@ impl Scheduler {
     /// liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        // Answers of the host KV cache arrive on a connection the executor
-        // does not wait on: while some are awaited, the park is short.
+        // Answers of the host KV cache and of the host latent pools arrive on
+        // connections the executor does not wait on: while some are awaited,
+        // the park is short.
         // So is the park of a closing scheduler, which awaits its last
         // page commits.
         let timeout = if self.closing
@@ -689,6 +782,10 @@ impl Scheduler {
                 .kv_offload
                 .as_ref()
                 .is_some_and(crate::kv_cache::KvOffloadManager::waiting)
+            || self
+                .trajectories
+                .as_ref()
+                .is_some_and(crate::trajectories::TrajectoryStore::waiting)
         {
             KV_OFFLOAD_POLL
         } else {

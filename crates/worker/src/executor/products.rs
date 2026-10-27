@@ -367,6 +367,9 @@ pub(crate) fn prepared_step(
 pub(crate) struct PreparedOwners<'a> {
     pub(crate) owners: ProductOwners<'a>,
     pub(crate) info: &'a WorkerInfo,
+    /// The rank's index in its worker group, which picks its own pages of a
+    /// restored trajectory.
+    pub(crate) rank: u32,
     /// The trajectory ledger of a computation that names the `latents`
     /// resource.
     pub(crate) ledger: Option<&'a LatentLedger>,
@@ -387,7 +390,10 @@ pub(crate) struct Published {
 /// each trajectory's banks from the ledger, as the executor prepared them
 /// (`step["prepared"]`, one entry per call), noting the banks in `step`.
 /// Returns the tensors the executor's execution reads and writes, in call
-/// order, and the writes [`publish`] publishes behind it.
+/// order, and the writes [`publish`] publishes behind it. A latent
+/// preparation that restores a stored trajectory reads the stored pages
+/// besides: their views follow the call's writes, in the order of the page
+/// indices `step["calls"][i]["latent"]["restore"]` lists.
 pub(crate) fn bind_prepared(
     owners: &PreparedOwners<'_>,
     plan: &BatchPlan,
@@ -518,12 +524,28 @@ pub(crate) fn bind_prepared(
             let ledger = owners
                 .ledger
                 .ok_or_else(|| Error::Invalid("this rank keeps no latent trajectories".into()))?;
-            let (banks, update) = ledger.bind(slot, call, kind)?;
-            step["calls"][index]["latent"] = serde_json::json!({
+            // A resumed request's preparation copies the stored pages into
+            // the bank it initializes, and commits the stored step.
+            let (banks, update, restored) = match &call.latent_restore {
+                Some(restore) if kind == MediaCall::LatentPreparation => {
+                    let bound = ledger.bind_restore(slot, call, restore, owners.rank)?;
+                    (bound.banks, bound.update, bound.pages)
+                }
+                _ => {
+                    let (banks, update) = ledger.bind(slot, call, kind)?;
+                    (banks, update, Vec::new())
+                }
+            };
+            let mut latent = serde_json::json!({
                 "read": banks.read,
                 "write": banks.write,
                 "step": banks.step,
             });
+            if !restored.is_empty() {
+                latent["restore"] = restored.iter().map(|(page, _)| *page).collect();
+                tensors.extend(restored.into_iter().map(|(_, view)| view));
+            }
+            step["calls"][index]["latent"] = latent;
             batch.calls[index].forward.products.latent = Some(update);
         }
     }

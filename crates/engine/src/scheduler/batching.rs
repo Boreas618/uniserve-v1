@@ -682,7 +682,11 @@ impl Scheduler {
             let worker = first.worker.clone();
             let pages = kv_offload.take_offloads(&worker, batch.id);
             if !pages.is_empty() {
-                batch.page_offloads = Some(crate::executor::PageOffloads { worker, pages });
+                batch.page_offloads = Some(crate::executor::PageOffloads {
+                    worker,
+                    pages,
+                    latents: Vec::new(),
+                });
             }
         }
 

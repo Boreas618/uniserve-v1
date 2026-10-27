@@ -189,13 +189,18 @@ pub enum Event {
         /// Human-readable failure reason.
         message: String,
     },
-    /// Ends a token request on this engine without finishing it: every token
-    /// it generated here was sent before, and the daemon may submit it again
-    /// with those tokens (`GenerationRequest::generated_token_ids`) to the
-    /// engine that serves next.
+    /// Ends a request on this engine without finishing it: every token it
+    /// generated here was sent before, and the daemon may submit it again
+    /// with those tokens (`GenerationRequest::generated_token_ids`), or a
+    /// video request with the trajectory steps the engine stored
+    /// (`Trajectory::denoised_steps`), to the engine that serves next.
     Migratable {
         /// Why the request leaves its engine.
         cause: MigrationCause,
+        /// For a video request, the denoising steps of its trajectory the
+        /// engine stored in its host latent pools at the step boundary it
+        /// was preempted at; zero when it stored none.
+        denoised_steps: u32,
     },
 }
 
@@ -301,6 +306,34 @@ pub struct DiffusionRequest {
     pub priority: i32,
     /// Effective diffusion controls and model-preprocessed media unit count.
     pub sampling: DiffusionSamplingParams,
+    /// The request's latent trajectory across the engines that serve it.
+    pub trajectory: Trajectory,
+}
+
+/// A video request's latent trajectory across the engines that serve it.
+///
+/// An engine that preempts the request at a denoising-step boundary stores
+/// the trajectory in its host latent pools, keyed by `id`, the steps it
+/// took and the latent seed of what its denoising computes; the daemon
+/// submits the request again with those steps (`Event::Migratable`), and
+/// the engine that serves it next continues from them when its pools hold
+/// the trajectory under its own latent seed (or `state_seed`), and from
+/// noise otherwise. Either way it computes the same trajectory, since a
+/// trajectory's state at a step follows from the request alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Trajectory {
+    /// The identity that keys the stored trajectory: the daemon gives a
+    /// request one when it first submits it and keeps it across its
+    /// migrations.
+    pub id: u64,
+    /// The denoising steps of the trajectory an engine stored when it
+    /// preempted the request; zero for a request that starts from noise.
+    pub denoised_steps: u32,
+    /// The latent seed of the world whose stored trajectory the request
+    /// continues although the serving world's denoising computes other
+    /// numerics (a world change's `in_flight = keep`); `None` reads a
+    /// trajectory of the serving world's own latent seed only.
+    pub state_seed: Option<u64>,
 }
 
 /// The sizes of one condition of a video request, which size the products of

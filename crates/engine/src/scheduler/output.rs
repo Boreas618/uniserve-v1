@@ -1589,7 +1589,10 @@ impl Scheduler {
                     reason,
                     stop_reason,
                 } => terminal_event(&st, reason, stop_reason),
-                TokenTerminal::Migratable(cause) => Event::Migratable { cause },
+                TokenTerminal::Migratable(cause) => Event::Migratable {
+                    cause,
+                    denoised_steps: 0,
+                },
             };
             let accepted = terminal_published || st.output.events.enqueue(event);
             if accepted {

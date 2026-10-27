@@ -105,8 +105,21 @@ impl Scheduler {
                     TerminalIntent::Migrate(cause) => Some(cause),
                     _ => None,
                 });
-            if self.media_state(id).is_some() {
-                self.finish_media(id, DiffusionTerminal::Failed(msg.to_string()));
+            if let Some(state) = self.media_state(id) {
+                // A video request leaves as migratable, for the cause its
+                // preemption states or as lost, its trajectory not stored.
+                let cause = match state.terminal_intent {
+                    TerminalIntent::Migrate(cause) => Some(cause),
+                    TerminalIntent::None if self.config.canvas.is_none() => {
+                        Some(MigrationCause::Loss)
+                    }
+                    _ => None,
+                };
+                let terminal = match cause {
+                    Some(cause) => DiffusionTerminal::Migrated(cause, 0),
+                    None => DiffusionTerminal::Failed(msg.to_string()),
+                };
+                self.finish_media(id, terminal);
             } else if let Some(cause) = migrating {
                 self.migrate_request(id, cause);
             } else if self.migrates_on_loss(id) {
@@ -129,8 +142,9 @@ impl Scheduler {
     /// or running, ends as migratable now (`MigrationCause::Loss`), after
     /// every token it generated, or for the cause a migration it already
     /// began states. The daemon submits each again to the previous world,
-    /// which generates the dropped tokens again. The others are left to
-    /// `abort_all_requests`.
+    /// which generates the dropped tokens again. Every video request leaves
+    /// the same way, naming the trajectory it named before. The others are
+    /// left to `abort_all_requests`.
     pub(in crate::scheduler) fn hand_back_requests(&mut self) {
         if self.config.canvas.is_some() {
             return;
@@ -152,8 +166,26 @@ impl Scheduler {
             if let Some(st) = self.remove_waiting(id) {
                 let _ = st.output.events.event_tx.send(Event::Migratable {
                     cause: MigrationCause::Loss,
+                    denoised_steps: 0,
                 });
             }
+        }
+        // Video requests leave as well, whatever they reached: the world
+        // that held their trajectories failed, and the previous world
+        // computes them again from what they name.
+        while let Some(pending) = self.waiting_media.pop_front() {
+            let _ = pending.event_tx.send(Event::Migratable {
+                cause: MigrationCause::Loss,
+                denoised_steps: 0,
+            });
+        }
+        for id in self.media_ids() {
+            let cause = match self.media_state(id).map(|state| &state.terminal_intent) {
+                Some(TerminalIntent::Migrate(cause)) => *cause,
+                Some(TerminalIntent::None) => MigrationCause::Loss,
+                _ => continue,
+            };
+            self.finish_media(id, DiffusionTerminal::Migrated(cause, 0));
         }
 
         let running: Vec<(RequestId, MigrationCause)> = self
@@ -202,6 +234,10 @@ impl Scheduler {
         // released.
         if let Some(kv_offload) = self.kv_offload.as_mut() {
             kv_offload.worker_failed(&loss.worker_id);
+        }
+        // So are the trajectory offloads its batches carried.
+        if let Some(store) = self.trajectories.as_mut() {
+            store.worker_failed(&loss.worker_id);
         }
 
         // Close the affected set over work not yet submitted: a queued call
@@ -314,9 +350,22 @@ impl Scheduler {
                 .get(&id)
                 .is_some_and(|finish| finish.reason == FinishReason::Error);
             if let Some(state) = self.media_state_mut(id) {
+                // A video request whose workers were lost leaves as
+                // migratable once its calls drain, its trajectory lost with
+                // them, unless the worker refused it or it already fails;
+                // the daemon submits it again.
                 if state.admission.request_key == request {
                     state.terminal_intent = match refusal {
                         Some(reason) => TerminalIntent::Rejected(reason.clone()),
+                        None if migrates
+                            && !matches!(
+                                state.terminal_intent,
+                                TerminalIntent::Failure(_) | TerminalIntent::Rejected(_)
+                            ) =>
+                        {
+                            migrating = true;
+                            TerminalIntent::Migrate(MigrationCause::Loss)
+                        }
                         None => TerminalIntent::Failure(loss.message.clone()),
                     };
                 }
@@ -398,6 +447,7 @@ impl Scheduler {
                 if !self.inflight.has_pending_calls(id) {
                     let terminal = match refusal {
                         Some(reason) => DiffusionTerminal::Rejected(reason.clone()),
+                        None if migrating => DiffusionTerminal::Migrated(MigrationCause::Loss, 0),
                         None => DiffusionTerminal::Failed(loss.message.clone()),
                     };
                     self.finish_media(id, terminal);

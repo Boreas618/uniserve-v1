@@ -30,6 +30,7 @@ mod service;
 #[cfg(feature = "testing")]
 mod sim;
 mod spec;
+mod trajectories;
 mod warmup;
 mod worker;
 
@@ -77,7 +78,7 @@ pub use proto::request::{
     GenerationRequest, GenerationRequestError, GenerationResourceError, ImageEncoder,
     ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageTrigger, MediaKind, ModelDtype,
     ModelDtypeParseError, MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot,
-    RejectionKind, Request, StopReason, encoder_cache_key,
+    RejectionKind, Request, StopReason, Trajectory, encoder_cache_key,
 };
 
 /// Lock `mutex`, keeping the state a panicking holder left.

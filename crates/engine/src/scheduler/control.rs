@@ -312,7 +312,10 @@ impl Scheduler {
             .collect();
         for id in queued {
             if let Some(st) = self.remove_waiting(id) {
-                let _ = st.output.events.event_tx.send(Event::Migratable { cause });
+                let _ = st.output.events.event_tx.send(Event::Migratable {
+                    cause,
+                    denoised_steps: 0,
+                });
             }
         }
         self.migrate_running(cause, |_| true);

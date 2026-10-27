@@ -183,6 +183,18 @@ impl LatentStorage {
         self.pages.select(0, i64::from(bank))
     }
 
+    /// The address of page `page` of `bank`, whose
+    /// `page_units * width` values lie contiguously from it.
+    pub(crate) fn page_address(&self, bank: u8, page: u64) -> Result<u64> {
+        if bank > 1 || page == 0 || page >= u64::from(self.num_pages) {
+            return Err(Error::Invalid("latent page is outside the pool".into()));
+        }
+        let page_bytes =
+            u64::from(self.page_units) * u64::from(self.width) * self.dtype().bytes() as u64;
+        let index = u64::from(bank) * u64::from(self.num_pages) + page;
+        Ok(self.pages.address() + index * page_bytes)
+    }
+
     /// The first `units` units stored in `pages` of `bank`, page by page.
     pub fn spans(&self, bank: u8, pages: &[u32], units: u32) -> Result<Spans> {
         if bank > 1 || u64::from(units) > pages.len() as u64 * u64::from(self.page_units) {
@@ -240,6 +252,14 @@ mod tests {
         assert!(storage.spans(0, &[0], 1).is_err());
         assert_eq!(storage.bank(1)?.shape(), &[4, 2, 3]);
         assert!(storage.bank(2).is_err());
+        // A page's address is where its bank's view holds it, which a
+        // trajectory offload copies from.
+        assert_eq!(
+            storage.page_address(1, 3)?,
+            storage.bank(1)?.select(0, 3)?.address()
+        );
+        assert!(storage.page_address(0, 0).is_err());
+        assert!(storage.page_address(1, 4).is_err());
         Ok(())
     }
 }

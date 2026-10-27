@@ -819,6 +819,8 @@ impl Scheduler {
                 predecessor: root,
                 terminal_intent: TerminalIntent::None,
                 artifact: None,
+                restoring: Restoring::Ready(None),
+                offloading: false,
             };
 
             // The interval from receipt to admission is the queue wait. The
@@ -834,6 +836,12 @@ impl Scheduler {
             }
             self.running_media.insert(id, state);
             self.running_order.push(id);
+            // A resumed request's stored trajectory is pinned while its
+            // conditions are prepared.
+            let restoring = self.start_restore(id);
+            if let Some(state) = self.media_state_mut(id) {
+                state.restoring = restoring;
+            }
         }
     }
 
@@ -1159,9 +1167,11 @@ impl Scheduler {
                 TerminalIntent::Failure(message) => DiffusionTerminal::Failed(message),
                 TerminalIntent::Rejected(message) => DiffusionTerminal::Rejected(message),
                 TerminalIntent::Finish(reason) => DiffusionTerminal::Finished(reason),
-                // `migrate_requests` marks token requests alone.
-                TerminalIntent::Migrate(_) => {
-                    DiffusionTerminal::Failed("a media request does not migrate".to_owned())
+                // A preempted request is at a step boundary: its trajectory
+                // is stored before it leaves.
+                TerminalIntent::Migrate(cause) => {
+                    self.retire_preempted(id, cause);
+                    continue;
                 }
                 TerminalIntent::None => continue,
             };

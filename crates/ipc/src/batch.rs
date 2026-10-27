@@ -92,6 +92,73 @@ impl PageCopy {
     }
 }
 
+/// One page of a video request's latent trajectory copied between its
+/// request slot's pages in a rank's latent banks and a slot of the rank's
+/// host latent pool, a page pool of the rank's host's Storage Server.
+///
+/// An offload ([`LatentOffload`]) copies page `page` of the bank holding
+/// the trajectory's committed step into the pool slot, which the engine
+/// reserved; a restore ([`LatentRestore`]) copies the pool slot, which the
+/// engine pinned, into page `page` of the bank the request's latent
+/// preparation initializes. A page is the bank's `[page_units]` float32
+/// values, the rank's own share of the trajectory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatentPageCopy {
+    /// The rank of the worker group that copies the page.
+    pub rank: u32,
+    /// The latent pool at the rank's host's Storage Server.
+    pub pool: u64,
+    /// The pool slot.
+    pub slot: u64,
+    /// The page's index among the request slot's pages, from zero.
+    pub page: u32,
+}
+
+/// A preempted video request's trajectory, written from the bank holding
+/// its committed step into the host latent pools of its denoising ranks
+/// (one [`LatentPageCopy`] per page of the request slot and rank). The
+/// request's calls have completed, so the committed step is final; the
+/// rank's output for the batch reports the copies complete, and the
+/// engine then commits the pool slots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatentOffload {
+    /// The request whose slot's trajectory is written.
+    pub request_key: RequestKey,
+    pub pages: Vec<LatentPageCopy>,
+}
+
+/// The stored trajectory a resumed video request's latent preparation
+/// opens at: the call prepares the request as for step zero, then copies
+/// every page of `pages` into the bank it initializes, and commits the
+/// trajectory at step `steps`. The engine pinned the pool slots, on every
+/// rank of the denoiser, until the call's result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatentRestore {
+    /// Denoising steps the stored trajectory took; positive.
+    pub steps: u32,
+    pub pages: Vec<LatentPageCopy>,
+}
+
+impl LatentRestore {
+    /// Validates the restored step and the pages.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.steps > 0 && !self.pages.is_empty(),
+            "a latent restore names no step or no page"
+        );
+        let pages = self
+            .pages
+            .iter()
+            .map(|copy| (copy.rank, copy.page))
+            .collect::<HashSet<_>>();
+        ensure_valid!(
+            pages.len() == self.pages.len(),
+            "a latent restore copies one page of one rank twice"
+        );
+        Ok(())
+    }
+}
+
 /// Whether `units` are real units (never the zero sentinel) without repeats.
 fn distinct_units(units: &[UnitId]) -> bool {
     units.iter().all(|unit| unit.0 > 0) && units.iter().collect::<HashSet<_>>().len() == units.len()
@@ -388,6 +455,11 @@ pub struct Batch {
     /// stream as soon as the batch arrives; the batch's output reports them
     /// complete. A batch may carry them alone.
     pub page_offloads: Vec<PageCopy>,
+    /// Preempted video trajectories written to the host latent pools, on
+    /// the rank's copy stream behind every batch that used the latent
+    /// banks; the batch's output reports them complete. A batch may carry
+    /// them alone.
+    pub latent_offloads: Vec<LatentOffload>,
 }
 
 impl Batch {
@@ -416,6 +488,7 @@ impl Batch {
             cache_inputs: Vec::new(),
             page_loads: Vec::new(),
             page_offloads: Vec::new(),
+            latent_offloads: Vec::new(),
         }
     }
 
@@ -477,11 +550,22 @@ impl Batch {
     fn validate_batch(&self, placed: bool) -> ValidationResult<()> {
         // Establish the batch envelope before validating relationships within it.
         // A batch of page offloads alone writes an engine's last published pages
-        // to the host KV cache before it closes its workers.
+        // to the host KV cache before it closes its workers, and one of latent
+        // offloads alone a preempted video request's trajectory.
         ensure_valid!(
-            !self.calls.is_empty() || !self.commands.is_empty() || !self.page_offloads.is_empty(),
+            !self.calls.is_empty()
+                || !self.commands.is_empty()
+                || !self.page_offloads.is_empty()
+                || !self.latent_offloads.is_empty(),
             "a submission batch must carry at least one call, control or page write"
         );
+        let mut offloaded = HashSet::with_capacity(self.latent_offloads.len());
+        for offload in &self.latent_offloads {
+            ensure_valid!(
+                offloaded.insert(offload.request_key) && !offload.pages.is_empty(),
+                "a batch offloads one trajectory twice or a trajectory without pages"
+            );
+        }
         ensure_valid!(
             self.collective_seq > 0,
             "batch collective sequence must be positive"

@@ -1011,6 +1011,7 @@ mod tests {
             input_image: None,
             cache_input: None,
             cache_output: None,
+            latent_restore: None,
         }
     }
 

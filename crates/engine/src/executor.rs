@@ -88,6 +88,14 @@ pub struct ExecutorInfo {
     /// and `SimExecutor` leave it empty, which serves no pool through the
     /// host KV cache.
     pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
+    /// For each pool, each rank's host latent pool as the rank reported it,
+    /// and the rank's host, in rank order: the video denoising ranks report
+    /// one, every other rank none (`ipc::WorkerInfo::latent_pool`).
+    ///
+    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// leaves it empty, which stores no preempted trajectory, and a
+    /// simulated executor states its own (`SimEngine::set_latent_pools`).
+    pub rank_latents: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
 }
 
 impl ExecutorInfo {

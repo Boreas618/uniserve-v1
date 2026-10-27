@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState};
+use crate::engine::hold::Kept;
 use crate::leader::{Leader, UpdateError, locked, stats_sink};
 use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
 
@@ -662,13 +663,21 @@ impl Leader {
             )
         });
         // A successor computing other numerics than the serving world (its
-        // pages' prefix seed differs) reads none of its pages, but the
-        // requests in flight continue with the state they reached unless
-        // the change recomputes them.
-        let numerics_change = running.info().prefix_seed != successor.info().prefix_seed;
+        // pages' prefix seed, or its stored trajectories' latent seed,
+        // differs) reads none of its pages or trajectories, but the requests
+        // in flight continue with the state they reached unless the change
+        // recomputes them.
+        let (before, after) = (running.info(), successor.info());
+        let pages_change = before.prefix_seed != after.prefix_seed;
+        let trajectories_change = before.latent_seed != after.latent_seed;
+        let numerics_change = pages_change || trajectories_change;
         let hold = Arc::clone(self.migrator.hold());
         if numerics_change && in_flight == InFlight::Keep {
-            hold.keep(Some((previous_world, running.info().prefix_seed)));
+            hold.keep(Some(Kept {
+                world: previous_world,
+                prefix_seed: pages_change.then_some(before.prefix_seed),
+                latent_seed: trajectories_change.then_some(before.latent_seed),
+            }));
         }
         let paused = Instant::now();
         hold.hold();
