@@ -61,6 +61,7 @@ _catalog: Mapping[str, str] = MappingProxyType(
     {
         "Qwen3ForCausalLM": "uniserve.models.qwen3",
         "Qwen3MoeForCausalLM": "uniserve.models.qwen3",
+        "Qwen3_5ForConditionalGeneration": "uniserve.models.qwen3_5",
         "BagelForConditionalGeneration": "uniserve.models.bagel",
         "DiffusionGemmaForBlockDiffusion": "uniserve.models.diffusion_gemma",
         "NEOChatModel": "uniserve.models.sensenova_u1",

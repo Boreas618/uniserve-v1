@@ -1291,11 +1291,13 @@ fn endpoint(host: &str) -> WorkerEndpoint {
 
 /// The graph policy a rank serves with.
 ///
-/// `auto` captures CUDA graphs when serving captures the loaded attention
-/// provider's calls (`uniserve.backends.attention.Backend.captures`) and
-/// otherwise serves every call eagerly; `full` requires that capture; `off`
-/// never captures. Every rank of a group loads the same provider, so the
-/// group resolves one policy and captures the same shapes.
+/// `auto` captures CUDA graphs when serving captures every call of the
+/// loaded model, its attention provider's
+/// (`uniserve.backends.attention.Backend.captures`) and its modules'
+/// (`uniserve.loading.rank.uncaptured`), and otherwise serves every call
+/// eagerly; `full` requires that capture; `off` never captures. Every rank
+/// of a group loads the same model and provider, so the group resolves one
+/// policy and captures the same shapes.
 ///
 /// A rank holding `host_component`, a component that keeps its weights in
 /// host memory, requires `off`: its layers' weight copies are scheduled by
@@ -1312,18 +1314,18 @@ fn graph_policy(
             "component {name} keeps its weights in host memory, which requires cuda_graph_config.policy=off"
         )));
     }
-    if model.attention_captures || configured == "off" {
+    if model.uncaptured.is_empty() || configured == "off" {
         return Ok(configured.to_owned());
     }
     if configured == "full" {
         return Err(Error::Unsupported(format!(
-            "graph policy full requires an attention provider whose calls serving captures; the {} provider's are not",
-            model.attention_backend
+            "graph policy full requires a model whose calls serving captures: {}",
+            model.uncaptured
         )));
     }
     tracing::info!(
-        "graph policy auto serves every call eagerly: the {} attention provider's calls are not captured",
-        model.attention_backend
+        "graph policy auto serves every call eagerly: {}",
+        model.uncaptured
     );
     Ok("off".to_owned())
 }
