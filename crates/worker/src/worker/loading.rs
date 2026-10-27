@@ -120,8 +120,10 @@ pub(crate) struct LoadedModel {
     pub(crate) video_decoder: bool,
     /// The attention backend the model was loaded with.
     pub(crate) attention_backend: String,
-    /// Whether serving captures that backend's calls in CUDA graphs.
-    pub(crate) attention_captures: bool,
+    /// Why serving does not capture the model's calls in CUDA graphs: its
+    /// attention provider's or one of its modules'; empty when it captures
+    /// them all.
+    pub(crate) uncaptured: String,
 }
 
 /// The module paths a rank loads and those left unloaded below them:
@@ -286,14 +288,14 @@ impl LoadedModel {
         let backend: tvm_ffi::String =
             Interpreter::import(&format!("{LOADING}.attention_backend"))?
                 .call_as(&[handle.view()])?;
-        let captures = Interpreter::import(&format!("{LOADING}.attention_captures"))?
-            .call_as::<bool>(&[handle.view()])?;
+        let uncaptured: tvm_ffi::String =
+            Interpreter::import(&format!("{LOADING}.uncaptured"))?.call_as(&[handle.view()])?;
         Ok(Self {
             handle,
             declarations: description.declarations,
             video_decoder: description.video_decoder,
             attention_backend: backend.as_str().to_owned(),
-            attention_captures: captures,
+            uncaptured: uncaptured.as_str().to_owned(),
         })
     }
 

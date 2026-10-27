@@ -23,6 +23,13 @@ from ._activation import (
 from ._attention import attention
 from ._bias import bias_add
 from ._frame import frame_norm_pad, frame_pad, load_frame_kernels
+from ._gated_delta import (
+    causal_conv1d,
+    conv_window,
+    gated_delta_rule,
+    gated_delta_step,
+    packed_rows,
+)
 from ._linear import linear, merged_linear
 from ._moe import Routes, fused_moe, topk_softmax
 from ._norm import (
@@ -55,8 +62,12 @@ __all__ = [
     "attention",
     "bias_add",
     "calibrated_nvfp4",
+    "causal_conv1d",
+    "conv_window",
     "frame_norm_pad",
     "frame_pad",
+    "gated_delta_rule",
+    "gated_delta_step",
     "gated_residual",
     "gated_residual_rms_norm",
     "gated_residual_rms_norm_fp8",
@@ -65,6 +76,7 @@ __all__ = [
     "linear",
     "load_frame_kernels",
     "merged_linear",
+    "packed_rows",
     "modulated_rms_norm",
     "patchify",
     "qk_bias_rms_norm_rope_",

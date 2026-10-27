@@ -433,6 +433,7 @@ mod tests {
         for (description, model_type) in [
             (ModelDescription::Qwen3, "qwen3"),
             (ModelDescription::Qwen3, "qwen3_moe"),
+            (ModelDescription::Qwen3, "qwen3_5"),
             (ModelDescription::SenseNova, "neo_chat"),
             (ModelDescription::Bagel, "bagel"),
         ] {

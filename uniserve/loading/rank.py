@@ -894,12 +894,24 @@ def attention_backend(loaded: Loaded) -> str:
     return loaded.attention_backend
 
 
-def attention_captures(loaded: Loaded) -> bool:
-    """Whether serving captures the loaded attention provider's calls.
+def uncaptured(loaded: Loaded) -> str:
+    """Why serving does not capture the loaded model's calls, or ``""``
+    when it captures them all.
 
-    See ``uniserve.backends.attention.Backend.captures``.
-    """
-    return bool(loaded.attention.captures)
+    Serving captures a call of the attention provider when the provider
+    says so (``uniserve.backends.attention.Backend.captures``), and a
+    module's calls unless its class says otherwise (``captures = False``,
+    an implementation whose forward runs a host loop too long to capture).
+    """  # noqa: D205
+    if not loaded.attention.captures:
+        return (
+            f"the {loaded.attention_backend} attention provider's calls are "
+            "not captured"
+        )
+    for module in loaded.module.modules():
+        if getattr(type(module), "captures", True) is False:
+            return f"{type(module).function}'s calls are not captured"
+    return ""
 
 
 def weight_formats(loaded: Loaded) -> list[str]:

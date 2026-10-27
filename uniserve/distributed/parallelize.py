@@ -12,6 +12,7 @@ from uniserve.nn.attention._parallel import ParallelAttention
 from uniserve.nn.attention.config import AttentionParallelConfig
 from uniserve.nn.attention.layer import Attention
 from uniserve.nn.attention.vsa import SegmentAttention
+from uniserve.nn.gated_delta import GatedDeltaNet
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -223,6 +224,52 @@ def partition_experts(model: nn.Module, group: Communicator) -> None:
             linear.num_experts = count
         module.expert_slice = local
         module.expert_group = group
+
+
+def _partition_gated_delta(
+    module: GatedDeltaNet,
+    mesh: DeviceMesh,
+    group: Communicator,
+    attention: AttentionParallelConfig,
+) -> None:
+    """Narrow a gated delta layer to the rank's whole key heads.
+
+    Each rank of the tensor-parallel group keeps an equal run of key heads
+    and the value heads that read them, with their convolution channels
+    (query, key and value channels, in that order) and per-head decay
+    parameters. The model's column-parallel input projections produce
+    exactly those channels and heads.
+    """
+    bound = getattr(module, "_parallel_mesh", None)
+    if bound is not None:
+        if bound != mesh or module._attention_parallel != attention:
+            raise ValueError(
+                "gated delta attention cannot change its mathematical partition"
+            )
+        return
+    if module.num_key_heads % group.size:
+        raise ValueError(
+            "gated delta key heads must divide the tensor-parallel group"
+        )
+    keys = module.num_key_heads // group.size
+    values = module.num_value_heads // group.size
+    module.key_heads = range(group.rank * keys, (group.rank + 1) * keys)
+    module.value_heads = range(group.rank * values, (group.rank + 1) * values)
+    if group.size > 1:
+        weight = module.conv_weight
+        module.conv_weight = nn.Parameter(
+            torch.cat([weight[part] for part in module.channel_slices()]),
+            requires_grad=False,
+        )
+        heads = slice(module.value_heads.start, module.value_heads.stop)
+        module.a_log = nn.Parameter(
+            module.a_log[heads].contiguous(), requires_grad=False
+        )
+        module.dt_bias = nn.Parameter(
+            module.dt_bias[heads].contiguous(), requires_grad=False
+        )
+    module._parallel_mesh = mesh
+    module._attention_parallel = attention
 
 
 def _replicated_heads(mesh: DeviceMesh, heads: int) -> Distribution:
@@ -560,6 +607,9 @@ def parallelize_(
             continue
         if isinstance(child, FusedMoE):
             _partition_experts(child, mesh, group, attention)
+            continue
+        if isinstance(child, GatedDeltaNet):
+            _partition_gated_delta(child, mesh, group, attention)
             continue
         if not isinstance(child, (Linear, VocabParallelEmbedding)):
             continue
