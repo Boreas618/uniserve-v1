@@ -474,11 +474,11 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
         };
         // The change's future holds the model files it resolves.
         match Box::pin(leader.apply(request)).await {
-            Ok(Applied::Unchanged) => Ok(json!({ "change": "none" })),
-            Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
-            Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
-            Ok(Applied::World(report)) => Ok(json!({ "change": "world", "world": report })),
-            Ok(Applied::Daemon { config, executable }) => {
+            Ok(Applied::Daemon {
+                config,
+                executable,
+                then,
+            }) => {
                 let Some(restarter) = restarter else {
                     return Err((
                         StatusCode::BAD_REQUEST,
@@ -487,19 +487,72 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
                             .to_owned(),
                     ));
                 };
+                let world = then.is_some();
                 restarter
-                    .restart(executable, Some(*config), &leader, &admin, &jobs)
+                    .restart(executable, Some(*config), then, &leader, &admin, &jobs)
                     .await
-                    .map(|pid| json!({ "change": "daemon", "pid": pid }))
+                    .map(|pid| {
+                        // The successor changes the world in an operation of
+                        // its own (`GET /admin/status`).
+                        json!({ "change": "daemon", "pid": pid, "then": world.then_some("world") })
+                    })
                     .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))
             }
-            Err(error) => Err((
-                update_status(&error),
-                format!("{:#}", anyhow::Error::from(error)),
-            )),
+            applied => applied_result(applied),
         }
     })
     .await
+}
+
+/// What `PUT /admin/config` answers for a change that needs no hot restart
+/// of the daemon, or why it failed.
+fn applied_result(
+    applied: Result<Applied, UpdateError>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    match applied {
+        Ok(Applied::Unchanged) => Ok(json!({ "change": "none" })),
+        Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
+        Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
+        Ok(Applied::World(report)) => Ok(json!({ "change": "world", "world": report })),
+        Ok(Applied::Daemon { .. }) => Err((
+            StatusCode::CONFLICT,
+            "the daemon's own options changed again after its hot restart".to_owned(),
+        )),
+        Err(error) => Err((
+            update_status(&error),
+            format!("{:#}", anyhow::Error::from(error)),
+        )),
+    }
+}
+
+/// Applies `request`, the rest of a change whose daemon options the hot
+/// restart that started this daemon applied, as an operation of its own
+/// (`config`), which `GET /admin/status` reports.
+pub(crate) fn apply_after_restart(
+    admin: &Arc<Admin>,
+    leader: &Arc<crate::leader::Leader>,
+    request: ApplyRequest,
+) {
+    let operation = match admin.begin("config") {
+        Ok(operation) => operation,
+        Err(other) => {
+            admin.record(
+                "operation",
+                format!(
+                    "the change after the hot restart did not start: operation {} ({}) runs",
+                    other.id, other.kind
+                ),
+            );
+            return;
+        }
+    };
+    let admin = Arc::clone(admin);
+    let leader = Arc::clone(leader);
+    tokio::spawn(async move {
+        let applied = Box::pin(leader.apply(request)).await;
+        let outcome = applied_result(applied).map_err(|(_, error)| error);
+        admin.end(operation, outcome);
+    });
 }
 
 /// `POST /admin/config/commit`: ends the trial of the world that executes
@@ -864,7 +917,7 @@ async fn restart(State(state): State<AdminState>, body: axum::body::Bytes) -> Re
     let jobs = Arc::clone(&state.jobs);
     run(&state.admin, "restart", body.wait, async move {
         restarter
-            .restart(body.executable, None, &leader, &admin, &jobs)
+            .restart(body.executable, None, None, &leader, &admin, &jobs)
             .await
             .map(|pid| json!({ "pid": pid }))
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))

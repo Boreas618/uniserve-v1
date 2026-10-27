@@ -800,6 +800,42 @@ def _restart_while_streaming(
     server = tomllib.loads(status["config"])["server_config"]
     assert server["port"] == port, server
 
+    # A change of both the daemon's options and what a world executes
+    # restarts the daemon on its new options first, and its successor then
+    # changes the world in an operation of its own.
+    previous = successors[-1]
+    port = find_free_port()
+    both = _apply(moved_url, f"server_config.port={port}", CHANGE)
+    assert both["change"] == "daemon", both
+    assert both["then"] == "world", both
+    successors.append(both["pid"])
+    both_url = f"http://127.0.0.1:{port}"
+
+    def changed() -> dict | None:
+        status = httpx.get(f"{both_url}/admin/status", timeout=10).json()
+        last = status["last_operation"]
+        if status["operation"] is None and last and last["kind"] == "config":
+            return last
+        return None
+
+    _wait_until(lambda: changed() is not None, 900, "the world did not change")
+    last = changed()
+    assert last["state"] == "succeeded", last
+    assert last["result"]["change"] == "world", last
+    committed = _admin(both_url, "config/commit")
+    assert committed.status_code == 200, committed.text
+    status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
+    config = tomllib.loads(status["config"])
+    assert config["server_config"]["port"] == port, config
+    assert config["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 4, 8, 16]
+    reply = _chat(both_url, name, "Say hello.")
+    assert reply["choices"][0]["message"]["content"]
+    _wait_until(
+        lambda: not _runs(previous),
+        120,
+        "the daemon on the previous address did not exit",
+    )
+
 
 def _storage_pid(runtime: Path) -> int:
     """The process id of the Storage Server serving the test's socket."""
