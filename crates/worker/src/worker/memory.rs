@@ -228,8 +228,8 @@ pub(super) fn allocate_storage(
     );
 
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
-    // entries, one per request slot and unresolved call, on the primary device
-    // where every binding computes.
+    // entries, `relay_depth` per request slot (`ArenaCapacity`), on the
+    // primary device where every binding computes.
     let devices = vec![config.device.memory()];
     let buffer_pool =
         BufferPool::allocate(plan.info.buffer_pool_bytes.max(1), &devices, &mut *memory)?;
@@ -238,7 +238,7 @@ pub(super) fn allocate_storage(
         plan.info.encoder_entry_bytes.max(1) as usize,
         devices,
         plan.info.request_slots as usize,
-        plan.info.max_unresolved_calls as usize + 1,
+        plan.arena.relay_depth,
         buffer_pool,
         Arc::clone(&events),
     )?;
