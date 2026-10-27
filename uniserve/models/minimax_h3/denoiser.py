@@ -601,7 +601,12 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 ):
                     raise ValueError("H3 visual condition rows do not match")
                 clean = visual.to(device=out.device, dtype=torch.float32)
-                draw = patchify_video(draw.to(device=out.device))[0]
+                # A serving rank's draws are its page-locked host sources,
+                # which the copy reads in stream order without the host
+                # waiting; their next writer is the slot's next preparation.
+                draw = patchify_video(
+                    draw.to(device=out.device, non_blocking=True)
+                )[0]
                 # The reference's anchoring, op for op in FP32; mixing after
                 # patching is the same elementwise arithmetic.
                 anchored = level * clean + (1.0 - level) * draw
