@@ -227,6 +227,7 @@ def load_model(
     modules: frozenset[str] | None = None,
     exclude_modules: frozenset[str] = frozenset(),
     experts: Communicator | None = None,
+    tensor_experts: bool = False,
     expert_kernels: ExpertKernels = "local",
     retained: Retained | None = None,
     load: frozenset[str] = frozenset(),
@@ -238,7 +239,9 @@ def load_model(
     dimensions and layout queries stay available. Neither constructors nor
     the resulting model retain loading state. ``experts`` names the
     expert-parallel group every ``FusedMoE`` shards its experts over
-    (``partition_experts``), so this rank reads only its own experts.
+    (``partition_experts``), so this rank reads only its own experts;
+    ``tensor_experts`` has each mesh's tensor-parallel group divide the
+    experts instead of their channels (``parallelize_(whole_experts=True)``).
     ``exclude_modules`` leaves named subtrees on meta even when their
     ancestors are selected, as when attention ranks borrow remote experts.
     These subtrees also retain their own mathematical partition instead of
@@ -247,7 +250,7 @@ def load_model(
     ``expert_kernels`` names those of the routed experts.
 
     With ``retained``, the selected modules take the tensors a worker
-    published when it last loaded this model on this placement
+    published when it last loaded this model at this position
     (``uniserve.loading.retained``) instead of reading the checkpoint; they
     are already in their final layout. ``load`` names the tensors
     (``uniserve.loading.retained`` identities) the worker reads from the
@@ -307,6 +310,7 @@ def load_model(
                 mesh,
                 attention=attention.get(path, AttentionParallelConfig()),
                 exclude=excluded,
+                whole_experts=tensor_experts,
             )
     if experts is not None:
         partition_experts(model, experts)

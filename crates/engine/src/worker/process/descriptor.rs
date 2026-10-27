@@ -90,6 +90,7 @@ impl Default for WorkerProcessArgs {
             load_format: LoadFormat::default(),
             download_dir: None,
             load_threads: None,
+            parallel_degrees: Vec::new(),
             dtype: Self::DEFAULT_DTYPE,
             quantization_config: serde_json::json!({}),
             kv_cache_dtype: None,
@@ -119,6 +120,7 @@ impl Default for WorkerProcessArgs {
             ffmpeg: Self::DEFAULT_FFMPEG.into(),
             min_video_seconds: None,
             expert_parallel: None,
+            tensor_experts: false,
             expert_microbatches: Self::DEFAULT_EXPERT_MICROBATCHES,
         }
     }
@@ -248,6 +250,7 @@ impl WorkerProcessArgs {
                     })
                 })
                 .transpose()?,
+            tensor_experts: self.tensor_experts,
             role: serde_name(&self.role)?,
             expert_microbatches: self.expert_microbatches,
             distributed_backend: self.distributed_backend.clone(),
@@ -256,6 +259,7 @@ impl WorkerProcessArgs {
             load_format: serde_name(&self.load_format)?,
             download_dir: self.download_dir.as_deref().map(path),
             load_threads: self.load_threads,
+            parallel_degrees: self.parallel_degrees.clone(),
             model_dtype: self.dtype.as_str().to_owned(),
             quantization_config: self.quantization_config.clone(),
             prefix_cache_dtype: self

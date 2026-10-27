@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use storage::protocol::{Access, Claim, Key, Role, Scope, StorageRecord};
+use storage::protocol::{Access, Claim, Key, Placement, Role, Scope, StorageRecord};
 use storage::transport::{Connection, Socket};
 
 use crate::kv_storage::KvStorage;
@@ -270,7 +270,8 @@ impl Server {
             });
         }
         let mut tensors = Vec::with_capacity(self.tensors.len());
-        for (key, tensor) in std::mem::take(&mut self.tensors) {
+        self.copies.clear();
+        for ((key, _), tensor) in std::mem::take(&mut self.tensors) {
             tensors.push((
                 key,
                 HandedTensor {
@@ -520,10 +521,24 @@ impl Server {
                 world: holder.world,
             })
         };
+        // A tensor lies where its storage lies.
+        let locations: HashMap<u64, Placement> = handed
+            .storages
+            .iter()
+            .map(|(id, record, _)| (*id, record.placement))
+            .collect();
         let mut tensors = HashMap::with_capacity(handed.tensors.len());
+        let mut copies: HashMap<Key, Vec<Placement>> = HashMap::new();
         for (key, tensor) in handed.tensors {
+            let location = *locations.get(&tensor.storage).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("handed tensor {} names no storage", tensor.name),
+                )
+            })?;
+            copies.entry(key).or_default().push(location);
             tensors.insert(
-                key,
+                (key, location),
                 TensorEntry {
                     name: tensor.name,
                     storage: tensor.storage,
@@ -580,6 +595,7 @@ impl Server {
             storages,
             next_storage: handed.next_storage,
             tensors,
+            copies,
             deployments: {
                 let mut worlds: HashMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = handed
                     .worlds
@@ -766,7 +782,9 @@ mod tests {
 
         // The same connections go on: the worker finds its tensor, the head
         // still holds the claim, and a new client reaches the socket.
-        let got = worker.get(vec![Key([1; 32])], Mode::Read).unwrap();
+        let got = worker
+            .get(vec![Key([1; 32])], Mode::Read, Vec::new())
+            .unwrap();
         assert!(got.missing.is_empty());
         assert_eq!(head.list().unwrap().deployments.len(), 1);
         let mut operator = Client::connect(&path, Role::Operator).unwrap();

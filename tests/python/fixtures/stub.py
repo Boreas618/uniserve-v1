@@ -63,6 +63,7 @@ def load_model(description, **overrides):
         "attention_ranks": 0,
         "expert_dedicated": False,
         "expert_exchange": None,
+        "tensor_experts": False,
         "retained": None,
         "load": [],
         "attention_backend": "auto",

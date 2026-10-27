@@ -152,6 +152,7 @@ impl EngineConfig {
             load_format: named(&workers.load_format, "load_config.format")?,
             download_dir: stated(&workers.download_dir).map(PathBuf::from),
             load_threads: workers.load_threads,
+            parallel_degrees: workers.parallel_degrees.clone(),
             dtype: named(&workers.dtype, "dtype")?,
             quantization_config,
             kv_cache_dtype: stated(&kv_cache.dtype)

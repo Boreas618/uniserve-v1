@@ -107,6 +107,10 @@ pub struct LaunchDescriptor {
     pub rendezvous_listen_fd: Option<i32>,
     /// Membership in the deployment's expert-parallel union.
     pub expert_parallel: Option<ExpertParallelDescriptor>,
+    /// Whether the worker's tensor-parallel ranks divide the routed experts
+    /// among themselves, each keeping whole experts, instead of dividing
+    /// every expert's channels.
+    pub tensor_experts: bool,
     /// `model` or `experts`.
     pub role: String,
     /// Concurrent microbatches of a disaggregated attention rank.
@@ -123,6 +127,9 @@ pub struct LaunchDescriptor {
     pub load_format: String,
     pub download_dir: Option<String>,
     pub load_threads: Option<u32>,
+    /// The tensor- and expert-parallel degrees retained weight memory is
+    /// chunked for; empty for every degree up to the GPUs the worker sees.
+    pub parallel_degrees: Vec<u32>,
     /// Compute dtype name.
     pub model_dtype: String,
     /// Precision selectors, a JSON object.

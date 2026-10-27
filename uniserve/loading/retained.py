@@ -5,10 +5,10 @@ restarted worker binds them instead of reading the checkpoint. The server
 stores bytes; this module defines what they are:
 
 - :func:`fingerprints` digests what determines a model's loaded bytes
-  besides the worker's placement and GPUs. The structure fingerprint covers
-  the normalized configuration, the module selection, the weight choices,
-  the load mode, which kernels read the routed experts, the revisions of
-  how the model's weights derive from its checkpoint
+  besides the regions of its logical tensors a rank holds. The structure
+  fingerprint covers the normalized configuration, the weight choices, the
+  load mode, which kernels read the routed experts, the revisions of how
+  the model's weights derive from its checkpoint
   (``uniserve.numerics.loading``) and what selects the providers whose
   layouts encoded weights are stored in: the kernel libraries' versions and
   the kernel providers plugins add. A change of code that keeps those
@@ -16,14 +16,19 @@ stores bytes; this module defines what they are:
   source's files. A tensor loaded from a source is keyed by its source's
   fingerprint, so a change to one source's files reloads only its tensors;
   the manifest and the tensors no source loads are keyed by the structure.
-  The worker adds its placement and GPUs to form the keys.
+  The worker adds the region of each logical tensor a chunk of retained
+  memory holds and where it lies in the chunk to form the chunk's key, so
+  the key names neither the rank nor its GPU.
 - :class:`Layout` describes a loaded model's device tensors for publishing:
   each parameter and buffer as its fields (a dense tensor's data, or a
   quantized tensor's encoded fields), grouped by the torch storage they
-  view, and a manifest naming each tensor's representation. The worker
-  allocates retained memory per storage; :meth:`Layout.publish` copies one
-  storage into it and rebinds every field that viewed it, so branches that
-  loading coalesced into one storage stay adjacent.
+  view, each field with the part of its logical tensor it holds and how
+  its bytes encode it (:func:`field_parts`, from the modules' declared
+  logical tensors, ``uniserve.distributed.logical``), and a manifest naming
+  each tensor's representation. The worker allocates retained memory per
+  storage, in chunks; :meth:`Layout.publish` copies one storage into the
+  chunks the worker created and rebinds every field that viewed it, so
+  branches that loading coalesced into one storage stay adjacent.
 - :class:`Retained` rebuilds a worker's retained tensors as views of its
   retained storages under the manifest's representations, and installs
   them on a freshly constructed model in place of reading the checkpoint.
@@ -49,6 +54,8 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from fractions import Fraction
+from math import prod
 from pathlib import Path
 from typing import Any
 
@@ -56,11 +63,13 @@ import torch
 from torch import nn
 
 from uniserve import numerics, plugins
+from uniserve.distributed.distribution import Segment, Span
+from uniserve.distributed.logical import Logical, logical_tensors
 from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve.quantization.tensor import RowOrder, ScaleLayout
 
 # The manifest's format; a manifest of another version is not bound.
-MANIFEST_VERSION = 4
+MANIFEST_VERSION = 6
 
 # The field name of a dense tensor's data.
 _DATA = "data"
@@ -238,7 +247,8 @@ def fingerprints(
 ) -> dict[str, Any]:
     """The digests of what determines a model's loaded bytes.
 
-    The worker's placement and GPUs aside, which the worker adds.
+    The regions of the logical tensors a rank holds aside, which the worker
+    adds with each chunk's key.
 
     Args:
         source: The resolved ``registry.Config`` of this rank's modules,
@@ -263,6 +273,9 @@ def fingerprints(
     """
     # What determines the weights' values: the configuration, the weight
     # choices and the revisions of how they derive from the checkpoint.
+    # Which modules a rank selects decides which tensors it loads, never
+    # the bytes of one it loads, so ranks of any selection key the same
+    # region alike.
     values = hashlib.sha256()
     _hash(values, "uniserve-model-values")
     _hash(values, numerics.loading(source.model_class, _encodings(source)))
@@ -270,8 +283,6 @@ def fingerprints(
         source.model_class,
         source.model,
         source.checkpoint_format,
-        source.modules,
-        source.exclude_modules,
         source.weights,
         io.mode,
         str(model_dtype),
@@ -322,7 +333,8 @@ class _Entry:
 
     ``source`` names the checkpoint source the tensor is loaded from, empty
     for a tensor no source loads; ``host`` marks a matrix streamed from
-    host memory.
+    host memory. ``parts`` describes each field's part of its logical
+    tensor and its encoding (:func:`field_parts`).
     """
 
     id: str
@@ -330,6 +342,7 @@ class _Entry:
     fields: dict[str, torch.Tensor]
     source: str = ""
     host: bool = False
+    parts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def tensor_entry(identity: str, tensor: torch.Tensor) -> _Entry:
@@ -348,6 +361,200 @@ def tensor_entry(identity: str, tensor: torch.Tensor) -> _Entry:
         }
         return _Entry(identity, representation, dict(tensor.buffers()))
     return _Entry(identity, {"kind": "dense"}, {_DATA: tensor})
+
+
+def to_canonical(tensor: QuantizedTensor) -> QuantizedTensor:
+    """``tensor`` in the canonical encoding of its format: block scales in
+    linear order and every matrix's rows in logical order, each field an
+    affine view of its part of the logical tensor. Runs on the tensor's
+    device; the result decodes exactly as ``tensor`` does.
+    """  # noqa: D205
+    return tensor.repack(
+        scale_layout=ScaleLayout.LINEAR, row_order=RowOrder.LINEAR
+    )
+
+
+def from_canonical(
+    canonical: QuantizedTensor, representation: Mapping[str, Any]
+) -> QuantizedTensor:
+    """The canonical ``canonical`` stored in the scale layout and row order
+    ``representation`` names (a manifest's quantized representation), the
+    inverse of :func:`to_canonical`. Runs on the tensor's device.
+    """  # noqa: D205
+    return canonical.repack(
+        scale_layout=ScaleLayout(representation["scale_layout"]),
+        row_order=RowOrder(representation["row_order"]),
+    )
+
+
+# Alignment of each field of a group's canonical form in its staging bytes.
+_CANONICAL_ALIGNMENT = 256
+
+
+def _scaled_part(
+    weight: Logical, local: tuple[int, ...], field_shape: tuple[int, ...]
+) -> Logical | None:
+    """The part of a field's own logical tensor that a field of
+    ``field_shape`` holds when its tensor's local ``local`` holds
+    ``weight``: each dimension scaled by the field's extent over the
+    tensor's (a packed value or a block scale per several elements).
+    ``None`` when a dimension does not scale to whole indices.
+    """  # noqa: D205
+    if len(field_shape) != len(local):
+        return None
+    shape, segments = [], []
+    for dim, (extent, mine) in enumerate(zip(local, field_shape, strict=True)):
+        if extent == 0:
+            return None
+        ratio = Fraction(mine, extent)
+        logical = weight.shape[dim] * ratio
+        if logical.denominator != 1:
+            return None
+        scaled = []
+        for segment in weight.segments[dim]:
+            start = segment.span.start * ratio
+            count = segment.span.count * ratio
+            position = segment.local * ratio
+            if any(
+                value.denominator != 1 for value in (start, count, position)
+            ) or (ratio != 1 and segment.span.step != 1):
+                return None
+            scaled.append(
+                Segment(
+                    Span(int(start), int(count), segment.span.step),
+                    int(position),
+                )
+            )
+        shape.append(int(logical))
+        segments.append(tuple(scaled))
+    return Logical(tuple(shape), weight.dims, weight.units, tuple(segments))
+
+
+def _strides(shape: tuple[int, ...]) -> list[int]:
+    strides = [1] * len(shape)
+    for dim in range(len(shape) - 2, -1, -1):
+        strides[dim] = strides[dim + 1] * shape[dim + 1]
+    return strides
+
+
+def field_parts(
+    entry: _Entry, tensor: torch.Tensor, weight: Logical | None
+) -> dict[str, dict[str, Any]]:
+    """Each field's part of its logical tensor and how its bytes encode it.
+
+    A dense tensor's one field holds the declared part of the tensor
+    (``weight``; the whole local tensor when its module declares none). A
+    quantized tensor's fields hold the parts of their own logical tensors
+    that scale from the tensor's part: values per element or packed pair,
+    scales per block. Fields in linear scale and row order are affine;
+    otherwise their bytes are a function of the whole tensor, and the
+    canonical form of the group (:func:`to_canonical`) holds each field
+    affinely, the fields back to back in staging bytes.
+    """
+    logical_shape = tuple(int(extent) for extent in tensor.shape)
+    weight = weight or Logical.whole(logical_shape)
+    if not isinstance(tensor, QuantizedTensor):
+        value = entry.fields[_DATA]
+        return {
+            _DATA: {
+                "element": value.element_size(),
+                "logical": weight.describe(),
+                "encoding": {"kind": "affine"},
+            }
+        }
+
+    # The local tensor's logical extents, against which fields scale.
+    local = logical_shape
+    linear = (
+        tensor.scale_layout is ScaleLayout.LINEAR
+        and tensor.row_order is RowOrder.LINEAR
+    )
+    parts: dict[str, dict[str, Any]] = {}
+    if linear:
+        for name, value in entry.fields.items():
+            shape = tuple(int(extent) for extent in value.shape)
+            part = _scaled_part(weight, local, shape)
+            if part is None and value.numel() == 1:
+                # A per-tensor scale: every part of the tensor shares it.
+                part = Logical.whole(shape)
+            if part is None:
+                break
+            parts[name] = {
+                "element": value.element_size(),
+                "logical": part.describe(),
+                "encoding": {"kind": "affine"},
+            }
+        else:
+            return parts
+
+    # The group's canonical form, laid out on the meta device: each field
+    # of it at the next aligned offset of the staging bytes.
+    meta = tensor.quantizer.from_tensors(
+        {
+            name: torch.empty_like(value, device="meta")
+            for name, value in entry.fields.items()
+        },
+        shape=tuple(tensor.shape),
+        dtype=tensor.dtype,
+        scale_layout=tensor.scale_layout,
+        row_order=tensor.row_order,
+    )
+    stored_canonical = to_canonical(meta).buffers()
+    canonical: dict[str, tuple[int, tuple[int, ...], Logical]] = {}
+    offset = 0
+    for field_name in entry.fields:
+        stored = stored_canonical[field_name]
+        shape = tuple(int(extent) for extent in stored.shape)
+        part = _scaled_part(weight, local, shape)
+        if (
+            part is None
+            and stored.is_contiguous()
+            and len(shape) < len(local)
+            and prod(shape[:-1]) == prod(local[:-1])
+        ):
+            # Linear block scales of a stacked tensor flatten its leading
+            # dimensions; the same bytes viewed in the tensor's dimensions
+            # hold its part affinely.
+            shape = (*local[:-1], shape[-1])
+            part = _scaled_part(weight, local, shape)
+        if part is None and stored.numel() == 1:
+            part = Logical.whole(shape)
+        if part is None:
+            # A field whose canonical form holds no affine part (a scale
+            # flattened across matrices): the group moves only as the
+            # stored bytes of a source that holds the same.
+            canonical = {}
+            break
+        offset = -(-offset // _CANONICAL_ALIGNMENT) * _CANONICAL_ALIGNMENT
+        canonical[field_name] = (offset, shape, part)
+        offset += stored.numel() * stored.element_size()
+
+    name = (
+        f"{tensor.quantizer.format}:{tensor.scale_layout.value}:"
+        f"{tensor.row_order.value}"
+    )
+    for field_name, value in entry.fields.items():
+        form = canonical.get(field_name)
+        parts[field_name] = {
+            "element": value.element_size(),
+            # The part of the group's tensor the field encodes: its
+            # canonical part, or the tensor's own without one.
+            "logical": (weight if form is None else form[2]).describe(),
+            "encoding": {
+                "kind": "encoded",
+                "name": name,
+                "group": entry.id,
+                "canonical": None
+                if form is None
+                else {
+                    "offset": form[0],
+                    "shape": list(form[1]),
+                    "strides": _strides(form[1]),
+                    "logical": form[2].describe(),
+                },
+            },
+        }
+    return parts
 
 
 def tensors(module: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
@@ -416,6 +623,7 @@ class Layout:
         host: frozenset[int] = frozenset(),
         origins: Mapping[int, str] | None = None,
         only: frozenset[str] | None = None,
+        devices: frozenset[str] = frozenset(("cuda",)),
     ) -> Layout:
         """The layout of ``module``'s parameters and buffers.
 
@@ -425,18 +633,21 @@ class Layout:
         each loaded tensor's checkpoint source by object identity
         (``uniserve.loading.loader.Result.origins``). ``only`` narrows the
         tensors to publish to those identities; ``None`` publishes all.
+        ``devices`` are the device types the tensors may lie on: CUDA for
+        a worker's retention; a caller describing a model loaded elsewhere
+        (on the host, to plan its redistribution) names that device.
 
         Raises:
-            ValueError: A tensor lies outside CUDA memory, which retention
-                does not hold.
+            ValueError: A tensor lies outside ``devices``.
         """
         origins = {} if origins is None else origins
+        declared = logical_tensors(module)
         layout = cls([])
         index: dict[tuple[str, int], int] = {}
         for identity, tensor in tensors(module):
             if tensor.is_meta:
                 continue
-            if tensor.device.type != "cuda":
+            if tensor.device.type not in devices:
                 raise ValueError(
                     f"{identity} lies in {tensor.device.type} memory; "
                     "only CUDA weights are retained"
@@ -444,6 +655,7 @@ class Layout:
             entry = tensor_entry(identity, tensor)
             entry.source = origins.get(id(tensor), "")
             entry.host = id(tensor) in host
+            entry.parts = field_parts(entry, tensor, declared.get(id(tensor)))
             layout.entries.append(entry)
             if only is not None and identity not in only:
                 continue
@@ -536,17 +748,58 @@ class Layout:
             for stride in tensor.stride()
         ]
 
+    def columns(self) -> dict[str, list]:
+        """The layout's storage and field lists by method name, as a
+        planner computes a rank's retained storages from them (the worker
+        library's ``weight_storages``).
+        """  # noqa: D205
+        return {
+            name: getattr(self, name)()
+            for name in (
+                "storage_devices",
+                "storage_bytes",
+                "field_ids",
+                "field_sources",
+                "field_storages",
+                "field_offsets",
+                "field_dtypes",
+                "field_ranks",
+                "field_shapes",
+                "field_strides",
+                "field_parts",
+            )
+        }
+
+    def field_parts(self) -> list[str]:
+        """Each field's part of its logical tensor and its encoding, as
+        JSON (``{"element", "logical", "encoding"}``, :func:`field_parts`).
+        """  # noqa: D205
+        return [
+            json.dumps(entry.parts[name], sort_keys=True)
+            for _, entry, name, _ in self._fields()
+        ]
+
     @torch.no_grad()
-    def publish(self, index: int, memory: torch.Tensor, offset: int) -> None:
+    def publish(
+        self,
+        index: int,
+        memory: torch.Tensor,
+        offset: int,
+        written: Sequence[int] | None = None,
+    ) -> None:
         """Move storage ``index`` into ``memory`` at byte ``offset``.
 
-        Copies the storage's bytes and rebinds every field that viewed it to
-        the same place in ``memory``, a one-dimensional ``uint8`` tensor
-        over a whole retained allocation on the storage's device. Each field
-        keeps its tensor object, so every module that holds it reads the
-        retained bytes. The loaded storage returns to the driver with the
-        allocator cache once the cache holds ``_RELEASE_BYTES``, and after
-        the last storage, so the next retained allocation can take its
+        ``memory`` is a one-dimensional ``uint8`` tensor over a whole
+        retained storage on the storage's device, made of chunks. The
+        storage's bytes in the chunks the worker created, ``written`` (flat
+        ``[start, end, ...]`` byte ranges relative to the storage, one per
+        chunk; all of them when ``None``), are copied; the chunks it mapped
+        from another world hold the same bytes already. Every field that
+        viewed the storage is rebound to the same place in ``memory``. Each
+        field keeps its tensor object, so every module that holds it reads
+        the retained bytes. The loaded storage returns to the driver with
+        the allocator cache once the cache holds ``_RELEASE_BYTES``, and
+        after the last storage, so the next retained chunks can take its
         memory; the copies have then completed.
         """
         storage = self._storages[index]
@@ -556,7 +809,10 @@ class Layout:
         source.set_(storage, 0, (size,), (1,))
         target = memory.untyped_storage()
         base = memory.storage_offset() + offset
-        memory[offset : offset + size].copy_(source)
+        # One copy per chunk: a copy stays inside one allocation.
+        bounds = [0, size] if written is None else [int(b) for b in written]
+        for start, end in zip(bounds[::2], bounds[1::2], strict=True):
+            memory[offset + start : offset + end].copy_(source[start:end])
         for _, _, tensor, position in self._views[index]:
             element = tensor.element_size()
             start = base + position
@@ -579,10 +835,10 @@ class Layout:
     def host_fields(self, loaded, path: str) -> list[Any]:
         """The fields of the stack under ``path`` in its host region.
 
-        Returns ``[ids, offsets, dtypes, ranks, shapes, strides, sources]``,
-        each a flat list as the ``field_*`` methods return them, with byte
-        offsets in the region (``host_weights.placements``). Call before the
-        stack is bound to its slots.
+        Returns ``[ids, offsets, dtypes, ranks, shapes, strides, sources,
+        parts]``, each a flat list as the ``field_*`` methods return them,
+        with byte offsets in the region (``host_weights.placements``). Call
+        before the stack is bound to its slots.
 
         Raises:
             ValueError: A streamed matrix is not a dense host-streamed entry
@@ -597,6 +853,7 @@ class Layout:
         shapes: list[int] = []
         strides: list[int] = []
         sources: list[str] = []
+        parts: list[str] = []
         for parameter, offset in host_weights.placements(loaded, str(path)):
             entry = self._host.get(id(parameter))
             if entry is None or entry.representation["kind"] != "dense":
@@ -604,13 +861,14 @@ class Layout:
                     "a streamed matrix is not a dense host entry of the layout"
                 )
             ids.append(f"{entry.id}/{_DATA}")
+            parts.append(json.dumps(entry.parts[_DATA], sort_keys=True))
             sources.append(entry.source)
             offsets.append(offset)
             dtypes.append(str(parameter.dtype).removeprefix("torch."))
             ranks.append(parameter.dim())
             shapes.extend(parameter.shape)
             strides.extend(parameter.stride())
-        return [ids, offsets, dtypes, ranks, shapes, strides, sources]
+        return [ids, offsets, dtypes, ranks, shapes, strides, sources, parts]
 
 
 def describe(

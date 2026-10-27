@@ -994,6 +994,9 @@ message Workers {
   // tensors in place of its files, as an in-place weight update from it
   // left them; empty to read the files.
   string weights = 13;
+  // The tensor- and expert-parallel degrees retained weight memory is
+  // chunked for; empty for every degree up to the GPUs a worker sees.
+  repeated uint32 parallel_degrees = 14;
 }
 
 message CudaGraphs {

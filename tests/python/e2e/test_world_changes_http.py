@@ -32,6 +32,15 @@ the same request alone, with the same usage.
   world, which reads its KV cache as it left it and answers a cached prompt
   as before.
 
+- A change of the parallel configuration on four GPUs (two replicas of
+  tensor parallelism 2 becoming four expert-parallel schedulers, and two
+  expert-parallel schedulers becoming one tensor-parallel group sharing its
+  experts) moves the stream to a successor whose workers receive their
+  weights from the serving world through the Transfer Server instead of
+  reading the checkpoint: the stream continues with the committed world's
+  tokens for the request alone, and every GPU's weights equal, field by
+  field, those of a direct start in the new configuration.
+
 The tests print the pause of every promotion and rollback. Each runs a
 Storage Server of its own: ``XDG_RUNTIME_DIR`` points the daemon at a
 directory of the test's, and the server the daemon starts there is stopped
@@ -979,3 +988,196 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
     lines = _log_lines(log)
     assert any("rolling back" in line for line in lines)
     assert any("the previous world serves again" in line for line in lines)
+
+
+# The plugin that digests every weight field a world's workers hold on
+# their GPUs: by GPU, each field's identity and the SHA-256 of its bytes.
+DIGEST_PLUGIN = """
+import hashlib
+
+import torch
+
+from uniserve.loading.retained import tensor_entry, tensors
+
+
+def register(registry):
+    registry.hook("weight_digests", digests)
+
+
+def digests(payload, models):
+    by_gpu = {}
+    for model in models:
+        for identity, tensor in tensors(model):
+            if tensor.device.type != "cuda":
+                continue
+            gpu = str(torch.cuda.get_device_properties(tensor.device).uuid)
+            fields = tensor_entry(identity, tensor).fields
+            for name, field in fields.items():
+                data = field.detach().contiguous().reshape(-1).view(torch.uint8)
+                by_gpu.setdefault(gpu, {})[f"{identity}/{name}"] = (
+                    hashlib.sha256(data.cpu().numpy().tobytes()).hexdigest()
+                )
+    return by_gpu
+"""
+
+
+def _plugin(plugins: Path, name: str, source: str) -> dict[str, str]:
+    """Installs plugin `name` of `source` under `plugins`; returns the
+    environment that makes a deployment's processes import it.
+    """  # noqa: D205
+    package = plugins / f"uniserve_{name}_plugin"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(source)
+    metadata = plugins / f"uniserve_{name}_plugin-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: uniserve-{name}-plugin\nVersion: 1.0\n"
+    )
+    (metadata / "entry_points.txt").write_text(
+        f"[uniserve.plugins]\n{name} = uniserve_{name}_plugin:register\n"
+    )
+    return {
+        "PYTHONPATH": os.pathsep.join(
+            [str(plugins), *filter(None, [os.environ.get("PYTHONPATH")])]
+        )
+    }
+
+
+def _weight_digests(base_url: str) -> dict[str, dict[str, str]]:
+    """Every weight field's digest on every GPU of the executing world."""
+    response = _admin(base_url, "hooks/weight_digests")
+    assert response.status_code == 200, response.text
+    by_gpu: dict[str, dict[str, str]] = {}
+    for result in response.json()["result"]["results"]:
+        for gpu, fields in result.items():
+            by_gpu.setdefault(gpu, {}).update(fields)
+    return by_gpu
+
+
+def _four_devices() -> str:
+    """The four GPUs a four-GPU deployment serves on
+    (``UNISERVE_WORLD_DEVICES``, ``0,1,2,3`` by default).
+    """  # noqa: D205
+    return os.environ.get("UNISERVE_WORLD_DEVICES", "0,1,2,3")
+
+
+# The parallel configurations of a four-GPU host a deployment changes
+# between: the options it serves with first, the change to the next, and
+# the options a direct start of the next states.
+PARALLEL_CHANGES = {
+    # Two replicas of tensor parallelism 2 becoming four expert-parallel
+    # schedulers with data-parallel attention.
+    "dp2-tp2-to-dep4": (
+        ("--tensor-parallel-size", "2", "--data-parallel-size", "2"),
+        (
+            "tensor_parallel_size=1",
+            "data_parallel_size=4",
+            "moe_config.expert_parallel=true",
+        ),
+        (
+            "--tensor-parallel-size",
+            "1",
+            "--data-parallel-size",
+            "4",
+            "--set",
+            "moe_config.expert_parallel=true",
+        ),
+    ),
+    # Two expert-parallel schedulers on the first two GPUs becoming one
+    # tensor-parallel group of four GPUs sharing its experts.
+    "dep2-to-tep4": (
+        (
+            "--data-parallel-size",
+            "2",
+            "--set",
+            "moe_config.expert_parallel=true",
+        ),
+        ("tensor_parallel_size=4", "data_parallel_size=1"),
+        (
+            "--tensor-parallel-size",
+            "4",
+            "--set",
+            "moe_config.expert_parallel=true",
+        ),
+    ),
+}
+
+
+# The ranks of each change's first configuration.
+SOURCE_RANKS = {"dp2-tp2-to-dep4": 4, "dep2-to-tep4": 2}
+
+
+@pytest.mark.parametrize("change", list(PARALLEL_CHANGES))
+def test_a_parallel_configuration_change_continues_a_streaming_request(
+    tmp_path: Path, change: str
+):
+    """A change of the parallel configuration is a world change: the
+    successor holds other regions of the weights on each GPU and lays its
+    KV cache out for its own heads. The count streaming across it continues
+    without failing and reads the tokens the committed world decodes for
+    the request alone, and the committed world's weights on every GPU are
+    byte for byte those of a direct start in its configuration.
+    """  # noqa: D205
+    source, assignments, target = PARALLEL_CHANGES[change]
+    name = "qwen3-parallel-change"
+    environment = _plugin(tmp_path / "plugins", "digest", DIGEST_PLUGIN)
+    devices = _four_devices()
+    changed_path = tmp_path / "changed"
+    changed_path.mkdir()
+    with _serve(changed_path, name, devices, source, env=environment) as (
+        base_url,
+        log,
+    ):
+        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        report = _world_change(base_url, *assignments)
+        streaming.mark()
+        assert report["parallel"] == "changed", report
+        assert report["previous_world"] == serving["world"], report
+        print(
+            f"{change}: promotion pause {report['pause_seconds']:.3f} s "
+            f"(park {report['park_seconds']:.3f} s, "
+            f"preparation {report['prepare_seconds']:.1f} s)"
+        )
+        streaming.wait_for(streaming.marked + 64)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        streaming.join()
+        assert len(streaming.tokens) > streaming.marked
+        reference, reference_usage = _ask(base_url, name)
+        assert streaming.tokens == reference
+        assert streaming.usage == reference_usage
+        changed = _weight_digests(base_url)
+
+    lines = _log_lines(log)
+    assert any("a request migrated" in line for line in lines), (
+        "the streaming request did not migrate to the successor"
+    )
+    # Only the first world's ranks read the checkpoint; the successor's
+    # received their weights from it through the Transfer Server.
+    loaded = sum(
+        "uniserve.loading.rank: loaded numerical model" in line
+        for line in lines
+    )
+    assert loaded == SOURCE_RANKS[change], loaded
+    assert any(
+        "receiving the rank's weights from the host's other worlds" in line
+        for line in lines
+    )
+    assert any("retained the received weights" in line for line in lines)
+    direct_path = tmp_path / "direct"
+    direct_path.mkdir()
+    with _serve(direct_path, name, devices, target, env=environment) as (
+        base_url,
+        _,
+    ):
+        direct = _weight_digests(base_url)
+    assert sorted(changed) == sorted(direct)
+    for gpu, fields in direct.items():
+        differing = sorted(
+            field
+            for field in fields.keys() | changed[gpu].keys()
+            if fields.get(field) != changed[gpu].get(field)
+        )
+        assert not differing, f"GPU {gpu}: {differing[:8]}"

@@ -166,7 +166,10 @@ pub(crate) fn span(
 }
 
 pub(crate) fn tensor_region(byte: u8) -> Region {
-    Region::Tensor { key: key(byte) }
+    Region::Tensor {
+        key: key(byte),
+        at: None,
+    }
 }
 
 /// `region` at the Storage Server of another host listening at `endpoint`.

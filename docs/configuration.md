@@ -117,6 +117,7 @@ retention = "30m"
 | `download_dir` | Hugging Face default | Cache root for repository models |
 | `threads` | Loader default | Concurrent checkpoint file readers |
 | `weights` | unset | A plugin's weight source (`scheme://...`, `docs/plugins.md`) that streams the checkpoint's tensors in place of its files; the model's configuration and tokenizer stay the checkpoint's. An in-place weight update from a source sets it |
+| `parallel_degrees` | every degree up to the GPUs a worker sees | The tensor- and expert-parallel degrees the deployment's configurations use. Retained weight memory is allocated in chunks cut where any of these degrees divides a logical tensor, so a world of another of them maps the chunks it shares with the world before it on the same GPU instead of copying them (`docs/architecture.md`, Weights). State them when the deployment may grow beyond the GPUs its workers see |
 
 ### `kv_cache_config`
 
@@ -182,7 +183,7 @@ A trial also rolls back, whatever these state, on a fault of the successor: a wo
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `expert_parallel` | `false` | Shard routed experts across the schedulers or the deployment's expert workers |
+| `expert_parallel` | `false` | Shard routed experts across the schedulers, the tensor-parallel ranks of a single scheduler's one worker group, or the deployment's expert workers |
 | `exchange` | `"alltoall"` | `alltoall`, `megamoe`, `deepep` or `dwdp` |
 | `microbatches` | `1` | Microbatches overlapping attention with dedicated expert workers |
 

@@ -4,6 +4,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::protocol::{Link, Memory, Placement};
+
 use super::*;
 
 /// The allocation granularity of these worlds: small, so that shards of a
@@ -180,19 +182,33 @@ fn moe_rank(tp: u64, t: u64, ep: u64, e: u64) -> Vec<Storage> {
     ]
 }
 
-fn gpu(index: usize) -> String {
-    format!("host/GPU-{index}")
+fn gpu(index: usize) -> Gpu {
+    [index as u8 + 1; 16]
 }
 
-fn links(gpus: usize) -> Vec<Link> {
-    let mut links = Vec::new();
+/// Links between `gpus` GPUs as a Transfer Server measures them, with the
+/// host's.
+fn links(gpus: usize) -> Vec<LinkBandwidth> {
+    let mut links = vec![LinkBandwidth {
+        link: Link {
+            source: Memory::Host,
+            destination: Memory::Host,
+        },
+        bytes_per_second: 50_000_000_000,
+    }];
     for source in 0..gpus {
         for target in 0..gpus {
-            links.push(Link {
-                source: gpu(source),
-                target: gpu(target),
+            links.push(LinkBandwidth {
+                link: Link {
+                    source: Memory::Device { gpu: gpu(source) },
+                    destination: Memory::Device { gpu: gpu(target) },
+                },
                 // A copy within a GPU is faster than one between GPUs.
-                bytes_per_second: if source == target { 4e12 } else { 4e11 },
+                bytes_per_second: if source == target {
+                    4_000_000_000_000
+                } else {
+                    400_000_000_000
+                },
             });
         }
     }
@@ -440,7 +456,7 @@ fn assert_fields_equal(request: &Request, applied: &[Vec<Vec<u8>>]) {
     }
 }
 
-fn world(ranks: Vec<(Option<String>, Vec<Storage>)>) -> World {
+fn world(ranks: Vec<(Option<Gpu>, Vec<Storage>)>) -> World {
     World {
         ranks: ranks
             .into_iter()
@@ -482,12 +498,47 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
                 sum
             });
     assert_eq!(mapped.len(), 4);
-    // Every task stays inside its regions and moves the copies' bytes.
-    let tasks: Vec<CopyTask> = manifest.tasks(&request, 1).collect::<Result<_>>().unwrap();
+    // Every span stays inside one chunk on each side, named at its GPU, and
+    // the spans move the copies' bytes.
+    let spans: Vec<crate::protocol::Span> =
+        manifest.spans(&request).collect::<Result<_>>().unwrap();
     assert_eq!(
-        tasks.iter().map(|task| task.length).sum::<u64>(),
+        spans.iter().map(|span| span.bytes).sum::<u64>(),
         manifest.copied_bytes()
     );
+    let chunk = |region: &crate::protocol::Region, world: &World, gpus: &[Gpu]| {
+        let crate::protocol::Region::Tensor {
+            key,
+            at: Some(Placement::Device { gpu }),
+        } = region
+        else {
+            panic!("a span names a chunk at its GPU");
+        };
+        world
+            .ranks
+            .iter()
+            .zip(gpus)
+            .filter(|(_, held)| *held == gpu)
+            .flat_map(|(rank, _)| rank.storages.iter().flat_map(|storage| &storage.chunks))
+            .find(|chunk| chunk.key == *key)
+            .map(|chunk| chunk.length)
+            .expect("a span names a chunk its rank holds")
+    };
+    let source_gpus: Vec<Gpu> = request
+        .source
+        .ranks
+        .iter()
+        .map(|rank| rank.gpu.unwrap())
+        .collect();
+    for span in &spans {
+        assert!(
+            span.source_offset + span.bytes <= chunk(&span.source, &request.source, &source_gpus)
+        );
+        assert!(
+            span.destination_offset + span.bytes
+                <= chunk(&span.destination, &request.target, &manifest.gpus)
+        );
+    }
 }
 
 #[test]
@@ -513,7 +564,7 @@ fn ranks_take_the_gpus_that_hold_their_experts() {
     let manifest = Manifest::plan(&request).unwrap();
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
-    let holder = |rank: usize| manifest.gpus[rank].clone();
+    let holder = |rank: usize| manifest.gpus[rank];
     assert!(
         [holder(0), holder(1)].contains(&gpu(0)) && [holder(2), holder(3)].contains(&gpu(1)),
         "{:?}",
@@ -528,6 +579,42 @@ fn ranks_take_the_gpus_that_hold_their_experts() {
             .any(|mapping| mapping.rank == rank as u32 && mapping.storage == 2);
         assert_eq!(experts_mapped, on_kept_gpu, "rank {rank}");
     }
+}
+
+#[test]
+fn running_target_ranks_keep_their_gpus() {
+    // The same change with target ranks already running on GPUs 0..4 in
+    // order: rank 1, whose experts GPU 0 holds, copies them to GPU 1.
+    let source = world(vec![
+        (Some(gpu(0)), moe_rank(1, 0, 2, 0)),
+        (Some(gpu(1)), moe_rank(1, 0, 2, 1)),
+    ]);
+    let target = world(
+        (0..4)
+            .map(|rank| (Some(gpu(rank as usize)), moe_rank(4, rank, 4, rank)))
+            .collect(),
+    );
+    let request = Request {
+        source,
+        target,
+        gpus: (0..4).map(gpu).collect(),
+        links: links(4),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert_eq!(manifest.gpus, (0..4).map(gpu).collect::<Vec<_>>());
+    assert!(manifest.missing.is_empty());
+    assert_fields_equal(&request, &apply(&request, &manifest));
+    let experts_mapped = |rank: u32| {
+        manifest
+            .mappings
+            .iter()
+            .any(|mapping| mapping.rank == rank && mapping.storage == 2)
+    };
+    assert!(experts_mapped(0) && !experts_mapped(1));
+
+    let mut partial = request.clone();
+    partial.target.ranks[1].gpu = None;
+    assert!(Manifest::plan(&partial).is_err());
 }
 
 #[test]

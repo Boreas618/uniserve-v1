@@ -256,6 +256,18 @@ impl State {
         self.gpus.insert(device.0, uuid);
         Ok(uuid)
     }
+
+    /// Where the worker's retained memory lies: the GPUs it addressed and
+    /// host memory. A key has a copy at each location that holds it, so
+    /// the worker retains, renames and releases the copies at its own
+    /// locations and leaves other workers' copies to them.
+    fn locations(&self) -> Vec<Placement> {
+        self.gpus
+            .values()
+            .map(|gpu| Placement::Device { gpu: *gpu })
+            .chain(std::iter::once(Placement::Host { numa_node: None }))
+            .collect()
+    }
 }
 
 impl Retained {
@@ -392,6 +404,63 @@ impl Retained {
         request(&mut lock(&self.state).client).map_err(|error| storage_error(what, error))
     }
 
+    /// Submit `spans` to the host's Transfer Server as one task of
+    /// `update` at `priority` (`Request::Transfer`); returns the task. The
+    /// task ends with the worker's connection, so the worker keeps its
+    /// sources and destinations until [`Self::transferred`] answers.
+    pub(crate) fn transfer(
+        &self,
+        spans: Vec<storage::protocol::Span>,
+        priority: storage::protocol::Priority,
+        update: u64,
+    ) -> Result<u64> {
+        self.call("submitting a transfer", |client| {
+            client.transfer(spans, priority, update)
+        })
+    }
+
+    /// Block until transfer `task` ends: `Ok` once every span was copied,
+    /// an error naming how it ended otherwise. Other events the connection
+    /// receives meanwhile are for no one else: a worker submits the only
+    /// transfers whose events reach it.
+    pub(crate) fn transferred(&self, task: u64) -> Result<()> {
+        use storage::protocol::{Event, TransferEnd};
+        loop {
+            {
+                let mut state = lock(&self.state);
+                state
+                    .client
+                    .pump()
+                    .map_err(|error| storage_error("awaiting a transfer", error))?;
+                while let Some((event, _)) = state.client.next_event() {
+                    if let Event::Transferred {
+                        task: ended,
+                        bytes,
+                        end,
+                    } = event
+                        && ended == task
+                    {
+                        return match end {
+                            TransferEnd::Complete => {
+                                tracing::info!(task, bytes, "the transfer copied every span");
+                                Ok(())
+                            }
+                            TransferEnd::Cancelled => Err(Error::Interface(format!(
+                                "transfer {task} was cancelled after {bytes} bytes"
+                            ))),
+                            TransferEnd::Failed { message } => Err(Error::Interface(format!(
+                                "transfer {task} failed after {bytes} bytes: {message}"
+                            ))),
+                        };
+                    }
+                }
+            }
+            // Events arrive on the connection while the copies run; the
+            // lock is free for other calls in between.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Note tensors the worker uses, which its startup retains.
     pub(crate) fn use_keys(&self, keys: impl IntoIterator<Item = Key>) {
         lock(&self.state).used.extend(keys);
@@ -404,9 +473,10 @@ impl Retained {
             return Ok(());
         }
         let mut state = lock(&self.state);
+        let at = state.locations();
         state
             .client
-            .rekey(moves.clone())
+            .rekey(moves.clone(), at)
             .map_err(|error| storage_error("renaming retained weights", error))?;
         for (old, new) in moves {
             if state.used.remove(&old) {
@@ -435,9 +505,10 @@ impl Retained {
             })
             .map(|tensor| tensor.key)
             .collect();
+        let at = state.locations();
         let released = state
             .client
-            .retain(keep)
+            .retain(keep, at)
             .map_err(|error| storage_error("releasing retained weights", error))?;
         if released > 0 {
             tracing::info!(released, "released retained weights before loading");
@@ -513,9 +584,10 @@ impl Retained {
             }
         }
         if untaken > 0 {
+            let at = state.locations();
             state
                 .client
-                .retain(keep)
+                .retain(keep, at)
                 .map_err(|error| storage_error("releasing untaken storages", error))?;
             tracing::info!(
                 released = untaken,
@@ -615,9 +687,10 @@ impl Retained {
     pub(crate) fn retain_used(&self) -> Result<()> {
         let mut state = lock(&self.state);
         let used = state.used.iter().copied().collect();
+        let at = state.locations();
         let released = state
             .client
-            .retain(used)
+            .retain(used, at)
             .map_err(|error| storage_error("retaining the worker's storages", error))?;
         if released > 0 {
             tracing::info!(
@@ -712,7 +785,7 @@ impl ExclusiveMemory for &Retained {
         let mode = if standby { Mode::Standby } else { Mode::Write };
         let got = state
             .client
-            .get(keys, mode)
+            .get(keys, mode, Vec::new())
             .map_err(|error| storage_error("taking exclusive storages", error))?;
         if standby && let Some(missing) = got.missing.first() {
             let name = keyed
@@ -848,7 +921,7 @@ impl Retained {
             let asked: Vec<Key> = indices.iter().map(|&index| keys[index]).collect();
             let got = state
                 .client
-                .get(asked, mode)
+                .get(asked, mode, Vec::new())
                 .map_err(|error| storage_error("taking a segmented storage", error))?;
             if mode == Mode::Standby
                 && !standby
@@ -945,9 +1018,10 @@ impl Retained {
                 .retain(|(inherited, _, _)| *inherited != key);
         }
         let used: Vec<Key> = state.used.iter().copied().collect();
+        let at = state.locations();
         state
             .client
-            .retain(used)
+            .retain(used, at)
             .map_err(|error| storage_error("giving back segments", error))?;
         Ok(())
     }
@@ -989,7 +1063,7 @@ impl Retained {
         }
         let got = state
             .client
-            .get(keys.clone(), Mode::Standby)
+            .get(keys.clone(), Mode::Standby, Vec::new())
             .map_err(|error| storage_error("mapping the predecessor's storages", error))?;
         if let Some(missing) = got.missing.first() {
             let name = keys
@@ -1043,9 +1117,10 @@ impl Retained {
             state.used.remove(key);
         }
         let used: Vec<Key> = state.used.iter().copied().collect();
+        let at = state.locations();
         state
             .client
-            .retain(used)
+            .retain(used, at)
             .map_err(|error| storage_error("forgetting the predecessor's storages", error))?;
         Ok(())
     }

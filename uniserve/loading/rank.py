@@ -10,8 +10,8 @@ reached by import path with explicit arguments:
 2. :func:`load_model` narrows the checkpoint to this rank's modules and the
    launch's weight choices and materializes them on the meshes the rank
    created, or binds the tensors the rank retained when it last loaded the
-   same model on the same placement (:func:`fingerprint`,
-   ``uniserve.loading.retained``).
+   same model at the same position of its parallel configuration
+   (:func:`fingerprint`, ``uniserve.loading.retained``).
 
 The objects returned here are opaque to the rank and passed back unchanged.
 What the rank reports of a loaded model it reads from the functions below
@@ -392,7 +392,7 @@ def fingerprint(
 ) -> str:
     """The digests of what determines this rank's loaded weights.
 
-    Placement and GPUs aside (``uniserve.loading.retained.fingerprints``),
+    The regions a rank holds aside (``uniserve.loading.retained.fingerprints``),
     as JSON text; the arguments are those of :func:`load_model`. Empty for
     the stub model, whose weights are not retained.
     """
@@ -440,6 +440,7 @@ def load_model(
     attention_ranks: int,
     expert_dedicated: bool,
     expert_exchange: str | None,
+    tensor_experts: bool,
     retained: retention.Retained | None,
     load: Sequence[str],
     attention_backend: str,
@@ -451,6 +452,7 @@ def load_model(
     prefill_split_tile_size: int | None,
     use_tensor_core: bool | None,
     weights: str | None = None,
+    unread: bool = False,
 ) -> Loaded:
     """Materialize this rank's modules of a described model on its meshes.
 
@@ -484,8 +486,11 @@ def load_model(
         expert_exchange: The expert union's exchange transport, which
             selects the kernels its routed experts are laid out for;
             ``None`` without an expert union.
+        tensor_experts: The tensor-parallel group of each mesh divides the
+            routed experts among its ranks, each keeping whole experts,
+            instead of every expert's channels.
         retained: The tensors this rank retained when it last loaded this
-            model on this placement, which it binds instead of reading the
+            model at this position, which it binds instead of reading the
             checkpoint; ``None`` loads.
         load: With ``retained``, the tensors to read from the checkpoint
             instead, which the rank's loading peers agreed on
@@ -498,6 +503,11 @@ def load_model(
         weights: A plugin's weight source (``scheme://...``) that streams
             the checkpoint's tensors in place of its files; ``None`` reads
             the files.
+        unread: Materialize every tensor without reading the checkpoint
+            (the ``dummy`` mode of ``uniserve.loading.Config``): the model
+            has the storages, shapes, element types and encodings a load
+            gives it, not its values. A worker plans the layout of the
+            weights it then receives from another world with it.
     """
     weights = _text(weights)
     resolved = _resolve(
@@ -508,6 +518,12 @@ def load_model(
         model_dtype,
         weights,
     )
+    if bool(unread) and isinstance(resolved, Resolved):
+        source = resolved.source
+        resolved = replace(
+            resolved,
+            source=replace(source, io=replace(source.io, mode="dummy")),
+        )
     device = str(device)
     generation = _text(generation_device)
     dedicated = str(role) == "experts"
@@ -596,6 +612,7 @@ def load_model(
             attention=attention,
             devices=_devices(description.model, generation),
             experts=partition,
+            tensor_experts=bool(tensor_experts),
             expert_kernels=kernels,
             retained=retained,
             load=frozenset(str(name) for name in load),
@@ -619,6 +636,7 @@ def load_model(
                 attention=attention,
                 devices=_devices(checkpoint.model, generation),
                 experts=partition,
+                tensor_experts=bool(tensor_experts),
                 expert_kernels=kernels,
             ).model
 
@@ -631,7 +649,9 @@ def load_model(
                 for child in module.modules()
                 if isinstance(child, FusedMoE)
             )
-        if retained is None:
+        if unread:
+            action = "materialized without reading"
+        elif retained is None:
             action = "loaded"
         elif load:
             action = f"bound retained tensors and read {len(load)} of"

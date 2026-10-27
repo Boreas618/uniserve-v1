@@ -7,10 +7,11 @@ use std::ops::Range;
 use super::layout::{Encoding, Field, Logical, Piece, Segment};
 use super::region::{Span, atoms, volume};
 use super::{
-    Conversion, Copy, Endpoint, Error, Fill, LinkLoad, Manifest, Mapping, Missing, Request, Result,
-    Side, Space, Staging,
+    Conversion, Copy, Endpoint, Error, Fill, Gpu, LinkLoad, Manifest, Mapping, Missing, Request,
+    Result, Side, Space, Staging, uuid,
 };
 use crate::Key;
+use crate::protocol::Memory;
 
 /// The most tied GPU assignments whose transfers are planned to find the
 /// one whose busiest link finishes first: every assignment of up to five
@@ -106,8 +107,9 @@ struct Context<'r> {
     /// Source fields by logical tensor.
     sources: HashMap<&'r str, Vec<FieldRef>>,
     /// Source chunks by GPU and key.
-    chunks: HashMap<(&'r str, Key), SourceChunk>,
-    bandwidth: HashMap<(&'r str, &'r str), f64>,
+    chunks: HashMap<(Gpu, Key), SourceChunk>,
+    /// Each measured link's bandwidth in bytes per second.
+    bandwidth: HashMap<(Gpu, Gpu), f64>,
 }
 
 impl<'r> Context<'r> {
@@ -117,7 +119,6 @@ impl<'r> Context<'r> {
         for (rank, source) in request.source.ranks.iter().enumerate() {
             let gpu = source
                 .gpu
-                .as_deref()
                 .ok_or_else(|| Error::Invalid(format!("source rank {rank} names no GPU")))?;
             for (storage, held) in source.storages.iter().enumerate() {
                 held.layout.validate()?;
@@ -149,15 +150,19 @@ impl<'r> Context<'r> {
                 request.gpus.len()
             )));
         }
+        // Links between GPUs, as the Transfer Server measured them; a copy
+        // within one GPU takes the link from it to itself.
         let bandwidth = request
             .links
             .iter()
-            .map(|link| {
-                (
-                    (link.source.as_str(), link.target.as_str()),
-                    link.bytes_per_second,
-                )
-            })
+            .filter_map(
+                |measured| match (&measured.link.source, &measured.link.destination) {
+                    (Memory::Device { gpu: source }, Memory::Device { gpu: destination }) => {
+                        Some(((*source, *destination), measured.bytes_per_second as f64))
+                    }
+                    _ => None,
+                },
+            )
             .collect();
         Ok(Self {
             request,
@@ -177,16 +182,17 @@ impl<'r> Context<'r> {
             .fields[at.field as usize]
     }
 
-    fn source_gpu(&self, rank: u32) -> &'r str {
+    /// The GPU of source rank `rank`, which `Context::new` checked it
+    /// names.
+    fn source_gpu(&self, rank: u32) -> Gpu {
         self.request.source.ranks[rank as usize]
             .gpu
-            .as_deref()
             .unwrap_or_default()
     }
 
     /// The bytes of target rank `rank`'s regions that the source ranks on
     /// GPU `gpu` hold.
-    fn local_bytes(&self, rank: usize, gpu: &str) -> u64 {
+    fn local_bytes(&self, rank: usize, gpu: Gpu) -> u64 {
         let mut bytes = 0;
         for held in &self.request.target.ranks[rank].storages {
             for field in &held.layout.fields {
@@ -334,21 +340,40 @@ fn hungarian(local: &[Vec<u64>], gpus: usize) -> Vec<usize> {
 pub(super) fn plan(request: &Request) -> Result<Manifest> {
     let context = Context::new(request)?;
     let ranks = request.target.ranks.len();
-    let local: Vec<Vec<u64>> = (0..ranks)
+    // Target ranks already running on their GPUs keep them; otherwise the
+    // manifest assigns every rank a GPU.
+    let fixed: Option<Vec<usize>> = request
+        .target
+        .ranks
+        .iter()
         .map(|rank| {
-            request
-                .gpus
-                .iter()
-                .map(|gpu| context.local_bytes(rank, gpu))
-                .collect()
+            rank.gpu
+                .and_then(|gpu| request.gpus.iter().position(|candidate| *candidate == gpu))
         })
         .collect();
+    let candidates = match fixed {
+        Some(assignment) => vec![assignment],
+        None if request.target.ranks.iter().any(|rank| rank.gpu.is_some()) => {
+            return Err(Error::Invalid(
+                "target ranks name GPUs for some ranks only, or GPUs outside the request's".into(),
+            ));
+        }
+        None => {
+            let local: Vec<Vec<u64>> = (0..ranks)
+                .map(|rank| {
+                    request
+                        .gpus
+                        .iter()
+                        .map(|gpu| context.local_bytes(rank, *gpu))
+                        .collect()
+                })
+                .collect();
+            assignments(&local, request.gpus.len())
+        }
+    };
     let mut best: Option<(f64, Manifest)> = None;
-    for assignment in assignments(&local, request.gpus.len()) {
-        let gpus: Vec<String> = assignment
-            .iter()
-            .map(|&gpu| request.gpus[gpu].clone())
-            .collect();
+    for assignment in candidates {
+        let gpus: Vec<Gpu> = assignment.iter().map(|&gpu| request.gpus[gpu]).collect();
         let manifest = Draft::new(&context, gpus).build()?;
         let busiest = manifest
             .links
@@ -368,7 +393,7 @@ pub(super) fn plan(request: &Request) -> Result<Manifest> {
 /// One GPU assignment's manifest under construction.
 struct Draft<'c, 'r> {
     context: &'c Context<'r>,
-    gpus: Vec<String>,
+    gpus: Vec<Gpu>,
     mappings: Vec<Mapping>,
     stagings: Vec<Staging>,
     staging_index: HashMap<(Side, u32, String), u32>,
@@ -380,7 +405,7 @@ struct Draft<'c, 'r> {
 }
 
 impl<'c, 'r> Draft<'c, 'r> {
-    fn new(context: &'c Context<'r>, gpus: Vec<String>) -> Self {
+    fn new(context: &'c Context<'r>, gpus: Vec<Gpu>) -> Self {
         Self {
             context,
             gpus,
@@ -421,7 +446,7 @@ impl<'c, 'r> Draft<'c, 'r> {
     fn rank(&mut self, rank: u32) -> Result<()> {
         let context = self.context;
         let target = &context.request.target.ranks[rank as usize];
-        let gpu = self.gpus[rank as usize].clone();
+        let gpu = self.gpus[rank as usize];
         // Chunks a source on the same GPU holds under the same key.
         let mut mapped: Vec<Vec<Option<SourceChunk>>> = target
             .storages
@@ -430,7 +455,7 @@ impl<'c, 'r> Draft<'c, 'r> {
                 storage
                     .chunks
                     .iter()
-                    .map(|chunk| context.chunks.get(&(gpu.as_str(), chunk.key)).copied())
+                    .map(|chunk| context.chunks.get(&(gpu, chunk.key)).copied())
                     .collect()
             })
             .collect();
@@ -908,26 +933,26 @@ impl<'c, 'r> Draft<'c, 'r> {
         let context = self.context;
         let mut order: Vec<usize> = (0..self.cells.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.cells[index].bytes));
-        let mut loads: BTreeMap<(String, String), u64> = BTreeMap::new();
+        let mut loads: BTreeMap<(Gpu, Gpu), u64> = BTreeMap::new();
         let mut busiest = 0.0_f64;
         for index in order {
             let cell = &self.cells[index];
-            let target_gpu = self.gpus[cell.target.rank as usize].as_str();
+            let target_gpu = self.gpus[cell.target.rank as usize];
             let mut best: Option<((f64, f64), (FieldRef, Form))> = None;
             for &(source, form) in &cell.candidates {
                 let source_gpu = context.source_gpu(source.rank);
                 let bandwidth = *context
                     .bandwidth
                     .get(&(source_gpu, target_gpu))
+                    .filter(|bandwidth| **bandwidth > 0.0)
                     .ok_or_else(|| {
                         Error::Invalid(format!(
-                            "no bandwidth is known from {source_gpu} to {target_gpu}"
+                            "no bandwidth is measured from GPU {} to GPU {}",
+                            uuid(&source_gpu),
+                            uuid(&target_gpu)
                         ))
                     })?;
-                let load = loads
-                    .get(&(source_gpu.to_owned(), target_gpu.to_owned()))
-                    .copied()
-                    .unwrap_or(0);
+                let load = loads.get(&(source_gpu, target_gpu)).copied().unwrap_or(0);
                 let finish = (load + cell.bytes) as f64 / bandwidth;
                 let score = (busiest.max(finish), finish);
                 if best.as_ref().is_none_or(|(current, _)| score < *current) {
@@ -938,10 +963,8 @@ impl<'c, 'r> Draft<'c, 'r> {
                 continue;
             };
             busiest = latest;
-            let source_gpu = context.source_gpu(chosen.0.rank).to_owned();
-            *loads
-                .entry((source_gpu, target_gpu.to_owned()))
-                .or_default() += cell.bytes;
+            let source_gpu = context.source_gpu(chosen.0.rank);
+            *loads.entry((source_gpu, target_gpu)).or_default() += cell.bytes;
             self.cells[index].chosen = Some(chosen);
         }
         loads
@@ -949,7 +972,7 @@ impl<'c, 'r> Draft<'c, 'r> {
             .map(|((source, target), bytes)| {
                 let bandwidth = context
                     .bandwidth
-                    .get(&(source.as_str(), target.as_str()))
+                    .get(&(source, target))
                     .copied()
                     .unwrap_or(f64::INFINITY);
                 Ok(LinkLoad {

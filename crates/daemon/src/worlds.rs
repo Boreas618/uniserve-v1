@@ -13,14 +13,20 @@
 //!    share with the serving world read-only (the weights of the same keys,
 //!    and the KV cache segments of the serving world's workers of the same
 //!    scope), create the rest of their own, warm up and capture their graphs.
-//!    The serving world executes throughout.
+//!    The serving world executes throughout. A successor of another
+//!    parallel configuration holds other regions of the logical tensors on
+//!    each GPU: it maps the weight chunks whose keys (the regions they
+//!    hold) lie on its GPUs, and none of the serving world's KV cache, which
+//!    it lays out for its own heads.
 //! 2. **Promotion.** At a step boundary new requests wait, the serving world
 //!    parks (it ends every token request that resumes from its generated
 //!    tokens as migratable and executes nothing more, keeping its memory and
 //!    its prefix cache index), and the successor imports that index into
 //!    the units it maps and serves: every migrated request is submitted
 //!    again with the tokens it generated and reuses the pages of every
-//!    complete page of them, computing at most its last page.
+//!    complete page of them, computing at most its last page. On a
+//!    successor of another parallel configuration each computes its tokens
+//!    again.
 //! 3. **Trial.** The successor executes; the previous world is kept as
 //!    `update_config.previous_world` states: parked, its weights alone, or
 //!    its weights in host memory. The trial ends only with the operator's
@@ -302,10 +308,42 @@ fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
     }
 }
 
+/// Whether `target` states another parallel configuration than `served`:
+/// other ranks, devices or hosts, another device of a generation tower
+/// (the worker mesh), another division of the routed experts, or another
+/// page size of the KV cache. Each GPU of the successor then holds other
+/// regions of the logical tensors: its weights are keyed by those regions,
+/// so a chunk of the same key on its GPU is mapped and the rest
+/// redistributed, and its KV cache is laid out for its own heads and
+/// pages, so it maps none of the serving world's segments and the requests
+/// in flight compute their state again.
+fn parallel_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
+    let ranks = |spec: &wire::EngineSpec| {
+        spec.placement.as_ref().map(|placement| {
+            (
+                placement.worker_groups.clone(),
+                placement.tensor_parallel_size,
+                placement.data_parallel_size,
+                placement.device.clone(),
+                placement.worker_hosts.clone(),
+            )
+        })
+    };
+    let mesh = |spec: &wire::EngineSpec| spec.workers.as_ref().map(|workers| workers.mesh.clone());
+    let pages = |spec: &wire::EngineSpec| spec.kv_cache.as_ref().map(|cache| cache.block_size);
+    ranks(served) != ranks(target)
+        || mesh(served) != mesh(target)
+        || pages(served) != pages(target)
+        || served.experts != target.experts
+}
+
 /// What a world change keeps of the serving world's derived state, by the
 /// parts of the engine spec that decide each one's keys: the weights and
-/// the KV cache the successor maps. Names the parts that differ.
+/// the KV cache the successor maps. Names the parts that differ. A change
+/// of the parallel configuration ([`parallel_change`]) is not among them:
+/// it redistributes both.
 fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'static str> {
+    let parallel = parallel_change(served, target);
     let mut parts = Vec::new();
     let mut differs = |name: &'static str, same: bool| {
         if !same {
@@ -315,13 +353,30 @@ fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'stat
     differs("the deployment", served.deployment == target.deployment);
     differs("the model", served.model == target.model);
     differs("the host", served.host == target.host);
-    differs("the placement", served.placement == target.placement);
+    // The queue depth and memory fraction of the same ranks.
+    let sizing = |spec: &wire::EngineSpec| {
+        spec.placement.as_ref().map(|placement| {
+            (
+                placement.queue_depth,
+                placement.mem_fraction_static.to_bits(),
+            )
+        })
+    };
+    differs(
+        "the placement",
+        parallel || sizing(served) == sizing(target),
+    );
     differs("the product transport", served.transfer == target.transfer);
-    differs("the KV cache", served.kv_cache == target.kv_cache);
-    differs("the experts", served.experts == target.experts);
+    // The KV cache but its page size, which a parallel change covers.
+    let cache = |spec: &wire::EngineSpec| {
+        spec.kv_cache.clone().map(|cache| wire::KvCache {
+            block_size: None,
+            ..cache
+        })
+    };
+    differs("the KV cache", cache(served) == cache(target));
     differs("the video options", served.video == target.video);
     if let (Some(old), Some(new)) = (&served.workers, &target.workers) {
-        differs("the worker mesh", old.mesh == new.mesh);
         differs("the dtype", old.dtype == new.dtype);
         differs(
             "the quantization",
@@ -476,7 +531,15 @@ impl Leader {
         // A world change: what each derived state of the serving world
         // becomes in its successor.
         let unmapped = differing(&served, &target_spec);
+        let redistributes = parallel_change(&served, &target_spec);
         let running = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        let (weights, kv_cache) = if !unmapped.is_empty() {
+            ("unmapped", "unmapped")
+        } else if redistributes {
+            ("redistributed", "recomputed")
+        } else {
+            ("mapped", "mapped")
+        };
         let in_place = crate::leader::configurable(
             &comparable(&served),
             &comparable(&target_spec),
@@ -497,8 +560,8 @@ impl Leader {
             "daemon": daemon_changes,
             "previous_world": update.previous_world,
             "in_flight": request.in_flight,
-            "weights": if unmapped.is_empty() { "mapped" } else { "unmapped" },
-            "kv_cache": if unmapped.is_empty() { "mapped" } else { "unmapped" },
+            "weights": weights,
+            "kv_cache": kv_cache,
             "differs": unmapped,
             "in_flight_requests": running.in_flight(),
             "memory": memory.as_ref().map(|(plan, _)| plan),
@@ -573,6 +636,7 @@ impl Leader {
                 target_digest,
                 &update,
                 request.in_flight,
+                redistributes,
             )
             .await?;
         Ok(Applied::World(report))
@@ -580,7 +644,9 @@ impl Leader {
 
     /// Moves the deployment from the world `running` executes to a
     /// successor executing `target`, up to its trial (steps 1 to 3 of the
-    /// module).
+    /// module). A successor of another parallel configuration
+    /// (`redistributes`) maps none of the serving world's KV cache, and the
+    /// requests in flight compute their state again on it.
     #[expect(
         clippy::too_many_arguments,
         reason = "one world change: both worlds' specs and configurations and its options"
@@ -595,6 +661,7 @@ impl Leader {
         target_digest: String,
         update: &crate::options::UpdateOptions,
         in_flight: InFlight,
+        redistributes: bool,
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
         let previous_world = running.world();
@@ -612,10 +679,17 @@ impl Leader {
                 )
             })?;
         let memory = memory_report(&shrunk);
-        let segments = running.describe_cache().await.map_err(|error| {
-            self.progress_done();
-            anyhow::anyhow!("the serving world did not describe its KV cache: {error}")
-        })?;
+        // A successor of another parallel configuration lays its cache out
+        // for the heads it holds, so it maps none of the serving world's
+        // segments.
+        let segments = if redistributes {
+            Vec::new()
+        } else {
+            running.describe_cache().await.map_err(|error| {
+                self.progress_done();
+                anyhow::anyhow!("the serving world did not describe its KV cache: {error}")
+            })?
+        };
         spec.world = 0;
         spec.predecessor = Some(wire::Predecessor {
             world: previous_world,
@@ -698,7 +772,7 @@ impl Leader {
         let parked = paused.elapsed();
         // A previous world kept parked keeps its memory until the commit; one
         // kept as its weights frees the rest as the successor serves.
-        let recompute = numerics_change && in_flight == InFlight::Recompute;
+        let recompute = redistributes || (numerics_change && in_flight == InFlight::Recompute);
         let grows = update.previous_world != PreviousWorld::Parked;
         if let Err(error) = successor.promote(index, recompute, grows).await {
             hold.keep(None);
@@ -766,6 +840,7 @@ impl Leader {
             "pause_seconds": pause.as_secs_f64(),
             "previous_world_kept": update.previous_world,
             "numerics": if numerics_change { "changed" } else { "unchanged" },
+            "parallel": if redistributes { "changed" } else { "unchanged" },
             "in_flight": if numerics_change { Some(in_flight) } else { None },
             "memory": memory,
         });
@@ -1309,5 +1384,38 @@ mod tests {
         assert!(differing(&served, &target).is_empty());
         target.model = "b".into();
         assert_eq!(differing(&served, &target), vec!["the model"]);
+    }
+
+    /// Another parallel configuration redistributes the weights and the KV
+    /// cache rather than being refused; the sizing of the same ranks is
+    /// still refused.
+    #[test]
+    fn a_parallel_configuration_change_redistributes() {
+        let served = wire::EngineSpec {
+            placement: Some(wire::Placement {
+                tensor_parallel_size: 2,
+                data_parallel_size: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut target = served.clone();
+        if let Some(placement) = target.placement.as_mut() {
+            placement.tensor_parallel_size = 1;
+            placement.data_parallel_size = 4;
+        }
+        target.experts = Some(wire::Experts {
+            expert_parallel: true,
+            ..Default::default()
+        });
+        assert!(parallel_change(&served, &target));
+        assert!(differing(&served, &target).is_empty());
+
+        let mut sized = served.clone();
+        if let Some(placement) = sized.placement.as_mut() {
+            placement.mem_fraction_static = 0.5;
+        }
+        assert!(!parallel_change(&served, &sized));
+        assert_eq!(differing(&served, &sized), vec!["the placement"]);
     }
 }

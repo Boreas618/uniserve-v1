@@ -63,13 +63,20 @@ def _layers(model, disaggregated: bool) -> list[FusedMoE]:
     """Routed-expert layers that exchange tokens, in traversal order.
 
     With dedicated expert ranks every routed-expert layer exchanges;
-    colocated, the layers whose experts are partitioned across ranks.
+    colocated, the layers whose experts are partitioned across ranks that
+    hold different tokens, not across a tensor-parallel group.
     """
     return [
         module
         for module in _module(model).modules()
         if isinstance(module, FusedMoE)
-        and (disaggregated or module.expert_group.size > 1)
+        and (
+            disaggregated
+            or (
+                module.expert_group.size > 1
+                and module.expert_group is not module.group
+            )
+        )
     ]
 
 

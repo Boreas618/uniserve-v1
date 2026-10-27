@@ -587,6 +587,9 @@ impl SchedulerHandle {
         }
 
         let disaggregated = !expert_workers.is_empty();
+        // Experts sharded with one scheduler divide over its tensor-parallel
+        // ranks instead of an expert union across schedulers.
+        let tensor_experts = config.expert_parallel.is_some() && !disaggregated && size == 1;
         anyhow::ensure!(
             config.worker_process.expert_microbatches >= 1
                 && (config.worker_process.expert_microbatches == 1 || disaggregated),
@@ -601,6 +604,19 @@ impl SchedulerHandle {
                 ) && core_groups.iter().all(|core_group| core_group.len() == 1),
                 "disaggregated experts require deepep or megamoe and one model group per scheduler"
             );
+        } else if tensor_experts {
+            // The ranks of one tensor-parallel group hold every token of
+            // their scheduler, so no exchange moves tokens: each runs its
+            // share of the experts over all of them and the group sums the
+            // outputs, as it sums the shards of tensor-parallel experts.
+            anyhow::ensure!(
+                config.expert_parallel == Some(ExpertExchange::AllToAll)
+                    && core_groups[0].len() == 1
+                    && core_groups[0][0].ranks.len() > 1,
+                "expert parallelism within one scheduler requires a single worker group of two \
+                 or more tensor-parallel ranks, which exchange no tokens: the exchange applies \
+                 across schedulers"
+            );
         } else {
             anyhow::ensure!(
                 config.expert_parallel.is_none()
@@ -609,8 +625,8 @@ impl SchedulerHandle {
                         && core_groups.iter().all(|core_group| {
                             core_group.len() == 1 && core_group[0].ranks.len() == 1
                         })),
-                "colocated expert parallelism requires two or more schedulers of one \
-                 one-worker group each; deepep requires dedicated expert workers"
+                "colocated expert parallelism across schedulers requires one one-worker group \
+                 per scheduler; deepep requires dedicated expert workers"
             );
         }
         let attention_ranks = if disaggregated {
@@ -703,15 +719,16 @@ impl SchedulerHandle {
                         .mem_fraction_static
                         .unwrap_or(config.worker_process.mem_fraction_static),
                     transfer: transfer.clone(),
-                    expert_parallel: config.expert_parallel.map(|exchange| {
-                        crate::worker::ExpertParallelPlacement {
+                    expert_parallel: config.expert_parallel.filter(|_| !tensor_experts).map(
+                        |exchange| crate::worker::ExpertParallelPlacement {
                             rank: union_rank as u32,
                             size: expert_world_size as u32,
                             attention_ranks: attention_ranks as u32,
                             address: None,
                             exchange,
-                        }
-                    }),
+                        },
+                    ),
+                    tensor_experts,
                     ..config.worker_process.clone()
                 });
                 union_rank += worker.ranks.len();
@@ -1421,10 +1438,12 @@ mod tests {
         assert!(error.to_string().contains("schedulers must place"));
     }
 
-    /// Experts shard across two or more schedulers of one worker each; any
-    /// other placement is refused before a worker launches.
+    /// Experts shard across two or more schedulers of one one-rank worker
+    /// each, or across the tensor-parallel ranks of one scheduler's single
+    /// group; a one-rank scheduler, and schedulers of multi-rank groups,
+    /// are refused before a worker launches.
     #[test]
-    fn expert_parallelism_needs_several_one_worker_engine_cores() {
+    fn expert_parallelism_needs_several_ranks_in_one_arrangement() {
         let hosts = ["localhost".to_owned()];
         for (cores, ranks) in [(1, 1), (2, 2)] {
             let config = EngineConfig {

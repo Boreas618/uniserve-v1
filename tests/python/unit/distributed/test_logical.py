@@ -144,15 +144,19 @@ def _whole(kv_heads):
     return model
 
 
-def _tensor_parallel(model, size, rank):
+def _tensor_parallel(model, size, rank, *, whole_experts=False):
     mesh = DeviceMesh(
         ranks=tuple(range(size)), shape=(size,), axes=("tp",), rank=rank
     )
     object.__setattr__(
         mesh, "_groups", {("tp",): Communicator(tuple(range(size)), rank, "tp")}
     )
-    parallelize_(model, mesh)
+    parallelize_(model, mesh, whole_experts=whole_experts)
     return model
+
+
+def _tensor_parallel_experts(model, size, rank):
+    return _tensor_parallel(model, size, rank, whole_experts=True)
 
 
 def _expert_parallel(model, size, rank):
@@ -168,6 +172,9 @@ def _expert_parallel(model, size, rank):
         (1, _tensor_parallel, 2),
         (2, _tensor_parallel, 4),
         (2, _expert_parallel, 2),
+        # Tensor-parallel attention with the group dividing whole experts.
+        (2, _tensor_parallel_experts, 2),
+        (2, _tensor_parallel_experts, 4),
     ),
 )
 def test_partitioned_parameters_hold_their_declared_parts(
@@ -206,3 +213,19 @@ def test_expert_parts_name_the_up_and_gate_rows_of_their_channels():
         (segment.span.start, segment.span.count, segment.local)
         for segment in part.segments[1]
     ] == [(4, 4, 0), (12, 4, 4)]
+
+
+def test_a_tensor_parallel_group_dividing_experts_keeps_their_channels():
+    model = _tensor_parallel_experts(_whole(2), 4, 2)
+    experts = next(m for m in model.modules() if isinstance(m, FusedMoE))
+    part = logical_tensors(model)[id(experts.up_gate.weight)]
+    # Rank 2 of 4 holds experts 2 of the 4, every up and gate row whole.
+    assert experts.expert_slice == slice(2, 3)
+    assert experts.group is experts.expert_group
+    assert part.shape == (4, 16, 16)
+    assert [
+        (segment.span.start, segment.span.count) for segment in part.segments[0]
+    ] == [(2, 1)]
+    assert [
+        (segment.span.start, segment.span.count) for segment in part.segments[1]
+    ] == [(0, 16)]
