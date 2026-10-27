@@ -340,26 +340,79 @@ impl Scheduler {
 
     /// Copy prompt pages of the worker groups whose ranks all map a page
     /// pool for every cache group through the host KV cache, as a head of
-    /// `deployment` on `host`: ranks on `host` through its Storage Server's
+    /// `world` of `deployment` on `host` (what a world on trial commits is
+    /// its own until its commit): ranks on `host` through its Storage Server's
     /// socket, the others through their servers' TCP addresses. Sliding
     /// windows are offloaded every `boundary_interval` pages of a long
-    /// prompt. A failure to reach this host's server leaves the host KV cache
-    /// off.
-    pub fn enable_kv_offload(&mut self, deployment: &str, host: &str, boundary_interval: usize) {
+    /// prompt. The world's host KV cache holds one token count on every
+    /// rank, of `size` (`crate::kv_cache::HostCacheDemand`): its device
+    /// tokens times the ratio, or what the stated bytes of each host hold,
+    /// which every rank maps its pools at (`uniserve.host_cache`). A failure to reach
+    /// this host's server leaves the host KV cache off.
+    ///
+    /// # Errors
+    ///
+    /// Fails when another host's server cannot size the cache, or a rank
+    /// cannot map its pools.
+    pub fn enable_kv_offload(
+        &mut self,
+        deployment: &str,
+        world: u64,
+        host: &str,
+        boundary_interval: usize,
+        size: crate::kv_cache::HostCacheSize,
+    ) -> anyhow::Result<()> {
         let socket = storage::socket::default_socket();
         let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(
             &socket,
             deployment,
+            world,
             boundary_interval,
         ) {
             Ok(kv_offload) => kv_offload,
             Err(error) => {
                 tracing::warn!(%error, "the host KV cache is off: the storage server is unreachable");
-                return;
+                return Ok(());
             }
         };
+        let mut rank_caches = self.executor.info().rank_caches.clone();
+        let Some(demand) = crate::kv_cache::HostCacheDemand::of(&rank_caches, size.ratio) else {
+            return Ok(());
+        };
+        // The world asks for its device tokens times the ratio, or, when
+        // the deployment states each host's bytes, for whatever those hold;
+        // each host lowers the count for the whole world to what its budget
+        // holds over the world's ranks there.
+        let asked = match size.host_bytes {
+            Some(_) => u64::MAX,
+            None => demand.tokens,
+        };
+        let mut tokens = asked;
+        for (rank_host, (endpoint, token_bytes)) in demand.hosts {
+            let held = kv_offload.host_cache_tokens(
+                rank_host == host,
+                endpoint.as_deref(),
+                asked,
+                token_bytes,
+                size.host_bytes,
+            )?;
+            tokens = tokens.min(held);
+        }
+        tracing::info!(asked, tokens, "sized the world's host KV cache");
+        let payload = serde_json::json!({ "tokens": tokens }).to_string();
+        for (worker, results) in self.executor.hook_groups("uniserve.host_cache", &payload)? {
+            let Some(ranks) = rank_caches.get_mut(&worker) else {
+                continue;
+            };
+            for ((_, cache), result) in ranks.iter_mut().zip(results) {
+                let pools: Option<Vec<ipc::PagePoolInfo>> = serde_json::from_str(&result)?;
+                if let (Some(cache), Some(pools)) = (cache.as_mut(), pools) {
+                    cache.page_pools = pools;
+                }
+            }
+        }
         let mut served = false;
-        for (worker, ranks) in &self.executor.info().rank_caches {
+        for (worker, ranks) in &rank_caches {
             let reports: Option<Vec<crate::kv_cache::RankCache<'_>>> = ranks
                 .iter()
                 .map(|(rank_host, cache)| {
@@ -376,6 +429,7 @@ impl Scheduler {
         if served {
             self.kv_offload = Some(kv_offload);
         }
+        Ok(())
     }
 
     /// Returns the executor's aggregate worker capabilities.

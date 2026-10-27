@@ -65,6 +65,17 @@ pub struct PrefixCacheInfo {
     /// is copied through the host KV cache.
     #[serde(default)]
     pub request_states: bool,
+    /// The bytes one token of the rank's pages takes in the host KV cache,
+    /// over every cache group (a group's page bytes over its block size,
+    /// rounded up); zero for a rank that copies no page through it. The
+    /// engine sizes the world's host KV cache in tokens from them
+    /// (`uniserve.host_cache`).
+    #[serde(default)]
+    pub host_token_bytes: u64,
+    /// Where an engine on another host reaches the rank's host's Storage
+    /// Server (`StorageLaunch::tcp`); `None` on the engine's host.
+    #[serde(default)]
+    pub storage_endpoint: Option<String>,
 }
 
 impl PrefixCacheInfo {
@@ -317,6 +328,10 @@ impl PrefixCacheInfo {
             inherited_start: self.inherited_start,
             inherited_units: self.inherited_units,
             request_states: self.request_states || other.request_states,
+            // Each stage's pages are its own (`page_pools`); the merged view
+            // copies none.
+            host_token_bytes: 0,
+            storage_endpoint: None,
         };
         ensure_valid!(
             self.inherited() == other.inherited(),
@@ -825,6 +840,8 @@ impl Default for WorkerInfo {
                 inherited_units: 0,
                 request_states: false,
                 identity: String::new(),
+                host_token_bytes: 0,
+                storage_endpoint: None,
             }),
             latent_page_units: 0,
             latent_pages: 0,

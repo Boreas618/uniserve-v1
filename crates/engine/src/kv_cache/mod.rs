@@ -58,7 +58,10 @@ mod offload;
 
 pub(crate) use encoder_cache::EncoderCacheManager;
 use freeq::UnitMeta;
-pub(crate) use offload::{DEFAULT_BOUNDARY_INTERVAL, KvOffloadManager, OffloadKind, RankCache};
+pub use offload::HostCacheSize;
+pub(crate) use offload::{
+    DEFAULT_BOUNDARY_INTERVAL, HostCacheDemand, KvOffloadManager, OffloadKind, RankCache,
+};
 
 /// Computes an incremental per-page prefix hash with 64-bit FNV-1a.
 ///

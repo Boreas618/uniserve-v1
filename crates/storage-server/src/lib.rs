@@ -125,6 +125,9 @@ struct TensorEntry {
     /// world, so a world's memory outlives its processes and is released
     /// with the world.
     retainers: BTreeSet<Retainer>,
+    /// The deployment and world whose worker put the tensor: a world on
+    /// trial keeps what it publishes to itself until its commit.
+    publisher: (String, u64),
     /// The process that may write an exclusive tensor.
     writer: Option<Holder>,
     /// Processes that map an exclusive tensor in standby.
@@ -134,6 +137,21 @@ struct TensorEntry {
 struct Deployment {
     claim: Claim,
     head: Option<ClientId>,
+    /// The worlds claimed and not retired. The oldest serves; those newer
+    /// are on trial and keep what they publish to themselves.
+    worlds: BTreeSet<u64>,
+    /// The worlds a rollback retired while on trial: what they publish
+    /// while their processes leave stays theirs.
+    discarded: BTreeSet<u64>,
+}
+
+impl Deployment {
+    /// The worlds that keep what they publish to themselves: those on
+    /// trial, claimed and newer than the oldest, and those discarded.
+    fn private(&self) -> BTreeSet<u64> {
+        let trial = self.worlds.iter().skip(1);
+        trial.chain(&self.discarded).copied().collect()
+    }
 }
 
 /// What handling a request came to.
@@ -599,7 +617,8 @@ impl Server {
                 | Request::Abort { .. }
                 | Request::Pin { .. }
                 | Request::Unpin { .. }
-                | Request::Prefetch { .. },
+                | Request::Prefetch { .. }
+                | Request::HostCache { .. },
                 role,
             ) => {
                 let outcome = self.pages(id, request, &role);
@@ -625,7 +644,7 @@ impl Server {
                     world,
                     retire,
                 },
-                Role::Head { deployment },
+                Role::Head { deployment, .. },
             ) => self.claim(id, &deployment, scopes, *world, retire),
             (
                 request,
@@ -752,17 +771,61 @@ impl Server {
             Some(claim) => claim,
             None => Claim(random_token().map_err(resource)?),
         };
+        // The head that holds the claim adds and retires worlds. A new head
+        // starts from its own world: the worlds a previous head kept on
+        // trial are discarded with that head, never committed, and the
+        // pages of every world discarded before are relabelled as such, so
+        // that the new head's worlds may take their numbers.
+        let (trial, mut discarded, mut worlds) = match self.deployments.get(deployment) {
+            Some(entry) => (
+                entry.worlds.iter().skip(1).copied().collect(),
+                entry.discarded.clone(),
+                entry.worlds.clone(),
+            ),
+            None => (BTreeSet::new(), BTreeSet::new(), BTreeSet::new()),
+        };
+        let mut retired: BTreeSet<u64> = retire.iter().copied().collect();
+        if held.is_none() {
+            retired.extend(trial.iter().filter(|&&old| old != world));
+            worlds.clear();
+        }
+        worlds.insert(world);
+        worlds.retain(|world| !retired.contains(world));
+        // A world on trial that a claim retires is rolled back: its pages
+        // are discarded. A world on trial that the deployment keeps but no
+        // longer as a trial is committed: every world reads its pages,
+        // which the KV storage now takes.
+        let oldest = worlds.first().copied();
+        for &old in &trial {
+            if retired.contains(&old) {
+                self.pages.discard_world(deployment, old);
+                discarded.insert(old);
+            } else if Some(old) == oldest {
+                for (pool, pages) in self.pages.published_by(deployment, old) {
+                    self.upload(pool, pages);
+                }
+            }
+        }
+        if held.is_none() {
+            for &old in &discarded {
+                self.pages.discard_world(deployment, old);
+            }
+            discarded.clear();
+        }
         self.deployments.insert(
             deployment.to_owned(),
             Deployment {
                 claim,
                 head: Some(id),
+                worlds,
+                discarded,
             },
         );
+        // The retired worlds map no page pool any more.
+        self.pages.retire_users(deployment, &retired);
         // The world's retention of the scopes it no longer places ends, and
         // every retired world's retention ends.
         let listed: BTreeSet<&Scope> = scopes.iter().collect();
-        let retired: BTreeSet<u64> = retire.iter().copied().collect();
         let released: Vec<Key> = self
             .tensors
             .iter_mut()
@@ -903,6 +966,44 @@ impl Server {
         ))
     }
 
+    /// What a head of `world` of `deployment` reads.
+    fn visibility(&self, deployment: &str, world: u64) -> pages::Visibility {
+        pages::Visibility {
+            world,
+            private: self
+                .deployments
+                .get(deployment)
+                .map(Deployment::private)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// What the head connected as `client` reads; nothing of a world on
+    /// trial once it is gone.
+    fn head_visibility(&self, client: ClientId) -> pages::Visibility {
+        match self
+            .clients
+            .get(&client)
+            .and_then(|client| client.role.as_ref())
+        {
+            Some(Role::Head { deployment, world }) => self.visibility(deployment, *world),
+            _ => self.visibility("", 0),
+        }
+    }
+
+    /// Whether a worker of `holder`'s world reads `tensor`: its own world
+    /// published it, or a world every world of the publisher's deployment
+    /// reads did. What a world on trial publishes stays its own until its
+    /// commit, whichever worlds retain it.
+    fn sees(&self, holder: &Holder, tensor: &TensorEntry) -> bool {
+        let (deployment, world) = &tensor.publisher;
+        (*deployment == holder.scope.deployment && *world == holder.world)
+            || !self
+                .deployments
+                .get(deployment)
+                .is_some_and(|entry| entry.private().contains(world))
+    }
+
     /// Whether `holder` is a worker of its deployment's current head.
     fn current(&self, holder: &Holder) -> bool {
         self.deployments
@@ -917,7 +1018,15 @@ impl Server {
         if !self.current(holder) {
             return Err(stale(holder));
         }
-        let listed: BTreeSet<&Key> = keys.iter().collect();
+        // A world retains only what it reads.
+        let listed: BTreeSet<&Key> = keys
+            .iter()
+            .filter(|key| {
+                self.tensors
+                    .get(key)
+                    .is_some_and(|tensor| self.sees(holder, tensor))
+            })
+            .collect();
         let retainer = holder.retainer();
         let mut released = Vec::new();
         for (key, tensor) in &mut self.tensors {
@@ -984,9 +1093,19 @@ impl Server {
         if mode != Mode::Read && !self.current(holder) {
             return Err(stale(holder));
         }
+        // A tensor another world keeps to itself is missing to the caller.
+        let hidden: BTreeSet<Key> = keys
+            .iter()
+            .filter(|key| {
+                self.tensors
+                    .get(key)
+                    .is_some_and(|tensor| !self.sees(holder, tensor))
+            })
+            .copied()
+            .collect();
         let mut victims = Vec::new();
         for key in keys {
-            let Some(tensor) = self.tensors.get(key) else {
+            let Some(tensor) = self.tensors.get(key).filter(|_| !hidden.contains(key)) else {
                 continue;
             };
             match (tensor.access, mode) {
@@ -1011,7 +1130,7 @@ impl Server {
         let mut tensors = Vec::new();
         let mut missing = Vec::new();
         for key in keys {
-            let Some(tensor) = self.tensors.get_mut(key) else {
+            let Some(tensor) = self.tensors.get_mut(key).filter(|_| !hidden.contains(key)) else {
                 missing.push(*key);
                 continue;
             };
@@ -1106,8 +1225,34 @@ impl Server {
             })
             .collect();
         for tensor in tensors {
+            let unseen = self
+                .tensors
+                .get(&tensor.key)
+                .is_some_and(|existing| !self.sees(holder, existing));
             if let Some(existing) = self.tensors.get_mut(&tensor.key) {
                 existing.retainers.insert(holder.retainer());
+                if !unseen {
+                    continue;
+                }
+                // A world on trial, which the caller does not read,
+                // published the key: the caller's bytes take the place of
+                // that world's, so that no world reads them through the
+                // caller. The world on trial's processes keep the memory
+                // they map.
+                let storage = ids[tensor.storage as usize];
+                let previous = std::mem::replace(&mut existing.storage, storage);
+                existing.publisher = (holder.scope.deployment.clone(), holder.world);
+                existing.name.clone_from(&tensor.name);
+                existing.offset = tensor.offset;
+                existing.dtype.clone_from(&tensor.dtype);
+                existing.shape.clone_from(&tensor.shape);
+                existing.strides.clone_from(&tensor.strides);
+                if let Some(entry) = self.storages.get_mut(&storage) {
+                    entry.tensors += 1;
+                }
+                if let Some(entry) = self.storages.get_mut(&previous) {
+                    entry.tensors -= 1;
+                }
                 continue;
             }
             let storage = ids[tensor.storage as usize];
@@ -1125,6 +1270,7 @@ impl Server {
                     strides: tensor.strides.clone(),
                     access: tensor.access,
                     retainers: BTreeSet::from([holder.retainer()]),
+                    publisher: (holder.scope.deployment.clone(), holder.world),
                     writer: (tensor.access == Access::Exclusive).then(|| holder.clone()),
                     standby: Vec::new(),
                 },
@@ -1323,7 +1469,7 @@ impl Server {
             Some(Role::Connector) if self.kv_storage.client == Some(id) => self.connector_gone(),
             _ => {}
         }
-        if let Some(Role::Head { deployment }) = &client.role
+        if let Some(Role::Head { deployment, .. }) = &client.role
             && let Some(entry) = self.deployments.get_mut(deployment)
             && entry.head == Some(id)
         {
@@ -1531,10 +1677,11 @@ impl Server {
         pool: u64,
         keys: &[Key],
         tag: u64,
+        visibility: &pages::Visibility,
     ) -> Result<(), (ErrorKind, String)> {
         let entry = pool_of(&mut self.pages, pool)?;
         let fetches = if self.kv_storage.client.is_some() {
-            entry.prefetch(keys)
+            entry.prefetch(keys, visibility)
         } else {
             vec![pages::Fetch::Full; keys.len()]
         };
@@ -1547,7 +1694,10 @@ impl Server {
             })
             .collect();
         if pages.is_empty() {
-            let results = keys.iter().map(|key| entry.holds(key)).collect();
+            let results = keys
+                .iter()
+                .map(|key| entry.holds(key, visibility))
+                .collect();
             self.events
                 .push((head, Event::Prefetched { tag, results }, Vec::new()));
             return Ok(());
@@ -1594,6 +1744,7 @@ impl Server {
             } => {
                 // A page the pool did not hold is in L2 when the pool holds
                 // it by now, and in L3 when the connector found it.
+                let visibility = self.head_visibility(client);
                 let mut missing = keys.iter().enumerate();
                 let levels = held
                     .iter()
@@ -1604,7 +1755,11 @@ impl Server {
                         let Some((index, key)) = missing.next() else {
                             return PageLevel::Absent;
                         };
-                        if self.pages.get(pool).is_some_and(|entry| entry.holds(key)) {
+                        if self
+                            .pages
+                            .get(pool)
+                            .is_some_and(|entry| entry.holds(key, &visibility))
+                        {
                             PageLevel::Host
                         } else if succeeded(index) {
                             PageLevel::Storage
@@ -1635,12 +1790,16 @@ impl Server {
                 pages,
                 keys,
             } => {
+                let visibility = self.head_visibility(head);
                 let Some(entry) = self.pages.get_mut(pool) else {
                     return;
                 };
                 let arrived: Vec<bool> = (0..pages.len()).map(succeeded).collect();
                 entry.fetched(&pages, &arrived);
-                let results = keys.iter().map(|key| entry.holds(key)).collect();
+                let results = keys
+                    .iter()
+                    .map(|key| entry.holds(key, &visibility))
+                    .collect();
                 self.events
                     .push((head, Event::Prefetched { tag, results }, Vec::new()));
                 self.send_events();
@@ -1693,12 +1852,28 @@ impl Server {
                         .pages
                         .slots_of(shape.page_bytes, *bytes)
                         .map_err(resource)?;
-                    self.admit_host(slots * shape.page_bytes)?;
+                    // A pool the host cannot hold first takes the place of
+                    // the deployment's pools no world maps any more, whose
+                    // pages a previous world left.
+                    if self.admit_host(slots * shape.page_bytes).is_err() {
+                        let unreferenced: Vec<u64> = self
+                            .pages
+                            .unreferenced(&scope.deployment)
+                            .into_iter()
+                            .map(|(pool, _)| pool)
+                            .collect();
+                        let released = self.pages.release_pools(&unreferenced);
+                        self.pools_released(&released);
+                        self.admit_host(slots * shape.page_bytes)?;
+                    }
                     self.pages
                         .create(&scope.deployment, *shape, *numa_node, slots)
                         .map_err(resource)?
                 }
             };
+            if let Role::Worker { scope, world, .. } = role {
+                self.pages.add_user(pool, scope, *world);
+            }
             let slots = self.pages.get(pool).map_or(0, pages::Pool::slots);
             self.offer_pools();
             return Ok(Outcome::Reply(
@@ -1710,12 +1885,13 @@ impl Server {
                 vec![Attachment::Pool(pool)],
             ));
         }
-        let Role::Head { deployment } = role else {
+        let Role::Head { deployment, world } = role else {
             return Err(invalid(&format!(
                 "{} is a request of a head",
                 request_name(request)
             )));
         };
+        let visibility = self.visibility(deployment, *world);
         let of_deployment = |scope: &Scope| {
             if &scope.deployment == deployment {
                 Ok(())
@@ -1733,7 +1909,7 @@ impl Server {
         }
         match request {
             Request::Lookup { pool, keys } => {
-                let held = pool_of(&mut self.pages, *pool)?.lookup(keys);
+                let held = pool_of(&mut self.pages, *pool)?.lookup(keys, &visibility);
                 let missing: Vec<Key> = keys
                     .iter()
                     .zip(&held)
@@ -1773,12 +1949,20 @@ impl Server {
                 of_deployment(writer)?;
                 let slots = self
                     .pages
-                    .reserve(*pool, writer, id, keys, *window)
+                    .reserve(*pool, writer, id, keys, *window, &visibility)
                     .ok_or_else(|| invalid(&format!("page pool {pool} does not exist")))?;
                 reply(Reply::Reserved { slots })
             }
             Request::Commit { pool, keys } => {
-                let committed = pool_of(&mut self.pages, *pool)?.commit(keys);
+                let entry = pool_of(&mut self.pages, *pool)?;
+                let mut committed = entry.commit(keys);
+                // The KV storage takes the pages every world reads; those of
+                // a world on trial wait for its commit.
+                committed.retain(|(_, slot)| {
+                    entry
+                        .publisher(*slot)
+                        .is_some_and(|published| visibility.shared(published))
+                });
                 self.upload(*pool, committed);
                 reply(Reply::Committed)
             }
@@ -1788,7 +1972,7 @@ impl Server {
             }
             Request::Pin { pool, reader, keys } => {
                 of_deployment(reader)?;
-                let slots = pool_of(&mut self.pages, *pool)?.pin(reader, id, keys);
+                let slots = pool_of(&mut self.pages, *pool)?.pin(reader, id, keys, &visibility);
                 reply(Reply::Pinned { slots })
             }
             Request::Unpin { pool, reader, keys } => {
@@ -1796,8 +1980,44 @@ impl Server {
                 pool_of(&mut self.pages, *pool)?.unpin(reader, keys);
                 reply(Reply::Unpinned)
             }
+            Request::HostCache {
+                tokens,
+                token_bytes,
+                host_bytes,
+            } => {
+                let per_token: u64 = token_bytes.iter().sum();
+                let budget = match host_bytes {
+                    Some(bytes) => *bytes,
+                    None => {
+                        let releasable: u64 = self
+                            .pages
+                            .unreferenced(deployment)
+                            .iter()
+                            .map(|(_, bytes)| bytes)
+                            .sum();
+                        let available = (available_memory().map_err(resource)? + releasable)
+                            .saturating_sub(self.pages.unallocated())
+                            .saturating_sub(self.host_reserve);
+                        available / 5 * 4
+                    }
+                };
+                let held = match budget.checked_div(per_token) {
+                    Some(fits) => fits.min(*tokens),
+                    None => *tokens,
+                };
+                tracing::info!(
+                    deployment,
+                    world,
+                    tokens,
+                    per_token,
+                    budget,
+                    held,
+                    "sized the host KV cache of a world"
+                );
+                reply(Reply::HostCache { tokens: held })
+            }
             Request::Prefetch { pool, keys, tag } => {
-                self.prefetch(id, *pool, keys, *tag)?;
+                self.prefetch(id, *pool, keys, *tag, &visibility)?;
                 reply(Reply::Prefetching)
             }
             _ => Err(invalid(&format!(
@@ -1860,13 +2080,29 @@ fn request_pool(request: &Request) -> Option<u64> {
 /// bytes.
 fn available_memory() -> io::Result<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo")?;
-    meminfo
+    let available = meminfo
         .lines()
         .find_map(|line| line.strip_prefix("MemAvailable:"))
         .and_then(|value| value.trim().strip_suffix("kB"))
         .and_then(|kib| kib.trim().parse::<u64>().ok())
         .map(|kib| kib * 1024)
-        .ok_or_else(|| io::Error::other("/proc/meminfo states no MemAvailable"))
+        .ok_or_else(|| io::Error::other("/proc/meminfo states no MemAvailable"))?;
+    Ok(cgroup_room().map_or(available, |room| available.min(room)))
+}
+
+/// What the server's memory cgroup (v2) lets it allocate beyond what the
+/// cgroup holds: its limit less its usage; `None` without a limit.
+fn cgroup_room() -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim();
+    let directory = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let read = |name: &str| std::fs::read_to_string(directory.join(name)).ok();
+    let limit = read("memory.max")?.trim().parse::<u64>().ok()?;
+    let usage = read("memory.current")?.trim().parse::<u64>().ok()?;
+    Some(limit.saturating_sub(usage))
 }
 
 fn invalid(message: &str) -> (ErrorKind, String) {
@@ -1915,6 +2151,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Unpin { .. } => "unpin",
         Request::Endpoint => "endpoint",
         Request::Prefetch { .. } => "prefetch",
+        Request::HostCache { .. } => "host_cache",
         Request::Finished { .. } => "finished",
     }
 }

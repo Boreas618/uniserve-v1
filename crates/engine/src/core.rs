@@ -368,6 +368,9 @@ pub struct EngineConfig {
     /// a long prompt offloads its sliding windows to the host KV cache
     /// before.
     pub boundary_interval: usize,
+    /// How large the world's host KV cache is (`kv_cache_config.host_ratio`
+    /// and `host_gib`).
+    pub host_cache: crate::kv_cache::HostCacheSize,
     /// Waiting queue policy for admitting/scheduling requests.
     pub schedule_policy: SchedulingPolicy,
     /// Static computation components and physical rank membership.
@@ -450,6 +453,7 @@ impl EngineConfig {
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
             prefix_cache: true,
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
+            host_cache: crate::kv_cache::HostCacheSize::default(),
             schedule_policy: SchedulingPolicy::Fcfs,
             worker_groups: vec![WorkerGroupConfig::placed(
                 &["localhost".to_owned()],
@@ -846,11 +850,15 @@ impl SchedulerHandle {
                 .map(|group| group.id.clone()),
         );
         if config.prefix_cache && config.worker_process.host_kv_cache {
-            scheduler.enable_kv_offload(
-                &config.worker_process.deployment,
-                &config.worker_process.host,
-                config.boundary_interval,
-            );
+            scheduler
+                .enable_kv_offload(
+                    &config.worker_process.deployment,
+                    config.world,
+                    &config.worker_process.host,
+                    config.boundary_interval,
+                    config.host_cache,
+                )
+                .context("sizing the world's host KV cache")?;
         }
         Self::spawn(scheduler, config.worker_process.model, waker)
     }

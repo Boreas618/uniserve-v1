@@ -2735,6 +2735,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 &socket,
                 storage::Role::Head {
                     deployment: STUB_WORKER.into(),
+                    world: 0,
                 },
             )
             .unwrap();
@@ -2744,7 +2745,6 @@ fn stub_storage() -> ipc::StorageLaunch {
                 deployment: STUB_WORKER.into(),
                 claim: claim.0,
                 host_kv_cache: false,
-                host_kv_cache_bytes: None,
                 tcp: None,
                 world: 0,
                 standby: false,

@@ -30,12 +30,10 @@ pub struct StorageLaunch {
     /// head.
     pub claim: [u8; 16],
     /// Whether the engine copies the worker's cache pages through the host
-    /// KV cache: the worker then maps a page pool per cache group.
+    /// KV cache: the worker then maps a page pool per cache group, holding
+    /// the tokens the engine sizes the world's host KV cache at
+    /// (`uniserve.host_cache`).
     pub host_kv_cache: bool,
-    /// The bytes of host KV cache the worker keeps over its page pools,
-    /// split between its cache groups; the Storage Server's size for each
-    /// pool when `None`.
-    pub host_kv_cache_bytes: Option<u64>,
     /// Where an engine on another host reaches the server (`host:port`), for
     /// page requests; `None` on the engine's host, or when the server accepts
     /// no other host.

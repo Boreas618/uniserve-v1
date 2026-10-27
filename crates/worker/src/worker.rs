@@ -59,8 +59,8 @@ use crate::executor::experts::{ExpertMember, ExpertStart};
 use crate::executor::transfer::TransferRuntime;
 use crate::ffi::{Handle, Interpreter};
 use crate::job::{BLOCK_ON_TIMEOUT, JobQueue};
-use crate::memory::HostKvCache;
 use crate::memory::allocation::Storage;
+use crate::memory::prefix_cache::host::{self, HostCacheSetup};
 use crate::memory::retained::Retained;
 use crate::memory::weights::{self, WeightKeys};
 use crate::parallel::world::{World, startup_timeout};
@@ -149,6 +149,10 @@ pub(crate) struct Worker {
     /// What holds the plugins' communication buffers, which serve for the
     /// worker's lifetime.
     _plugin_buffers: Option<Handle>,
+    /// What mapping the rank's host page pools needs, until the engine
+    /// sizes them; `None` for a rank that copies no page through the host
+    /// KV cache.
+    host_cache: Option<HostCacheSetup>,
     warmed: bool,
 }
 
@@ -474,7 +478,7 @@ impl Worker {
         let mut graphs = GraphStorage::new(budgets);
         let mut scratches = Scratches::default();
 
-        let mut storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
+        let storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
             .map_err(phase("storage"))?;
         // The engine copies the cache's pages through the host KV cache when
         // it says so; pages are keyed by the whole model's fingerprint and
@@ -490,33 +494,35 @@ impl Worker {
                 .clone()
                 .unwrap_or_else(|| identity.clone());
         }
-        if let (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) = (
+        // The engine sizes the host KV cache of every rank of the world at
+        // one token count once each reported what a token of its pages
+        // takes, and the rank maps its page pools then
+        // (`uniserve.host_cache`).
+        let host_cache = match (
             launch.storage.host_kv_cache,
-            model_fingerprint.as_deref(),
-            storage.prefix_cache.as_mut(),
+            model_fingerprint,
+            storage.prefix_cache.as_ref(),
             device.cuda(),
             info.prefix_cache.as_mut(),
         ) {
-            let (host_kv_cache, pools) = HostKvCache::start(
-                &retained,
-                prefix_cache.plan(),
-                cuda,
-                fingerprint,
-                launch.storage.tcp.as_deref(),
-                launch.storage.host_kv_cache_bytes,
-            )
-            .map_err(phase("storage"))?;
-            // The host KV cache's copies run on a copy stream of the cache's
-            // device, beside the forwards on the primary stream.
-            let copy = streams
-                .create_copy(cuda)
-                .and_then(|copy| Ok(copy.stream()?.clone()))
-                .map_err(phase("streams"))?;
-            prefix_cache
-                .set_host_kv_cache(host_kv_cache, copy)
-                .map_err(phase("storage"))?;
-            reported.page_pools = pools;
-        }
+            (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) => {
+                // The host KV cache's copies run on a copy stream of the
+                // cache's device, beside the forwards on the primary stream.
+                let copy = streams
+                    .create_copy(cuda)
+                    .and_then(|copy| Ok(copy.stream()?.clone()))
+                    .map_err(phase("streams"))?;
+                reported.host_token_bytes = host::token_bytes(prefix_cache.plan());
+                reported.storage_endpoint = launch.storage.tcp.clone();
+                Some(HostCacheSetup {
+                    fingerprint,
+                    endpoint: launch.storage.tcp.clone(),
+                    device: cuda,
+                    copy,
+                })
+            }
+            _ => None,
+        };
         // Each stream a component's collectives run on gets torch groups of
         // its own, created by every rank at this point of its startup.
         let collectives = if dedicated {
@@ -668,6 +674,7 @@ impl Worker {
             identity,
             launch,
             _plugin_buffers: plugin_buffers,
+            host_cache,
             warmed: false,
         })
     }
@@ -826,6 +833,7 @@ impl Worker {
             predecessor: self.config.predecessor.clone(),
             max_total_tokens: self.config.max_total_tokens,
             devices: self.config.devices().filter_map(Device::cuda).collect(),
+            host_cache: self.host_cache.take(),
         };
         // The rank serves with CUPTI attached (`crate::profiling::cupti`),
         // unless a profiler holds it; the control thread's (this one's)

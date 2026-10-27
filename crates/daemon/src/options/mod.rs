@@ -356,10 +356,15 @@ pub struct KvCacheOptions {
     /// a sliding-window group's window before each aligned boundary.
     /// Applies with `prefix_caching`.
     pub host_tier: bool,
-    /// The host KV cache each worker keeps, in GiB, split between its cache
-    /// groups (as SGLang's `--hicache-size`). The host's Storage Server
-    /// refuses a size the host's available memory cannot hold.
-    pub host_gib: NonZeroU64,
+    /// The host KV cache's token count over the device KV cache's, the
+    /// same on every rank of a world (as SGLang's `--hicache-ratio`); each
+    /// host's Storage Server lowers it for the whole world to what four
+    /// fifths of its available memory hold. The engine's default (2.0)
+    /// when unset.
+    pub host_ratio: Option<f64>,
+    /// The deployment's host KV cache on each host, in GiB, over the ranks
+    /// there, in place of `host_ratio` (as SGLang's `--hicache-size`).
+    pub host_gib: Option<NonZeroU64>,
     /// Keep every page of the host KV cache in Mooncake, the KV storage,
     /// through the Storage Servers this deployment starts, and prefetch long
     /// hits back. Applies with `host_tier`; none when unset.
@@ -370,13 +375,6 @@ pub struct KvCacheOptions {
     pub boundary_interval: Option<NonZeroU32>,
 }
 
-/// The host KV cache each worker keeps when `kv_cache_config.host_gib` is
-/// unset, in GiB.
-const DEFAULT_HOST_GIB: NonZeroU64 = match NonZeroU64::new(64) {
-    Some(gib) => gib,
-    None => NonZeroU64::MIN,
-};
-
 impl Default for KvCacheOptions {
     fn default() -> Self {
         Self {
@@ -385,7 +383,8 @@ impl Default for KvCacheOptions {
             dtype: None,
             prefix_caching: true,
             host_tier: true,
-            host_gib: DEFAULT_HOST_GIB,
+            host_ratio: None,
+            host_gib: None,
             mooncake: None,
             boundary_interval: None,
         }
@@ -1164,7 +1163,8 @@ impl ServeConfig {
                     library: text(&mooncake.library),
                 }),
                 boundary_interval: kv_cache.boundary_interval.map(NonZeroU32::get),
-                host_bytes: Some(kv_cache.host_gib.get() << 30),
+                host_ratio: kv_cache.host_ratio,
+                host_bytes: kv_cache.host_gib.map(|gib| gib.get() << 30),
             }),
             workers: Some(wire::Workers {
                 executable: worker.executable.to_string_lossy().into_owned(),

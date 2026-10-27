@@ -43,8 +43,10 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks: 5 adds worlds (the `world` of a
-/// worker's role and of a claim, and a claim's `retire`).
-pub const VERSION: u32 = 5;
+/// worker's role and of a claim, and a claim's `retire`); 6 adds the world
+/// of a head's role, whose page requests read and publish that world's
+/// pages.
+pub const VERSION: u32 = 6;
 
 /// The earliest client version the server serves: a client of version 4
 /// knows no worlds, and its requests act on world 0.
@@ -102,9 +104,20 @@ pub struct Claim(pub [u8; 16]);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// The holder of a deployment's claim on this host: the host's daemon,
-    /// for the head of the deployment.
-    Head { deployment: String },
+    /// A head of the deployment: the holder of its claim on this host (the
+    /// host's daemon), or an engine of the deployment, which sends the page
+    /// requests.
+    ///
+    /// An engine states its `world`: the pages it commits are that world's,
+    /// and it reads its own world's pages and those every world shares. A world newer than the deployment's
+    /// oldest claimed world is on trial: what it publishes, pages and
+    /// tensors alike, is its own until the commit retires its predecessor,
+    /// and a rollback that retires it discards them.
+    Head {
+        deployment: String,
+        #[serde(default)]
+        world: u64,
+    },
     /// A worker of `scope` in `world`, started by the launch `generation` of
     /// its group, for the head that holds `claim`.
     Worker {
@@ -384,6 +397,21 @@ pub enum Request {
     /// [`Event::Prefetched`] with the same `tag` follows when the reads
     /// end.
     Prefetch { pool: u64, keys: Vec<Key>, tag: u64 },
+    /// The token count each rank of a world holds in the host KV cache of
+    /// this host, beside the world's other ranks here: the least of
+    /// `tokens`, the count the world asks for, and the host's budget over
+    /// the bytes one token takes on all of those ranks (`token_bytes`, one
+    /// entry per rank). The budget is `host_bytes`, the deployment's host KV
+    /// cache on each host, when stated; otherwise four fifths of the host's
+    /// available memory (bounded by the server's memory cgroup limit, and
+    /// counting the deployment's page pools no world maps, which the server
+    /// releases for a new pool) less what the page pools have yet to
+    /// allocate and the server's reserve. Answered with [`Reply::HostCache`].
+    HostCache {
+        tokens: u64,
+        token_bytes: Vec<u64>,
+        host_bytes: Option<u64>,
+    },
     /// The connector ran task `task` of an [`Event::Exists`],
     /// [`Event::Upload`] or [`Event::Download`]: one result per page of the
     /// task.
@@ -463,6 +491,10 @@ pub enum Reply {
         tcp: Option<String>,
     },
     Prefetching,
+    /// The token count of a [`Request::HostCache`].
+    HostCache {
+        tokens: u64,
+    },
     Finished,
     Error {
         kind: ErrorKind,

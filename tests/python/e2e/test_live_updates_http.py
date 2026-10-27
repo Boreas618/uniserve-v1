@@ -89,7 +89,7 @@ OPTIONS = (
 # A change of the options that only a new world executes: graphs of other
 # decode batch sizes.
 CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
-# Each worker's host KV cache, in GiB.
+# The deployment's host KV cache on the host, in GiB.
 HOST_GIB = 8
 PROMPT = (
     "Count from 1 to 3000, separated by commas and spaces. "
@@ -122,12 +122,20 @@ def _checkpoint() -> str:
     return checkpoint
 
 
-def _shmem_gib() -> float:
-    """The host's shared memory in use (``Shmem`` of ``/proc/meminfo``)."""
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        if line.startswith("Shmem:"):
-            return int(line.split()[1]) / (1 << 20)
-    raise AssertionError("/proc/meminfo states no Shmem")
+def _pool_gib(runtime: Path) -> float:
+    """The host page pools the test's Storage Server holds, in GiB: the
+    sizes of its ``uniserve-page-pool`` memfds, whose memory the host frees
+    once the server and the workers that map them let them go.
+    """  # noqa: D205
+    pid = _storage_pid(runtime)
+    held = 0
+    for descriptor in Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            if os.readlink(descriptor).startswith("/memfd:uniserve-page-pool"):
+                held += descriptor.stat().st_size
+        except OSError:
+            continue
+    return held / (1 << 30)
 
 
 def _available_gib() -> float:
@@ -340,9 +348,8 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_memory(
 ):
     device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
     with _node(runtime, device, tmp_path / "node.log") as (base_url, pid):
-        shmem = _shmem_gib()
         gpu = _gpu_used_mib(device)
-        print(f"before: Shmem {shmem:.2f} GiB, GPU {gpu} MiB")
+        print(f"before: GPU {gpu} MiB")
         for index in range(3):
             name = f"qwen3-live-{index}"
             _deploy(base_url, name)
@@ -354,13 +361,13 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_memory(
             }, state
             reply = _chat(base_url, name, "Say hello.")
             assert reply["choices"][0]["message"]["content"]
-            serving = _shmem_gib()
+            pools = _pool_gib(runtime)
             print(
-                f"{name} serving: Shmem {serving:.2f} GiB, "
+                f"{name} serving: page pools {pools:.2f} GiB, "
                 f"GPU {_gpu_used_mib(device)} MiB"
             )
-            # The deployment's page pools: its worker's host KV cache.
-            assert serving - shmem >= HOST_GIB * 0.99, (serving, shmem)
+            # The deployment's page pools: its host KV cache of `HOST_GIB`.
+            assert pools >= HOST_GIB * 0.99, pools
             assert name in _storage_list(runtime)
 
             response = httpx.post(
@@ -370,15 +377,14 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_memory(
             state = _settle(base_url)
             assert state["state"] == "idle", state
             assert state["last_error"] is None, state
-            after_shmem = _shmem_gib()
+            after_pools = _pool_gib(runtime)
             after_gpu = _gpu_used_mib(device)
             print(
-                f"{name} down: Shmem {after_shmem:.2f} GiB, GPU {after_gpu} MiB"
+                f"{name} down: page pools {after_pools:.2f} GiB, "
+                f"GPU {after_gpu} MiB"
             )
             assert name not in _storage_list(runtime)
-            # The host's other processes move its shared memory by less than
-            # a page pool's gigabytes.
-            assert abs(after_shmem - shmem) < 1.0, (after_shmem, shmem)
+            assert after_pools == 0, after_pools
             assert after_gpu <= gpu + 1024, (after_gpu, gpu)
 
         # A host KV cache the host's available memory cannot hold.

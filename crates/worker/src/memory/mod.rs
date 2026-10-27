@@ -32,4 +32,4 @@ pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate, Tr
 pub(crate) use output::{OutputLease, OutputPool};
 pub use pinned_pool::PinnedPool;
 pub(crate) use prefix_cache::block_tables::AttentionRow;
-pub(crate) use prefix_cache::{HostKvCache, TransferBases, UnitAccesses};
+pub(crate) use prefix_cache::{TransferBases, UnitAccesses};

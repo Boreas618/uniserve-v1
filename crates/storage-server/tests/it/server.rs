@@ -101,6 +101,7 @@ fn head(socket: &Path) -> Client {
         socket,
         Role::Head {
             deployment: "model".into(),
+            world: 0,
         },
     )
     .unwrap()
@@ -566,6 +567,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
         &server.tcp,
         Role::Head {
             deployment: "model".into(),
+            world: 0,
         },
     )
     .unwrap();
@@ -824,6 +826,7 @@ fn head_of(socket: &Path, deployment: &str) -> Client {
         socket,
         Role::Head {
             deployment: deployment.into(),
+            world: 0,
         },
     )
     .unwrap()
@@ -1139,6 +1142,364 @@ fn worlds_retain_their_own_memory_and_a_claim_retires_one() {
             .all(|tensor| tensor.retainers.iter().all(|retainer| retainer.world == 2)),
         "{listing:?}"
     );
+}
+
+/// The engine of `world` of the deployment, which sends its page requests.
+fn engine_head(socket: &Path, world: u64) -> Client {
+    Client::connect(
+        socket,
+        Role::Head {
+            deployment: "model".into(),
+            world,
+        },
+    )
+    .unwrap()
+}
+
+/// A page pool of four 16-byte pages that `worker` maps.
+fn trial_pool(worker: &mut Client) -> u64 {
+    use storage::protocol::{PageShape, Reply, Request};
+
+    let shape = PageShape {
+        layout: key(3),
+        kv_head_offset: 0,
+        kv_head_count: 2,
+        page_bytes: 16,
+    };
+    let answer = worker
+        .call(
+            &Request::PagePool {
+                shape,
+                numa_node: None,
+                bytes: None,
+            },
+            &[],
+        )
+        .unwrap();
+    let Reply::PagePool { pool, .. } = answer.reply else {
+        panic!("the page pool was refused: {:?}", answer.reply);
+    };
+    pool
+}
+
+/// `head` writes and commits the pages of `keys` in `pool`.
+fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
+    use storage::protocol::{PageSlot, Reply, Request};
+
+    let Reply::Reserved { slots } = head
+        .call(
+            &Request::Reserve {
+                pool,
+                writer: scope("text", 0),
+                keys: keys.to_vec(),
+                window: None,
+            },
+            &[],
+        )
+        .unwrap()
+        .reply
+    else {
+        panic!("the reservation was refused");
+    };
+    assert!(
+        slots
+            .iter()
+            .all(|slot| matches!(slot, PageSlot::Reserved { .. })),
+        "{slots:?}"
+    );
+    head.call(
+        &Request::Commit {
+            pool,
+            keys: keys.to_vec(),
+        },
+        &[],
+    )
+    .unwrap();
+}
+
+/// The levels `head` finds the pages of `keys` at in `pool`, without a
+/// connector.
+fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<storage::protocol::PageLevel> {
+    use storage::protocol::{Reply, Request};
+
+    let Reply::Lookup { levels } = head
+        .call(
+            &Request::Lookup {
+                pool,
+                keys: keys.to_vec(),
+            },
+            &[],
+        )
+        .unwrap()
+        .reply
+    else {
+        panic!("the lookup was refused");
+    };
+    levels
+}
+
+/// A world on trial beside the world it succeeds keeps the pages it commits
+/// to itself: the serving world neither reads them nor finds them in the KV
+/// storage, which takes them only once the commit retires the previous
+/// world. The world on trial reads the serving world's pages.
+#[test]
+fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
+    use storage::protocol::{Event, PageLevel, Request};
+
+    let server = Running::start();
+    let mut daemon = head(&server.socket);
+    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let pool = trial_pool(&mut worker);
+    let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
+    assert!(matches!(next_event(&mut connector).0, Event::Pool { .. }));
+    let finish = |connector: &mut Client, task: u64, results: Vec<bool>| {
+        connector
+            .call(&Request::Finished { task, results }, &[])
+            .unwrap();
+    };
+
+    // The serving world's pages are every world's, and the KV storage
+    // takes them at once.
+    let mut serving = engine_head(&server.socket, 1);
+    publish(&mut serving, pool, &[key(1)]);
+    let (Event::Upload { task, pages, .. }, _) = next_event(&mut connector) else {
+        panic!("the serving world's page was not uploaded");
+    };
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].0, key(1));
+    finish(&mut connector, task, vec![true]);
+
+    // World 2 starts on trial and commits a page of its own.
+    daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut trial = engine_head(&server.socket, 2);
+    publish(&mut trial, pool, &[key(2)]);
+    assert_eq!(
+        levels(&mut trial, pool, &[key(1), key(2)]),
+        vec![PageLevel::Host, PageLevel::Host]
+    );
+
+    // The serving world asks the KV storage for the page it does not read:
+    // the connector's next task is that lookup, so no upload preceded it.
+    let lookup = serving
+        .submit(
+            &Request::Lookup {
+                pool,
+                keys: vec![key(1), key(2)],
+            },
+            &[],
+        )
+        .unwrap();
+    let (Event::Exists { task, keys, .. }, _) = next_event(&mut connector) else {
+        panic!("a page of the world on trial was uploaded before its commit");
+    };
+    assert_eq!(keys, vec![key(2)]);
+    finish(&mut connector, task, vec![false]);
+    assert_eq!(
+        serving.wait(lookup).unwrap().reply,
+        storage::protocol::Reply::Lookup {
+            levels: vec![PageLevel::Host, PageLevel::Absent]
+        }
+    );
+    // Nor does it pin it.
+    let storage::protocol::Reply::Pinned { slots } = serving
+        .call(
+            &Request::Pin {
+                pool,
+                reader: scope("text", 0),
+                keys: vec![key(2)],
+            },
+            &[],
+        )
+        .unwrap()
+        .reply
+    else {
+        panic!("the pin was refused");
+    };
+    assert_eq!(slots, vec![None]);
+
+    // The commit retires world 1: world 2's pages are every world's, and
+    // the KV storage takes them.
+    daemon.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    let (Event::Upload { task, pages, .. }, _) = next_event(&mut connector) else {
+        panic!("the committed world's pages were not uploaded");
+    };
+    assert_eq!(
+        pages.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        vec![key(2)]
+    );
+    finish(&mut connector, task, vec![true]);
+    let mut next = engine_head(&server.socket, 3);
+    assert_eq!(
+        levels(&mut next, pool, &[key(1), key(2)]),
+        vec![PageLevel::Host, PageLevel::Host]
+    );
+}
+
+/// A rollback discards what the world on trial published: its pages leave
+/// the pool, and the read-only tensors it alone put leave the server. Until
+/// then the serving world reads none of them, and a tensor of the same key
+/// that the serving world puts carries the serving world's bytes.
+#[test]
+fn a_rollback_discards_what_the_world_on_trial_published() {
+    use storage::protocol::PageLevel;
+
+    let server = Running::start();
+    let mut daemon = head(&server.socket);
+    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut serving_worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let pool = trial_pool(&mut serving_worker);
+    daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut trial_worker = world_worker(&server.socket, scope("text", 0), 2, claim);
+
+    // World 2 publishes a page and two read-only tensors.
+    let mut trial = engine_head(&server.socket, 2);
+    publish(&mut trial, pool, &[key(5)]);
+    let trial_bytes = [memfd(b"bad!"), memfd(b"new!")];
+    trial_worker
+        .put(
+            vec![
+                tensor(key(6), "weights", 0, 0, Access::ReadOnly),
+                tensor(key(7), "other", 1, 0, Access::ReadOnly),
+            ],
+            &[
+                (host(4), trial_bytes[0].as_fd()),
+                (host(4), trial_bytes[1].as_fd()),
+            ],
+        )
+        .unwrap();
+
+    // The serving world reads none of them and retains none.
+    let mut serving = engine_head(&server.socket, 1);
+    assert_eq!(
+        levels(&mut serving, pool, &[key(5)]),
+        vec![PageLevel::Absent]
+    );
+    let got = serving_worker
+        .get(vec![key(6), key(7)], Mode::Read)
+        .unwrap();
+    assert!(got.tensors.is_empty());
+    assert_eq!(got.missing, vec![key(6), key(7)]);
+    serving_worker.retain(vec![key(6)]).unwrap();
+    // A key it puts itself holds its own bytes, for every world.
+    let serving_bytes = memfd(b"good");
+    serving_worker
+        .put(
+            vec![tensor(key(6), "weights", 0, 0, Access::ReadOnly)],
+            &[(host(4), serving_bytes.as_fd())],
+        )
+        .unwrap();
+    let mut got = trial_worker.get(vec![key(6)], Mode::Read).unwrap();
+    assert_eq!(contents(got.storages.remove(0).1), b"good");
+
+    // World 2 reserves a page it commits only after the rollback.
+    let storage::protocol::Reply::Reserved { .. } = trial
+        .call(
+            &storage::protocol::Request::Reserve {
+                pool,
+                writer: scope("text", 0),
+                keys: vec![key(8)],
+                window: None,
+            },
+            &[],
+        )
+        .unwrap()
+        .reply
+    else {
+        panic!("the reservation was refused");
+    };
+
+    // The rollback retires world 2. Neither its committed page nor the one
+    // it commits as it leaves is read by any world, nor what it reserves
+    // after.
+    daemon.claim(1, vec![scope("text", 0)], vec![2]).unwrap();
+    trial
+        .call(
+            &storage::protocol::Request::Commit {
+                pool,
+                keys: vec![key(8)],
+            },
+            &[],
+        )
+        .unwrap();
+    publish(&mut trial, pool, &[key(9)]);
+    assert_eq!(
+        levels(&mut serving, pool, &[key(5), key(8), key(9)]),
+        vec![PageLevel::Absent; 3]
+    );
+    let mut next = engine_head(&server.socket, 3);
+    assert_eq!(
+        levels(&mut next, pool, &[key(5), key(8), key(9)]),
+        vec![PageLevel::Absent; 3]
+    );
+    // The page committed before the rollback left the pool.
+    let listing = daemon.list().unwrap();
+    assert_eq!(listing.page_pools[0].ready, 2, "{listing:?}");
+    assert_eq!(retained_names(&mut daemon), vec!["weights"]);
+    let mut got = serving_worker.get(vec![key(6)], Mode::Read).unwrap();
+    assert_eq!(contents(got.storages.remove(0).1), b"good");
+}
+
+/// What the serving world published stays the serving world's to read when
+/// only the world on trial still retains it: a previous world restarted on
+/// its weights maps the cache segments it published again.
+#[test]
+fn a_world_reads_what_it_published_that_only_a_world_on_trial_retains() {
+    let server = Running::start();
+    let mut daemon = head(&server.socket);
+    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut serving = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let planes = memfd(&[1; 4]);
+    serving
+        .put(
+            vec![tensor(key(10), "planes", 0, 0, Access::Exclusive)],
+            &[(host(4), planes.as_fd())],
+        )
+        .unwrap();
+    daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut trial = world_worker(&server.socket, scope("text", 0), 2, claim);
+    trial.get(vec![key(10)], Mode::Standby).unwrap();
+    serving.retain(Vec::new()).unwrap();
+    drop(serving);
+
+    let mut restarted = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let got = restarted.get(vec![key(10)], Mode::Standby).unwrap();
+    assert_eq!(got.tensors.len(), 1, "{:?}", got.missing);
+}
+
+/// A world's ranks on a host hold one token count in its host KV cache:
+/// what the world asks for, unless the host's budget over the bytes a token
+/// takes on all of them holds fewer.
+#[test]
+fn a_host_sizes_the_host_kv_cache_of_a_world_in_tokens() {
+    use storage::protocol::{Reply, Request};
+
+    let server = Running::start();
+    let mut daemon = head(&server.socket);
+    daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut engine = engine_head(&server.socket, 1);
+    let mut ask = |tokens: u64, host_bytes: Option<u64>| {
+        let answer = engine
+            .call(
+                &Request::HostCache {
+                    tokens,
+                    token_bytes: vec![1024, 3072],
+                    host_bytes,
+                },
+                &[],
+            )
+            .unwrap();
+        let Reply::HostCache { tokens } = answer.reply else {
+            panic!("the host KV cache was not sized: {:?}", answer.reply);
+        };
+        tokens
+    };
+
+    // A stated budget of 64 MiB holds 16384 tokens of 4 KiB over both ranks.
+    assert_eq!(ask(1 << 20, Some(64 << 20)), 16384);
+    assert_eq!(ask(4096, Some(64 << 20)), 4096);
+    // The host's available memory holds a few thousand tokens.
+    assert_eq!(ask(4096, None), 4096);
 }
 
 /// A server serves clients of its protocol and of every earlier one from

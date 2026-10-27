@@ -54,9 +54,6 @@ pub struct WorkerProcessArgs {
     /// Whether the engine copies the group's cache pages through the
     /// host KV cache (`kv_cache_config.host_tier`).
     pub host_kv_cache: bool,
-    /// The bytes of host KV cache each of the group's workers keeps
-    /// (`kv_cache_config.host_gib`).
-    pub host_kv_cache_bytes: Option<u64>,
     /// The Mooncake connector a host's Storage Server the deployment starts
     /// runs (`kv_cache_config.mooncake`), keeping committed pages in the
     /// KV storage.
