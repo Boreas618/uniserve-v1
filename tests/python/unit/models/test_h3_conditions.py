@@ -181,6 +181,44 @@ def test_encoded_conditions_fill_the_rows_past_the_prompt():
         )
 
 
+@pytest.mark.gpu
+def test_pinned_draws_encode_without_waiting_for_the_device():
+    # A serving rank encodes conditions from its page-locked host draws in
+    # stream order: the host never waits for the device, and the rows equal
+    # those of draws already on the device.
+    model = _small().cuda()
+    size = model.make_size(124, 50, canvas=WIDE, conditions=(CLIP, FIRST))
+    layout = model.layout_size(size)
+    generator = torch.Generator().manual_seed(5)
+    latents = tuple(
+        torch.randn(shape, generator=generator).cuda()
+        for shape in ((4032, 96), (120, 32), (1008, 96))
+    )
+    noise = tuple(
+        torch.randn(shape, generator=generator).pin_memory()
+        for shape in model.condition_noise_shapes(size)
+    )
+    shape = (model.text_condition_rows(layout), model.text_condition_width)
+    expected = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    actual = torch.zeros_like(expected)
+    with torch.inference_mode():
+        model.encode_conditions(
+            size,
+            layout,
+            latents=latents,
+            noise=tuple(draw.cuda() for draw in noise),
+            out=expected,
+        )
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            model.encode_conditions(
+                size, layout, latents=latents, noise=noise, out=actual
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    assert torch.equal(actual, expected)
+
+
 def test_reference_segments_take_whole_tiles():
     model = _meta(omniref_denoiser())
     voice = Condition(ConditionRole.REFERENCE, None, 32_000)
