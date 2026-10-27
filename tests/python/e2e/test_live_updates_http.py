@@ -187,11 +187,14 @@ def _storage_list(runtime: Path) -> str:
 
 def _held(runtime: Path) -> list[str]:
     """What the test's Storage Server holds, its page pools without their
-    slot counters, which the deployment's offloads move as it serves.
+    slot counters, which the deployment's offloads move as it serves. Its
+    Transfer Server's process, contexts, link measurements and tasks are no
+    memory it holds: a restarted server's Transfer Server measures anew.
     """  # noqa: D205
     return sorted(
         line.split(": ", 1)[0] if line.startswith("page pool") else line
         for line in _storage_list(runtime).splitlines()
+        if not line.startswith(("transfer ", "link "))
     )
 
 
