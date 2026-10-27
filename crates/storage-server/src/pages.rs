@@ -1255,7 +1255,7 @@ fn pool_memory(bytes: u64, numa_node: Option<u32>) -> io::Result<OwnedFd> {
 /// policy of a mapping of it for every process that maps it later, so the
 /// pages land on `node` whoever first touches them. Pages fall back to
 /// other nodes when `node` has none free.
-fn prefer_node(descriptor: &OwnedFd, bytes: u64, node: u32) -> io::Result<()> {
+pub(crate) fn prefer_node(descriptor: &OwnedFd, bytes: u64, node: u32) -> io::Result<()> {
     use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
     // The node mask holds bits for nodes 0..MASK_BITS.

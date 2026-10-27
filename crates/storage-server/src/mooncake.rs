@@ -211,7 +211,15 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                 Event::Download { task, pool, pages } => {
                     let _ = transfers.send(Job::Download { task, pool, pages });
                 }
-                Event::Prefetched { .. } => {}
+                // The events of heads, workers and the Transfer Server.
+                Event::Prefetched { .. }
+                | Event::TransferProgress { .. }
+                | Event::Transferred { .. }
+                | Event::Allocation { .. }
+                | Event::AllocationReleased { .. }
+                | Event::Transfer { .. }
+                | Event::Cancel { .. }
+                | Event::Throttle { .. } => {}
             }
         }
         let finished = std::mem::take(&mut *lock(&shared.finished));

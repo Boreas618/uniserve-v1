@@ -7,7 +7,8 @@
 //! With `--mooncake-master`, the server also runs the Mooncake connector,
 //! which keeps committed pages in Mooncake (L3): this executable's `storage
 //! connector` command, as a child process the server starts again when it
-//! ends.
+//! ends. It always runs its Transfer Server, which copies between the
+//! memory it holds, the same way (`storage transfer`).
 //!
 //! `list` prints what a running server holds, and `retire` releases the
 //! memory of a deployment that is no longer served.
@@ -56,6 +57,13 @@ pub(crate) enum StorageCommand {
         tcp: Option<String>,
         #[command(flatten)]
         mooncake: Mooncake,
+        /// How long one chunk of the Transfer Server's copies lasts at its
+        /// link's bandwidth, in microseconds: a copy engine turns to the
+        /// executing world's own copies, and to transfers of a higher
+        /// priority, between chunks, so a chunk is kept far below one
+        /// scheduler step.
+        #[arg(long, default_value_t = 1000)]
+        transfer_chunk_us: u64,
         /// Go on with the server the predecessor of a hot restart hands over
         /// on the handoff socket at this descriptor (`storage restart`).
         #[arg(long, hide = true)]
@@ -68,6 +76,16 @@ pub(crate) enum StorageCommand {
         socket: PathBuf,
         #[command(flatten)]
         mooncake: Mooncake,
+    },
+    /// The Transfer Server a server runs as its child.
+    #[command(hide = true)]
+    Transfer {
+        #[arg(long)]
+        socket: PathBuf,
+        /// How long one chunk of a copy lasts at its link's bandwidth, in
+        /// microseconds.
+        #[arg(long)]
+        chunk_us: u64,
     },
     /// Print the tensors, bytes and deployments the running server holds.
     List {
@@ -159,6 +177,7 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
             host_reserve_gib,
             tcp,
             mooncake,
+            transfer_chunk_us,
             takeover,
         } => mooncake.settings().and_then(|connector| {
             let executable = std::env::current_exe().context("locating this executable")?;
@@ -169,7 +188,13 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
                 host_reserve_bytes: host_reserve_gib << 30,
                 tcp,
                 connector,
-                connector_command: vec![executable.into(), "storage".into(), "connector".into()],
+                connector_command: vec![
+                    executable.clone().into(),
+                    "storage".into(),
+                    "connector".into(),
+                ],
+                transfer_command: vec![executable.into(), "storage".into(), "transfer".into()],
+                transfer_chunk: std::time::Duration::from_micros(transfer_chunk_us),
                 takeover,
             })
         }),
@@ -177,6 +202,12 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
             .settings()
             .and_then(|settings| settings.context("the connector needs --mooncake-master"))
             .and_then(|settings| storage_server::run_connector(&socket, &settings)),
+        StorageCommand::Transfer { socket, chunk_us } => storage_server::run_transfer_server(
+            &socket,
+            &storage_server::transfer::Options {
+                chunk: std::time::Duration::from_micros(chunk_us),
+            },
+        ),
         StorageCommand::List { socket } => {
             storage_server::list(&socket.unwrap_or_else(socket::default_socket))
                 .map_err(anyhow::Error::from)

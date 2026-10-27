@@ -8,7 +8,8 @@
 //! starter's end never ends it.
 //!
 //! With connector settings, the server also runs the Mooncake connector
-//! ([`run_connector`]) as a child process it starts again when it ends.
+//! ([`run_connector`]) as a child process it starts again when it ends. It
+//! always runs its Transfer Server ([`run_transfer_server`]) the same way.
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -17,12 +18,13 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 use storage::connector::Settings;
 use storage::{Client, socket};
 
-use crate::{ConnectorLaunch, Server};
+use crate::{Launch, Server};
 
 /// How to serve: the arguments of `uniserve storage serve`.
 #[derive(Debug, Clone)]
@@ -45,6 +47,12 @@ pub struct ServeOptions {
     /// The command that runs the connector, before its own arguments: this
     /// executable and its `storage connector` command.
     pub connector_command: Vec<OsString>,
+    /// The command that runs the Transfer Server, before its own arguments:
+    /// this executable and its `storage transfer` command.
+    pub transfer_command: Vec<OsString>,
+    /// How long one chunk of the Transfer Server's copies lasts at its
+    /// link's bandwidth.
+    pub transfer_chunk: Duration,
     /// Go on with the server the predecessor of a hot restart hands over on
     /// the handoff socket at this descriptor, rather than binding the
     /// socket (`crate::restart`).
@@ -87,6 +95,24 @@ pub fn run_connector(socket: &Path, settings: &Settings) -> anyhow::Result<()> {
     let ran = crate::mooncake::run(socket, settings).map_err(anyhow::Error::from);
     if let Err(error) = &ran {
         tracing::error!("the Mooncake connector failed: {error:#}");
+    }
+    ran
+}
+
+/// Run the Transfer Server for the server on `socket` until the server
+/// closes its connection.
+///
+/// # Errors
+///
+/// Fails when a GPU cannot be measured or the server cannot be reached.
+pub fn run_transfer_server(
+    socket: &Path,
+    options: &crate::transfer::Options,
+) -> anyhow::Result<()> {
+    init_logging();
+    let ran = crate::transfer::run(socket, options).map_err(anyhow::Error::from);
+    if let Err(error) = &ran {
+        tracing::error!("the Transfer Server failed: {error:#}");
     }
     ran
 }
@@ -146,7 +172,45 @@ pub fn list(socket: &Path) -> storage::Result<()> {
     if listing.connector {
         println!("mooncake connector connected");
     }
+    if let Some(transfer) = &listing.transfer {
+        println!("transfer server {} connected", transfer.pid);
+        for context in &transfer.contexts {
+            println!(
+                "transfer server context on {}: {} bytes",
+                cuda::DeviceUuid(context.gpu),
+                context.bytes
+            );
+        }
+        for measured in &transfer.links {
+            println!(
+                "link {} -> {}: {:.1} GB/s",
+                memory_name(measured.link.source),
+                memory_name(measured.link.destination),
+                measured.bytes_per_second as f64 / 1e9
+            );
+        }
+        for task in &transfer.tasks {
+            println!(
+                "transfer {} of {} update {} {:?}: {} of {} bytes{}",
+                task.task,
+                task.deployment,
+                task.update,
+                task.priority,
+                task.copied,
+                task.bytes,
+                if task.cancelled { ", cancelled" } else { "" }
+            );
+        }
+    }
     Ok(())
+}
+
+/// A link end's name in the listing.
+fn memory_name(memory: storage::protocol::Memory) -> String {
+    match memory {
+        storage::protocol::Memory::Host => "host".into(),
+        storage::protocol::Memory::Device { gpu } => cuda::DeviceUuid(gpu).to_string(),
+    }
 }
 
 /// Release the memory of `deployment`, which is no longer served, at the
@@ -194,12 +258,12 @@ fn serve_on(options: &ServeOptions, ready: Option<OwnedFd>) -> anyhow::Result<()
     };
     raise_descriptor_limit()?;
     let (wake, stop) = stop_signals()?;
-    let connector = connector_launch(options);
     let mut server = Server::new(
         listener,
         options.page_pool_bytes,
         options.host_reserve_bytes,
-        connector,
+        connector_launch(options),
+        Some(transfer_launch(options)),
     )?;
     if let Some(address) = &options.tcp {
         let listener = std::net::TcpListener::bind(address)
@@ -218,8 +282,12 @@ fn serve_on(options: &ServeOptions, ready: Option<OwnedFd>) -> anyhow::Result<()
 fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> {
     raise_descriptor_limit()?;
     let (wake, stop) = stop_signals()?;
-    let (server, lock) = Server::resume(descriptor, connector_launch(options))
-        .context("taking the server over from its predecessor")?;
+    let (server, lock) = Server::resume(
+        descriptor,
+        connector_launch(options),
+        Some(transfer_launch(options)),
+    )
+    .context("taking the server over from its predecessor")?;
     let lock = socket::SocketLock::resume(lock, options.socket.clone());
     tracing::info!(socket = %options.socket.display(), "storage server listening after a hot restart");
     run_until_stopped(server, &wake, &stop, lock)
@@ -245,17 +313,33 @@ fn run_until_stopped(
 }
 
 /// The connector the server runs, from `options`.
-fn connector_launch(options: &ServeOptions) -> Option<ConnectorLaunch> {
+fn connector_launch(options: &ServeOptions) -> Option<Launch> {
     options.connector.as_ref().map(|settings| {
         let mut command = options.connector_command.clone();
         let program = command.remove(0);
         command.extend(["--socket".into(), options.socket.as_os_str().to_owned()]);
         command.extend(settings.arguments().into_iter().map(Into::into));
-        ConnectorLaunch {
+        Launch {
             program: program.into(),
             arguments: command,
         }
     })
+}
+
+/// The Transfer Server the server runs, from `options`.
+fn transfer_launch(options: &ServeOptions) -> Launch {
+    let mut command = options.transfer_command.clone();
+    let program = command.remove(0);
+    command.extend([
+        "--socket".into(),
+        options.socket.as_os_str().to_owned(),
+        "--chunk-us".into(),
+        options.transfer_chunk.as_micros().to_string().into(),
+    ]);
+    Launch {
+        program: program.into(),
+        arguments: command,
+    }
 }
 
 /// Raise the soft limit on open descriptors to the hard limit: the server

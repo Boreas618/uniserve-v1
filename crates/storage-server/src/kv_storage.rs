@@ -12,24 +12,10 @@
 //! A connector that ends fails its tasks in flight.
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::OsString;
-use std::os::fd::OwnedFd;
-use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::time::{Duration, Instant};
 
 use storage::protocol::Key;
 
-/// How long the server waits before starting a connector that ended again,
-/// so a connector that cannot reach Mooncake does not restart in a loop.
-pub(super) const RESTART_DELAY: Duration = Duration::from_secs(5);
-
-/// How the server starts its connector.
-#[derive(Debug, Clone)]
-pub struct Launch {
-    pub program: PathBuf,
-    pub arguments: Vec<OsString>,
-}
+use crate::child::{Launch, Supervised};
 
 /// A task the connector runs for the server.
 pub(super) enum Task {
@@ -59,11 +45,7 @@ pub(super) enum Task {
 
 /// The connector process and its connection.
 pub(super) struct KvStorage {
-    launch: Option<Launch>,
-    /// The running process, with its pidfd.
-    pub(super) child: Option<(Child, OwnedFd)>,
-    /// When to start the process again.
-    pub(super) restart: Option<Instant>,
+    pub(super) process: Supervised,
     /// The connected connector's client.
     pub(super) client: Option<u64>,
     pub(super) tasks: HashMap<u64, Task>,
@@ -74,75 +56,13 @@ pub(super) struct KvStorage {
 
 impl KvStorage {
     pub(super) fn new(launch: Option<Launch>) -> Self {
-        let restart = launch.as_ref().map(|_| Instant::now());
         Self {
-            launch,
-            child: None,
-            restart,
+            process: Supervised::new("Mooncake connector", launch),
             client: None,
             tasks: HashMap::new(),
             next: 1,
             offered: BTreeSet::new(),
         }
-    }
-
-    /// Start the process when its restart is due.
-    pub(super) fn start_due(&mut self) {
-        let Some(launch) = &self.launch else {
-            return;
-        };
-        if self.child.is_some() || self.restart.is_none_or(|at| Instant::now() < at) {
-            return;
-        }
-        self.restart = None;
-        let started = Command::new(&launch.program)
-            .args(&launch.arguments)
-            .spawn()
-            .and_then(|child| {
-                let pid = rustix::process::Pid::from_child(&child);
-                let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;
-                Ok((child, pidfd))
-            });
-        match started {
-            Ok((child, pidfd)) => {
-                tracing::info!(pid = child.id(), "started the Mooncake connector");
-                self.child = Some((child, pidfd));
-            }
-            Err(error) => {
-                tracing::warn!(%error, "the Mooncake connector could not be started");
-                self.restart = Some(Instant::now() + RESTART_DELAY);
-            }
-        }
-    }
-
-    /// Reap the process when it ended, and schedule its restart.
-    pub(super) fn reap(&mut self) {
-        let Some((child, _)) = &mut self.child else {
-            return;
-        };
-        if let Ok(Some(status)) = child.try_wait() {
-            tracing::warn!(%status, "the Mooncake connector ended");
-            self.child = None;
-            self.restart = Some(Instant::now() + RESTART_DELAY);
-        }
-    }
-
-    /// Ends the connector and waits for it, as a hot restart does before its
-    /// successor starts one of its own; none starts here again.
-    pub(super) fn stop(&mut self) {
-        self.launch = None;
-        self.restart = None;
-        if let Some((mut child, _)) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    /// How long the server may sleep before a restart is due.
-    pub(super) fn timeout(&self) -> Option<Duration> {
-        self.restart
-            .filter(|_| self.launch.is_some() && self.child.is_none())
-            .map(|at| at.saturating_duration_since(Instant::now()))
     }
 
     /// The identity of a new task.

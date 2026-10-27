@@ -13,7 +13,10 @@
 //! the host KV cache and which page each holds. Its Mooncake connector
 //! ([`mooncake`], run as a child process [`kv_storage`] supervises) keeps
 //! committed pages in the KV storage and reads them back for
-//! prefetches.
+//! prefetches. Its Transfer Server ([`transfer`], another child process,
+//! which [`transfers`] supervises) copies bytes between the memory the
+//! server holds, for the tasks heads and workers submit; that process, not
+//! the server, holds the CUDA contexts the copies need.
 //!
 //! [`serve`] runs a server, the `uniserve storage serve` command, and
 //! [`list`] and [`retire`] are the operator's commands against a running
@@ -25,12 +28,15 @@
 //! its connection's queue until then, while every other connection is
 //! served on.
 
+mod child;
 mod kv_storage;
 pub mod mooncake;
 mod pages;
 mod restart;
 mod serve;
 mod shoot;
+pub mod transfer;
+mod transfers;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
@@ -43,16 +49,16 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::mooncake::BATCH_PAGES;
-pub use kv_storage::Launch as ConnectorLaunch;
+pub use child::Launch;
 use kv_storage::{KvStorage, Task};
 pub use pages::DEFAULT_POOL_BYTES;
 pub use restart::{Pending as RestartPending, TAKEOVER_DESCRIPTOR, relaunch_arguments};
-pub use serve::{ServeOptions, list, retire, run_connector, serve};
+pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
 use shoot::ShootDowns;
 use storage::protocol::{
-    Access, Claim, ClientMessage, ErrorKind, Event, Hello, Key, ListedDeployment, ListedTensor,
-    Listing, MIN_VERSION, Mode, PageLevel, Placement, Reply, Request, Retainer, Role, Scope,
-    ScopeBytes, ServerMessage, StorageRecord, TensorRecord, VERSION, Welcome,
+    Access, Allocation, Claim, ClientMessage, ErrorKind, Event, Hello, Key, ListedDeployment,
+    ListedTensor, Listing, MIN_VERSION, Mode, PageLevel, Placement, Reply, Request, Retainer, Role,
+    Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord, VERSION, Welcome,
 };
 use storage::transport::Connection;
 
@@ -94,7 +100,7 @@ struct Client {
     pid: i32,
     /// The peer process, held so that its identity cannot be reused; `None`
     /// for a connection from another host, which may only make a head's
-    /// page requests.
+    /// page and transfer requests.
     pidfd: Option<Arc<OwnedFd>>,
     role: Option<Role>,
     /// Requests received and not yet answered, in arrival order.
@@ -188,6 +194,7 @@ pub struct Server {
     /// processes.
     host_reserve: u64,
     kv_storage: KvStorage,
+    transfers: transfers::Transfers,
     /// Events to send once the request being handled is answered.
     events: Vec<(ClientId, Event, Vec<Attachment>)>,
     /// The arguments a hot restart's successor starts with.
@@ -201,13 +208,14 @@ impl Server {
     /// Serve on `listener`, which the caller bound with mode 0600, with
     /// page pools of `page_pool_bytes` each unless a worker asks for another
     /// size, leaving `host_reserve` bytes of the host's available memory to
-    /// other processes, and run the Mooncake connector `connector` when
-    /// given.
+    /// other processes, and run the Mooncake connector `connector` and the
+    /// Transfer Server `transfer` when given.
     pub fn new(
         listener: UnixListener,
         page_pool_bytes: u64,
         host_reserve: u64,
-        connector: Option<ConnectorLaunch>,
+        connector: Option<Launch>,
+        transfer: Option<Launch>,
     ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
         Ok(Self {
@@ -223,6 +231,7 @@ impl Server {
             pages: pages::Pools::new(page_pool_bytes),
             host_reserve,
             kv_storage: KvStorage::new(connector),
+            transfers: transfers::Transfers::new(transfer),
             events: Vec::new(),
             relaunch: Vec::new(),
             restart: None,
@@ -280,12 +289,15 @@ impl Server {
         for pidfd in &pidfds {
             fds.push(PollFd::new(pidfd.as_ref(), PollFlags::IN));
         }
-        if let Some((_, pidfd)) = &self.kv_storage.child {
-            fds.push(PollFd::new(pidfd, PollFlags::IN));
+        for process in [&self.kv_storage.process, &self.transfers.process] {
+            if let Some((_, pidfd)) = &process.child {
+                fds.push(PollFd::new(pidfd, PollFlags::IN));
+            }
         }
         let timeout = [
             self.shootdowns.polling().then_some(NVML_POLL),
-            self.kv_storage.timeout(),
+            self.kv_storage.process.timeout(),
+            self.transfers.process.timeout(),
         ]
         .into_iter()
         .flatten()
@@ -320,8 +332,10 @@ impl Server {
         if self.shootdowns.advance() {
             self.settle_shootdowns();
         }
-        self.kv_storage.reap();
-        self.kv_storage.start_due();
+        self.kv_storage.process.reap();
+        self.kv_storage.process.start_due();
+        self.transfers.process.reap();
+        self.transfers.process.start_due();
         self.serve_queues();
         self.flush_and_reap();
         Ok(())
@@ -502,6 +516,14 @@ impl Server {
                 self.kv_storage.client = Some(id);
                 tracing::info!(pid = client.pid, "the Mooncake connector connected");
             }
+        }
+        if matches!(hello.role, Role::Transfer) {
+            let pid = self.clients.get(&id).map_or(0, |client| client.pid);
+            if let Err(message) = self.transfer_hello(id, pid) {
+                return Welcome::Refused { message };
+            }
+        }
+        if let Some(client) = self.clients.get_mut(&id) {
             client.role = Some(hello.role);
         }
         Welcome::Accepted { version: VERSION }
@@ -626,6 +648,13 @@ impl Server {
                 // abort freed some: the windows that followed them end.
                 self.pages.settle();
                 outcome
+            }
+            (
+                Request::Transfer { .. } | Request::Cancel { .. } | Request::Throttle { .. },
+                role,
+            ) => self.transfer_request(id, request, &role),
+            (Request::Measured { .. } | Request::Copied { .. }, Role::Transfer) => {
+                self.transfer_report(request)
             }
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
@@ -910,9 +939,11 @@ impl Server {
         count
     }
 
-    /// Tell the connector that it no longer maps `pools`.
+    /// Tell the connector and the Transfer Server that they no longer map
+    /// `pools`.
     fn pools_released(&mut self, pools: &[u64]) {
         for &pool in pools {
+            self.allocation_released(Allocation::Pool { pool });
             if self.kv_storage.offered.remove(&pool)
                 && let Some(connector) = self.kv_storage.client
             {
@@ -1405,6 +1436,9 @@ impl Server {
         });
         if empty {
             self.storages.remove(&tensor.storage);
+            self.allocation_released(Allocation::Storage {
+                storage: tensor.storage,
+            });
         }
     }
 
@@ -1467,8 +1501,12 @@ impl Server {
                 self.pages.worker_gone(scope);
             }
             Some(Role::Connector) if self.kv_storage.client == Some(id) => self.connector_gone(),
+            Some(Role::Transfer) if self.transfers.client == Some(id) => {
+                self.transfer_server_gone();
+            }
             _ => {}
         }
+        self.transfer_client_gone(id);
         if let Some(Role::Head { deployment, .. }) = &client.role
             && let Some(entry) = self.deployments.get_mut(deployment)
             && entry.head == Some(id)
@@ -1483,6 +1521,11 @@ impl Server {
                 }
             }
         }
+        // What the disconnect ended goes out now, not with the next reply:
+        // the failures of the Transfer Server's tasks to their submitters,
+        // the cancellations of a gone submitter's tasks to the Transfer
+        // Server.
+        self.send_events();
     }
 
     /// Write pending replies and drop closed clients.
@@ -1573,6 +1616,7 @@ impl Server {
                 .collect(),
             page_pools: self.pages.listing(),
             connector: self.kv_storage.client.is_some(),
+            transfer: self.listed_transfer(),
         }
     }
 
@@ -2153,6 +2197,11 @@ fn request_name(request: &Request) -> &'static str {
         Request::Prefetch { .. } => "prefetch",
         Request::HostCache { .. } => "host_cache",
         Request::Finished { .. } => "finished",
+        Request::Transfer { .. } => "transfer",
+        Request::Cancel { .. } => "cancel",
+        Request::Throttle { .. } => "throttle",
+        Request::Measured { .. } => "measured",
+        Request::Copied { .. } => "copied",
     }
 }
 

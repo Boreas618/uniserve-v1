@@ -26,6 +26,9 @@ pub enum DeviceAttribute {
     ComputeCapabilityMajor = 75,
     ComputeCapabilityMinor = 76,
     VirtualMemoryManagementSupported = 102,
+    /// Whether host memory registers for reads alone
+    /// (`CU_MEMHOSTREGISTER_READ_ONLY`, [`crate::HostRegistration::read_only`]).
+    ReadOnlyHostRegisterSupported = 113,
     HandleTypePosixFileDescriptorSupported = 103,
     HandleTypeFabricSupported = 128,
     /// The host NUMA node closest to the device, or -1 when the host has no
