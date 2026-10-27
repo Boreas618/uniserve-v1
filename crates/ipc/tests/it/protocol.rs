@@ -721,9 +721,15 @@ fn windowed_block_table_round_trips_its_start_page_and_units() {
     let mut outside = run.clone();
     outside.new_cache_units[1].unit_ids = vec![UnitId(11)];
     assert!(outside.validate().is_err());
-    let mut sentinel = run;
+    // A state group's page without a checkpoint names the padding sentinel
+    // for its units; a real unit appears once.
+    let mut sentinel = run.clone();
     sentinel.block_tables[1].unit_ids[0] = UnitId(0);
-    assert!(sentinel.validate().is_err());
+    sentinel.block_tables[1].unit_ids[1] = UnitId(0);
+    assert!(sentinel.validate().is_ok());
+    let mut repeated = run;
+    repeated.block_tables[1].unit_ids[0] = UnitId(8);
+    assert!(repeated.validate().is_err());
 }
 
 #[test]

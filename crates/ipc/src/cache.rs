@@ -24,15 +24,28 @@ pub enum CacheGroupKind {
         /// window.
         window: u32,
     },
+    /// Checkpoints of the layers a worker keeps per request slot, such as a
+    /// recurrent state: page `k` holds every such layer's state after token
+    /// `(k + 1) * block_size - 1`. A reader continuing from token `t` needs
+    /// only the page that ends at `t`, the page a one-token window holds;
+    /// a table names units only for the pages that hold or receive a
+    /// checkpoint and the padding sentinel, unit 0, for the others.
+    State,
 }
 
 impl CacheGroupKind {
-    /// Returns the history bound in tokens, or `None` for full attention.
+    /// Returns the history bound in tokens, or `None` for full attention
+    /// and for state checkpoints.
     pub const fn window(self) -> Option<u32> {
         match self {
-            Self::Full => None,
+            Self::Full | Self::State => None,
             Self::SlidingWindow { window } => Some(window),
         }
+    }
+
+    /// Whether the group holds state checkpoints rather than K/V rows.
+    pub const fn is_state(self) -> bool {
+        matches!(self, Self::State)
     }
 }
 
@@ -52,13 +65,15 @@ pub struct CacheGroup {
     /// Global cache-layer ids of this rank's layers in the group, in the
     /// column order the worker stores them.
     pub layer_ids: Vec<u32>,
-    /// KV heads this rank stores per layer.
+    /// KV heads this rank stores per layer; for a state group, the heads of
+    /// the layers' state partition this rank keeps.
     pub num_kv_heads: u32,
     /// Logical KV heads of each layer across all tensor-parallel members.
     pub total_kv_heads: u32,
     /// First logical KV head stored by this rank.
     pub kv_head_offset: u32,
-    /// Elements stored per KV head.
+    /// Elements stored per KV head; one for a state group, whose pages hold
+    /// bytes rather than K/V rows.
     pub head_dim: u32,
 }
 

@@ -6,6 +6,8 @@
 use super::*;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
+use crate::kv_cache::Checkpoint;
+
 impl Scheduler {
     /// Registers one selected call with its allocated physical inputs and outputs.
     ///
@@ -560,7 +562,9 @@ impl Scheduler {
 
 impl Scheduler {
     /// Grows the request's cache tables for a call that reads from cache token
-    /// `read_start` and holds `total_tokens` tokens.
+    /// `read_start` and holds `total_tokens` tokens and computes prompt
+    /// tokens (or loads a reused prefix): a state group checkpoints the last
+    /// boundary it reaches.
     ///
     /// A sliding-window group needs only the pages the read's window and the
     /// call's tokens intersect; every group's units come from one pool.
@@ -572,6 +576,30 @@ impl Scheduler {
         id: RequestId,
         read_start: usize,
         total_tokens: usize,
+    ) -> bool {
+        self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Boundary)
+    }
+
+    /// Grows the request's cache tables for a decode call, as
+    /// [`Self::ensure_request_capacity`] does for a prompt call, except that
+    /// a state group checkpoints only a boundary that is a multiple of the
+    /// state interval.
+    pub(in crate::scheduler) fn ensure_decode_capacity(
+        &mut self,
+        id: RequestId,
+        read_start: usize,
+        total_tokens: usize,
+    ) -> bool {
+        let checkpoint = Checkpoint::Interval(self.state_interval);
+        self.grow_request_tables(id, read_start, total_tokens, checkpoint)
+    }
+
+    fn grow_request_tables(
+        &mut self,
+        id: RequestId,
+        read_start: usize,
+        total_tokens: usize,
+        checkpoint: Checkpoint,
     ) -> bool {
         let Some(state) = self.running.get_mut(&id) else {
             return false;
@@ -587,6 +615,7 @@ impl Scheduler {
                 &mut allocations.prefix_cache,
                 read_start.min(u32::MAX as usize) as u32,
                 total_tokens.min(u32::MAX as usize) as u32,
+                checkpoint,
             )
             .is_ok()
     }

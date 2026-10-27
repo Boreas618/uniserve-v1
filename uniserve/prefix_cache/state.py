@@ -126,6 +126,14 @@ class State:
             self, "initialized", MappingProxyType(dict(self.initialized))
         )
 
+    def buffers(self) -> Mapping[str, torch.Tensor]:
+        """Each field's physical buffers and its flags by name:
+        ``"<field>.values"`` (or an encoded tensor's buffers) and
+        ``"<field>.initialized"``, each with the leading block axis. A layer
+        kept per request slot names its slot banks' fields so.
+        """  # noqa: D205
+        return MappingProxyType(dict(self._storage()))
+
     def _storage(self) -> Mapping[str, torch.Tensor]:
         """Flatten each field into its physical buffers plus its flag vector."""
         result: dict[str, torch.Tensor] = {}
@@ -277,9 +285,15 @@ class StateConfig(ABC):
       ``uniserve.prefix_cache.slots.rows()``;
     - its reuse and host KV cache rules: pages follow their ``window``
       (``None`` keeps the whole history, a token count only the window
-      before each reader); a deployment with ``"states"`` layers reuses no
-      prefix and copies no page through the host KV cache, since a page
-      does not hold the state a request reached;
+      before each reader). A ``"states"`` layer's state at a token prefix
+      is kept as a checkpoint in a page of the pool's state group
+      (``uniserve.prefix_cache.checkpoints``): the group's page ``k`` holds
+      the state after token ``(k + 1) * block_size - 1``. Such pages are
+      published, reused and copied through the host KV cache as K/V pages
+      are, so a request resumes from the checkpoint at its reused prefix;
+    - its partition: ``heads`` logical heads, of which the rank keeps
+      ``head_indices``. A state kept whole on every rank has one head, the
+      default;
     - its transfer: ``State.transfer_views`` and ``State.copy_blocks``
       borrow and copy whole blocks; a page transfer splits the ``heads``
       axis between tensor-parallel ranks.
@@ -290,6 +304,16 @@ class StateConfig(ABC):
     """
 
     indexing: ClassVar[Literal["tokens", "states"]]
+
+    @property
+    def heads(self) -> int:
+        """The logical heads the state is partitioned by across ranks."""
+        return 1
+
+    @property
+    def state_heads(self) -> tuple[int, ...]:
+        """The logical heads of the state this rank keeps."""
+        return (0,)
 
     @abstractmethod
     def buffers(

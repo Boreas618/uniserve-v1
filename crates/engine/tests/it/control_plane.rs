@@ -1921,18 +1921,20 @@ fn latent_blocks_are_admitted_only_at_captured_sizes() {
     }
 }
 
-/// Workers that keep cache layers per request slot (a recurrent state) reuse
-/// no prefix and retain no reusable page, although the deployment enables
-/// prefix caching: a page does not hold the state its request reached.
+/// Workers that keep cache layers per request slot (a recurrent state)
+/// checkpoint them in a state group: a request of the same prompt reuses the
+/// prefix up to the checkpoint the first request's prompt kept at its last
+/// page boundary, and no deeper.
 #[test]
-fn request_states_disable_prefix_reuse() {
+fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
     use engine::{EngineConfig, SchedulerHandle};
     use std::sync::atomic::Ordering;
 
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
-    sim.set_request_states(true);
+    sim.set_block_size(16);
+    sim.add_state_group(2);
     let config = EngineConfig {
         prefix_cache: true,
         ..EngineConfig::sim("sim-model")
@@ -1961,8 +1963,10 @@ fn request_states_disable_prefix_reuse() {
         }
         assert_eq!(finish, Some(FinishReason::Eos));
     }
-    assert_eq!(stats.prefix.hit_tokens.load(Ordering::Relaxed), 0);
-    assert_eq!(stats.prefix_cache.pages_stored.load(Ordering::Relaxed), 0);
+    // The prompt of 600 tokens is one chunk, which checkpoints boundary 592:
+    // the deepest boundary that leaves a token to compute.
+    assert_eq!(stats.prefix.hit_tokens.load(Ordering::Relaxed), 592);
+    assert!(stats.prefix_cache.pages_stored.load(Ordering::Relaxed) > 0);
     engine.shutdown();
 }
 

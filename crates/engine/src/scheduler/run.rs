@@ -232,6 +232,7 @@ impl Scheduler {
             config,
             fatal: false,
             kv_offload: None,
+            state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             closing: false,
             resizing: None,
             asleep: false,
@@ -336,6 +337,13 @@ impl Scheduler {
         if let Some(cache) = self.storage.cache.as_mut() {
             cache.set_prefix_reuse(on);
         }
+    }
+
+    /// Checkpoints the state groups of decoding requests at the page
+    /// boundaries that are multiples of `tokens`; a prompt call checkpoints
+    /// the last boundary it reaches whatever the interval.
+    pub fn set_state_interval(&mut self, tokens: usize) {
+        self.state_interval = tokens.max(1);
     }
 
     /// Copy prompt pages of the worker groups whose ranks all map a page

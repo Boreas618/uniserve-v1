@@ -368,6 +368,9 @@ pub struct EngineConfig {
     /// a long prompt offloads its sliding windows to the host KV cache
     /// before.
     pub boundary_interval: usize,
+    /// The decoded tokens between two checkpoints of a request's state
+    /// groups (`Scheduler::set_state_interval`).
+    pub state_interval: usize,
     /// How large the world's host KV cache is (`kv_cache_config.host_ratio`
     /// and `host_gib`).
     pub host_cache: crate::kv_cache::HostCacheSize,
@@ -453,6 +456,7 @@ impl EngineConfig {
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
             prefix_cache: true,
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
+            state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             host_cache: crate::kv_cache::HostCacheSize::default(),
             schedule_policy: SchedulingPolicy::Fcfs,
             worker_groups: vec![WorkerGroupConfig::placed(
@@ -841,6 +845,7 @@ impl SchedulerHandle {
             config.generation_limits,
         )?;
         scheduler.set_prefix_reuse(config.prefix_cache);
+        scheduler.set_state_interval(config.state_interval);
         scheduler.set_trial(config.predecessor.is_some());
         scheduler.set_prefill_groups(
             config

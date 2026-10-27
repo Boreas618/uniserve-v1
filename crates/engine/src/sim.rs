@@ -1390,8 +1390,9 @@ impl SimEngine {
             .num_units = count;
     }
 
-    /// Reports cache layers kept per request slot beside the pages
-    /// (`PrefixCacheInfo::request_states`).
+    /// Reports a state group after the K/V groups: checkpoints of a layer
+    /// kept per request slot, a page of `units_per_page` units at every
+    /// boundary of the first group's block size.
     ///
     /// # Panics
     ///
@@ -1400,12 +1401,29 @@ impl SimEngine {
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
     )]
-    pub fn set_request_states(&mut self, kept: bool) {
-        self.info
+    pub fn add_state_group(&mut self, units_per_page: u32) {
+        let cache = self
+            .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a prefix cache")
-            .request_states = kept;
+            .expect("sim AR worker has a prefix cache");
+        let first = cache.groups[0].clone();
+        let layer = cache
+            .groups
+            .iter()
+            .flat_map(|group| group.layer_ids.iter().copied())
+            .max()
+            .map_or(0, |layer| layer + 1);
+        cache.groups.push(ipc::CacheGroup {
+            kind: ipc::CacheGroupKind::State,
+            block_size: first.block_size,
+            units_per_page,
+            layer_ids: vec![layer],
+            num_kv_heads: 1,
+            total_kv_heads: 1,
+            kv_head_offset: 0,
+            head_dim: 1,
+        });
     }
 
     /// Sets every cache group's block size in tokens.

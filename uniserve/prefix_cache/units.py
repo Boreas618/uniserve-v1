@@ -25,6 +25,18 @@ table, so each layer's view and the stacked allocation of each field are
 the ``[layers, blocks, block_size, heads, dim]`` layout of a per-layer
 stack.
 
+Layers kept per request slot (``StateConfig.indexing == "states"``) form
+the pool's state group, after the K/V groups: its page ``k`` holds every
+such layer's checkpoint, the state after token ``(k + 1) * block_size -
+1``, where ``block_size`` is the largest K/V block size, so every page
+boundary of the state group is a page boundary of every K/V group. A
+page's planes are numbered in the order a host page stores them (field
+major, then unit, then column: plane ``p`` is field ``p // (units_per_page
+* columns)``, unit ``(p // columns) % units_per_page`` of the page, column
+``p % columns``); each layer's checkpoint is a run of consecutive planes
+holding its slot fields' bytes (``CheckpointLayout``), read and written
+through ``uniserve.prefix_cache.checkpoints``.
+
 The serving worker allocates the fields itself and constructs a ``UnitPool``
 over them; standalone library callers allocate with ``UnitPool.allocate``.
 Either way the pool only borrows its fields: unit assignment, retirement and
@@ -43,25 +55,61 @@ from uniserve.quantization import Quantizer
 from uniserve.tensors import BufferConfig
 
 from . import mha
-from .state import Config, State
+from .checkpoints import Checkpoints, Lookups
+from .state import Config, State, StateConfig
 
 _FIELDS = ("key", "value")
 
 
 @dataclass(frozen=True, slots=True)
+class CheckpointLayout:
+    """Where one layer's checkpoint lies in a page of the state group.
+
+    Attributes:
+        first_plane: The first of the page planes the checkpoint occupies,
+            in the page's plane order (see the module documentation).
+        planes: The consecutive planes it occupies.
+        fields: Each slot field the checkpoint copies, in the order the
+            layer's state type declares them: its bank field name
+            (``"<field>.values"``, ``"<field>.initialized"``), the byte
+            offset within the run (a multiple of ``CHECKPOINT_ALIGNMENT``),
+            one slot's extent and the element type.
+    """
+
+    first_plane: int
+    planes: int
+    fields: tuple[tuple[str, int, tuple[int, ...], torch.dtype], ...]
+
+
+# Byte alignment of each field of a checkpoint, a multiple of every element
+# size, so each field's bytes view as its element type in place.
+CHECKPOINT_ALIGNMENT = 16
+
+
+@dataclass(frozen=True, slots=True)
 class CacheGroup:
-    """Cache layers that share a history window and a K/V page shape.
+    """Cache layers sharing a history window and a K/V page shape.
+
+    The pool's state group instead holds the checkpoints of the layers kept
+    per request slot.
 
     Attributes:
         window: History tokens any reader of the group needs; ``None`` keeps
-            the whole history.
-        block_size: Tokens stored per logical page; a power of two.
+            the whole history. ``None`` for the state group.
+        block_size: Tokens stored per logical page; a power of two. The
+            state group's pages are checkpoints ``block_size`` tokens apart.
         units_per_page: Units one logical page occupies.
         layers: Cache layer names in column order; layer ``k`` lies in
-            column ``k % columns`` of a page's unit ``k // columns``.
-        num_kv_heads: Local K/V heads stored per layer.
-        head_dim: Elements per head.
-        dtype: Stored element dtype (``float8_e4m3fn`` for FP8 storage).
+            column ``k % columns`` of a page's unit ``k // columns``. The
+            state group's layers lie in the planes of ``checkpoints``.
+        num_kv_heads: Local K/V heads stored per layer; for the state
+            group, the local heads of its layers' state partition.
+        head_dim: Elements per head; one for the state group, whose pages
+            hold bytes rather than K/V rows.
+        dtype: Stored element dtype (``float8_e4m3fn`` for FP8 storage);
+            ``uint8`` for the state group.
+        checkpoints: The state group's layers' checkpoints, in ``layers``
+            order; empty for a K/V group.
     """
 
     window: int | None
@@ -71,6 +119,14 @@ class CacheGroup:
     num_kv_heads: int
     head_dim: int
     dtype: torch.dtype
+    checkpoints: tuple[CheckpointLayout, ...] = ()
+
+    @property
+    def states(self) -> bool:
+        """Whether the group holds checkpoints of layers kept per request
+        slot rather than K/V rows.
+        """  # noqa: D205
+        return bool(self.checkpoints)
 
     @property
     def row_bytes(self) -> int:
@@ -127,6 +183,11 @@ class Planes:
             for row in range(value.units_per_page)
         )
 
+    @property
+    def attention(self) -> tuple[CacheGroup, ...]:
+        """The K/V groups, which lead the groups."""
+        return tuple(group for group in self.groups if not group.states)
+
     def buffers(self, num_units: int) -> dict[str, BufferConfig]:
         """Declare every backing field the pool allocates for ``num_units``.
 
@@ -160,26 +221,39 @@ def plan_units(
 ) -> Planes:
     """Group cache layers and derive the unit pool's column planes.
 
-    Layers group by history window, logical and local K/V heads, head width
-    and stored element type, in order of first appearance. ``block_size`` is
-    the block size of the group with the widest token rows; its rows fill one
-    plane, and every other group's page holds as many tokens as fit that
-    plane.
+    K/V layers group by history window, logical and local K/V heads, head
+    width and stored element type, in order of first appearance.
+    ``block_size`` is the block size of the group with the widest token
+    rows; its rows fill one plane, and every other group's page holds as
+    many tokens as fit that plane. Layers kept per request slot form the
+    state group, last, whose pages hold their checkpoints at every multiple
+    of the largest K/V block size (see the module documentation).
 
     Args:
-        config: MHA cache layers by module path.
+        config: Cache layers by module path: MHA layers, and layers whose
+            type is indexed by request slot.
         block_size: Tokens per page of the widest group; a power of two.
         dtype: Logical storage dtype, or ``None`` for each layer's compute
             dtype.
-        quantization: Optional per-layer quantizer; every layer must use the
-            same FP8 block quantizer or none.
+        quantization: Optional per-layer quantizer of the MHA layers; every
+            layer must use the same FP8 block quantizer or none.
 
     Raises:
-        ValueError: A layer is not an MHA layout, quantization is mixed or
+        ValueError: There is no MHA layer, a layer is neither an MHA layout
+            nor indexed by request slot, quantization is mixed or
             unsupported, ``block_size`` is not a positive power of two, or a
             group's rows do not divide the plane into a power-of-two page.
     """
-    layers = config.layers
+    states = {
+        name: layout
+        for name, layout in config.layers.items()
+        if layout.indexing == "states"
+    }
+    layers = {
+        name: layout
+        for name, layout in config.layers.items()
+        if name not in states
+    }
     if not layers or any(
         not isinstance(layout, mha.Config) for layout in layers.values()
     ):
@@ -251,7 +325,74 @@ def plan_units(
                 dtype=stored,
             )
         )
+    if states:
+        groups.append(
+            _state_group(
+                states,
+                columns=columns,
+                plane_bytes=plane_bytes,
+                block_size=max(group.block_size for group in groups),
+            )
+        )
     return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
+
+
+def _state_group(
+    states: Mapping[str, StateConfig],
+    *,
+    columns: int,
+    plane_bytes: int,
+    block_size: int,
+) -> CacheGroup:
+    """The state group of the layers kept per request slot.
+
+    Each layer's checkpoint copies every slot field its type declares, at
+    ``CHECKPOINT_ALIGNMENT``-byte offsets, into a run of whole planes that
+    follows the previous layer's; a page holds the units every run needs.
+
+    Raises:
+        ValueError: The layers partition their states by different heads.
+    """
+    from . import slots
+
+    partitions = {
+        (layout.heads, layout.state_heads) for layout in states.values()
+    }
+    if len(partitions) != 1:
+        raise ValueError(
+            "the layers kept per request slot partition their states by "
+            "different heads"
+        )
+    _, heads = next(iter(partitions))
+
+    checkpoints = []
+    first = 0
+    for layout in states.values():
+        fields = []
+        offset = 0
+        for name, (shape, dtype) in slots.fields(layout).items():
+            offset = -(-offset // CHECKPOINT_ALIGNMENT) * CHECKPOINT_ALIGNMENT
+            fields.append((name, offset, shape, dtype))
+            count = 1
+            for extent in shape:
+                count *= extent
+            offset += count * torch.empty((), dtype=dtype).element_size()
+        planes = max(1, -(-offset // plane_bytes))
+        checkpoints.append(CheckpointLayout(first, planes, tuple(fields)))
+        first += planes
+
+    # Every unit of a page holds a key and a value plane per column.
+    units_per_page = -(-first // (2 * columns))
+    return CacheGroup(
+        window=None,
+        block_size=block_size,
+        units_per_page=units_per_page,
+        layers=tuple(states),
+        num_kv_heads=len(heads),
+        head_dim=1,
+        dtype=torch.uint8,
+        checkpoints=tuple(checkpoints),
+    )
 
 
 class UnitPool:
@@ -281,7 +422,8 @@ class UnitPool:
         dtype as their logical storage dtype; FP8 layers encode their
         compute dtype. ``states`` are the states of the layers kept per
         request slot (``uniserve.prefix_cache.slots``), which ``state``
-        serves too; they have no block table.
+        serves too; they have no block table, and their checkpoints in the
+        pages of the state group are served by ``checkpoints``.
 
         Raises:
             ValueError: A field disagrees with the planes' layout.
@@ -306,9 +448,32 @@ class UnitPool:
         self._configs = dict(configs)
         self._states: dict[str, State] = {}
         self._tables: dict[str, int] = {}
+        self._checkpoints: dict[str, Checkpoints] = {}
+        # The state group's layers read the same tables in a forward.
+        lookups = Lookups()
         columns = planes.columns
         first_table = 0
         for group in planes.groups:
+            if group.states:
+                # The state group's pages hold checkpoints of the layers
+                # kept per request slot; its tables address them.
+                for name, layout in zip(
+                    group.layers, group.checkpoints, strict=True
+                ):
+                    self._checkpoints[name] = Checkpoints(
+                        (
+                            self._fields["key.values"],
+                            self._fields["value.values"],
+                        ),
+                        layout,
+                        tables=range(
+                            first_table, first_table + group.units_per_page
+                        ),
+                        interval=group.block_size,
+                        lookups=lookups,
+                    )
+                first_table += group.units_per_page
+                continue
             for index, name in enumerate(group.layers):
                 row, column = divmod(index, columns)
                 views = {}
@@ -353,13 +518,18 @@ class UnitPool:
         device: torch.device | str,
         dtype: torch.dtype | None = None,
         quantization: Mapping[str, Quantizer | None] | None = None,
+        request_slots: int = 0,
     ) -> UnitPool:
         """Allocate and reset a pool's fields for standalone library use.
 
         ``block_size``, ``dtype`` and ``quantization`` are interpreted as by
         ``plan_units``; ``num_units`` counts every unit, sentinel included.
-        Scales start at one and every other field at zero.
+        Scales start at one and every other field at zero. The layers kept
+        per request slot get banks of ``request_slots`` slots after the
+        padding slot 0, zeroed.
         """
+        from . import slots
+
         planes = plan_units(
             config,
             block_size=block_size,
@@ -375,11 +545,35 @@ class UnitPool:
             for name, requirement in planes.buffers(num_units).items()
         }
         configs = {}
+        states = {}
         for name, layout in config.layers.items():
+            if layout.indexing == "states":
+                states[name] = layout
+                continue
             if not isinstance(layout, mha.Config):
                 raise ValueError("a K/V unit pool requires MHA cache layers")
             configs[name] = layout
-        return cls(planes, fields, configs, num_units=num_units)
+        banks = {
+            f"{name}/{field}": torch.zeros(
+                (request_slots + 1, *shape), dtype=bank_dtype, device=device
+            )
+            for name, layout in states.items()
+            for field, (shape, bank_dtype) in slots.fields(layout).items()
+        }
+        return cls(
+            planes,
+            fields,
+            configs,
+            num_units=num_units,
+            states=slots.bind(states, banks),
+        )
+
+    def checkpoints(self, name: str) -> Checkpoints | None:
+        """The checkpoints of a layer kept per request slot in the state
+        group's pages; ``None`` for a K/V layer.
+        """  # noqa: D205
+        self.state(name)
+        return self._checkpoints.get(name)
 
     @property
     def groups(self) -> tuple[CacheGroup, ...]:

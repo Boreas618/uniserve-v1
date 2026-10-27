@@ -21,7 +21,7 @@ mod bytes;
 pub(crate) use bytes::ByteAllocator;
 
 pub(crate) use crate::kv_cache::CacheAllocation;
-use crate::kv_cache::{BlockPool, GroupShape, PrefixCacheCoordinator};
+use crate::kv_cache::{BlockPool, Checkpoint, GroupShape, PrefixCacheCoordinator};
 
 /// Owned request row, returned only after its request epoch retires.
 ///
@@ -176,10 +176,6 @@ impl LatentPool {
 pub(crate) struct PrefixCacheManager {
     pub(crate) block_pool: BlockPool,
     pub(crate) coordinator: PrefixCacheCoordinator,
-    /// Whether a page holds all a request reached: false when the workers
-    /// also keep states per request (`PrefixCacheInfo::request_states`),
-    /// which no prefix reuse restores.
-    reusable: bool,
 }
 
 impl PrefixCacheManager {
@@ -209,12 +205,9 @@ impl PrefixCacheManager {
                     .collect(),
             );
             coordinator.set_seed(crate::kv_cache::prefix_seed(&prefix_cache.identity));
-            let reusable = !prefix_cache.request_states;
-            coordinator.set_prefix_enabled(reusable);
             PrefixCacheManager {
                 block_pool,
                 coordinator,
-                reusable,
             }
         })
     }
@@ -332,19 +325,26 @@ impl PrefixCacheManager {
     pub(crate) fn allocate(&self, tokens: u32) -> Result<CacheAllocation, OutOfStorage> {
         let mut allocation = self.coordinator.empty();
         self.coordinator
-            .ensure_capacity(&self.block_pool, &mut allocation, 0, tokens as usize)
+            .ensure_capacity(
+                &self.block_pool,
+                &mut allocation,
+                0,
+                tokens as usize,
+                Checkpoint::Boundary,
+            )
             .ok_or(OutOfStorage::PrefixCache)?;
         Ok(allocation)
     }
 
     /// Grow every cache group atomically for a call that reads from token
     /// `read_start` and holds `tokens` tokens, retaining shared prefix
-    /// references.
+    /// references; its state groups checkpoint as `checkpoint` says.
     pub(crate) fn grow(
         &self,
         allocation: &mut CacheAllocation,
         read_start: u32,
         tokens: u32,
+        checkpoint: Checkpoint,
     ) -> Result<(), OutOfStorage> {
         self.coordinator
             .ensure_capacity(
@@ -352,15 +352,14 @@ impl PrefixCacheManager {
                 allocation,
                 read_start as usize,
                 tokens as usize,
+                checkpoint,
             )
             .ok_or(OutOfStorage::PrefixCache)
     }
 
-    /// Enables or disables prefix reuse, which workers that keep states per
-    /// request never allow.
+    /// Enables or disables prefix reuse.
     pub(crate) fn set_prefix_reuse(&mut self, enabled: bool) {
-        self.coordinator
-            .set_prefix_enabled(enabled && self.reusable);
+        self.coordinator.set_prefix_enabled(enabled);
     }
 }
 

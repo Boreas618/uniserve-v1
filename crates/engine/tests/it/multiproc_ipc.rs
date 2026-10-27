@@ -2058,11 +2058,13 @@ fn tokens_until_terminal(events: &mut engine::EventRx) -> anyhow::Result<(Vec<u3
 /// kept per request slot (`uniserve.models.stub.TokenCount`, the test
 /// implementation of such a cache layer type), whose forward fails when a
 /// row continues from another count than its prefix. A prompt of three
-/// chunks and its decode steps carry the count in the request's slot; a
-/// second request of the same prompt reuses no prefix, which its slot never
-/// counted, and generates the same tokens.
+/// chunks and its decode steps carry the count in the request's slot, and
+/// each chunk checkpoints it at its last page boundary; a second request of
+/// the same prompt reuses the prefix up to the last chunk's checkpoint,
+/// resumes its count from it in another slot, and generates the same
+/// tokens.
 #[test]
-fn a_cache_layer_kept_per_request_carries_its_state_across_forwards() -> anyhow::Result<()> {
+fn a_cache_layer_kept_per_request_resumes_from_its_checkpoints() -> anyhow::Result<()> {
     let model = tempfile::tempdir()?;
     std::fs::write(model.path().join("stub.json"), r#"{"request_state": true}"#)?;
     let mut config = stub_engine_config("request-states");
@@ -2112,9 +2114,12 @@ fn a_cache_layer_kept_per_request_carries_its_state_across_forwards() -> anyhow:
         generated[0].len() == 8 && generated[0] == generated[1],
         "{generated:?}"
     );
+    // The last chunk, of tokens 512 to 600, checkpointed its last page
+    // boundary: the deepest one leaving a token to compute.
+    let reused = stats.prefix.hit_tokens.load(Ordering::Relaxed);
     anyhow::ensure!(
-        stats.prefix.hit_tokens.load(Ordering::Relaxed) == 0,
-        "a prefix was reused"
+        reused > 512 && reused < 600,
+        "the second request reused {reused} prompt tokens"
     );
     Ok(())
 }

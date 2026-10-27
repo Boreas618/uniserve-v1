@@ -832,6 +832,7 @@ impl Worker {
             cupti: crate::profiling::cupti::Cupti::new(observed),
             predecessor: self.config.predecessor.clone(),
             max_total_tokens: self.config.max_total_tokens,
+            request_slots: self.config.max_request_pool_size,
             devices: self.config.devices().filter_map(Device::cuda).collect(),
             host_cache: self.host_cache.take(),
         };

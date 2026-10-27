@@ -26,9 +26,10 @@ pub(crate) struct CacheCapacity {
 pub(crate) struct CacheDemand<'a> {
     /// `(tokens per page, units per page)` of every cache group.
     pub pages: &'a [(u32, u32)],
-    /// A configured token capacity, which sizes the pool instead of the
+    /// The units a configured token capacity takes
+    /// (`CachePlan::token_units`), which size the pool instead of the
     /// storage grant.
-    pub tokens: Option<u64>,
+    pub token_units: Option<u64>,
     /// The exact units of a standby worker's pool: those of the worker it
     /// stands by for, whose planes it maps rather than allocates.
     pub units: Option<u64>,
@@ -41,7 +42,8 @@ pub(crate) struct CacheDemand<'a> {
 }
 
 impl CacheCapacity {
-    /// Explicit token capacity counts whole pages of every cache group.
+    /// Explicit token capacity counts whole pages of every K/V group and a
+    /// state checkpoint per request slot.
     /// Automatic sizing gives the pool the complete units the grant holds
     /// beside the reserved ones; without a grant the pool takes
     /// [`DEFAULT_NUM_UNITS`]. Every mode leaves room for the sentinel unit
@@ -49,7 +51,7 @@ impl CacheCapacity {
     pub(crate) fn derive(demand: &CacheDemand<'_>) -> Result<Self> {
         let CacheDemand {
             pages,
-            tokens,
+            token_units,
             units: adopted,
             unit_bytes,
             available_bytes,
@@ -79,13 +81,13 @@ impl CacheCapacity {
             // The planes exist already: the grant need not hold them.
             return Ok(Self { num_units: units });
         }
-        let num_units = if let Some(tokens) = tokens {
-            if tokens == 0 {
+        let num_units = if let Some(units) = token_units {
+            if units == 0 {
                 return Err(Error::Invalid(
                     "configured KV token capacity must be positive".into(),
                 ));
             }
-            minimum.max(units_for_tokens(pages, tokens))
+            minimum.max(units)
         } else if let Some(available) = available_bytes {
             let units = (available / unit_bytes).saturating_sub(reserved_units);
             if units < minimum {
@@ -108,14 +110,6 @@ impl CacheCapacity {
 
         Ok(Self { num_units })
     }
-}
-
-/// Count whole token pages across all cache groups, rounding down per group.
-pub(crate) fn units_for_tokens(pages: &[(u32, u32)], tokens: u64) -> u64 {
-    pages
-        .iter()
-        .map(|&(page, units)| tokens / u64::from(page) * u64::from(units))
-        .sum()
 }
 
 /// Unresolved calls of a token worker, including a producer and its consumer

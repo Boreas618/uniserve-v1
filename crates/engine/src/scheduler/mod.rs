@@ -425,6 +425,9 @@ pub struct Scheduler {
     /// The host KV cache, when it serves a worker group
     /// (`Scheduler::enable_kv_offload`).
     kv_offload: Option<crate::kv_cache::KvOffloadManager>,
+    /// The decoded tokens between two checkpoints of a request's state
+    /// groups (`Scheduler::set_state_interval`).
+    state_interval: usize,
     /// Set once the scheduler closes its workers: it admits and schedules
     /// nothing more while it offloads its last pages to the host KV cache
     /// (`Scheduler::flush_offloads`).

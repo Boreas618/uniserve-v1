@@ -211,6 +211,13 @@ pub(crate) fn export(
             "cache export destination is ahead of its source".into(),
         ));
     }
+    // A request's state kept per request slot lives in its slot, which an
+    // export of its pages does not carry.
+    if planes.plan().states() {
+        return Err(Error::Invalid(
+            "a cache export does not carry the state a model keeps per request slot".into(),
+        ));
+    }
 
     let mut selected = Vec::new();
     let mut groups = Vec::new();
@@ -503,6 +510,7 @@ mod tests {
             dtype: PrefixCacheDtype::Float8E4m3Fn,
             groups: vec![CacheGroupPlan {
                 window: None,
+                state: false,
                 block_size: tokens as u32,
                 units_per_page: 1,
                 layers: vec!["a".into(), "b".into()],
@@ -677,6 +685,7 @@ mod tests {
                 dtype: PrefixCacheDtype::BFloat16,
                 groups: vec![CacheGroupPlan {
                     window: None,
+                    state: false,
                     block_size: 8,
                     units_per_page: 1,
                     layers: vec!["a".into(), "b".into()],

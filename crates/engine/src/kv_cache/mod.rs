@@ -41,6 +41,23 @@
 //!   page before it, and each sliding-window group's window of pages just
 //!   before it. The same managers decide reuse in the device cache and,
 //!   through [`KvOffloadManager`], in the host KV cache and the KV storage.
+//! - State checkpoints: a state group (`CacheGroupKind::State`) holds the
+//!   checkpoints of the layers a worker keeps per request slot, such as a
+//!   recurrent state: page `k` holds the state after token `(k + 1) *
+//!   block_size - 1`, so a reuse at a boundary needs the page that ends
+//!   there, as a one-token window does. A table holds units only for the
+//!   pages that hold a checkpoint, and the padding sentinel for the others
+//!   ([`TablePage`]): a prompt call checkpoints the last boundary it reaches
+//!   (the chunk boundaries of chunked prefill), a decode call only a
+//!   multiple of the state interval ([`DEFAULT_STATE_INTERVAL`]), as SGLang
+//!   tracks a recurrent state at the end of each prefill chunk and every
+//!   `mamba_track_interval` decoded tokens
+//!   (`refs/sglang/python/sglang/srt/managers/schedule_batch.py`,
+//!   `_mamba_radix_cache_v2_req_prepare_for_extend` and the decode track
+//!   mask) and vLLM's `mamba_cache_mode = "align"` caches the state at the
+//!   end of each scheduler step on a block boundary
+//!   (`refs/vllm/vllm/config/cache.py`). Checkpoint pages publish, reuse
+//!   and copy through the host KV cache as K/V pages do.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -62,6 +79,13 @@ pub use offload::HostCacheSize;
 pub(crate) use offload::{
     DEFAULT_BOUNDARY_INTERVAL, HostCacheDemand, KvOffloadManager, OffloadKind, RankCache,
 };
+
+/// The decoded tokens between two checkpoints of a state group's request,
+/// unless the deployment sets another (`kv_cache_config.state_interval`):
+/// SGLang's default `mamba_track_interval`
+/// (`refs/sglang/python/sglang/srt/arg_groups/fields/exec_.py`). A request
+/// resumed by its tokens recomputes at most this many decoded tokens.
+pub(crate) const DEFAULT_STATE_INTERVAL: usize = 256;
 
 /// Computes an incremental per-page prefix hash with 64-bit FNV-1a.
 ///
@@ -846,12 +870,68 @@ pub(crate) struct GroupShape {
     pub(crate) block_size: usize,
     /// Units one logical page occupies.
     pub(crate) units_per_page: usize,
-    /// History tokens any reader needs, or `None` for full attention.
+    /// History tokens any reader needs, or `None` for full attention. A
+    /// state group's reader needs one: the checkpoint ending at its first
+    /// token.
     pub(crate) window: Option<usize>,
+    /// Whether the group holds state checkpoints, whose tables hold units
+    /// only for the pages that hold a checkpoint
+    /// ([`GroupShape::checkpoint_page`]).
+    pub(crate) state: bool,
+}
+
+/// Where a call growing a request's tables checkpoints its state groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Checkpoint {
+    /// A prompt call (or a load of a reused prefix) keeps the state at the
+    /// last page boundary it reaches.
+    Boundary,
+    /// A decode call keeps the state at a boundary only when it is a
+    /// multiple of the state interval.
+    Interval(usize),
 }
 
 impl GroupShape {
-    /// The reuse rules of the group's attention type.
+    /// A K/V group's shape: pages of `block_size` tokens of `units_per_page`
+    /// units, reading the `window` tokens before each reader, or every
+    /// earlier token without one.
+    #[cfg(test)]
+    pub(crate) fn attention(
+        block_size: usize,
+        units_per_page: usize,
+        window: Option<usize>,
+    ) -> Self {
+        Self {
+            block_size,
+            units_per_page,
+            window,
+            state: false,
+        }
+    }
+
+    /// The logical page a call reading from token `read_start` and holding
+    /// `total_tokens` tokens checkpoints into: the page ending at the last
+    /// boundary it reaches, when that boundary follows `read_start` and the
+    /// call checkpoints it. `None` for a K/V group.
+    fn checkpoint_page(
+        &self,
+        read_start: usize,
+        total_tokens: usize,
+        checkpoint: Checkpoint,
+    ) -> Option<usize> {
+        if !self.state {
+            return None;
+        }
+        let boundary = total_tokens / self.block_size * self.block_size;
+        let kept = match checkpoint {
+            Checkpoint::Boundary => true,
+            Checkpoint::Interval(interval) => boundary.is_multiple_of(interval.max(1)),
+        };
+        (boundary > read_start && kept).then(|| boundary / self.block_size - 1)
+    }
+
+    /// The reuse rules of the group's attention type; a state group's are
+    /// those of a one-token window.
     pub(crate) fn manager(&self) -> manager::AttentionManager {
         match self.window {
             None => manager::AttentionManager::Full(manager::FullAttentionManager {
@@ -868,10 +948,16 @@ impl GroupShape {
 
     /// Derives the scheduler shape of a worker-reported group.
     pub(crate) fn from_group(group: &CacheGroup) -> Self {
+        let state = group.kind.is_state();
         Self {
             block_size: group.block_size as usize,
             units_per_page: group.units_per_page as usize,
-            window: group.kind.window().map(|window| window as usize),
+            window: if state {
+                Some(1)
+            } else {
+                group.kind.window().map(|window| window as usize)
+            },
+            state,
         }
     }
 
@@ -894,18 +980,39 @@ impl GroupShape {
 /// unit when the table allocated it fresh.
 #[derive(Debug)]
 struct TablePage {
-    page: PageRef,
+    /// The page's units; `None` for a state group's page that holds no
+    /// checkpoint, which workers see as the padding sentinel and never read.
+    page: Option<PageRef>,
     /// `None` for a page acquired from the prefix cache, which already holds
     /// computed keys and values; otherwise the owning allocation's unit serial at the
     /// page's allocation.
     serial: Option<u64>,
 }
 
+/// The pages a call needs a table to gain: the table's start, how many
+/// pages it appends and which of them take units, and which page it already
+/// holds without units that now takes them.
+struct Growth {
+    start: usize,
+    /// One entry per appended page: whether it takes units.
+    appended: Vec<bool>,
+    /// A page the table holds without units that takes them now.
+    filled: Option<usize>,
+}
+
+impl Growth {
+    /// The pages the growth allocates units for.
+    fn pages(&self) -> usize {
+        self.appended.iter().filter(|held| **held).count() + usize::from(self.filled.is_some())
+    }
+}
+
 /// One sequence's logical-page to physical-unit mapping in one cache group.
 ///
 /// Logical pages `start_page..end_page` are held; earlier pages are retired
-/// tombstones that no worker reads, which only a sliding-window group
-/// produces.
+/// tombstones that no worker reads, which only a sliding-window group and a
+/// state group produce. A state group's table holds units only for its
+/// pages that hold a checkpoint.
 #[derive(Debug)]
 pub(crate) struct BlockTable {
     group_id: usize,
@@ -913,7 +1020,8 @@ pub(crate) struct BlockTable {
     start_page: usize,
     pages: VecDeque<TablePage>,
     /// `(start_page, end_page)` most recently declared to workers, or `None`
-    /// before the first declaration or after a rollback.
+    /// before the first declaration, after a rollback, or once a page the
+    /// table held without units took them.
     sent: Option<(usize, usize)>,
 }
 
@@ -953,20 +1061,30 @@ impl BlockTable {
         self.end_page() * self.shape.block_size
     }
 
-    /// Returns the held pages' units, page-major from `start_page`.
+    /// Returns the held pages' units, page-major from `start_page`; a page
+    /// without units names the padding sentinel, unit 0, in each position.
     pub(crate) fn unit_ids(&self) -> Vec<UnitId> {
+        let sentinel = vec![UnitId(0); self.shape.units_per_page];
         self.pages
             .iter()
-            .flat_map(|entry| entry.page.units().iter().copied())
+            .flat_map(|entry| {
+                entry
+                    .page
+                    .as_ref()
+                    .map_or(sentinel.as_slice(), |page| page.units())
+                    .iter()
+                    .copied()
+            })
             .collect()
     }
 
-    /// Returns the held page at absolute logical `index`, if held.
+    /// Returns the held page at absolute logical `index`, if held with
+    /// units.
     pub(crate) fn page(&self, index: usize) -> Option<&PageRef> {
         index
             .checked_sub(self.start_page)
             .and_then(|offset| self.pages.get(offset))
-            .map(|entry| &entry.page)
+            .and_then(|entry| entry.page.as_ref())
     }
 
     /// Returns the units of fresh pages allocated at or after `serial`, which
@@ -975,7 +1093,8 @@ impl BlockTable {
         self.pages
             .iter()
             .filter(|entry| entry.serial.is_some_and(|value| value >= serial))
-            .flat_map(|entry| entry.page.units().iter().copied())
+            .filter_map(|entry| entry.page.as_ref())
+            .flat_map(|page| page.units().iter().copied())
             .collect()
     }
 
@@ -986,7 +1105,7 @@ impl BlockTable {
 
     /// Marks the table's `Reserved` units as `Active`.
     pub(crate) fn activate(&self, pool: &BlockPool) {
-        pool.activate(self.pages.iter().map(|entry| &entry.page));
+        pool.activate(self.pages.iter().filter_map(|entry| entry.page.as_ref()));
     }
 
     /// Records the held page interval as declared to workers.
@@ -1000,25 +1119,42 @@ impl BlockTable {
     }
 
     /// Returns the pages a call reading from token `read_start` and holding
-    /// `total_tokens` tokens still needs, as `(new start page, pages to
-    /// append)`.
+    /// `total_tokens` tokens still needs.
     ///
     /// Pages are only appended, so a non-empty table keeps its start. An
     /// empty table that never held a page starts at the first page the read
-    /// needs; a full-attention table always starts at page zero.
-    fn demand(&self, read_start: usize, total_tokens: usize) -> (usize, usize) {
-        let start = if self.pages.is_empty() && self.start_page == 0 {
+    /// needs; a full-attention table always starts at page zero. A K/V
+    /// table's pages all take units; a state table's take units only for
+    /// the page the call checkpoints into ([`GroupShape::checkpoint_page`]),
+    /// which may be a page the table already holds without them.
+    fn demand(&self, read_start: usize, total_tokens: usize, checkpoint: Checkpoint) -> Growth {
+        let fresh = self.pages.is_empty() && self.start_page == 0;
+        let start = if fresh {
             self.shape.first_needed_page(read_start)
         } else {
             self.start_page
         };
         let end = self.shape.pages_covering(total_tokens);
-        let current_end = if self.pages.is_empty() && self.start_page == 0 {
-            start
-        } else {
-            self.end_page()
-        };
-        (start, end.saturating_sub(current_end))
+        let current_end = if fresh { start } else { self.end_page() };
+        let target = self
+            .shape
+            .checkpoint_page(read_start, total_tokens, checkpoint);
+        let appended = (current_end..end.max(current_end))
+            .map(|page| !self.shape.state || target == Some(page))
+            .collect();
+        let filled = target.filter(|&page| {
+            page >= start
+                && page < current_end
+                && page
+                    .checked_sub(self.start_page)
+                    .and_then(|offset| self.pages.get(offset))
+                    .is_some_and(|entry| entry.page.is_none())
+        });
+        Growth {
+            start,
+            appended,
+            filled,
+        }
     }
 
     /// Retires held pages before absolute logical page `page`.
@@ -1215,13 +1351,15 @@ impl PrefixCacheCoordinator {
     ///
     /// A full-attention group needs every page before `total_tokens`; a
     /// sliding-window group needs only the pages intersecting
-    /// `[read_start - window, total_tokens)`. Returns `None` when the tables
-    /// do not match the groups.
+    /// `[read_start - window, total_tokens)`; a state group only the page
+    /// the call checkpoints into. Returns `None` when the tables do not
+    /// match the groups.
     pub(crate) fn units_needed(
         &self,
         allocation: &CacheAllocation,
         read_start: usize,
         total_tokens: usize,
+        checkpoint: Checkpoint,
     ) -> Option<usize> {
         if !self.matches(allocation) {
             return None;
@@ -1231,8 +1369,8 @@ impl PrefixCacheCoordinator {
                 .tables
                 .iter()
                 .map(|table| {
-                    let (_, pages) = table.demand(read_start, total_tokens);
-                    pages * table.shape.units_per_page
+                    table.demand(read_start, total_tokens, checkpoint).pages()
+                        * table.shape.units_per_page
                 })
                 .sum(),
         )
@@ -1242,26 +1380,44 @@ impl PrefixCacheCoordinator {
     /// cached prefix allocates to hold `total_tokens` tokens.
     ///
     /// The prefix is a multiple of every block size, and acquisition takes its
-    /// pages (a full group's whole prefix, a sliding group's window) from the
-    /// cache, so each group allocates only the pages after it.
+    /// pages (a full group's whole prefix, a sliding group's window, a state
+    /// group's checkpoint) from the cache, so each group allocates only the
+    /// pages after it: a state group the checkpoint at the last boundary
+    /// the first call reaches.
     pub(crate) fn units_after_prefix(&self, prefix_tokens: usize, total_tokens: usize) -> usize {
         self.groups
             .iter()
             .map(|group| {
-                let pages = group
-                    .pages_covering(total_tokens)
-                    .saturating_sub(prefix_tokens / group.block_size);
+                let pages = if group.state {
+                    usize::from(
+                        group
+                            .checkpoint_page(prefix_tokens, total_tokens, Checkpoint::Boundary)
+                            .is_some(),
+                    )
+                } else {
+                    group
+                        .pages_covering(total_tokens)
+                        .saturating_sub(prefix_tokens / group.block_size)
+                };
                 pages * group.units_per_page
             })
             .sum()
     }
 
     /// Returns the units that tables holding every page of `tokens` tokens
-    /// in every group occupy, as a worst-case reservation made up front.
+    /// in every group occupy, as a worst-case reservation made up front. A
+    /// state group's table holds one checkpoint, at the last boundary.
     pub(crate) fn units_for_tokens(&self, tokens: usize) -> usize {
         self.groups
             .iter()
-            .map(|group| group.pages_covering(tokens) * group.units_per_page)
+            .map(|group| {
+                let pages = if group.state {
+                    usize::from(tokens >= group.block_size)
+                } else {
+                    group.pages_covering(tokens)
+                };
+                pages * group.units_per_page
+            })
             .sum()
     }
 
@@ -1269,22 +1425,28 @@ impl PrefixCacheCoordinator {
     /// prompt in chunks of at most `chunk` tokens.
     ///
     /// Full-attention groups hold every page; a sliding-window group holds
-    /// only the pages one chunk's window and query can intersect.
+    /// only the pages one chunk's window and query can intersect; a state
+    /// group the checkpoint a chunk starts from and the one it writes.
     pub(crate) fn min_units_for_prompt(&self, tokens: usize, chunk: usize) -> usize {
         self.groups
             .iter()
             .map(|group| {
                 let pages = group.pages_covering(tokens);
-                let pages = group.window.map_or(pages, |window| {
-                    pages.min((window + chunk.max(1)).div_ceil(group.block_size) + 1)
-                });
+                let pages = if group.state {
+                    pages.min(2)
+                } else {
+                    group.window.map_or(pages, |window| {
+                        pages.min((window + chunk.max(1)).div_ceil(group.block_size) + 1)
+                    })
+                };
                 pages * group.units_per_page
             })
             .sum()
     }
 
     /// Grows every group table atomically for a call that reads from token
-    /// `read_start` and holds `total_tokens` tokens.
+    /// `read_start` and holds `total_tokens` tokens, checkpointing its
+    /// state groups as `checkpoint` says.
     ///
     /// The sum of every group's unit demand must fit the free units; the call
     /// then allocates them all or nothing. Returns `None`, with every table
@@ -1296,11 +1458,14 @@ impl PrefixCacheCoordinator {
         allocation: &mut CacheAllocation,
         read_start: usize,
         total_tokens: usize,
+        checkpoint: Checkpoint,
     ) -> Option<()> {
-        let demand = self.units_needed(allocation, read_start, total_tokens)?;
-        if demand == 0 {
-            return Some(());
-        }
+        let demand = self.units_needed(allocation, read_start, total_tokens, checkpoint)?;
+        let growths: Vec<Growth> = allocation
+            .tables
+            .iter()
+            .map(|table| table.demand(read_start, total_tokens, checkpoint))
+            .collect();
         if demand > pool.free_units() {
             return None;
         }
@@ -1310,39 +1475,62 @@ impl PrefixCacheCoordinator {
         // growth. Dropping unappended pages releases them without holding
         // the pool's lock.
         let mut grown = Vec::with_capacity(allocation.tables.len());
-        for table in &allocation.tables {
-            let (start, pages) = table.demand(read_start, total_tokens);
-            let allocated = if pages == 0 {
+        for (table, growth) in allocation.tables.iter().zip(&growths) {
+            let count = growth.pages();
+            let allocated = if count == 0 {
                 Vec::new()
             } else {
-                pool.allocate(pages, table.shape.units_per_page)?
+                pool.allocate(count, table.shape.units_per_page)?
             };
-            grown.push((start, allocated));
+            grown.push(allocated);
         }
-        for (table, (start, pages)) in allocation.tables.iter_mut().zip(grown) {
+        for ((table, growth), pages) in allocation.tables.iter_mut().zip(growths).zip(grown) {
             if table.pages.is_empty() && table.start_page == 0 {
-                table.start_page = start;
+                table.start_page = growth.start;
             }
-            for page in pages {
-                let serial = allocation.allocated_units;
-                allocation.allocated_units += page.units().len() as u64;
-                table.pages.push_back(TablePage {
-                    page,
+            let mut pages = pages.into_iter();
+            let mut take = |allocation_units: &mut u64| {
+                let page = pages.next()?;
+                let serial = *allocation_units;
+                *allocation_units += page.units().len() as u64;
+                Some(TablePage {
+                    page: Some(page),
                     serial: Some(serial),
-                });
+                })
+            };
+            if let Some(index) = growth.filled
+                && let Some(entry) = take(&mut allocation.allocated_units)
+                && let Some(slot) = table.pages.get_mut(index - table.start_page)
+            {
+                *slot = entry;
+                // The page's units changed within the declared interval.
+                table.clear_sent();
+            }
+            for held in growth.appended {
+                let entry = if held {
+                    take(&mut allocation.allocated_units)
+                } else {
+                    None
+                };
+                table.pages.push_back(entry.unwrap_or(TablePage {
+                    page: None,
+                    serial: None,
+                }));
             }
         }
         Some(())
     }
 
-    /// Retires sliding-window pages no later reader needs.
+    /// Retires sliding-window and state pages no later reader needs.
     ///
     /// `visible` is the request's accepted cache extent after a completed call.
     /// Calls apply in submission order, so every earlier reader has
     /// completed, and every later call reads from at least `visible -
     /// window`. Pages that lie entirely before that bound are retired; a
-    /// published page stays matchable as `Cached`. Full-attention tables are
-    /// unchanged. Returns `false` when the tables do not match the groups.
+    /// published page stays matchable as `Cached`. A state group keeps the
+    /// checkpoint ending at `visible`, the one a later call may start from.
+    /// Full-attention tables are unchanged. Returns `false` when the tables
+    /// do not match the groups.
     pub(crate) fn release_window(&self, allocation: &mut CacheAllocation, visible: usize) -> bool {
         if !self.matches(allocation) {
             return false;
@@ -1585,11 +1773,12 @@ impl PrefixCacheCoordinator {
 
         for (table, (start, references)) in allocation.tables.iter_mut().zip(acquired) {
             table.start_page = start;
-            table.pages.extend(
-                references
-                    .into_iter()
-                    .map(|page| TablePage { page, serial: None }),
-            );
+            table
+                .pages
+                .extend(references.into_iter().map(|page| TablePage {
+                    page: Some(page),
+                    serial: None,
+                }));
         }
         result.cached_tokens = selection.tokens;
         Some(result)
@@ -1727,19 +1916,24 @@ mod tests {
     }
 
     fn full(block_size: usize, units_per_page: usize) -> GroupShape {
-        GroupShape {
-            block_size,
-            units_per_page,
-            window: None,
-        }
+        GroupShape::attention(block_size, units_per_page, None)
     }
 
     fn sliding(block_size: usize, units_per_page: usize, window: usize) -> GroupShape {
-        GroupShape {
-            block_size,
-            units_per_page,
-            window: Some(window),
-        }
+        GroupShape::attention(block_size, units_per_page, Some(window))
+    }
+
+    fn state(block_size: usize, units_per_page: usize) -> GroupShape {
+        GroupShape::from_group(&ipc::CacheGroup {
+            kind: ipc::CacheGroupKind::State,
+            block_size: block_size as u32,
+            units_per_page: units_per_page as u32,
+            layer_ids: vec![0],
+            num_kv_heads: 1,
+            total_kv_heads: 1,
+            kv_head_offset: 0,
+            head_dim: 1,
+        })
     }
 
     /// Prefills `prompt` into fresh tables and publishes every complete page.
@@ -1762,7 +1956,7 @@ mod tests {
             )
             .unwrap();
         coordinator
-            .ensure_capacity(pool, &mut allocation, 0, prompt.len())
+            .ensure_capacity(pool, &mut allocation, 0, prompt.len(), Checkpoint::Boundary)
             .unwrap();
         let mut published = Vec::new();
         assert!(coordinator.publish_computed(
@@ -1897,7 +2091,13 @@ mod tests {
             )
             .unwrap();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, tokens.len())
+            .ensure_capacity(
+                &pool,
+                &mut allocation,
+                0,
+                tokens.len(),
+                Checkpoint::Boundary,
+            )
             .unwrap();
         coordinator.extend_hashes(&mut lookup.page_hashes, tokens, PrefixScope::default());
         let mut published = Vec::new();
@@ -1933,9 +2133,12 @@ mod tests {
         let mut allocation = coordinator.empty();
 
         // Eight tokens need one full page and two sliding pages: 1 + 6 units.
-        assert_eq!(coordinator.units_needed(&allocation, 0, 8), Some(7));
+        assert_eq!(
+            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
+            Some(7)
+        );
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 8)
+            .ensure_capacity(&pool, &mut allocation, 0, 8, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.free_units(), 2);
         assert_eq!(allocation.tables[1].unit_ids().len(), 6);
@@ -1951,7 +2154,7 @@ mod tests {
         // four units, but only two are free: nothing is allocated.
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 8, 12)
+                .ensure_capacity(&pool, &mut allocation, 8, 12, Checkpoint::Boundary)
                 .is_none()
         );
         assert_eq!(pool.free_units(), 2);
@@ -1970,7 +2173,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 6)
+            .ensure_capacity(&pool, &mut allocation, 0, 6, Checkpoint::Boundary)
             .unwrap();
         let units: Vec<u32> = allocation.tables[0]
             .unit_ids()
@@ -1981,7 +2184,7 @@ mod tests {
         assert!(units.iter().all(|unit| *unit > 3));
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 6, 7)
+                .ensure_capacity(&pool, &mut allocation, 6, 7, Checkpoint::Boundary)
                 .is_none()
         );
     }
@@ -1993,7 +2196,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 12)
+            .ensure_capacity(&pool, &mut allocation, 0, 12, Checkpoint::Boundary)
             .unwrap();
         let held: Vec<u32> = allocation.tables[0]
             .unit_ids()
@@ -2016,7 +2219,7 @@ mod tests {
         assert_eq!(pool.free_units(), 7);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 7)
+            .ensure_capacity(&pool, &mut allocation, 0, 7, Checkpoint::Boundary)
             .unwrap();
         assert!(
             allocation.tables[0]
@@ -2026,7 +2229,7 @@ mod tests {
         );
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 7, 8)
+                .ensure_capacity(&pool, &mut allocation, 7, 8, Checkpoint::Boundary)
                 .is_none()
         );
 
@@ -2044,7 +2247,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 7)
+            .ensure_capacity(&pool, &mut allocation, 0, 7, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.withdraw(4), 4);
         pool.restore();
@@ -2061,16 +2264,19 @@ mod tests {
         let pool = BlockPool::new(6, 0);
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), full(8, 3)]);
         let mut allocation = coordinator.empty();
-        assert_eq!(coordinator.units_needed(&allocation, 0, 8), Some(5));
+        assert_eq!(
+            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
+            Some(5)
+        );
         let blocker = pool.allocate(1, 1).unwrap();
         assert!(
             coordinator
-                .ensure_capacity(&pool, &mut allocation, 0, 8)
+                .ensure_capacity(&pool, &mut allocation, 0, 8, Checkpoint::Boundary)
                 .is_none()
         );
         drop(blocker);
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 8)
+            .ensure_capacity(&pool, &mut allocation, 0, 8, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(pool.free_units(), 0);
     }
@@ -2115,10 +2321,135 @@ mod tests {
 
         // Growth appends after the window and never moves the start back.
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 16, 20)
+            .ensure_capacity(&pool, &mut allocation, 16, 20, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[1].start_page(), 2);
         assert_eq!(allocation.tables[1].end_page(), 5);
+    }
+
+    /// A state table holds units only for the checkpoint each call keeps:
+    /// a prompt call's last boundary, and a decode call's boundary at a
+    /// multiple of the state interval. Published checkpoints serve a later
+    /// prompt's reuse, which ends where one is held.
+    #[test]
+    fn state_tables_hold_only_checkpoints_and_reuse_ends_at_one() {
+        let pool = BlockPool::new(128, 0);
+        let source = endpoint();
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), state(4, 3)]);
+        let tokens = (1..=24).collect::<Vec<u32>>();
+        let mut allocation = coordinator.empty();
+        let lookup = coordinator
+            .acquire_prefix(
+                &pool,
+                &mut allocation,
+                &tokens,
+                false,
+                false,
+                PrefixScope::default(),
+                &source,
+            )
+            .unwrap();
+
+        // A first chunk of ten tokens covers three pages and checkpoints
+        // boundary 8 alone: one state page of three units.
+        let free = pool.free_units();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 0, 10, Checkpoint::Boundary)
+            .unwrap();
+        assert_eq!(free - pool.free_units(), 3 + 3);
+        let units = allocation.tables[1].unit_ids();
+        assert_eq!(units.len(), 9);
+        assert!(
+            units[..3]
+                .iter()
+                .chain(&units[6..])
+                .all(|unit| *unit == UnitId(0))
+        );
+        assert!(units[3..6].iter().all(|unit| *unit != UnitId(0)));
+        assert!(allocation.tables[1].page(0).is_none());
+        assert_eq!(allocation.tables[1].fresh_units(0), units[3..6].to_vec());
+
+        // Publication skips the pages without a checkpoint; release keeps
+        // the checkpoint a later call may start from, then retires it.
+        let mut published = Vec::new();
+        assert!(coordinator.publish_computed(
+            &pool,
+            &allocation,
+            CachedTokens::prompt(&tokens),
+            &lookup.page_hashes,
+            10,
+            &mut published,
+            true,
+            &source,
+        ));
+        assert!(coordinator.release_window(&mut allocation, 8));
+        assert_eq!(allocation.tables[1].start_page(), 1);
+        assert!(coordinator.release_window(&mut allocation, 10));
+        assert_eq!(allocation.tables[1].start_page(), 2);
+        assert!(
+            units[3..6]
+                .iter()
+                .all(|unit| pool.unit_state(*unit) == UnitState::Cached)
+        );
+
+        // The second chunk checkpoints boundary 16; decoding checkpoints
+        // boundary 24, a multiple of the interval, but not boundary 20, in
+        // the page the table held without units since token 20.
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 10, 18, Checkpoint::Boundary)
+            .unwrap();
+        assert!(allocation.tables[1].page(3).is_some());
+        assert!(allocation.tables[1].page(4).is_none());
+        for position in 18..23 {
+            coordinator
+                .ensure_capacity(
+                    &pool,
+                    &mut allocation,
+                    position,
+                    position + 1,
+                    Checkpoint::Interval(8),
+                )
+                .unwrap();
+        }
+        assert!(allocation.tables[1].page(4).is_none());
+        assert!(allocation.tables[1].page(5).is_none());
+        allocation.tables[1].mark_sent();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 23, 24, Checkpoint::Interval(8))
+            .unwrap();
+        assert!(allocation.tables[1].page(5).is_some());
+        assert!(allocation.tables[1].changed_since_sent());
+
+        // A later prompt of the first 13 tokens finds no checkpoint at 12,
+        // the deepest boundary it may reuse, and reuses the one at 8: its
+        // state table starts at the checkpoint's page.
+        let hit = coordinator.probe_prefix(
+            &pool,
+            &tokens[..13],
+            true,
+            false,
+            PrefixScope::default(),
+            &source,
+        );
+        assert_eq!(hit.cached_tokens, 8);
+        let mut target = coordinator.empty();
+        let reused = coordinator
+            .acquire_prefix(
+                &pool,
+                &mut target,
+                &tokens[..13],
+                true,
+                false,
+                PrefixScope::default(),
+                &source,
+            )
+            .unwrap();
+        assert_eq!(reused.cached_tokens, 8);
+        assert_eq!(
+            (target.tables[1].start_page(), target.tables[1].end_page()),
+            (1, 2)
+        );
+        assert_eq!(target.tables[1].unit_ids(), units[3..6].to_vec());
     }
 
     #[test]
@@ -2127,7 +2458,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![sliding(4, 1, 4)]);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 12)
+            .ensure_capacity(&pool, &mut allocation, 0, 12, Checkpoint::Boundary)
             .unwrap();
         let first = allocation.tables[0].page(0).unwrap().units()[0];
         assert!(coordinator.release_window(&mut allocation, 12));
@@ -2144,9 +2475,12 @@ mod tests {
 
         // A read from token 16 needs history [11, 20): sliding pages 2..5,
         // while the full group needs pages 0..5.
-        assert_eq!(coordinator.units_needed(&allocation, 16, 20), Some(5 + 3));
+        assert_eq!(
+            coordinator.units_needed(&allocation, 16, 20, Checkpoint::Boundary),
+            Some(5 + 3)
+        );
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 16, 20)
+            .ensure_capacity(&pool, &mut allocation, 16, 20, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[1].start_page(), 2);
         assert_eq!(allocation.tables[1].end_page(), 5);
@@ -2255,7 +2589,7 @@ mod tests {
 
         // The first prefill chunk appends after the prefix in every group.
         coordinator
-            .ensure_capacity(&pool, &mut target, 16, 24)
+            .ensure_capacity(&pool, &mut target, 16, 24, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(target.tables[0].end_page(), 3);
         assert_eq!(target.tables[1].end_page(), 6);
@@ -2427,7 +2761,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(2, 2, 4)]);
         let mut allocation = coordinator.empty();
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 0, 4)
+            .ensure_capacity(&pool, &mut allocation, 0, 4, Checkpoint::Boundary)
             .unwrap();
         let watermark = allocation.allocated_units();
         assert_eq!(watermark, 1 + 4);
@@ -2437,7 +2771,7 @@ mod tests {
         // Growth to six tokens adds one full page and one sliding page; only
         // those units are fresh past the watermark, and both tables changed.
         coordinator
-            .ensure_capacity(&pool, &mut allocation, 4, 6)
+            .ensure_capacity(&pool, &mut allocation, 4, 6, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(allocation.tables[0].fresh_units(watermark).len(), 1);
         assert_eq!(allocation.tables[1].fresh_units(watermark).len(), 2);
