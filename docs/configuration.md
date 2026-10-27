@@ -243,6 +243,15 @@ Each entry is the median over the point's reports of the step time over its run'
 
 A worker compiles the kernels its model runs that its machine has not cached yet, on first use. The compilations run up to `MAX_JOBS` parallel jobs when the worker's environment, its host daemon's, sets it. Otherwise each worker takes an equal share, among the ranks of its launch on its host, of half of the host's available CPUs and of the host memory available as it starts, at 6.1 GiB per job (the peak of one compiler process of FlashInfer's fused-MoE kernels), and at least one job; its log states the number.
 
+### `profiling_config`
+
+The workers' always-on profiling: the fence probes at the entry and exit of the model's components, exported as per-step component durations (`uniserve:worker_fence_step_seconds`, [execution profiling](profiling.md#fence-probes)). Profiling sessions take their options with their request (`POST /admin/profile`).
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `fence_probes` | `true` | Whether the probes record; a change switches every worker's probes in place, at the engine's next step boundary |
+| `fence_components` | `["*.TransformerLayer"]` | Name patterns (`*` matches any run) of the components whose module instances carry probes, a component being the `<component>` of the function its module class declares (`uniserve/numerics.py`); the probes are captured into a world's CUDA graphs, so a change takes a new world. Empty for no probe |
+
 ### `logging_config`
 
 | Option | Default | Meaning |

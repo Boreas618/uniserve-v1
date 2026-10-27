@@ -1,20 +1,18 @@
 //! The device time of registered streams, from CUPTI's activity records.
 //!
-//! [`StreamActivity::start`] enables CUPTI's records of kernels
+//! [`StreamActivity::start`] enables, on the process's subscription
+//! ([`super::subscriber`]), CUPTI's records of kernels
 //! (`CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL`), copies (`MEMCPY`, and
 //! `MEMCPY2` for peer copies) and fills (`MEMSET`), and registers the
 //! streams to account by name. A graph launch is recorded by its nodes,
-//! under the stream it was launched on: CUPTI's graph-level records
-//! (`GRAPH_TRACE`) make `cuGraphLaunch` of a graph instantiated before they
-//! were enabled crash the process (observed with CUPTI 13.0), and the
-//! worker instantiates its graphs before it serves. The device timestamps
-//! each operation's start and end, and CUPTI collects the records in
-//! buffers. CUPTI's own periodic flush delivers only full buffers, so the
-//! recording's flush thread asks CUPTI every [`FLUSH_PERIOD`] to deliver
-//! every buffer whose records completed (`cuptiActivityFlushAll`, which
-//! issues no CUDA synchronization); the delivery callback merges each
-//! registered stream's operations into the union of their intervals.
-//! Records of other streams are ignored.
+//! under the stream it was launched on, unless a collector enabled CUPTI's
+//! graph-level records (`GRAPH_TRACE`, a timeline that traces whole graphs):
+//! the launch is then one record, whose interval is accounted the same way.
+//! The device timestamps each operation's start and end, and CUPTI collects
+//! the records in buffers, which the subscription's flush thread has CUPTI
+//! deliver every [`FLUSH_PERIOD`]; the delivery merges each registered
+//! stream's operations into the union of their intervals. Records of other
+//! streams are ignored.
 //!
 //! A stream's `busy` time is the length of that union: operations that
 //! overlap (concurrent nodes of one graph) count once. Its `gap` time is the
@@ -38,38 +36,18 @@
 //! [`take`] reads the time accumulated since the last take from atomics the
 //! delivery callback publishes, so it never waits for the callback.
 
-use std::alloc::Layout;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
 
+pub use super::subscriber::FLUSH_PERIOD;
+use super::subscriber::{self, GRAPH_TRACE};
 use super::{check, cupti};
 use crate::{Error, Result, Stream, lock};
-
-/// How often the flush thread has CUPTI deliver the buffers whose records
-/// completed.
-pub const FLUSH_PERIOD: Duration = Duration::from_millis(100);
 
 /// How much device time behind a stream's latest end its union keeps for
 /// records that arrive out of order, in nanoseconds.
 pub const RETAINED_NS: u64 = 2_000_000_000;
-
-/// Each activity buffer CUPTI fills: 1 MiB (about 4,800 kernel records),
-/// aligned as CUPTI requires. While a stream runs without pause, the buffer
-/// it fills always holds the record of an operation in flight, and a flush
-/// delivers it only once it is full; a small buffer bounds how long its
-/// operations wait to be counted.
-const BUFFER: Layout = match Layout::from_size_align(1 << 20, 8) {
-    Ok(layout) => layout,
-    Err(_) => panic!("the activity buffer layout is invalid"),
-};
-
-/// `CUPTI_ACTIVITY_FLAG_FLUSH_FORCED`.
-const FLUSH_FORCED: u32 = 1;
 
 /// Where a record keeps its interval and its stream, in bytes from the
 /// record's start (the `CUpti_Activity*` structs of the CUPTI headers the
@@ -111,8 +89,17 @@ const KINDS: &[(u32, Fields)] = &[
     (2, TRANSFER),
 ];
 
-pub(super) type BufferRequested = unsafe extern "C" fn(*mut *mut u8, *mut usize, *mut usize);
-pub(super) type BufferCompleted = unsafe extern "C" fn(*mut c_void, u32, *mut u8, usize, usize);
+/// `CUpti_ActivityGraphTrace2`.
+const GRAPH: Fields = Fields {
+    start: 8,
+    end: 16,
+    context: 32,
+    stream: 36,
+};
+
+/// The kinds accounted besides [`KINDS`] while another collector enables
+/// them: a graph launch recorded whole.
+const ACCOUNTED: &[(u32, Fields)] = &[(GRAPH_TRACE, GRAPH)];
 
 /// The time of one stream that the delivery callback publishes, in whole
 /// microseconds since the stream was registered, and what [`take`] took of
@@ -231,9 +218,6 @@ static TIMELINES: Mutex<Option<HashMap<(u32, u32), Timeline>>> = Mutex::new(None
 /// stay readable after the recording stops, until the next start.
 static STREAMS: Mutex<Vec<(String, Arc<Counters>)>> = Mutex::new(Vec::new());
 
-/// Records CUPTI dropped for lack of buffer space since the last take.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
-
 /// Whether a [`StreamActivity`] records.
 static RECORDING: AtomicBool = AtomicBool::new(false);
 
@@ -275,7 +259,7 @@ pub fn take() -> Taken {
         .collect();
     Taken {
         streams,
-        dropped_records: DROPPED.swap(0, Ordering::AcqRel),
+        dropped_records: subscriber::take_dropped(),
     }
 }
 
@@ -289,37 +273,25 @@ fn delta(total: &AtomicU64, taken: &AtomicU64) -> u64 {
 /// The process's recording of its registered streams' device activity;
 /// stops on drop. One records at a time.
 pub struct StreamActivity {
-    /// The flush thread, which ends once the sender is dropped; `None`
-    /// until it started.
-    flusher: Option<(Sender<()>, JoinHandle<()>)>,
+    /// The kinds this recording enabled, which its drop releases.
+    enabled: Vec<u32>,
 }
 
 impl StreamActivity {
     /// Record the device activity of `streams`, each under its name, which
-    /// [`take`] reports. Fails when `libcupti.so` is missing, CUPTI refuses
-    /// a record kind, or another recording is active.
-    ///
-    /// CUPTI accepts one client: the caller starts the recording only when
-    /// no profiler injected CUPTI into the process, as a successful
-    /// [`super::BlockingWatch::start`] shows; this recording would replace
-    /// the profiler's buffer callbacks.
+    /// [`take`] reports. Fails when the process could not subscribe to
+    /// CUPTI ([`subscriber::subscribe`]), CUPTI refuses a record kind, or
+    /// another recording is active.
     pub fn start<'a>(streams: impl IntoIterator<Item = (&'a str, &'a Stream)>) -> Result<Self> {
+        subscriber::subscribe()?;
         let cupti = cupti()?;
         if RECORDING.swap(true, Ordering::AcqRel) {
             return Err(Error::ActivityRecorded);
         }
-        // From here the drop disables what was enabled.
-        let mut recording = Self { flusher: None };
-
-        *lock(&TIMELINES) = Some(HashMap::new());
-        // SAFETY: both callbacks match CUPTI's prototypes and never unwind.
-        let status = unsafe { (cupti.register_buffers)(on_buffer_requested, on_buffer_completed) };
-        check(status, "cuptiActivityRegisterCallbacks")?;
-        for &(kind, _) in KINDS {
-            // SAFETY: the kind is a `CUpti_ActivityKind`.
-            let status = unsafe { (cupti.activity_enable)(kind) };
-            check(status, "cuptiActivityEnable")?;
-        }
+        // From here the drop releases what was enabled.
+        let mut recording = Self {
+            enabled: Vec::new(),
+        };
 
         let mut registered = Vec::new();
         let mut timelines = HashMap::new();
@@ -343,106 +315,59 @@ impl StreamActivity {
         }
         *lock(&TIMELINES) = Some(timelines);
         *lock(&STREAMS) = registered;
-
-        let (stop, stopped) = mpsc::channel::<()>();
-        let thread = std::thread::Builder::new()
-            .name("cupti-flush".into())
-            .spawn(move || {
-                // The recording's drop disconnects the channel, which ends
-                // the loop.
-                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(FLUSH_PERIOD) {
-                    // SAFETY: the buffer callbacks stay registered while the
-                    // recording lives.
-                    let _ = unsafe { (cupti.flush_all)(0) };
-                }
-            })
-            .map_err(|source| Error::Thread {
-                name: "cupti-flush",
-                source: Arc::new(source),
-            })?;
-        recording.flusher = Some((stop, thread));
+        for &(kind, _) in KINDS {
+            subscriber::enable_kind(kind)?;
+            recording.enabled.push(kind);
+        }
         Ok(recording)
     }
 }
 
 impl Drop for StreamActivity {
     fn drop(&mut self) {
-        if let Some((stop, thread)) = self.flusher.take() {
-            drop(stop);
-            let _ = thread.join();
+        for &kind in &self.enabled {
+            subscriber::disable_kind(kind);
         }
-        if let Ok(cupti) = cupti() {
-            // SAFETY: disabling a kind that was not enabled is harmless; the
-            // forced flush delivers the remaining buffers through the
-            // callbacks, which are still registered.
-            unsafe {
-                for &(kind, _) in KINDS {
-                    let _ = (cupti.activity_disable)(kind);
-                }
-                let _ = (cupti.flush_all)(FLUSH_FORCED);
-            }
-        }
+        // The forced flush delivers the remaining records, merged while the
+        // streams are still registered.
+        subscriber::flush(true);
         *lock(&TIMELINES) = None;
         RECORDING.store(false, Ordering::Release);
     }
 }
 
-/// CUPTI asks for an empty buffer; a null one makes it drop records.
-unsafe extern "C" fn on_buffer_requested(
-    buffer: *mut *mut u8,
-    size: *mut usize,
-    records: *mut usize,
-) {
-    // SAFETY: the layout has a nonzero size.
-    let allocated = unsafe { std::alloc::alloc(BUFFER) };
-    // SAFETY: CUPTI passes valid out-pointers; zero records means as many
-    // as fit.
-    unsafe {
-        *buffer = allocated;
-        *size = if allocated.is_null() {
-            0
-        } else {
-            BUFFER.size()
-        };
-        *records = 0;
-    }
+/// One delivered buffer's records, merged into the registered streams'
+/// timelines while the delivery holds them.
+pub(super) struct Delivery {
+    timelines: MutexGuard<'static, Option<HashMap<(u32, u32), Timeline>>>,
 }
 
-/// CUPTI delivers a buffer from [`on_buffer_requested`]: its records are
-/// merged into the registered streams' timelines and the buffer freed.
-unsafe extern "C" fn on_buffer_completed(
-    context: *mut c_void,
-    stream: u32,
-    buffer: *mut u8,
-    _size: usize,
-    valid: usize,
-) {
-    if buffer.is_null() {
-        return;
+impl Delivery {
+    pub(super) fn begin() -> Self {
+        Self {
+            timelines: lock(&TIMELINES),
+        }
     }
-    if let Ok(cupti) = cupti() {
-        if let Some(timelines) = lock(&TIMELINES).as_mut() {
-            let mut record = std::ptr::null_mut();
-            // SAFETY: CUPTI walks the valid bytes of its own buffer and
-            // points `record` at each record, until it reports none left.
-            while unsafe { (cupti.next_record)(buffer, valid, &mut record) } == 0 {
-                // SAFETY: the record lies in the buffer and starts with its
-                // kind; its kind gives its layout.
-                unsafe { merge(timelines, record) };
-            }
+
+    /// Merge one record of the buffer.
+    ///
+    /// # Safety
+    /// `record` points at a whole activity record.
+    pub(super) unsafe fn record(&mut self, record: *const u8) {
+        if let Some(timelines) = self.timelines.as_mut() {
+            // SAFETY: forwarded from the caller.
+            unsafe { merge(timelines, record) };
+        }
+    }
+
+    /// Publish the merged time of every registered stream.
+    pub(super) fn end(mut self) {
+        if let Some(timelines) = self.timelines.as_mut() {
             for timeline in timelines.values_mut() {
                 timeline.publish();
             }
         }
-        let mut dropped = 0;
-        // SAFETY: the context and stream are those CUPTI passed; it writes
-        // one count.
-        if unsafe { (cupti.dropped_records)(context, stream, &mut dropped) } == 0 {
-            DROPPED.fetch_add(dropped as u64, Ordering::AcqRel);
-        }
     }
-    // SAFETY: the buffer came from `on_buffer_requested` with this layout.
-    unsafe { std::alloc::dealloc(buffer, BUFFER) };
 }
 
 /// Merge one record into the timeline of its stream, if registered.
@@ -452,7 +377,11 @@ unsafe extern "C" fn on_buffer_completed(
 unsafe fn merge(timelines: &mut HashMap<(u32, u32), Timeline>, record: *const u8) {
     // SAFETY: every record starts with its `CUpti_ActivityKind`.
     let kind = unsafe { read::<u32>(record, 0) };
-    let Some(&(_, fields)) = KINDS.iter().find(|&&(enabled, _)| enabled == kind) else {
+    let Some(&(_, fields)) = KINDS
+        .iter()
+        .chain(ACCOUNTED)
+        .find(|&&(enabled, _)| enabled == kind)
+    else {
         return;
     };
     // SAFETY: the fields lie inside a record of this kind.
@@ -534,7 +463,7 @@ pub(crate) mod tests {
             name: name.to_owned(),
             ..StreamTime::default()
         };
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !delivered(&sum) && std::time::Instant::now() < deadline {
             std::thread::sleep(FLUSH_PERIOD / 4);
             for stream in take()
@@ -551,6 +480,7 @@ pub(crate) mod tests {
     }
 
     mod device {
+        use std::ffi::c_void;
         use std::time::Duration;
 
         use libloading::Library;

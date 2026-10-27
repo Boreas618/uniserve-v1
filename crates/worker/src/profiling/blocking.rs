@@ -1,5 +1,5 @@
 //! The driver calls that made a rank's serving threads wait for the device,
-//! counted by thread and call while the rank serves ([`cuda::cupti`]).
+//! counted by thread and call while the rank serves ([`cuda::cupti::blocking`]).
 //!
 //! The builder thread watches each job it performs (a serving call of the
 //! executor inside it that makes such a call fails,

@@ -50,6 +50,9 @@ use crate::worker::Worker;
 /// executable.
 pub(crate) fn main(argv: &[String], python: &Path) -> i32 {
     crate::logging::init();
+    // Before any thread starts and any NVTX call is made: NVTX loads the
+    // injection library its environment names at its first call.
+    crate::profiling::ranges::inject(python);
     // Installed first, before the interpreter exists: Python installs no
     // handlers of its own (`python::host`).
     let signals = match Signals::install() {

@@ -1,0 +1,541 @@
+//! A session's collectors on one rank, and their arming at step boundaries.
+//!
+//! Every CUPTI-based collector reaches CUPTI through the process's one
+//! subscription (`cuda::cupti::subscriber`): the timeline enables its records
+//! and callbacks on it, and the profiling APIs (range profiler, PM sampling,
+//! PC sampling) belong to the same CUPTI. A collector is prepared when the
+//! session starts ([`Collectors::prepare`]), armed and disarmed at step
+//! boundaries ([`Collectors::arm`], [`Collectors::disarm`]), drained while
+//! armed by the session's sampler thread ([`Collectors::drain`]), and
+//! released when the session ends or the quality-of-service guard turns it
+//! off ([`Collectors::release`]).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use cuda::cupti::pc_sampling::PcSampler;
+use cuda::cupti::pm_sampling::PmSampler;
+use cuda::cupti::range_profiler::{RangeProfiler, Ranges};
+use cuda::cupti::timeline::{self, Timeline};
+use cuda::{DeviceId, PrimaryContext};
+use proto::profile::{Collector, GraphTrace, MetricRanges, SessionRequest};
+
+use super::artifact::{Message, Rows};
+use crate::profiling::fences::{Fences, Tap};
+
+/// The PM sampler's hardware buffer: 64 MiB.
+const PM_HARDWARE_BUFFER: usize = 64 << 20;
+
+/// The samples one PM decode takes at most.
+const PM_MAX_SAMPLES: u32 = 65_536;
+
+/// The ranges one range profiler pass holds.
+const MAX_RANGES: usize = 65_536;
+
+/// The program counters one PC sampling take holds.
+const MAX_PCS: usize = 10_000;
+
+/// A prepared collector.
+enum Prepared {
+    Timeline {
+        graphs: GraphTrace,
+        running: Option<Timeline>,
+    },
+    FenceTimeline {
+        fences: Arc<Fences>,
+        components: Vec<String>,
+    },
+    PmSampling(PmSampler),
+    RangeMetrics {
+        profiler: RangeProfiler,
+        ranges: MetricRanges,
+    },
+    PcSampling(PcSampler),
+}
+
+/// The collectors of a session on one rank.
+pub(crate) struct Collectors {
+    context: Option<PrimaryContext>,
+    prepared: BTreeMap<Collector, Prepared>,
+    rows: Rows,
+    armed: bool,
+    /// The NVTX switch before a timeline armed it.
+    nvtx_before: Option<bool>,
+}
+
+/// The armed component-range profiler, which the probes push and pop
+/// ranges on: a probe's entry pushes and its exit pops.
+static COMPONENT_RANGES: std::sync::Mutex<Option<ComponentRanges>> = std::sync::Mutex::new(None);
+
+/// Whether [`COMPONENT_RANGES`] holds a profiler, read by every probe.
+static COMPONENT_RANGES_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish or withdraw the component-range profiler.
+fn publish_component_ranges(ranges: Option<ComponentRanges>) {
+    let armed = ranges.is_some();
+    *crate::lock(&COMPONENT_RANGES) = ranges;
+    COMPONENT_RANGES_ARMED.store(armed, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a probe pushes and pops component ranges now.
+pub(crate) fn component_ranges_armed() -> bool {
+    COMPONENT_RANGES_ARMED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The armed component-range profiler: its object, reached by the probes.
+struct ComponentRanges {
+    /// The profiler, shared with the collector that owns it.
+    profiler: *const RangeProfiler,
+    names: Vec<String>,
+}
+
+// SAFETY: the profiler pointer is valid while the owning collector is armed
+// (the collector clears it before it disarms or drops); CUPTI accepts the
+// range calls from any thread.
+unsafe impl Send for ComponentRanges {}
+
+/// The probes' part: push or pop the component range of `probe`'s instance,
+/// while component ranges are armed and `capturing` is false (a capture
+/// pushes no host range).
+pub(crate) fn component_range(probe: u32, capturing: bool) {
+    if capturing {
+        return;
+    }
+    let ranges = crate::lock(&COMPONENT_RANGES);
+    let Some(ranges) = ranges.as_ref() else {
+        return;
+    };
+    // SAFETY: the pointer is valid while it is published (above).
+    let profiler = unsafe { &*ranges.profiler };
+    let result = if probe.is_multiple_of(2) {
+        match ranges.names.get((probe / 2) as usize) {
+            Some(name) => profiler.push(name),
+            None => return,
+        }
+    } else {
+        profiler.pop()
+    };
+    if let Err(error) = result {
+        tracing::debug!("a component range was not recorded: {error}");
+    }
+}
+
+impl Collectors {
+    /// Prepare `request`'s collectors on `device`: what fails to prepare is
+    /// reported as unavailable, with its reason, and the session runs the
+    /// others.
+    pub(crate) fn prepare(
+        request: &SessionRequest,
+        device: Option<DeviceId>,
+        rows: Rows,
+    ) -> (Self, BTreeMap<String, String>) {
+        let context = device.and_then(|device| PrimaryContext::retain(device).ok());
+        let mut prepared = BTreeMap::new();
+        let mut states = BTreeMap::new();
+        for &collector in &request.collectors {
+            match prepare(collector, request, context.as_ref(), &rows) {
+                Ok(ready) => {
+                    prepared.insert(collector, ready);
+                    states.insert(collector.as_str().to_owned(), "prepared".to_owned());
+                    rows.send(Message::Collector {
+                        name: collector.as_str().to_owned(),
+                        state: "prepared".to_owned(),
+                        detail: String::new(),
+                    });
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        "profiling collector {} is unavailable: {reason}",
+                        collector.as_str()
+                    );
+                    states.insert(
+                        collector.as_str().to_owned(),
+                        format!("unavailable: {reason}"),
+                    );
+                    rows.send(Message::Collector {
+                        name: collector.as_str().to_owned(),
+                        state: "unavailable".to_owned(),
+                        detail: reason,
+                    });
+                }
+            }
+        }
+        (
+            Self {
+                context,
+                prepared,
+                rows,
+                armed: false,
+                nvtx_before: None,
+            },
+            states,
+        )
+    }
+
+    /// Whether any collector is prepared.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.prepared.is_empty()
+    }
+
+    /// The collectors prepared and not released.
+    pub(crate) fn names(&self) -> Vec<Collector> {
+        self.prepared.keys().copied().collect()
+    }
+
+    /// Start every prepared collector; one that fails to start is
+    /// released, with its reason recorded.
+    pub(crate) fn arm(&mut self) {
+        if self.armed {
+            return;
+        }
+        let _context = self
+            .context
+            .as_ref()
+            .and_then(|context| context.enter().ok());
+        let mut failed = Vec::new();
+        for (&collector, prepared) in &mut self.prepared {
+            let started = match prepared {
+                Prepared::Timeline { graphs, running } => {
+                    let rows = self.rows.clone();
+                    let sink: timeline::Sink = Arc::new(move |delivered: timeline::Delivered| {
+                        rows.send(Message::Timeline {
+                            records: delivered.records,
+                            names: delivered.names,
+                        });
+                    });
+                    let graphs = match graphs {
+                        GraphTrace::Whole => timeline::GraphTrace::Whole,
+                        GraphTrace::Nodes => timeline::GraphTrace::Nodes,
+                    };
+                    Timeline::start(graphs, sink).map(|started| {
+                        *running = Some(started);
+                        self.nvtx_before = Some(nvtx(true));
+                    })
+                }
+                Prepared::FenceTimeline { fences, components } => {
+                    let rows = self.rows.clone();
+                    fences.tap(Tap {
+                        components: components.clone(),
+                        sink: Box::new(move |device, records| {
+                            rows.send(Message::Fences { device, records });
+                        }),
+                    });
+                    Ok(())
+                }
+                Prepared::PmSampling(sampler) => sampler.start(),
+                Prepared::RangeMetrics { profiler, ranges } => profiler.start().map(|()| {
+                    if *ranges == MetricRanges::Component
+                        && let Some(fences) = Fences::installed()
+                    {
+                        publish_component_ranges(Some(ComponentRanges {
+                            profiler: &raw const *profiler,
+                            names: fences
+                                .instances()
+                                .iter()
+                                .map(|instance| instance.path.clone())
+                                .collect(),
+                        }));
+                    }
+                }),
+                Prepared::PcSampling(sampler) => sampler.start(),
+            };
+            if let Err(error) = started {
+                failed.push((collector, error.to_string()));
+            }
+        }
+        for (collector, reason) in failed {
+            tracing::warn!(
+                "profiling collector {} did not start: {reason}",
+                collector.as_str()
+            );
+            self.release(collector, "failed", &reason);
+        }
+        self.armed = true;
+    }
+
+    /// Stop every armed collector and hand what it collected to the file.
+    pub(crate) fn disarm(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _context = self
+            .context
+            .as_ref()
+            .and_then(|context| context.enter().ok());
+        publish_component_ranges(None);
+        let mut failed = Vec::new();
+        for (&collector, prepared) in &mut self.prepared {
+            let stopped = stop(prepared, &self.rows);
+            if let Err(error) = stopped {
+                failed.push((collector, error));
+            }
+        }
+        if let Some(before) = self.nvtx_before.take() {
+            nvtx(before);
+        }
+        self.armed = false;
+        for (collector, reason) in failed {
+            tracing::warn!(
+                "profiling collector {} failed to stop: {reason}",
+                collector.as_str()
+            );
+            self.release(collector, "failed", &reason);
+        }
+    }
+
+    /// Hand what the armed samplers collected so far to the file: PM samples
+    /// and PC samples, which the hardware buffers would otherwise
+    /// overflow.
+    pub(crate) fn drain(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _context = self
+            .context
+            .as_ref()
+            .and_then(|context| context.enter().ok());
+        for prepared in self.prepared.values_mut() {
+            let drained = match prepared {
+                Prepared::PmSampling(sampler) => sampler.decode().map(|decoded| {
+                    if decoded.overflow {
+                        tracing::warn!(
+                            "PM sampling's hardware buffer overflowed: samples were lost"
+                        );
+                    }
+                    self.rows.send(Message::Pm {
+                        metrics: sampler.metrics(),
+                        samples: decoded.samples,
+                    });
+                }),
+                Prepared::PcSampling(sampler) => sampler.take().map(|taken| {
+                    if taken.total_samples > 0 {
+                        self.rows.send(Message::Pc(taken));
+                    }
+                }),
+                _ => Ok(()),
+            };
+            if let Err(error) = drained {
+                tracing::warn!("a profiling collector could not be drained: {error}");
+            }
+        }
+    }
+
+    /// Stop the range profiler, hand its ranges to the file and start it
+    /// again, so that a long window never fills its counter data image.
+    pub(crate) fn cycle_ranges(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _context = self
+            .context
+            .as_ref()
+            .and_then(|context| context.enter().ok());
+        if let Some(Prepared::RangeMetrics { profiler, .. }) =
+            self.prepared.get_mut(&Collector::RangeMetrics)
+        {
+            match profiler.stop() {
+                Ok(collected) => {
+                    send_ranges(&self.rows, profiler, collected);
+                    if let Err(error) = profiler.start() {
+                        tracing::warn!("the range profiler did not start again: {error}");
+                    }
+                }
+                Err(error) => tracing::warn!("the range profiler could not be read: {error}"),
+            }
+        }
+    }
+
+    /// Release `collector`: stop it if armed, hand what it collected to the
+    /// file and record why it was released (`state`: `failed`, `released`
+    /// by the quality-of-service guard, or `ended`).
+    pub(crate) fn release(&mut self, collector: Collector, state: &str, detail: &str) -> bool {
+        let Some(mut prepared) = self.prepared.remove(&collector) else {
+            return false;
+        };
+        let _context = self
+            .context
+            .as_ref()
+            .and_then(|context| context.enter().ok());
+        if self.armed {
+            if collector == Collector::RangeMetrics {
+                publish_component_ranges(None);
+            }
+            if let Err(error) = stop(&mut prepared, &self.rows) {
+                tracing::warn!(
+                    "profiling collector {} failed to stop: {error}",
+                    collector.as_str()
+                );
+            }
+            if collector == Collector::Timeline
+                && let Some(before) = self.nvtx_before.take()
+            {
+                nvtx(before);
+            }
+        }
+        drop(prepared);
+        self.rows.send(Message::Collector {
+            name: collector.as_str().to_owned(),
+            state: state.to_owned(),
+            detail: detail.to_owned(),
+        });
+        true
+    }
+
+    /// Release every collector, the session ending.
+    pub(crate) fn release_all(&mut self, reason: &str) {
+        self.disarm();
+        for collector in self.names() {
+            self.release(collector, "ended", reason);
+        }
+    }
+}
+
+/// Stop one collector and hand what it collected to the file.
+fn stop(prepared: &mut Prepared, rows: &Rows) -> std::result::Result<(), String> {
+    match prepared {
+        Prepared::Timeline { running, .. } => {
+            // Dropping the timeline delivers what remains to the file.
+            drop(running.take());
+            Ok(())
+        }
+        Prepared::FenceTimeline { fences, .. } => {
+            fences.poll(true);
+            fences.untap();
+            Ok(())
+        }
+        Prepared::PmSampling(sampler) => {
+            sampler.stop().map_err(|error| error.to_string())?;
+            let decoded = sampler.decode().map_err(|error| error.to_string())?;
+            rows.send(Message::Pm {
+                metrics: sampler.metrics(),
+                samples: decoded.samples,
+            });
+            Ok(())
+        }
+        Prepared::RangeMetrics { profiler, .. } => {
+            let collected = profiler.stop().map_err(|error| error.to_string())?;
+            send_ranges(rows, profiler, collected);
+            Ok(())
+        }
+        Prepared::PcSampling(sampler) => {
+            sampler.stop().map_err(|error| error.to_string())?;
+            let taken = sampler.take().map_err(|error| error.to_string())?;
+            rows.send(Message::Pc(taken));
+            Ok(())
+        }
+    }
+}
+
+fn send_ranges(
+    rows: &Rows,
+    profiler: &RangeProfiler,
+    collected: cuda::cupti::range_profiler::Collected,
+) {
+    if collected.dropped > 0 {
+        tracing::warn!(
+            "the range profiler dropped {} ranges: its counter data image was full",
+            collected.dropped
+        );
+    }
+    rows.send(Message::Ranges {
+        metrics: profiler.metrics(),
+        ranges: collected.ranges,
+    });
+}
+
+/// Prepare one collector, or say why it is unavailable.
+fn prepare(
+    collector: Collector,
+    request: &SessionRequest,
+    context: Option<&PrimaryContext>,
+    rows: &Rows,
+) -> std::result::Result<Prepared, String> {
+    let cupti = || {
+        cuda::cupti::subscriber::subscribe().map_err(|error| {
+            format!("the process holds no CUPTI subscription (a profiler may hold it): {error}")
+        })
+    };
+    let device = || {
+        context
+            .map(|context| (context.handle(), context.device().0 as usize))
+            .ok_or_else(|| "the rank has no CUDA device".to_owned())
+    };
+    match collector {
+        Collector::Timeline => {
+            cupti()?;
+            Ok(Prepared::Timeline {
+                graphs: request.timeline.graphs,
+                running: None,
+            })
+        }
+        Collector::FenceTimeline => {
+            let fences = Fences::installed().ok_or_else(|| {
+                "the rank has no fence probes (profiling_config.fence_components)".to_owned()
+            })?;
+            Ok(Prepared::FenceTimeline {
+                fences: Arc::clone(fences),
+                components: request.components.clone(),
+            })
+        }
+        Collector::PmSampling => {
+            cupti()?;
+            let (_, device) = device()?;
+            let options = &request.pm_sampling;
+            PmSampler::enable(
+                device,
+                &options.metrics,
+                options.interval_ns,
+                PM_HARDWARE_BUFFER,
+                PM_MAX_SAMPLES,
+            )
+            .map_err(|error| error.to_string())
+            .map(Prepared::PmSampling)
+        }
+        Collector::RangeMetrics => {
+            cupti()?;
+            let (context, device) = device()?;
+            let options = &request.range_metrics;
+            let ranges = match options.ranges {
+                MetricRanges::Kernel => Ranges::Kernels,
+                MetricRanges::Component => {
+                    if Fences::installed().is_none() {
+                        return Err("component ranges need the rank's fence probes \
+                             (profiling_config.fence_components)"
+                            .to_owned());
+                    }
+                    Ranges::User
+                }
+            };
+            RangeProfiler::enable(context, device, &options.metrics, ranges, MAX_RANGES)
+                .map_err(|error| error.to_string())
+                .map(|profiler| Prepared::RangeMetrics {
+                    profiler,
+                    ranges: options.ranges,
+                })
+        }
+        Collector::PcSampling => {
+            cupti()?;
+            let (context, _) = device()?;
+            let sampler = PcSampler::enable(context, request.pc_sampling.period, MAX_PCS)
+                .map_err(|error| error.to_string())?;
+            rows.send(Message::PcReasons(sampler.stall_reasons().to_vec()));
+            Ok(Prepared::PcSampling(sampler))
+        }
+    }
+}
+
+/// Set the NVTX switch of the rank's ranges and of the library's; returns
+/// the rank's switch before.
+fn nvtx(enabled: bool) -> bool {
+    let before = crate::profiling::ranges::set_enabled(enabled);
+    let set = crate::ffi::Interpreter::import("uniserve.profiling.set_nvtx").and_then(|function| {
+        function
+            .call_values(&[tvm_ffi::Any::from(enabled)])
+            .map(drop)
+    });
+    if let Err(error) = set {
+        tracing::warn!("the library's NVTX switch was not set: {error}");
+    }
+    before
+}

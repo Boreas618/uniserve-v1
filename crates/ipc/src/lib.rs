@@ -120,7 +120,7 @@ pub use parallel::{
     ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,
     ParallelConfigError, SequenceParallel,
 };
-pub use proto::report::ForwardStats;
+pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
     CanvasSampling, CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams,
     ImageParamsError, PrefixCacheDtype, PrefixCacheDtypeParseError, RequestId, SamplingParams,

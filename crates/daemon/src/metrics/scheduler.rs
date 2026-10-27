@@ -45,6 +45,20 @@ pub struct EngineModeLabels {
     pub mode: String,
 }
 
+/// Labels identifying one component of the fence probes' step durations.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EngineFenceLabels {
+    /// Served model identity.
+    pub model_name: String,
+    /// Scheduler index.
+    pub engine: u32,
+    /// The steps' stage: their call kind, such as `prefill` or `decode`.
+    pub stage: String,
+    /// The component (`<component>` of its declared function), or `step`
+    /// for the step's span between its markers.
+    pub component: String,
+}
+
 /// Labels identifying one state of a worker stream's device time.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EngineStreamLabels {
@@ -185,6 +199,10 @@ pub struct SchedulerMetrics {
     pub worker_stream_us: Family<EngineStreamLabels, U64Counter>,
     /// Worker driver calls that waited for the device, by thread and call.
     pub worker_blocking_calls: Family<EngineBlockingLabels, U64Counter>,
+    /// Fence probe step durations by stage and component.
+    pub worker_fence_step_seconds: Family<EngineFenceLabels, super::CountedHistogram>,
+    /// Fence probe records the workers lost.
+    pub worker_fence_records_lost: Family<EngineLabels, U64Counter>,
     /// CUDA graph captures.
     pub worker_cuda_graph_captures: Family<EngineLabels, U64Counter>,
     /// CUDA graph replays.
@@ -407,6 +425,21 @@ impl SchedulerMetrics {
              call; a serving call of the executor that made one failed.",
             worker_blocking_calls.clone(),
         );
+        let worker_fence_step_seconds: Family<EngineFenceLabels, super::CountedHistogram> =
+            Default::default();
+        registry.register(
+            "uniserve:worker_fence_step_seconds",
+            "Per-step durations from the workers' fence probes, by stage and component: a \
+             step's summed durations of the component's probed module instances, or the step's \
+             span between its markers for component `step`, measured on the device.",
+            worker_fence_step_seconds.clone(),
+        );
+        let worker_fence_records_lost: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:worker_fence_records_lost",
+            "Fence probe records a worker's reader lost: overwritten before it read them.",
+            worker_fence_records_lost.clone(),
+        );
         let worker_cuda_graph_captures: Family<EngineLabels, U64Counter> = Default::default();
         registry.register(
             "uniserve:worker_cuda_graph_captures",
@@ -599,6 +632,8 @@ impl SchedulerMetrics {
             worker_forward_component_us,
             worker_stream_us,
             worker_blocking_calls,
+            worker_fence_step_seconds,
+            worker_fence_records_lost,
             worker_cuda_graph_captures,
             worker_cuda_graph_replays,
             worker_cuda_graph_misses,

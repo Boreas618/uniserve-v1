@@ -203,6 +203,15 @@ impl EngineConfig {
             max_condition_rows: video.max_condition_rows,
             video_resolutions: video.resolutions.clone(),
             video_aspect_ratios: video.aspect_ratios.clone(),
+            fence_probes: spec
+                .profiling
+                .as_ref()
+                .is_some_and(|profiling| profiling.fence_probes),
+            fence_components: spec
+                .profiling
+                .as_ref()
+                .map(|profiling| profiling.fence_components.clone())
+                .unwrap_or_default(),
             ..graph_arguments(graphs, flashinfer)?
         };
 
@@ -430,6 +439,7 @@ mod tests {
             segments: Vec::new(),
             retire: Vec::new(),
             speculation: None,
+            profiling: None,
         }
     }
 

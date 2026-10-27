@@ -12,6 +12,7 @@
 //! | Stream | [`Stream`] | `cuStreamDestroy` on drop |
 //! | Event | [`Event`] | `cuEventDestroy` on drop |
 //! | Graph executable | [`GraphExec`] (borrowed) | by its owner |
+//! | Module loaded from PTX | [`Module`], [`Function`] | never: graphs keep calling its kernels |
 //! | Device memory | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
 //! | Host memory | [`PinnedBuffer`] (deferred), [`HostRegistration`] (synchronous) | on drop |
 //! | NCCL | [`nccl::Communicator`] | explicit `destroy` |
@@ -32,6 +33,7 @@ mod error;
 mod event;
 mod graph;
 mod memory;
+mod module;
 pub mod nccl;
 mod nvml;
 mod pool;
@@ -52,6 +54,7 @@ pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
 pub use graph::GraphExec;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
+pub use module::{Function, Module};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream};

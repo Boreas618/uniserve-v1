@@ -55,6 +55,71 @@ pub type F64Gauge = Gauge<f64, AtomicU64>;
 /// new label set uses that layout.
 pub(crate) type HistogramFamily = Family<EngineLabels, Histogram, fn() -> Histogram>;
 
+/// A histogram whose observations arrive already counted per bucket of
+/// [`proto::report::FENCE_BUCKETS_US`] (`proto::report::FenceHistogram`): the workers count each
+/// step's durations and the daemon adds their counts. Values are exported
+/// in seconds.
+#[derive(Debug, Default, Clone)]
+pub struct CountedHistogram {
+    /// The sum in microseconds and the count of each bucket, the last past
+    /// the largest bound.
+    inner: std::sync::Arc<std::sync::Mutex<(u64, Vec<u64>)>>,
+}
+
+impl CountedHistogram {
+    /// Add a span's counts.
+    pub fn add(&self, histogram: &proto::report::FenceHistogram) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.1.is_empty() {
+            inner.1 = vec![0; proto::report::FENCE_BUCKETS_US.len() + 1];
+        }
+        for (count, &more) in inner.1.iter_mut().zip(&histogram.buckets) {
+            *count = count.saturating_add(more);
+        }
+        inner.0 = inner.0.saturating_add(histogram.sum_us);
+    }
+}
+
+impl prometheus_client::metrics::TypedMetric for CountedHistogram {
+    const TYPE: prometheus_client::metrics::MetricType =
+        prometheus_client::metrics::MetricType::Histogram;
+}
+
+impl prometheus_client::encoding::EncodeMetric for CountedHistogram {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::MetricEncoder,
+    ) -> Result<(), fmt::Error> {
+        let (sum_us, counts) = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Per-bucket counts with their upper bounds in seconds, the last
+        // unbounded, as `prometheus_client`'s own histogram hands them over.
+        let buckets: Vec<(f64, u64)> = proto::report::FENCE_BUCKETS_US
+            .iter()
+            .map(|&bound| bound as f64 / 1e6)
+            .chain([f64::MAX])
+            .zip(counts.iter().copied().chain(std::iter::repeat(0)))
+            .collect();
+        let count = counts.iter().sum();
+        encoder.encode_histogram::<prometheus_client::encoding::NoLabelSet>(
+            sum_us as f64 / 1e6,
+            count,
+            &buckets,
+            None,
+        )
+    }
+
+    fn metric_type(&self) -> prometheus_client::metrics::MetricType {
+        <Self as prometheus_client::metrics::TypedMetric>::TYPE
+    }
+}
+
 /// Prometheus registry together with handles to every UniServe metric family.
 pub struct Metrics {
     registry: Registry,

@@ -212,6 +212,7 @@ pub struct ServeConfig {
     pub cuda_graph_config: CudaGraphOptions,
     pub flashinfer_config: FlashInferOptions,
     pub worker_config: WorkerOptions,
+    pub profiling_config: ProfilingOptions,
     pub logging_config: LoggingOptions,
     pub chat_config: ChatOptions,
     pub image_fetch_config: ImageFetchOptions,
@@ -254,6 +255,7 @@ impl Default for ServeConfig {
             cuda_graph_config: CudaGraphOptions::default(),
             flashinfer_config: FlashInferOptions::default(),
             worker_config: WorkerOptions::default(),
+            profiling_config: ProfilingOptions::default(),
             logging_config: LoggingOptions::default(),
             chat_config: ChatOptions::default(),
             image_fetch_config: ImageFetchOptions::default(),
@@ -890,6 +892,36 @@ pub fn daemon_options_differ(current: &ServeConfig, target: &ServeConfig) -> boo
         || current.diffusion_generation_config != target.diffusion_generation_config
 }
 
+/// The workers' always-on profiling (`profiling_config`): the fence
+/// probes at the entry and exit of the model's components, which export
+/// per-step component durations (`docs/profiling.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfilingOptions {
+    /// Whether the probes record: the device switch every probe reads,
+    /// changed in place, at the engine's next step boundary.
+    pub fence_probes: bool,
+    /// Name patterns (`*` matches any run) of the components whose module
+    /// instances carry probes in the CUDA graphs a world captures; a change
+    /// takes a new world. Empty for no probe.
+    pub fence_components: Vec<String>,
+}
+
+impl Default for ProfilingOptions {
+    fn default() -> Self {
+        Self {
+            fence_probes: true,
+            fence_components: DEFAULT_FENCE_COMPONENTS
+                .iter()
+                .map(|&pattern| pattern.to_owned())
+                .collect(),
+        }
+    }
+}
+
+/// The components probed by default: each model's transformer layer.
+pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*.TransformerLayer"];
+
 /// How the deployment moves to a new configuration in another world
 /// (`update_config`, `PUT /admin/config`): what of the previous world its
 /// trial keeps for a rollback, when the trial rolls back by itself, and how
@@ -1341,6 +1373,10 @@ impl ServeConfig {
                     num_draft_tokens: self.speculative_config.num_draft_tokens,
                 },
             ),
+            profiling: Some(wire::Profiling {
+                fence_probes: self.profiling_config.fence_probes,
+                fence_components: self.profiling_config.fence_components.clone(),
+            }),
         })
     }
 }

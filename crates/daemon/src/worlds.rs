@@ -220,6 +220,9 @@ pub(crate) struct Sample {
 #[derive(Default)]
 pub(crate) struct Observer {
     samples: std::sync::Mutex<VecDeque<Sample>>,
+    /// The profiling sessions' progress the workers reported, keyed
+    /// `{session}/{counter}` (`ForwardStats::profile`), summed.
+    profile: std::sync::Mutex<BTreeMap<String, u64>>,
 }
 
 /// The longest span statistics are kept for.
@@ -232,6 +235,12 @@ impl Observer {
             .worker_forward_stats
             .as_ref()
             .map_or(0, |forward| forward.mode_tokens.values().sum());
+        if let Some(forward) = &stats.worker_forward_stats {
+            let mut profile = locked(&self.profile);
+            for (key, value) in &forward.profile {
+                *profile.entry(key.clone()).or_default() += value;
+            }
+        }
         let now = Instant::now();
         let mut samples = locked(&self.samples);
         samples.push_back(Sample {
@@ -295,6 +304,20 @@ impl Observer {
         {
             visit(sample);
         }
+    }
+
+    /// Profiling session `session`'s progress the workers reported: the
+    /// steps their windows took, the bytes of their files, and the workers
+    /// whose window ended.
+    pub(crate) fn profile(&self, session: u64) -> (u64, u64, u64) {
+        let profile = locked(&self.profile);
+        let counter = |name: &str| {
+            profile
+                .get(&format!("{session}/{name}"))
+                .copied()
+                .unwrap_or_default()
+        };
+        (counter("steps"), counter("bytes"), counter("ended"))
     }
 
     /// The calls of `world` that produced non-finite logits since `since`.
@@ -832,6 +855,36 @@ impl Leader {
                 then: Some(Box::new(request)),
             });
         }
+        // The fence probes' switch alone changes in place: every worker
+        // writes its device switch at the engine's next step boundary, and
+        // the graphs that captured the probes stay.
+        let mut switched = comparable(&served);
+        if let (Some(served), Some(target)) =
+            (switched.profiling.as_mut(), target_spec.profiling.as_ref())
+        {
+            served.fence_probes = target.fence_probes;
+        }
+        if switched == comparable(&target_spec) {
+            let enabled = target_spec
+                .profiling
+                .as_ref()
+                .is_some_and(|profiling| profiling.fence_probes);
+            running
+                .hook(
+                    "uniserve.fence_switch",
+                    &serde_json::json!({ "enabled": enabled }).to_string(),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("the workers did not switch the probes: {error}")
+                })?;
+            info!(enabled, "the workers switched the fence probes in place");
+            let mut spec = served;
+            spec.profiling = target_spec.profiling;
+            *locked(&self.engines.served) = Some(spec);
+            *locked(&self.engines.config) = target;
+            return Ok(Applied::InPlace(plan));
+        }
         // Scheduling alone, within the batch the serving world's workers
         // were started for, changes in place at the schedulers' next step.
         if in_place {
@@ -1071,6 +1124,9 @@ impl Leader {
                 latent_seed: trajectories_change.then_some(before.latent_seed),
             }));
         }
+        // A profiling session belongs to the serving world: it ends, its
+        // files written, before the world parks.
+        crate::profiling::end_for_world(&self.engines, Some(running), "world change").await;
         let paused = Instant::now();
         hold.hold();
         let index = match running.park().await {
@@ -1531,6 +1587,8 @@ pub(crate) async fn rollback(
     // The hold names no engine while it holds: the world on trial is taken
     // first.
     let failing = hold.client();
+    // A profiling session of the world on trial ends with it.
+    crate::profiling::end_for_world(engines, failing.as_deref(), "rollback").await;
     hold.hold();
     // The world on trial preempts its requests, which wait for the previous
     // world: its live schedulers park, and a scheduler that failed handed

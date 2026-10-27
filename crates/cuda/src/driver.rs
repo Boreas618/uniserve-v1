@@ -209,6 +209,12 @@ driver_table! {
         memset_d32_async = "cuMemsetD32Async": fn(u64, u32, usize, Handle);
         memset_d2d8_async = "cuMemsetD2D8Async": fn(u64, usize, u8, usize, usize, Handle);
         memset_d2d32_async = "cuMemsetD2D32Async": fn(u64, usize, u32, usize, usize, Handle);
+
+        module_load_data = "cuModuleLoadData": fn(*mut Handle, *const c_void);
+        module_get_function = "cuModuleGetFunction": fn(*mut Handle, Handle, *const c_char);
+        launch_kernel = "cuLaunchKernel": fn(
+            Handle, u32, u32, u32, u32, u32, u32, u32, Handle, *mut *mut c_void, *mut *mut c_void,
+        );
     }
     lazy {
         // CUDA 12.8 batch APIs; the CUDA 13 `_v2` signatures have no failIdx.

@@ -762,6 +762,29 @@ fn record(
     }
 }
 
+/// Record into `job`, on the builder thread in the job's order, the begin
+/// (`begin`) or end marker of the batch's step on the computation's
+/// `stream` (`crate::profiling::fences`): the probes the execution between
+/// them runs name the batch. Nothing for a rank without fence probes or a
+/// computation on the host.
+fn mark_step(job: &Job, stream: Option<&Stream>, plan: &BatchPlan, begin: bool) -> Result<()> {
+    let (Some(fences), Some(stream)) = (crate::profiling::fences::Fences::installed(), stream)
+    else {
+        return Ok(());
+    };
+    let stream = stream.clone();
+    let step = plan.batch_id;
+    let stage = plan
+        .calls
+        .first()
+        .map_or("lifecycle", |call| call.kind.as_str());
+    job.on(None).launch_host_fn(Box::new(move || {
+        if let Err(error) = fences.mark(&stream, step, stage, begin) {
+            tracing::warn!("a fence step marker was not launched: {error}");
+        }
+    }))
+}
+
 /// Record the batch's last job into `job`, up to what follows its commit
 /// point.
 fn record_last(
@@ -846,7 +869,9 @@ fn record_last(
                 bound.push(predicate.clone());
             }
         }
+        mark_step(job, stream.as_ref(), plan, true).map_err(&failed)?;
         job.call_returning(executor.execute(index, step.to_string(), bound.clone()));
+        mark_step(job, stream.as_ref(), plan, false).map_err(&failed)?;
         publish(owners, plan, batch, published, issue).map_err(&failed)?;
         if images {
             image::publish(&mut image_owners, plan, batch, &mut parked.image, job)
@@ -880,11 +905,13 @@ fn record_last(
         if parked.executes {
             let column =
                 column_step(tensors, plan, index, batch, &reservation, issue).map_err(&failed)?;
+            mark_step(job, stream.as_ref(), plan, true).map_err(&failed)?;
             job.call_returning(executor.execute(
                 index,
                 column.step.to_string(),
                 column.tensors.clone(),
             ));
+            mark_step(job, stream.as_ref(), plan, false).map_err(&failed)?;
             // The records are checked on the builder thread right behind the
             // call that wrote them, before anything past it is performed.
             let records = Arc::clone(&parked.records);

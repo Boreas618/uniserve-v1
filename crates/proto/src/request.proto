@@ -948,6 +948,9 @@ message EngineSpec {
   // speculates keeps the drafter's draft cache in its pool, so any change
   // of it is a world change.
   Speculation speculation = 20;
+  // The always-on profiling of the workers (`profiling_config`); absent for
+  // none.
+  Profiling profiling = 21;
 }
 
 // Speculative decoding with the model's drafter.
@@ -955,6 +958,15 @@ message Speculation {
   // The most draft tokens one verification carries per request; at least
   // one.
   uint32 num_draft_tokens = 1;
+}
+
+// The workers' always-on profiling.
+message Profiling {
+  // Whether the fence probes record: the device switch every probe reads.
+  bool fence_probes = 1;
+  // The components whose module instances carry fence probes in the graphs
+  // the workers capture, as name patterns (`*` matches any run).
+  repeated string fence_components = 2;
 }
 
 // What an engine that succeeds another maps of it.

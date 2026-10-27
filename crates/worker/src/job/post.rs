@@ -36,7 +36,7 @@ pub(super) fn perform(job: Job, post: Post) {
         job: Some(post.id),
         completions: post.completions.clone(),
     };
-    let watched = cuda::cupti::Watched::enter();
+    let watched = cuda::cupti::blocking::Watched::enter();
     let (completion, after) = job.perform_operations();
     performing.job = None;
     crate::profiling::blocking::add("builder", &watched.calls());

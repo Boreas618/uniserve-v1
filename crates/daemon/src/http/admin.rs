@@ -55,7 +55,7 @@ pub(crate) struct Operation {
     pub id: u64,
     /// `config`, `commit`, `rollback`, `update_weights`,
     /// `pause_generation`, `continue_generation`, `flush_cache`, `sleep`,
-    /// `wake_up`, `load_lora_adapter`, `unload_lora_adapter`, `cupti`,
+    /// `wake_up`, `load_lora_adapter`, `unload_lora_adapter`, `profile`,
     /// `hook`, `restart` or `shutdown`.
     pub kind: String,
     /// `running`, `succeeded` or `failed`.
@@ -332,7 +332,10 @@ pub(crate) fn router(state: AdminState) -> Router {
         .route("/admin/wake_up", post(wake_up))
         .route("/admin/load_lora_adapter", post(load_lora_adapter))
         .route("/admin/unload_lora_adapter", post(unload_lora_adapter))
-        .route("/admin/cupti", post(cupti))
+        .route(
+            "/admin/profile",
+            get(profile_status).post(start_profile).delete(stop_profile),
+        )
         .route("/admin/hooks/{name}", post(named_hook))
         .with_state(state)
 }
@@ -799,42 +802,46 @@ async fn unload_lora_adapter(State(state): State<AdminState>, body: axum::body::
     .await
 }
 
-/// The body of `POST /admin/cupti`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CuptiBody {
-    /// Whether every worker's process is to have CUPTI attached.
-    attached: bool,
-}
-
-/// `POST /admin/cupti`: every worker attaches CUPTI
-/// (`uniserve.attach_cupti`) or detaches it (`uniserve.detach_cupti`) at the
-/// engine's next step boundary, and answers whether it is attached and
-/// records its streams' device time. Attached, the workers count the driver
-/// calls that make their threads wait for the device and report the busy
-/// and idle time of their primary and copy streams.
-async fn cupti(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
-    let body: CuptiBody = match serde_json::from_slice(&body) {
-        Ok(body) => body,
+/// `POST /admin/profile`: starts a profiling session
+/// (`proto::profile::SessionRequest`) on every worker of the executing world
+/// at the engine's next step boundary (`crate::profiling`), and answers with
+/// it: its identity, each worker's file and collectors. One runs at a time:
+/// another is refused (`400`) until it ends.
+async fn start_profile(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+    let request: proto::profile::SessionRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
         Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
     };
-    let hook = if body.attached {
-        "uniserve.attach_cupti"
-    } else {
-        "uniserve.detach_cupti"
-    };
     let leader = Arc::clone(&state.leader);
-    run(&state.admin, "cupti", true, async move {
-        leader
-            .hook(hook, "null")
-            .await
-            .map(|results| json!({ "results": json_results(&results) }))
-            .map_err(|error| {
-                (
-                    update_status(&error),
-                    format!("{:#}", anyhow::Error::from(error)),
-                )
-            })
+    run(&state.admin, "profile", true, async move {
+        leader.start_profile(request).await.map_err(|error| {
+            (
+                update_status(&error),
+                format!("{:#}", anyhow::Error::from(error)),
+            )
+        })
+    })
+    .await
+}
+
+/// `GET /admin/profile`: the running session, or the last that ended: its
+/// state, the steps and bytes its workers recorded, the step time it costs
+/// and what its quality-of-service guard did; `null` before any.
+async fn profile_status(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    Json(json!({ "session": state.leader.profile_status() }))
+}
+
+/// `DELETE /admin/profile`: ends the running session at the engine's next
+/// step boundary, every worker writing its file, and answers with it.
+async fn stop_profile(State(state): State<AdminState>) -> Response {
+    let leader = Arc::clone(&state.leader);
+    run(&state.admin, "profile", true, async move {
+        leader.stop_profile("operator").await.map_err(|error| {
+            (
+                update_status(&error),
+                format!("{:#}", anyhow::Error::from(error)),
+            )
+        })
     })
     .await
 }

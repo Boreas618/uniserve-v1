@@ -208,6 +208,14 @@ pub struct WorkerStats {
     /// Worker driver calls that waited for the device, keyed
     /// `{thread}/{call}` (`ForwardStats::blocking_calls`).
     pub blocking_calls: Mutex<BTreeMap<String, u64>>,
+    /// Fence probe step durations keyed `{stage}/{component}`
+    /// (`ForwardStats::fence_us`).
+    pub fence_us: Mutex<BTreeMap<String, ipc::FenceHistogram>>,
+    /// Cumulative fence probe records the workers lost.
+    pub fence_records_lost: AtomicU64,
+    /// Profiling session progress keyed `{session}/{counter}`
+    /// (`ForwardStats::profile`).
+    pub profile: Mutex<BTreeMap<String, u64>>,
     /// Cumulative attention kernel launches.
     pub attention_launches: AtomicU64,
     /// Cumulative attention execution time, in microseconds.

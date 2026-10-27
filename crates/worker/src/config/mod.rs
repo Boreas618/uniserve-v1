@@ -11,7 +11,7 @@ pub(crate) mod placement;
 pub use device::Device;
 // The resolved launch configuration the launch tests read.
 pub use launch::{
-    AttentionOptions, DataPlane, ExpertUnion, IpcConfig, LoadOptions, ModelSource,
+    AttentionOptions, DataPlane, ExpertUnion, FenceOptions, IpcConfig, LoadOptions, ModelSource,
     RendezvousConfig, WorkerLaunch, resolve,
 };
 

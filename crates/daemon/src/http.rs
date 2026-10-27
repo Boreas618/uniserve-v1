@@ -531,6 +531,15 @@ mod tests {
         Request::builder().uri(path).body(Body::empty()).unwrap()
     }
 
+    /// A `DELETE` request to `path`.
+    fn delete_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     /// A chat completion of `tokens` tokens, streamed when `stream` is set.
     fn chat_body(tokens: u32, stream: bool) -> Value {
         json!({
@@ -671,31 +680,82 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    /// `/admin/cupti` has every worker attach or detach CUPTI and answers
-    /// each worker's state; a body that does not choose is refused.
+    /// A profiling session runs on every worker until the operator ends it,
+    /// one at a time; its status reports each worker's collectors and, once
+    /// it ended, why and each worker's file.
     #[tokio::test]
-    async fn cupti_is_attached_and_detached_on_every_worker() {
+    async fn a_profiling_session_runs_until_the_operator_ends_it() {
         let app = router(sim_engine(ModelParameters::Qwen3));
-        for attached in [false, true] {
-            let (status, _, body) = send(
-                &app,
-                post_json("/admin/cupti", &json!({ "attached": attached })),
-            )
-            .await;
-            assert_eq!(
-                (status, &body["state"]),
-                (StatusCode::OK, &json!("succeeded")),
-                "{body}"
-            );
-            // The simulated worker has no device, and no CUPTI to attach.
-            assert_eq!(
-                body["result"]["results"],
-                json!([{ "attached": false, "stream_activity": false }]),
-                "{body}"
-            );
-        }
-        let (status, _, _) = send(&app, post_json("/admin/cupti", &json!({}))).await;
+        let (status, _, body) = send(&app, get_request("/admin/profile")).await;
+        assert_eq!((status, &body["session"]), (StatusCode::OK, &json!(null)));
+
+        let request = json!({
+            "collectors": ["timeline", "pm_sampling"],
+            "stages": ["decode"],
+            "output_dir": "/tmp/uniserve-profile-test",
+        });
+        let (status, _, body) = send(&app, post_json("/admin/profile", &request)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let session = &body["result"];
+        assert_eq!(session["state"], json!("running"), "{body}");
+        // The simulated worker has no device: it runs no collector.
+        assert_eq!(
+            session["workers"][0]["collectors"]["timeline"],
+            json!("unavailable: the simulated worker has no device")
+        );
+        assert_eq!(session["collectors"], json!([]));
+
+        // One session at a time.
+        let (status, _, body) = send(&app, post_json("/admin/profile", &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (_, _, body) = send(&app, get_request("/admin/profile")).await;
+        assert_eq!(body["session"]["state"], json!("running"));
+
+        let (status, _, body) = send(&app, delete_request("/admin/profile")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ended = &body["result"];
+        assert_eq!(
+            (&ended["state"], &ended["end_reason"]),
+            (&json!("ended"), &json!("operator")),
+            "{body}"
+        );
+        assert_eq!(ended["files"][0]["reason"], json!("operator"));
+        let (status, _, _) = send(&app, delete_request("/admin/profile")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A session of a window of seconds ends by itself once they passed; a
+    /// request that runs no collector or names an unknown option is refused.
+    #[tokio::test]
+    async fn a_session_ends_after_its_seconds_and_a_faulty_request_is_refused() {
+        let app = router(sim_engine(ModelParameters::Qwen3));
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/admin/profile",
+                &json!({"collectors": ["pm_sampling"], "seconds": 0.5, "output_dir": "/tmp/p"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, _, body) = send(&app, get_request("/admin/profile")).await;
+            if body["session"]["state"] == json!("ended") {
+                assert_eq!(body["session"]["end_reason"], json!("seconds"));
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{body}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        for faulty in [
+            json!({"collectors": [], "output_dir": "/tmp/p"}),
+            json!({"collectors": ["timeline"], "output_dir": "/tmp/p", "window": 3}),
+        ] {
+            let (status, _, body) = send(&app, post_json("/admin/profile", &faulty)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
     }
 
     /// A loaded LoRA adapter is listed and served under its name until it
