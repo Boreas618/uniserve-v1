@@ -23,18 +23,32 @@
 //!    closes cancel tasks ([`Event::Cancel`]); each still ends with its
 //!    report, since bytes may be in flight until then.
 //!
+//! A span's source on another host ([`Region::Remote`]) is forwarded as
+//! that host's region ([`Allocation::Remote`]), which this server cannot
+//! check: the Transfer Server has that host's server expose it and READs
+//! it. The other direction serves another host's Transfer Server, a
+//! [`Role::Peer`]: its [`Request::Expose`](storage::protocol::Request::Expose)
+//! names regions of a deployment here, which the server checks as a
+//! task's sources, gives the Transfer Server, and has it register with its
+//! NIXL agent ([`Event::Register`]); the peer's request waits until the
+//! Transfer Server reports the ranges and its agent's metadata
+//! ([`Request::Registered`](storage::protocol::Request::Registered)), which
+//! answer it ([`Reply::Exposed`]).
+//!
 //! When the Transfer Server's connection closes, every task it held fails
 //! and the submitters learn it at once: the update a task served aborts,
-//! and the next Transfer Server maps the allocations of new tasks again.
-//! While none is connected a submission is refused
+//! and the next Transfer Server maps the allocations of new tasks again. An
+//! exposure waiting for it is refused, and the next Transfer Server's agent
+//! registers the regions afresh when a peer asks again. While none is
+//! connected a submission or an exposure is refused
 //! ([`ErrorKind::Unavailable`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use storage::protocol::{
     Access, Allocation, ContextBytes, ErrorKind, Event, Link, LinkBandwidth, ListedTask,
-    ListedTransfer, Memory, Move, Placement, Priority, Region, Reply, Role, Span, Throttle,
-    TransferEnd,
+    ListedTransfer, Memory, Move, Placement, Priority, Region, Registered, Reply, Role, Span,
+    Throttle, TransferEnd,
 };
 
 use crate::child::{Launch, Supervised};
@@ -62,9 +76,14 @@ pub(super) struct Transfers {
     next_task: u64,
     /// The allocations the connected Transfer Server was given.
     given: BTreeSet<Allocation>,
-    /// What it measured when it started.
+    /// What it measured: every link of this host when it started, and the
+    /// links from other hosts it timed since.
     links: Vec<LinkBandwidth>,
     contexts: Vec<ContextBytes>,
+    /// Peers' exposures waiting for the Transfer Server's registrations, by
+    /// the number of their [`Event::Register`].
+    exposures: BTreeMap<u64, Exposure>,
+    next_registration: u64,
 }
 
 impl Transfers {
@@ -77,8 +96,26 @@ impl Transfers {
             given: BTreeSet::new(),
             links: Vec::new(),
             contexts: Vec::new(),
+            exposures: BTreeMap::new(),
+            next_registration: 1,
         }
     }
+}
+
+/// The regions of a peer's exposure, checked and resolved: the allocations
+/// the Transfer Server registers, each once, and for each region the index
+/// of its allocation among them and the offset of its first byte there.
+pub(super) struct Exposing {
+    allocations: Vec<Allocation>,
+    regions: Vec<(usize, u64)>,
+}
+
+/// A peer's exposure the server answers once its Transfer Server reported
+/// the registrations: the peer's client and request, and its regions.
+struct Exposure {
+    client: ClientId,
+    request: u64,
+    regions: Vec<(usize, u64)>,
 }
 
 /// A region resolved to one of the server's allocations: the allocation,
@@ -175,14 +212,26 @@ impl Server {
 
         match request {
             Request::Measured { links, contexts } => {
-                self.transfers.links.clone_from(links);
-                self.transfers.contexts.clone_from(contexts);
+                // A later report adds links from other hosts as copies
+                // timed them; the latest measurement of a link stands.
+                let known = &mut self.transfers.links;
+                for measured in links {
+                    match known.iter_mut().find(|entry| entry.link == measured.link) {
+                        Some(entry) => entry.clone_from(measured),
+                        None => known.push(measured.clone()),
+                    }
+                }
+                let known = &mut self.transfers.contexts;
                 for context in contexts {
                     tracing::info!(
                         gpu = %cuda::DeviceUuid(context.gpu),
                         bytes = context.bytes,
                         "the Transfer Server's CUDA context"
                     );
+                    match known.iter_mut().find(|entry| entry.gpu == context.gpu) {
+                        Some(entry) => *entry = *context,
+                        None => known.push(*context),
+                    }
                 }
                 Ok(Outcome::Reply(Reply::Noted, Vec::new()))
             }
@@ -190,8 +239,153 @@ impl Server {
                 self.copied(*task, *bytes, end.clone());
                 Ok(Outcome::Reply(Reply::Noted, Vec::new()))
             }
+            Request::Registered {
+                request,
+                metadata,
+                ranges,
+                failure,
+            } => {
+                self.registered(*request, metadata, ranges, failure.as_deref());
+                Ok(Outcome::Reply(Reply::Noted, Vec::new()))
+            }
             _ => Err(invalid("not a request of the Transfer Server")),
         }
+    }
+
+    /// A peer's [`Request::Expose`](storage::protocol::Request::Expose) of
+    /// `regions` of `deployment`: each is a retained tensor or a page pool
+    /// of the deployment, checked as a task's source is, and the Transfer
+    /// Server is given each allocation it does not hold yet. The request
+    /// then waits for the registrations ([`Server::begin_exposure`]).
+    pub(super) fn expose(
+        &mut self,
+        deployment: &str,
+        regions: &[Region],
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        let Some(transfer_server) = self.transfers.client else {
+            return Err(unavailable());
+        };
+        if regions.is_empty() {
+            return Err(invalid("an exposure names at least one region"));
+        }
+
+        let mut allocations: Vec<Allocation> = Vec::new();
+        let mut placed = Vec::with_capacity(regions.len());
+        let mut needed = BTreeMap::new();
+        for region in regions {
+            if !matches!(region, Region::Tensor { .. } | Region::Pool { .. }) {
+                return Err(invalid(
+                    "a host exposes its own retained tensors and page pools",
+                ));
+            }
+            let resolved = self.resolve(deployment, region, false)?;
+            let index = match allocations
+                .iter()
+                .position(|known| *known == resolved.allocation)
+            {
+                Some(index) => index,
+                None => {
+                    allocations.push(resolved.allocation.clone());
+                    allocations.len() - 1
+                }
+            };
+            placed.push((index, resolved.base));
+            need(&mut needed, resolved);
+        }
+        for (allocation, resolved) in needed {
+            self.give(transfer_server, allocation, &resolved);
+        }
+        Ok(Outcome::Exposing(Exposing {
+            allocations,
+            regions: placed,
+        }))
+    }
+
+    /// Have the Transfer Server register an exposure's allocations, and hold
+    /// the connection of `client`, the peer, until it reports them and
+    /// `request` is answered: requests are answered in order.
+    pub(super) fn begin_exposure(&mut self, client: ClientId, request: u64, exposing: Exposing) {
+        let Some(transfer_server) = self.transfers.client else {
+            self.answer(client, request, error_reply(unavailable()), &[]);
+            return;
+        };
+        if let Some(entry) = self.clients.get_mut(&client) {
+            entry.held = true;
+        }
+        let number = self.transfers.next_registration;
+        self.transfers.next_registration += 1;
+        self.events.push((
+            transfer_server,
+            Event::Register {
+                request: number,
+                allocations: exposing.allocations,
+            },
+            Vec::new(),
+        ));
+        self.transfers.exposures.insert(
+            number,
+            Exposure {
+                client,
+                request,
+                regions: exposing.regions,
+            },
+        );
+    }
+
+    /// The Transfer Server registered the allocations of exposure
+    /// `number`, or failed to: the peer's request is answered, and its
+    /// connection's next requests are served.
+    fn registered(
+        &mut self,
+        number: u64,
+        metadata: &[u8],
+        ranges: &[Registered],
+        failure: Option<&str>,
+    ) {
+        let Some(exposure) = self.transfers.exposures.remove(&number) else {
+            // The peer disconnected meanwhile.
+            return;
+        };
+        let reply = match failure {
+            Some(message) => error_reply((ErrorKind::Resource, message.to_owned())),
+            None => {
+                // Each region's range runs from its first byte to the end
+                // of its allocation.
+                let regions = exposure
+                    .regions
+                    .iter()
+                    .map(|&(index, base)| {
+                        let range = ranges.get(index).filter(|range| base <= range.bytes)?;
+                        Some(Registered {
+                            memory: range.memory.clone(),
+                            key: range.key,
+                            address: range.address + base,
+                            bytes: range.bytes - base,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                match regions {
+                    Some(regions) => Reply::Exposed {
+                        metadata: metadata.to_vec(),
+                        regions,
+                    },
+                    None => error_reply((
+                        ErrorKind::Resource,
+                        "the Transfer Server reported no range for an exposed region".into(),
+                    )),
+                }
+            }
+        };
+        self.release_exposure(exposure, reply);
+    }
+
+    /// Answer a peer's exposure with `reply` and serve its connection on.
+    fn release_exposure(&mut self, exposure: Exposure, reply: Reply) {
+        self.answer(exposure.client, exposure.request, reply, &[]);
+        if let Some(client) = self.clients.get_mut(&exposure.client) {
+            client.held = false;
+        }
+        self.serve_queue(exposure.client);
     }
 
     /// Check and forward a transfer; returns its task.
@@ -219,40 +413,49 @@ impl Server {
             if span.bytes == 0 {
                 return Err(invalid("a span copies at least one byte"));
             }
-            let source = self.resolve(deployment, &span.source, false)?;
             let destination = self.resolve(deployment, &span.destination, true)?;
-            if matches!(source.allocation, Allocation::Fabric { .. })
-                && matches!(destination.allocation, Allocation::Fabric { .. })
-            {
-                return Err(invalid(
-                    "a span copies to or from this host's memory, not between two other hosts",
-                ));
-            }
-            let source_offset = within(&source, span.source_offset, span.bytes, "source")?;
             let destination_offset = within(
                 &destination,
                 span.destination_offset,
                 span.bytes,
                 "destination",
             )?;
+            let crossing =
+                invalid("a span copies to or from this host's memory, not between two other hosts");
+            let (source, source_offset) = match &span.source {
+                // Another host's region: that host checks it, and the span
+                // against it, once the Transfer Server asks it to expose
+                // the region.
+                Region::Remote { endpoint, region } => {
+                    if matches!(destination.allocation, Allocation::Fabric { .. }) {
+                        return Err(crossing);
+                    }
+                    (remote(deployment, endpoint, region)?, span.source_offset)
+                }
+                region => {
+                    let source = self.resolve(deployment, region, false)?;
+                    if matches!(source.allocation, Allocation::Fabric { .. })
+                        && matches!(destination.allocation, Allocation::Fabric { .. })
+                    {
+                        return Err(crossing);
+                    }
+                    let offset = within(&source, span.source_offset, span.bytes, "source")?;
+                    let allocation = source.allocation.clone();
+                    need(&mut needed, source);
+                    (allocation, offset)
+                }
+            };
             bytes = bytes
                 .checked_add(span.bytes)
                 .ok_or_else(|| invalid("the spans' bytes overflow"))?;
             moves.push(Move {
-                source: source.allocation.clone(),
+                source,
                 source_offset,
                 destination: destination.allocation.clone(),
                 destination_offset,
                 bytes: span.bytes,
             });
-            for resolved in [source, destination] {
-                if resolved.attachment.is_some() {
-                    needed
-                        .entry(resolved.allocation.clone())
-                        .and_modify(|known| known.writable |= resolved.writable)
-                        .or_insert(resolved);
-                }
-            }
+            need(&mut needed, destination);
         }
 
         for (allocation, resolved) in needed {
@@ -297,7 +500,7 @@ impl Server {
             transfer_server,
             Event::Allocation {
                 allocation,
-                memory: resolved.memory,
+                memory: resolved.memory.clone(),
                 bytes: resolved.bytes,
                 writable: resolved.writable,
             },
@@ -393,6 +596,12 @@ impl Server {
                     writable: destination,
                 })
             }
+            Region::Remote { .. } => Err(invalid(if destination {
+                "a span writes memory of this host: another host's region is a source, which \
+                 this host READs"
+            } else {
+                "another host exposes its own retained tensors and page pools"
+            })),
         }
     }
 
@@ -459,6 +668,11 @@ impl Server {
     /// A client's connection closed: the tasks it submitted are cancelled,
     /// since nobody waits for them any more.
     pub(super) fn transfer_client_gone(&mut self, id: ClientId) {
+        // A peer that left waits for no exposure; what its Transfer Server
+        // registers stays registered, as any exposed region does.
+        self.transfers
+            .exposures
+            .retain(|_, exposure| exposure.client != id);
         let cancelled = self.cancel_where(|_, task| task.client == id);
         if cancelled > 0 {
             tracing::info!(
@@ -488,6 +702,15 @@ impl Server {
                 },
                 Vec::new(),
             ));
+        }
+        // Its agent ended with it: the regions it was registering are
+        // refused, and the next one registers them when a peer asks again.
+        for (_, exposure) in std::mem::take(&mut self.transfers.exposures) {
+            let reply = error_reply((
+                ErrorKind::Unavailable,
+                "the Transfer Server ended before it registered the regions".into(),
+            ));
+            self.release_exposure(exposure, reply);
         }
     }
 
@@ -548,6 +771,47 @@ fn within(
             resolved.bytes, resolved.base
         ))),
     }
+}
+
+/// Note that the Transfer Server needs `resolved`'s descriptor, mapped for
+/// writing when any span writes it.
+fn need(needed: &mut BTreeMap<Allocation, Resolved>, resolved: Resolved) {
+    if resolved.attachment.is_some() {
+        needed
+            .entry(resolved.allocation.clone())
+            .and_modify(|known| known.writable |= resolved.writable)
+            .or_insert(resolved);
+    }
+}
+
+/// The allocation of `region`, of `deployment`, at the Storage Server of
+/// another host listening at `endpoint`: a retained tensor or a page pool
+/// there, which that host checks once the Transfer Server asks it to expose
+/// the region.
+fn remote(
+    deployment: &str,
+    endpoint: &str,
+    region: &Region,
+) -> Result<Allocation, (ErrorKind, String)> {
+    if !matches!(region, Region::Tensor { .. } | Region::Pool { .. }) {
+        return Err(invalid(
+            "another host's region is one of its retained tensors or page pools",
+        ));
+    }
+    if endpoint.is_empty() {
+        return Err(invalid(
+            "another host's region names the endpoint of its Storage Server",
+        ));
+    }
+    Ok(Allocation::Remote {
+        endpoint: endpoint.to_owned(),
+        deployment: deployment.to_owned(),
+        region: Box::new(region.clone()),
+    })
+}
+
+fn error_reply((kind, message): (ErrorKind, String)) -> Reply {
+    Reply::Error { kind, message }
 }
 
 fn unavailable() -> (ErrorKind, String) {

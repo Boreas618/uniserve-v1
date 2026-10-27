@@ -37,6 +37,9 @@ fn stand_in_transfer_server() {
         Path::new(&socket),
         &storage_server::transfer::Options {
             chunk: Duration::from_millis(1),
+            // The NIXL build the tests between hosts name; the loader's
+            // search path otherwise.
+            nixl_library: std::env::var_os("NIXL_CAPI_LIBRARY").map(Into::into),
         },
     )
     .unwrap();
@@ -44,7 +47,7 @@ fn stand_in_transfer_server() {
 
 /// Which GPUs the Transfer Server sees.
 #[derive(Clone, Copy)]
-enum Gpus {
+pub(crate) enum Gpus {
     /// None: it copies host memory only.
     Hidden,
     /// Those this process sees.
@@ -52,7 +55,7 @@ enum Gpus {
 }
 
 /// The launch of this binary's stand-in Transfer Server for `socket`.
-fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
+pub(crate) fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
     let mut arguments: Vec<std::ffi::OsString> = Vec::new();
     if let Gpus::Hidden = gpus {
         arguments.push("CUDA_VISIBLE_DEVICES=".into());
@@ -77,7 +80,7 @@ fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
 }
 
 /// A server whose Transfer Server is connected and measured.
-fn serving(gpus: Gpus) -> Running {
+pub(crate) fn serving(gpus: Gpus) -> Running {
     // The server forks the Transfer Server; no test's dropped connection
     // must stay open in the child meanwhile.
     let _forking = FORKING
@@ -90,7 +93,7 @@ fn serving(gpus: Gpus) -> Running {
 
 /// The pid of the server's measured Transfer Server, once one other than
 /// `not` is.
-fn transfer_pid(socket: &Path, not: Option<i32>) -> i32 {
+pub(crate) fn transfer_pid(socket: &Path, not: Option<i32>) -> i32 {
     let mut operator = Client::connect(socket, Role::Operator).unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -109,7 +112,7 @@ fn transfer_pid(socket: &Path, not: Option<i32>) -> i32 {
 }
 
 /// The next transfer event `client` receives, within a minute.
-fn transfer_event(client: &mut Client) -> Event {
+pub(crate) fn transfer_event(client: &mut Client) -> Event {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         client.pump().unwrap();
@@ -122,7 +125,7 @@ fn transfer_event(client: &mut Client) -> Event {
 }
 
 /// The end of task `task`, skipping its progress.
-fn end_of(client: &mut Client, task: u64) -> (u64, TransferEnd) {
+pub(crate) fn end_of(client: &mut Client, task: u64) -> (u64, TransferEnd) {
     loop {
         match transfer_event(client) {
             Event::Transferred {
@@ -137,13 +140,19 @@ fn end_of(client: &mut Client, task: u64) -> (u64, TransferEnd) {
 }
 
 /// Bytes of a pattern that differs at every position of a span.
-fn pattern(bytes: usize, seed: u8) -> Vec<u8> {
+pub(crate) fn pattern(bytes: usize, seed: u8) -> Vec<u8> {
     (0..bytes)
         .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()
 }
 
-fn span(source: Region, source_offset: u64, destination: Region, offset: u64, bytes: u64) -> Span {
+pub(crate) fn span(
+    source: Region,
+    source_offset: u64,
+    destination: Region,
+    offset: u64,
+    bytes: u64,
+) -> Span {
     Span {
         source,
         source_offset,
@@ -153,12 +162,20 @@ fn span(source: Region, source_offset: u64, destination: Region, offset: u64, by
     }
 }
 
-fn tensor_region(byte: u8) -> Region {
+pub(crate) fn tensor_region(byte: u8) -> Region {
     Region::Tensor { key: key(byte) }
 }
 
+/// `region` at the Storage Server of another host listening at `endpoint`.
+pub(crate) fn remote_region(endpoint: &str, region: Region) -> Region {
+    Region::Remote {
+        endpoint: endpoint.into(),
+        region: Box::new(region),
+    }
+}
+
 /// The bytes of `file` from `offset`.
-fn read(file: &std::fs::File, offset: u64, bytes: usize) -> Vec<u8> {
+pub(crate) fn read(file: &std::fs::File, offset: u64, bytes: usize) -> Vec<u8> {
     let mut buffer = vec![0; bytes];
     file.read_exact_at(&mut buffer, offset).unwrap();
     buffer
@@ -296,6 +313,25 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_memory_of_its_deployment()
             span(tensor_region(1), 0, tensor_region(2), 0, 8),
             span(tensor_region(1), 0, tensor_region(2), 0, 0),
         ],
+        // Another host's memory is a source only: this host READs it.
+        vec![span(
+            tensor_region(1),
+            0,
+            remote_region("10.0.0.2:7000", tensor_region(2)),
+            0,
+            8,
+        )],
+        // Another host's region is one of its tensors or page pools.
+        vec![span(
+            remote_region(
+                "10.0.0.2:7000",
+                remote_region("10.0.0.3:7000", tensor_region(1)),
+            ),
+            0,
+            tensor_region(2),
+            0,
+            8,
+        )],
     ];
     for spans in refused {
         let result = worker.transfer(spans, Priority::Background, 1);
@@ -370,7 +406,7 @@ fn slow(server: &Running, bytes: u64) -> Slow {
         destination: Memory::Host,
     };
     for _ in 0..8 {
-        head.throttle(vec![link], Throttle::Halve).unwrap();
+        head.throttle(vec![link.clone()], Throttle::Halve).unwrap();
     }
     Slow {
         head,
@@ -527,7 +563,7 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
 
 /// GPU tests: device memory the test process allocates and retains at the
 /// server, as a worker does.
-mod device {
+pub(crate) mod device {
     use std::os::fd::{AsFd, OwnedFd};
 
     use cuda::{
@@ -544,7 +580,7 @@ mod device {
 
     /// A retained device allocation of `bytes` on `device` holding
     /// `contents`, with its descriptor.
-    fn device_storage(device: DeviceId, contents: &[u8]) -> (DeviceAllocation, OwnedFd) {
+    pub(crate) fn device_storage(device: DeviceId, contents: &[u8]) -> (DeviceAllocation, OwnedFd) {
         let devices: Vec<DeviceId> = (0..DeviceId::count().unwrap()).map(DeviceId).collect();
         let allocation = DeviceAllocation::retainable(device, contents.len(), &devices).unwrap();
         let mut staging = PinnedBuffer::new(device, contents.len()).unwrap();
@@ -562,7 +598,7 @@ mod device {
     }
 
     /// The bytes of `allocation`.
-    fn device_bytes(allocation: &DeviceAllocation) -> Vec<u8> {
+    pub(crate) fn device_bytes(allocation: &DeviceAllocation) -> Vec<u8> {
         let staging = PinnedBuffer::new(allocation.device(), allocation.len()).unwrap();
         let stream = Stream::new(allocation.device()).unwrap();
         let mut batch = CopyBatch::new(SourceOrder::Stream);
@@ -575,7 +611,7 @@ mod device {
         host[..allocation.len()].to_vec()
     }
 
-    fn record(device: DeviceId, bytes: usize) -> StorageRecord {
+    pub(crate) fn record(device: DeviceId, bytes: usize) -> StorageRecord {
         StorageRecord {
             placement: Placement::Device {
                 gpu: device.uuid().unwrap().0,

@@ -8,14 +8,16 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::net::ToSocketAddrs;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::protocol::{
-    Claim, ClientMessage, ErrorKind, Event, Hello, Key, Link, Listing, Mode, Priority, Reply,
-    Request, Role, Scope, ServerMessage, Span, StorageRecord, TensorRecord, Throttle, VERSION,
-    Welcome,
+    Claim, ClientMessage, ErrorKind, Event, Hello, Key, Link, Listing, Mode, Priority, Region,
+    Registered, Reply, Request, Role, Scope, ServerMessage, Span, StorageRecord, TensorRecord,
+    Throttle, VERSION, Welcome,
 };
 use crate::transport::Connection;
 
@@ -77,6 +79,33 @@ impl Client {
         let stream = std::net::TcpStream::connect(address)?;
         stream.set_nodelay(true)?;
         Self::open(Connection::new(stream), role)
+    }
+
+    /// Connect to the server of another host at `address` (`host:port`,
+    /// its `Endpoint`) as [`Role::Peer`], the Transfer Server of this host
+    /// that READs memory there. Connecting, and every blocking call after
+    /// it ([`Client::call`]), fails once `timeout` passes without an
+    /// answer, so a host that stopped answering fails the caller's task
+    /// instead of holding it.
+    pub fn connect_peer(address: &str, timeout: Duration) -> Result<Self> {
+        let mut refused = None;
+        for candidate in address.to_socket_addrs()? {
+            match std::net::TcpStream::connect_timeout(&candidate, timeout) {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    stream.set_read_timeout(Some(timeout))?;
+                    stream.set_write_timeout(Some(timeout))?;
+                    return Self::open(Connection::new(stream), Role::Peer);
+                }
+                Err(error) => refused = Some(error),
+            }
+        }
+        Err(Error::Io(refused.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{address} names no address"),
+            )
+        })))
     }
 
     /// Connect to the server at `socket` as an operator, in this build's
@@ -382,6 +411,24 @@ impl Client {
         match Self::expect(self.call(&Request::Throttle { links, throttle }, &[])?)?.reply {
             Reply::Throttled => Ok(()),
             other => Err(unexpected("throttle", &other)),
+        }
+    }
+
+    /// See [`Request::Expose`]. Returns the NIXL agent metadata of the
+    /// server's Transfer Server and each region's registered range, in
+    /// order.
+    pub fn expose(
+        &mut self,
+        deployment: String,
+        regions: Vec<Region>,
+    ) -> Result<(Vec<u8>, Vec<Registered>)> {
+        let request = Request::Expose {
+            deployment,
+            regions,
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
+            Reply::Exposed { metadata, regions } => Ok((metadata, regions)),
+            other => Err(unexpected("expose", &other)),
         }
     }
 

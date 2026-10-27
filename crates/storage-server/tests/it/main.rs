@@ -2,5 +2,6 @@
 
 #![cfg(test)]
 
+mod remote;
 mod server;
 mod transfer;

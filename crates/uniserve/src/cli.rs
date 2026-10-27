@@ -87,7 +87,7 @@ pub(crate) enum Command {
     },
     /// The Storage Server of this host and the operator's commands against
     /// it.
-    Storage(StorageArgs),
+    Storage(Box<StorageArgs>),
 }
 
 #[cfg(test)]

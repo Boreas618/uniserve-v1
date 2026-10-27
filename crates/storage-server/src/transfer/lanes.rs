@@ -21,14 +21,22 @@
 //! - **Completion.** A GPU lane keeps [`DEPTH`] chunks submitted on its own
 //!   stream, so its copy engine never waits for the host, and counts a
 //!   chunk copied only once the event recorded after it completed, as the
-//!   host observes. A task ends when its last chunk completed: complete,
-//!   cancelled or failed. A cancelled or failed task's queued pieces leave
-//!   at once, and it ends once its submitted chunks completed, since only
-//!   then are its regions free of copies.
+//!   host observes. A network lane keeps [`DEPTH`] NIXL READs posted and
+//!   counts a chunk copied once its READ completed, as the host polls it:
+//!   a READ passes through no CUDA stream. A task ends when its last chunk
+//!   completed: complete, cancelled or failed. A cancelled or failed task's
+//!   queued pieces leave at once, and it ends once its submitted chunks
+//!   completed, since only then are its regions free of copies.
+//! - **Links from other hosts.** Nobody measured them when the process
+//!   started: a network lane times its chunks of [`MEASURE_BYTES`], one at
+//!   a time, until [`MEASURE_SAMPLES`] of them took the link's bandwidth,
+//!   and reports it; until then its chunks are of that size and wait for
+//!   no budget.
 //!
 //! A device fault (a failed copy submission or completion) leaves the CUDA
 //! context unusable, so the process ends: the Storage Server fails every
-//! task it held and starts a new Transfer Server.
+//! task it held and starts a new Transfer Server. A failed READ (another
+//! host or the network failed) fails its task alone.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::OwnedFd;
@@ -36,9 +44,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cuda::{DeviceId, Event, EventFlags, Stream, memcpy_async};
-use storage::protocol::{Link, Priority, Throttle, TransferEnd};
+use storage::protocol::{Link, LinkBandwidth, Priority, Throttle, TransferEnd};
 
 use super::memory::{Fabric, Mapped};
+use super::network::{Network, Source};
 
 /// How often a running task reports its progress, at most.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -50,12 +59,24 @@ const MIN_CHUNK: u64 = 256 << 10;
 /// Chunks are whole multiples of this.
 const CHUNK_ALIGN: u64 = 64 << 10;
 
-/// The chunk a lane times to learn the bandwidth of a link nobody measured
-/// (one to another host's GPU).
+/// The chunk a GPU lane times to learn the bandwidth of a link nobody
+/// measured (one from another host's GPU of the NVLink fabric).
 const PROBE_CHUNK: u64 = 4 << 20;
 
-/// The chunks a GPU lane keeps submitted: one copying while the host waits
-/// for the other.
+/// The chunk a network lane times to learn the bandwidth of a link from
+/// another host: as long as a measured copy when the process starts
+/// (`devices::SAMPLE_BYTES`), so that the fixed cost of posting a READ and
+/// seeing it complete is a few percent of its time at the line rate of the
+/// host's network adapters.
+const MEASURE_BYTES: u64 = 64 << 20;
+
+/// The timed chunks of [`MEASURE_BYTES`] whose fastest gives a link from
+/// another host its bandwidth: the first READ over a new connection also
+/// sets the connection up.
+const MEASURE_SAMPLES: usize = 2;
+
+/// The chunks a GPU or network lane keeps in flight: one copying while the host
+/// waits for the other.
 const DEPTH: usize = 2;
 
 /// The least share of its bandwidth a halved link keeps.
@@ -74,21 +95,26 @@ pub(super) enum Runner {
     Device(DeviceId),
     /// The CPU, between host buffers.
     Host,
+    /// This process's NIXL agent, with READs from another host through
+    /// the network adapters.
+    Network,
 }
 
 /// A lane: the link it moves bytes over and what runs its copies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LaneKey {
     pub(super) link: Link,
     pub(super) runner: Runner,
 }
 
-/// One end of a piece: an allocation the server gave, or another host's
-/// allocation imported on the lane's GPU.
+/// One end of a piece: an allocation the server gave, another host's
+/// allocation imported on the lane's GPU, or another host's memory that a
+/// READ reaches.
 #[derive(Clone)]
 pub(super) enum End {
     Given(Arc<Mapped>),
     Fabric(Arc<Fabric>),
+    Remote(Arc<Source>),
 }
 
 impl End {
@@ -99,9 +125,15 @@ impl End {
             (End::Given(mapped), Runner::Device(device)) => match mapped.memory {
                 storage::protocol::Memory::Device { .. } => mapped.device_address(),
                 storage::protocol::Memory::Host => mapped.registered_address(device),
+                storage::protocol::Memory::Remote { .. } => {
+                    Err("the server gives allocations of this host only".into())
+                }
             },
             (End::Fabric(fabric), Runner::Device(_)) => fabric.address(),
             (End::Fabric(_), Runner::Host) => Err("the CPU copies no GPU memory".into()),
+            (End::Remote(_), _) | (_, Runner::Network) => {
+                Err("another host's memory is read by a READ, not copied by address".into())
+            }
         }
     }
 }
@@ -205,6 +237,8 @@ struct State {
     /// Each report: the task, the bytes it copied, and its end once it
     /// ended.
     reports: Vec<(u64, u64, Option<TransferEnd>)>,
+    /// Links from other hosts that lanes measured, not reported yet.
+    measured: Vec<LinkBandwidth>,
 }
 
 impl State {
@@ -332,7 +366,7 @@ impl Shared {
             let mut state = self.lock();
             state
                 .budgets
-                .entry(*link)
+                .entry(link.clone())
                 .or_insert_with(|| Budget::new(now))
                 .charge(bytes, bandwidth, capacity, now)
         };
@@ -349,6 +383,21 @@ impl Shared {
             self.wake_main();
         }
     }
+
+    /// A lane measured `link`, from another host, at `bandwidth` bytes per
+    /// second.
+    fn measured(&self, link: &Link, bandwidth: f64) {
+        tracing::info!(
+            ?link,
+            gigabytes_per_second = bandwidth / 1e9,
+            "measured a link from another host"
+        );
+        self.lock().measured.push(LinkBandwidth {
+            link: link.clone(),
+            bytes_per_second: bandwidth as u64,
+        });
+        self.wake_main();
+    }
 }
 
 /// The lanes and their shared state, as the main thread drives them.
@@ -359,10 +408,17 @@ pub(super) struct Lanes {
     chunk: Duration,
     /// Each link's bandwidth as measured at start, in bytes per second.
     bandwidths: HashMap<Link, f64>,
+    /// The NIXL agent network lanes post their READs with.
+    network: Arc<Network>,
 }
 
 impl Lanes {
-    pub(super) fn new(wake: OwnedFd, chunk: Duration, bandwidths: HashMap<Link, f64>) -> Self {
+    pub(super) fn new(
+        wake: OwnedFd,
+        chunk: Duration,
+        bandwidths: HashMap<Link, f64>,
+        network: Arc<Network>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -370,6 +426,7 @@ impl Lanes {
                     queues: HashMap::new(),
                     budgets: HashMap::new(),
                     reports: Vec::new(),
+                    measured: Vec::new(),
                 }),
                 work: Condvar::new(),
                 wake,
@@ -377,14 +434,15 @@ impl Lanes {
             running: HashSet::new(),
             chunk,
             bandwidths,
+            network,
         }
     }
 
     /// Queue task `task`'s pieces, each on its lane, at `priority`.
     pub(super) fn submit(&mut self, task: u64, priority: Priority, pieces: Vec<(LaneKey, Piece)>) {
         for (lane, _) in &pieces {
-            if self.running.insert(*lane) {
-                self.spawn(*lane);
+            if self.running.insert(lane.clone()) {
+                self.spawn(lane.clone());
             }
         }
         let mut state = self.shared.lock();
@@ -405,12 +463,10 @@ impl Lanes {
         self.shared.work.notify_all();
     }
 
-    /// End task `task` at once, failed: it copied nothing.
-    pub(super) fn fail(&mut self, task: u64, message: String) {
-        self.shared
-            .lock()
-            .reports
-            .push((task, 0, Some(TransferEnd::Failed { message })));
+    /// End task `task` at once as `end`, before it copied anything: it
+    /// cannot run, or it was cancelled before its pieces were queued.
+    pub(super) fn end(&mut self, task: u64, end: TransferEnd) {
+        self.shared.lock().reports.push((task, 0, Some(end)));
         self.shared.wake_main();
     }
 
@@ -438,7 +494,7 @@ impl Lanes {
         for link in links {
             state
                 .budgets
-                .entry(*link)
+                .entry(link.clone())
                 .or_insert_with(|| Budget::new(now))
                 .change(throttle, now);
         }
@@ -449,16 +505,23 @@ impl Lanes {
         std::mem::take(&mut self.shared.lock().reports)
     }
 
+    /// The links from other hosts measured since the last call.
+    pub(super) fn measured(&mut self) -> Vec<LinkBandwidth> {
+        std::mem::take(&mut self.shared.lock().measured)
+    }
+
     /// Start the thread of `lane`.
     fn spawn(&self, lane: LaneKey) {
         let shared = Arc::clone(&self.shared);
+        let network = Arc::clone(&self.network);
         let bandwidth = self.bandwidths.get(&lane.link).copied();
         let chunk = self.chunk;
         let spawned = std::thread::Builder::new()
             .name("uniserve-transfer-lane".into())
             .spawn(move || match lane.runner {
-                Runner::Device(device) => device_lane(&shared, lane, device, bandwidth, chunk),
-                Runner::Host => host_lane(&shared, lane, bandwidth, chunk),
+                Runner::Device(device) => device_lane(&shared, &lane, device, bandwidth, chunk),
+                Runner::Host => host_lane(&shared, &lane, bandwidth, chunk),
+                Runner::Network => network_lane(&shared, &lane, &network, bandwidth, chunk),
             });
         if let Err(error) = spawned {
             fatal("starting a lane's thread", &error);
@@ -478,7 +541,7 @@ fn chunk_bytes(bandwidth: Option<f64>, chunk: Duration) -> u64 {
 /// Run `lane`'s chunks on the copy engines of `device`.
 fn device_lane(
     shared: &Shared,
-    lane: LaneKey,
+    lane: &LaneKey,
     device: DeviceId,
     mut bandwidth: Option<f64>,
     chunk: Duration,
@@ -488,7 +551,7 @@ fn device_lane(
     let mut flight: VecDeque<(Piece, Event)> = VecDeque::with_capacity(DEPTH);
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
-        let Some(piece) = shared.next(&lane, bytes, !flight.is_empty()) else {
+        let Some(piece) = shared.next(lane, bytes, !flight.is_empty()) else {
             // Nothing is queued: the oldest chunk in flight completes first.
             if let Some((piece, event)) = flight.pop_front() {
                 wait(&event);
@@ -555,10 +618,10 @@ fn device_lane(
 }
 
 /// Run `lane`'s chunks, between host buffers, on the CPU.
-fn host_lane(shared: &Shared, lane: LaneKey, bandwidth: Option<f64>, chunk: Duration) {
+fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Duration) {
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
-        let Some(piece) = shared.next(&lane, bytes, false) else {
+        let Some(piece) = shared.next(lane, bytes, false) else {
             continue;
         };
         if let Some(bandwidth) = bandwidth {
@@ -592,6 +655,120 @@ fn host_lane(shared: &Shared, lane: LaneKey, bandwidth: Option<f64>, chunk: Dura
     }
 }
 
+/// Run `lane`'s chunks, from another host's memory into this host's, as
+/// NIXL READs this process's agent posts.
+///
+/// While the link is unmeasured its chunks are [`MEASURE_BYTES`] long and
+/// run one at a time, each timed from its post to its completion; the
+/// fastest of the first [`MEASURE_SAMPLES`] full chunks becomes the link's
+/// bandwidth, which the lane reports. A shorter chunk (the tail of a piece)
+/// is not timed: the fixed cost of a READ would understate the link.
+fn network_lane(
+    shared: &Shared,
+    lane: &LaneKey,
+    network: &Network,
+    mut bandwidth: Option<f64>,
+    chunk: Duration,
+) {
+    let mut flight: VecDeque<(Piece, nixl::Transfer)> = VecDeque::with_capacity(DEPTH);
+    let mut samples = Vec::with_capacity(MEASURE_SAMPLES);
+    loop {
+        let bytes = match bandwidth {
+            Some(_) => chunk_bytes(bandwidth, chunk),
+            None => MEASURE_BYTES,
+        };
+        let Some(piece) = shared.next(lane, bytes, !flight.is_empty()) else {
+            // Nothing is queued: the oldest READ in flight completes first.
+            if let Some((piece, transfer)) = flight.pop_front() {
+                let failure = finish(transfer);
+                shared.complete(&piece, failure);
+            }
+            continue;
+        };
+        if let Some(bandwidth) = bandwidth {
+            shared.pace(
+                &lane.link,
+                piece.bytes,
+                bandwidth,
+                (DEPTH as u64 * bytes) as f64,
+            );
+        }
+        let started = Instant::now();
+        let transfer = match post(network, &piece) {
+            Ok(transfer) => transfer,
+            Err(message) => {
+                shared.complete(&piece, Some(message));
+                continue;
+            }
+        };
+        if bandwidth.is_none() {
+            let failure = finish(transfer);
+            if failure.is_none() && piece.bytes == MEASURE_BYTES {
+                let seconds = started.elapsed().as_secs_f64().max(1e-6);
+                samples.push(piece.bytes as f64 / seconds);
+                if samples.len() == MEASURE_SAMPLES {
+                    let fastest = samples.iter().copied().fold(0.0, f64::max);
+                    bandwidth = Some(fastest);
+                    shared.measured(&lane.link, fastest);
+                }
+            }
+            shared.complete(&piece, failure);
+            continue;
+        }
+        flight.push_back((piece, transfer));
+        if flight.len() >= DEPTH
+            && let Some((piece, transfer)) = flight.pop_front()
+        {
+            let failure = finish(transfer);
+            shared.complete(&piece, failure);
+        }
+    }
+}
+
+/// Post `piece` as one READ of `network`'s agent: from another host's
+/// memory, which its Transfer Server registered, into an allocation of this
+/// host's, registered here at its first READ.
+fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
+    let (End::Remote(source), End::Given(destination)) = (&piece.source, &piece.destination) else {
+        return Err("a READ reads another host's memory into this host's".into());
+    };
+    let agent = network.agent()?;
+    let local = destination.nixl_region(agent)?;
+    let len =
+        usize::try_from(piece.bytes).map_err(|_| "a chunk exceeds the address space".to_owned())?;
+    // The server checked the destination span against its allocation, and
+    // the exposure resolution the source span against its region's range.
+    let span = nixl::Span {
+        source: nixl::Region {
+            address: source.region.address + piece.source_offset,
+            len,
+            ..source.region
+        },
+        destination: nixl::Region {
+            address: local.address + piece.destination_offset,
+            len,
+            ..local
+        },
+    };
+    agent
+        .read(&source.peer, &[span])
+        .map_err(|error| format!("posting a READ from {}: {error}", source.endpoint))
+}
+
+/// Poll `transfer` until it completed, as the host observes it; returns
+/// why it failed when it did. A READ that failed (another host or the
+/// network failed) fails its task, not the process: no CUDA context took
+/// part in it.
+fn finish(mut transfer: nixl::Transfer) -> Option<String> {
+    loop {
+        match transfer.poll() {
+            Ok(true) => return None,
+            Ok(false) => std::thread::sleep(POLL),
+            Err(error) => return Some(format!("a READ from another host failed: {error}")),
+        }
+    }
+}
+
 /// Wait until `event` completed, as the host observes it.
 fn wait(event: &Event) {
     loop {
@@ -605,7 +782,7 @@ fn wait(event: &Event) {
 
 /// End the process after a device fault: its CUDA contexts are no longer
 /// trusted. The Storage Server fails every task and starts another.
-fn fatal(what: &str, error: &dyn std::fmt::Display) -> ! {
+pub(super) fn fatal(what: &str, error: &dyn std::fmt::Display) -> ! {
     tracing::error!(%error, "the Transfer Server failed {what}; it ends");
     std::process::exit(1)
 }

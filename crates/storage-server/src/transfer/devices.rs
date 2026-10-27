@@ -26,8 +26,8 @@ use cuda::{
 };
 use storage::protocol::{ContextBytes, Link, LinkBandwidth, Memory};
 
-use super::Error;
 use super::memory::HostMap;
+use super::{Error, memory_name};
 
 /// The bytes of one measured copy.
 const SAMPLE_BYTES: usize = 64 << 20;
@@ -227,8 +227,8 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
     };
     for measured in &links {
         tracing::info!(
-            source = %memory_name(measured.link.source),
-            destination = %memory_name(measured.link.destination),
+            source = %memory_name(&measured.link.source),
+            destination = %memory_name(&measured.link.destination),
             gigabytes_per_second = measured.bytes_per_second as f64 / 1e9,
             "measured a link"
         );
@@ -309,12 +309,4 @@ fn rate(bytes: usize, seconds: f64) -> u64 {
         return u64::MAX;
     }
     (bytes as f64 / seconds) as u64
-}
-
-/// A link end's name for the log.
-pub(super) fn memory_name(memory: Memory) -> String {
-    match memory {
-        Memory::Host => "host".into(),
-        Memory::Device { gpu } => cuda::DeviceUuid(gpu).to_string(),
-    }
 }

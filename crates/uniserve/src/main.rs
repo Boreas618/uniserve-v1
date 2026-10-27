@@ -123,7 +123,7 @@ fn main() -> Result<std::process::ExitCode> {
             follow_lifeline(lifeline);
             worker::run(arguments)
         }
-        Command::Storage(args) => return Ok(storage::run(args)),
+        Command::Storage(args) => return Ok(storage::run(*args)),
     };
     if let Some(descriptor) = args.takeover {
         logging::init_tracing(

@@ -24,6 +24,7 @@ use anyhow::Context;
 use storage::connector::Settings;
 use storage::{Client, socket};
 
+use crate::transfer::memory_name;
 use crate::{Launch, Server};
 
 /// How to serve: the arguments of `uniserve storage serve`.
@@ -53,6 +54,9 @@ pub struct ServeOptions {
     /// How long one chunk of the Transfer Server's copies lasts at its
     /// link's bandwidth.
     pub transfer_chunk: Duration,
+    /// NIXL's C API library the Transfer Server's agent loads for copies
+    /// between hosts; the loader's search path finds it when `None`.
+    pub nixl_library: Option<PathBuf>,
     /// Go on with the server the predecessor of a hot restart hands over on
     /// the handoff socket at this descriptor, rather than binding the
     /// socket (`crate::restart`).
@@ -184,8 +188,8 @@ pub fn list(socket: &Path) -> storage::Result<()> {
         for measured in &transfer.links {
             println!(
                 "link {} -> {}: {:.1} GB/s",
-                memory_name(measured.link.source),
-                memory_name(measured.link.destination),
+                memory_name(&measured.link.source),
+                memory_name(&measured.link.destination),
                 measured.bytes_per_second as f64 / 1e9
             );
         }
@@ -203,14 +207,6 @@ pub fn list(socket: &Path) -> storage::Result<()> {
         }
     }
     Ok(())
-}
-
-/// A link end's name in the listing.
-fn memory_name(memory: storage::protocol::Memory) -> String {
-    match memory {
-        storage::protocol::Memory::Host => "host".into(),
-        storage::protocol::Memory::Device { gpu } => cuda::DeviceUuid(gpu).to_string(),
-    }
 }
 
 /// Release the memory of `deployment`, which is no longer served, at the
@@ -336,6 +332,9 @@ fn transfer_launch(options: &ServeOptions) -> Launch {
         "--chunk-us".into(),
         options.transfer_chunk.as_micros().to_string().into(),
     ]);
+    if let Some(library) = &options.nixl_library {
+        command.extend(["--nixl-library".into(), library.as_os_str().to_owned()]);
+    }
     Launch {
         program: program.into(),
         arguments: command,

@@ -219,7 +219,8 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                 | Event::AllocationReleased { .. }
                 | Event::Transfer { .. }
                 | Event::Cancel { .. }
-                | Event::Throttle { .. } => {}
+                | Event::Throttle { .. }
+                | Event::Register { .. } => {}
             }
         }
         let finished = std::mem::take(&mut *lock(&shared.finished));

@@ -64,6 +64,11 @@ pub(crate) enum StorageCommand {
         /// scheduler step.
         #[arg(long, default_value_t = 1000)]
         transfer_chunk_us: u64,
+        /// NIXL's C API library (`libnixl_capi.so`, of the NIXL release
+        /// this build pins) that the Transfer Server loads for copies from
+        /// other hosts; found on the loader's search path when unset.
+        #[arg(long)]
+        nixl_library: Option<PathBuf>,
         /// Go on with the server the predecessor of a hot restart hands over
         /// on the handoff socket at this descriptor (`storage restart`).
         #[arg(long, hide = true)]
@@ -86,6 +91,9 @@ pub(crate) enum StorageCommand {
         /// microseconds.
         #[arg(long)]
         chunk_us: u64,
+        /// NIXL's C API library, for copies from other hosts.
+        #[arg(long)]
+        nixl_library: Option<PathBuf>,
     },
     /// Print the tensors, bytes and deployments the running server holds.
     List {
@@ -178,6 +186,7 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
             tcp,
             mooncake,
             transfer_chunk_us,
+            nixl_library,
             takeover,
         } => mooncake.settings().and_then(|connector| {
             let executable = std::env::current_exe().context("locating this executable")?;
@@ -195,6 +204,7 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
                 ],
                 transfer_command: vec![executable.into(), "storage".into(), "transfer".into()],
                 transfer_chunk: std::time::Duration::from_micros(transfer_chunk_us),
+                nixl_library,
                 takeover,
             })
         }),
@@ -202,10 +212,15 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
             .settings()
             .and_then(|settings| settings.context("the connector needs --mooncake-master"))
             .and_then(|settings| storage_server::run_connector(&socket, &settings)),
-        StorageCommand::Transfer { socket, chunk_us } => storage_server::run_transfer_server(
+        StorageCommand::Transfer {
+            socket,
+            chunk_us,
+            nixl_library,
+        } => storage_server::run_transfer_server(
             &socket,
             &storage_server::transfer::Options {
                 chunk: std::time::Duration::from_micros(chunk_us),
+                nixl_library,
             },
         ),
         StorageCommand::List { socket } => {
