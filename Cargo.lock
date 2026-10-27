@@ -3739,6 +3739,7 @@ dependencies = [
  "rmp-serde",
  "rustix",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "tracing",
