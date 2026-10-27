@@ -17,7 +17,9 @@
 //!   which keeps committed pages in the KV storage (L3).
 //!
 //! The server holds memory and never interprets it: clients compute every
-//! key, define what the bytes mean, and run every device copy.
+//! key and define what the bytes mean. Bytes move on the clients' own
+//! streams, or through the server's Transfer Server, which copies between
+//! the memory the server holds at a client's request.
 
 pub mod client;
 pub mod connector;

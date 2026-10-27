@@ -19,16 +19,16 @@ use storage::{
     Access, Claim, Client, Error, Key, Mode, Placement, Role, Scope, StorageRecord, TensorRecord,
     socket,
 };
-use storage_server::Server;
+use storage_server::{Launch, Server};
 
 /// Held by a test while it starts a child process, and by a test whose
 /// server must see its dropped connections close: a child forked from this
 /// process holds every connection open until it executes its program.
-static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A server on its own socket, stopped when dropped.
-struct Running {
-    socket: PathBuf,
+pub(crate) struct Running {
+    pub(crate) socket: PathBuf,
     /// The loopback address other hosts' heads connect to.
     tcp: String,
     stop: Arc<AtomicBool>,
@@ -39,8 +39,15 @@ struct Running {
 
 impl Running {
     fn start() -> Self {
+        Self::with_transfer(|_| None)
+    }
+
+    /// A server that runs the Transfer Server `transfer` names for its
+    /// socket.
+    pub(crate) fn with_transfer(transfer: impl FnOnce(&Path) -> Option<Launch>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
+        let transfer = transfer(&socket);
         let (listener, lock) = socket::bind(&socket).unwrap().unwrap();
         let mut ends = [0; 2];
         // SAFETY: pipe2 fills the two descriptors it creates.
@@ -56,7 +63,7 @@ impl Running {
         let thread = std::thread::spawn(move || {
             let _lock = lock;
             // Pools of four 16-byte pages.
-            let mut server = Server::new(listener, 64, 0, None).unwrap();
+            let mut server = Server::new(listener, 64, 0, None, transfer).unwrap();
             server.listen_tcp(tcp).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
@@ -84,7 +91,7 @@ impl Drop for Running {
     }
 }
 
-fn scope(group: &str, rank: u32) -> Scope {
+pub(crate) fn scope(group: &str, rank: u32) -> Scope {
     Scope {
         deployment: "model".into(),
         group: group.into(),
@@ -92,11 +99,11 @@ fn scope(group: &str, rank: u32) -> Scope {
     }
 }
 
-fn key(byte: u8) -> Key {
+pub(crate) fn key(byte: u8) -> Key {
     Key([byte; 32])
 }
 
-fn head(socket: &Path) -> Client {
+pub(crate) fn head(socket: &Path) -> Client {
     Client::connect(
         socket,
         Role::Head {
@@ -107,7 +114,7 @@ fn head(socket: &Path) -> Client {
     .unwrap()
 }
 
-fn worker(socket: &Path, scope: Scope, generation: u64, claim: Claim) -> Client {
+pub(crate) fn worker(socket: &Path, scope: Scope, generation: u64, claim: Claim) -> Client {
     Client::connect(
         socket,
         Role::Worker {
@@ -121,7 +128,7 @@ fn worker(socket: &Path, scope: Scope, generation: u64, claim: Claim) -> Client 
 }
 
 /// A memfd holding `bytes`.
-fn memfd(bytes: &[u8]) -> std::fs::File {
+pub(crate) fn memfd(bytes: &[u8]) -> std::fs::File {
     // SAFETY: memfd_create with a static name.
     let fd = unsafe { libc::memfd_create(c"storage-test".as_ptr(), libc::MFD_CLOEXEC) };
     assert!(fd >= 0);
@@ -132,7 +139,7 @@ fn memfd(bytes: &[u8]) -> std::fs::File {
 }
 
 /// The bytes a received storage descriptor holds.
-fn contents(descriptor: OwnedFd) -> Vec<u8> {
+pub(crate) fn contents(descriptor: OwnedFd) -> Vec<u8> {
     let mut file = std::fs::File::from(descriptor);
     file.rewind().unwrap();
     let mut bytes = Vec::new();
@@ -140,7 +147,13 @@ fn contents(descriptor: OwnedFd) -> Vec<u8> {
     bytes
 }
 
-fn tensor(key: Key, name: &str, storage: u32, offset: u64, access: Access) -> TensorRecord {
+pub(crate) fn tensor(
+    key: Key,
+    name: &str,
+    storage: u32,
+    offset: u64,
+    access: Access,
+) -> TensorRecord {
     TensorRecord {
         key,
         name: name.into(),
@@ -153,14 +166,14 @@ fn tensor(key: Key, name: &str, storage: u32, offset: u64, access: Access) -> Te
     }
 }
 
-fn host(bytes: u64) -> StorageRecord {
+pub(crate) fn host(bytes: u64) -> StorageRecord {
     StorageRecord {
         placement: Placement::Host { numa_node: None },
         bytes,
     }
 }
 
-fn server_error(result: Result<impl std::fmt::Debug, Error>) -> ErrorKind {
+pub(crate) fn server_error(result: Result<impl std::fmt::Debug, Error>) -> ErrorKind {
     match result {
         Err(Error::Server { kind, .. }) => kind,
         other => panic!("expected a server error, got {other:?}"),
@@ -626,7 +639,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
 }
 
 /// The next event `client` receives, waiting up to ten seconds.
-fn next_event(client: &mut Client) -> (storage::protocol::Event, Vec<OwnedFd>) {
+pub(crate) fn next_event(client: &mut Client) -> (storage::protocol::Event, Vec<OwnedFd>) {
     for _ in 0..1000 {
         client.pump().unwrap();
         if let Some(event) = client.next_event() {

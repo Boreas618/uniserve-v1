@@ -2725,6 +2725,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                     storage_server::DEFAULT_POOL_BYTES,
                     0,
                     None,
+                    None,
                 )
                 .unwrap();
                 server

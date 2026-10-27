@@ -5,13 +5,14 @@
 //! An operator's [`Request::Restart`] starts the successor (`uniserve
 //! storage serve ... --takeover FD`) with one end of a socket pair at that
 //! descriptor and answers with its process id. The server serves on until
-//! nothing is in flight: no request waits, no shoot-down runs, the connector
-//! runs no task, and every reply was written. It then stops its connector,
-//! and hands the successor its state with every descriptor it holds: the
+//! nothing is in flight: no request waits, no shoot-down runs, neither the
+//! connector nor the Transfer Server runs a task, and every reply was
+//! written. It then stops both, and hands the successor its state with
+//! every descriptor it holds: the
 //! listening sockets and their lock, each client's connection and pidfd,
 //! each storage's memory and each page pool's memfd ([`Server::hand_over`]).
 //! The successor goes on from there ([`Server::resume`]), starts its own
-//! connector, says it serves, and this server exits. A client's request
+//! connector and Transfer Server, says it serves, and this server exits. A client's request
 //! sent meanwhile waits in its connection until the successor reads it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -29,7 +30,8 @@ use storage::transport::{Connection, Socket};
 
 use crate::kv_storage::KvStorage;
 use crate::pages::{HandedPools, Pools};
-use crate::{ClientId, ConnectorLaunch, Deployment, Holder, Server, StorageEntry, TensorEntry};
+use crate::transfers::Transfers;
+use crate::{ClientId, Deployment, Holder, Launch, Server, StorageEntry, TensorEntry};
 use storage::protocol::Retainer;
 
 /// The descriptor a successor finds the handoff socket at.
@@ -210,11 +212,12 @@ impl Server {
     }
 
     /// Whether nothing is in flight: no request waits or is held, no
-    /// shoot-down runs, the connector runs no task, and every reply was
-    /// written.
+    /// shoot-down runs, neither the connector nor the Transfer Server runs a
+    /// task, and every reply was written.
     pub(crate) fn quiescent(&self) -> bool {
         self.shootdowns.pending_pidfds().is_empty()
             && self.kv_storage.tasks.is_empty()
+            && self.transfers.tasks.is_empty()
             && self.events.is_empty()
             && self.clients.values().all(|client| {
                 !client.held && client.queue.is_empty() && !client.connection.wants_write()
@@ -237,8 +240,9 @@ impl Server {
     /// Fails when the handoff socket fails or the successor gives up; the
     /// server's state is gone either way.
     pub fn hand_over(mut self, pending: Pending, lock: OwnedFd) -> io::Result<u32> {
-        // The successor starts a connector of its own.
-        self.kv_storage.stop();
+        // The successor starts a connector and a Transfer Server of its own.
+        self.kv_storage.process.stop();
+        self.transfers.process.stop();
         let mut pidfds = Pidfds::default();
         let mut clients = Vec::with_capacity(self.clients.len());
         let mut client_descriptors = Vec::with_capacity(self.clients.len());
@@ -387,8 +391,9 @@ impl Server {
     }
 
     /// Goes on with the server a predecessor hands over on the handoff
-    /// socket at `descriptor`, running the connector `connector` as the
-    /// predecessor did; returns the server and the listening socket's lock.
+    /// socket at `descriptor`, running the connector `connector` and the
+    /// Transfer Server `transfer` as the predecessor did; returns the server
+    /// and the listening socket's lock.
     ///
     /// # Errors
     ///
@@ -396,7 +401,8 @@ impl Server {
     /// same, and its clients see their connections close.
     pub fn resume(
         descriptor: i32,
-        connector: Option<ConnectorLaunch>,
+        connector: Option<Launch>,
+        transfer: Option<Launch>,
     ) -> io::Result<(Self, OwnedFd)> {
         // SAFETY: the predecessor placed the handoff socket at this
         // descriptor, which nothing else in this process owns.
@@ -417,7 +423,7 @@ impl Server {
         let Message::Takeover(handed) = message else {
             return Err(io::Error::other("the predecessor sent no takeover"));
         };
-        match Self::rebuild(*handed, descriptors, connector) {
+        match Self::rebuild(*handed, descriptors, connector, transfer) {
             Ok(resumed) => {
                 connection.send(&Message::Serving, &[])?;
                 while !connection.flush()? {
@@ -441,7 +447,8 @@ impl Server {
     fn rebuild(
         handed: HandedServer,
         descriptors: Vec<OwnedFd>,
-        connector: Option<ConnectorLaunch>,
+        connector: Option<Launch>,
+        transfer: Option<Launch>,
     ) -> io::Result<(Self, OwnedFd)> {
         let mut descriptors = descriptors.into_iter();
         let mut next = || {
@@ -593,6 +600,7 @@ impl Server {
             pages,
             host_reserve: handed.host_reserve,
             kv_storage: KvStorage::new(connector),
+            transfers: Transfers::new(transfer),
             events: Vec::new(),
             relaunch: handed.relaunch,
             restart: None,
@@ -665,7 +673,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("storage.sock");
         let (listener, lock) = socket::bind(&path).unwrap().unwrap();
-        let server = Server::new(listener, 64, 0, None).unwrap();
+        let server = Server::new(listener, 64, 0, None, None).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(server, Arc::clone(&stop));
 
@@ -724,7 +732,7 @@ mod tests {
         let server = thread.join().unwrap();
         let (ours, theirs) = UnixStream::pair().unwrap();
         let descriptor = theirs.into_raw_fd();
-        let successor = std::thread::spawn(move || Server::resume(descriptor, None).unwrap());
+        let successor = std::thread::spawn(move || Server::resume(descriptor, None, None).unwrap());
         let placeholder = std::process::Command::new("sleep")
             .arg("60")
             .spawn()

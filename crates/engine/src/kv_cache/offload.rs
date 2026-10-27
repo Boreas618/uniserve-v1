@@ -1664,7 +1664,7 @@ mod tests {
             let stopped = Arc::clone(&stop);
             let thread = std::thread::spawn(move || {
                 let _lock = lock;
-                let mut server = Server::new(listener, 64 * 16, 0, None).unwrap();
+                let mut server = Server::new(listener, 64 * 16, 0, None, None).unwrap();
                 server
                     .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                     .unwrap();

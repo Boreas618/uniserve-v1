@@ -39,17 +39,32 @@
 //! on their own streams, at the head's direction. Behind the pools, the
 //! server's Mooncake connector ([`Role::Connector`]) keeps committed pages
 //! in the KV storage (L3) and reads them back for prefetches.
+//!
+//! The server copies no byte itself. Its Transfer Server ([`Role::Transfer`])
+//! copies between the memory the server holds for heads and workers: a
+//! client submits a task of [`Span`]s with a [`Priority`]
+//! ([`Request::Transfer`]), the server resolves each [`Region`] to one of its
+//! allocations and forwards the task, and relays the Transfer Server's
+//! progress and the task's end to the client as events
+//! ([`Event::TransferProgress`], [`Event::Transferred`]). The submitter
+//! keeps a task's sources unchanged and its destinations unread until the
+//! task ends; the Transfer Server reports the end only after it saw every
+//! copy complete on the host.
 
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks: 5 adds worlds (the `world` of a
 /// worker's role and of a claim, and a claim's `retire`); 6 adds the world
 /// of a head's role, whose page requests read and publish that world's
-/// pages.
-pub const VERSION: u32 = 6;
+/// pages; 7 adds transfers (the Transfer Server's role, its requests and
+/// events, and the listing's `transfer`).
+pub const VERSION: u32 = 7;
 
 /// The earliest client version the server serves: a client of version 4
-/// knows no worlds, and its requests act on world 0.
+/// knows no worlds, and its requests act on world 0; a client of version 4
+/// or 5 states no world as a head, which reads and publishes world 0's
+/// pages; a client before version 7 makes no transfer request and reads no
+/// transfer event.
 pub const MIN_VERSION: u32 = 4;
 
 /// A content address: the 32-byte digest of everything that determines a
@@ -131,6 +146,9 @@ pub enum Role {
     },
     /// The Mooncake connector the server runs.
     Connector,
+    /// The Transfer Server the server runs, which copies bytes between the
+    /// memory the server holds.
+    Transfer,
     /// An operator's client, which lists what the server holds and retires
     /// deployments that are no longer served.
     Operator,
@@ -286,8 +304,172 @@ pub enum Mode {
     Standby,
 }
 
+/// Memory a transfer copies from or into, as its client names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Region {
+    /// The storage of the retained tensor `key`, which a scope of the
+    /// caller's deployment holds. Offsets count from the tensor's first
+    /// byte, and a copy may reach every byte of the storage from there (the
+    /// other tensors packed in it included). Only an exclusive tensor is
+    /// written: a read-only tensor is immutable.
+    Tensor { key: Key },
+    /// A live page pool of the caller's deployment; offsets count from slot
+    /// 0, at `slot × page_bytes`.
+    Pool { pool: u64 },
+    /// A device allocation of another host that shares this host's NVLink
+    /// fabric (multi-node NVLink): its 64-byte fabric handle, which the
+    /// process that created the allocation exported, its GPU and size, and
+    /// the byte offsets count from `offset`. The handle imports only while
+    /// that process holds the allocation: CUDA exports no fabric handle
+    /// from an allocation imported through its POSIX descriptor, which is
+    /// how the Storage Server and its Transfer Server hold memory, and a
+    /// fabric handle stops importing once its creator released the
+    /// allocation. Copies import the handle into this host's Transfer
+    /// Server.
+    Fabric {
+        handle: Vec<u8>,
+        gpu: [u8; 16],
+        bytes: u64,
+        offset: u64,
+    },
+}
+
+/// One copy of a transfer: `bytes` bytes from `source_offset` of `source`
+/// to `destination_offset` of `destination`. The spans of a task run in no
+/// fixed order, so no span writes bytes another span of the task reads or
+/// writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub source: Region,
+    pub source_offset: u64,
+    pub destination: Region,
+    pub destination_offset: u64,
+    pub bytes: u64,
+}
+
+/// The order in which the tasks on one link take their turns, highest
+/// first. A link runs a chunk of the highest priority that has one, and the
+/// tasks of one priority in the order they were submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    /// What a world's promotion waits for: the data the in-flight requests
+    /// wrote after the next world's store was warmed.
+    Promotion,
+    /// Warming the next world's store while the executing world runs: the
+    /// pages the in-flight requests filled, copied ahead of the promotion.
+    Warming,
+    /// Weight moves and every other copy no promotion waits for.
+    Background,
+}
+
+impl Priority {
+    /// Every priority, highest first.
+    pub const ORDER: [Priority; 3] = [Priority::Promotion, Priority::Warming, Priority::Background];
+
+    /// The priority's position in [`Self::ORDER`]: 0 is the highest.
+    pub fn rank(self) -> usize {
+        match self {
+            Priority::Promotion => 0,
+            Priority::Warming => 1,
+            Priority::Background => 2,
+        }
+    }
+}
+
+/// One end of a [`Link`]: host memory, or the memory of one GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Memory {
+    Host,
+    /// The GPU with this UUID.
+    Device {
+        gpu: [u8; 16],
+    },
+}
+
+/// The path a copy takes, from the memory it reads to the memory it writes.
+/// The Transfer Server measures each link's bandwidth when it starts, cuts
+/// copies into chunks by it, and keeps a byte budget per link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Link {
+    pub source: Memory,
+    pub destination: Memory,
+}
+
+/// A change of links' byte budgets, which the head of the executing world
+/// makes when its scheduler steps slow down while transfers run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Throttle {
+    /// Halve each link's budget, down to a floor; a restoration under way
+    /// stops.
+    Halve,
+    /// Raise each link's budget back to its bandwidth, gradually.
+    Restore,
+}
+
+/// How a transfer task ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferEnd {
+    /// Every span was copied.
+    Complete,
+    /// The task was cancelled; its destinations hold any part of the spans.
+    Cancelled,
+    /// A span could not be copied, or the Transfer Server ended; its
+    /// destinations hold any part of the spans.
+    Failed { message: String },
+}
+
+/// One allocation of the server's, as the server names it to its Transfer
+/// Server, or an allocation of another host the Transfer Server imports.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Allocation {
+    /// The storage the server numbers `storage`.
+    Storage { storage: u64 },
+    /// The page pool `pool`.
+    Pool { pool: u64 },
+    /// A device allocation of another host of the NVLink fabric, `bytes`
+    /// long, on the GPU `gpu`, by its fabric handle.
+    Fabric {
+        handle: Vec<u8>,
+        gpu: [u8; 16],
+        bytes: u64,
+    },
+}
+
+/// One copy the server gives its Transfer Server: a [`Span`] with its
+/// regions resolved to allocations, and offsets from their first byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Move {
+    pub source: Allocation,
+    pub source_offset: u64,
+    pub destination: Allocation,
+    pub destination_offset: u64,
+    pub bytes: u64,
+}
+
+/// A link's bandwidth as the Transfer Server measured it when it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkBandwidth {
+    pub link: Link,
+    pub bytes_per_second: u64,
+}
+
+/// The device memory the Transfer Server's CUDA context takes on one GPU,
+/// as NVML attributes it to the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBytes {
+    pub gpu: [u8; 16],
+    pub bytes: u64,
+}
+
 /// A client's request. Head requests come from a [`Role::Head`] client and
-/// worker requests from a [`Role::Worker`] client; `List` from any.
+/// worker requests from a [`Role::Worker`] client; `List` from any. The
+/// connector's and the Transfer Server's requests say which they are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
@@ -343,7 +525,8 @@ pub enum Request {
     /// Hand the server to a successor server of `executable` (this
     /// server's own when `None`), which goes on with every connection, the
     /// listening sockets, the tensors' memory and the page pools once no
-    /// request, shoot-down or connector task is in flight (a hot restart);
+    /// request, shoot-down, connector task or transfer is in flight (a hot
+    /// restart);
     /// the server then exits. Answered with the successor's process id
     /// once it started.
     Restart { executable: Option<String> },
@@ -416,6 +599,48 @@ pub enum Request {
     /// [`Event::Upload`] or [`Event::Download`]: one result per page of the
     /// task.
     Finished { task: u64, results: Vec<bool> },
+    /// From a head or a worker: copy `spans` as one task of `update`, which
+    /// takes its turn at `priority` on every link it uses. Answered with the
+    /// task's number at once; [`Event::TransferProgress`] follows as it
+    /// copies and [`Event::Transferred`] when it ends. Refused, copying
+    /// nothing, when no Transfer Server runs, when a region is not memory
+    /// of the caller's deployment, or when a span reaches past its region
+    /// or writes a read-only tensor. A task ends with its submitter's
+    /// connection, cancelled.
+    Transfer {
+        spans: Vec<Span>,
+        priority: Priority,
+        /// The update (world change) the task serves, a number its
+        /// deployment's head chooses; the tasks of an update that aborts
+        /// are cancelled together.
+        update: u64,
+    },
+    /// From a head or a worker: cancel `tasks` and, with `update`, every
+    /// task of that update, of the caller's deployment. Answered at once;
+    /// each task's [`Event::Transferred`] follows once the Transfer Server
+    /// copies none of its bytes any more.
+    Cancel {
+        tasks: Vec<u64>,
+        update: Option<u64>,
+    },
+    /// From a head: halve or restore the byte budget of each of `links`.
+    Throttle {
+        links: Vec<Link>,
+        throttle: Throttle,
+    },
+    /// From the Transfer Server, once after it connected: each link's
+    /// bandwidth and the device memory its CUDA context takes on each GPU.
+    Measured {
+        links: Vec<LinkBandwidth>,
+        contexts: Vec<ContextBytes>,
+    },
+    /// From the Transfer Server: task `task` copied `bytes` so far, and
+    /// ended as `end` when given.
+    Copied {
+        task: u64,
+        bytes: u64,
+        end: Option<TransferEnd>,
+    },
 }
 
 /// Why a request failed.
@@ -434,6 +659,9 @@ pub enum ErrorKind {
     ShootDown,
     /// The server failed to hold or pass a descriptor.
     Resource,
+    /// No Transfer Server is connected: it has not started yet, or it
+    /// ended and the server starts it again.
+    Unavailable,
 }
 
 /// The server's answer to one request.
@@ -496,6 +724,18 @@ pub enum Reply {
         tokens: u64,
     },
     Finished,
+    /// The task a [`Request::Transfer`] submitted.
+    Transferring {
+        task: u64,
+    },
+    /// How many tasks a [`Request::Cancel`] cancelled.
+    Cancelled {
+        tasks: u64,
+    },
+    Throttled,
+    /// The server took a report of its Transfer Server's
+    /// ([`Request::Measured`], [`Request::Copied`]).
+    Noted,
     Error {
         kind: ErrorKind,
         message: String,
@@ -518,6 +758,37 @@ pub struct Listing {
     /// Whether the Mooncake connector is connected.
     #[serde(default)]
     pub connector: bool,
+    /// The Transfer Server, while it is connected.
+    #[serde(default)]
+    pub transfer: Option<ListedTransfer>,
+}
+
+/// The Transfer Server in a [`Listing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedTransfer {
+    /// Its process id.
+    pub pid: i32,
+    /// The links it measured when it started; empty until it reported them.
+    pub links: Vec<LinkBandwidth>,
+    /// The device memory its CUDA context takes on each GPU it uses.
+    pub contexts: Vec<ContextBytes>,
+    /// The tasks it runs.
+    pub tasks: Vec<ListedTask>,
+}
+
+/// One transfer task in a [`Listing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedTask {
+    pub task: u64,
+    pub deployment: String,
+    pub update: u64,
+    pub priority: Priority,
+    /// The bytes of all its spans.
+    pub bytes: u64,
+    /// The bytes copied so far.
+    pub copied: u64,
+    /// Whether it is being cancelled.
+    pub cancelled: bool,
 }
 
 /// One page pool in a [`Listing`].
@@ -587,10 +858,50 @@ pub struct ListedDeployment {
 }
 
 /// A message the server sends outside the answers to requests: the
-/// completion of a head's prefetch, and the connector's work.
+/// completion of a head's prefetch and of a transfer, the connector's work
+/// and the Transfer Server's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
+    /// To a transfer's submitter: task `task` copied `bytes` of its spans
+    /// so far.
+    TransferProgress { task: u64, bytes: u64 },
+    /// To a transfer's submitter: task `task` ended as `end`, having copied
+    /// `bytes`. From then on the Transfer Server reads none of its sources
+    /// and writes none of its destinations.
+    Transferred {
+        task: u64,
+        bytes: u64,
+        end: TransferEnd,
+    },
+    /// To the Transfer Server: an allocation of `bytes` in `memory`, whose
+    /// descriptor travels with the event (a CUDA VMM allocation's POSIX
+    /// handle, or a memfd), before the first task that copies it. It maps
+    /// the allocation for writing when `writable`: a page pool, or a
+    /// storage that holds an exclusive tensor.
+    Allocation {
+        allocation: Allocation,
+        memory: Memory,
+        bytes: u64,
+        writable: bool,
+    },
+    /// To the Transfer Server: the server released the allocation; it
+    /// unmaps it once no task copies it.
+    AllocationReleased { allocation: Allocation },
+    /// To the Transfer Server: copy `moves` as task `task` at `priority`,
+    /// and report with [`Request::Copied`].
+    Transfer {
+        task: u64,
+        priority: Priority,
+        moves: Vec<Move>,
+    },
+    /// To the Transfer Server: cancel task `task`.
+    Cancel { task: u64 },
+    /// To the Transfer Server: change the budgets of `links`.
+    Throttle {
+        links: Vec<Link>,
+        throttle: Throttle,
+    },
     /// To a head: the prefetch `tag` ended. `results[i]` is whether the pool
     /// holds the page of the prefetch's key `i`.
     Prefetched { tag: u64, results: Vec<bool> },

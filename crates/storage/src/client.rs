@@ -13,8 +13,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use crate::protocol::{
-    Claim, ClientMessage, ErrorKind, Event, Hello, Key, Listing, Mode, Reply, Request, Role, Scope,
-    ServerMessage, StorageRecord, TensorRecord, VERSION, Welcome,
+    Claim, ClientMessage, ErrorKind, Event, Hello, Key, Link, Listing, Mode, Priority, Reply,
+    Request, Role, Scope, ServerMessage, Span, StorageRecord, TensorRecord, Throttle, VERSION,
+    Welcome,
 };
 use crate::transport::Connection;
 
@@ -351,6 +352,36 @@ impl Client {
         match Self::expect(self.call(&Request::Retire { deployment }, &[])?)?.reply {
             Reply::Retired { released } => Ok(released),
             other => Err(unexpected("retire", &other)),
+        }
+    }
+
+    /// See [`Request::Transfer`]. Returns the task, whose progress and end
+    /// arrive as events.
+    pub fn transfer(&mut self, spans: Vec<Span>, priority: Priority, update: u64) -> Result<u64> {
+        let request = Request::Transfer {
+            spans,
+            priority,
+            update,
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
+            Reply::Transferring { task } => Ok(task),
+            other => Err(unexpected("transfer", &other)),
+        }
+    }
+
+    /// See [`Request::Cancel`]. Returns how many tasks were cancelled.
+    pub fn cancel(&mut self, tasks: Vec<u64>, update: Option<u64>) -> Result<u64> {
+        match Self::expect(self.call(&Request::Cancel { tasks, update }, &[])?)?.reply {
+            Reply::Cancelled { tasks } => Ok(tasks),
+            other => Err(unexpected("cancel", &other)),
+        }
+    }
+
+    /// See [`Request::Throttle`].
+    pub fn throttle(&mut self, links: Vec<Link>, throttle: Throttle) -> Result<()> {
+        match Self::expect(self.call(&Request::Throttle { links, throttle }, &[])?)?.reply {
+            Reply::Throttled => Ok(()),
+            other => Err(unexpected("throttle", &other)),
         }
     }
 
