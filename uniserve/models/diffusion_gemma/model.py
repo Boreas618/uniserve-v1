@@ -43,6 +43,8 @@ class Model(nn.Module):
     callers substitute for the image placeholder embeddings of a prompt.
     """
 
+    function = "models.diffusion_gemma.model.Model/1"
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config

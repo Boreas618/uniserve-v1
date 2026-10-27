@@ -43,6 +43,8 @@ def video_clips(num_frames: int) -> tuple[slice, ...]:
 class VideoPostprocessor(BaseVideoPostprocessor):
     """Remove H3's three-frame decoder padding and cross-fade five-frame overlaps."""  # noqa: E501
 
+    function = "models.minimax_h3.output.VideoPostprocessor/1"
+
     def __init__(self, *, frame_rate: int):
         # Weight of the current clip across the five overlap frames: 0, 0.2,
         # ..., 0.8, so the first blended frame is entirely the predecessor's.

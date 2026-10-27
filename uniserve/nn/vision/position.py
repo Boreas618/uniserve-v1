@@ -146,6 +146,8 @@ def merged_grid_coordinates(
 class PositionEmbedding(nn.Module):
     """Learned position rows indexed on a fixed two-dimensional grid."""
 
+    function = "nn.vision.position.PositionEmbedding/1"
+
     def __init__(self, grid_size: tuple[int, int], hidden_size: int):
         super().__init__()
         if len(grid_size) != 2 or any(

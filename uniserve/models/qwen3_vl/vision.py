@@ -49,6 +49,8 @@ ROPE_THETA = 10_000.0
 class Attention(nn.Module):
     """Bidirectional rotary attention within each patch sequence."""
 
+    function = "models.qwen3_vl.vision.Attention/1"
+
     def __init__(self, config: VisionConfig):
         super().__init__()
         heads, width = config.num_heads, config.head_dim
@@ -86,6 +88,8 @@ class Attention(nn.Module):
 class TransformerLayer(nn.Module):
     """Pre-norm attention and MLP, each added to the residual stream."""
 
+    function = "models.qwen3_vl.vision.TransformerLayer/1"
+
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.input_norm = nn.LayerNorm(config.hidden_size, eps=LAYER_NORM_EPS)
@@ -117,6 +121,8 @@ class PatchMerger(nn.Module):
     concatenation; DeepStack mergers normalize the concatenated row.
     """
 
+    function = "models.qwen3_vl.vision.PatchMerger/1"
+
     def __init__(self, config: VisionConfig, *, normalize_merged: bool):
         super().__init__()
         self.width = config.hidden_size * config.spatial_merge_size**2
@@ -142,6 +148,8 @@ class PatchMerger(nn.Module):
 
 class VisionTower(nn.Module):
     """Encode packed image and video patches into language-width tokens."""
+
+    function = "models.qwen3_vl.vision.VisionTower/1"
 
     def __init__(self, config: VisionConfig):
         super().__init__()

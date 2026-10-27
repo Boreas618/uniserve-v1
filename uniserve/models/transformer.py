@@ -65,6 +65,8 @@ class PhasedLayer(nn.Module):
     final layer without them runs whole.
     """
 
+    function = "models.transformer.PhasedLayer/1"
+
     def forward(self, hidden, residual, positions, attention):
         """Compose token-mixing attention and the per-token remainder."""
         return self.feed_forward(
@@ -116,6 +118,8 @@ class TransformerDecoder(nn.Module):
     alone. Every other layer, and every layer of an earlier pipeline stage,
     runs whole.
     """
+
+    function = "models.transformer.TransformerDecoder/1"
 
     # Pipeline binding drops the embedding outside the first stage and the
     # output norm outside the last one.
@@ -449,6 +453,8 @@ class _Traversal:
 
 class TransformerEncoder(nn.Module):
     """Evaluate ordinary encoder layers over the same packed sequence domain."""
+
+    function = "models.transformer.TransformerEncoder/1"
 
     def __init__(self, layers: nn.ModuleList, norm: nn.Module):
         super().__init__()

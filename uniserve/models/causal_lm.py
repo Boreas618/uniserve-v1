@@ -14,6 +14,8 @@ from .transformer import TransformerDecoder
 class CausalLM(nn.Module):
     """Compose embedding replacement, a decoder, and a vocabulary head."""
 
+    function = "models.causal_lm.CausalLM/1"
+
     # Pipeline binding drops the head outside the last stage.
     lm_head: nn.Module | None
 

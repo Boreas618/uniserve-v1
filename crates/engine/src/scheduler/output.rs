@@ -1676,6 +1676,7 @@ impl Scheduler {
         let visible = state.cache_visible_len as usize;
         let cache_write = state.req.cache.write;
         let isolation_key = state.req.cache.isolation_key;
+        let scope = crate::kv_cache::PrefixScope::of(&state.req.cache);
         // Past its prompt, the cache of a request that generates text alone
         // holds the tokens it generated here (a migrated request's earlier
         // ones end its prompt), each written by the decode that reads it:
@@ -1708,7 +1709,7 @@ impl Scheduler {
         if !generated.is_empty() && !hashes.is_empty() {
             prefix_cache
                 .coordinator
-                .extend_hashes(&mut hashes, tokens, isolation_key);
+                .extend_hashes(&mut hashes, tokens, scope);
             if let Some((kv_offload, worker)) = kv_offload.as_ref()
                 && !page_keys.is_empty()
             {

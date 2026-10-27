@@ -36,6 +36,8 @@ from .config import Config, TransformerConfig
 class Attention(nn.Module):
     """Multi-head self-attention over a variable-length patch sequence."""
 
+    function = "models.siglip.encoder.Attention/1"
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         heads = config.num_attention_heads
@@ -68,6 +70,8 @@ class Attention(nn.Module):
 class TransformerLayer(nn.Module):
     """Pre-norm attention and GELU MLP with residual connections."""
 
+    function = "models.siglip.encoder.TransformerLayer/1"
+
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.input_norm = nn.LayerNorm(
@@ -96,6 +100,8 @@ class TransformerLayer(nn.Module):
 
 class Encoder(nn.Module):
     """Encode canonical HWC patch rows with separate attention per image."""
+
+    function = "models.siglip.encoder.Encoder/1"
 
     def __init__(self, config: Config):
         super().__init__()

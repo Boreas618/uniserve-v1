@@ -48,6 +48,8 @@ class PatchEmbedder(nn.Module):
     embeds a patch's column index, row 1 its row index.
     """
 
+    function = "models.diffusion_gemma.vision.PatchEmbedder/1"
+
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.projection = Linear(
@@ -78,6 +80,8 @@ class Attention(nn.Module):
     an unweighted one. The first half of every head rotates by the patch
     column and the second half by its row.
     """
+
+    function = "models.diffusion_gemma.vision.Attention/1"
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -134,6 +138,8 @@ class Attention(nn.Module):
 class EncoderLayer(nn.Module):
     """Gemma sandwich-normalized attention and tanh-GELU gated MLP."""
 
+    function = "models.diffusion_gemma.vision.EncoderLayer/1"
+
     def __init__(self, config: VisionConfig):
         super().__init__()
         size, eps = config.hidden_size, config.rms_norm_eps
@@ -164,6 +170,8 @@ class VisionTransformer(nn.Module):
     Each spatial axis rotates ``head_dim / 2`` channels with the default
     frequencies of that width. The stack has no final norm.
     """
+
+    function = "models.diffusion_gemma.vision.VisionTransformer/1"
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -207,6 +215,8 @@ class Pooler(nn.Module):
     has one shape for every packing of the same number of patch rows.
     """
 
+    function = "models.diffusion_gemma.vision.Pooler/1"
+
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.kernel_size = config.pooling_kernel_size
@@ -243,6 +253,8 @@ class Pooler(nn.Module):
 
 class Encoder(nn.Module):
     """Encode the patches of one or more images into pooled soft tokens."""
+
+    function = "models.diffusion_gemma.vision.Encoder/1"
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -347,6 +359,8 @@ class Encoder(nn.Module):
 
 class Embedder(nn.Module):
     """Project soft tokens to the text width after an unweighted RMS norm."""
+
+    function = "models.diffusion_gemma.vision.Embedder/1"
 
     def __init__(self, config: VisionConfig, text_hidden_size: int):
         super().__init__()

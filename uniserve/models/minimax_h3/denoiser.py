@@ -209,6 +209,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     numerical attention input and never represents a second computation batch.
     """
 
+    function = "models.minimax_h3.denoiser.Denoiser/1"
+
     def __init__(self, config: DenoiserConfig):
         super().__init__(
             modalities=("video", "audio"),

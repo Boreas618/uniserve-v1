@@ -13,6 +13,8 @@ from uniserve.nn.linear import Linear
 class PatchEmbed(nn.Module):
     """Project NCHW pixels into non-overlapping spatial token rows."""
 
+    function = "nn.vision.modules.PatchEmbed/1"
+
     def __init__(
         self,
         in_channels: int,
@@ -43,6 +45,8 @@ class TubeletEmbed(nn.Module):
     patch_size]`` of the checkpoints. Their convolution kernel equals its
     stride, so one matrix product over the flattened tubelets evaluates it.
     """
+
+    function = "nn.vision.modules.TubeletEmbed/1"
 
     def __init__(
         self,
@@ -91,6 +95,8 @@ class TubeletEmbed(nn.Module):
 
 class MLPConnector(nn.Module):
     """Map vision features to language width through a two-layer MLP."""
+
+    function = "nn.vision.modules.MLPConnector/1"
 
     def __init__(
         self,

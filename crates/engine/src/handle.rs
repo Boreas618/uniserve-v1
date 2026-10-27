@@ -491,13 +491,18 @@ pub enum Command {
     /// that resumes from its generated tokens as migratable, lets the
     /// others finish, and answers with the prefix cache index once nothing
     /// runs; it executes nothing more until resumed.
-    Park(crossbeam_channel::Sender<Result<Vec<crate::kv_cache::IndexedPage>, String>>),
+    Park(crossbeam_channel::Sender<Result<crate::scheduler::ParkedCache, String>>),
     /// Resumes a parked scheduler, and answers whether it did.
     Resume(crossbeam_channel::Sender<Result<(), String>>),
     /// Promotes a successor scheduler (`Scheduler::promote`): imports its
-    /// predecessor's prefix cache index, and answers with the outcome.
+    /// predecessor's prefix cache index, once its cache holds the requests
+    /// the predecessor hands over (which `recompute` from their tokens or
+    /// not, while it `grows` into the predecessor's memory at once or not),
+    /// and answers with the outcome.
     Promote {
-        index: Vec<crate::kv_cache::IndexedPage>,
+        cache: crate::scheduler::ParkedCache,
+        recompute: bool,
+        grows: bool,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Commits a successor scheduler (`Scheduler::commit`), and answers
@@ -698,10 +703,11 @@ impl CommandSender {
     }
 
     /// Parks the scheduler (`Command::Park`); the receiver gets its
-    /// prefix cache index once it parked, or why it did not.
+    /// prefix cache index and what its migrating requests held once it
+    /// parked, or why it did not.
     pub fn park(
         &self,
-    ) -> crossbeam_channel::Receiver<Result<Vec<crate::kv_cache::IndexedPage>, String>> {
+    ) -> crossbeam_channel::Receiver<Result<crate::scheduler::ParkedCache, String>> {
         let (answer, parked) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Park(answer));
         parked
@@ -715,14 +721,21 @@ impl CommandSender {
         resumed
     }
 
-    /// Promotes a successor scheduler with its predecessor's prefix cache
-    /// index (`Command::Promote`); the receiver gets the outcome.
+    /// Promotes a successor scheduler with what its predecessor parked
+    /// with (`Command::Promote`); the receiver gets the outcome.
     pub fn promote(
         &self,
-        index: Vec<crate::kv_cache::IndexedPage>,
+        cache: crate::scheduler::ParkedCache,
+        recompute: bool,
+        grows: bool,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, promoted) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Promote { index, answer });
+        let _ = self.send(Command::Promote {
+            cache,
+            recompute,
+            grows,
+            answer,
+        });
         promoted
     }
 

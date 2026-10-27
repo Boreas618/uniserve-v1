@@ -30,6 +30,8 @@ class Model(nn.Module):
     denoisers condition on.
     """
 
+    function = "models.minimax_h3.model.Model/1"
+
     transformer: Denoiser | None
     transformer_ref: Denoiser | None
 

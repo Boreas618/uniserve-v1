@@ -35,7 +35,7 @@ import torch
 from torch import nn
 
 from uniserve import loading as library
-from uniserve import plugins
+from uniserve import numerics, plugins
 from uniserve.distributed import Communicator, communication_axes
 from uniserve.errors import SetupError
 from uniserve.loading import retained as retention
@@ -372,6 +372,14 @@ def _expert_kernels(
     return "split" if attention_ranks else "megamoe"
 
 
+def identity(loaded: Loaded) -> str:
+    """The identity of what a rank's loaded model computes
+    (``uniserve.numerics.identity`` of its whole model), which keys the
+    cache pages its forwards write.
+    """  # noqa: D205
+    return numerics.identity(loaded.root)
+
+
 def fingerprint(
     description: Description,
     modules: Sequence[str],
@@ -381,15 +389,12 @@ def fingerprint(
     expert_exchange: str | None,
     attention_ranks: int,
     weights: str | None = None,
-    numerics: str | None = None,
 ) -> str:
     """The digests of what determines this rank's loaded weights.
 
     Placement and GPUs aside (``uniserve.loading.retained.fingerprints``),
-    as JSON text; the arguments are those of :func:`load_model`, and
-    ``numerics`` the digest of the code the weights were loaded with (empty
-    for the code loaded so far). Empty for the stub model, whose weights
-    are not retained.
+    as JSON text; the arguments are those of :func:`load_model`. Empty for
+    the stub model, whose weights are not retained.
     """
     resolved = _resolve(
         description,
@@ -408,7 +413,6 @@ def fingerprint(
             description.io,
             str(model_dtype),
             kernels,
-            _text(numerics) or None,
         ),
         sort_keys=True,
     )

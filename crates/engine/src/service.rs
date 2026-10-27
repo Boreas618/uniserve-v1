@@ -797,11 +797,12 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
             let mut error = String::new();
             for (group, answer) in answers {
                 match answer.recv() {
-                    Ok(Ok(pages)) => {
+                    Ok(Ok(parked)) => {
                         if let Some(group) = group {
                             index.push(wire::GroupIndex {
                                 worker_group: group,
-                                pages: pages
+                                pages: parked
+                                    .pages
                                     .into_iter()
                                     .map(|page| wire::IndexedPage {
                                         group: page.group,
@@ -810,6 +811,8 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
                                         units: page.units,
                                     })
                                     .collect(),
+                                held_units: parked.held_units,
+                                requests: parked.requests,
                             });
                         }
                     }
@@ -1285,6 +1288,13 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
             .unwrap_or(u32::MAX),
         }),
         segments: describe(&schedulers)?,
+        prefix_seed: crate::kv_cache::prefix_seed(
+            first
+                .info()
+                .prefix_cache
+                .as_ref()
+                .map_or("", |cache| cache.identity.as_str()),
+        ),
     };
     // A successor prepared beside its predecessor serves once the daemon
     // promotes it, with the predecessor's prefix cache index.
@@ -1295,24 +1305,25 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
             String::new(),
         ))?;
         tracing::info!(engine, world = spec.world, "the engine is prepared");
-        let Some(index) = await_promotion(&mut reader)? else {
+        let Some(promote) = await_promotion(&mut reader)? else {
             tracing::info!(engine, "the daemon shut the prepared engine down");
             SchedulerHandle::shutdown_all(&schedulers);
             return Ok(());
         };
-        // Every scheduler promotes at once, each with the index of the
-        // predecessor's scheduler over the same worker group.
+        let (index, recompute, grows) = (&promote.index, promote.recompute, promote.grows);
+        // Every scheduler promotes at once, each with what the predecessor's
+        // scheduler over the same worker group parked with.
         let promoted = std::thread::scope(|scope| {
             let promoting: Vec<_> = schedulers
                 .iter()
                 .map(|scheduler| {
-                    let pages = scheduler
+                    let parked = scheduler
                         .cache_group()
                         .and_then(|group| {
                             index.iter().find(|indexed| indexed.worker_group == group)
                         })
-                        .map(|indexed| {
-                            indexed
+                        .map(|indexed| crate::scheduler::ParkedCache {
+                            pages: indexed
                                 .pages
                                 .iter()
                                 .map(|page| crate::kv_cache::IndexedPage {
@@ -1321,10 +1332,12 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
                                     tokens: page.tokens.clone(),
                                     units: page.units.clone(),
                                 })
-                                .collect()
+                                .collect(),
+                            held_units: indexed.held_units,
+                            requests: indexed.requests,
                         })
                         .unwrap_or_default();
-                    scope.spawn(move || scheduler.promote(pages))
+                    scope.spawn(move || scheduler.promote(parked, recompute, grows))
                 })
                 .collect();
             let mut outcome = Ok(());
@@ -1366,7 +1379,7 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
 /// predecessor's prefix cache index once it promotes the engine, `None` once
 /// it shuts the engine down or closes the connection. A prepared engine is
 /// submitted nothing.
-fn await_promotion(reader: &mut Connection) -> anyhow::Result<Option<Vec<wire::GroupIndex>>> {
+fn await_promotion(reader: &mut Connection) -> anyhow::Result<Option<wire::Promote>> {
     loop {
         let message = match reader.try_recv::<wire::ToEngine>() {
             Ok(Some(message)) => message,
@@ -1380,7 +1393,7 @@ fn await_promotion(reader: &mut Connection) -> anyhow::Result<Option<Vec<wire::G
         match message.kind {
             Some(to_engine::Kind::Engine(command)) => match command.kind {
                 Some(wire::engine_command::Kind::Promote(promote)) => {
-                    return Ok(Some(promote.index));
+                    return Ok(Some(promote));
                 }
                 Some(wire::engine_command::Kind::Shutdown(_)) => return Ok(None),
                 // The daemon addresses a serving engine's other commands.

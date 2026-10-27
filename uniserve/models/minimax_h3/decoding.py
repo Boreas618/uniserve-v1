@@ -44,6 +44,8 @@ class VideoDecoder(BaseVideoDecoder):
     video row order.
     """
 
+    function = "models.minimax_h3.decoding.VideoDecoder/1"
+
     def __init__(self, config: video_vae.Config, *, attention: Attention):
         super().__init__(video_vae.Model(config))
         self.config = config
@@ -144,6 +146,8 @@ class VideoDecoder(BaseVideoDecoder):
 
 class AudioDecoder(BaseAudioDecoder):
     """Convert H3 channel-major latents to interleaved stereo PCM."""
+
+    function = "models.minimax_h3.decoding.AudioDecoder/1"
 
     def __init__(self, config: audio_vae.Config, *, sample_rate: int):
         super().__init__(audio_vae.Model(config), sample_rate=sample_rate)

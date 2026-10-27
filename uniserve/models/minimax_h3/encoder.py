@@ -110,6 +110,8 @@ class TextEncoder(qwen3_vl.TextEncoder):
     representation.
     """
 
+    function = "models.minimax_h3.encoder.TextEncoder/1"
+
     def __init__(self, config: TextEncoderConfig):
         network = qwen3.Transformer(
             qwen3.Config(

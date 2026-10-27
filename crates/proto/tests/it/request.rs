@@ -85,6 +85,7 @@ fn generation() -> GenerationRequest {
             read: false,
             write: true,
             isolation_key: Some(99),
+            state_seed: Some(7),
         },
         include_stop_token: true,
         image_generation: ImageGenerationConfig {

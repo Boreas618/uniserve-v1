@@ -34,6 +34,8 @@ class Encoder(nn.Module, Generic[InputT]):
     calls independently within each sample, as ordinary batched modules do.
     """
 
+    function = "models.encoder.Encoder/1"
+
     def __init__(self, network: nn.Module):
         super().__init__()
         self.network = network
@@ -80,6 +82,8 @@ class TextConditioner(Encoder[tuple[torch.Tensor, ...]]):
     them; the outputs of padding rows are unspecified. The network receives
     stacked samples ``[samples, rows, width]`` and their lengths or None.
     """
+
+    function = "models.encoder.TextConditioner/1"
 
     def encode(
         self,
@@ -143,6 +147,8 @@ class PatchEncoder(Encoder[VisionInput]):
     and segments. ``max_slots`` bounds the images, and so the activations,
     of one packed call; a larger batch runs in groups of that many.
     """
+
+    function = "models.encoder.PatchEncoder/1"
 
     def __init__(
         self,
@@ -367,6 +373,8 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
     encoder, in execution order. Output normalization belongs to the supplied
     network; an Identity norm exposes its unnormalized final residual stream.
     """
+
+    function = "models.encoder.TextEncoder/1"
 
     network: TransformerDecoder
 
@@ -634,6 +642,8 @@ class VideoEncoder(nn.Module):
     Inputs remain borrowed; results are new tensors.
     """
 
+    function = "models.encoder.VideoEncoder/1"
+
     row_group: int = 1
 
     def __init__(self, encoder: LatentEncoder):
@@ -900,6 +910,8 @@ class AudioEncoder(nn.Module):
     output rows. Inputs carry ``sample_rate`` samples per second and remain
     borrowed; results are new tensors.
     """
+
+    function = "models.encoder.AudioEncoder/1"
 
     def __init__(self, encoder: LatentEncoder, *, sample_rate: int):
         super().__init__()

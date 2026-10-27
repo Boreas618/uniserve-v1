@@ -222,6 +222,13 @@ def _stop_storage_server(socket: Path) -> None:
             os.kill(int(entry.name), signal.SIGTERM)
 
 
+def _device() -> str:
+    """The GPU a one-GPU deployment serves on (``UNISERVE_WORLD_DEVICE``,
+    0 by default), so that cases run beside each other on other GPUs.
+    """  # noqa: D205
+    return os.environ.get("UNISERVE_WORLD_DEVICE", "0")
+
+
 def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
     """The devices and extra options of a deployment.
 
@@ -230,7 +237,7 @@ def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
     exchanging through DeepEP.
     """
     if topology == "single":
-        return "0", ()
+        return _device(), ()
     if topology == "experts":
         return "0,1", (
             "--data-parallel-size",
@@ -252,7 +259,7 @@ def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
 def _serve(
     tmp_path: Path,
     name: str,
-    devices: str = "0",
+    devices: str | None = None,
     options: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
 ) -> Iterator[tuple[str, Path]]:
@@ -278,7 +285,7 @@ def _serve(
     command += options
     log = tmp_path / "server.log"
     environment = {
-        "CUDA_VISIBLE_DEVICES": devices,
+        "CUDA_VISIBLE_DEVICES": devices or _device(),
         "XDG_RUNTIME_DIR": str(runtime),
         **(env or {}),
     }
@@ -600,6 +607,119 @@ def test_an_operator_rollback_resumes_the_previous_world(
         )
         == 1
     ), "a world read the checkpoint again rather than the retained weights"
+
+
+# The plugin of a release that revised what the normalization computes: the
+# next world declares another revision of it, while the arithmetic stays as
+# it was, so the requests a world change moves compute the same tokens
+# however they continue.
+REVISION_PLUGIN = """
+from uniserve.nn.norm import RMSNorm
+
+
+def register(registry):
+    RMSNorm.function = "nn.norm.RMSNorm/2"
+"""
+
+
+def _prefix_hits(base_url: str) -> float:
+    """The prefix cache hits every world counted so far
+    (``uniserve:prefix_cache_hits``).
+    """  # noqa: D205
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith("uniserve:prefix_cache_hits")
+    )
+
+
+@pytest.mark.parametrize(
+    ("in_flight", "previous_world"),
+    [("keep", "parked"), ("keep", "weights"), ("recompute", "parked")],
+)
+def test_a_world_of_other_numerics_continues_the_requests_in_flight(
+    tmp_path: Path, in_flight: str, previous_world: str
+):
+    """A request kept continues on the pages of the state it reached, the
+    previous world kept parked or as its weights. A request recomputed
+    computes them again in the successor's own segments, which hold its
+    head alone until the commit gives it the previous world's: a change
+    whose requests in flight need more is refused, and the serving world
+    serves on.
+    """  # noqa: D205
+    name = "qwen3-world-numerics"
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    environment = {
+        "PYTHONPATH": os.pathsep.join(
+            [str(plugins), *filter(None, [os.environ.get("PYTHONPATH")])]
+        )
+    }
+    with _serve(tmp_path, name, env=environment) as (base_url, log):
+        cached = _chat(base_url, name, CACHED_PROMPT)
+        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+
+        # The next world's processes import the release; the serving
+        # world's do not.
+        package = plugins / "uniserve_revision_plugin"
+        package.mkdir()
+        (package / "__init__.py").write_text(REVISION_PLUGIN)
+        metadata = plugins / "uniserve_revision_plugin-1.0.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: uniserve-revision-plugin\n"
+            "Version: 1.0\n"
+        )
+        (metadata / "entry_points.txt").write_text(
+            "[uniserve.plugins]\nrevision = uniserve_revision_plugin:register\n"
+        )
+        hits = _prefix_hits(base_url)
+        response = httpx.put(
+            f"{base_url}/admin/config",
+            json={
+                "set": [
+                    CHANGE,
+                    f"update_config.previous_world={previous_world}",
+                ],
+                "in_flight": in_flight,
+            },
+            timeout=1800,
+        )
+        if (in_flight, previous_world) == ("recompute", "parked"):
+            assert response.status_code == 500, response.text
+            assert "free units" in response.text, response.text
+            assert _config(base_url)["slots"][0] == serving
+            streaming.join()
+            reference, reference_usage = _ask(base_url, name)
+            assert streaming.tokens == reference
+            assert streaming.usage == reference_usage
+            return
+        assert response.status_code == 200, response.text
+        report = response.json()["result"]["world"]
+        assert report["numerics"] == "changed", report
+        assert report["in_flight"] == in_flight, report
+        streaming.wait_for(len(streaming.tokens) + 64)
+        assert _admin(base_url, "config/commit").status_code == 200
+        streaming.join()
+
+        migrated = _prefix_hits(base_url) - hits
+        print(f"{in_flight}: the migrated request hit {migrated:.0f} tokens")
+        if in_flight == "keep":
+            assert migrated >= EARLY_TOKENS, migrated
+        else:
+            assert migrated == 0, migrated
+
+        # A request after the change hits no page of the earlier numerics.
+        before = _prefix_hits(base_url)
+        assert _chat(base_url, name, CACHED_PROMPT) == cached
+        assert _prefix_hits(base_url) == before
+
+        reference, reference_usage = _ask(base_url, name)
+        assert streaming.tokens == reference
+        assert streaming.usage == reference_usage
 
 
 # The faults the world on trial meets, by the hook that arms each, and the

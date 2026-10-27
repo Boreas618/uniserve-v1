@@ -31,6 +31,8 @@ class TransformerLayer(MoTLayer):
     accumulation is higher precision.
     """
 
+    function = "models.bagel.transformer.TransformerLayer/1"
+
     def __init__(self, config: TransformerConfig, index: int):
         hidden, dim = config.hidden_size, config.head_dim
 
@@ -94,6 +96,8 @@ class TransformerLayer(MoTLayer):
 
 class Transformer(MoTDecoder):
     """Stack routed MoT layers over a shared embedding with per-route norms."""
+
+    function = "models.bagel.transformer.Transformer/1"
 
     def __init__(self, config: TransformerConfig):
         super().__init__(

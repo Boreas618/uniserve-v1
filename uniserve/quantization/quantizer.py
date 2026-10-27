@@ -25,6 +25,15 @@ if TYPE_CHECKING:
     from uniserve.distributed import Distribution
 
 
+# The revision of what each encoding's quantizer computes from a value: its
+# scales and its encoded fields (`uniserve.numerics.loading`).
+FUNCTIONS: dict[str, str] = {
+    "fp8": "quantization.fp8/1",
+    "mxfp8": "quantization.mxfp8/1",
+    "nvfp4": "quantization.nvfp4/1",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class Quantizer:
     """Convert a complete logical statistical domain to one supported encoding.

@@ -20,6 +20,8 @@ class GatedMLP(nn.Module):
     takes none.
     """  # noqa: D205
 
+    function = "nn.mlp.GatedMLP/1"
+
     activation: SiLUAndMul | GELUAndMul
 
     def __init__(

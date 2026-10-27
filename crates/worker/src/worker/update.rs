@@ -40,10 +40,10 @@ pub(crate) struct WeightUpdate {
     pub(crate) storages: Vec<Arc<Storage>>,
     /// Their keys; `None` for weights the rank does not retain.
     pub(crate) keys: Option<WeightKeys>,
-    /// The digest of the code the rank loaded its weights with, which the
-    /// keys of the rewritten weights cover too: a new process computes the
-    /// same digest before it loads, and binds them.
-    pub(crate) numerics: Option<String>,
+    /// The identity of what the model's forwards compute
+    /// (`weights::model_identity`), which keys its cache pages with the
+    /// rewritten weights' fingerprint.
+    pub(crate) identity: String,
 }
 
 impl WeightUpdate {
@@ -123,8 +123,7 @@ impl WeightUpdate {
             model.weights = None;
         }
         let description = Description::describe(&launch)?;
-        let fingerprints =
-            LoadedModel::fingerprint(&description, &launch, self.numerics.as_deref())?;
+        let fingerprints = LoadedModel::fingerprint(&description, &launch)?;
         if let (Some(keys), Some(fingerprints)) = (&self.keys, &fingerprints) {
             let devices: Vec<DeviceId> = launch
                 .execution
@@ -146,13 +145,17 @@ impl WeightUpdate {
         self.launch = launch;
         let contents: Vec<String> = match (plan, &fingerprints) {
             (Some(plan), Some(fingerprints)) if host_cache => {
-                page_contents(plan, &fingerprints.pages()?)
+                page_contents(plan, &fingerprints.pages(&self.identity))
                     .iter()
                     .map(|content| content.iter().map(|byte| format!("{byte:02x}")).collect())
                     .collect()
             }
             _ => Vec::new(),
         };
-        Ok(serde_json::json!({ "group": group, "page_contents": contents }))
+        // The identity that roots the device pages' hash chains from now on.
+        let identity = fingerprints
+            .as_ref()
+            .map(|fingerprints| fingerprints.pages(&self.identity));
+        Ok(serde_json::json!({ "group": group, "page_contents": contents, "identity": identity }))
     }
 }

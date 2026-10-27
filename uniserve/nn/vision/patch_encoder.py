@@ -23,6 +23,8 @@ class PatchEncoder(nn.Module):
     this module does not deliver tensors between devices.
     """  # noqa: D205
 
+    function = "nn.vision.patch_encoder.PatchEncoder/1"
+
     def __init__(
         self,
         encoder: nn.Module,

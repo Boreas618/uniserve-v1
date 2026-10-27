@@ -13,6 +13,8 @@ from uniserve.nn.norm import RMSNorm
 class QKVProjection(nn.Module):
     """Project named branches and reshape their TP-local head dimensions."""
 
+    function = "nn.attention.projection.QKVProjection/1"
+
     def __init__(self, projection: QKVParallelLinear):
         super().__init__()
         self.projection = projection
@@ -46,6 +48,8 @@ class QKVProjection(nn.Module):
 
 class RotaryQKVProjection(QKVProjection):
     """Normalize Q/K heads and rotate them with one split-half factor pair."""
+
+    function = "nn.attention.projection.RotaryQKVProjection/1"
 
     def __init__(self, projection, query_norm: nn.Module, key_norm: nn.Module):
         super().__init__(projection)
@@ -91,6 +95,8 @@ class AxialQKVProjection(QKVProjection):
     partitions the head into ordered normalization domains; each domain covers
     complete rotary axes and every axis inside it shares its RMS denominator.
     """
+
+    function = "nn.attention.projection.AxialQKVProjection/1"
 
     def __init__(
         self, projection, query_norm, key_norm, *, axis_dims, rotations

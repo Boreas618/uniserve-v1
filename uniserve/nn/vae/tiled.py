@@ -89,6 +89,8 @@ class TiledDecoder(nn.Module):
     spatial compression ratio. Blending retains decoded-dtype rounding.
     """
 
+    function = "nn.vae.tiled.TiledDecoder/1"
+
     def __init__(
         self,
         decoder: nn.Module,
@@ -185,6 +187,8 @@ class TiledEncoder(nn.Module):
     captured at the tile shape; a tiled encoding then encodes its tiles
     through it.
     """
+
+    function = "nn.vae.tiled.TiledEncoder/1"
 
     def __init__(
         self,

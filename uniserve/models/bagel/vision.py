@@ -26,6 +26,8 @@ class Encoder(nn.Module):
     loaded from the checkpoint's ``vit_pos_embed.pos_embed`` tensor.
     """
 
+    function = "models.bagel.vision.Encoder/1"
+
     def __init__(self, config: Config):
         super().__init__()
         self.encoder = siglip.Encoder(config.vision)

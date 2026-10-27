@@ -40,6 +40,8 @@ class Denoiser(ImageDenoiser):
     last stage returns predictions.
     """
 
+    function = "models.bagel.denoiser.Denoiser/1"
+
     # BAGEL frames each generated image with its start and end marker tokens,
     # and its image-unconditional branch reads the conditioning prefix.
     framing_tokens = 2

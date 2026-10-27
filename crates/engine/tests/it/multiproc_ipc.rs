@@ -2245,7 +2245,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() -> anyhow
                 .park()
                 .recv()?
                 .map_err(|error| anyhow::anyhow!(error))?;
-            successor.promote(index)?;
+            successor.promote(index, false, false)?;
             running.shutdown();
             successor
                 .commit()

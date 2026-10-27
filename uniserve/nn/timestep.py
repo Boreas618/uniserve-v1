@@ -30,6 +30,8 @@ def timestep_embedding(
 class TimestepEmbedding(nn.Module):
     """Project sinusoidal timestep features through a learned SiLU MLP."""
 
+    function = "nn.timestep.TimestepEmbedding/1"
+
     def __init__(self, hidden_size: int, frequency_dim: int = 256):
         super().__init__()
         if type(frequency_dim) is not int or frequency_dim < 2:

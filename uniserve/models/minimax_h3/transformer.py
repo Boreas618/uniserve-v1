@@ -63,6 +63,8 @@ def _feed_forward_rows(hidden_size: int, itemsize: int) -> int:
 class TransformerLayer(nn.Module):
     """Apply modality-indexed attention and feed-forward residual updates."""
 
+    function = "models.minimax_h3.transformer.TransformerLayer/1"
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -291,6 +293,8 @@ class StepProjection(nn.Module):
     head on the device, so one captured evaluation serves every step.
     """
 
+    function = "models.minimax_h3.transformer.StepProjection/1"
+
     weight: torch.Tensor
     bias: torch.Tensor
 
@@ -328,6 +332,8 @@ class Transformer(nn.Module):
     ``layers`` keys remain the global checkpoint layer numbers, while
     ``modulation`` is indexed by resident position.
     """
+
+    function = "models.minimax_h3.transformer.Transformer/1"
 
     def __init__(
         self,

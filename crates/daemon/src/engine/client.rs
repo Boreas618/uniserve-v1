@@ -47,6 +47,9 @@ pub struct EngineInfo {
     /// take scheduling limits in place; `None` from an engine that does not
     /// state it.
     pub capacity: Option<wire::BatchCapacity>,
+    /// The root of the prefix hash chains of the pages the engine's workers
+    /// compute: equal between worlds whose models and numerics agree.
+    pub prefix_seed: u64,
 }
 
 impl From<wire::EngineInfo> for EngineInfo {
@@ -58,6 +61,7 @@ impl From<wire::EngineInfo> for EngineInfo {
             schedulers: info.schedulers,
             segments: info.segments,
             capacity: info.capacity,
+            prefix_seed: info.prefix_seed,
         }
     }
 }
@@ -347,20 +351,32 @@ impl EngineClient {
 
     /// Promotes a prepared engine, which succeeds a parked one: its workers
     /// adopt the predecessor's cache flags, and it imports `index`, the
-    /// predecessor's prefix cache index, and serves. Waits until the engine
-    /// reports that it serves; an engine that serves already is left as it
-    /// is.
+    /// predecessor's prefix cache index, and serves the requests the
+    /// predecessor hands over, which `recompute` their state from their
+    /// tokens or not, and for which its cache `grows` into the
+    /// predecessor's memory at once or only at its commit. Waits until the
+    /// engine reports that it serves; an engine that serves already is left
+    /// as it is.
     ///
     /// # Errors
     ///
-    /// Fails when the engine reports that its promotion failed, or its
-    /// connection closes first.
-    pub async fn promote(&self, index: Vec<wire::GroupIndex>) -> Result<(), SubmitError> {
+    /// Fails when the engine reports that its promotion failed, as when its
+    /// cache cannot hold those requests, or its connection closes first.
+    pub async fn promote(
+        &self,
+        index: Vec<wire::GroupIndex>,
+        recompute: bool,
+        grows: bool,
+    ) -> Result<(), SubmitError> {
         let mut states = self.states();
         if *states.borrow_and_update() == EngineState::Standby {
             self.shared
                 .send(to_engine::Kind::Engine(wire::EngineCommand {
-                    kind: Some(wire::engine_command::Kind::Promote(wire::Promote { index })),
+                    kind: Some(wire::engine_command::Kind::Promote(wire::Promote {
+                        index,
+                        recompute,
+                        grows,
+                    })),
                 }));
         }
         loop {
@@ -899,6 +915,14 @@ pub struct EventStream {
 }
 
 impl EventStream {
+    /// The world of the engine that feeds the stream; `None` for a stream no
+    /// engine feeds.
+    pub fn world(&self) -> Option<u64> {
+        self.shared
+            .as_ref()
+            .map(|shared| shared.world.load(Ordering::Relaxed))
+    }
+
     /// A stream of the events `events` delivers, which no engine feeds.
     #[cfg(test)]
     pub(crate) fn detached(events: mpsc::UnboundedReceiver<Event>) -> Self {

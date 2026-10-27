@@ -178,6 +178,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
             .unwrap_or(0),
         schedulers: cores.len() as u32,
         segments: Vec::new(),
+        prefix_seed: 0,
         capacity: None,
     };
     let model_name = first.model_name().to_owned();

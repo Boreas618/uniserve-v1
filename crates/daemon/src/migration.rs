@@ -299,6 +299,16 @@ impl RequestEvents {
         // Its prompt's log-probabilities were reported where it began.
         continuation.sampling.return_prompt_logprobs = false;
         continuation.sampling.n_prompt_logprobs = 0;
+        // A request a world change moves to a world computing other
+        // numerics continues with the state it reached (`in_flight = keep`):
+        // it reads that state's pages and writes none, since its later pages
+        // are neither world's.
+        if cause == MigrationCause::Drain
+            && let Some(seed) = self.stream.world().and_then(|world| hold.kept(world))
+        {
+            continuation.cache.state_seed = Some(seed);
+            continuation.cache.write = false;
+        }
         let (stream, _scheduler) = hold
             .submit(Request::Generation(Box::new(continuation)))
             .await

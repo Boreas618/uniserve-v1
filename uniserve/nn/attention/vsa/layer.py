@@ -21,6 +21,8 @@ class BlockAttention(nn.Module):
     that tile.
     """
 
+    function = "nn.attention.vsa.layer.BlockAttention/1"
+
     def __init__(self, scale: float):
         super().__init__()
         if not math.isfinite(scale) or scale <= 0:

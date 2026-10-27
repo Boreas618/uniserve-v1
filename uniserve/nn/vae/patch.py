@@ -17,6 +17,8 @@ class PatchAutoencoder(nn.Module):
     The posterior generator and every input tensor belong to the caller.
     """
 
+    function = "nn.vae.patch.PatchAutoencoder/1"
+
     value_range = (0.0, 1.0)
 
     def __init__(
@@ -130,6 +132,8 @@ class PatchAutoencoder(nn.Module):
 
 class RGBDecoder(nn.Module):
     """Restore signed RGB pixels from canonical spatial patch rows."""
+
+    function = "nn.vae.patch.RGBDecoder/1"
 
     value_range = (-1.0, 1.0)
 

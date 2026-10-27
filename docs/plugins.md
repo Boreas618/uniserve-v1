@@ -31,6 +31,10 @@ def register(registry):
 
 A name may not shadow a built-in provider or architecture, and two plugins may not add the same one.
 
+## Numerical identity
+
+What a model computes keys the state derived from it (`uniserve.numerics`): every module class of a plugin's model package declares its function as `function = "<component>/<revision>"`, a stable name whose revision the plugin raises whenever what the component computes changes, and only then (another kernel, fusion or reduction order computes the same function); the package declares `LOADING = "<package>/<revision>"`, the revision of how its parameters derive from its checkpoint. A module's identity digests its function, the formats of the tensors it holds and its children's identities; a model's identity roots its KV cache pages' keys, so a new revision makes a world change recompute the requests it migrates (or continue them with the state they reached, as `in_flight` states, `docs/admin.md`), and pages of the old revision miss. A model with a module class that declares no function does not load.
+
 ## Cache layer types
 
 A model package's module owns a cache layer when it has a `cache_name` and a `cache_state(dtype)` method returning the layer's `uniserve.prefix_cache.StateConfig`; the decoder collects every such layer into the model's cache configuration (`TransformerDecoder.cache_config`). The `StateConfig` subclass is the cache layer's type, and states:
@@ -50,4 +54,4 @@ A plugin's provider serves where the configuration names a provider of its famil
 
 ## Updating
 
-The installed plugins' distributions and versions enter the weights' fingerprint, since a provider declares the layout of the weights it serves. A plugin installed, removed or upgraded is taken up by the next world (`PUT /admin/config`, `docs/admin.md`): the new world's processes import the plugins installed when they start, load the weights the plugin's providers read in their own layout, capture their graphs, and take over without a restart.
+Each kernel provider a plugin adds enters the weights' fingerprint with the version of the distribution it comes from, since a provider declares the layout of the weights it serves; a plugin that adds no provider leaves the weights' keys as they were. A plugin installed, removed or upgraded is taken up by the next world (`PUT /admin/config`, `docs/admin.md`): the new world's processes import the plugins installed when they start, load the weights the plugin's providers read in their own layout, capture their graphs, and take over without a restart.

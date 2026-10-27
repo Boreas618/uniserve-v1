@@ -26,6 +26,8 @@ class Model(CausalLM):
     outside the first stage and the head outside the last one.
     """
 
+    function = "models.qwen3.model.Model/1"
+
     def __init__(self, config: Config):
         super().__init__(
             Transformer(config),

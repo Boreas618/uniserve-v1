@@ -205,13 +205,22 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
         ),
         "{terminal:?}"
     );
-    let index = parked
+    let parked = parked
         .recv_timeout(Duration::from_secs(10))
         .expect("the scheduler parked")
         .expect("the scheduler parked without an error");
     // The running request published the pages of its prompt and the tokens
-    // it generated, which a successor imports.
-    assert!(index.iter().all(|page| !page.units.is_empty()), "{index:?}");
+    // it generated, which a successor imports; it is the one request handed
+    // over with a state, and held the units its pages took.
+    assert!(
+        parked.pages.iter().all(|page| !page.units.is_empty()),
+        "{parked:?}"
+    );
+    assert_eq!(parked.requests, 1);
+    assert!(
+        parked.held_units as usize >= parked.pages.len(),
+        "{parked:?}"
+    );
     assert!(handle.resume().recv().unwrap().is_ok());
     handle.shutdown();
     thread.join().unwrap();
@@ -472,4 +481,51 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
         matches!(terminal, Some(Event::Error { .. })),
         "{terminal:?}"
     );
+}
+
+/// A successor promotes only while the units its own cache holds free hold
+/// what the requests its predecessor hands over compute: a request that
+/// recomputes more units than are free refuses the promotion, with both
+/// counts; one continuing with the state it reached needs a page.
+#[test]
+fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
+    let mut sim = SimEngine::new();
+    sim.set_num_units(16);
+    sim.set_block_size(16);
+    let scheduler = support::scheduler_with(
+        Box::new(SimExecutor::new(sim)),
+        SimEngine::special_tokens(),
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let thread = thread::spawn(move || {
+        let _ = scheduler.run(rx);
+    });
+    let handle = CommandSender::new(tx);
+
+    let parked = engine::ParkedCache {
+        pages: Vec::new(),
+        held_units: 64,
+        requests: 1,
+    };
+    let refused = handle
+        .promote(parked.clone(), true, false)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    let reason = refused.expect_err("15 free units cannot hold 65");
+    assert!(
+        reason.contains("15 free units") && reason.contains("need 65"),
+        "{reason}"
+    );
+    assert!(
+        handle
+            .promote(parked, false, false)
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the scheduler answers")
+            .is_ok()
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
 }

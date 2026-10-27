@@ -27,6 +27,8 @@ class TopK(nn.Module):
     :func:`uniserve.nn.functional.topk_softmax`).
     """
 
+    function = "nn.moe.TopK/1"
+
     def __init__(self, k: int, *, renormalize: bool = True) -> None:
         super().__init__()
         if type(k) is not int or k <= 0:
@@ -50,6 +52,8 @@ class ExpertLinear(nn.Module):
     ``Linear`` does for one matrix. Tensor-parallel binding narrows the
     output or input channels of every expert alike.
     """
+
+    function = "nn.moe.ExpertLinear/1"
 
     def __init__(
         self,
@@ -118,6 +122,8 @@ class FusedMoE(nn.Module):
     native kernel covers is an error, not a slower path, and an
     expert-parallel call needs the operator an execution context binds.
     """
+
+    function = "nn.moe.FusedMoE/1"
 
     def __init__(
         self,

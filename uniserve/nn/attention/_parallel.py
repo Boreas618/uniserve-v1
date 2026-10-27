@@ -39,6 +39,8 @@ class ParallelAttention(torch.nn.Module):
     owns communication storage.
     """
 
+    function = "nn.attention._parallel.ParallelAttention/1"
+
     def __init__(
         self,
         *,

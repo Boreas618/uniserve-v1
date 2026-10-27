@@ -33,6 +33,8 @@ class AdaLNCache(nn.Module):
             solver step.
     """
 
+    function = "nn.adaln_cache.AdaLNCache/1"
+
     products: torch.Tensor
     output_products: torch.Tensor | None
     groups: torch.Tensor

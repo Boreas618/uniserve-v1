@@ -37,6 +37,8 @@ from .config import Config
 class Attention(nn.Module):
     """QK-normalized rotary attention followed by the output contraction."""
 
+    function = "models.qwen3.transformer.Attention/1"
+
     def __init__(self, config: Config, layer: int):
         super().__init__()
         self.qkv = RotaryQKVProjection(
@@ -117,6 +119,8 @@ class MoE(nn.Module):
     sum to the hidden dtype, a difference within that dtype's rounding.
     """
 
+    function = "models.qwen3.transformer.MoE/1"
+
     def __init__(self, config: Config):
         super().__init__()
         self.router = Linear(config.hidden_size, config.num_experts, bias=False)
@@ -139,6 +143,8 @@ class MoE(nn.Module):
 
 class TransformerLayer(nn.Module):
     """Qwen pre-normalization equations with a separate residual stream."""
+
+    function = "models.qwen3.transformer.TransformerLayer/1"
 
     def __init__(self, config: Config, layer: int):
         super().__init__()
@@ -191,6 +197,8 @@ class TransformerLayer(nn.Module):
 
 class Transformer(TransformerDecoder):
     """Qwen3 decoder stack: embedding, pre-norm layers, and the final RMS norm."""  # noqa: E501
+
+    function = "models.qwen3.transformer.Transformer/1"
 
     def __init__(self, config: Config):
         # Layer keys are global layer indices. Pipeline binding keeps the

@@ -51,6 +51,8 @@ class Denoiser(ImageDenoiser):
     tokens take.
     """
 
+    function = "models.sensenova_u1.denoiser.Denoiser/1"
+
     # The prompt's ``<img>`` token sits at the position before the image, the
     # patches share the next one and ``</img>`` takes the one after.
     rope_advance = 2

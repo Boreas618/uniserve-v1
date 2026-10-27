@@ -45,6 +45,8 @@ class Attention(nn.Module):
     which the window does not bound.
     """
 
+    function = "nn.attention.layer.Attention/1"
+
     # Recorded by parallelize_ once the layer is bound to its partition.
     _parallel_mesh: DeviceMesh
     _attention_parallel: AttentionParallelConfig
