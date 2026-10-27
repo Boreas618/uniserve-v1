@@ -12,25 +12,23 @@
 //!   worlds, and becomes the successor's alone when the predecessor is
 //!   retired: the commit's handover of the segments is a transfer on the
 //!   ledger, never a release and an allocation.
-//! - The CUDA context of the server's Transfer Server on each GPU, as it
-//!   measured it when it started (`Request::Measured`), in every ledger of
-//!   that GPU, for as long as it is connected.
 //! - What the processes book themselves ([`Request::Book`]), which the server
 //!   cannot see: a worker's graph pool, process memory and staging under its
-//!   scope and world, the Transfer Server's staging. A booking lives as long
-//!   as its process's connection, since the process's memory ends with the
-//!   process. The processes of one scope and world serve in turn (a rank and
-//!   the relaunch or standby that replaces it), so the largest of their
-//!   bookings of an item counts.
+//!   scope and world; the Transfer Server's staging, and its CUDA context
+//!   while it holds the context on the GPU, in every ledger of the GPU. A
+//!   booking lives as long as its process's connection, since the process's
+//!   memory ends with the process. The processes of one scope and world
+//!   serve in turn (a rank and the relaunch or standby that replaces it), so
+//!   the largest of their bookings of an item counts.
 //!
 //! The quota of a deployment's ledger is `⌊total × fraction⌋` of the whole
 //! GPU, which its workers state with their bookings; while two worlds that
 //! state different fractions hold memory on the GPU, the smaller quota
 //! holds. Every change that adds to a ledger, a booking or a new device
 //! storage, is refused when it would take the ledger past its quota, so a
-//! ledger's sum never exceeds it. The Transfer Server's context, whose
-//! memory exists by the time it reports it, is booked as measured: the
-//! worlds size themselves beside it.
+//! ledger's sum never exceeds it. The Transfer Server books its context
+//! before it retains the context, so a ledger without room for it refuses
+//! the context and the work that needed it.
 //!
 //! [`Request::Book`]: storage::protocol::Request::Book
 
@@ -137,10 +135,11 @@ impl Ledgers {
     }
 
     /// The ledgers of the GPUs `gpus` admits and the deployments `deployment`
-    /// admits, derived from the retained device storages `held`, the
-    /// Transfer Server's CUDA `contexts` (the bytes it measured on each GPU)
-    /// and the bookings, sorted by GPU and deployment. A GPU that only the
-    /// Transfer Server uses has a ledger of no deployment.
+    /// admits, derived from the retained device storages `held` and the
+    /// bookings, sorted by GPU and deployment, each with the bytes the
+    /// Transfer Server's CUDA context takes on its GPU while held
+    /// (`contexts`, as it measured them). A GPU that only the Transfer
+    /// Server uses has a ledger of no deployment.
     pub(crate) fn ledgers<'a>(
         &self,
         held: impl IntoIterator<Item = Held<'a>>,
@@ -201,11 +200,7 @@ impl Ledgers {
         // Each worker's booking, the largest of its scope and world's
         // processes; the Transfer Server's, the largest of its processes.
         let mut workers: BTreeMap<(String, [u8; 16], EntryKey), u64> = BTreeMap::new();
-        let mut transfer: BTreeMap<([u8; 16], Item), u64> = contexts
-            .iter()
-            .filter(|(gpu, bytes)| gpus(gpu) && *bytes > 0)
-            .map(|&(gpu, bytes)| ((gpu, Item::TransferContext), bytes))
-            .collect();
+        let mut transfer: BTreeMap<([u8; 16], Item), u64> = BTreeMap::new();
         for booking in self.bookings.values() {
             for (&(gpu, item), &bytes) in &booking.items {
                 if !gpus(&gpu) {
@@ -278,6 +273,10 @@ impl Ledgers {
                     .map(|(_, quota)| *quota)
                     .min(),
                 deployment: name,
+                transfer_context: contexts
+                    .iter()
+                    .find(|(of, _)| *of == gpu)
+                    .map_or(0, |&(_, bytes)| bytes),
                 total: self.totals.get(&gpu).copied().unwrap_or(0),
                 entries: entries
                     .into_iter()

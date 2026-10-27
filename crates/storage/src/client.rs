@@ -414,21 +414,33 @@ impl Client {
         }
     }
 
-    /// See [`Request::Expose`]. Returns the NIXL agent metadata of the
-    /// server's Transfer Server and each region's registered range, in
-    /// order.
+    /// See [`Request::Expose`]. Returns the exposure, which
+    /// [`Client::unexpose`] ends, the NIXL agent metadata of the server's
+    /// Transfer Server, and each region's registered range, in order.
     pub fn expose(
         &mut self,
         deployment: String,
         regions: Vec<Region>,
-    ) -> Result<(Vec<u8>, Vec<Registered>)> {
+    ) -> Result<(u64, Vec<u8>, Vec<Registered>)> {
         let request = Request::Expose {
             deployment,
             regions,
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Exposed { metadata, regions } => Ok((metadata, regions)),
+            Reply::Exposed {
+                exposure,
+                metadata,
+                regions,
+            } => Ok((exposure, metadata, regions)),
             other => Err(unexpected("expose", &other)),
+        }
+    }
+
+    /// See [`Request::Unexpose`].
+    pub fn unexpose(&mut self, exposure: u64) -> Result<()> {
+        match Self::expect(self.call(&Request::Unexpose { exposure }, &[])?)?.reply {
+            Reply::Unexposed => Ok(()),
+            other => Err(unexpected("unexpose", &other)),
         }
     }
 
