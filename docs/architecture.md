@@ -261,6 +261,7 @@ crates/ipc/             engine-to-worker messages, the channel, registration, la
 crates/storage/         the Storage Server's protocol and client
 crates/storage-server/  the Storage Server and its Mooncake connector
 crates/cuda/            CUDA driver, VMM, NVML and NCCL bindings and graph launch, loaded at run time
+crates/nixl/            NIXL agents with the UCX backend: memory registration, agent metadata exchange and READs between hosts, loaded at run time
 crates/daemon/          a node's daemon: process supervision, the node's Storage Server claim, the process interface's service; on the leader, the HTTP/OpenAI API, model profiles, input and output processing, metrics and the engine's client
 crates/engine/          the engine process: schedulers, KV cache allocation, worker groups and process launch through the daemons, the request interface's service
 crates/worker/          the worker runtime, installed as the library uniserve/_worker
