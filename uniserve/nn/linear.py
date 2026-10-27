@@ -12,6 +12,7 @@ from torch import nn
 from torch.distributed.tensor import Replicate, Shard
 
 from uniserve.distributed import Communicator, DeviceMesh, Distribution
+from uniserve.distributed.logical import Logical
 from uniserve.quantization import QuantizedTensor, Quantizer
 
 from . import _binding
@@ -162,6 +163,31 @@ class Linear(nn.Module):
         self.weight_distribution = _distribution()
         self.output_distribution = _distribution()
         self._weight_slice = (slice(0, out_features), slice(0, in_features))
+        # How many consecutive output and input channels any partition of
+        # the weight keeps together; zero for a dimension no partition
+        # divides. A projection of whole heads keeps a head's channels.
+        self.units = (0, 0)
+
+    def logical_tensors(self) -> Mapping[str, Logical]:
+        """The logical ``weight [out_features, in_features]`` and ``bias
+        [out_features]`` whose parts this projection holds, as its weight
+        distribution divides them (``uniserve.distributed.logical``).
+        """  # noqa: D205
+        weight = Logical.distributed(
+            self.weight_distribution,
+            (self.out_features, self.in_features),
+            ("output", "input"),
+            self.units,
+        )
+        parts = {"weight": weight}
+        if self.bias is not None:
+            parts["bias"] = Logical(
+                weight.shape[:1],
+                weight.dims[:1],
+                weight.units[:1],
+                weight.segments[:1],
+            )
+        return parts
 
     def forward(
         self,
@@ -253,6 +279,7 @@ class ColumnParallelLinear(Linear):
         )
         self.weight_distribution = _distribution(self.group, 0)
         self.output_distribution = _distribution(self.group, 1)
+        self.units = (1, 0)
 
     def forward_chunks(
         self,
@@ -311,6 +338,7 @@ class RowParallelLinear(Linear):
         )
         self.weight_distribution = _distribution(self.group, 1)
         self.output_distribution = _distribution(self.group)
+        self.units = (0, 1)
 
     def forward(
         self,
@@ -454,6 +482,9 @@ class MergedColumnParallelLinear(nn.Module):
             }
         )
         self.branch_width = branch_width
+        # Any partition keeps an interleaved branch's channel groups whole.
+        for branch in self.projections.values():
+            branch.units = (branch_width or 1, 0)
         # Bound by parallelize_ for a Ulysses "exchange" projection: every
         # member projects all heads of its own rows with whole weights and
         # sends each member its head shard instead of gathering input rows.
@@ -678,6 +709,10 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        # Any partition keeps whole heads: one query head's rows, and one
+        # KV head's key and value rows.
+        for branch in self.projections.values():
+            branch.units = (head_dim, 0)
 
 
 def _padded_vocabulary(size: int, members: int) -> int:
@@ -739,6 +774,21 @@ class VocabParallelEmbedding(nn.Module):
             self.weight[padding_idx - start].zero_()
         self.weight_distribution = _distribution(self.group, 0)
 
+    def logical_tensors(self) -> Mapping[str, Logical]:
+        """The logical ``weight [vocabulary, embedding_dim]``: the partition
+        divides the padded vocabulary, whose rows past the real tokens are
+        zero padding.
+        """  # noqa: D205
+        return {
+            "weight": Logical.distributed(
+                self.weight_distribution,
+                (self.vocab.size, self.embedding_dim),
+                ("vocabulary", "channel"),
+                (1, 0),
+                domain=(self.vocab.padded_size, self.embedding_dim),
+            )
+        }
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # IDs owned by other shards embed as zeros here; the all-reduce sums
         # every shard's partial rows into the complete embedding.
@@ -799,6 +849,28 @@ class VocabParallelHead(ColumnParallelLinear):
         self.weight[valid:].zero_()
         if self.bias is not None:
             self.bias[valid:].zero_()
+
+    def logical_tensors(self) -> Mapping[str, Logical]:
+        """The logical ``weight [vocabulary, in_features]`` and ``bias``:
+        the partition divides the padded vocabulary, whose rows past the
+        real tokens are zero padding.
+        """  # noqa: D205
+        weight = Logical.distributed(
+            self.weight_distribution,
+            (self.vocab.size, self.in_features),
+            ("vocabulary", "input"),
+            self.units,
+            domain=(self.out_features, self.in_features),
+        )
+        parts = {"weight": weight}
+        if self.bias is not None:
+            parts["bias"] = Logical(
+                weight.shape[:1],
+                weight.dims[:1],
+                weight.units[:1],
+                weight.segments[:1],
+            )
+        return parts
 
     def forward(
         self,

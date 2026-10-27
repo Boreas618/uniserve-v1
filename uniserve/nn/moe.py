@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 import torch
 from torch import nn
+from torch.distributed.tensor import Shard
 
-from uniserve.distributed import Communicator
+from uniserve.distributed import Communicator, DeviceMesh, Distribution
+from uniserve.distributed.distribution import BlockShard
+from uniserve.distributed.logical import Logical
 from uniserve.nn import _binding, functional
 from uniserve.nn.functional import Routes
 from uniserve.quantization import Quantizer
@@ -174,6 +178,47 @@ class FusedMoE(nn.Module):
         # the runtime, so it is not a communication group of this module.
         self.expert_slice = slice(0, num_experts)
         self.expert_group = Communicator()
+
+    def logical_tensors(self) -> Mapping[str, Logical]:
+        """The logical stacked weights whose parts this rank holds.
+
+        ``up_gate.weight [E, 2I, H]`` and ``down.weight [E, H, I]``, as
+        the expert group divides the experts and the tensor-parallel group
+        divides ``I``: the up and gate rows are two named sub-blocks of the
+        output dimension, each divided on its own, and the local tensor
+        stores the rank's up rows before its gate rows. Any partition keeps
+        whole experts.
+        """
+        experts, channels = self.expert_group, self.group
+        mesh = DeviceMesh(
+            ranks=tuple(range(experts.size * channels.size)),
+            shape=(experts.size, channels.size),
+            axes=("experts", "channels"),
+            rank=experts.rank * channels.size + channels.rank,
+        )
+        intermediate = self.intermediate_size
+        up_gate = Distribution(
+            mesh,
+            (
+                Shard(0),
+                BlockShard(1, (("up", intermediate), ("gate", intermediate))),
+            ),
+        )
+        down = Distribution(mesh, (Shard(0), Shard(2)))
+        return {
+            "up_gate.weight": Logical.distributed(
+                up_gate,
+                (self.num_experts, 2 * intermediate, self.hidden_size),
+                ("expert", "output", "input"),
+                (1, 1, 0),
+            ),
+            "down.weight": Logical.distributed(
+                down,
+                (self.num_experts, self.hidden_size, intermediate),
+                ("expert", "output", "input"),
+                (1, 0, 1),
+            ),
+        }
 
     def forward(
         self,
