@@ -113,7 +113,6 @@ impl EngineConfig {
             // A deployment is what one daemon serves under its served name.
             deployment: spec.deployment.clone(),
             host_kv_cache,
-            host_kv_cache_bytes: kv_cache.host_bytes,
             kv_storage: kv_cache
                 .mooncake
                 .as_ref()
@@ -208,6 +207,10 @@ impl EngineConfig {
                 .map_or(crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL, |interval| {
                     interval as usize
                 }),
+            host_cache: crate::kv_cache::HostCacheSize::new(
+                kv_cache.host_ratio,
+                kv_cache.host_bytes,
+            )?,
             schedule_policy: named(&scheduling.policy, "scheduler_config.policy")?,
             worker_groups,
             transfer,

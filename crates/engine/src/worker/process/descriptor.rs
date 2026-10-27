@@ -53,7 +53,6 @@ impl Default for WorkerProcessArgs {
             // own, so independent launches never contest one claim.
             deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
             host_kv_cache: false,
-            host_kv_cache_bytes: None,
             kv_storage: None,
             keep_standby: false,
             standby: false,
@@ -385,7 +384,6 @@ mod tests {
             deployment: "model".into(),
             claim: [7; 16],
             host_kv_cache: true,
-            host_kv_cache_bytes: Some(64 << 30),
             tcp: Some("10.0.0.2:4100".into()),
             world: 3,
             standby: false,

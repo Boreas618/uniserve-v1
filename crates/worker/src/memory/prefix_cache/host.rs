@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cuda::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder};
+use cuda::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder, Stream};
 use ipc::{PageCopy, PagePoolInfo};
 use sha2::{Digest, Sha256};
 use storage::Key;
@@ -59,6 +59,17 @@ fn page_bytes(plan: &CachePlan, group: &CacheGroupPlan) -> u64 {
     let layers = group.layer_ids.len() as u64;
     let scales = if plan.quantized { 2 * layers * 4 } else { 0 };
     2 * layers * plan.plane_bytes + scales
+}
+
+/// The bytes one token of `plan`'s pages takes over every cache group: each
+/// group's page bytes over its block size, rounded up, so that the pools of
+/// `tokens` tokens ([`HostKvCache::start`]) take at most `tokens` times as
+/// many bytes.
+pub(crate) fn token_bytes(plan: &CachePlan) -> u64 {
+    plan.groups
+        .iter()
+        .map(|group| page_bytes(plan, group).div_ceil(u64::from(group.block_size)))
+        .sum()
 }
 
 /// The digest of the byte layout of `group`'s pages: the page encoding,
@@ -106,15 +117,54 @@ pub(crate) fn page_contents(plan: &CachePlan, fingerprint: &str) -> Vec<[u8; 32]
         .collect()
 }
 
+/// What a rank whose pages the engine copies through the host KV cache
+/// keeps until the engine sizes it (`uniserve.host_cache`).
+pub(crate) struct HostCacheSetup {
+    /// The pages' key digest (`Fingerprints::pages`).
+    pub(crate) fingerprint: String,
+    /// Where an engine on another host reaches the host's Storage Server.
+    pub(crate) endpoint: Option<String>,
+    /// The cache's device.
+    pub(crate) device: DeviceId,
+    /// The copy stream the pages are copied on, beside the forwards on the
+    /// primary stream.
+    pub(crate) copy: Stream,
+}
+
+impl HostCacheSetup {
+    /// Map the page pools of `cache`, `tokens` tokens in each cache group,
+    /// and copy the cache's pages through them from now on. Returns what
+    /// the rank reports of each pool.
+    pub(crate) fn map(
+        self,
+        retained: &Retained,
+        cache: &mut super::PrefixCache,
+        tokens: u64,
+    ) -> Result<Vec<PagePoolInfo>> {
+        let (host, pools) = HostKvCache::start(
+            retained,
+            cache.plan(),
+            self.device,
+            &self.fingerprint,
+            self.endpoint.as_deref(),
+            tokens,
+        )?;
+        cache.set_host_kv_cache(host, self.copy)?;
+        Ok(pools)
+    }
+}
+
 impl HostKvCache {
     /// Map a page pool for every cache group of `plan` at the rank's host's
     /// Storage Server, registered with `device`. A sliding-window group's
     /// pool holds the windows the engine offloads before aligned
     /// boundaries, page by page, as a full-attention group's holds every
-    /// published page. `fingerprint`
-    /// is the pages' key digest (`Fingerprints::pages`).
-    /// The pools share `bytes` so that each holds as many pages as the
-    /// others; each takes the server's size when `None`.
+    /// published page. `fingerprint` is the pages' key digest
+    /// (`Fingerprints::pages`).
+    /// Each group's pool holds the pages of `tokens` tokens, the count the
+    /// engine sizes every rank of the world's host KV cache at; a pool the
+    /// deployment already has for the same pages, which a previous world
+    /// created, is shared at its size.
     /// Returns the host KV cache and what the rank reports of each pool.
     pub(crate) fn start(
         retained: &Retained,
@@ -122,28 +172,10 @@ impl HostKvCache {
         device: DeviceId,
         fingerprint: &str,
         endpoint: Option<&str>,
-        bytes: Option<u64>,
+        tokens: u64,
     ) -> Result<(Self, Vec<PagePoolInfo>)> {
         let mut pools = BTreeMap::new();
         let mut infos = Vec::new();
-        // One page of every group per slot of the shared budget.
-        let slots = match bytes {
-            Some(bytes) => {
-                let page_set: u64 = plan
-                    .groups
-                    .iter()
-                    .map(|group| page_bytes(plan, group))
-                    .sum();
-                let slots = bytes.checked_div(page_set).unwrap_or(0);
-                if slots == 0 {
-                    return Err(Error::Resource(
-                        "the host KV cache holds no page of each cache group",
-                    ));
-                }
-                Some(slots)
-            }
-            None => None,
-        };
         for (index, group) in plan.groups.iter().enumerate() {
             let layout = layout(plan, index);
             let content = content(fingerprint, &layout);
@@ -159,7 +191,13 @@ impl HostKvCache {
                 kv_head_count: group.num_kv_heads,
                 page_bytes: page_bytes(plan, group),
             };
-            let bytes = slots.map(|slots| slots * shape.page_bytes);
+            let slots = tokens / u64::from(group.block_size);
+            if slots == 0 {
+                return Err(Error::Resource(
+                    "the host KV cache holds no page of each cache group",
+                ));
+            }
+            let bytes = Some(slots * shape.page_bytes);
             let answer = retained.call("mapping a page pool", |client| {
                 client.call(
                     &Request::PagePool {

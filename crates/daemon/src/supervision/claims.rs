@@ -129,6 +129,9 @@ impl ClaimHolder {
             &socket,
             storage::Role::Head {
                 deployment: claim.deployment.clone(),
+                // The claim holds every world; it reads and publishes no
+                // page.
+                world: 0,
             },
         )
         .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;

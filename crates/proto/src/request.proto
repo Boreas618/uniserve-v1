@@ -896,9 +896,13 @@ message KvCache {
   // long prompt offloads its sliding windows before; absent for the
   // engine's default.
   optional uint32 boundary_interval = 7;
-  // The bytes of host KV cache each worker keeps, split between its cache
-  // groups; absent for the Storage Server's size for each pool.
-  optional uint64 host_bytes = 8;
+  reserved 8;
+  // The host KV cache's token count over the device KV cache's, the same on
+  // every rank of a world; absent for the engine's default (2.0).
+  optional double host_ratio = 9;
+  // The bytes of the deployment's host KV cache on each host, over the
+  // ranks there, in place of `host_ratio`; absent to size it by the ratio.
+  optional uint64 host_bytes = 10;
 }
 
 message Mooncake {

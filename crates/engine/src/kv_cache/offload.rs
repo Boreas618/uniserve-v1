@@ -50,6 +50,15 @@
 //! does. The keys of every group form one key space: for each key, the
 //! lookups say where its page is.
 //!
+//! A world's host KV cache holds one token count on every rank
+//! ([`HostCacheDemand`]): the world asks for its device KV cache's tokens
+//! times `kv_cache_config.host_ratio`, and each host's Storage Server lowers
+//! that for the whole world to what its budget holds over the bytes a token
+//! takes on all of the world's ranks there (`Request::HostCache`). Every
+//! rank then maps a pool per cache group holding that many tokens
+//! (`uniserve.host_cache`); a pool the deployment already has for the same
+//! pages, which a previous world created, is shared at its size.
+//!
 //! A rank's pool is reached through its host's Storage Server: on the
 //! engine's host through the server's socket, on another host over the TCP
 //! address the rank reports for it. Requests to the servers never block
@@ -57,7 +66,7 @@
 //! [`KvOffloadManager::poll`] at every step; while answers are awaited, a
 //! parked scheduler wakes after a millisecond to take them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -82,6 +91,97 @@ pub(crate) const PREFETCH_MIN_TOKENS: usize = 256;
 /// thousand tokens in pages of 64 tokens is a quarter of this interval, so
 /// the windows offloaded hold at most a quarter of the group's pages.
 pub(crate) const DEFAULT_BOUNDARY_INTERVAL: usize = 64;
+
+/// The host KV cache's token count over the device KV cache's when
+/// `kv_cache_config.host_ratio` is unset: SGLang's default for a host cache
+/// that keeps pages (`--hicache-ratio`).
+const DEFAULT_HOST_RATIO: f64 = 2.0;
+
+/// How large a world's host KV cache is (`kv_cache_config.host_ratio` and
+/// `host_gib`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HostCacheSize {
+    /// The token count over the device KV cache's.
+    pub ratio: f64,
+    /// The bytes of the deployment's host KV cache on each host, in place
+    /// of the budget from the host's available memory.
+    pub host_bytes: Option<u64>,
+}
+
+impl Default for HostCacheSize {
+    fn default() -> Self {
+        Self {
+            ratio: DEFAULT_HOST_RATIO,
+            host_bytes: None,
+        }
+    }
+}
+
+impl HostCacheSize {
+    /// The size a deployment states, the defaults where it states none.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a ratio that is not a positive finite number.
+    pub fn new(ratio: Option<f64>, host_bytes: Option<u64>) -> anyhow::Result<Self> {
+        let ratio = ratio.unwrap_or(DEFAULT_HOST_RATIO);
+        anyhow::ensure!(
+            ratio.is_finite() && ratio > 0.0,
+            "kv_cache_config.host_ratio must be a positive number, not {ratio}"
+        );
+        Ok(Self { ratio, host_bytes })
+    }
+}
+
+/// What a world's host KV cache asks of each host: the token count of every
+/// rank, and the ranks of each host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostCacheDemand {
+    /// The device KV cache's tokens times the ratio, the least over the
+    /// world's ranks.
+    pub tokens: u64,
+    /// By host: where an engine on another host reaches its Storage Server,
+    /// and the bytes a token takes on each of the world's ranks there.
+    pub hosts: BTreeMap<String, (Option<String>, Vec<u64>)>,
+}
+
+impl HostCacheDemand {
+    /// The demand of the ranks of `ranks` (by worker group, each rank's host
+    /// and cache) whose pages the host KV cache copies, at `ratio`; `None`
+    /// when none does. A rank's device KV cache holds its allocatable units,
+    /// those beside the sentinel and the units its warmup lends, of the
+    /// largest block size's tokens each.
+    pub(crate) fn of(
+        ranks: &BTreeMap<WorkerGroupId, Vec<(String, Option<PrefixCacheInfo>)>>,
+        ratio: f64,
+    ) -> Option<Self> {
+        let mut tokens: Option<u64> = None;
+        let mut hosts: BTreeMap<String, (Option<String>, Vec<u64>)> = BTreeMap::new();
+        for (host, cache) in ranks.values().flatten() {
+            let Some(cache) = cache.as_ref().filter(|cache| cache.host_token_bytes > 0) else {
+                continue;
+            };
+            let unit_tokens = cache
+                .groups
+                .iter()
+                .map(|group| u64::from(group.block_size))
+                .max()
+                .unwrap_or(0);
+            let units = cache.num_units.saturating_sub(1 + cache.scratch_units);
+            let device = u64::from(units) * unit_tokens;
+            let asked = (device as f64 * ratio).ceil() as u64;
+            tokens = Some(tokens.map_or(asked, |tokens| tokens.min(asked)));
+            let entry = hosts
+                .entry(host.clone())
+                .or_insert_with(|| (cache.storage_endpoint.clone(), Vec::new()));
+            entry.1.push(cache.host_token_bytes);
+        }
+        Some(Self {
+            tokens: tokens?,
+            hosts,
+        })
+    }
+}
 
 /// How long admission waits for a prefetch of `tokens` tokens: one second,
 /// and a quarter second per 1024 tokens.
@@ -287,6 +387,8 @@ pub(crate) struct RankCache<'a> {
 /// The scheduler's side of the host KV cache and the KV storage.
 pub(crate) struct KvOffloadManager {
     deployment: String,
+    /// The engine's world, which publishes the pages it commits.
+    world: u64,
     /// The pages of the largest block size between aligned sliding-window
     /// boundaries.
     boundary_interval: usize,
@@ -313,21 +415,24 @@ pub(crate) struct KvOffloadManager {
 
 impl KvOffloadManager {
     /// Connect to this host's Storage Server, at `socket`, as a head of
-    /// `deployment`, offloading sliding windows every `boundary_interval`
-    /// pages of a long prompt.
+    /// `world` of `deployment`, offloading sliding windows every
+    /// `boundary_interval` pages of a long prompt.
     pub(crate) fn connect(
         socket: &std::path::Path,
         deployment: &str,
+        world: u64,
         boundary_interval: usize,
     ) -> anyhow::Result<Self> {
         let client = Client::connect(
             socket,
             Role::Head {
                 deployment: deployment.to_owned(),
+                world,
             },
         )?;
         Ok(Self {
             deployment: deployment.to_owned(),
+            world,
             boundary_interval: boundary_interval.max(1),
             clients: vec![client],
             remote: HashMap::new(),
@@ -351,6 +456,7 @@ impl KvOffloadManager {
         }
         let role = Role::Head {
             deployment: self.deployment.clone(),
+            world: self.world,
         };
         match Client::connect_tcp(address, role) {
             Ok(client) => {
@@ -362,6 +468,43 @@ impl KvOffloadManager {
             Err(error) => {
                 tracing::warn!(address, %error, "the host KV cache cannot reach a storage server");
                 None
+            }
+        }
+    }
+
+    /// The token count every rank of the world holds in the host KV cache
+    /// of `host`'s Storage Server, for the world's ranks there that take
+    /// `token_bytes` bytes a token (`Request::HostCache`): at most `tokens`.
+    /// `local` names the engine's host; another host's server is reached at
+    /// `endpoint`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server cannot be reached or refuses the request.
+    pub(crate) fn host_cache_tokens(
+        &mut self,
+        local: bool,
+        endpoint: Option<&str>,
+        tokens: u64,
+        token_bytes: Vec<u64>,
+        host_bytes: Option<u64>,
+    ) -> anyhow::Result<u64> {
+        let client = if local {
+            0
+        } else {
+            endpoint
+                .and_then(|address| self.remote(address))
+                .ok_or_else(|| anyhow::anyhow!("another host's Storage Server is unreachable"))?
+        };
+        let request = Request::HostCache {
+            tokens,
+            token_bytes,
+            host_bytes,
+        };
+        match self.clients[client].call(&request, &[])?.reply {
+            Reply::HostCache { tokens } => Ok(tokens),
+            other => {
+                anyhow::bail!("the Storage Server answered a host KV cache size with {other:?}")
             }
         }
     }
@@ -1656,7 +1799,51 @@ mod tests {
             inherited_units: 0,
             identity: String::new(),
             request_states: false,
+            host_token_bytes: 0,
+            storage_endpoint: None,
         }
+    }
+
+    /// A world asks for its device KV cache's tokens times the ratio, the
+    /// least over its ranks, and states the bytes a token takes on each rank
+    /// by host; ranks that copy no page ask nothing.
+    #[test]
+    fn a_world_asks_its_hosts_for_one_token_count() {
+        let rank = |host: &str, units: u32, scratch: u32, bytes: u64| {
+            let mut cache = report(vec![cache_group(None)], &[], &[]);
+            cache.num_units = units;
+            cache.scratch_units = scratch;
+            cache.host_token_bytes = bytes;
+            cache.storage_endpoint = Some(format!("{host}:7000"));
+            (host.to_owned(), Some(cache))
+        };
+        let block = u64::from(cache_group(None).block_size);
+        let ranks = BTreeMap::from([
+            (
+                WorkerGroupId("text".to_owned()),
+                vec![rank("a", 65, 0, 100), rank("b", 65, 0, 100)],
+            ),
+            (
+                WorkerGroupId("prefill".to_owned()),
+                vec![rank("a", 41, 8, 300), ("b".to_owned(), None)],
+            ),
+        ]);
+
+        let demand = HostCacheDemand::of(&ranks, 1.5).unwrap();
+        // The prefill ranks allocate 32 units beside the sentinel and the
+        // units their warmup lends.
+        assert_eq!(demand.tokens, (32 * block * 3).div_ceil(2));
+        assert_eq!(
+            demand.hosts["a"],
+            (Some("a:7000".to_owned()), vec![300, 100])
+        );
+        assert_eq!(demand.hosts["b"], (Some("b:7000".to_owned()), vec![100]));
+
+        let none = BTreeMap::from([(
+            WorkerGroupId("experts".to_owned()),
+            vec![("a".to_owned(), None)],
+        )]);
+        assert_eq!(HostCacheDemand::of(&none, 2.0), None);
     }
 
     /// Poll `kv_offload` until `done` holds, for at most ten seconds.
@@ -1683,7 +1870,8 @@ mod tests {
         let mooncake = connector(&server.socket, Arc::clone(&stop));
 
         let mut kv_offload =
-            KvOffloadManager::connect(&server.socket, "model", DEFAULT_BOUNDARY_INTERVAL).unwrap();
+            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL)
+                .unwrap();
         let cache = report(vec![cache_group(None)], &pools, &[3]);
         let text = WorkerGroupId("text".into());
         assert!(kv_offload.add_worker(
@@ -1719,7 +1907,8 @@ mod tests {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[4, 5]);
         let mut kv_offload =
-            KvOffloadManager::connect(&server.socket, "model", DEFAULT_BOUNDARY_INTERVAL).unwrap();
+            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL)
+                .unwrap();
         let cache = report(
             vec![cache_group(None), cache_group(Some(128))],
             &pools,
@@ -1798,7 +1987,8 @@ mod tests {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[4, 5]);
         let mut kv_offload =
-            KvOffloadManager::connect(&server.socket, "model", DEFAULT_BOUNDARY_INTERVAL).unwrap();
+            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL)
+                .unwrap();
         let cache = report(
             vec![cache_group(None), cache_group(Some(128))],
             &pools,
@@ -1836,7 +2026,7 @@ mod tests {
     fn sliding_windows_offload_before_aligned_boundaries() {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[6, 7]);
-        let mut kv_offload = KvOffloadManager::connect(&server.socket, "model", 4).unwrap();
+        let mut kv_offload = KvOffloadManager::connect(&server.socket, "model", 0, 4).unwrap();
         let cache = report(
             vec![cache_group(None), cache_group(Some(128))],
             &pools,

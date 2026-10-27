@@ -53,6 +53,9 @@ enum Slot {
         writer: Scope,
         /// The head that reserved the slot, while it is connected.
         head: Option<ClientId>,
+        /// The world whose head reserved the slot, which publishes its page.
+        #[serde(default)]
+        world: u64,
     },
     /// Reserved for the connector, which reads the page from the
     /// KV storage.
@@ -68,7 +71,41 @@ enum Slot {
         pins: Vec<(Scope, Option<ClientId>)>,
         /// The connector's uploads of the page in flight.
         uploads: u32,
+        /// The world that published the page (`Visibility`); zero for a
+        /// page every world shares, such as one read from the KV storage.
+        #[serde(default)]
+        world: u64,
     },
+}
+
+/// The world a discarded page is published by: no world reads it, and it
+/// leaves the pool once nobody reads it.
+pub(super) const DISCARDED: u64 = u64::MAX;
+
+/// Which pages a head reads: those its own world published, and those every
+/// world of its deployment shares. A world on trial beside the world it
+/// succeeds (`private`) keeps what it publishes to itself until its commit
+/// retires its predecessor; a rollback discards it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Visibility {
+    /// The world of the head that reads.
+    pub(super) world: u64,
+    /// The deployment's worlds on trial: claimed and newer than its oldest
+    /// claimed world.
+    pub(super) private: BTreeSet<u64>,
+}
+
+impl Visibility {
+    /// Whether a page `published` by that world is read.
+    pub(super) fn sees(&self, published: u64) -> bool {
+        published == self.world || self.shared(published)
+    }
+
+    /// Whether every world of the deployment reads a page `published` by
+    /// that world.
+    pub(super) fn shared(&self, published: u64) -> bool {
+        published != DISCARDED && !self.private.contains(&published)
+    }
 }
 
 impl Slot {
@@ -122,6 +159,9 @@ pub(super) struct Pool {
     /// since [`Pools::settle`] last took them.
     removed: Vec<Key>,
     ended: Vec<(u64, Option<PageAnchor>)>,
+    /// The scopes, by world, whose workers mapped the pool: a pool no
+    /// claimed world maps is the server's to release.
+    users: BTreeSet<(Scope, u64)>,
 }
 
 /// Every page pool of the server.
@@ -160,6 +200,8 @@ pub(super) struct HandedPool {
     next_window: u64,
     removed: Vec<Key>,
     ended: Vec<(u64, Option<PageAnchor>)>,
+    #[serde(default)]
+    users: Vec<(Scope, u64)>,
 }
 
 /// A pool's identity: its deployment, page shape and NUMA node.
@@ -206,6 +248,7 @@ impl Pools {
                     next_window: pool.next_window,
                     removed: pool.removed,
                     ended: pool.ended,
+                    users: pool.users.into_iter().collect(),
                 }
             })
             .collect();
@@ -258,6 +301,7 @@ impl Pools {
                         next_window: pool.next_window,
                         removed: pool.removed,
                         ended: pool.ended,
+                        users: pool.users.into_iter().collect(),
                     },
                 )
             })
@@ -345,6 +389,7 @@ impl Pools {
                 next_window: 1,
                 removed: Vec::new(),
                 ended: Vec::new(),
+                users: BTreeSet::new(),
             },
         );
         self.by_shape
@@ -373,6 +418,48 @@ impl Pools {
                 size.saturating_sub(held)
             })
             .sum()
+    }
+
+    /// `world`'s worker of `scope` maps `pool`.
+    pub(super) fn add_user(&mut self, pool: u64, scope: &Scope, world: u64) {
+        if let Some(entry) = self.pools.get_mut(&pool) {
+            entry.users.insert((scope.clone(), world));
+        }
+    }
+
+    /// `retired` worlds of `deployment` map no pool any more.
+    pub(super) fn retire_users(&mut self, deployment: &str, retired: &BTreeSet<u64>) {
+        for pool in self.pools.values_mut() {
+            if pool.deployment == deployment {
+                pool.users.retain(|(_, world)| !retired.contains(world));
+            }
+        }
+    }
+
+    /// The live pools of `deployment` no world maps, with their bytes.
+    pub(super) fn unreferenced(&self, deployment: &str) -> Vec<(u64, u64)> {
+        self.pools
+            .iter()
+            .filter(|(id, pool)| {
+                pool.deployment == deployment
+                    && pool.users.is_empty()
+                    && !self.releasing.contains(id)
+            })
+            .map(|(&id, pool)| (id, pool.slots() * pool.shape.page_bytes))
+            .collect()
+    }
+
+    /// Release `pools`, as [`Self::release`] releases a deployment's.
+    /// Returns the pools that left at once.
+    pub(super) fn release_pools(&mut self, pools: &[u64]) -> Vec<u64> {
+        self.by_shape.retain(|_, id| !pools.contains(id));
+        let live: Vec<u64> = pools
+            .iter()
+            .copied()
+            .filter(|id| self.pools.contains_key(id))
+            .collect();
+        self.releasing.extend(live);
+        self.reap()
     }
 
     /// Whether `pool` is released and waits for the connector to finish.
@@ -450,9 +537,10 @@ impl Pools {
         head: ClientId,
         keys: &[Key],
         window: Option<PageWindow>,
+        visibility: &Visibility,
     ) -> Option<Vec<PageSlot>> {
         let entry = self.pools.get_mut(&pool)?;
-        let (slots, id) = entry.reserve(writer, head, keys, window);
+        let (slots, id) = entry.reserve(writer, head, keys, window, visibility);
         if let (Some(id), Some(anchor)) = (id, window.and_then(|window| window.anchor)) {
             self.anchors
                 .entry((anchor.pool, anchor.key))
@@ -461,6 +549,27 @@ impl Pools {
         }
         self.settle();
         Some(slots)
+    }
+
+    /// Discard the pages `world` of `deployment` published while on trial
+    /// ([`Pool::discard_world`]).
+    pub(super) fn discard_world(&mut self, deployment: &str, world: u64) {
+        for pool in self.pools.values_mut() {
+            if pool.deployment == deployment {
+                pool.discard_world(world);
+            }
+        }
+        self.settle();
+    }
+
+    /// The pages `world` of `deployment` published, by pool.
+    pub(super) fn published_by(&self, deployment: &str, world: u64) -> Vec<(u64, Vec<(Key, u32)>)> {
+        self.pools
+            .iter()
+            .filter(|(id, pool)| pool.deployment == deployment && !self.releasing.contains(id))
+            .map(|(&id, pool)| (id, pool.published_by(world)))
+            .filter(|(_, pages)| !pages.is_empty())
+            .collect()
     }
 
     /// End the windows whose anchors left their pools, and forget the
@@ -544,15 +653,16 @@ impl Pool {
         self.tick
     }
 
-    /// Whether the pool holds each of `keys` committed; the pages it holds
-    /// become the most recently used.
-    pub(super) fn lookup(&mut self, keys: &[Key]) -> Vec<bool> {
+    /// Whether the pool holds each of `keys` committed, in a page `visibility`
+    /// reads; the pages it holds become the most recently used.
+    pub(super) fn lookup(&mut self, keys: &[Key], visibility: &Visibility) -> Vec<bool> {
         keys.iter()
             .map(|key| {
                 let Some(&slot) = self.index.get(key) else {
                     return false;
                 };
-                if !matches!(self.slots[slot as usize], Slot::Ready { .. }) {
+                if !matches!(self.slots[slot as usize], Slot::Ready { world, .. } if visibility.sees(world))
+                {
                     return false;
                 }
                 self.refresh(slot);
@@ -579,20 +689,23 @@ impl Pool {
         }
     }
 
-    /// A slot for each key the pool holds no page of, written by the worker
-    /// of `writer` for `head`. With `window`, the pages of `keys` the pool
-    /// reserves or holds become one window, whose id is returned.
+    /// A slot for each key the pool holds no page of that `visibility`
+    /// reads, written by the worker of `writer` for `head`. A page of the
+    /// key that another world keeps to itself, and nobody reads, gives way.
+    /// With `window`, the pages of `keys` the pool reserves or holds become
+    /// one window, whose id is returned.
     fn reserve(
         &mut self,
         writer: &Scope,
         head: ClientId,
         keys: &[Key],
         window: Option<PageWindow>,
+        visibility: &Visibility,
     ) -> (Vec<PageSlot>, Option<u64>) {
         let slots: Vec<PageSlot> = keys
             .iter()
             .map(|key| {
-                if self.index.contains_key(key) {
+                if !self.yield_unseen(key, visibility) {
                     return PageSlot::Present;
                 }
                 let Some(slot) = self.take_slot() else {
@@ -602,6 +715,7 @@ impl Pool {
                     key: *key,
                     writer: writer.clone(),
                     head: Some(head),
+                    world: visibility.world,
                 };
                 self.index.insert(*key, slot);
                 PageSlot::Reserved {
@@ -693,42 +807,72 @@ impl Pool {
             let Some(&slot) = self.index.get(key) else {
                 continue;
             };
-            if !matches!(self.slots[slot as usize], Slot::Reserved { .. }) {
+            let Slot::Reserved { world, .. } = self.slots[slot as usize] else {
                 continue;
-            }
-            self.ready(*key, slot);
+            };
+            self.ready(*key, slot, world);
             committed.push((*key, slot));
         }
         committed
     }
 
-    /// `slot` holds `key`'s page, readable and the most recently used.
-    fn ready(&mut self, key: Key, slot: u32) {
+    /// `slot` holds `key`'s page, which `world` published, readable and the
+    /// most recently used.
+    fn ready(&mut self, key: Key, slot: u32, world: u64) {
         let tick = self.touch();
         self.slots[slot as usize] = Slot::Ready {
             key,
             touched: tick,
             pins: Vec::new(),
             uploads: 0,
+            world,
         };
         self.evictable.insert(tick, slot);
     }
 
-    /// Whether the pool holds `key`'s committed page.
-    pub(super) fn holds(&self, key: &Key) -> bool {
-        self.index
-            .get(key)
-            .is_some_and(|&slot| matches!(self.slots[slot as usize], Slot::Ready { .. }))
+    /// Whether the pool holds `key`'s committed page in a page `visibility`
+    /// reads.
+    pub(super) fn holds(&self, key: &Key, visibility: &Visibility) -> bool {
+        self.index.get(key).is_some_and(|&slot| {
+            matches!(self.slots[slot as usize], Slot::Ready { world, .. } if visibility.sees(world))
+        })
+    }
+
+    /// The world that published the committed page in `slot`.
+    pub(super) fn publisher(&self, slot: u32) -> Option<u64> {
+        match self.slots.get(slot as usize)? {
+            Slot::Ready { world, .. } => Some(*world),
+            _ => None,
+        }
+    }
+
+    /// Free `key`'s page when `visibility` does not read it and nobody else
+    /// does: the slot it held is free for a page `visibility` reads. Whether
+    /// the pool now holds no page of `key`.
+    fn yield_unseen(&mut self, key: &Key, visibility: &Visibility) -> bool {
+        let Some(&held) = self.index.get(key) else {
+            return true;
+        };
+        let unseen_idle = matches!(
+            &self.slots[held as usize],
+            Slot::Ready { world, pins, uploads, .. }
+                if !visibility.sees(*world) && Slot::idle(pins, *uploads)
+        );
+        if unseen_idle {
+            self.free_slot(held);
+        }
+        unseen_idle
     }
 
     /// A slot for the connector to read each key's page into, for the keys
-    /// the pool holds no page of. Fetches hold at most half of the slots, so
-    /// that prefetching never takes the slots that workers write.
-    pub(super) fn prefetch(&mut self, keys: &[Key]) -> Vec<Fetch> {
+    /// the pool holds no page of that `visibility` reads. Fetches hold at
+    /// most half of the slots, so that prefetching never takes the slots
+    /// that workers write.
+    pub(super) fn prefetch(&mut self, keys: &[Key], visibility: &Visibility) -> Vec<Fetch> {
         let limit = self.slots() / 2;
         keys.iter()
             .map(|key| {
-                if self.index.contains_key(key) {
+                if !self.yield_unseen(key, visibility) {
                     return Fetch::Present;
                 }
                 if self.fetching >= limit {
@@ -757,7 +901,8 @@ impl Pool {
             }
             if results.get(index).copied().unwrap_or(false) {
                 self.fetching -= 1;
-                self.ready(*key, *slot);
+                // The KV storage holds only pages every world shares.
+                self.ready(*key, *slot, 0);
             } else {
                 self.free_slot(*slot);
             }
@@ -773,6 +918,7 @@ impl Pool {
                 touched,
                 pins,
                 uploads,
+                ..
             } = &mut self.slots[*slot as usize]
                 && held == key
             {
@@ -792,6 +938,7 @@ impl Pool {
                 touched,
                 pins,
                 uploads,
+                ..
             } = &mut self.slots[*slot as usize]
                 && held == key
                 && *uploads > 0
@@ -860,6 +1007,7 @@ impl Pool {
                 touched,
                 pins,
                 uploads,
+                ..
             } => {
                 if Slot::idle(pins, *uploads) {
                     self.evictable.remove(touched);
@@ -874,8 +1022,62 @@ impl Pool {
         self.leave(slot, key);
     }
 
-    /// Pin the committed pages of `keys` for the worker of `reader`.
-    pub(super) fn pin(&mut self, reader: &Scope, head: ClientId, keys: &[Key]) -> Vec<Option<u64>> {
+    /// Discard the pages `world` published, a world on trial that a
+    /// rollback retires: those nobody reads leave the pool, and no world
+    /// reads the others, which leave it once their readers unpin them, nor
+    /// the pages it reserved and commits later.
+    pub(super) fn discard_world(&mut self, world: u64) {
+        for slot in 0..self.slots.len() as u32 {
+            let idle = match &mut self.slots[slot as usize] {
+                Slot::Ready {
+                    world: published,
+                    pins,
+                    uploads,
+                    ..
+                } if *published == world => {
+                    *published = DISCARDED;
+                    Slot::idle(pins, *uploads)
+                }
+                Slot::Reserved {
+                    world: published, ..
+                } if *published == world => {
+                    *published = DISCARDED;
+                    false
+                }
+                _ => false,
+            };
+            if idle {
+                self.free_slot(slot);
+            }
+        }
+    }
+
+    /// The pages `world` published, with their slots: those every world
+    /// shares once the commit of `world` retires its predecessor.
+    pub(super) fn published_by(&self, world: u64) -> Vec<(Key, u32)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, state)| match state {
+                Slot::Ready {
+                    key,
+                    world: published,
+                    ..
+                } if *published == world => Some((*key, slot as u32)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pin the committed pages of `keys` that `visibility` reads for the
+    /// worker of `reader`.
+    pub(super) fn pin(
+        &mut self,
+        reader: &Scope,
+        head: ClientId,
+        keys: &[Key],
+        visibility: &Visibility,
+    ) -> Vec<Option<u64>> {
         keys.iter()
             .map(|key| {
                 let slot = *self.index.get(key)?;
@@ -884,11 +1086,15 @@ impl Pool {
                     touched,
                     pins,
                     uploads,
+                    world,
                     ..
                 } = &mut self.slots[slot as usize]
                 else {
                     return None;
                 };
+                if !visibility.sees(*world) {
+                    return None;
+                }
                 if Slot::idle(pins, *uploads) {
                     self.evictable.remove(touched);
                 }
@@ -1142,6 +1348,14 @@ mod tests {
         Key([byte; 32])
     }
 
+    /// What a head of a deployment with no world on trial reads.
+    fn all() -> Visibility {
+        Visibility {
+            world: 0,
+            private: BTreeSet::new(),
+        }
+    }
+
     /// A pool of `slots` pages of 16 bytes and layout `layout`, in `pools`.
     fn add_pool(pools: &mut Pools, layout: u8, slots: u64) -> u64 {
         let shape = PageShape {
@@ -1163,7 +1377,9 @@ mod tests {
 
     /// Reserve and commit `keys` in `pool`, as one window with `window`.
     fn store(pools: &mut Pools, pool: u64, keys: &[Key], window: Option<PageWindow>) {
-        let slots = pools.reserve(pool, &scope(0), 1, keys, window).unwrap();
+        let slots = pools
+            .reserve(pool, &scope(0), 1, keys, window, &all())
+            .unwrap();
         assert!(
             slots
                 .iter()
@@ -1174,7 +1390,7 @@ mod tests {
     }
 
     fn held(pools: &mut Pools, pool: u64, keys: &[Key]) -> Vec<bool> {
-        pools.get_mut(pool).unwrap().lookup(keys)
+        pools.get_mut(pool).unwrap().lookup(keys, &all())
     }
 
     #[test]
@@ -1182,7 +1398,7 @@ mod tests {
         let (mut pools, id) = pools(2);
         assert!(matches!(
             pools
-                .reserve(id, &scope(0), 1, &[key(1), key(2)], None)
+                .reserve(id, &scope(0), 1, &[key(1), key(2)], None, &all())
                 .unwrap()[..],
             [PageSlot::Reserved { .. }, PageSlot::Reserved { .. }]
         ));
@@ -1197,11 +1413,15 @@ mod tests {
         // Touching the first page leaves the second least recently used.
         assert_eq!(held(&mut pools, id, &[key(1)]), [true]);
         assert_eq!(
-            pools.reserve(id, &scope(0), 1, &[key(1)], None).unwrap(),
+            pools
+                .reserve(id, &scope(0), 1, &[key(1)], None, &all())
+                .unwrap(),
             vec![PageSlot::Present]
         );
         assert!(matches!(
-            pools.reserve(id, &scope(0), 1, &[key(3)], None).unwrap()[..],
+            pools
+                .reserve(id, &scope(0), 1, &[key(3)], None, &all())
+                .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
         assert_eq!(held(&mut pools, id, &[key(2), key(1)]), [false, true]);
@@ -1210,28 +1430,34 @@ mod tests {
     #[test]
     fn pinned_and_reserved_slots_are_not_evicted() {
         let (mut pools, id) = pools(2);
-        pools.reserve(id, &scope(0), 1, &[key(1), key(2)], None);
+        pools.reserve(id, &scope(0), 1, &[key(1), key(2)], None, &all());
         let pool = pools.get_mut(id).unwrap();
         pool.commit(&[key(1)]);
         let slot = pool_slot_of(pool, key(1));
         assert_eq!(
-            pool.pin(&scope(1), 1, &[key(1), key(9)]),
+            pool.pin(&scope(1), 1, &[key(1), key(9)], &all()),
             vec![Some(slot), None]
         );
         assert_eq!(
-            pools.reserve(id, &scope(0), 1, &[key(3)], None).unwrap(),
+            pools
+                .reserve(id, &scope(0), 1, &[key(3)], None, &all())
+                .unwrap(),
             vec![PageSlot::Full]
         );
 
         pools.get_mut(id).unwrap().unpin(&scope(1), &[key(1)]);
         assert!(matches!(
-            pools.reserve(id, &scope(0), 1, &[key(3)], None).unwrap()[..],
+            pools
+                .reserve(id, &scope(0), 1, &[key(3)], None, &all())
+                .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
         // Aborting frees the reserved slot of the unwritten page.
         pools.get_mut(id).unwrap().abort(&[key(2)]);
         assert!(matches!(
-            pools.reserve(id, &scope(0), 1, &[key(4)], None).unwrap()[..],
+            pools
+                .reserve(id, &scope(0), 1, &[key(4)], None, &all())
+                .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
     }
@@ -1274,7 +1500,10 @@ mod tests {
             }),
         });
         store(&mut pools, window, &[key(11), key(12)], anchor);
-        pools.get_mut(window).unwrap().pin(&scope(1), 1, &[key(12)]);
+        pools
+            .get_mut(window)
+            .unwrap()
+            .pin(&scope(1), 1, &[key(12)], &all());
 
         // Two more full-attention pages evict the anchor.
         store(&mut pools, full, &[key(2), key(3)], None);
@@ -1353,14 +1582,16 @@ mod tests {
     fn fetches_hold_half_the_slots_and_uploads_keep_their_pages() {
         let (mut pools, id) = pools(4);
         let pool = pools.get_mut(id).unwrap();
-        let fetches = pool.prefetch(&[key(1), key(2), key(3)]);
+        let fetches = pool.prefetch(&[key(1), key(2), key(3)], &all());
         let [Fetch::Reserved(first), Fetch::Reserved(second), Fetch::Full] = fetches[..] else {
             panic!("fetches took {fetches:?}");
         };
         // A page being fetched is neither readable nor reserved again.
-        assert_eq!(pool.lookup(&[key(1)]), [false]);
+        assert_eq!(pool.lookup(&[key(1)], &all()), [false]);
         assert_eq!(
-            pools.reserve(id, &scope(0), 1, &[key(1)], None).unwrap(),
+            pools
+                .reserve(id, &scope(0), 1, &[key(1)], None, &all())
+                .unwrap(),
             vec![PageSlot::Present]
         );
 
@@ -1368,33 +1599,42 @@ mod tests {
         let pool = pools.get_mut(id).unwrap();
         let pages = [(key(1), first), (key(2), second)];
         pool.fetched(&pages, &[true, false]);
-        assert_eq!(pool.lookup(&[key(1), key(2)]), [true, false]);
+        assert_eq!(pool.lookup(&[key(1), key(2)], &all()), [true, false]);
         assert_eq!(pool.listed(1).fetching, 0);
 
         // A page the connector uploads is not evicted until it is done.
         pool.upload(&pages[..1]);
         let reserved = pools
-            .reserve(id, &scope(0), 1, &[key(5), key(6), key(7), key(8)], None)
+            .reserve(
+                id,
+                &scope(0),
+                1,
+                &[key(5), key(6), key(7), key(8)],
+                None,
+                &all(),
+            )
             .unwrap();
         assert_eq!(reserved[3], PageSlot::Full);
-        assert!(pools.get(id).unwrap().holds(&key(1)));
+        assert!(pools.get(id).unwrap().holds(&key(1), &all()));
         pools.get_mut(id).unwrap().uploaded(&pages[..1]);
         assert!(matches!(
-            pools.reserve(id, &scope(0), 1, &[key(9)], None).unwrap()[..],
+            pools
+                .reserve(id, &scope(0), 1, &[key(9)], None, &all())
+                .unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
-        assert!(!pools.get(id).unwrap().holds(&key(1)));
+        assert!(!pools.get(id).unwrap().holds(&key(1), &all()));
     }
 
     #[test]
     fn a_closed_head_leaves_its_slots_to_the_workers_still_connected() {
         let (mut pools, id) = pools(3);
-        pools.reserve(id, &scope(0), 7, &[key(1)], None);
-        pools.reserve(id, &scope(1), 7, &[key(2)], None);
-        pools.reserve(id, &scope(0), 7, &[key(3)], None);
+        pools.reserve(id, &scope(0), 7, &[key(1)], None, &all());
+        pools.reserve(id, &scope(1), 7, &[key(2)], None, &all());
+        pools.reserve(id, &scope(0), 7, &[key(3)], None, &all());
         let pool = pools.get_mut(id).unwrap();
         pool.commit(&[key(3)]);
-        pool.pin(&scope(1), 7, &[key(3)]);
+        pool.pin(&scope(1), 7, &[key(3)], &all());
 
         // The worker of rank 0 is gone; rank 1 may still copy.
         pool.orphan(7, &|scope| scope.rank == 1);

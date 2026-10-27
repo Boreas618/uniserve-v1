@@ -291,6 +291,10 @@ impl CachePlan {
             // The worker reports its identity once it loaded the model.
             identity: String::new(),
             request_states: !self.states.is_empty(),
+            // The rank reports what its host KV cache takes once the engine
+            // copies its pages through one.
+            host_token_bytes: 0,
+            storage_endpoint: None,
         }
     }
 

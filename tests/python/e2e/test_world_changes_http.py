@@ -75,6 +75,9 @@ PROMPT = (
 )
 # A prompt of several pages, whose pages the serving world publishes.
 CACHED_PROMPT = "Describe the sea in one sentence. " * 40
+# A prompt of several pages only a world on trial computes, which shares no
+# page with the other prompts.
+TRIAL_PROMPT = "List the colours of the rainbow and what each means. " * 40
 # Options every deployment of the tests serves with: few captured graphs,
 # so that worlds start while the count streams, and a small KV cache.
 OPTIONS = (
@@ -229,6 +232,14 @@ def _device() -> str:
     return os.environ.get("UNISERVE_WORLD_DEVICE", "0")
 
 
+def _devices() -> str:
+    """The two GPUs a two-GPU deployment serves on
+    (``UNISERVE_WORLD_DEVICES``, ``0,1`` by default), so that cases run
+    beside each other on other GPUs.
+    """  # noqa: D205
+    return os.environ.get("UNISERVE_WORLD_DEVICES", "0,1")
+
+
 def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
     """The devices and extra options of a deployment.
 
@@ -239,13 +250,13 @@ def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
     if topology == "single":
         return _device(), ()
     if topology == "experts":
-        return "0,1", (
+        return _devices(), (
             "--data-parallel-size",
             "2",
             "--set",
             "moe_config.expert_parallel=true",
         )
-    return "0,1", (
+    return _devices(), (
         "--worker-groups",
         str(dedicated_experts(tmp_path)),
         "--set",
@@ -540,6 +551,9 @@ def test_an_operator_rollback_resumes_the_previous_world(
             "world": serving["world"],
             "state": previous_world,
         }, status
+        # The world on trial publishes the pages of a prompt only it
+        # computes.
+        trial_answer = _chat(base_url, name, TRIAL_PROMPT)
         if previous_world == "weights":
             _wait_until(
                 lambda: not _runs(engine_before),
@@ -571,7 +585,15 @@ def test_an_operator_rollback_resumes_the_previous_world(
         reference, reference_usage = _ask(base_url, name)
         assert streaming.tokens == reference
         assert streaming.usage == reference_usage
-        assert _chat(base_url, name, CACHED_PROMPT) == cached
+        # The previous world reads the pages it published before the change,
+        # from its device cache or the host KV cache, and none the discarded
+        # world published.
+        answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
+        assert answer == cached
+        assert hits > 0
+        answer, hits = _hits_of(base_url, name, TRIAL_PROMPT)
+        assert answer == trial_answer
+        assert hits == 0
 
         # The configuration is unavailable until forced.
         again = _apply(
@@ -622,16 +644,45 @@ def register(registry):
 """
 
 
-def _prefix_hits(base_url: str) -> float:
-    """The prefix cache hits every world counted so far
-    (``uniserve:prefix_cache_hits``).
+# How long the counters an engine reports every second take to include
+# what a request it answered counted: two report intervals.
+REPORT_SETTLE = 2.0
+
+
+def _prefix_counter(base_url: str, name: str) -> float:
+    """A prefix cache counter every world counted so far, in tokens
+    (``uniserve:prefix_cache_<name>``).
     """  # noqa: D205
     text = httpx.get(f"{base_url}/metrics", timeout=10).text
     return sum(
         float(line.rsplit(" ", 1)[1])
         for line in text.splitlines()
-        if line.startswith("uniserve:prefix_cache_hits")
+        if line.startswith(f"uniserve:prefix_cache_{name}")
     )
+
+
+def _prefix_hits(base_url: str) -> float:
+    """The prefix cache hits every world counted so far."""
+    return _prefix_counter(base_url, "hits")
+
+
+def _hits_of(base_url: str, name: str, prompt: str) -> tuple[str, float]:
+    """The answer to `prompt` and the prompt tokens it found cached.
+
+    Its query is counted at admission and the pages it loads from the host
+    KV cache once they arrive, before it computes, so the hits are read once
+    the report carrying the query arrived and another followed.
+    """
+    queries = _prefix_counter(base_url, "queries")
+    hits = _prefix_hits(base_url)
+    answer = _chat(base_url, name, prompt)
+    _wait_until(
+        lambda: _prefix_counter(base_url, "queries") > queries,
+        30,
+        "the request's prefix cache query was not reported",
+    )
+    time.sleep(REPORT_SETTLE)
+    return answer, _prefix_hits(base_url) - hits
 
 
 @pytest.mark.parametrize(
@@ -713,9 +764,9 @@ def test_a_world_of_other_numerics_continues_the_requests_in_flight(
             assert migrated == 0, migrated
 
         # A request after the change hits no page of the earlier numerics.
-        before = _prefix_hits(base_url)
-        assert _chat(base_url, name, CACHED_PROMPT) == cached
-        assert _prefix_hits(base_url) == before
+        answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
+        assert answer == cached
+        assert hits == 0
 
         reference, reference_usage = _ask(base_url, name)
         assert streaming.tokens == reference

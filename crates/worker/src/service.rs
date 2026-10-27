@@ -107,6 +107,10 @@ pub(crate) struct Maintenance {
     /// The rank's CUDA devices, whose contexts the rank probes while jobs
     /// are in flight (`Service::watch_jobs`).
     pub(crate) devices: Vec<cuda::DeviceId>,
+    /// What mapping the rank's host page pools needs, which
+    /// `uniserve.host_cache` takes; `None` for a rank that copies no page
+    /// through the host KV cache, and once mapped.
+    pub(crate) host_cache: Option<crate::memory::prefix_cache::host::HostCacheSetup>,
 }
 
 /// A standby worker parked until its promotion: its retained storages,
@@ -616,6 +620,11 @@ impl Service<'_> {
     /// - `uniserve.restore_cache`: creates them again;
     /// - `uniserve.sleep`: suspends the graph memory and gives back every
     ///   segment; `uniserve.wake` restores both;
+    /// - `uniserve.host_cache` (`{"tokens": count}`): maps the rank's host
+    ///   page pools, each holding the pages of `count` tokens, the count
+    ///   the engine sizes the world's host KV cache at, and answers what the
+    ///   rank reports of each pool (`ipc::PagePoolInfo`); a rank that copies
+    ///   no page through the host KV cache answers `null`;
     /// - `uniserve.update_weights` (`{"model_path": path}`): rewrites the
     ///   weights in place from the checkpoint at `path`
     ///   (`crate::worker::update`), and answers the rank's worker group and
@@ -714,6 +723,27 @@ impl Service<'_> {
                     "reserve_bytes": reserve,
                     "exclusive_bytes": exclusive,
                 })
+            }
+            "uniserve.host_cache" => {
+                let tokens = payload["tokens"]
+                    .as_u64()
+                    .ok_or_else(|| Error::Invalid("host_cache names no token count".into()))?;
+                let Some(setup) = self.maintenance.host_cache.take() else {
+                    return Ok(serde_json::Value::Null.to_string());
+                };
+                let retained = retained.as_deref().ok_or(Error::State(
+                    "a host KV cache maps its pools at a Storage Server",
+                ))?;
+                let cache = self
+                    .executor
+                    .backend_mut()
+                    .worker_storage_mut()
+                    .and_then(|storage| storage.prefix_cache.as_mut())
+                    .ok_or(Error::State("a host KV cache copies a rank's prefix cache"))?;
+                let pools = setup.map(retained, cache, tokens)?;
+                tracing::info!(tokens, pools = pools.len(), "mapped the host KV cache");
+                serde_json::to_value(pools)
+                    .map_err(|error| Error::Invalid(format!("host_cache result: {error}")))?
             }
             "uniserve.release_cache" => {
                 let first = payload["from"]
@@ -1026,6 +1056,7 @@ mod tests {
                 predecessor: None,
                 max_total_tokens: None,
                 devices: Vec::new(),
+                host_cache: None,
             },
         )
         .run()

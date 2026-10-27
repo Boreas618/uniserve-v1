@@ -50,7 +50,7 @@ pub use crate::handle::{
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
-pub use crate::kv_cache::IndexedPage;
+pub use crate::kv_cache::{HostCacheSize, IndexedPage};
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,

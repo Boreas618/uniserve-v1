@@ -92,6 +92,7 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
         socket,
         Role::Head {
             deployment: "model".into(),
+            world: 0,
         },
     )
     .unwrap();

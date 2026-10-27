@@ -72,6 +72,11 @@ struct HandedServer {
     next_storage: u64,
     tensors: Vec<(Key, HandedTensor)>,
     deployments: Vec<(String, Claim, Option<ClientId>)>,
+    /// The worlds each deployment claims, and those it discarded; a
+    /// predecessor that knew no visibility of worlds hands none over, and
+    /// its deployments claim none.
+    #[serde(default)]
+    worlds: Vec<(String, BTreeSet<u64>, BTreeSet<u64>)>,
     /// The pidfds of the processes shot down that left every GPU, and of
     /// those that did not leave one in time.
     shot_finished: Vec<usize>,
@@ -107,6 +112,11 @@ struct HandedTensor {
     scopes: BTreeSet<Scope>,
     #[serde(default)]
     retainers: BTreeSet<Retainer>,
+    /// The deployment and world that published the tensor; a predecessor
+    /// that knew no visibility of worlds hands over tensors every world
+    /// reads (world 0).
+    #[serde(default)]
+    publisher: (String, u64),
     writer: Option<HandedHolder>,
     standby: Vec<HandedHolder>,
 }
@@ -263,6 +273,7 @@ impl Server {
                     access: tensor.access,
                     scopes: BTreeSet::new(),
                     retainers: tensor.retainers,
+                    publisher: tensor.publisher,
                     writer: tensor.writer.as_ref().map(|holder| pidfds.holder(holder)),
                     standby: tensor
                         .standby
@@ -311,6 +322,17 @@ impl Server {
             storages,
             next_storage: self.next_storage,
             tensors,
+            worlds: self
+                .deployments
+                .iter()
+                .map(|(name, deployment)| {
+                    (
+                        name.clone(),
+                        deployment.worlds.clone(),
+                        deployment.discarded.clone(),
+                    )
+                })
+                .collect(),
             deployments: self
                 .deployments
                 .drain()
@@ -506,6 +528,7 @@ impl Server {
                                 .map(|scope| Retainer { scope, world: 0 }),
                         )
                         .collect(),
+                    publisher: tensor.publisher,
                     writer: tensor.writer.map(holder).transpose()?,
                     standby: tensor
                         .standby
@@ -543,11 +566,29 @@ impl Server {
             storages,
             next_storage: handed.next_storage,
             tensors,
-            deployments: handed
-                .deployments
-                .into_iter()
-                .map(|(name, claim, head)| (name, Deployment { claim, head }))
-                .collect(),
+            deployments: {
+                let mut worlds: HashMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = handed
+                    .worlds
+                    .into_iter()
+                    .map(|(name, worlds, discarded)| (name, (worlds, discarded)))
+                    .collect();
+                handed
+                    .deployments
+                    .into_iter()
+                    .map(|(name, claim, head)| {
+                        let (worlds, discarded) = worlds.remove(&name).unwrap_or_default();
+                        (
+                            name,
+                            Deployment {
+                                claim,
+                                head,
+                                worlds,
+                                discarded,
+                            },
+                        )
+                    })
+                    .collect()
+            },
             shootdowns,
             pages,
             host_reserve: handed.host_reserve,
@@ -637,6 +678,7 @@ mod tests {
             &path,
             Role::Head {
                 deployment: "model".into(),
+                world: 0,
             },
         )
         .unwrap();
