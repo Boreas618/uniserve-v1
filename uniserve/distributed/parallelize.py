@@ -134,12 +134,17 @@ def communicators(module: nn.Module) -> tuple:
     return tuple(groups.values())
 
 
-def _partition_experts(module, mesh, group, attention) -> None:
-    """Keep this rank's interval of every expert's intermediate channels.
+def _partition_experts(module, mesh, group, attention, whole: bool) -> None:
+    """Keep this rank's share of the experts of the tensor-parallel group.
 
-    Each rank holds the same experts with ``I / tp`` of their up, gate and
-    down channels; ``up_gate`` keeps the local up rows followed by the local
-    gate rows, preserving the resident order.
+    By default each rank holds the same experts with ``I / tp`` of their up,
+    gate and down channels; ``up_gate`` keeps the local up rows followed by
+    the local gate rows, preserving the resident order. With ``whole``,
+    rank ``r`` of ``P`` holds the whole global experts ``[r * E / P, (r +
+    1) * E / P)`` instead, the interval expert-parallel kernels skip the
+    other experts' routes by; the group is then both the layer's expert
+    group and the group summing its partial outputs, so the ranks, which
+    hold the same tokens, exchange none.
     """
     bound = getattr(module, "_parallel_mesh", None)
     if bound is not None:
@@ -148,13 +153,32 @@ def _partition_experts(module, mesh, group, attention) -> None:
                 "a resident layer cannot change its mathematical partition"
             )
         return
+    if isinstance(module.up_gate.weight, QuantizedTensor):
+        raise ValueError("parallel binding must precede weight quantization")
+    if whole and group.size > 1:
+        if module.num_experts % group.size:
+            raise ValueError(
+                f"{module.num_experts} experts do not divide a tensor-parallel "
+                f"group of {group.size} ranks"
+            )
+        count = module.num_experts // group.size
+        local = slice(group.rank * count, (group.rank + 1) * count)
+        for linear in (module.up_gate, module.down):
+            linear.weight = nn.Parameter(
+                linear.weight[local].contiguous(), requires_grad=False
+            )
+            linear.num_experts = count
+        module.expert_slice = local
+        module.expert_group = group
+        module.group = group
+        module._parallel_mesh = mesh
+        module._attention_parallel = attention
+        return
     intermediate = module.intermediate_size
     if intermediate % group.size:
         raise ValueError(
             "expert intermediate channels must divide the tensor-parallel group"
         )
-    if isinstance(module.up_gate.weight, QuantizedTensor):
-        raise ValueError("parallel binding must precede weight quantization")
     width = intermediate // group.size
     local = slice(group.rank * width, (group.rank + 1) * width)
     if width != intermediate:
@@ -314,6 +338,7 @@ def parallelize_(
     *,
     attention: AttentionParallelConfig = AttentionParallelConfig(),
     exclude: frozenset[nn.Module] = frozenset(),
+    whole_experts: bool = False,
 ) -> None:
     """Partition resident numerical parameters on an already bound mesh.
 
@@ -323,7 +348,11 @@ def parallelize_(
     Attention axis names select token placements; TP owns matrix channels.
     ``exclude`` leaves the named subtrees, including shared aliases, on their
     own mathematical partition. In particular, remote experts do not inherit
-    the calling attention module's tensor-parallel reduction.
+    the calling attention module's tensor-parallel reduction. With
+    ``whole_experts`` the tensor-parallel group divides every ``FusedMoE``'s
+    experts among its ranks, each keeping whole experts, instead of every
+    expert's intermediate channels; either way the group sums the ranks'
+    partial outputs once after the experts.
     """
     if mesh.rank not in mesh.ranks:
         raise ValueError("a nonparticipating rank cannot bind resident layers")
@@ -606,7 +635,7 @@ def parallelize_(
             child._attention_parallel = attention
             continue
         if isinstance(child, FusedMoE):
-            _partition_experts(child, mesh, group, attention)
+            _partition_experts(child, mesh, group, attention, whole_experts)
             continue
         if isinstance(child, GatedDeltaNet):
             _partition_gated_delta(child, mesh, group, attention)

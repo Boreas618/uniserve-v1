@@ -245,6 +245,29 @@ impl Worker {
             None => None,
         };
         let agreement = world.union.as_ref().unwrap_or(&world.host);
+        // A rank whose position no world loaded before receives its weights
+        // from the host's other worlds instead; layers streamed from host
+        // memory are retained whole and load.
+        let streams_from_host = components
+            .placed()
+            .iter()
+            .any(|placed| placed.config.weights == ComponentWeights::Host);
+        let found = match &keys {
+            Some(keys) if !streams_from_host => receive_weights(
+                &Receiving {
+                    keys,
+                    retained: &retained,
+                    agreement,
+                    description: &description,
+                    launch: &launch,
+                    meshes: &meshes,
+                    experts: experts.as_ref(),
+                },
+                found,
+            )
+            .map_err(phase("load"))?,
+            _ => found,
+        };
         let load =
             agree_load(agreement, weights::Load::of(found.as_ref())).map_err(phase("load"))?;
         let (found, load) = match load {
@@ -263,8 +286,8 @@ impl Worker {
         let model = LoadedModel::load(
             description,
             &launch,
-            meshes,
-            experts,
+            &meshes,
+            experts.as_ref(),
             host_only,
             binding.as_ref(),
             &load,
@@ -282,23 +305,24 @@ impl Worker {
             .collect();
         // A rank publishes what it read: everything, or the tensors it
         // read beside those it bound.
-        let (mut published, bound) = match (found, &keys) {
-            (Some(found), Some(keys)) if !load.is_empty() => (
-                Some(
-                    keys.publish(model.handle(), &host_paths, Some(&load))
-                        .map_err(phase("load"))?,
-                ),
-                found.into_storages(),
-            ),
+        let (mut published, (bound, receipt)) = match (found, &keys) {
+            (Some(found), Some(keys)) if !load.is_empty() => {
+                let mut published = keys
+                    .publish(&retained, model.handle(), &host_paths, Some(&load))
+                    .map_err(phase("load"))?;
+                // The manifest names what the rank bound as well.
+                published.keep(&found, &load);
+                (Some(published), found.into_storages())
+            }
             (Some(found), _) => (None, found.into_storages()),
             (None, Some(keys)) => (
                 Some(
-                    keys.publish(model.handle(), &host_paths, None)
+                    keys.publish(&retained, model.handle(), &host_paths, None)
                         .map_err(phase("load"))?,
                 ),
-                Vec::new(),
+                (Vec::new(), None),
             ),
-            (None, None) => (None, Vec::new()),
+            (None, None) => (None, (Vec::new(), None)),
         };
         // Every later graph decision of the rank reads the resolved policy.
         let host_component = components
@@ -416,6 +440,15 @@ impl Worker {
         };
         let host_weights =
             HostWeights::start(&model, &components, &mut retention).map_err(phase("load"))?;
+        // Weights received from other worlds arrived while the model bound
+        // them and the executor and the expert exchange were built; their
+        // chunks are retained read-only before the published manifest names
+        // them.
+        if let Some(receipt) = receipt {
+            receipt
+                .retain(&retained, published.is_some())
+                .map_err(phase("load"))?;
+        }
         let weight_storages = match published {
             Some(published) => {
                 let mut storages = published.put(&retained).map_err(phase("load"))?;
@@ -1320,6 +1353,57 @@ fn model_fingerprints(
 
 /// What every rank in `agreement` reads from the checkpoint, from each
 /// rank's own `need` (`weights::Load`).
+/// What a rank receives its weights with ([`receive_weights`]).
+struct Receiving<'a> {
+    keys: &'a WeightKeys,
+    retained: &'a Retained,
+    /// The ranks that load together, which receive together.
+    agreement: &'a crate::parallel::host::HostGroup,
+    description: &'a Description,
+    launch: &'a WorkerLaunch,
+    meshes: &'a [ComponentMesh],
+    experts: Option<&'a ExpertPartition>,
+}
+
+/// The weights a rank binds: `found`, those it retained at its position
+/// before, or the weights it receives from the host's other worlds
+/// (`weights::WeightKeys::receive`). The ranks that load together receive
+/// when any of them found no manifest of its own and each sees weights
+/// other worlds hold; each then materializes its model without reading
+/// the checkpoint, plans the storages its weights take, frees the model and
+/// receives into them, a rank that found its manifest included. `None`
+/// when the ranks load from the checkpoint.
+fn receive_weights(
+    receiving: &Receiving<'_>,
+    found: Option<weights::Found>,
+) -> Result<Option<weights::Found>> {
+    let Receiving {
+        keys,
+        retained,
+        agreement,
+        description,
+        launch,
+        meshes,
+        experts,
+    } = *receiving;
+    let sources = keys.sources(retained)?;
+    let votes =
+        agreement.all_gather_bytes(&[u8::from(found.is_none()), u8::from(sources.is_some())])?;
+    let needed = votes.iter().any(|vote| vote.first() == Some(&1));
+    let available = votes.iter().all(|vote| vote.get(1) == Some(&1));
+    let (true, true, Some(sources)) = (needed, available, sources) else {
+        return Ok(found);
+    };
+    // A rank that found its manifest receives with the others: its chunks
+    // all lie on its GPU and are mapped.
+    drop(found);
+    let unread = LoadedModel::unread(description, launch, meshes, experts)?;
+    let planned = keys.plan(&unread, &[], None)?;
+    drop(unread);
+    keys.receive(retained, planned, &sources, agreement)
+        .map(Some)
+}
+
 fn agree_load(
     agreement: &crate::parallel::host::HostGroup,
     need: weights::Load,
@@ -1361,9 +1445,26 @@ fn weight_keys(
     Ok(Some(WeightKeys::new(
         retained,
         fingerprints,
-        &weights::placement(launch)?,
+        &weights::position(launch)?,
         &devices,
+        &chunk_degrees(launch)?,
     )?))
+}
+
+/// The tensor- and expert-parallel degrees the rank's weight memory is
+/// chunked for: `load_config.parallel_degrees`, or every degree up to the
+/// number of GPUs the process sees.
+fn chunk_degrees(launch: &WorkerLaunch) -> Result<Vec<u64>> {
+    if !launch.load.parallel_degrees.is_empty() {
+        return Ok(launch
+            .load
+            .parallel_degrees
+            .iter()
+            .map(|&degree| u64::from(degree))
+            .collect());
+    }
+    let visible = DeviceId::count()?.max(1) as u64;
+    Ok((1..=visible).collect())
 }
 
 /// The worker's identity for transfers: the deployment's name of its host,

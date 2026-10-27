@@ -322,6 +322,11 @@ pub struct LoadOptions {
     /// A plugin's weight source (`scheme://...`) that streams the
     /// checkpoint's tensors in place of its files; the files when unset.
     pub weights: Option<String>,
+    /// The tensor- and expert-parallel degrees the configurations of the
+    /// deployment use, which retained weight memory is chunked for so that
+    /// a world of any of them maps the chunks it shares with another;
+    /// every degree up to the GPUs a worker sees when empty.
+    pub parallel_degrees: Vec<NonZeroU32>,
 }
 
 impl Default for LoadOptions {
@@ -331,6 +336,7 @@ impl Default for LoadOptions {
             download_dir: None,
             threads: None,
             weights: None,
+            parallel_degrees: Vec::new(),
         }
     }
 }
@@ -493,8 +499,9 @@ impl Default for PlacementOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoeOptions {
-    /// Shard routed experts across the schedulers or the
-    /// deployment's expert workers.
+    /// Shard routed experts across the schedulers, the tensor-parallel
+    /// ranks of a single scheduler's one worker group, or the deployment's
+    /// expert workers.
     pub expert_parallel: bool,
     /// How sharded experts are reached: `alltoall`, `megamoe`, `deepep` or
     /// `dwdp`.
@@ -1207,6 +1214,12 @@ impl ServeConfig {
                 load_threads: self.load_config.threads.map(NonZeroU32::get),
                 standby_memory: word(&worker.standby_memory),
                 weights: self.load_config.weights.clone().unwrap_or_default(),
+                parallel_degrees: self
+                    .load_config
+                    .parallel_degrees
+                    .iter()
+                    .map(|degree| degree.get())
+                    .collect(),
             }),
             cuda_graphs: Some(wire::CudaGraphs {
                 policy: word(&graphs.policy),

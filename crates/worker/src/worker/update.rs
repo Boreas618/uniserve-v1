@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use cuda::{DeviceId, Protection};
+use cuda::Protection;
 use tvm_ffi::Any;
 
 use super::loading::{Description, LoadedModel};
@@ -26,7 +26,7 @@ use crate::memory::CachePlan;
 use crate::memory::allocation::Storage;
 use crate::memory::prefix_cache::host::page_contents;
 use crate::memory::retained::Retained;
-use crate::memory::weights::{self, WeightKeys};
+use crate::memory::weights::WeightKeys;
 use crate::{Error, Result};
 
 /// What an in-place weight update rewrites and renames.
@@ -125,17 +125,7 @@ impl WeightUpdate {
         let description = Description::describe(&launch)?;
         let fingerprints = LoadedModel::fingerprint(&description, &launch)?;
         if let (Some(keys), Some(fingerprints)) = (&self.keys, &fingerprints) {
-            let devices: Vec<DeviceId> = launch
-                .execution
-                .devices()
-                .filter_map(|device| device.cuda())
-                .collect();
-            let renamed = WeightKeys::new(
-                retained,
-                fingerprints,
-                &weights::placement(&launch)?,
-                &devices,
-            )?;
+            let renamed = keys.under(fingerprints);
             let moves = keys.moves(&renamed, retained)?;
             let moved = moves.len();
             retained.rekey(moves)?;

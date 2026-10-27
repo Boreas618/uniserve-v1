@@ -120,11 +120,16 @@ class FusedMoE(nn.Module):
     expert group of ``P`` ranks, while ``topk_ids`` keep naming global
     experts; its bound operator exchanges every routed token with the rank
     holding its experts and returns the complete sum to the token's rank.
-    An active ``ExecutionContext`` supplies a prepared expert kernel. A
-    standalone call prepares a native kernel for itself on a GPU and
-    evaluates the portable reference on the CPU; a GPU representation no
-    native kernel covers is an error, not a slower path, and an
-    expert-parallel call needs the operator an execution context binds.
+    A tensor-parallel group may divide the experts instead of ``I``
+    (``parallelize_(whole_experts=True)``): ``group`` is then also the
+    expert group, every rank runs its experts over the tokens all of them
+    hold, routes to the others' experts contributing nothing, and the group
+    sums the partial outputs as it sums ``I`` shards. An active
+    ``ExecutionContext`` supplies a prepared expert kernel. A standalone
+    call prepares a native kernel for itself on a GPU and evaluates the
+    portable reference on the CPU; a GPU representation no native kernel
+    covers is an error, not a slower path, and an expert-parallel call
+    needs the operator an execution context binds.
     """
 
     function = "nn.moe.FusedMoE/1"
@@ -189,7 +194,10 @@ class FusedMoE(nn.Module):
         stores the rank's up rows before its gate rows. Any partition keeps
         whole experts.
         """
-        experts, channels = self.expert_group, self.group
+        experts = self.expert_group
+        # A tensor-parallel group dividing whole experts is the expert group
+        # itself and leaves every expert's channels whole.
+        channels = Communicator() if self.group is experts else self.group
         mesh = DeviceMesh(
             ranks=tuple(range(experts.size * channels.size)),
             shape=(experts.size, channels.size),

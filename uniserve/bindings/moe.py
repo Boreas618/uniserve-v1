@@ -164,8 +164,11 @@ class MoEBinding:
             else None
         )
         self.exchange = exchange if self.weights is None else None
+        # Experts a tensor-parallel group divides (its group is the expert
+        # group) see every token on every rank: no exchange moves them.
         if (
             module.expert_group.size > 1
+            and module.expert_group is not module.group
             and exchange is None
             and self.weights is None
         ):

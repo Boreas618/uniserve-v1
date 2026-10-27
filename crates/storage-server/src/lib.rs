@@ -70,6 +70,8 @@ const NVML_POLL: Duration = Duration::from_millis(20);
 
 type ClientId = u64;
 type StorageId = u64;
+/// One copy of a tensor: its key and where its storage lies.
+type TensorId = (Key, Placement);
 
 /// A process that holds or may hold access to a tensor.
 #[derive(Clone)]
@@ -192,7 +194,12 @@ pub struct Server {
     next_client: ClientId,
     storages: HashMap<StorageId, StorageEntry>,
     next_storage: StorageId,
-    tensors: HashMap<Key, TensorEntry>,
+    /// Every retained tensor by its key and where its storage lies: a key
+    /// names what the bytes are, its storage where they lie, and a key
+    /// has at most one copy at each location.
+    tensors: HashMap<TensorId, TensorEntry>,
+    /// Where each key's copies lie.
+    copies: HashMap<Key, Vec<Placement>>,
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
     pages: pages::Pools,
@@ -235,6 +242,7 @@ impl Server {
             storages: HashMap::new(),
             next_storage: 1,
             tensors: HashMap::new(),
+            copies: HashMap::new(),
             deployments: HashMap::new(),
             shootdowns: ShootDowns::default(),
             pages: pages::Pools::new(page_pool_bytes),
@@ -764,14 +772,14 @@ impl Server {
                     world,
                 };
                 match request {
-                    Request::Retain { keys } => self.retain(&holder, keys),
-                    Request::Get { keys, mode } => self.get(&holder, keys, *mode),
+                    Request::Retain { keys, at } => self.retain(&holder, keys, at),
+                    Request::Get { keys, mode, at } => self.get(&holder, keys, *mode, at),
                     Request::Put { tensors, storages } => {
                         self.put(&holder, tensors, storages, descriptors)
                     }
                     Request::Promote { keys } => self.promote(&holder, keys),
                     Request::Release { keys } => self.release(&holder, keys),
-                    Request::Rekey { moves } => self.rekey(&holder, moves),
+                    Request::Rekey { moves, at } => self.rekey(&holder, moves, at),
                     _ => Err(invalid(&format!(
                         "{} is not a worker request",
                         request_name(request)
@@ -921,21 +929,21 @@ impl Server {
         // The world's retention of the scopes it no longer places ends, and
         // every retired world's retention ends.
         let listed: BTreeSet<&Scope> = scopes.iter().collect();
-        let released: Vec<Key> = self
+        let released: Vec<TensorId> = self
             .tensors
             .iter_mut()
-            .filter_map(|(key, tensor)| {
+            .filter_map(|(id, tensor)| {
                 tensor.retainers.retain(|retainer| {
                     retainer.scope.deployment != deployment
                         || !(retired.contains(&retainer.world)
                             || (retainer.world == world && !listed.contains(&retainer.scope)))
                 });
-                tensor.retainers.is_empty().then_some(*key)
+                tensor.retainers.is_empty().then_some(*id)
             })
             .collect();
         let count = released.len();
-        for key in released {
-            self.remove_tensor(&key);
+        for id in released {
+            self.remove_tensor(&id);
         }
         // A retired world's quota ends with its memory: the ledger then
         // books what its successor alone holds, under the successor's.
@@ -983,19 +991,19 @@ impl Server {
     /// claim. Returns the tensors released.
     fn release_deployment(&mut self, deployment: &str) -> u64 {
         self.deployments.remove(deployment);
-        let released: Vec<Key> = self
+        let released: Vec<TensorId> = self
             .tensors
             .iter_mut()
-            .filter_map(|(key, tensor)| {
+            .filter_map(|(id, tensor)| {
                 tensor
                     .retainers
                     .retain(|retainer| retainer.scope.deployment != deployment);
-                tensor.retainers.is_empty().then_some(*key)
+                tensor.retainers.is_empty().then_some(*id)
             })
             .collect();
         let count = released.len() as u64;
-        for key in released {
-            self.remove_tensor(&key);
+        for id in released {
+            self.remove_tensor(&id);
         }
         let pools = self.pages.release(deployment);
         self.pools_released(&pools);
@@ -1151,7 +1159,7 @@ impl Server {
                 "only the head that claimed {deployment} keeps its worlds' weights"
             )));
         }
-        let released: Vec<Key> = self
+        let released: Vec<(Key, Placement)> = self
             .tensors
             .iter_mut()
             .filter(|(_, tensor)| tensor.access == Access::Exclusive)
@@ -1163,8 +1171,8 @@ impl Server {
             })
             .collect();
         let count = released.len() as u64;
-        for key in released {
-            self.remove_tensor(&key);
+        for copy in released {
+            self.remove_tensor(&copy);
         }
         tracing::info!(
             deployment,
@@ -1244,34 +1252,40 @@ impl Server {
             .is_some_and(|entry| entry.claim == holder.claim)
     }
 
-    /// `retain`: the listed keys that exist are held for the caller's
-    /// scope in its world, and the world releases every other tensor of the
-    /// scope; other worlds keep theirs.
-    fn retain(&mut self, holder: &Holder, keys: &[Key]) -> Result<Outcome, (ErrorKind, String)> {
+    /// `retain`: the copies on `at` of the listed keys that exist are held
+    /// for the caller's scope in its world, and the world releases every
+    /// other tensor of the scope; other worlds keep theirs.
+    fn retain(
+        &mut self,
+        holder: &Holder,
+        keys: &[Key],
+        at: &[Placement],
+    ) -> Result<Outcome, (ErrorKind, String)> {
         if !self.current(holder) {
             return Err(stale(holder));
         }
-        // A world retains only what it reads.
-        let listed: BTreeSet<&Key> = keys
+        // A world retains only what it reads, at the locations it names.
+        let listed: std::collections::HashSet<TensorId> = keys
             .iter()
-            .filter(|key| {
+            .flat_map(|key| self.copies_of(key, at))
+            .filter(|id| {
                 self.tensors
-                    .get(key)
+                    .get(id)
                     .is_some_and(|tensor| self.sees(holder, tensor))
             })
             .collect();
         let retainer = holder.retainer();
         let mut released = Vec::new();
-        for (key, tensor) in &mut self.tensors {
-            if listed.contains(key) {
+        for (id, tensor) in &mut self.tensors {
+            if listed.contains(id) {
                 tensor.retainers.insert(retainer.clone());
             } else if tensor.retainers.remove(&retainer) && tensor.retainers.is_empty() {
-                released.push(*key);
+                released.push(*id);
             }
         }
         let count = released.len() as u64;
-        for key in released {
-            self.remove_tensor(&key);
+        for id in released {
+            self.remove_tensor(&id);
         }
         Ok(Outcome::Reply(
             Reply::Retained { released: count },
@@ -1316,29 +1330,42 @@ impl Server {
         Ok(Some(writer.clone()))
     }
 
+    /// The copies of `key` at the locations `at` selects.
+    fn copies_of(&self, key: &Key, at: &[Placement]) -> Vec<TensorId> {
+        self.copies
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|location| selected(at, location))
+            .map(|location| (*key, *location))
+            .collect()
+    }
+
     /// `get`: see [`Request::Get`].
     fn get(
         &mut self,
         holder: &Holder,
         keys: &[Key],
         mode: Mode,
+        at: &[Placement],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if mode != Mode::Read && !self.current(holder) {
             return Err(stale(holder));
         }
-        // A tensor another world keeps to itself is missing to the caller.
-        let hidden: BTreeSet<Key> = keys
+        // The copies at the locations asked for that the caller sees: a
+        // tensor another world keeps to itself is missing to the caller.
+        let ids: Vec<TensorId> = keys
             .iter()
-            .filter(|key| {
+            .flat_map(|key| self.copies_of(key, at))
+            .filter(|id| {
                 self.tensors
-                    .get(key)
-                    .is_some_and(|tensor| !self.sees(holder, tensor))
+                    .get(id)
+                    .is_some_and(|tensor| self.sees(holder, tensor))
             })
-            .copied()
             .collect();
         let mut victims = Vec::new();
-        for key in keys {
-            let Some(tensor) = self.tensors.get(key).filter(|_| !hidden.contains(key)) else {
+        for id in &ids {
+            let Some(tensor) = self.tensors.get(id) else {
                 continue;
             };
             match (tensor.access, mode) {
@@ -1361,12 +1388,17 @@ impl Server {
 
         let mut storages: Vec<StorageId> = Vec::new();
         let mut tensors = Vec::new();
-        let mut missing = Vec::new();
-        for key in keys {
-            let Some(tensor) = self.tensors.get_mut(key).filter(|_| !hidden.contains(key)) else {
-                missing.push(*key);
+        let found: BTreeSet<Key> = ids.iter().map(|(key, _)| *key).collect();
+        let missing = keys
+            .iter()
+            .filter(|key| !found.contains(key))
+            .copied()
+            .collect();
+        for id in &ids {
+            let Some(tensor) = self.tensors.get_mut(id) else {
                 continue;
             };
+            let key = &id.0;
             if tensor.access == Access::Exclusive {
                 match mode {
                     Mode::Write => tensor.writer = Some(holder.clone()),
@@ -1425,16 +1457,17 @@ impl Server {
             )));
         }
         for tensor in tensors {
+            let Some(storage) = storages.get(tensor.storage as usize) else {
+                return Err(invalid(&format!("{} names no storage", tensor.name)));
+            };
             // A key is a content address: a read-only tensor already
-            // retained holds these very bytes, and the put only adds the
-            // caller's scope to it. Exclusive tensors are created once.
-            if let Some(existing) = self.tensors.get(&tensor.key)
+            // retained at the same location holds these very bytes, and
+            // the put only adds the caller's scope to it. Exclusive tensors
+            // are created once.
+            if let Some(existing) = self.tensors.get(&(tensor.key, storage.placement))
                 && (existing.access, tensor.access) != (Access::ReadOnly, Access::ReadOnly)
             {
                 return Err(invalid(&format!("{} is already retained", tensor.name)));
-            }
-            if tensor.storage as usize >= storages.len() {
-                return Err(invalid(&format!("{} names no storage", tensor.name)));
             }
             if tensor.shape.len() != tensor.strides.len() {
                 return Err(invalid(&format!("{} has one stride per axis", tensor.name)));
@@ -1459,11 +1492,12 @@ impl Server {
             })
             .collect();
         for tensor in tensors {
+            let location = storages[tensor.storage as usize].placement;
             let unseen = self
                 .tensors
-                .get(&tensor.key)
+                .get(&(tensor.key, location))
                 .is_some_and(|existing| !self.sees(holder, existing));
-            if let Some(existing) = self.tensors.get_mut(&tensor.key) {
+            if let Some(existing) = self.tensors.get_mut(&(tensor.key, location)) {
                 existing.retainers.insert(holder.retainer());
                 if !unseen {
                     continue;
@@ -1493,8 +1527,8 @@ impl Server {
             if let Some(entry) = self.storages.get_mut(&storage) {
                 entry.tensors += 1;
             }
-            self.tensors.insert(
-                tensor.key,
+            self.insert_tensor(
+                (tensor.key, location),
                 TensorEntry {
                     name: tensor.name.clone(),
                     storage,
@@ -1527,7 +1561,12 @@ impl Server {
     ) -> Result<(), (ErrorKind, String)> {
         let created: BTreeSet<usize> = tensors
             .iter()
-            .filter(|tensor| !self.tensors.contains_key(&tensor.key))
+            .filter(|tensor| {
+                let location = storages
+                    .get(tensor.storage as usize)
+                    .map(|storage| storage.placement);
+                location.is_none_or(|location| !self.tensors.contains_key(&(tensor.key, location)))
+            })
             .map(|tensor| tensor.storage as usize)
             .collect();
         let mut added: BTreeMap<[u8; 16], u64> = BTreeMap::new();
@@ -1565,19 +1604,29 @@ impl Server {
         if !self.current(holder) {
             return Err(stale(holder));
         }
-        let mut victims = Vec::new();
+        // The copies the caller maps in standby: an exclusive key names one
+        // storage, so one copy each.
+        let mut promoted = Vec::with_capacity(keys.len());
         for key in keys {
-            let tensor = self
-                .tensors
-                .get(key)
-                .ok_or_else(|| invalid(&format!("{key:?} is not retained")))?;
-            if !tensor
-                .standby
-                .iter()
-                .any(|standby| Arc::ptr_eq(&standby.pidfd, &holder.pidfd))
-            {
-                return Err(invalid(&format!("{} is not held in standby", tensor.name)));
-            }
+            let id = self
+                .copies_of(key, &[])
+                .into_iter()
+                .find(|id| {
+                    self.tensors.get(id).is_some_and(|tensor| {
+                        tensor
+                            .standby
+                            .iter()
+                            .any(|standby| Arc::ptr_eq(&standby.pidfd, &holder.pidfd))
+                    })
+                })
+                .ok_or_else(|| invalid(&format!("{key:?} is not held in standby")))?;
+            promoted.push(id);
+        }
+        let mut victims = Vec::new();
+        for id in &promoted {
+            let Some(tensor) = self.tensors.get(id) else {
+                continue;
+            };
             // A promotion takes over from a writer of the previous head or of
             // an earlier launch, whatever its generation.
             if let Some(writer) = &tensor.writer
@@ -1603,8 +1652,8 @@ impl Server {
         if !victims.is_empty() {
             return Ok(Outcome::Wait(victims));
         }
-        for key in keys {
-            if let Some(tensor) = self.tensors.get_mut(key) {
+        for id in &promoted {
+            if let Some(tensor) = self.tensors.get_mut(id) {
                 tensor
                     .standby
                     .retain(|standby| !Arc::ptr_eq(&standby.pidfd, &holder.pidfd));
@@ -1617,13 +1666,15 @@ impl Server {
     /// `release`: see [`Request::Release`].
     fn release(&mut self, holder: &Holder, keys: &[Key]) -> Result<Outcome, (ErrorKind, String)> {
         for key in keys {
-            if let Some(tensor) = self.tensors.get_mut(key)
-                && tensor
-                    .writer
-                    .as_ref()
-                    .is_some_and(|writer| Arc::ptr_eq(&writer.pidfd, &holder.pidfd))
-            {
-                tensor.writer = None;
+            for id in self.copies_of(key, &[]) {
+                if let Some(tensor) = self.tensors.get_mut(&id)
+                    && tensor
+                        .writer
+                        .as_ref()
+                        .is_some_and(|writer| Arc::ptr_eq(&writer.pidfd, &holder.pidfd))
+                {
+                    tensor.writer = None;
+                }
             }
         }
         Ok(Outcome::Reply(Reply::Released, Vec::new()))
@@ -1634,48 +1685,79 @@ impl Server {
         &mut self,
         holder: &Holder,
         moves: &[(Key, Key)],
+        at: &[Placement],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if !self.current(holder) {
             return Err(stale(holder));
         }
-        let mut moved = BTreeSet::new();
+        // Each copy moves to the new key at its own location.
+        let mut renamed: Vec<(TensorId, TensorId)> = Vec::new();
+        let mut moved = std::collections::HashSet::new();
         for (old, new) in moves {
-            let tensor = self
-                .tensors
-                .get(old)
-                .ok_or_else(|| invalid(&format!("{old:?} is not retained")))?;
-            if tensor.access != Access::ReadOnly {
-                return Err(invalid(&format!("{} is not read-only", tensor.name)));
+            let copies = self.copies_of(old, at);
+            if copies.is_empty() {
+                return Err(invalid(&format!("{old:?} is not retained")));
             }
-            if let Some(other) = tensor
-                .retainers
-                .iter()
-                .map(|retainer| &retainer.scope)
-                .find(|scope| scope.deployment != holder.scope.deployment)
-            {
-                return Err((
-                    ErrorKind::Held,
-                    format!("{} is held by {other} as well", tensor.name),
-                ));
-            }
-            if self.tensors.contains_key(new) || !moved.insert(*new) {
-                return Err(invalid(&format!(
-                    "{} cannot move to {new:?}, which is retained",
-                    tensor.name
-                )));
+            for id in copies {
+                let Some(tensor) = self.tensors.get(&id) else {
+                    continue;
+                };
+                if tensor.access != Access::ReadOnly {
+                    return Err(invalid(&format!("{} is not read-only", tensor.name)));
+                }
+                if let Some(other) = tensor
+                    .retainers
+                    .iter()
+                    .map(|retainer| &retainer.scope)
+                    .find(|scope| scope.deployment != holder.scope.deployment)
+                {
+                    return Err((
+                        ErrorKind::Held,
+                        format!("{} is held by {other} as well", tensor.name),
+                    ));
+                }
+                let target = (*new, id.1);
+                if self.tensors.contains_key(&target) || !moved.insert(target) {
+                    return Err(invalid(&format!(
+                        "{} cannot move to {new:?}, which is retained",
+                        tensor.name
+                    )));
+                }
+                renamed.push((id, target));
             }
         }
-        for (old, new) in moves {
-            if let Some(tensor) = self.tensors.remove(old) {
-                self.tensors.insert(*new, tensor);
+        for (old, new) in renamed {
+            if let Some(tensor) = self.take_tensor(&old) {
+                self.insert_tensor(new, tensor);
             }
         }
         Ok(Outcome::Reply(Reply::Rekeyed, Vec::new()))
     }
 
+    /// Index a tensor under `id`.
+    fn insert_tensor(&mut self, id: TensorId, tensor: TensorEntry) {
+        let locations = self.copies.entry(id.0).or_default();
+        if !locations.contains(&id.1) {
+            locations.push(id.1);
+        }
+        self.tensors.insert(id, tensor);
+    }
+
+    /// Take a tensor out of the index, its storage left as it is.
+    fn take_tensor(&mut self, id: &TensorId) -> Option<TensorEntry> {
+        let tensor = self.tensors.remove(id)?;
+        if let Some(locations) = self.copies.get_mut(&id.0) {
+            locations.retain(|location| *location != id.1);
+            if locations.is_empty() {
+                self.copies.remove(&id.0);
+            }
+        }
+        Some(tensor)
+    }
+
     /// Remove a tensor and release its storage with its last tensor.
-    fn remove_tensor(&mut self, key: &Key) {
-        let Some(tensor) = self.tensors.remove(key) else {
+    fn remove_tensor(&mut self, id: &TensorId) {
+        let Some(tensor) = self.take_tensor(id) else {
             return;
         };
         let empty = self.storages.get_mut(&tensor.storage).is_some_and(|entry| {
@@ -1798,7 +1880,7 @@ impl Server {
         let mut host = BTreeMap::<Retainer, u64>::new();
         let mut counted = BTreeSet::<(StorageId, Retainer)>::new();
         let mut tensors = Vec::with_capacity(self.tensors.len());
-        for (key, tensor) in &self.tensors {
+        for ((key, _), tensor) in &self.tensors {
             let Some(storage) = self.storages.get(&tensor.storage) else {
                 continue;
             };
@@ -2330,6 +2412,12 @@ fn wide(pages: &[(Key, u32)]) -> Vec<(Key, u64)> {
         .iter()
         .map(|(key, slot)| (*key, u64::from(*slot)))
         .collect()
+}
+
+/// Whether a request's locations `at` select `location`: every location
+/// when it lists none.
+fn selected(at: &[Placement], location: &Placement) -> bool {
+    at.is_empty() || at.contains(location)
 }
 
 /// The record of a retained tensor, naming storage `storage` of a reply.

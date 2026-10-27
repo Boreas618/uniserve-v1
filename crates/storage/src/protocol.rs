@@ -88,8 +88,10 @@ use serde::{Deserialize, Serialize};
 /// Server's role and its exposures, and the registrations of the Transfer
 /// Server's NIXL agent); 9 adds the GPUs' memory ledgers (`Book`, `Ledger`,
 /// a storage's KV cache `segment`, the listing's `ledgers`) and a world kept
-/// as its weights (`KeepWeights`).
-pub const VERSION: u32 = 9;
+/// as its weights (`KeepWeights`); 10 lets one key have a copy at each
+/// location memory lies at, which `get`, `retain`, `rekey` and a transfer's
+/// tensor regions select by their `at`.
+pub const VERSION: u32 = 10;
 
 /// The earliest client version the server serves: a client of version 4
 /// knows no worlds, and its requests act on world 0; a client of version 4
@@ -97,7 +99,8 @@ pub const VERSION: u32 = 9;
 /// pages; a client before version 7 makes no transfer request and reads no
 /// transfer event; a client before version 8 names no memory of another
 /// host; a client before version 9 books nothing in the ledgers and marks
-/// no storage as a KV cache segment.
+/// no storage as a KV cache segment; a client before version 10 names no
+/// location of a key's copy, and its requests take every copy.
 pub const MIN_VERSION: u32 = 4;
 
 /// A content address: the 32-byte digest of everything that determines a
@@ -215,7 +218,7 @@ pub enum Welcome {
 }
 
 /// Where a storage's physical memory is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
     /// A CUDA VMM allocation on the GPU with this UUID, held through a POSIX
@@ -558,8 +561,14 @@ pub enum Region {
     /// caller's deployment holds. Offsets count from the tensor's first
     /// byte, and a copy may reach every byte of the storage from there (the
     /// other tensors packed in it included). Only an exclusive tensor is
-    /// written: a read-only tensor is immutable.
-    Tensor { key: Key },
+    /// written: a read-only tensor is immutable. A key with copies at
+    /// several locations names the copy at `at`; `None` names the key's
+    /// only copy.
+    Tensor {
+        key: Key,
+        #[serde(default)]
+        at: Option<Placement>,
+    },
     /// A live page pool of the caller's deployment; offsets count from slot
     /// 0, at `slot × page_bytes`.
     Pool { pool: u64 },
@@ -790,8 +799,13 @@ pub enum Request {
         retire: Vec<u64>,
     },
     /// Release every tensor the caller's scope retains in the caller's world
-    /// that `keys` does not list.
-    Retain { keys: Vec<Key> },
+    /// that `keys` does not list; the copies of listed keys at the locations
+    /// `at` lists are retained (every copy when `at` is empty).
+    Retain {
+        keys: Vec<Key>,
+        #[serde(default)]
+        at: Vec<Placement>,
+    },
     /// Every world of `worlds` of the head's deployment keeps its weights
     /// alone on the host: its retention of every exclusive tensor ends (its
     /// KV cache segments, cache flags and scales, buffer pool, latent
@@ -801,14 +815,22 @@ pub enum Request {
     /// the segments its successor maps stay the successor's. Answered with
     /// `Retained`.
     KeepWeights { worlds: Vec<u64> },
-    /// The tensors of `keys` that exist, with their storages' descriptors,
-    /// and the keys that do not.
-    Get { keys: Vec<Key>, mode: Mode },
+    /// The copies of `keys` that exist at the locations `at` lists (at
+    /// every location when `at` is empty), with their storages'
+    /// descriptors, and the keys with no such copy.
+    Get {
+        keys: Vec<Key>,
+        mode: Mode,
+        #[serde(default)]
+        at: Vec<Placement>,
+    },
     /// Publish tensors whose bytes are written, over the storages this
     /// message carries. Read-only tensors become readable; exclusive ones
-    /// keep the caller as their writer. A read-only tensor already retained
-    /// under the same key holds the same bytes: the put adds the caller's
-    /// scope to it and the server keeps the retained one.
+    /// keep the caller as their writer. A key names what a tensor's bytes
+    /// are, and its storage's record where they lie: a key has at most
+    /// one copy at each location. A read-only tensor already retained under
+    /// the same key at the same location holds the same bytes: the put
+    /// adds the caller's scope to it and the server keeps the retained one.
     Put {
         tensors: Vec<TensorRecord>,
         storages: Vec<StorageRecord>,
@@ -819,12 +841,18 @@ pub enum Request {
     /// Give up write access: the caller has drained its streams and
     /// unmapped or downgraded its mappings.
     Release { keys: Vec<Key> },
-    /// Move read-only tensors to new keys, each `(old, new)`: the caller
-    /// rewrites their bytes in place, as an in-place weight update does, so
-    /// the old keys no longer name them. Refused, moving none, unless every
-    /// old key is a read-only tensor that the caller's deployment alone
-    /// holds and no new key is retained.
-    Rekey { moves: Vec<(Key, Key)> },
+    /// Move the copies at the locations `at` lists (every copy when `at`
+    /// is empty) of read-only tensors to new keys, each `(old, new)`: the
+    /// caller rewrites their bytes in place, as an in-place weight update
+    /// does, so the old keys no longer name them. Refused, moving none,
+    /// unless every old key has such a copy, each a read-only tensor that
+    /// the caller's deployment alone holds, and no new key has a copy at
+    /// its location.
+    Rekey {
+        moves: Vec<(Key, Key)>,
+        #[serde(default)]
+        at: Vec<Placement>,
+    },
     /// Every tensor, storage and claim the server holds.
     List,
     /// Release every tensor and page pool of `deployment` and forget its

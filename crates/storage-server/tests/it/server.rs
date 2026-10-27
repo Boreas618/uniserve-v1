@@ -206,7 +206,7 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
     // Rank 1 maps the same bytes; one storage travels for both tensors.
     let mut second = worker(&server.socket, scope("text", 1), 1, claim);
     let got = second
-        .get(vec![key(1), key(2), key(3)], Mode::Read)
+        .get(vec![key(1), key(2), key(3)], Mode::Read, Vec::new())
         .unwrap();
     assert_eq!(got.missing, vec![key(3)]);
     assert_eq!(got.storages.len(), 1);
@@ -221,8 +221,8 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
     assert_eq!(contents(descriptor), b"abcdefgh");
 
     // The tensors live while some scope retains them.
-    assert_eq!(first.retain(Vec::new()).unwrap(), 0);
-    assert_eq!(second.retain(vec![key(2)]).unwrap(), 1);
+    assert_eq!(first.retain(Vec::new(), Vec::new()).unwrap(), 0);
+    assert_eq!(second.retain(vec![key(2)], Vec::new()).unwrap(), 1);
     let listed: Vec<String> = head
         .list()
         .unwrap()
@@ -312,34 +312,37 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
         .unwrap();
     // Another rank of the deployment holds `a` too.
     let mut second = worker(&server.socket, scope("text", 1), 1, claim);
-    second.get(vec![key(1)], Mode::Read).unwrap();
+    second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
 
     // Refused, moving none: an exclusive tensor, a retained new key, or one
     // new key twice.
     assert_eq!(
-        server_error(first.rekey(vec![(key(1), key(11)), (key(3), key(13))])),
+        server_error(first.rekey(vec![(key(1), key(11)), (key(3), key(13))], Vec::new())),
         ErrorKind::Invalid
     );
     assert_eq!(
-        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(1))])),
+        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(1))], Vec::new())),
         ErrorKind::Invalid
     );
     assert_eq!(
-        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(11))])),
+        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(11))], Vec::new())),
         ErrorKind::Invalid
     );
     assert_eq!(
-        first.get(vec![key(1), key(2)], Mode::Read).unwrap().missing,
+        first
+            .get(vec![key(1), key(2)], Mode::Read, Vec::new())
+            .unwrap()
+            .missing,
         vec![]
     );
 
     // The deployment's tensors move with their scopes; the old keys name
     // nothing more and the new ones the same bytes.
     first
-        .rekey(vec![(key(1), key(11)), (key(2), key(12))])
+        .rekey(vec![(key(1), key(11)), (key(2), key(12))], Vec::new())
         .unwrap();
     let got = second
-        .get(vec![key(1), key(11), key(12)], Mode::Read)
+        .get(vec![key(1), key(11), key(12)], Mode::Read, Vec::new())
         .unwrap();
     assert_eq!(got.missing, vec![key(1)]);
     let (_, descriptor) = got.storages.into_iter().next().unwrap();
@@ -358,9 +361,9 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
         .claim(0, vec![other.clone()], Vec::new())
         .unwrap();
     let mut stranger = worker(&server.socket, other, 1, other_claim);
-    stranger.get(vec![key(12)], Mode::Read).unwrap();
+    stranger.get(vec![key(12)], Mode::Read, Vec::new()).unwrap();
     assert_eq!(
-        server_error(first.rekey(vec![(key(12), key(22))])),
+        server_error(first.rekey(vec![(key(12), key(22))], Vec::new())),
         ErrorKind::Held
     );
 }
@@ -384,16 +387,16 @@ fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
     // worker of the same launch does not take a live writer's access.
     let mut other = worker(&server.socket, scope("flow", 0), 1, claim);
     assert_eq!(
-        server_error(other.get(vec![key(9)], Mode::Read)),
+        server_error(other.get(vec![key(9)], Mode::Read, Vec::new())),
         ErrorKind::Invalid
     );
     assert_eq!(
-        server_error(other.get(vec![key(9)], Mode::Write)),
+        server_error(other.get(vec![key(9)], Mode::Write, Vec::new())),
         ErrorKind::Held
     );
 
     writer.release(vec![key(9)]).unwrap();
-    let got = other.get(vec![key(9)], Mode::Write).unwrap();
+    let got = other.get(vec![key(9)], Mode::Write, Vec::new()).unwrap();
     assert_eq!(got.tensors.len(), 1);
     let pid = std::process::id() as i32;
     let listing = other.list().unwrap();
@@ -517,7 +520,9 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     // The next launch of the same scope takes the tensor: the server kills
     // the child, waits for it to exit and hands write access on.
     let mut relaunched = worker(&server.socket, scope("flow", 0), 2, claim);
-    let got = relaunched.get(vec![key(5)], Mode::Write).unwrap();
+    let got = relaunched
+        .get(vec![key(5)], Mode::Write, Vec::new())
+        .unwrap();
     assert_eq!(got.tensors.len(), 1);
     let status = child.wait().unwrap();
     assert_eq!(
@@ -1106,9 +1111,9 @@ fn worlds_retain_their_own_memory_and_a_claim_retires_one() {
     let second_claim = head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     assert_eq!(first_claim, second_claim);
     let mut second = world_worker(&server.socket, scope("text", 0), 2, second_claim);
-    let got = second.get(vec![key(1)], Mode::Read).unwrap();
+    let got = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     assert_eq!(got.tensors.len(), 1);
-    let got = second.get(vec![key(2)], Mode::Standby).unwrap();
+    let got = second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
     assert_eq!(got.tensors.len(), 1);
     let buffer = memfd(&[4; 4]);
     second
@@ -1120,7 +1125,12 @@ fn worlds_retain_their_own_memory_and_a_claim_retires_one() {
 
     // World 2's worker retains what it uses; world 1's buffer, which it
     // never took, stays world 1's.
-    assert_eq!(second.retain(vec![key(1), key(2), key(4)]).unwrap(), 0);
+    assert_eq!(
+        second
+            .retain(vec![key(1), key(2), key(4)], Vec::new())
+            .unwrap(),
+        0
+    );
     assert_eq!(
         retained_names(&mut head),
         vec!["buffer", "buffer", "planes", "weights"]
@@ -1139,7 +1149,9 @@ fn worlds_retain_their_own_memory_and_a_claim_retires_one() {
     assert_eq!(worlds, vec![1, 2]);
 
     // World 1's worker keeps writing what it holds.
-    first.retain(vec![key(1), key(2), key(3)]).unwrap();
+    first
+        .retain(vec![key(1), key(2), key(3)], Vec::new())
+        .unwrap();
 
     // The commit of world 2 retires world 1: its buffer goes, what world 2
     // retains stays.
@@ -1390,11 +1402,11 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
         vec![PageLevel::Absent]
     );
     let got = serving_worker
-        .get(vec![key(6), key(7)], Mode::Read)
+        .get(vec![key(6), key(7)], Mode::Read, Vec::new())
         .unwrap();
     assert!(got.tensors.is_empty());
     assert_eq!(got.missing, vec![key(6), key(7)]);
-    serving_worker.retain(vec![key(6)]).unwrap();
+    serving_worker.retain(vec![key(6)], Vec::new()).unwrap();
     // A key it puts itself holds its own bytes, for every world.
     let serving_bytes = memfd(b"good");
     serving_worker
@@ -1403,7 +1415,9 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
             &[(host(4), serving_bytes.as_fd())],
         )
         .unwrap();
-    let mut got = trial_worker.get(vec![key(6)], Mode::Read).unwrap();
+    let mut got = trial_worker
+        .get(vec![key(6)], Mode::Read, Vec::new())
+        .unwrap();
     assert_eq!(contents(got.storages.remove(0).1), b"good");
 
     // World 2 reserves a page it commits only after the rollback.
@@ -1450,7 +1464,9 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
     let listing = daemon.list().unwrap();
     assert_eq!(listing.page_pools[0].ready, 2, "{listing:?}");
     assert_eq!(retained_names(&mut daemon), vec!["weights"]);
-    let mut got = serving_worker.get(vec![key(6)], Mode::Read).unwrap();
+    let mut got = serving_worker
+        .get(vec![key(6)], Mode::Read, Vec::new())
+        .unwrap();
     assert_eq!(contents(got.storages.remove(0).1), b"good");
 }
 
@@ -1472,12 +1488,14 @@ fn a_world_reads_what_it_published_that_only_a_world_on_trial_retains() {
         .unwrap();
     daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut trial = world_worker(&server.socket, scope("text", 0), 2, claim);
-    trial.get(vec![key(10)], Mode::Standby).unwrap();
-    serving.retain(Vec::new()).unwrap();
+    trial.get(vec![key(10)], Mode::Standby, Vec::new()).unwrap();
+    serving.retain(Vec::new(), Vec::new()).unwrap();
     drop(serving);
 
     let mut restarted = world_worker(&server.socket, scope("text", 0), 1, claim);
-    let got = restarted.get(vec![key(10)], Mode::Standby).unwrap();
+    let got = restarted
+        .get(vec![key(10)], Mode::Standby, Vec::new())
+        .unwrap();
     assert_eq!(got.tensors.len(), 1, "{:?}", got.missing);
 }
 
@@ -1554,6 +1572,99 @@ fn a_server_serves_earlier_clients_and_refuses_later_ones() {
         welcome(VERSION + 1),
         storage::protocol::ServerMessage::Welcome(storage::protocol::Welcome::Refused { .. })
     ));
+}
+
+#[test]
+fn one_key_keeps_a_copy_at_each_location() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head
+        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .unwrap();
+    let near = Placement::Host { numa_node: Some(0) };
+    let far = Placement::Host { numa_node: Some(1) };
+    let on = |location| StorageRecord {
+        placement: location,
+        bytes: 4,
+        segment: None,
+    };
+
+    // Two ranks publish what one key names, each at its own location.
+    let mut first = worker(&server.socket, scope("text", 0), 1, claim);
+    let mut second = worker(&server.socket, scope("text", 1), 1, claim);
+    let storage = memfd(b"aaaa");
+    first
+        .put(
+            vec![tensor(key(1), "near", 0, 0, Access::ReadOnly)],
+            &[(on(near), storage.as_fd())],
+        )
+        .unwrap();
+    let storage = memfd(b"bbbb");
+    second
+        .put(
+            vec![tensor(key(1), "far", 0, 0, Access::ReadOnly)],
+            &[(on(far), storage.as_fd())],
+        )
+        .unwrap();
+
+    // A get selects the copy where the caller needs it, or every copy.
+    let got = second.get(vec![key(1)], Mode::Read, vec![far]).unwrap();
+    assert_eq!(got.storages.len(), 1);
+    let (record, descriptor) = got.storages.into_iter().next().unwrap();
+    assert_eq!(record.placement, far);
+    assert_eq!(contents(descriptor), b"bbbb");
+    let every = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
+    assert_eq!(every.storages.len(), 2);
+    let elsewhere = Placement::Host { numa_node: Some(2) };
+    assert_eq!(
+        second
+            .get(vec![key(1)], Mode::Read, vec![elsewhere])
+            .unwrap()
+            .missing,
+        vec![key(1)]
+    );
+
+    // A put of the same key at a location with a copy shares that copy.
+    let storage = memfd(b"cccc");
+    first
+        .put(
+            vec![tensor(key(1), "again", 0, 0, Access::ReadOnly)],
+            &[(on(far), storage.as_fd())],
+        )
+        .unwrap();
+    let got = first.get(vec![key(1)], Mode::Read, vec![far]).unwrap();
+    let (_, descriptor) = got.storages.into_iter().next().unwrap();
+    assert_eq!(contents(descriptor), b"bbbb");
+
+    // Rekeying moves the selected copy only.
+    first.rekey(vec![(key(1), key(2))], vec![near]).unwrap();
+    let got = first
+        .get(vec![key(1), key(2)], Mode::Read, Vec::new())
+        .unwrap();
+    let mut held: Vec<(Key, Placement)> = got
+        .tensors
+        .iter()
+        .map(|tensor| {
+            (
+                tensor.key,
+                got.storages[tensor.storage as usize].0.placement,
+            )
+        })
+        .collect();
+    held.sort_by_key(|(key, _)| *key);
+    assert_eq!(held, vec![(key(1), far), (key(2), near)]);
+
+    // Each copy lives while some scope retains it at its location.
+    second.retain(Vec::new(), Vec::new()).unwrap();
+    first.retain(vec![key(2)], vec![near]).unwrap();
+    let listed: Vec<(Key, Placement)> = head
+        .list()
+        .unwrap()
+        .tensors
+        .into_iter()
+        .map(|tensor| (tensor.key, tensor.placement))
+        .collect();
+    assert_eq!(listed, vec![(key(2), near)]);
 }
 
 /// The GPU the ledger tests book on, which no process touches: the server
@@ -1650,8 +1761,8 @@ fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     // by both worlds, beside the process and graph pool world 2 books.
     head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut second = world_worker(&server.socket, scope("text", 0), 2, claim);
-    second.get(vec![key(1)], Mode::Read).unwrap();
-    second.get(vec![key(2)], Mode::Standby).unwrap();
+    second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
+    second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
     let book = second
         .book(
             GPU,
@@ -1744,8 +1855,8 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
         .unwrap();
     head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut second = world_worker(&server.socket, scope("text", 0), 2, claim);
-    second.get(vec![key(1)], Mode::Read).unwrap();
-    second.get(vec![key(2)], Mode::Standby).unwrap();
+    second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
+    second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
     assert_eq!(ledger(&mut head).used(), 370);
 
     // The previous world's processes exit; the head keeps its weights.

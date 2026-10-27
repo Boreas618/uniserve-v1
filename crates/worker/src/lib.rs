@@ -29,6 +29,7 @@ mod host;
 mod job;
 pub mod launch;
 mod logging;
+mod manifests;
 pub mod memory;
 pub mod parallel;
 mod profiling;

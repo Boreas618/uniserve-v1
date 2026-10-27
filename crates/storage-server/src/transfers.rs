@@ -557,19 +557,32 @@ impl Server {
         destination: bool,
     ) -> Result<Resolved, (ErrorKind, String)> {
         match region {
-            Region::Tensor { key } => {
-                let tensor = self
-                    .tensors
-                    .get(key)
+            Region::Tensor { key, at } => {
+                // The copy at `at`, or the key's only copy.
+                let copies: Vec<_> = self
+                    .copies_of(key, at.as_slice())
+                    .into_iter()
+                    .filter_map(|id| self.tensors.get(&id))
                     .filter(|tensor| {
                         tensor
                             .retainers
                             .iter()
                             .any(|retainer| retainer.scope.deployment == deployment)
                     })
-                    .ok_or_else(|| {
-                        invalid(&format!("{key:?} is no retained tensor of {deployment}"))
-                    })?;
+                    .collect();
+                let tensor = match copies.as_slice() {
+                    [tensor] => *tensor,
+                    [] => {
+                        return Err(invalid(&format!(
+                            "{key:?} is no retained tensor of {deployment}"
+                        )));
+                    }
+                    _ => {
+                        return Err(invalid(&format!(
+                            "{key:?} has a copy at several locations; a region names one"
+                        )));
+                    }
+                };
                 if destination && tensor.access == Access::ReadOnly {
                     return Err(invalid(&format!(
                         "{} is read-only and is not written",

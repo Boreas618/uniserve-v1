@@ -150,6 +150,9 @@ pub struct WorkerProcessArgs {
     pub download_dir: Option<std::path::PathBuf>,
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
+    /// The tensor- and expert-parallel degrees retained weight memory is
+    /// chunked for; empty for every degree up to the GPUs the worker sees.
+    pub parallel_degrees: Vec<u32>,
     /// Numeric data type used by model parameters and activations.
     pub dtype: crate::ModelDtype,
     /// WorkerGroup-specific quantization policy.
@@ -238,6 +241,10 @@ pub struct WorkerProcessArgs {
     /// replica joins, when the deployment shards routed experts across the
     /// replicas; `None` keeps every expert on the group's own ranks.
     pub expert_parallel: Option<ExpertParallelPlacement>,
+    /// Whether the group's tensor-parallel ranks divide the routed experts
+    /// among themselves, each keeping whole experts and the group summing
+    /// their outputs, instead of dividing every expert's channels.
+    pub tensor_experts: bool,
     /// Independent numerical microbatches overlapping attention and remote experts.
     pub expert_microbatches: u32,
 }

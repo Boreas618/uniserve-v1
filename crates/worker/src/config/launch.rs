@@ -99,6 +99,9 @@ pub struct LoadOptions {
     pub mode: String,
     pub download_dir: Option<String>,
     pub num_threads: Option<u32>,
+    /// The tensor- and expert-parallel degrees retained weight memory is
+    /// chunked for; empty for every degree up to the GPUs the worker sees.
+    pub parallel_degrees: Vec<u32>,
 }
 
 /// FlashInfer attention options passed to the attention backend.
@@ -142,6 +145,10 @@ pub struct WorkerLaunch {
     /// Group rendezvous; present for a multi-rank group outside an expert union.
     pub rendezvous: Option<RendezvousConfig>,
     pub expert_parallel: Option<ExpertUnion>,
+    /// Whether the worker's tensor-parallel ranks divide the routed experts
+    /// among themselves, each keeping whole experts and the group summing
+    /// their outputs, instead of dividing every expert's channels.
+    pub tensor_experts: bool,
     /// `None` for the stub model.
     pub model: Option<ModelSource>,
     pub data_plane: DataPlane,
@@ -230,6 +237,7 @@ pub fn resolve(
         distributed_backend: text(descriptor.distributed_backend.as_deref()),
         rendezvous,
         expert_parallel: experts,
+        tensor_experts: descriptor.tensor_experts,
         model: model.map(|path| ModelSource {
             path,
             quantization: descriptor.quantization_config.to_string(),
@@ -335,6 +343,7 @@ fn load_options(descriptor: &LaunchDescriptor) -> Result<LoadOptions, Descriptor
         mode: mode.to_owned(),
         download_dir: text(descriptor.download_dir.as_deref()),
         num_threads: descriptor.load_threads,
+        parallel_degrees: descriptor.parallel_degrees.clone(),
     })
 }
 

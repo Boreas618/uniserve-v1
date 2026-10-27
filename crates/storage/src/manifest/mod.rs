@@ -39,9 +39,10 @@
 //!
 //! The manifest's digest covers everything it directs; every participating
 //! worker verifies it before executing ([`Manifest::verify`]), and a
-//! [`Planner`] computes each pair's manifest once. [`Manifest::tasks`]
-//! turns the copies into the transfer tasks of chunk regions the Transfer
-//! Server executes.
+//! [`Planner`] computes each pair's manifest once. [`Manifest::spans`]
+//! turns the copies into the spans of a transfer between the chunks the
+//! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
+//! its Transfer Server executes.
 
 pub mod layout;
 mod plan;
@@ -58,9 +59,10 @@ use sha2::{Digest as _, Sha256};
 
 pub use layout::{Canonical, Encoding, Field, Logical, Piece, Segment, StorageLayout};
 pub use region::Span;
-pub use tasks::{CopyTask, Region, Tasks};
+pub use tasks::Spans;
 
 use crate::Key;
+use crate::protocol::LinkBandwidth;
 
 /// Why a manifest cannot be computed or applied.
 #[derive(Debug, thiserror::Error)]
@@ -149,13 +151,29 @@ impl Storage {
     }
 }
 
+/// A GPU, by its UUID, as the Storage Server and the Transfer Server name
+/// it.
+pub type Gpu = [u8; 16];
+
+/// A GPU's UUID in its usual text form.
+pub(crate) fn uuid(gpu: &Gpu) -> String {
+    let hex: String = gpu.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 /// One rank of a world.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rank {
-    /// The GPU the rank's storages lie on (a host-unique name such as
-    /// `<host>/GPU-<uuid>`); `None` for a target rank, which the manifest
-    /// assigns a GPU.
-    pub gpu: Option<String>,
+    /// The GPU the rank's storages lie on; `None` for a target rank, which
+    /// the manifest assigns a GPU.
+    pub gpu: Option<Gpu>,
     pub storages: Vec<Storage>,
 }
 
@@ -165,23 +183,18 @@ pub struct World {
     pub ranks: Vec<Rank>,
 }
 
-/// The measured bandwidth of copies from one GPU to another (to itself for
-/// a copy within a GPU), as the Transfer Server measures it at startup.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Link {
-    pub source: String,
-    pub target: String,
-    pub bytes_per_second: f64,
-}
-
 /// What a manifest is computed from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub source: World,
     pub target: World,
     /// The GPUs the target world's ranks may take, at least one per rank.
-    pub gpus: Vec<String>,
-    pub links: Vec<Link>,
+    pub gpus: Vec<Gpu>,
+    /// The bandwidth of every link between them, as the host's Transfer
+    /// Server measured it when it started (the listing's
+    /// `transfer.links`): a copy within one GPU takes the link from it to
+    /// itself, and every link a block may take must be measured.
+    pub links: Vec<LinkBandwidth>,
 }
 
 impl Request {
@@ -301,8 +314,8 @@ pub struct Missing {
 /// The bytes a manifest moves over one link and their estimated time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkLoad {
-    pub source: String,
-    pub target: String,
+    pub source: Gpu,
+    pub target: Gpu,
     pub bytes: u64,
     pub seconds: f64,
 }
@@ -313,7 +326,7 @@ pub struct Manifest {
     /// The digest of the request the manifest was computed from.
     pub request: [u8; 32],
     /// Each target rank's GPU.
-    pub gpus: Vec<String>,
+    pub gpus: Vec<Gpu>,
     pub mappings: Vec<Mapping>,
     pub stagings: Vec<Staging>,
     /// Conversions of source groups to canonical, before the copies.

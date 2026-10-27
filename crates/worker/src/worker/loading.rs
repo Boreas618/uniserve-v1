@@ -215,14 +215,78 @@ impl LoadedModel {
     pub(crate) fn load(
         description: Description,
         launch: &WorkerLaunch,
-        meshes: Vec<ComponentMesh>,
-        experts: Option<ExpertPartition>,
+        meshes: &[ComponentMesh],
+        experts: Option<&ExpertPartition>,
         host_only: bool,
         retained: Option<&Handle>,
         load: &BTreeSet<String>,
     ) -> Result<Self> {
+        let handle = Self::materialize(
+            &description,
+            launch,
+            meshes,
+            experts,
+            host_only,
+            retained,
+            load,
+            false,
+        )?;
+        let backend: tvm_ffi::String =
+            Interpreter::import(&format!("{LOADING}.attention_backend"))?
+                .call_as(&[handle.view()])?;
+        let uncaptured: tvm_ffi::String =
+            Interpreter::import(&format!("{LOADING}.uncaptured"))?.call_as(&[handle.view()])?;
+        Ok(Self {
+            handle,
+            declarations: description.declarations,
+            video_decoder: description.video_decoder,
+            attention_backend: backend.as_str().to_owned(),
+            uncaptured: uncaptured.as_str().to_owned(),
+        })
+    }
+
+    /// This rank's modules materialized as [`LoadedModel::load`] loads
+    /// them, but without reading the checkpoint (`rank.load_model`'s
+    /// `unread`): every tensor has its storage, shape, element type and
+    /// encoding, not its value. Returns the `rank.Loaded` handle, from
+    /// which a worker plans the layout of the weights it receives from
+    /// another world.
+    pub(crate) fn unread(
+        description: &Description,
+        launch: &WorkerLaunch,
+        meshes: &[ComponentMesh],
+        experts: Option<&ExpertPartition>,
+    ) -> Result<Handle> {
+        Self::materialize(
+            description,
+            launch,
+            meshes,
+            experts,
+            false,
+            None,
+            &BTreeSet::new(),
+            true,
+        )
+    }
+
+    /// The `rank.Loaded` handle of `rank.load_model` with the launch's
+    /// arguments.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call of the library's loader with the launch's choices"
+    )]
+    fn materialize(
+        description: &Description,
+        launch: &WorkerLaunch,
+        meshes: &[ComponentMesh],
+        experts: Option<&ExpertPartition>,
+        host_only: bool,
+        retained: Option<&Handle>,
+        load: &BTreeSet<String>,
+        unread: bool,
+    ) -> Result<Handle> {
         let execution = &launch.execution;
-        let (modules, excluded) = selection(&description, launch);
+        let (modules, excluded) = selection(description, launch);
 
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
         let optional = |value: Option<i64>| value.map(Any::from).unwrap_or_default();
@@ -239,7 +303,7 @@ impl LoadedModel {
             ),
             None => (Any::default(), 0, false),
         };
-        let handle = Handle::new(
+        Handle::new(
             Interpreter::import(&format!("{LOADING}.load_model"))?.call_values(&[
                 description.handle.to_any(),
                 Any::from(strings(&modules)),
@@ -272,6 +336,7 @@ impl LoadedModel {
                     .as_ref()
                     .map(|union| text(&union.exchange))
                     .unwrap_or_default(),
+                Any::from(launch.tensor_experts),
                 retained.map(Handle::to_any).unwrap_or_default(),
                 Any::from(strings(load)),
                 text(execution.attention_backend.as_str()),
@@ -283,20 +348,9 @@ impl LoadedModel {
                 optional(attention.prefill_split_tile_size.map(i64::from)),
                 attention.use_tensor_core.map(Any::from).unwrap_or_default(),
                 weights(launch),
+                Any::from(unread),
             ])?,
-        )?;
-        let backend: tvm_ffi::String =
-            Interpreter::import(&format!("{LOADING}.attention_backend"))?
-                .call_as(&[handle.view()])?;
-        let uncaptured: tvm_ffi::String =
-            Interpreter::import(&format!("{LOADING}.uncaptured"))?.call_as(&[handle.view()])?;
-        Ok(Self {
-            handle,
-            declarations: description.declarations,
-            video_decoder: description.video_decoder,
-            attention_backend: backend.as_str().to_owned(),
-            uncaptured: uncaptured.as_str().to_owned(),
-        })
+        )
     }
 
     pub(crate) fn handle(&self) -> &Handle {

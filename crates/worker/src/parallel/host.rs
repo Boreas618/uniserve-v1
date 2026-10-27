@@ -262,6 +262,12 @@ impl HostGroup {
         })
     }
 
+    /// This member's index: its place in the member order of
+    /// [`Self::all_gather_bytes`].
+    pub(crate) fn index(&self) -> usize {
+        self.rank
+    }
+
     /// Every member's bytes, in member order.
     pub(crate) fn all_gather_bytes(&self, value: &[u8]) -> Result<Vec<Vec<u8>>> {
         let peers: Vec<(usize, &TcpStream)> = self
