@@ -286,6 +286,10 @@ const TRIAL_POLL: Duration = Duration::from_millis(500);
 /// How long the closed engine of a world takes to exit.
 const CLOSED_EXIT: Duration = Duration::from_secs(60);
 
+/// How long the status waits for the memory ledgers, which each node's
+/// daemon reads from its Storage Server.
+const LEDGER_READ: Duration = Duration::from_secs(10);
+
 /// The parts of `spec` a configuration states: without the world's identity
 /// and the layout of its cache, which the world's history sets.
 fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
@@ -326,6 +330,62 @@ fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'stat
         differs("the weight source", old.weights == new.weights);
     }
     parts
+}
+
+/// Whether a world succeeding the one `running` executes fits beside it on
+/// every device, from each GPU's memory ledger: the report `PUT
+/// /admin/config` plans with, and the refusal when it does not fit. The
+/// serving engine computes, for each worker that holds the KV cache, what
+/// the serving world, the successor and the Transfer Server hold on its GPU
+/// and the KV cache limit that leaves the serving world, and fails, with
+/// every item of every GPU and host, when a limit cannot hold the segments
+/// the serving world keeps in any case.
+async fn memory_plan(running: &EngineClient) -> (serde_json::Value, Option<String>) {
+    match running.resize_cache(wire::CacheChange::Plan).await {
+        Ok(results) => (memory_report(&results), None),
+        Err(refusal) => (
+            serde_json::json!({ "feasible": false, "refusal": refusal }),
+            Some(refusal),
+        ),
+    }
+}
+
+/// The memory report of the engine's per-device plans (`ledger::Preparing`
+/// of the engine, as JSON): each GPU's, and each host's admission of new
+/// host memory, which a successor sharing the serving world's page pools
+/// does not need.
+fn memory_report(plans: &[String]) -> serde_json::Value {
+    let gpus: Vec<serde_json::Value> = plans
+        .iter()
+        .filter_map(|plan| serde_json::from_str(plan).ok())
+        .collect();
+    let mut hosts: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for gpu in &gpus {
+        let (Some(host), Some(memory)) = (gpu["host"].as_str(), gpu.get("host_memory")) else {
+            continue;
+        };
+        let room = memory["available"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(memory["reserve"].as_u64().unwrap_or(0))
+            .saturating_sub(memory["pools_unallocated"].as_u64().unwrap_or(0));
+        hosts.entry(host.to_owned()).or_insert_with(|| {
+            serde_json::json!({
+                "host": host,
+                "available": memory["available"],
+                "reserve": memory["reserve"],
+                "pools_unallocated": memory["pools_unallocated"],
+                "admits": room,
+                "required": 0,
+                "feasible": true,
+            })
+        });
+    }
+    serde_json::json!({
+        "feasible": gpus.iter().all(|gpu| gpu["feasible"] == true),
+        "gpus": gpus,
+        "hosts": hosts.into_values().collect::<Vec<_>>(),
+    })
 }
 
 impl Leader {
@@ -416,6 +476,19 @@ impl Leader {
         // becomes in its successor.
         let unmapped = differing(&served, &target_spec);
         let running = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        let in_place = crate::leader::configurable(
+            &comparable(&served),
+            &comparable(&target_spec),
+            running.info().capacity.as_ref(),
+        );
+        // A change a new world executes is checked against every device's
+        // memory ledger first: the serving world's KV cache limit beside a
+        // successor, per GPU and host (`specs/online-operations.md` §6.6).
+        let memory = if world_changes && !in_place && unmapped.is_empty() {
+            Some(memory_plan(&running).await)
+        } else {
+            None
+        };
         let plan = serde_json::json!({
             "from": locked(&self.engines.worlds).executing,
             "digest": target_digest,
@@ -427,6 +500,7 @@ impl Leader {
             "kv_cache": if unmapped.is_empty() { "mapped" } else { "unmapped" },
             "differs": unmapped,
             "in_flight_requests": running.in_flight(),
+            "memory": memory.as_ref().map(|(plan, _)| plan),
         });
         if request.dry_run {
             return Ok(Applied::Planned(plan));
@@ -455,11 +529,7 @@ impl Leader {
         }
         // Scheduling alone, within the batch the serving world's workers
         // were started for, changes in place at the schedulers' next step.
-        if crate::leader::configurable(
-            &comparable(&served),
-            &comparable(&target_spec),
-            running.info().capacity.as_ref(),
-        ) {
+        if in_place {
             let scheduling = target_spec.scheduling.clone().unwrap_or_default();
             running
                 .configure(scheduling)
@@ -486,6 +556,11 @@ impl Leader {
                  does not run"
                     .to_owned(),
             ));
+        }
+        // A successor that does not fit beside the serving world on some
+        // GPU is refused before anything starts, naming each item there.
+        if let Some((_, Some(refusal))) = memory {
+            return Err(UpdateError::Refused(refusal));
         }
         let report = self
             .change_world(
@@ -523,9 +598,9 @@ impl Leader {
         let started = Instant::now();
         let previous_world = running.world();
         self.progress("shrink", None);
-        // The serving world's cache gives back the tail the successor needs;
-        // its requests run on.
-        running
+        // The serving world's cache gives back the tail past the limit each
+        // GPU's ledger leaves it beside the successor; its requests run on.
+        let shrunk = running
             .resize_cache_within(wire::CacheChange::Shrink, update.preempt_after)
             .await
             .map_err(|error| {
@@ -535,6 +610,7 @@ impl Leader {
                      serves on: {error}"
                 )
             })?;
+        let memory = memory_report(&shrunk);
         let segments = running.describe_cache().await.map_err(|error| {
             self.progress_done();
             anyhow::anyhow!("the serving world did not describe its KV cache: {error}")
@@ -656,8 +732,16 @@ impl Leader {
             }
         };
         // The successor's cache grows into the memory the previous world
-        // freed.
-        if let Err(error) = successor.resize_cache(wire::CacheChange::Grow).await {
+        // freed: a previous world kept as its weights released, with its
+        // processes, their graph pools and process memory, and keeps its
+        // weights alone, so every other storage of it the successor does
+        // not map is released first. Each GPU's ledger leaves the successor
+        // all of it at once.
+        let grown = match &previous {
+            Previous::Parked(_) => successor.resize_cache(wire::CacheChange::Grow).await,
+            Previous::Weights => successor.grow_keeping_weights(vec![previous_world]).await,
+        };
+        if let Err(error) = grown {
             warn!("the successor's KV cache did not grow: {error}");
         }
 
@@ -674,6 +758,7 @@ impl Leader {
             "previous_world_kept": update.previous_world,
             "numerics": if numerics_change { "changed" } else { "unchanged" },
             "in_flight": if numerics_change { Some(in_flight) } else { None },
+            "memory": memory,
         });
         {
             let mut worlds = locked(&self.engines.worlds);
@@ -783,8 +868,27 @@ impl Leader {
     }
 
     /// The deployment's configuration and worlds, as `GET /admin/config`
-    /// reports them.
-    pub fn config_status(&self) -> serde_json::Value {
+    /// reports them, with every item of the memory ledgers of the GPUs its
+    /// worlds use, per host: the executing engine has each node's daemon
+    /// read its Storage Server's ledgers, asking no worker.
+    pub async fn config_status(&self) -> serde_json::Value {
+        let ledgers = match self.migrator.hold().client() {
+            Some(client) => {
+                match tokio::time::timeout(LEDGER_READ, client.describe_memory()).await {
+                    Ok(Ok(nodes)) => serde_json::Value::Array(
+                        nodes
+                            .iter()
+                            .filter_map(|node| serde_json::from_str(node).ok())
+                            .collect(),
+                    ),
+                    Ok(Err(error)) => serde_json::json!({ "error": error }),
+                    Err(_) => serde_json::json!({
+                        "error": format!("the ledgers were not read within {LEDGER_READ:?}")
+                    }),
+                }
+            }
+            None => serde_json::Value::Null,
+        };
         let config = locked(&self.engines.config).clone();
         let printed = crate::options::printed(&config).unwrap_or_default();
         let digest = digest(&config).unwrap_or_default();
@@ -849,6 +953,7 @@ impl Leader {
             "trial": trial,
             "unavailable": worlds.unavailable.values().collect::<Vec<_>>(),
             "last": worlds.last,
+            "ledgers": ledgers,
         })
     }
 

@@ -172,6 +172,57 @@ impl ClaimHolder {
         Ok(claimed)
     }
 
+    /// Has this node's Storage Server keep the weights alone of `worlds` of
+    /// `deployment` (`Request::KeepWeights`), over the claim this daemon
+    /// holds; returns how many storages it released.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this daemon holds no claim of the deployment, or the
+    /// server cannot be reached or refuses.
+    pub(crate) fn keep_weights(&mut self, deployment: &str, worlds: &[u64]) -> anyhow::Result<u64> {
+        use anyhow::Context as _;
+
+        let held = self
+            .held
+            .get_mut(deployment)
+            .with_context(|| format!("this node holds no claim of deployment {deployment}"))?;
+        let released = held
+            .client
+            .keep_weights(worlds.to_vec())
+            .with_context(|| format!("keeping the weights alone of worlds {worlds:?}"))?;
+        tracing::info!(
+            deployment,
+            ?worlds,
+            released,
+            "worlds keep their weights alone"
+        );
+        Ok(released)
+    }
+
+    /// The memory ledgers this node's Storage Server keeps for
+    /// `deployment`, one per GPU of the node it uses, and what the host
+    /// admits of new host memory, as JSON (`{"ledgers": [...],
+    /// "host_memory": {...}}`), read over the claim this daemon holds.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this daemon holds no claim of the deployment, or the
+    /// server cannot be reached.
+    pub(crate) fn ledger(&mut self, deployment: &str) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+
+        let held = self
+            .held
+            .get_mut(deployment)
+            .with_context(|| format!("this node holds no claim of deployment {deployment}"))?;
+        let (ledgers, host) = held
+            .client
+            .ledger(Vec::new())
+            .with_context(|| format!("reading the memory ledgers of deployment {deployment}"))?;
+        Ok(serde_json::json!({ "ledgers": ledgers, "host_memory": host }).to_string())
+    }
+
     /// Restarts the server at `socket` with this daemon's executable when it
     /// speaks an earlier protocol than this build, which needs this build's,
     /// and waits until the successor serves: it goes on with every

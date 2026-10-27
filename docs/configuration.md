@@ -87,7 +87,7 @@ retention = "30m"
 | `attention_backend` | `"auto"` | Attention provider: `auto` selects a native kernel per call; `flashinfer`, `trtllm`, `flash_attn_4`, `torch`, `prefix_block`, `flash_attn` or `sgl_kernel` serves every call |
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold |
 | `max_num_batched_tokens` | `8192` | Token work admitted in one scheduling step; token models only |
-| `mem_fraction_static` | `0.7` | Each rank's share of its device's memory for weights, static allocations and the KV cache, in (0, 1]; a deployment group's `mem_fraction_static` overrides it |
+| `mem_fraction_static` | `0.7` | The deployment's share of each device's memory for weights, static allocations, graph pools and the KV cache, in (0, 1]: the quota `⌊total × fraction⌋` of the GPU's memory ledger, which both worlds of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it |
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
 | `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups; requests go to the scheduler with the fewest in flight. With `worker_groups`, the file's model groups form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |

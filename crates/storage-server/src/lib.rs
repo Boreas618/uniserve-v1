@@ -30,6 +30,7 @@
 
 mod child;
 mod kv_storage;
+mod ledger;
 pub mod mooncake;
 mod pages;
 mod restart;
@@ -56,9 +57,10 @@ pub use restart::{Pending as RestartPending, TAKEOVER_DESCRIPTOR, relaunch_argum
 pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
 use shoot::ShootDowns;
 use storage::protocol::{
-    Access, Allocation, Claim, ClientMessage, ErrorKind, Event, Hello, Key, ListedDeployment,
-    ListedTensor, Listing, MIN_VERSION, Mode, PageLevel, Placement, Reply, Request, Retainer, Role,
-    Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord, VERSION, Welcome,
+    Access, Allocation, Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostMemory, Item,
+    Key, ListedDeployment, ListedTensor, Listing, MIN_VERSION, Mode, PageLevel, Placement, Reply,
+    Request, Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord,
+    VERSION, Welcome,
 };
 use storage::transport::Connection;
 
@@ -197,6 +199,9 @@ pub struct Server {
     /// Host memory a new page pool leaves available to the host's other
     /// processes.
     host_reserve: u64,
+    /// The GPUs' memory ledgers: what the processes book and the quotas
+    /// the worlds state ([`ledger`]).
+    ledgers: ledger::Ledgers,
     kv_storage: KvStorage,
     transfers: transfers::Transfers,
     /// Events to send once the request being handled is answered.
@@ -234,6 +239,7 @@ impl Server {
             shootdowns: ShootDowns::default(),
             pages: pages::Pools::new(page_pool_bytes),
             host_reserve,
+            ledgers: ledger::Ledgers::default(),
             kv_storage: KvStorage::new(connector),
             transfers: transfers::Transfers::new(transfer),
             events: Vec::new(),
@@ -694,6 +700,46 @@ impl Server {
                 },
                 Role::Head { deployment, .. },
             ) => self.claim(id, &deployment, scopes, *world, retire),
+            (Request::KeepWeights { worlds }, Role::Head { deployment, .. }) => {
+                self.keep_weights(id, &deployment, worlds)
+            }
+            (Request::Ledger { gpus }, role) => {
+                let deployment = match &role {
+                    Role::Head { deployment, .. } => Some(deployment.clone()),
+                    Role::Worker { scope, .. } => Some(scope.deployment.clone()),
+                    Role::Transfer | Role::Peer | Role::Operator | Role::Connector => None,
+                };
+                let ledgers = self.ledgers_of(gpus, deployment.as_deref());
+                Ok(Outcome::Reply(
+                    Reply::Ledger {
+                        ledgers,
+                        host: self.host_memory().map_err(resource)?,
+                    },
+                    Vec::new(),
+                ))
+            }
+            (
+                Request::Book {
+                    gpu,
+                    total,
+                    quota,
+                    items,
+                },
+                Role::Worker { scope, world, .. },
+            ) => self.book(
+                id,
+                ledger::Booker::Worker { scope, world },
+                *gpu,
+                *total,
+                *quota,
+                items,
+            ),
+            (
+                Request::Book {
+                    gpu, total, items, ..
+                },
+                Role::Transfer,
+            ) => self.book(id, ledger::Booker::Transfer, *gpu, *total, None, items),
             (
                 request,
                 Role::Worker {
@@ -890,6 +936,9 @@ impl Server {
         for key in released {
             self.remove_tensor(&key);
         }
+        // A retired world's quota ends with its memory: the ledger then
+        // books what its successor alone holds, under the successor's.
+        self.ledgers.retire(deployment, &retired);
         tracing::info!(
             deployment,
             world,
@@ -949,6 +998,7 @@ impl Server {
         }
         let pools = self.pages.release(deployment);
         self.pools_released(&pools);
+        self.ledgers.release(deployment);
         tracing::info!(
             deployment,
             released = count,
@@ -976,23 +1026,152 @@ impl Server {
     /// available memory less the server's reserve and what the page pools
     /// have yet to allocate.
     fn admit_host(&self, bytes: u64) -> Result<(), (ErrorKind, String)> {
-        let available = available_memory().map_err(resource)?;
-        let pending = self.pages.unallocated();
-        let room = available
-            .saturating_sub(self.host_reserve)
-            .saturating_sub(pending);
+        let host = self.host_memory().map_err(resource)?;
+        let room = host.room();
         if bytes > room {
             return Err((
                 ErrorKind::Resource,
                 format!(
                     "{bytes} bytes of host memory exceed the {room} bytes the host can hold: \
-                     {available} bytes available, less {pending} bytes the page pools have yet \
-                     to allocate and the server's reserve of {} bytes",
-                    self.host_reserve
+                     {} bytes available, less {} bytes the page pools have yet to allocate and \
+                     the server's reserve of {} bytes",
+                    host.available, host.pools_unallocated, host.reserve
                 ),
             ));
         }
         Ok(())
+    }
+
+    /// What the host admits of new host memory now ([`Self::admit_host`]).
+    fn host_memory(&self) -> io::Result<HostMemory> {
+        Ok(HostMemory {
+            available: available_memory()?,
+            reserve: self.host_reserve,
+            pools_unallocated: self.pages.unallocated(),
+        })
+    }
+
+    /// The retained device storages as the ledgers see them: each storage's
+    /// record, the access of its tensors and the scopes of the worlds that
+    /// retain any of them.
+    fn held(&self) -> Vec<ledger::Held<'_>> {
+        let mut held: HashMap<StorageId, ledger::Held<'_>> = HashMap::new();
+        for tensor in self.tensors.values() {
+            let Some(storage) = self.storages.get(&tensor.storage) else {
+                continue;
+            };
+            if !matches!(storage.record.placement, Placement::Device { .. }) {
+                continue;
+            }
+            held.entry(tensor.storage)
+                .or_insert_with(|| ledger::Held {
+                    record: &storage.record,
+                    access: tensor.access,
+                    retainers: BTreeSet::new(),
+                })
+                .retainers
+                .extend(&tensor.retainers);
+        }
+        held.into_values().collect()
+    }
+
+    /// The ledgers of `gpus` (every GPU when empty) of `deployment` (every
+    /// deployment when `None`).
+    fn ledgers_of(&self, gpus: &[[u8; 16]], deployment: Option<&str>) -> Vec<GpuLedger> {
+        self.ledgers.ledgers(
+            self.held(),
+            &self.transfer_contexts(),
+            &|gpu| gpus.is_empty() || gpus.contains(gpu),
+            &|name| deployment.is_none_or(|deployment| deployment == name),
+        )
+    }
+
+    /// `book`: see [`Request::Book`]. A worker books in its deployment's
+    /// ledger, the Transfer Server in every ledger of the GPU.
+    fn book(
+        &mut self,
+        id: ClientId,
+        booker: ledger::Booker,
+        gpu: [u8; 16],
+        total: u64,
+        quota: Option<u64>,
+        items: &[(Item, u64)],
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        let deployment = match &booker {
+            ledger::Booker::Worker { scope, .. } => {
+                if let Some(&(item, _)) = items.iter().find(|(item, _)| !item.booked()) {
+                    return Err(invalid(&format!("a worker books no {}", item.name())));
+                }
+                Some(scope.deployment.clone())
+            }
+            ledger::Booker::Transfer => {
+                if let Some(&(item, _)) = items.iter().find(|(item, _)| *item != Item::Staging) {
+                    return Err(invalid(&format!(
+                        "the Transfer Server books no {}",
+                        item.name()
+                    )));
+                }
+                None
+            }
+        };
+        let before = self.ledgers_of(&[gpu], deployment.as_deref());
+        let previous = self.ledgers.book(id, booker, gpu, total, quota, items);
+        let after = self.ledgers_of(&[gpu], deployment.as_deref());
+        if let Some(refusal) = ledger::overrun(&before, &after) {
+            self.ledgers = previous;
+            return Err((ErrorKind::Quota, refusal));
+        }
+        Ok(Outcome::Reply(
+            Reply::Ledger {
+                ledgers: after,
+                host: self.host_memory().map_err(resource)?,
+            },
+            Vec::new(),
+        ))
+    }
+
+    /// `keep_weights`: see [`Request::KeepWeights`]. Refused unless the
+    /// caller is the deployment's head.
+    fn keep_weights(
+        &mut self,
+        id: ClientId,
+        deployment: &str,
+        worlds: &[u64],
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        if !self
+            .deployments
+            .get(deployment)
+            .is_some_and(|entry| entry.head == Some(id))
+        {
+            return Err(invalid(&format!(
+                "only the head that claimed {deployment} keeps its worlds' weights"
+            )));
+        }
+        let released: Vec<Key> = self
+            .tensors
+            .iter_mut()
+            .filter(|(_, tensor)| tensor.access == Access::Exclusive)
+            .filter_map(|(key, tensor)| {
+                tensor.retainers.retain(|retainer| {
+                    retainer.scope.deployment != deployment || !worlds.contains(&retainer.world)
+                });
+                tensor.retainers.is_empty().then_some(*key)
+            })
+            .collect();
+        let count = released.len() as u64;
+        for key in released {
+            self.remove_tensor(&key);
+        }
+        tracing::info!(
+            deployment,
+            ?worlds,
+            released = count,
+            "worlds keep their weights alone"
+        );
+        Ok(Outcome::Reply(
+            Reply::Retained { released: count },
+            Vec::new(),
+        ))
     }
 
     /// `retire`: see [`Request::Retire`]. Processes that still map the
@@ -1257,6 +1436,7 @@ impl Server {
                 return Err(invalid(&format!("{} has one stride per axis", tensor.name)));
             }
         }
+        self.admit_storages(holder, tensors, storages)?;
         let ids: Vec<StorageId> = storages
             .iter()
             .zip(descriptors)
@@ -1329,6 +1509,51 @@ impl Server {
         // A storage no tensor names is not retained.
         self.storages.retain(|_, entry| entry.tensors > 0);
         Ok(Outcome::Reply(Reply::Put, Vec::new()))
+    }
+
+    /// Refuses a put whose new device storages would take a ledger of the
+    /// holder's deployment past its quota. A storage is new when a tensor
+    /// the put creates lies in it; a read-only tensor already retained adds
+    /// the caller's scope to its storage and no memory.
+    fn admit_storages(
+        &self,
+        holder: &Holder,
+        tensors: &[TensorRecord],
+        storages: &[StorageRecord],
+    ) -> Result<(), (ErrorKind, String)> {
+        let created: BTreeSet<usize> = tensors
+            .iter()
+            .filter(|tensor| !self.tensors.contains_key(&tensor.key))
+            .map(|tensor| tensor.storage as usize)
+            .collect();
+        let mut added: BTreeMap<[u8; 16], u64> = BTreeMap::new();
+        for index in created {
+            if let Placement::Device { gpu } = storages[index].placement {
+                *added.entry(gpu).or_default() += storages[index].bytes;
+            }
+        }
+        for (gpu, bytes) in added {
+            let deployment = holder.scope.deployment.as_str();
+            for ledger in self.ledgers_of(&[gpu], Some(deployment)) {
+                let (Some(quota), used) = (ledger.quota, ledger.used()) else {
+                    continue;
+                };
+                if used + bytes > quota {
+                    return Err((
+                        ErrorKind::Quota,
+                        format!(
+                            "{bytes} bytes of new device storage of {} would take the memory \
+                             ledger of GPU {} to {} bytes, past its quota of {quota} bytes:\n{}",
+                            holder.scope,
+                            storage::protocol::gpu_name(&gpu),
+                            used + bytes,
+                            ledger.describe()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `promote`: see [`Request::Promote`].
@@ -1510,6 +1735,9 @@ impl Server {
         let Some(client) = self.clients.remove(&id) else {
             return;
         };
+        // What the process booked ends with it: the memory it booked is its
+        // own, which the driver frees as the process ends.
+        self.ledgers.disconnect(id);
         match &client.role {
             Some(Role::Head { .. }) => {
                 let clients = &self.clients;
@@ -1636,6 +1864,7 @@ impl Server {
             page_pools: self.pages.listing(),
             connector: self.kv_storage.client.is_some(),
             transfer: self.listed_transfer(),
+            ledgers: self.ledgers_of(&[], None),
         }
     }
 
@@ -2197,6 +2426,7 @@ fn request_name(request: &Request) -> &'static str {
     match request {
         Request::Claim { .. } => "claim",
         Request::Retain { .. } => "retain",
+        Request::KeepWeights { .. } => "keep_weights",
         Request::Get { .. } => "get",
         Request::Put { .. } => "put",
         Request::Promote { .. } => "promote",
@@ -2216,6 +2446,8 @@ fn request_name(request: &Request) -> &'static str {
         Request::Prefetch { .. } => "prefetch",
         Request::HostCache { .. } => "host_cache",
         Request::Finished { .. } => "finished",
+        Request::Book { .. } => "book",
+        Request::Ledger { .. } => "ledger",
         Request::Transfer { .. } => "transfer",
         Request::Cancel { .. } => "cancel",
         Request::Throttle { .. } => "throttle",

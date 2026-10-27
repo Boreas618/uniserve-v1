@@ -523,6 +523,46 @@ impl EngineClient {
         }
     }
 
+    /// Grows the engine's KV cache as [`Self::resize_cache`] does, once the
+    /// worlds of `keep_weights` (a previous world kept as its weights, whose
+    /// processes exited) released every storage but their weights on every
+    /// node, so that each GPU's ledger leaves the cache the rest.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::resize_cache`] does, or when a node keeps no
+    /// weights alone.
+    pub async fn grow_keeping_weights(
+        &self,
+        keep_weights: Vec<u64>,
+    ) -> Result<Vec<String>, String> {
+        self.ask(|id| {
+            wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+                id,
+                change: wire::CacheChange::Grow as i32,
+                preempt_after_ms: None,
+                keep_weights,
+            })
+        })
+        .await
+        .map(Answered::results)
+    }
+
+    /// The memory ledgers every node's Storage Server keeps for the
+    /// deployment, one JSON result per node: `{"host": ..., "ledgers":
+    /// [...], "host_memory": {...}}`. No worker is asked: each node's daemon
+    /// reads them over its claim.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot read them, or when the engine ends
+    /// first.
+    pub async fn describe_memory(&self) -> Result<Vec<String>, String> {
+        self.ask(|id| wire::engine_command::Kind::DescribeMemory(wire::DescribeMemory { id }))
+            .await
+            .map(Answered::results)
+    }
+
     /// Runs the worker hook `name` with the JSON `payload` on every worker
     /// once the engine's batches in flight complete, and returns each
     /// worker's JSON result.
@@ -600,6 +640,7 @@ impl EngineClient {
                 id,
                 change: change as i32,
                 preempt_after_ms: preempt_after.map(|after| after.as_millis() as u64),
+                keep_weights: Vec::new(),
             })
         })
         .await

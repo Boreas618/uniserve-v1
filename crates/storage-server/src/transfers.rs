@@ -729,6 +729,16 @@ impl Server {
         }
     }
 
+    /// The device memory the connected Transfer Server's CUDA context takes
+    /// on each GPU, as it measured it, which every ledger of the GPU books.
+    pub(super) fn transfer_contexts(&self) -> Vec<([u8; 16], u64)> {
+        self.transfers
+            .contexts
+            .iter()
+            .map(|context| (context.gpu, context.bytes))
+            .collect()
+    }
+
     /// The Transfer Server in a listing, while it is connected.
     pub(super) fn listed_transfer(&self) -> Option<ListedTransfer> {
         let client = self.clients.get(&self.transfers.client?)?;

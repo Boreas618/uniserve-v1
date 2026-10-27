@@ -62,6 +62,7 @@ pub(crate) mod generation;
 pub(crate) mod graph;
 pub(crate) mod image_artifact;
 mod inflight;
+mod ledger;
 pub(crate) mod output;
 mod placement;
 mod run;

@@ -1,9 +1,12 @@
-//! Giving back and restoring the KV cache's device memory: a shrink lets
-//! the requests that hold the tail it withdraws run to their end (or
-//! recomputes them past its bound) before the workers give the tail back, a
-//! restore creates it again and a growth as much of it as the memory holds,
-//! a sleeping scheduler admits nothing until it wakes, and a weight update
-//! rewrites the weights while the workers sleep.
+//! Giving back and restoring the KV cache's device memory against the GPU's
+//! memory ledger: a shrink keeps the segments the quota leaves the serving
+//! world beside everything else the ledger books and what a successor adds,
+//! lets the requests that hold the tail it withdraws run to their end (or
+//! recomputes them past its bound) before the workers give the tail back,
+//! and refuses a successor whose limit cannot hold the first segment; a
+//! restore creates the tail again and a growth as much of it as the
+//! ledger's room holds; a sleeping scheduler admits nothing until it wakes,
+//! and a weight update rewrites the weights while the workers sleep.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,6 +20,7 @@ use engine::{
 use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
 use proto::request::MigrationCause;
+use storage::{GpuLedger, Item, LedgerEntry, Scope, Segment};
 
 use crate::support;
 
@@ -30,12 +34,22 @@ const BLOCK: u32 = 16;
 /// Device bytes of one unit across the simulated planes: a segment holds
 /// 1000.
 const UNIT_BYTES: u64 = 250;
+const SEGMENT_BYTES: u64 = SEGMENT_UNITS as u64 * UNIT_BYTES;
+
+/// The serving world of the simulated workers.
+const WORLD: u64 = 1;
 
 /// What the simulated workers report and the hooks they ran.
 #[derive(Default)]
 struct Workers {
-    /// Device bytes the worker holds beside the weights and the cache.
+    /// The quota of the worker's GPU.
+    quota: u64,
+    /// What the worker's process books beside its weights and its cache.
     process_bytes: u64,
+    /// What the Transfer Server books on the GPU.
+    transfer_bytes: u64,
+    /// What another world's process books on the GPU.
+    other_world_bytes: u64,
     /// Free device bytes.
     free_bytes: u64,
     /// Segments the worker holds.
@@ -48,8 +62,87 @@ struct Workers {
     /// Whether an expert worker, which holds no cache, reports beside the
     /// worker that holds it.
     experts: bool,
+    /// What the expert worker's process books on a GPU of its own whose
+    /// quota is 1000 bytes; `None` for an expert worker that reports no
+    /// ledger.
+    expert_process: Option<u64>,
     /// Each hook run, with its payload.
     hooks: Vec<String>,
+}
+
+impl Workers {
+    /// The serving workers of a GPU whose quota their cache of eight
+    /// segments and their process of `process_bytes` fill.
+    fn filling(process_bytes: u64) -> Self {
+        Self {
+            quota: u64::from(SEGMENTS) * SEGMENT_BYTES + process_bytes,
+            process_bytes,
+            free_bytes: 1 << 40,
+            held: SEGMENTS,
+            ..Self::default()
+        }
+    }
+
+    /// The deployment's ledger of the worker's GPU: each held segment of the
+    /// serving world, its process, and the other world's and the Transfer
+    /// Server's bookings.
+    fn ledger(&self) -> GpuLedger {
+        let scope = Scope {
+            deployment: "model".into(),
+            group: "model".into(),
+            rank: 0,
+        };
+        let entry = |item, scope: Option<&Scope>, worlds: Vec<u64>, segment, bytes| LedgerEntry {
+            item,
+            scope: scope.cloned(),
+            worlds,
+            segment,
+            bytes,
+        };
+        let mut entries: Vec<LedgerEntry> = (0..self.held)
+            .map(|ordinal| {
+                entry(
+                    Item::CacheSegment,
+                    Some(&scope),
+                    vec![WORLD],
+                    Some(Segment {
+                        world: WORLD,
+                        ordinal,
+                    }),
+                    SEGMENT_BYTES,
+                )
+            })
+            .collect();
+        entries.push(entry(
+            Item::Process,
+            Some(&scope),
+            vec![WORLD],
+            None,
+            self.process_bytes,
+        ));
+        entries.push(entry(
+            Item::TransferContext,
+            None,
+            Vec::new(),
+            None,
+            self.transfer_bytes,
+        ));
+        entries.push(entry(
+            Item::Process,
+            Some(&scope),
+            vec![WORLD + 1],
+            None,
+            self.other_world_bytes,
+        ));
+        entries.retain(|entry| entry.bytes > 0);
+        GpuLedger {
+            gpu: [7; 16],
+            deployment: "model".into(),
+            total: 1 << 40,
+            quota: Some(self.quota),
+            entries,
+        }
+    }
 }
 
 /// The simulator, whose workers answer the engine's own hooks as workers
@@ -101,7 +194,7 @@ impl Executor for Segmented {
             "uniserve.cache_memory" => serde_json::json!({
                 "segments": (0..SEGMENTS)
                     .map(|ordinal| ipc::CacheSegment {
-                        world: 1,
+                        world: WORLD,
                         ordinal,
                         units: SEGMENT_UNITS,
                     })
@@ -112,9 +205,12 @@ impl Executor for Segmented {
                 "capacity_units": workers.capacity_units,
                 "scratch_units": 0,
                 "free_bytes": workers.free_bytes,
-                "process_bytes": workers.process_bytes,
-                "reserve_bytes": 0,
-                "exclusive_bytes": 0,
+                "graph_share_bytes": 0,
+                "host": "node0",
+                "scope": {"deployment": "model", "group": "model", "rank": 0},
+                "world": WORLD,
+                "ledger": workers.ledger(),
+                "host_memory": {"available": 1u64 << 40, "reserve": 10u64 << 30, "pools_unallocated": 0},
             }),
             "uniserve.release_cache" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;
@@ -146,10 +242,30 @@ impl Executor for Segmented {
         };
         let mut results = vec![result.to_string()];
         if workers.experts && name == "uniserve.cache_memory" {
+            let ledger = workers.expert_process.map(|process| GpuLedger {
+                gpu: [8; 16],
+                deployment: "model".into(),
+                total: 2_000,
+                quota: Some(1_000),
+                entries: vec![LedgerEntry {
+                    item: Item::Process,
+                    scope: Some(Scope {
+                        deployment: "model".into(),
+                        group: "experts".into(),
+                        rank: 0,
+                    }),
+                    worlds: vec![WORLD],
+                    segment: None,
+                    bytes: process,
+                }],
+            });
             results.push(
                 serde_json::json!({
                     "free_bytes": 0,
-                    "process_bytes": 1 << 30,
+                    "host": "node1",
+                    "scope": {"deployment": "model", "group": "experts", "rank": 0},
+                    "world": WORLD,
+                    "ledger": ledger,
                 })
                 .to_string(),
             );
@@ -158,22 +274,14 @@ impl Executor for Segmented {
     }
 }
 
-/// A scheduler over the simulator whose workers hold `process_bytes`
-/// beside the cache, with segmented planes of 32 units of `BLOCK` tokens.
-fn start(process_bytes: u64) -> (CommandSender, Arc<Mutex<Workers>>, thread::JoinHandle<()>) {
+/// A scheduler over the simulator whose `workers` serve a cache of
+/// segmented planes of 32 units of `BLOCK` tokens.
+fn start(workers: Workers) -> (CommandSender, Arc<Mutex<Workers>>, thread::JoinHandle<()>) {
     let mut sim = SimEngine::new();
     sim.set_text_len(10_000);
     sim.set_num_units(SEGMENTS * SEGMENT_UNITS);
     sim.set_block_size(BLOCK);
-    let workers = Arc::new(Mutex::new(Workers {
-        process_bytes,
-        free_bytes: 0,
-        held: SEGMENTS,
-        head_bytes: 0,
-        capacity_units: None,
-        experts: false,
-        hooks: Vec::new(),
-    }));
+    let workers = Arc::new(Mutex::new(workers));
     let scheduler = support::scheduler_with(
         Box::new(Segmented {
             inner: SimExecutor::new(sim),
@@ -256,15 +364,16 @@ fn resize(handle: &CommandSender, change: CacheChange) -> Result<Vec<String>, St
         .expect("the scheduler answers")
 }
 
-/// A shrink for a worker holding 3.5 segments' bytes beside the cache gives
-/// back the last four segments (units 16..32): the request holding units
-/// 1..=19, whose last page has room for every token it generates, runs on
-/// to its end, and the workers give the tail back once it let the units go.
-/// A request that fits the whole cache and not what is left waits until
-/// the restore.
+/// On a GPU whose quota the cache and a process of 3.5 segments' bytes
+/// fill, a successor adds a process as large, which leaves the serving
+/// world's cache 4.5 segments' bytes: the shrink gives back the last four
+/// segments (units 16..32). The request holding units 1..=19, whose last
+/// page has room for every token it generates, runs on to its end, and the
+/// workers give the tail back once it let the units go. A request that fits
+/// the whole cache and not what is left waits until the restore.
 #[test]
 fn a_shrink_lets_the_holders_of_the_tail_run_and_a_restore_returns_it() {
-    let (handle, workers, thread) = start(3_500);
+    let (handle, workers, thread) = start(Workers::filling(3_500));
     let mut holder = handle
         .submit(request_of(1, 18 * BLOCK as usize + 6, 8))
         .unwrap();
@@ -310,17 +419,16 @@ fn a_shrink_lets_the_holders_of_the_tail_run_and_a_restore_returns_it() {
 
 /// A cache of a configured token capacity makes room within it for a
 /// successor's head segment beside the segments the successor inherits,
-/// however much memory is free: a head of nine units withdraws the last
-/// three segments of the 32-unit capacity. A cache sized by memory withdraws
-/// nothing while the memory holds the successor.
+/// however much of the quota is left: a head of nine units withdraws the
+/// last three segments of the 32-unit capacity. A cache sized by memory
+/// withdraws nothing while the quota holds the successor.
 #[test]
 fn a_configured_capacity_withdraws_room_for_a_successors_head() {
-    let (handle, workers, thread) = start(0);
-    {
-        let mut workers = workers.lock().unwrap();
-        workers.free_bytes = 1 << 40;
-        workers.head_bytes = 9 * UNIT_BYTES;
-    }
+    let (handle, workers, thread) = start(Workers {
+        quota: 1 << 40,
+        head_bytes: 9 * UNIT_BYTES,
+        ..Workers::filling(0)
+    });
     assert!(
         resize(
             &handle,
@@ -362,14 +470,13 @@ fn a_configured_capacity_withdraws_room_for_a_successors_head() {
 /// successor's head as it does without one.
 #[test]
 fn a_worker_without_a_cache_leaves_the_shrink_to_the_others() {
-    let (handle, workers, thread) = start(0);
-    {
-        let mut workers = workers.lock().unwrap();
-        workers.free_bytes = 1 << 40;
-        workers.head_bytes = 9 * UNIT_BYTES;
-        workers.capacity_units = Some(u64::from(SEGMENTS * SEGMENT_UNITS));
-        workers.experts = true;
-    }
+    let (handle, workers, thread) = start(Workers {
+        quota: 1 << 40,
+        head_bytes: 9 * UNIT_BYTES,
+        capacity_units: Some(u64::from(SEGMENTS * SEGMENT_UNITS)),
+        experts: true,
+        ..Workers::filling(0)
+    });
     assert!(
         resize(
             &handle,
@@ -391,11 +498,62 @@ fn a_worker_without_a_cache_leaves_the_shrink_to_the_others() {
     thread.join().unwrap();
 }
 
+/// The GPU of an expert worker, which holds no cache to give back, must
+/// hold a successor's process beside the serving world's: a process of 400
+/// bytes fits twice in a quota of 1000 and the plan reports that GPU, one
+/// of 600 does not, and the shrink is refused before anything is withdrawn,
+/// naming that GPU's items.
+#[test]
+fn a_gpu_without_a_cache_must_hold_the_successor_beside_the_serving_world() {
+    let (handle, workers, thread) = start(Workers {
+        quota: 1 << 40,
+        experts: true,
+        expert_process: Some(400),
+        ..Workers::filling(0)
+    });
+    let plans = resize(&handle, CacheChange::Plan).unwrap();
+    assert_eq!(plans.len(), 2, "{plans:?}");
+    let experts: serde_json::Value = serde_json::from_str(&plans[1]).unwrap();
+    assert_eq!(
+        (&experts["host"], &experts["kv_limit"], &experts["feasible"]),
+        (
+            &serde_json::json!("node1"),
+            &serde_json::json!(200),
+            &serde_json::json!(true)
+        )
+    );
+
+    workers.lock().unwrap().expert_process = Some(600);
+    let refused = resize(
+        &handle,
+        CacheChange::Shrink {
+            preempt_after: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("host node1 GPU GPU-08080808") && refused.contains("KV cache limit -200"),
+        "{refused}"
+    );
+    assert!(
+        !workers
+            .lock()
+            .unwrap()
+            .hooks
+            .iter()
+            .any(|hook| hook.starts_with("uniserve.release_cache")),
+        "nothing is given back"
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// A shrink past its bound recomputes the requests still holding the tail:
 /// they end as migratable, and the workers give the tail back.
 #[test]
 fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
-    let (handle, workers, thread) = start(3_500);
+    let (handle, workers, thread) = start(Workers::filling(3_500));
     let mut holder = handle.submit(request(1, 20, 10_000)).unwrap();
     assert!(next_token(&mut holder, Duration::from_secs(10)).is_some());
 
@@ -426,11 +584,11 @@ fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
     thread.join().unwrap();
 }
 
-/// A growth creates as many of the segments given back as the free memory
-/// holds, and returns their units to allocation.
+/// A growth creates as many of the segments given back as the ledger's
+/// room within the quota holds, and returns their units to allocation.
 #[test]
-fn a_growth_creates_the_segments_the_free_memory_holds() {
-    let (handle, workers, thread) = start(3_500);
+fn a_growth_creates_the_segments_the_ledgers_room_holds() {
+    let (handle, workers, thread) = start(Workers::filling(3_500));
     assert!(
         resize(
             &handle,
@@ -442,8 +600,10 @@ fn a_growth_creates_the_segments_the_free_memory_holds() {
     );
     assert_eq!(workers.lock().unwrap().held, 4);
 
-    // Two and a half segments' bytes free: two segments grow back.
-    workers.lock().unwrap().free_bytes = 2_500;
+    // Another world's process of 1.5 segments' bytes leaves two and a half
+    // segments' bytes of the quota: two segments grow back, although the
+    // device has more free.
+    workers.lock().unwrap().other_world_bytes = 1_500;
     assert!(resize(&handle, CacheChange::Grow).is_ok());
     assert!(
         workers
@@ -467,13 +627,14 @@ fn a_growth_creates_the_segments_the_free_memory_holds() {
     thread.join().unwrap();
 }
 
-/// A worker holding more beside the cache than the cache past its first
-/// segment holds (7 segments of 1000 bytes) cannot get the room: the
-/// shrink fails before it withdraws anything, and requests go on with the
-/// whole cache.
+/// A successor whose process books more than the cache past its first
+/// segment holds (7 segments of 1000 bytes) does not fit: the serving
+/// world's limit of 500 bytes cannot hold its first segment. The shrink
+/// fails before it withdraws anything, naming every item of the device and
+/// its host, and requests go on with the whole cache.
 #[test]
 fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
-    let (handle, workers, thread) = start(7_500);
+    let (handle, workers, thread) = start(Workers::filling(7_500));
     let error = resize(
         &handle,
         CacheChange::Shrink {
@@ -481,7 +642,20 @@ fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
         },
     )
     .unwrap_err();
-    assert!(error.contains("cannot make room"), "{error}");
+    assert!(error.contains("does not fit"), "{error}");
+    assert!(
+        error.contains("KV cache limit 500 bytes, 1000 of which it cannot give back"),
+        "{error}"
+    );
+    assert!(
+        error.contains("successor world: 0 weights it does not map, 0 graph pool, 7500 process"),
+        "{error}"
+    );
+    assert!(
+        error.contains("ledger: process of model/model/0 of world 1: 7500 bytes"),
+        "{error}"
+    );
+    assert!(error.contains("host node0: admits"), "{error}");
     assert_eq!(
         workers.lock().unwrap().hooks,
         vec!["uniserve.cache_memory".to_owned()]
@@ -496,11 +670,100 @@ fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
     thread.join().unwrap();
 }
 
+/// A plan reports each device's memory beside a successor without
+/// withdrawing anything: the Transfer Server's context lowers the serving
+/// world's limit as every other item of the ledger does, and the shrink
+/// then keeps the segments the plan named.
+#[test]
+fn a_plan_reports_each_devices_memory_and_withdraws_nothing() {
+    let mut fill = Workers::filling(3_500);
+    fill.transfer_bytes = 1_500;
+    fill.quota += 1_500;
+    let (handle, workers, thread) = start(fill);
+    let plans = resize(&handle, CacheChange::Plan).unwrap();
+    assert_eq!(
+        workers.lock().unwrap().hooks,
+        vec!["uniserve.cache_memory".to_owned()]
+    );
+    let [plan] = plans.as_slice() else {
+        panic!("one plan per device: {plans:?}");
+    };
+    let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+    // 13000 bytes of quota, less 3500 of the serving world's process, 1500
+    // of the Transfer Server's and 3500 of the successor's process.
+    assert_eq!(plan["kv_limit"], 4_500);
+    assert_eq!(plan["transfer"], 1_500);
+    assert_eq!(plan["successor"]["process"], 3_500);
+    assert_eq!(plan["segments_kept"], 4);
+    assert_eq!(plan["feasible"], true);
+    assert_eq!(plan["host"], "node0");
+
+    assert!(
+        resize(
+            &handle,
+            CacheChange::Shrink {
+                preempt_after: None
+            }
+        )
+        .is_ok()
+    );
+    assert_eq!(workers.lock().unwrap().held, 4);
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A world on trial holds, beside the free units of its own segments, the
+/// segments it has yet to create that the ledger has room for: while the
+/// previous world's processes keep what they booked (it is parked), only
+/// its own 15 free units, too few for a request recomputing 20; once the
+/// promotion ends them (the previous world is kept as its weights), their
+/// bookings are the successor's, whose four deferred segments then fit.
+#[test]
+fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for() {
+    let (handle, workers, thread) = start(Workers::filling(3_500));
+    assert!(
+        resize(
+            &handle,
+            CacheChange::Shrink {
+                preempt_after: None
+            }
+        )
+        .is_ok()
+    );
+    // The previous world's process books the room the shrink left.
+    workers.lock().unwrap().other_world_bytes = 4 * SEGMENT_BYTES;
+    let parked = engine::ParkedCache {
+        pages: Vec::new(),
+        held_units: 20,
+        requests: 1,
+    };
+    let refused = handle
+        .promote(parked.clone(), true, false)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers")
+        .expect_err("15 free units cannot hold 21");
+    assert!(
+        refused.contains("15 free units") && refused.contains("need 21"),
+        "{refused}"
+    );
+    assert!(
+        handle
+            .promote(parked, true, true)
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the scheduler answers")
+            .is_ok()
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// A sleep recomputes the requests that run, gives the memory back, and
 /// admits nothing until the wake.
 #[test]
 fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
-    let (handle, workers, thread) = start(0);
+    let (handle, workers, thread) = start(Workers::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 
@@ -537,7 +800,7 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
 /// which they wake from after; requests are served again.
 #[test]
 fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sleep() {
-    let (handle, workers, thread) = start(0);
+    let (handle, workers, thread) = start(Workers::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 
@@ -575,7 +838,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
 /// without being handed back.
 #[test]
 fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
-    let (handle, workers, thread) = start(0);
+    let (handle, workers, thread) = start(Workers::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 
@@ -606,7 +869,7 @@ fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
 /// running and the one queued, aborted.
 #[test]
 fn a_weight_update_aborting_the_requests_in_flight_ends_them() {
-    let (handle, _workers, thread) = start(0);
+    let (handle, _workers, thread) = start(Workers::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 

@@ -463,13 +463,6 @@ impl BlockPool {
         lock(&self.inner).withdrawn
     }
 
-    /// How many units are withdrawn: those of the segments a growth or a
-    /// restore creates.
-    pub(crate) fn withdrawn_units(&self) -> usize {
-        let inner = lock(&self.inner);
-        inner.meta.len() - inner.withdrawn as usize
-    }
-
     /// Whether some units are withdrawn.
     pub(crate) fn has_withdrawn(&self) -> bool {
         let inner = lock(&self.inner);

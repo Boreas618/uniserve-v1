@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use proto::Connection;
 use proto::process::{
-    Claim, Downstream, Exit, Hello, Node, Request, Reserve, Scope, Spawn, Stop, Upstream, Welcome,
-    downstream, event, hello, reply, request, upstream,
+    Claim, Downstream, Exit, Hello, KeepWeights, LedgerQuery, Node, Request, Reserve, Scope, Spawn,
+    Stop, Upstream, Welcome, downstream, event, hello, reply, request, upstream,
 };
 
 /// Longest the leader takes to answer a request the engine sends: a claim
@@ -219,6 +219,52 @@ impl ProcessClient {
                 descriptor: reserved.descriptor,
             }),
             other => anyhow::bail!("the daemon answered a reservation with {other:?}"),
+        }
+    }
+
+    /// Has node `host`'s daemon keep the weights alone of `worlds` of
+    /// `deployment` at its Storage Server; returns how many storages it
+    /// released.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon holds no claim there or the server refuses.
+    pub(crate) fn keep_weights(
+        &mut self,
+        host: &str,
+        deployment: &str,
+        worlds: &[u64],
+    ) -> anyhow::Result<u64> {
+        match self
+            .request(request::Kind::KeepWeights(KeepWeights {
+                host: host.to_owned(),
+                deployment: deployment.to_owned(),
+                worlds: worlds.to_vec(),
+            }))
+            .with_context(|| format!("keeping the weights alone of worlds {worlds:?} on {host}"))?
+        {
+            reply::Kind::WeightsKept(kept) => Ok(kept.released),
+            other => anyhow::bail!("the daemon answered keeping weights with {other:?}"),
+        }
+    }
+
+    /// The memory ledgers node `host`'s Storage Server keeps for
+    /// `deployment`, as its daemon reads them over its claim: JSON of the
+    /// server's `Ledger` answer.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon holds no claim there or cannot reach the server.
+    pub(crate) fn ledger(&mut self, host: &str, deployment: &str) -> anyhow::Result<String> {
+        match self
+            .request(request::Kind::Ledger(LedgerQuery {
+                host: host.to_owned(),
+                deployment: deployment.to_owned(),
+            }))
+            .with_context(|| format!("reading the memory ledgers of host {host}"))?
+        {
+            reply::Kind::Ledger(report) => Ok(report.ledgers),
+            other => anyhow::bail!("the daemon answered a ledger query with {other:?}"),
         }
     }
 

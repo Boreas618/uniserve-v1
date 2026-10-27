@@ -1480,6 +1480,33 @@ impl Executor for WorkerExecutor {
         }
     }
 
+    /// Keeps the weights alone of `worlds` through the deployment's claims,
+    /// which every group shares.
+    fn keep_weights(&mut self, worlds: &[u64]) -> anyhow::Result<()> {
+        match self.workers.first() {
+            Some((_, group)) => group.claims().keep_weights(worlds),
+            None => Ok(()),
+        }
+    }
+
+    /// Reads the memory ledgers of the deployment's nodes through the
+    /// claims every group shares.
+    fn ledgers(&mut self) -> anyhow::Result<Vec<String>> {
+        let Some((_, group)) = self.workers.first() else {
+            return Ok(Vec::new());
+        };
+        group
+            .claims()
+            .ledgers()?
+            .into_iter()
+            .map(|(host, ledger)| {
+                let mut read: serde_json::Value = serde_json::from_str(&ledger)?;
+                read["host"] = serde_json::Value::String(host);
+                Ok(read.to_string())
+            })
+            .collect()
+    }
+
     /// Runs the worker hook on every group, the groups together, and
     /// returns each group's identity with its ranks' results.
     fn hook_groups(

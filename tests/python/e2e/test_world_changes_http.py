@@ -455,6 +455,46 @@ def _world_change(base_url: str, *assignments: str) -> dict:
     return result["world"]
 
 
+def _planned_memory(base_url: str, *assignments: str) -> dict:
+    """The memory plan of a dry run of `assignments`, which changes nothing:
+    for every GPU, the serving world's KV cache limit beside a successor
+    from the GPU's ledger, and every host's admission of host memory.
+    """  # noqa: D205
+    response = httpx.put(
+        f"{base_url}/admin/config",
+        json={"set": list(assignments), "dry_run": True},
+        timeout=1800,
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["result"]
+    assert result["change"] == "planned", result
+    return result["plan"]["memory"]
+
+
+def _ledgers(status: dict) -> list[dict]:
+    """Every GPU's memory ledger ``GET /admin/config`` reports, each of
+    whose entries' bytes sum to no more than its quota.
+    """  # noqa: D205
+    nodes = status["ledgers"]
+    assert isinstance(nodes, list) and nodes, status
+    ledgers = [ledger for node in nodes for ledger in node["ledgers"]]
+    assert ledgers, status
+    for ledger in ledgers:
+        used = sum(entry["bytes"] for entry in ledger["entries"])
+        assert ledger["quota"] is not None and used <= ledger["quota"], ledger
+    return ledgers
+
+
+def _worlds_of(ledgers: list[dict], item: str) -> set[tuple[int, ...]]:
+    """The sets of worlds holding the ledgers' entries of `item`."""
+    return {
+        tuple(entry["worlds"])
+        for ledger in ledgers
+        for entry in ledger["entries"]
+        if entry["item"] == item
+    }
+
+
 @pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
 def test_a_world_change_continues_a_streaming_request_and_commits(
     tmp_path: Path, topology: str
@@ -466,13 +506,33 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         (serving,) = [slot for slot in before["slots"] if slot]
         assert serving["state"] == "executing", before
         engines_before = _pids(log, "Engine")
+        # Every GPU's ledger books the serving world alone, within its
+        # quota: its weights, KV cache segments, graph pool and process.
+        ledgers = _ledgers(before)
+        for item in ("weights", "cache_segment", "graph_pool", "process"):
+            assert _worlds_of(ledgers, item) == {(serving["world"],)}, ledgers
 
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
+        # A dry run plans the change on every GPU's ledger and changes
+        # nothing: the successor fits beside the serving world.
+        memory = _planned_memory(base_url, CHANGE)
+        assert memory["feasible"] is True, memory
+        assert memory["gpus"] and memory["hosts"], memory
+        for gpu in memory["gpus"]:
+            assert gpu["kv_limit"] >= gpu["kv_floor"] > 0, gpu
+            assert gpu["successor"]["graph_pool"] > 0, gpu
+            print(
+                f"GPU {gpu['gpu']}: quota {gpu['quota']}, serving KV cache "
+                f"{gpu['serving_kv_cache']}, limit beside the successor "
+                f"{gpu['kv_limit']}, {gpu['segments_kept']} of "
+                f"{gpu['segments_held']} segments kept"
+            )
         report = _world_change(base_url, CHANGE)
         streaming.mark()
         world = report["world"]
         assert report["previous_world"] == serving["world"], report
+        assert report["memory"]["feasible"] is True, report
         print(
             f"promotion pause: {report['pause_seconds']:.3f} s "
             f"(park {report['park_seconds']:.3f} s, "
@@ -480,13 +540,20 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         )
 
         # The successor serves on trial beside the parked previous world, and
-        # the trial refuses another change.
+        # the trial refuses another change. Both worlds share each GPU's
+        # quota: the weights and the segments the successor maps are booked
+        # once, held by both, beside each world's graph pool and process.
         status = _config(base_url)
         assert status["trial"]["world"] == world, status
         assert status["slots"] == [
             {"world": world, "state": "executing"},
             {"world": serving["world"], "state": "parked"},
         ], status
+        ledgers = _ledgers(status)
+        both = (serving["world"], world)
+        assert _worlds_of(ledgers, "weights") == {both}, ledgers
+        assert both in _worlds_of(ledgers, "cache_segment"), ledgers
+        assert _worlds_of(ledgers, "process") == {(serving["world"],), (world,)}
         refused = _apply(base_url, "max_running_requests=4")
         assert refused.status_code == 409, refused.text
 
@@ -504,6 +571,19 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         ], status
         graphs = tomllib.loads(status["config"])["cuda_graph_config"]
         assert graphs["decode_batch_sizes"] == [1, 2, 4, 8, 16], graphs
+        # The commit released everything only the previous world held: the
+        # segments the successor mapped are its own on the ledger now. The
+        # previous world's workers end their bookings as their processes
+        # exit, a moment after its engine's.
+        items = ("weights", "cache_segment", "graph_pool", "process")
+        _wait_until(
+            lambda: all(
+                _worlds_of(_ledgers(_config(base_url)), item) == {(world,)}
+                for item in items
+            ),
+            30,
+            "the ledgers did not book the committed world alone",
+        )
         streaming.join()
         reference, reference_usage = _ask(base_url, name)
 
@@ -559,6 +639,23 @@ def test_an_operator_rollback_resumes_the_previous_world(
                 lambda: not _runs(engine_before),
                 120,
                 "the previous world's engine did not exit",
+            )
+
+            # The previous world keeps its weights alone: each GPU's ledger
+            # books nothing else of it once its workers exited, the
+            # segments the successor maps being the successor's.
+            def kept() -> set[str]:
+                return {
+                    entry["item"]
+                    for ledger in _ledgers(_config(base_url))
+                    for entry in ledger["entries"]
+                    if serving["world"] in entry["worlds"]
+                }
+
+            _wait_until(
+                lambda: kept() == {"weights"},
+                60,
+                "the previous world kept more than its weights",
             )
 
         rolled = _admin(

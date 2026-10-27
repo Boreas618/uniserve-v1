@@ -440,12 +440,8 @@ impl Executor for SimExecutor {
     fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
         let result = match name {
             "uniserve.cache_memory" => serde_json::json!({
-                "segments": 0,
-                "segment_units": 0,
-                "segment_bytes": 0,
-                "released_from": 0,
-                "free_bytes": 0,
-                "process_bytes": 0,
+                "segments": [],
+                "held": 0,
             }),
             "uniserve.release_cache"
             | "uniserve.restore_cache"

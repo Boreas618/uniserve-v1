@@ -439,10 +439,11 @@ struct ConfigBody {
 }
 
 /// `GET /admin/config`: the configuration, its digest, the two slots'
-/// worlds, the change in progress, the trial and the configurations a
-/// rollback marked unavailable (`Leader::config_status`).
+/// worlds, the change in progress, the trial, the configurations a
+/// rollback marked unavailable and every item of the GPUs' memory ledgers
+/// (`Leader::config_status`).
 async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
-    Json(state.leader.config_status())
+    Json(state.leader.config_status().await)
 }
 
 /// `PUT /admin/config`: changes the deployment to a configuration

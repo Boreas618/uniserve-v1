@@ -126,6 +126,20 @@ impl Scheduler {
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(retired);
             }
+            Command::KeepWeights { worlds, answer } => {
+                let kept = self
+                    .executor
+                    .keep_weights(&worlds)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = answer.send(kept);
+            }
+            Command::Ledgers(answer) => {
+                let read = self
+                    .executor
+                    .ledgers()
+                    .map_err(|error| format!("{error:#}"));
+                let _ = answer.send(read);
+            }
             Command::DescribeCache(answer) => {
                 let _ = answer.send(self.describe_cache());
             }
