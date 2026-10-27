@@ -13,6 +13,7 @@ The authorized objective governs all work. Measure progress by delivered behavio
 - Treat metrics, thresholds, and validation results as evidence about the objective. Investigate material failures and distinguish measurement artifacts, variation, and causal defects without changing acceptance criteria. An anomalous observation alone does not establish an external blocker.
 - Separate observed facts, measurements, metric-derived conclusions, supported causes, hypotheses, and unproven profiling targets. Never report a plausible explanation as a demonstrated root cause.
 - Continue authorized work until the intended outcome is complete or a genuine external impasse remains. Effort, activity, and procedural completeness do not substitute for delivery.
+- Execution has failed severely, and unacceptably, when much of the time goes to testing, when any work is repeated, or when GPUs sit idle while work remains. Spend time on delivery, keep every available GPU busy with independent work, and never redo work whose result still stands.
 
 ## Common Development Workflow
 
