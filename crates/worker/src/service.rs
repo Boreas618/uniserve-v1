@@ -9,7 +9,7 @@
 //! belongs to, and the channel goes on being served.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -861,12 +861,25 @@ impl Service<'_> {
                     .and_then(|storage| storage.prefix_cache.as_ref())
                     .is_some_and(crate::memory::PrefixCache::copies_pages);
                 let plan = planes.as_ref().map(|planes| Arc::clone(planes.plan()));
-                match (self.maintenance.weights.as_mut(), retained.as_deref()) {
+                // The requests in flight keep their KV cache through the
+                // update: the checkpoint loads beside the cache, in the
+                // graph memory as well when the free memory alone does not
+                // hold it.
+                let suspended = payload["keep"].as_bool().unwrap_or(false)
+                    && !self.maintenance.asleep
+                    && self.make_room_for_weights()?;
+                let updated = match (self.maintenance.weights.as_mut(), retained.as_deref()) {
                     (Some(weights), Some(retained)) => {
-                        weights.apply(path, retained, plan.as_deref(), copies_pages)?
+                        weights.apply(path, retained, plan.as_deref(), copies_pages)
                     }
-                    _ => serde_json::json!({ "group": null, "page_contents": [] }),
+                    _ => Ok(serde_json::json!({ "group": null, "page_contents": [] })),
+                };
+                if suspended {
+                    for pool in &self.maintenance.pools {
+                        pool.restore()?;
+                    }
                 }
+                updated?
             }
             "uniserve.attach_cupti" => {
                 self.maintenance.cupti.attach()?;
@@ -883,6 +896,58 @@ impl Service<'_> {
             }
         };
         Ok(result.to_string())
+    }
+}
+
+impl Service<'_> {
+    /// Makes the device memory beside the KV cache hold a checkpoint of the
+    /// rank's weights, which an update keeping the requests in flight loads
+    /// into new memory before it copies each tensor into place: the graph
+    /// memory is given back when the free memory alone does not hold it.
+    /// Returns whether it was given back, for the caller to restore once the
+    /// update ends.
+    ///
+    /// # Errors
+    ///
+    /// Refuses, with the graph memory restored, when even the free memory
+    /// and the graph memory together do not hold the checkpoint.
+    fn make_room_for_weights(&mut self) -> crate::Result<bool> {
+        let Some(weights) = self.maintenance.weights.as_ref() else {
+            return Ok(false);
+        };
+        let mut needed: BTreeMap<cuda::DeviceId, u64> = BTreeMap::new();
+        for storage in &weights.storages {
+            if let crate::ffi::MemoryKind::Cuda(device) = crate::ffi::Backing::device(&**storage) {
+                *needed.entry(device).or_default() += crate::ffi::Backing::bytes(&**storage) as u64;
+            }
+        }
+        let short = |needed: &BTreeMap<cuda::DeviceId, u64>| -> crate::Result<Option<(cuda::DeviceId, u64, u64)>> {
+            for (&device, &bytes) in needed {
+                let free = device.memory_info()?.free;
+                if free < bytes {
+                    return Ok(Some((device, bytes, free)));
+                }
+            }
+            Ok(None)
+        };
+        if short(&needed)?.is_none() {
+            return Ok(false);
+        }
+        for pool in &self.maintenance.pools {
+            pool.suspend()?;
+        }
+        if let Some((device, bytes, free)) = short(&needed)? {
+            for pool in &self.maintenance.pools {
+                pool.restore()?;
+            }
+            return Err(Error::Unsupported(format!(
+                "keeping the requests in flight through the weight update loads the checkpoint's \
+                 {bytes} bytes on {device} beside their KV cache, where {free} bytes are free with \
+                 the graph memory given back: update with the requests in flight recomputed or \
+                 aborted instead"
+            )));
+        }
+        Ok(true)
     }
 }
 

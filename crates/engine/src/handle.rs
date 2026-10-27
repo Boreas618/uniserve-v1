@@ -540,14 +540,29 @@ pub enum Command {
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Rewrites the weights in place from the checkpoint at `model_path`
-    /// (`Scheduler::update_weights`), and answers with what each worker
-    /// reported.
+    /// (`Scheduler::update_weights`), the requests in flight continuing as
+    /// `in_flight` says, and answers with what each worker reported.
     UpdateWeights {
         model_path: String,
+        in_flight: WeightsInFlight,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Requests orderly engine shutdown.
     Shutdown,
+}
+
+/// How the requests in flight continue through an in-place weight update
+/// (vLLM's `keep`, `abort` and SGLang's `in_place`, `retract`, `abort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeightsInFlight {
+    /// Each continues on the new weights with the KV cache it reached; the
+    /// pages it writes afterwards reach no shared tier.
+    #[default]
+    Keep,
+    /// Each computes its state again with the new weights.
+    Recompute,
+    /// Each ends, aborted, as do the requests the scheduler queued.
+    Abort,
 }
 
 /// A change to the device memory of a scheduler's KV cache.
@@ -819,16 +834,21 @@ impl CommandSender {
         receiver
     }
 
-    /// Rewrites the weights in place from the checkpoint at `model_path`
+    /// Rewrites the weights in place from the checkpoint at `model_path`,
+    /// the requests in flight continuing as `in_flight` says
     /// (`Command::UpdateWeights`); the receiver gets what each worker
     /// reported, or why the update failed.
     pub fn update_weights(
         &self,
         model_path: String,
+        in_flight: WeightsInFlight,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, receiver) = crossbeam_channel::bounded(1);
-        if let Err(error) = self.send(Command::UpdateWeights { model_path, answer })
-            && let Command::UpdateWeights { answer, .. } = error.0
+        if let Err(error) = self.send(Command::UpdateWeights {
+            model_path,
+            in_flight,
+            answer,
+        }) && let Command::UpdateWeights { answer, .. } = error.0
         {
             let _ = answer.send(Err("the scheduler stopped".to_owned()));
         }

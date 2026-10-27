@@ -833,6 +833,22 @@ pub struct LeaderStatus {
     pub executable: Option<String>,
 }
 
+/// How the requests in flight continue through an in-place weight update
+/// (`POST /admin/update_weights`; vLLM's `keep` and `abort`, SGLang's
+/// `in_place`, `retract` and `abort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeightsInFlight {
+    /// Each continues on the new weights with the KV cache it reached; the
+    /// pages it writes afterwards reach no shared tier.
+    #[default]
+    Keep,
+    /// Each computes its state again with the new weights.
+    Recompute,
+    /// Each ends, aborted.
+    Abort,
+}
+
 /// Why a change of the deployment did not happen or did not complete.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -1177,9 +1193,11 @@ impl Leader {
     /// `model_path`, another checkpoint of the served model, as SGLang's
     /// `update_weights_from_disk` does, or from a plugin's weight source
     /// (`scheme://...`) that streams the served checkpoint's tensors, and
-    /// returns what each worker reported. New requests wait; the token requests in flight are
-    /// recomputed with the new weights, and the others finish first. A
-    /// relaunch or an update after loads the new checkpoint.
+    /// returns what each worker reported. New requests wait; the requests
+    /// in flight continue as `in_flight` says (`engine::WeightsInFlight`):
+    /// on the new weights with the KV cache they reached, recomputed with
+    /// the new weights once the others finish, or aborted. A relaunch or an
+    /// update after loads the new checkpoint.
     ///
     /// # Errors
     ///
@@ -1187,7 +1205,11 @@ impl Leader {
     /// differently (another tokenizer, chat template, generation defaults
     /// or model facts); fails when no engine serves, or with the reason a
     /// worker did not update, after which the weights are those of before.
-    pub async fn update_weights(&self, model_path: &str) -> Result<Vec<String>, UpdateError> {
+    pub async fn update_weights(
+        &self,
+        model_path: &str,
+        in_flight: WeightsInFlight,
+    ) -> Result<Vec<String>, UpdateError> {
         let _replacing = self.engines.replacing.lock().await;
         let hold = self.migrator.hold();
         let client = hold.client().ok_or(UpdateError::NoEngine)?;
@@ -1221,7 +1243,7 @@ impl Leader {
 
         let paused = !hold.pause();
         let started = Instant::now();
-        let results = client.update_weights(model_path).await;
+        let results = client.update_weights(model_path, in_flight).await;
         if paused {
             hold.resume();
         }
@@ -1240,6 +1262,7 @@ impl Leader {
         info!(
             model = model_path,
             elapsed_ms = started.elapsed().as_millis() as u64,
+            ?in_flight,
             "the engine updated its weights in place"
         );
         Ok(results)

@@ -601,6 +601,10 @@ struct UpdateWeightsBody {
     /// Another checkpoint of the served model: a local directory or a
     /// Hugging Face repository.
     model_path: String,
+    /// How the requests in flight continue: `keep` (the default), `recompute`
+    /// or `abort`.
+    #[serde(default)]
+    in_flight: crate::leader::WeightsInFlight,
 }
 
 /// `POST /admin/update_weights`: the engine rewrites its weights in place
@@ -614,10 +618,21 @@ async fn update_weights(State(state): State<AdminState>, body: axum::body::Bytes
     let leader = Arc::clone(&state.leader);
     run(&state.admin, "update_weights", true, async move {
         leader
-            .update_weights(&body.model_path)
+            .update_weights(&body.model_path, body.in_flight)
             .await
-            .map(|results| json!({ "model_path": body.model_path, "results": json_results(&results) }))
-            .map_err(|error| (update_status(&error), format!("{:#}", anyhow::Error::from(error))))
+            .map(|results| {
+                json!({
+                    "model_path": body.model_path,
+                    "in_flight": body.in_flight,
+                    "results": json_results(&results),
+                })
+            })
+            .map_err(|error| {
+                (
+                    update_status(&error),
+                    format!("{:#}", anyhow::Error::from(error)),
+                )
+            })
     })
     .await
 }

@@ -157,13 +157,23 @@ impl Scheduler {
         }
     }
 
-    /// Rewrites the weights in place from the checkpoint at `model_path`
-    /// once no request runs, and answers with what each worker reported:
-    /// the requests running are recomputed and the others wait, as for a
-    /// sleep.
+    /// Rewrites the weights in place from the checkpoint at `model_path`,
+    /// and answers with what each worker reported. The requests in flight
+    /// continue as `in_flight` says:
+    ///
+    /// - `Keep`: once the batches in flight complete, the workers rewrite
+    ///   the weights beside the KV cache, and every request in flight
+    ///   continues on the new weights with the cache it reached. The state
+    ///   it computes afterwards follows neither the old weights nor the new
+    ///   ones, so it publishes no page from then on.
+    /// - `Recompute`: the requests running are recomputed and the others
+    ///   wait; the workers sleep while they rewrite, as for a sleep.
+    /// - `Abort`: every request the scheduler holds ends, aborted, before
+    ///   the workers sleep and rewrite.
     pub(super) fn update_weights(
         &mut self,
         model_path: String,
+        in_flight: crate::WeightsInFlight,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     ) {
         if self.resizing.is_some() {
@@ -173,6 +183,14 @@ impl Scheduler {
         if self.asleep {
             let _ = answer.send(self.apply_weights(&model_path));
             return;
+        }
+        match in_flight {
+            crate::WeightsInFlight::Keep => {
+                let _ = answer.send(self.apply_weights_keeping(&model_path));
+                return;
+            }
+            crate::WeightsInFlight::Abort => self.abort_held_requests(),
+            crate::WeightsInFlight::Recompute => {}
         }
         self.withdraw_from(0, true);
         self.resizing = Some(PendingResize {
@@ -287,6 +305,52 @@ impl Scheduler {
         self.reseed_pages(&results)?;
         tracing::info!(path, pages, "updated the weights in place");
         Ok(results)
+    }
+
+    /// Rewrites the weights from the checkpoint at `path` while the requests
+    /// in flight hold their KV cache (`WeightsInFlight::Keep`): the workers
+    /// load the checkpoint beside the cache once the batches in flight
+    /// complete. Every request in flight then publishes no page, and every
+    /// cached prefix page is revoked, as the new weights key pages anew.
+    fn apply_weights_keeping(&mut self, path: &str) -> Result<Vec<String>, String> {
+        let payload = serde_json::json!({ "model_path": path, "keep": true }).to_string();
+        let results = self.run_hook("uniserve.update_weights", &payload)?;
+        let mut kept = 0;
+        for state in self.running.values_mut() {
+            if state.req.cache.write {
+                state.req.cache.write = false;
+                kept += 1;
+            }
+        }
+        let pages = self.storage.flush_prefix_cache();
+        self.reseed_pages(&results)?;
+        tracing::info!(
+            path,
+            pages,
+            kept,
+            "updated the weights in place; the requests in flight keep their KV cache"
+        );
+        Ok(results)
+    }
+
+    /// Ends every request the scheduler holds, aborted: those queued, and
+    /// those running once their batches in flight drain.
+    fn abort_held_requests(&mut self) {
+        let mut held: Vec<RequestId> = self.running.keys().copied().collect();
+        held.extend(self.waiting.iter().map(|state| state.req.request_id));
+        held.extend(self.media_ids());
+        held.extend(
+            self.waiting_media
+                .iter()
+                .map(|submission| submission.request.request_id),
+        );
+        tracing::info!(
+            requests = held.len(),
+            "aborting the requests in flight for a weight update"
+        );
+        for id in held {
+            self.mark_cancelled(id, true);
+        }
     }
 
     /// Roots the prefix hash chains at the identity the weight update
