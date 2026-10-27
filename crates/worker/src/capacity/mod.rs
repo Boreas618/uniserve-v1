@@ -144,6 +144,9 @@ pub(crate) fn request_tensor_window(depth: usize, slots: usize) -> Result<usize>
 /// Storage and concurrency bounds consumed by the worker's physical owners.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArenaCapacity {
+    /// Relay entries of every request slot: the most calls of one request
+    /// whose scalar products the rank holds at once.
+    pub relay_depth: usize,
     /// Device bytes the product store's relay arenas may take. The store's
     /// other products lie in the scheduler-placed buffer pool, which bounds
     /// them.
@@ -212,10 +215,12 @@ pub(crate) struct RequestBounds {
 
 impl ArenaCapacity {
     /// The arena of a token worker: relay entries for every unresolved call of
-    /// every request slot, and one transfer ticket and one host-pool task per
-    /// queued call (`depth` batches of up to `calls` calls are in flight at
-    /// once, and a call holds at most one of each), each ticket budgeted for
-    /// the largest single read.
+    /// every request slot and the one before them, whose completion the
+    /// oldest of them still reads on the device as its predicate, and one
+    /// transfer ticket and one host-pool task per queued call (`depth`
+    /// batches of up to `calls` calls are in flight at once, and a call holds
+    /// at most one of each), each ticket budgeted for the largest single
+    /// read.
     pub(crate) fn for_tokens(bounds: &TokenBounds) -> Result<Self> {
         let TokenBounds {
             depth,
@@ -226,9 +231,11 @@ impl ArenaCapacity {
         } = *bounds;
         let window = call_window(depth, calls)?;
         let transfer_tickets = depth * calls;
-        let device_product_bytes = relay_bytes(requests, window);
+        let relay_depth = window + 1;
+        let device_product_bytes = relay_bytes(requests, relay_depth);
 
         Ok(Self {
+            relay_depth,
             device_product_bytes,
             transfer_bytes: transfer_bytes_per_read.max(1) * transfer_tickets as u64,
             transfer_tickets,
@@ -246,6 +253,14 @@ impl ArenaCapacity {
     /// slot, whichever is more, and at least one per rank of the
     /// deployment, since assembly reads from every producing rank,
     /// including stateless ranks.
+    ///
+    /// The engine queues a request's latent preparation and denoising steps
+    /// without waiting for their resolution, each predicated on the
+    /// completion of the one before it, so one request may hold a call in
+    /// every batch in flight on the rank (`depth`, one call of a request per
+    /// media batch). Every slot therefore has a relay entry per batch in
+    /// flight, and one more for the completion the oldest of those calls
+    /// still reads on the device.
     pub(crate) fn for_requests(bounds: &RequestBounds) -> Result<Self> {
         let RequestBounds {
             depth,
@@ -258,9 +273,11 @@ impl ArenaCapacity {
         } = *bounds;
         let window = request_tensor_window(depth, requests)?;
         let slots = (depth * calls).max(requests * concurrent_imports);
-        let device_product_bytes = relay_bytes(requests, window);
+        let relay_depth = depth + 1;
+        let device_product_bytes = relay_bytes(requests, relay_depth);
 
         Ok(Self {
+            relay_depth,
             device_product_bytes,
             transfer_bytes: (requests as u64 * product_bytes_per_request).max(1),
             transfer_tickets: ranks.max(slots),
@@ -280,10 +297,10 @@ impl ArenaCapacity {
     }
 }
 
-/// Bytes of the product store's relay arenas: one entry per unresolved call and
-/// one retirement entry, for every request slot and the padding slot zero. An
-/// entry holds one element of every scalar a call relays
-/// (`Call::RELAY_DTYPES`), in arenas allocated per dtype and field.
-fn relay_bytes(requests: usize, window: usize) -> u64 {
-    ((requests + 1) * (window + 1)) as u64 * Call::relay_row_bytes()
+/// Bytes of the product store's relay arenas: `depth` entries for every
+/// request slot and the padding slot zero. An entry holds one element of
+/// every scalar a call relays (`Call::RELAY_DTYPES`), in arenas allocated per
+/// dtype and field.
+fn relay_bytes(requests: usize, depth: usize) -> u64 {
+    ((requests + 1) * depth) as u64 * Call::relay_row_bytes()
 }

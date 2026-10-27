@@ -776,6 +776,9 @@ pub(crate) mod tests {
         // Twelve positions over three slots keep three unresolved outputs.
         assert_eq!(plan.info.max_unresolved_calls, 3);
         assert_eq!(plan.info.buffer_pool_bytes, 3 * 4096);
+        // One request may hold a call in each of the twelve batches in
+        // flight, each reading the completion of the one before it.
+        assert_eq!(plan.arena.relay_depth, 13);
     }
 
     #[test]
