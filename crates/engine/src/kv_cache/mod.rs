@@ -912,7 +912,8 @@ impl CacheAllocation {
 pub(crate) struct PrefixLookup {
     /// Chained hash of every complete prompt page, indexed by group and then
     /// by logical page. The scheduler keeps these to publish the prompt
-    /// through [`PrefixCacheCoordinator::publish_prompt`] as prefill completes.
+    /// through [`PrefixCacheCoordinator::publish_computed`] as prefill
+    /// completes, and extends them over the tokens the request generates.
     /// Empty when prefix caching does not apply to the request.
     pub(crate) page_hashes: Vec<Vec<u64>>,
     /// Leading prompt tokens acquired from the prefix cache; a multiple of
@@ -1166,21 +1167,33 @@ impl PrefixCacheCoordinator {
     /// zero leaves the seed unchanged and therefore shares pages with
     /// requests that carry no key.
     fn prefix_hashes(&self, prompt: &[u32], isolation_key: Option<u64>) -> Vec<Vec<u64>> {
+        let mut hashes = vec![Vec::new(); self.groups.len()];
+        self.extend_hashes(&mut hashes, CachedTokens::prompt(prompt), isolation_key);
+        hashes
+    }
+
+    /// Extends each group's hash chain in `hashes` over the complete pages of
+    /// `tokens` it does not cover yet, as [`Self::prefix_hashes`] chains a
+    /// prompt's pages: a chain over a request's prompt extended over the
+    /// tokens it generated equals the chain over the prompt of its
+    /// migration, whose prompt continues with those tokens. `hashes` holds
+    /// one chain per group, each a prefix of the chain over `tokens`.
+    pub(crate) fn extend_hashes(
+        &self,
+        hashes: &mut [Vec<u64>],
+        tokens: CachedTokens<'_>,
+        isolation_key: Option<u64>,
+    ) {
         let seed = isolation_key.map_or(self.hash_seed, |key| self.hash_seed ^ key.rotate_left(17));
-        self.groups
-            .iter()
-            .enumerate()
-            .map(|(group, shape)| {
-                let mut parent = seed;
-                prompt
-                    .chunks_exact(shape.block_size)
-                    .map(|tokens| {
-                        parent = block_hash(parent, group as u32, TEXT_MODALITY_TAG, tokens);
-                        parent
-                    })
-                    .collect()
-            })
-            .collect()
+        for (group, (shape, chain)) in self.groups.iter().zip(hashes.iter_mut()).enumerate() {
+            let complete = tokens.len() / shape.block_size;
+            let mut parent = chain.last().copied().unwrap_or(seed);
+            for page in chain.len()..complete {
+                let span = tokens.page(page, shape.block_size);
+                parent = block_hash(parent, group as u32, TEXT_MODALITY_TAG, &span);
+                chain.push(parent);
+            }
+        }
     }
 
     /// Finds the longest prompt prefix every group can reuse from the
@@ -1380,15 +1393,17 @@ impl PrefixCacheCoordinator {
         Some(result)
     }
 
-    /// Publishes complete computed prompt pages of every group into the
-    /// prefix cache.
+    /// Publishes the complete computed pages of every group into the prefix
+    /// cache: the prompt's, and those of the tokens the request generated
+    /// after it, whose pages a migration of the request finds as its prompt's.
     ///
-    /// `hashes` is the `PrefixLookup::page_hashes` from
-    /// [`PrefixCacheCoordinator::acquire_prefix`], and `published` records per
-    /// group how many leading pages were already published; both advance
-    /// together. A page is published once the worker has computed all of its
-    /// prompt tokens (`computed_tokens`) and while the table still holds it,
-    /// so a caller that publishes after every prefill chunk, before releasing
+    /// `hashes` chains every complete page of `tokens` (the prompt's from
+    /// [`PrefixCacheCoordinator::acquire_prefix`], the generated tokens'
+    /// through [`PrefixCacheCoordinator::extend_hashes`]), and `published`
+    /// records per group how many leading pages were already published; both
+    /// advance together. A page is published once the worker has computed
+    /// all of its tokens (`computed_tokens`) and while the table still holds
+    /// it, so a caller that publishes after every forward, before releasing
     /// any window page, publishes every page of a sliding-window group before
     /// it leaves the window. Returns `true` without publishing when prefix
     /// caching is disabled, `cache_write` is false, or `hashes` is empty (a
@@ -1396,13 +1411,13 @@ impl PrefixCacheCoordinator {
     /// hashes do not match the groups.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one prompt's computed blocks, publication policy and source worker"
+        reason = "one request's computed blocks, publication policy and source worker"
     )]
-    pub(crate) fn publish_prompt(
+    pub(crate) fn publish_computed(
         &self,
         pool: &BlockPool,
         allocation: &CacheAllocation,
-        prompt: &[u32],
+        tokens: CachedTokens<'_>,
         hashes: &[Vec<u64>],
         computed_tokens: usize,
         published: &mut Vec<usize>,
@@ -1417,21 +1432,87 @@ impl PrefixCacheCoordinator {
         }
         published.resize(self.groups.len(), 0);
 
-        let computed = computed_tokens.min(prompt.len());
+        let computed = computed_tokens.min(tokens.len());
         for (group, (table, group_hashes)) in allocation.tables.iter().zip(hashes).enumerate() {
             let block_size = table.shape.block_size;
             let complete = (computed / block_size).min(group_hashes.len());
-            for page in published[group]..complete {
+            for (page, hash) in group_hashes
+                .iter()
+                .enumerate()
+                .take(complete)
+                .skip(published[group])
+            {
                 // Retired pages cannot be inserted into the prefix cache.
                 let Some(reference) = table.page(page) else {
                     continue;
                 };
-                let tokens = &prompt[page * block_size..(page + 1) * block_size];
-                pool.publish(reference, group as u32, group_hashes[page], tokens, source);
+                let span = tokens.page(page, block_size);
+                pool.publish(reference, group as u32, *hash, &span, source);
             }
             published[group] = published[group].max(complete);
         }
         true
+    }
+}
+
+/// The tokens whose cache a request's tables hold, in order: its prompt,
+/// then the tokens it generated since it was admitted, whose cache each
+/// decode writes as it reads them. A migrated request's prompt already ends
+/// with the tokens it generated before.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CachedTokens<'a> {
+    prompt: &'a [u32],
+    generated: &'a [u32],
+}
+
+impl<'a> CachedTokens<'a> {
+    /// A prompt alone.
+    pub(crate) fn prompt(prompt: &'a [u32]) -> Self {
+        Self {
+            prompt,
+            generated: &[],
+        }
+    }
+
+    /// A prompt followed by the tokens generated after it.
+    pub(crate) fn new(prompt: &'a [u32], generated: &'a [u32]) -> Self {
+        Self { prompt, generated }
+    }
+
+    /// The tokens held.
+    pub(crate) fn len(&self) -> usize {
+        self.prompt.len() + self.generated.len()
+    }
+
+    /// The prompt's tokens, which lead.
+    pub(crate) fn prompt_len(&self) -> usize {
+        self.prompt.len()
+    }
+
+    /// The tokens of page `page` of `block_size` tokens, which must be
+    /// complete; borrowed unless the page spans the prompt's end.
+    pub(crate) fn page(&self, page: usize, block_size: usize) -> std::borrow::Cow<'a, [u32]> {
+        self.span(page * block_size..(page + 1) * block_size)
+    }
+
+    /// The tokens of `range`, which must lie within [`Self::len`]; borrowed
+    /// unless the range spans the prompt's end.
+    pub(crate) fn span(&self, range: std::ops::Range<usize>) -> std::borrow::Cow<'a, [u32]> {
+        let split = self.prompt.len();
+        if range.end <= split {
+            std::borrow::Cow::Borrowed(&self.prompt[range])
+        } else if range.start >= split {
+            std::borrow::Cow::Borrowed(&self.generated[range.start - split..range.end - split])
+        } else {
+            let mut tokens = self.prompt[range.start..].to_vec();
+            tokens.extend_from_slice(&self.generated[..range.end - split]);
+            std::borrow::Cow::Owned(tokens)
+        }
+    }
+
+    /// The tokens of `range`, or `None` when it reaches past [`Self::len`].
+    pub(crate) fn get(&self, range: std::ops::Range<usize>) -> Option<std::borrow::Cow<'a, [u32]>> {
+        (range.start <= range.end && range.end <= self.len()).then(|| self.span(range))
     }
 }
 
@@ -1474,10 +1555,10 @@ mod tests {
             .ensure_capacity(pool, &mut allocation, 0, prompt.len())
             .unwrap();
         let mut published = Vec::new();
-        assert!(coordinator.publish_prompt(
+        assert!(coordinator.publish_computed(
             pool,
             &allocation,
-            prompt,
+            CachedTokens::prompt(prompt),
             &lookup.page_hashes,
             prompt.len(),
             &mut published,
@@ -1514,6 +1595,78 @@ mod tests {
                 reference
             })
             .collect()
+    }
+
+    /// A chain extended over the tokens a request generated equals the
+    /// chain over its migration's prompt, which continues with them, so the
+    /// migration finds every page the request generated.
+    #[test]
+    fn a_chain_extended_over_generated_tokens_is_its_migrations_chain() {
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(2, 1, 8)]);
+        let prompt: Vec<u32> = (10..19).collect();
+        let generated: Vec<u32> = (100..107).collect();
+        let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
+
+        let mut hashes = coordinator.prefix_hashes(&prompt, Some(7));
+        coordinator.extend_hashes(&mut hashes, CachedTokens::new(&prompt, &generated), Some(7));
+        assert_eq!(hashes, coordinator.prefix_hashes(&migrated, Some(7)));
+        assert_eq!(hashes[0].len(), 4);
+        assert_eq!(hashes[1].len(), 8);
+
+        // Another isolation key chains other pages.
+        assert_ne!(hashes, coordinator.prefix_hashes(&migrated, Some(8)));
+    }
+
+    /// A page that spans the prompt's end reads both halves, in order.
+    #[test]
+    fn cached_tokens_read_pages_across_the_prompts_end() {
+        let prompt = [1, 2, 3];
+        let generated = [4, 5, 6, 7];
+        let tokens = CachedTokens::new(&prompt, &generated);
+        assert_eq!(tokens.len(), 7);
+        assert_eq!(tokens.prompt_len(), 3);
+        assert_eq!(&*tokens.page(0, 2), &[1, 2]);
+        assert_eq!(&*tokens.page(1, 2), &[3, 4]);
+        assert_eq!(&*tokens.page(2, 2), &[5, 6]);
+        assert!(tokens.get(6..8).is_none());
+        assert_eq!(tokens.get(6..7).as_deref(), Some(&[7][..]));
+    }
+
+    /// Pages of generated tokens publish once computed, and a lookup of the
+    /// migration's prompt reuses them.
+    #[test]
+    fn published_generated_pages_serve_the_migrations_prompt() {
+        let pool = BlockPool::new(16, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let prompt: Vec<u32> = (10..18).collect();
+        let generated: Vec<u32> = (100..110).collect();
+        let tokens = CachedTokens::new(&prompt, &generated);
+
+        let mut allocation = coordinator.empty();
+        let mut lookup = coordinator
+            .acquire_prefix(&pool, &mut allocation, &prompt, false, false, None, &source)
+            .unwrap();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 0, tokens.len())
+            .unwrap();
+        coordinator.extend_hashes(&mut lookup.page_hashes, tokens, None);
+        let mut published = Vec::new();
+        assert!(coordinator.publish_computed(
+            &pool,
+            &allocation,
+            tokens,
+            &lookup.page_hashes,
+            tokens.len(),
+            &mut published,
+            true,
+            &source,
+        ));
+        assert_eq!(published, vec![4]);
+
+        let migrated: Vec<u32> = prompt.iter().chain(&generated).copied().collect();
+        let hit = coordinator.probe_prefix(&pool, &migrated, true, false, None, &source);
+        assert_eq!(hit.cached_tokens, 16);
     }
 
     #[test]

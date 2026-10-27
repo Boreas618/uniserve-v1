@@ -16,7 +16,7 @@ use super::*;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::kv_cache::manager::AttentionManager;
-use crate::kv_cache::{KvOffloadManager, OffloadKind, PageRef};
+use crate::kv_cache::{CachedTokens, KvOffloadManager, OffloadKind, PageRef};
 
 /// How one understanding token ends or continues its request
 /// (`Scheduler::und_token_outcome`).
@@ -1617,17 +1617,23 @@ impl Scheduler {
     /// Applies a completed forward's accepted cache extent to the request's
     /// cache tables.
     ///
-    /// First publishes the prompt pages the request has now computed, keyed
-    /// by the loaded prefill worker that holds them, so every page of a
+    /// First publishes the pages the request has now computed, keyed by the
+    /// loaded prefill worker that holds them, so every page of a
     /// sliding-window group enters the prefix cache while its table still
-    /// holds it. Then, when the host KV cache serves the worker, reserves the
-    /// pages to offload ([`offloads`]) while the tables still hold them.
+    /// holds it: its prompt's, and for a request whose cache holds its
+    /// prompt and the text it generates alone, the pages of the tokens it
+    /// generated, which its migration's prompt finds. Then, when the host KV
+    /// cache serves the worker, reserves the pages to offload ([`offloads`])
+    /// while the tables still hold them.
     /// Last retires the sliding-window pages no later reader needs: calls
     /// apply in submission order, so every earlier reader has completed, and
     /// later calls read no history before the accepted extent minus the
     /// window. A request without its prefill worker or prefix cache breaks a
     /// scheduler invariant.
     pub(super) fn advance_request_cache(&mut self, id: RequestId) {
+        // A canvas deployment's requests write blocks, not their generated
+        // tokens in order.
+        let tokens_in_order = self.config.canvas.is_none();
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -1658,31 +1664,64 @@ impl Scheduler {
             return;
         };
 
-        // The request's prompt, hashes, page keys and export progress are
-        // borrowed beside its tables for the duration of the update.
+        // The request's prompt, generated tokens, hashes, page keys and
+        // export progress are borrowed beside its tables for the duration of
+        // the update.
         let prompt = std::mem::take(&mut state.req.prompt_token_ids);
-        let hashes = std::mem::take(&mut state.prefix_page_hashes);
-        let page_keys = std::mem::take(&mut state.page_keys);
+        let generated_tokens = std::mem::take(&mut state.generated_token_ids);
+        let mut hashes = std::mem::take(&mut state.prefix_page_hashes);
+        let mut page_keys = std::mem::take(&mut state.page_keys);
         let mut published = std::mem::take(&mut state.prefix_published);
         let published_before = published.clone();
-        let computed = state.num_computed_prompt_tokens as usize;
         let visible = state.cache_visible_len as usize;
         let cache_write = state.req.cache.write;
+        let isolation_key = state.req.cache.isolation_key;
+        // Past its prompt, the cache of a request that generates text alone
+        // holds the tokens it generated here (a migrated request's earlier
+        // ones end its prompt), each written by the decode that reads it:
+        // the accepted extent past the prompt, which the tokens recorded
+        // cover. Any other request publishes its prompt alone.
+        let generated = if tokens_in_order && state.caches_generated_text() {
+            let own = &generated_tokens[state
+                .req
+                .generated_token_ids
+                .len()
+                .min(generated_tokens.len())..];
+            &own[..visible.saturating_sub(prompt.len()).min(own.len())]
+        } else {
+            &[][..]
+        };
+        let tokens = CachedTokens::new(&prompt, generated);
+        let computed = if generated.is_empty() {
+            (state.num_computed_prompt_tokens as usize).min(prompt.len())
+        } else {
+            tokens.len()
+        };
         let offload_from = state.offload_boundary;
-        let offload_to = computed.min(prompt.len()).max(offload_from);
+        let offload_to = computed.max(offload_from);
         state.offload_boundary = offload_to;
         let kv_offload = self
             .kv_offload
             .as_mut()
             .zip(worker.as_ref())
             .filter(|(kv_offload, worker)| kv_offload.serves(worker));
+        if !generated.is_empty() && !hashes.is_empty() {
+            prefix_cache
+                .coordinator
+                .extend_hashes(&mut hashes, tokens, isolation_key);
+            if let Some((kv_offload, worker)) = kv_offload.as_ref()
+                && !page_keys.is_empty()
+            {
+                kv_offload.extend_page_keys(worker, &mut page_keys, tokens, isolation_key);
+            }
+        }
 
         let mut reserved = Vec::new();
         let advanced = state.prefix_cache_mut().is_some_and(|allocation| {
-            let published_now = prefix_cache.coordinator.publish_prompt(
+            let published_now = prefix_cache.coordinator.publish_computed(
                 &prefix_cache.block_pool,
                 allocation,
-                &prompt,
+                tokens,
                 &hashes,
                 computed,
                 &mut published,
@@ -1696,8 +1735,8 @@ impl Scheduler {
                     id,
                     &prefix_cache.block_pool,
                     allocation,
-                    PublishedPrompt {
-                        prompt: &prompt,
+                    PublishedPages {
+                        tokens,
                         hashes: &hashes,
                         page_keys: &page_keys,
                         before: &published_before,
@@ -1718,6 +1757,7 @@ impl Scheduler {
             kv_offload.loaded(id);
         }
         state.req.prompt_token_ids = prompt;
+        state.generated_token_ids = generated_tokens;
         state.prefix_page_hashes = hashes;
         state.page_keys = page_keys;
         state.prefix_published = published;
@@ -1727,12 +1767,12 @@ impl Scheduler {
     }
 }
 
-/// A request's prompt as its cache tables publish it: the prompt, its page
-/// hashes of the device cache and its page keys of the host KV cache by
-/// cache group, and the leading pages of each group published before and
-/// after the call just accepted.
-struct PublishedPrompt<'a> {
-    prompt: &'a [u32],
+/// A request's tokens as its cache tables publish them: its prompt and the
+/// tokens it generated, their page hashes of the device cache and their page
+/// keys of the host KV cache by cache group, and the leading pages of each
+/// group published before and after the call just accepted.
+struct PublishedPages<'a> {
+    tokens: CachedTokens<'a>,
     hashes: &'a [Vec<u64>],
     page_keys: &'a [Vec<storage::Key>],
     before: &'a [usize],
@@ -1751,7 +1791,7 @@ struct PublishedPrompt<'a> {
 /// still hold the windows: the caller runs this before releasing them.
 #[expect(
     clippy::too_many_arguments,
-    reason = "one request's tables, published prompt and offload range"
+    reason = "one request's tables, published pages and offload range"
 )]
 fn offloads(
     kv_offload: &KvOffloadManager,
@@ -1759,7 +1799,7 @@ fn offloads(
     request: RequestId,
     pool: &BlockPool,
     allocation: &CacheAllocation,
-    published: PublishedPrompt<'_>,
+    published: PublishedPages<'_>,
     boundaries: std::ops::Range<usize>,
     source: &Arc<ipc::WorkerEndpoint>,
 ) -> Vec<(usize, Vec<storage::Key>, Vec<PageRef>, OffloadKind)> {
@@ -1768,7 +1808,7 @@ fn offloads(
     let anchor_group = kv_offload.anchor_group(worker);
     let boundaries = kv_offload.offload_boundaries(
         worker,
-        published.prompt.len(),
+        published.tokens.prompt_len(),
         boundaries.start,
         boundaries.end,
     );
@@ -1786,12 +1826,12 @@ fn offloads(
         // units while it is copied.
         let held = |page: usize| {
             let reference = table.page(page)?;
-            let tokens = published.prompt.get(page * block..(page + 1) * block)?;
+            let tokens = published.tokens.get(page * block..(page + 1) * block)?;
             pool.acquire(
                 *reference.units().first()?,
                 *hashes.get(page)?,
                 group as u32,
-                tokens,
+                &tokens,
                 source,
             )
         };
