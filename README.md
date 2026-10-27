@@ -202,6 +202,7 @@ crates/storage/               The Storage Server's protocol and client
 crates/storage-server/        The Storage Server and its Mooncake connector
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
 crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
+crates/nixl/                  NIXL agents with the UCX backend: memory registration, metadata exchange and READs, loaded at runtime
 crates/daemon/                The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, model profiles, input and output processing, the HTTP API, metrics and the engine's client
 crates/engine/                The engine process: schedulers, KV allocation, executors, worker groups and the request interface's service
 crates/worker/                Rank runtime: the library a rank process loads through TVM-FFI
