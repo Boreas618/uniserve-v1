@@ -91,8 +91,10 @@ def test_slot_writes_are_queued_without_waiting_for_the_stream():
         state.count_generated(2, [4, 1, 4])
         state.install_bias(2, [(1, 0.5), (4, -2.0)])
         state.set_predicates([1, 2], True)
+        state.select_adapter(2, 7)
     finally:
         torch.cuda.set_sync_debug_mode(previous)
+    assert state.adapters.tolist() == [0, 0, 7, 0]
     assert state.penalty_counts[2].tolist() == [0, 1, 0, 0, 2]
     assert state.logit_bias[2].tolist() == [0.0, 0.5, 0.0, 0.0, -2.0]
     assert state.predicates.tolist() == [0, 1, 1, 0]
