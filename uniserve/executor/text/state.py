@@ -443,7 +443,10 @@ class SlotState:
 
     def select_adapter(self, slot: int, adapter: int) -> None:
         """Have slot ``slot``'s request compute with adapter ``adapter``."""
-        self.adapters[self._slot(slot)] = int(adapter)
+        slot = self._slot(slot)
+        # A fill passes the index to its kernel; an indexed assignment would
+        # copy it from the host and wait for the stream.
+        self.adapters[slot : slot + 1].fill_(int(adapter))
 
     def count_generated(self, slot: int, tokens: Sequence[int]) -> None:
         """Write slot ``slot``'s penalty counts of previously generated tokens.
