@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use engine::{
     BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SimEngine, SimExecutor,
-    WorkerGroupId,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, FinishReason, SchedulerConfig, SimEngine,
+    SimExecutor, WeightsInFlight, WorkerGroupId,
 };
 use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
@@ -532,17 +532,17 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
     thread.join().unwrap();
 }
 
-/// A weight update recomputes the requests that run, and rewrites the
-/// weights while the workers sleep, which they wake from after; requests
-/// are served again.
+/// A weight update that recomputes the requests in flight ends those that
+/// run as migratable, and rewrites the weights while the workers sleep,
+/// which they wake from after; requests are served again.
 #[test]
-fn a_weight_update_runs_while_the_workers_sleep() {
+fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sleep() {
     let (handle, workers, thread) = start(0);
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 
     let updated = handle
-        .update_weights("/checkpoints/next".to_owned())
+        .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Recompute)
         .recv_timeout(Duration::from_secs(10))
         .expect("the scheduler answers");
     assert!(updated.is_ok(), "{updated:?}");
@@ -564,6 +564,63 @@ fn a_weight_update_runs_while_the_workers_sleep() {
     assert!(matches!(
         terminal(&mut served),
         Some(Event::Finished { .. })
+    ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A weight update that keeps the requests in flight rewrites the weights
+/// beside their KV cache, and the request running continues to its end
+/// without being handed back.
+#[test]
+fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
+    let (handle, workers, thread) = start(0);
+    let mut running = handle.submit(request(1, 2, 150)).unwrap();
+    assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+
+    let updated = handle
+        .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Keep)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(updated.is_ok(), "{updated:?}");
+    assert_eq!(
+        workers.lock().unwrap().hooks,
+        vec![
+            r#"uniserve.update_weights {"model_path":"/checkpoints/next","keep":true}"#.to_owned()
+        ]
+    );
+    assert!(matches!(
+        terminal(&mut running),
+        Some(Event::Finished {
+            reason: FinishReason::MaxTokens | FinishReason::Completed | FinishReason::Eos,
+            ..
+        })
+    ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A weight update that aborts the requests in flight ends both the request
+/// running and the one queued, aborted.
+#[test]
+fn a_weight_update_aborting_the_requests_in_flight_ends_them() {
+    let (handle, _workers, thread) = start(0);
+    let mut running = handle.submit(request(1, 2, 150)).unwrap();
+    assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+
+    let updated = handle
+        .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Abort)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(updated.is_ok(), "{updated:?}");
+    assert!(matches!(
+        terminal(&mut running),
+        Some(Event::Finished {
+            reason: FinishReason::Aborted,
+            ..
+        })
     ));
 
     handle.shutdown();

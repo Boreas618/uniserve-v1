@@ -144,8 +144,12 @@ impl Scheduler {
                 let _ = answer.send(self.reconfigure(limits));
             }
             Command::ResizeCache { change, answer } => self.resize_cache(change, answer),
-            Command::UpdateWeights { model_path, answer } => {
-                self.update_weights(model_path, answer);
+            Command::UpdateWeights {
+                model_path,
+                in_flight,
+                answer,
+            } => {
+                self.update_weights(model_path, in_flight, answer);
             }
             Command::Shutdown => return true,
         }

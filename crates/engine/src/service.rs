@@ -531,11 +531,34 @@ fn read_requests(
                     resize_cache(&resize, front, routing);
                 }
                 Some(wire::engine_command::Kind::UpdateWeights(update)) => {
-                    tracing::info!(model = update.model_path, "updating the weights in place");
+                    let in_flight = match wire::WeightsInFlight::try_from(update.in_flight) {
+                        Ok(wire::WeightsInFlight::Keep) => crate::WeightsInFlight::Keep,
+                        Ok(wire::WeightsInFlight::Recompute) => crate::WeightsInFlight::Recompute,
+                        Ok(wire::WeightsInFlight::Abort) => crate::WeightsInFlight::Abort,
+                        Err(_) => {
+                            routing.send(
+                                front,
+                                Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
+                                    id: update.id,
+                                    results: Vec::new(),
+                                    error: format!("unknown in-flight choice {}", update.in_flight),
+                                })),
+                            );
+                            continue;
+                        }
+                    };
+                    tracing::info!(
+                        model = update.model_path,
+                        ?in_flight,
+                        "updating the weights in place"
+                    );
                     let answers: Vec<_> = routing
                         .slots
                         .iter()
-                        .map(|slot| slot.handle.update_weights(update.model_path.clone()))
+                        .map(|slot| {
+                            slot.handle
+                                .update_weights(update.model_path.clone(), in_flight)
+                        })
                         .collect();
                     answer_hooked(update.id, answers, front, routing);
                 }

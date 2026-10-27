@@ -607,13 +607,18 @@ impl EngineClient {
     }
 
     /// Has every worker rewrite its weights in place from the checkpoint at
-    /// `model_path` once no request runs, and returns what each reported.
+    /// `model_path`, the requests in flight continuing as `in_flight` says,
+    /// and returns what each reported.
     ///
     /// # Errors
     ///
     /// Fails with the reason a worker could not update, or when the engine
     /// ends first.
-    pub async fn update_weights(&self, model_path: &str) -> Result<Vec<String>, String> {
+    pub async fn update_weights(
+        &self,
+        model_path: &str,
+        in_flight: crate::leader::WeightsInFlight,
+    ) -> Result<Vec<String>, String> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = oneshot::channel();
         lock(&self.shared.answers).insert(id, answer);
@@ -623,6 +628,13 @@ impl EngineClient {
                     wire::UpdateWeights {
                         id,
                         model_path: model_path.to_owned(),
+                        in_flight: match in_flight {
+                            crate::leader::WeightsInFlight::Keep => wire::WeightsInFlight::Keep,
+                            crate::leader::WeightsInFlight::Recompute => {
+                                wire::WeightsInFlight::Recompute
+                            }
+                            crate::leader::WeightsInFlight::Abort => wire::WeightsInFlight::Abort,
+                        } as i32,
                     },
                 )),
             }));

@@ -1124,14 +1124,15 @@ impl SchedulerHandle {
         self.commands.configure(limits)
     }
 
-    /// Rewrites the weights in place from the checkpoint at `model_path`;
-    /// the receiver gets what each worker reported, or why the update
-    /// failed.
+    /// Rewrites the weights in place from the checkpoint at `model_path`,
+    /// the requests in flight continuing as `in_flight` says; the receiver
+    /// gets what each worker reported, or why the update failed.
     pub fn update_weights(
         &self,
         model_path: String,
+        in_flight: crate::WeightsInFlight,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        self.commands.update_weights(model_path)
+        self.commands.update_weights(model_path, in_flight)
     }
 
     /// Gives back or restores KV cache memory; the receiver gets what each

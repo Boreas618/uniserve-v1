@@ -234,9 +234,15 @@ def _chat(base_url: str, model: str, prompt: str, tokens: int = 16) -> dict:
 
 
 def _stream_count(
-    base_url: str, model: str, read: list[str], done: threading.Event
+    base_url: str,
+    model: str,
+    read: list[str],
+    done: threading.Event,
+    reasons: list[str] | None = None,
 ) -> None:
-    """Streams the count, appending each content delta to `read`."""
+    """Streams the count, appending each content delta to `read` and each
+    finish reason to `reasons`.
+    """  # noqa: D205
     with httpx.stream(
         "POST",
         f"{base_url}/v1/chat/completions",
@@ -260,7 +266,28 @@ def _stream_count(
                     content = (choice.get("delta") or {}).get("content")
                     if content:
                         read.append(content)
+                    if reasons is not None and choice.get("finish_reason"):
+                        reasons.append(choice["finish_reason"])
     done.set()
+
+
+# How long the counters an engine reports every second take to include
+# what a request it answered counted: two report intervals.
+REPORT_SETTLE = 2.0
+
+
+def _prefix_queries(base_url: str) -> float:
+    """The prompt tokens every scheduler looked up in its prefix cache so
+    far (``uniserve:prefix_cache_queries``), once the reports of what came
+    before arrived.
+    """  # noqa: D205
+    time.sleep(REPORT_SETTLE)
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith("uniserve:prefix_cache_queries")
+    )
 
 
 def _wait_until(predicate, timeout_s: float, what: str) -> None:
@@ -1129,26 +1156,52 @@ def test_a_weight_update_answers_as_the_new_checkpoint_does(
         original = answers(base_url)
         assert original != expected, "the checkpoints answer alike"
 
-        read: list[str] = []
-        done = threading.Event()
-        streaming = threading.Thread(
-            target=_stream_count, args=(base_url, name, read, done)
-        )
-        streaming.start()
-        _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
+        def stream() -> tuple[threading.Thread, threading.Event, list[str]]:
+            read: list[str] = []
+            reasons: list[str] = []
+            done = threading.Event()
+            streaming = threading.Thread(
+                target=_stream_count, args=(base_url, name, read, done, reasons)
+            )
+            streaming.start()
+            _wait_until(
+                lambda: len(read) >= 32, 300, "the count did not stream"
+            )
+            return streaming, done, reasons
+
+        # The requests in flight keep their KV cache by default: the count
+        # continues on the new weights from the state it reached, never
+        # admitted again, so it looks up no prefix.
+        streaming, done, reasons = stream()
+        queries = _prefix_queries(base_url)
         response = _admin(base_url, "update_weights", {"model_path": updated})
         assert response.status_code == 200, response.text
         result = response.json()["result"]
         assert result["model_path"] == updated, result
+        assert result["in_flight"] == "keep", result
         assert all(report["page_contents"] for report in result["results"]), (
             result
         )
         streaming.join(timeout=1800)
         assert done.is_set(), "the stream did not end after the update"
+        assert reasons and reasons[-1] != "abort", reasons
+        assert _prefix_queries(base_url) == queries
         assert answers(base_url) == expected
 
-        back = _admin(base_url, "update_weights", {"model_path": _checkpoint()})
+        # Recomputed, the count is admitted again with its prompt and the
+        # tokens it generated, and finishes on the new weights.
+        streaming, done, reasons = stream()
+        queries = _prefix_queries(base_url)
+        back = _admin(
+            base_url,
+            "update_weights",
+            {"model_path": _checkpoint(), "in_flight": "recompute"},
+        )
         assert back.status_code == 200, back.text
+        streaming.join(timeout=1800)
+        assert done.is_set(), "the stream did not end after the update"
+        assert reasons and reasons[-1] != "abort", reasons
+        assert _prefix_queries(base_url) > queries
         assert answers(base_url) == original
 
         refused = _admin(
@@ -1160,13 +1213,18 @@ def test_a_weight_update_answers_as_the_new_checkpoint_does(
         assert answers(base_url) == original
 
         # The plugin streams the base checkpoint's tensors with the other
-        # checkpoint's norm: the same answers as that checkpoint's.
+        # checkpoint's norm: the same answers as that checkpoint's. Aborted,
+        # the count in flight ends.
+        streaming, done, reasons = stream()
         streamed = _admin(
             base_url,
             "update_weights",
-            {"model_path": f"renormed://{_checkpoint()}"},
+            {"model_path": f"renormed://{_checkpoint()}", "in_flight": "abort"},
         )
         assert streamed.status_code == 200, streamed.text
+        streaming.join(timeout=300)
+        assert done.is_set(), "the aborted stream did not end"
+        assert reasons == ["abort"], reasons
         assert answers(base_url) == expected
         # A world change's successor binds the weights the source left.
         _change_world(base_url, CHANGE)

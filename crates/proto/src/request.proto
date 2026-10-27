@@ -293,6 +293,18 @@ message UpdateWeights {
   // Matches the `Hooked` answer.
   uint64 id = 1;
   string model_path = 2;
+  WeightsInFlight in_flight = 3;
+}
+
+// How the requests in flight continue through an in-place weight update.
+enum WeightsInFlight {
+  // Each continues on the new weights with the KV cache it reached; the
+  // pages it writes afterwards reach no shared tier.
+  WEIGHTS_IN_FLIGHT_KEEP = 0;
+  // Each computes its state again with the new weights.
+  WEIGHTS_IN_FLIGHT_RECOMPUTE = 1;
+  // Each ends, aborted, as do the requests the engine queued.
+  WEIGHTS_IN_FLIGHT_ABORT = 2;
 }
 
 // A change to the device memory of every scheduler's KV cache.
