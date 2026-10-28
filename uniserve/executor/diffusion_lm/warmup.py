@@ -86,6 +86,11 @@ def scratch_slots(rows: int, installed: int) -> np.ndarray:
     return np.arange(rows, dtype=np.int64) % installed + 1
 
 
+def scratch_lengths(shapes: Shapes) -> tuple[int, ...]:
+    """The one-token prefix tables shared by a computation's forwards."""
+    return (1,) * shapes.capacity()
+
+
 def _rows(queries: Sequence[int], installed: int) -> list[list[int]]:
     """Return the attention rows ``[slot, prefix, query]`` of ``queries``."""
     slots = scratch_slots(len(queries), installed)
@@ -376,11 +381,10 @@ def phases(computations: Sequence[DiffusionLMComputation]) -> list[Phase]:
         if not steps:
             continue
         # One one-token scratch table per block a denoising step holds.
-        installed = computation.shapes.capacity()
         laid.append(
             Phase(
                 computation.index,
-                (1,) * installed,
+                scratch_lengths(computation.shapes),
                 steps,
                 partial(computation.warm, steps),
             )

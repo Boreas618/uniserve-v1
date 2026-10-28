@@ -4,7 +4,7 @@ import itertools
 
 import pytest
 
-from uniserve.executor.image.denoiser import split_rows
+from uniserve.executor.image.denoiser import warm_forwards, warmup_lengths
 from uniserve.executor.image.shapes import (
     RowLimits,
     RowShape,
@@ -213,13 +213,20 @@ def test_each_buckets_warm_forward_selects_that_bucket(multiple):
     # Warmup captures every bucket by a forward of rows the family admits;
     # the forward selects exactly the bucket it captures.
     shapes = _denoise_shapes(multiple)
-    for shape in shapes.capture_order():
-        lengths = split_rows(shape, LIMITS, shapes)
-        assert lengths is not None, shape
-        assert all(
-            LIMITS.min_row_tokens <= length <= LIMITS.max_row_tokens
-            for length in lengths
-        )
-        assert shapes.select(len(lengths), sum(lengths)) == shape
-    # Without buckets one row of the shortest image warms the family.
-    assert split_rows(RowShape(SHORTEST + 1, 2), LIMITS, None) == [SHORTEST]
+    for family, writes in (("step", False), ("condition", True)):
+        forwards = warm_forwards(family, LIMITS, shapes, IMAGES)
+        assert [forward.shape for forward in forwards] == shapes.capture_order()
+        scratch = warmup_lengths(forwards, writes=writes)
+        for forward in forwards:
+            lengths = [tokens for _, _, tokens in forward.rows]
+            assert all(SHORTEST <= length <= LONGEST for length in lengths)
+            assert shapes.select(len(lengths), sum(lengths)) == forward.shape
+            for slot, prefix, tokens in forward.rows:
+                assert prefix + (tokens if writes else 0) <= scratch[slot - 1]
+
+        # Eager warmup runs one shortest row and needs only its one table.
+        (eager,) = warm_forwards(family, LIMITS, None, IMAGES)
+        assert eager.rows[0][2] == SHORTEST
+        assert warmup_lengths([eager], writes=writes) == [
+            SHORTEST if writes else eager.rows[0][1]
+        ]

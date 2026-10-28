@@ -164,7 +164,7 @@ class PrefillShape:
     outputs: bool
 
     def scratch_lengths(
-        self, row_tokens: int, pages: Pages, units: int
+        self, row_tokens: int, pages: Pages, units: int | None
     ) -> list[int]:
         """Fit the capture's rows into a scratch cache pool.
 
@@ -177,15 +177,15 @@ class PrefillShape:
             row_tokens: The most tokens one row (request) holds.
             pages: Each cache group's ``(tokens per page, units per page)``.
                 Block sizes are positive powers of two.
-            units: The scratch pool's units; it holds at least one page of
-                each group.
+            units: The scratch pool's units; ``None`` lays out the full
+                capture before capacity planning.
         """
         row_units = sum(count for _, count in pages)
         rows = max(
             min(
                 max(self.live_rows, _ceil_div(self.token_bucket, row_tokens)),
                 max(self.row_bucket - 1, 0),
-                units // row_units,
+                self.row_bucket if units is None else units // row_units,
             ),
             1,
         )
@@ -199,7 +199,9 @@ class PrefillShape:
         while low < high:
             tokens = low + _ceil_div(high - low, 2)
             lengths = _spread(rows, tokens, row_tokens, pages)
-            if lengths is not None and _pool_units(lengths, pages) <= units:
+            if lengths is not None and (
+                units is None or _pool_units(lengths, pages) <= units
+            ):
                 low = tokens
                 fitted = lengths
             else:

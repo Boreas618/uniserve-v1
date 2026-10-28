@@ -52,7 +52,7 @@ from .protocol import CALL_FIELD_NAMES, COMPLETION_FIELDS
 from .runner import TextRunner
 from .sampling import logprob_capacity
 from .state import NewRequest, RequestTable, SlotState
-from .warmup import Phase, finish, phases
+from .warmup import Phase, decode_layouts, finish, phases, prefill_layouts
 
 _logger = logging.getLogger(__name__)
 
@@ -102,6 +102,7 @@ class TextBinding:
     Attributes:
         slots: The request slots.
         units: The prefix cache pool's units, sentinel included.
+        warmup_units: Writable scratch units, sentinel excluded.
         unit_pool: The prefix cache's K/V pool object attention reads.
         tables: The worker's block tables by name (``unit_tables``,
             ``start_pages``, ``table_shapes``, ``verified_lengths``).
@@ -112,6 +113,7 @@ class TextBinding:
 
     slots: int
     units: int
+    warmup_units: int
     unit_pool: Any
     tables: Mapping[str, torch.Tensor]
     computations: tuple[ComputationBinding, ...]
@@ -208,7 +210,7 @@ class TextExecutor:
         self.state: SlotState | None = None
         self.table: RequestTable | None = None
         self.union: ExpertUnion | None = None
-        self._units = 0
+        self._warmup_units = 0
         self._phases: list[Phase] = []
 
     def _bounds(self, slots: int, units: int | None) -> TextBounds:
@@ -240,6 +242,18 @@ class TextExecutor:
         the slot state.
         """
         bounds = self._bounds(self.max_batch_calls, None)
+        shapes = bounds.shapes()
+        layouts = prefill_layouts(
+            shapes,
+            pages=bounds.pages,
+            row_tokens=min(self.max_model_len, self.max_batch_tokens),
+            units=None,
+            capacities=lambda _: [None],
+        ) + decode_layouts(
+            shapes,
+            prefill_outputs=self.prefill_outputs,
+            capacities=lambda _: [None],
+        )
         dims = bounds.dimensions(
             vocab=self.vocab,
             local_vocab=self.vocab,
@@ -276,6 +290,7 @@ class TextExecutor:
                 "call_fields": list(CALL_FIELD_NAMES),
                 "fixed_bytes": int(fixed),
                 "slot_bytes": int(slot_bytes),
+                "warmup_lengths": [list(layout.lengths) for layout in layouts],
             },
         }
 
@@ -304,7 +319,7 @@ class TextExecutor:
                 f"{len(binding.computations)} serve text"
             )
         by_name = {component.name: component for component in self.components}
-        self._units = binding.units
+        self._warmup_units = binding.warmup_units
         self.union = union
         bounds = self._bounds(binding.slots, binding.units)
         tables = binding.tables
@@ -439,7 +454,7 @@ class TextExecutor:
         self._phases = phases(
             [self.computations[index] for index in sorted(self.computations)],
             row_tokens=min(self.max_model_len, self.max_batch_tokens),
-            units=max(self._units - 1, 0),
+            units=self._warmup_units,
         )
         return [phase.describe() for phase in self._phases]
 

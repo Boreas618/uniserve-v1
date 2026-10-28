@@ -757,7 +757,9 @@ impl Worker {
         .map_err(|error| error.with_phase("executor"))?;
 
         // Every owner took its memory: retained storages of the scope that
-        // none took any more are released.
+        // none took any more are released. Rollback keeps its named Host
+        // cache storages without mapping them into this worker.
+        retained.use_keys(config.cache_keys.iter().copied());
         retained.retain_used().map_err(phase("storage"))?;
         tracing::info!("loaded numerical model");
         Ok(Self {
@@ -1640,6 +1642,10 @@ pub(crate) fn plan_rank(
     // daemon subtracts retained resources and the actual newly created
     // chunks after rank assignment, when those quantities are known.
     config.pool_storage_bytes = Some(quota as usize);
+    config.pool_storage_full_bytes = Some(quota as usize);
+    // Report the staged target's exact head and tail granularity. Planning
+    // reserves addresses but allocates no cache storage in this probe.
+    config.stage_cache = true;
     let (capacity, _) = plan(
         &target,
         &mut config,

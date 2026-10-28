@@ -58,6 +58,11 @@ pub struct WorkerConfig {
     /// whose segments the planes map read-only after the world's own
     /// (`LaunchDescriptor::predecessor`).
     pub predecessor: Option<ipc::PredecessorCache>,
+    /// Map writable warmup storage and reserve the remaining cache pool's
+    /// virtual addresses for staged transfer (`LaunchDescriptor::stage_cache`).
+    pub stage_cache: bool,
+    /// Existing Host cache storages retained for this world's rollback.
+    pub cache_keys: Vec<storage::Key>,
     /// The exact KV cache segments the rank's planes are made of
     /// (`LaunchDescriptor::segments`).
     pub segments: Option<ipc::CacheTable>,
@@ -158,6 +163,8 @@ impl WorkerConfig {
             max_total_tokens: None,
             world: 0,
             predecessor: None,
+            stage_cache: false,
+            cache_keys: Vec::new(),
             segments: None,
             generation_device: None,
             max_batch_calls: slots,

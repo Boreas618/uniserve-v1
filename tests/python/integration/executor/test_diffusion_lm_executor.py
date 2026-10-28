@@ -325,6 +325,7 @@ class Worker:
             TextBinding(
                 slots=SLOTS,
                 units=model.units,
+                warmup_units=model.units - 1,
                 unit_pool=pool,
                 tables={
                     "unit_tables": self.unit_tables,

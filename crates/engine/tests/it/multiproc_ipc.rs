@@ -2810,6 +2810,8 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         mem_fraction_static: 0.7,
         max_total_tokens: Some(4096),
         predecessor: None,
+        stage_cache: false,
+        cache_keys: Vec::new(),
         segments: None,
         received_weights: None,
         expert_order: Default::default(),

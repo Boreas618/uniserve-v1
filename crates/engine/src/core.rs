@@ -419,6 +419,11 @@ pub struct EngineConfig {
     /// fails the engine instead of being relaunched, and none keeps a
     /// standby.
     pub predecessor: Option<BTreeMap<String, ipc::PredecessorCache>>,
+    /// Prepare cache-transfer targets with writable warmup storage while
+    /// reserving the remaining pool's virtual addresses.
+    pub stage_cache: bool,
+    /// Existing Host cache keys retained for this world's trial rollback.
+    pub cache_keys: Vec<[u8; 32]>,
     /// The KV cache segments each worker group's planes were made of, by
     /// group identity, which an engine replacing a lost one of the world
     /// takes as its own; empty to lay the planes out afresh.
@@ -484,6 +489,8 @@ impl EngineConfig {
             end_of_image: 0,
             world: 0,
             predecessor: None,
+            stage_cache: false,
+            cache_keys: Vec::new(),
             segments: BTreeMap::new(),
             received_weights: BTreeMap::new(),
         }
@@ -767,6 +774,8 @@ impl SchedulerHandle {
         // the KV cache of their group's predecessor read-only.
         for args in &mut arguments {
             args.world = config.world;
+            args.stage_cache = config.stage_cache;
+            args.cache_keys = config.cache_keys.clone();
             args.predecessor = config
                 .predecessor
                 .as_ref()

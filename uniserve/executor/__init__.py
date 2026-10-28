@@ -104,6 +104,7 @@ class _Binding:
     host_scratch: Any | None = None
     unit_pool: Any | None = None
     units: int = 0
+    warmup_units: int = 0
     tables: dict[str, torch.Tensor] = field(default_factory=dict)
     staging: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
@@ -170,6 +171,7 @@ class _Binding:
             names = [str(name) for name in pages["tables"]]
             binding.tables = dict(zip(names, take(len(names)), strict=True))
             binding.units = int(pages["units"])
+            binding.warmup_units = int(pages["warmup_units"])
         for index, computation in enumerate(binding.computations):
             if "pages" in computation["resources"]:
                 tokens, flags = take(2)
@@ -359,6 +361,7 @@ class _TextComputations:
             TextBinding(
                 slots=binding.slots,
                 units=binding.units,
+                warmup_units=binding.warmup_units,
                 unit_pool=binding.unit_pool,
                 tables=binding.tables,
                 computations=_computation_bindings(binding, computations),
@@ -651,10 +654,31 @@ class Executor:
                     "the computations over the prefix cache disagree on call "
                     "fields"
                 )
+            lengths = [
+                phase for pages in stated for phase in pages["warmup_lengths"]
+            ]
+            if self._image is not None:
+                lengths.extend(manifest["image"]["warmup_lengths"])
+            groups = self._settings["pages"]["cache_groups"]
+            # Each warmup phase lends whole pages per scratch table. Phases
+            # run serially, so the largest footprint is the writable head.
+            warmup_units = max(
+                (
+                    sum(
+                        -(-max(length, 1) // group["block_size"])
+                        * group["units_per_page"]
+                        for length in phase
+                        for group in groups
+                    )
+                    for phase in lengths
+                ),
+                default=0,
+            )
             manifest["pages"] = {
                 "call_fields": fields,
                 "fixed_bytes": sum(int(p["fixed_bytes"]) for p in stated),
                 "slot_bytes": sum(int(p["slot_bytes"]) for p in stated),
+                "warmup_units": warmup_units,
             }
         return json.dumps(manifest)
 

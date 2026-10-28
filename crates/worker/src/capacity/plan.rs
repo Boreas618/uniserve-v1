@@ -211,6 +211,8 @@ pub(crate) struct Plan {
     /// The segments a device pool's planes are made of; `None` for planes
     /// that do not split.
     pub planes: Option<PlaneLayout>,
+    /// Writable units used by the executor's largest warmup phase.
+    pub warmup_units: u32,
 }
 
 fn narrow(value: usize, name: &str) -> Result<u32> {
@@ -261,6 +263,7 @@ pub(crate) struct TokenLayout {
     feature_bytes: u64,
     latent: Option<LatentPlan>,
     planes: Option<PlaneLayout>,
+    warmup_units: u32,
 }
 
 impl TokenLayout {
@@ -323,6 +326,7 @@ impl TokenLayout {
             feature_bytes,
             latent: facts.latent,
             planes: None,
+            warmup_units: 0,
         })
     }
 
@@ -333,6 +337,11 @@ impl TokenLayout {
     /// Record fixed storage an owner of the rank allocates on `device`.
     pub(crate) fn reserve(&mut self, device: Device, bytes: u64) {
         *self.fixed.entry(device).or_default() += bytes;
+    }
+
+    /// Record the writable scratch capacity of the executor's warmup layouts.
+    pub(crate) fn reserve_warmup(&mut self, units: u32) {
+        self.warmup_units = units;
     }
 
     /// Fit the cache pool beside the fixed storage and agree its unit count.
@@ -412,7 +421,7 @@ impl TokenLayout {
             // A successor's own units are what a configured capacity
             // leaves past the inherited ones, as far as its grant holds them
             // now, or what the grant holds.
-            successor: config.predecessor.is_some(),
+            successor: config.predecessor.is_some() || config.stage_cache,
             inherited_units: inherited,
         })?;
         // Every member allocates the same logical unit ids, bounded by the
@@ -428,17 +437,19 @@ impl TokenLayout {
                 .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
             planes = match (&config.segments, &config.predecessor) {
                 (Some(table), _) => Some(PlaneLayout::adopted(table)),
-                (None, Some(predecessor)) => Some(self.successor_layout(
-                    cache,
-                    config,
-                    predecessor,
-                    own,
-                    unit_bytes,
-                    reserved_units,
-                    granularity,
-                    group,
-                )?),
-                (None, None) => {
+                (None, predecessor) if predecessor.is_some() || config.stage_cache => {
+                    Some(self.successor_layout(
+                        cache,
+                        config,
+                        predecessor.as_ref(),
+                        own,
+                        unit_bytes,
+                        reserved_units,
+                        granularity,
+                        group,
+                    )?)
+                }
+                (None, _) => {
                     let rounded = crate::memory::prefix_cache::planes::segmented_units(
                         own,
                         cache.plane_bytes,
@@ -485,13 +496,11 @@ impl TokenLayout {
         Ok(capacity)
     }
 
-    /// The planes of a world that succeeds `predecessor` on the same
-    /// devices: a head segment holding the sentinel and as much warmup
-    /// scratch as the predecessor's warmup lent, the predecessor's segments
-    /// read-only, and a tail of the world's own sized for the pool its full
-    /// grant holds once the predecessor is gone, whose first segments it
-    /// creates now, as many as `now` units of its present grant hold, and
-    /// the others as its memory frees. Every member agrees on each count.
+    /// A successor's writable head holds the sentinel, its executor's
+    /// warmup scratch and request progress. Optional predecessor segments
+    /// follow read-only, then the target's tail at its full grant. Host
+    /// staging reserves the tail without creating it; other successors
+    /// create as many segments as their present grant holds.
     #[expect(
         clippy::too_many_arguments,
         reason = "one successor pool's plan, its grants and its group"
@@ -500,7 +509,7 @@ impl TokenLayout {
         &self,
         cache: &CachePlan,
         config: &WorkerConfig,
-        predecessor: &ipc::PredecessorCache,
+        predecessor: Option<&ipc::PredecessorCache>,
         now: u32,
         unit_bytes: u64,
         reserved_units: u64,
@@ -508,8 +517,8 @@ impl TokenLayout {
         group: &HostGroup,
     ) -> Result<PlaneLayout> {
         let inherited: u32 = predecessor
-            .segments
-            .iter()
+            .into_iter()
+            .flat_map(|predecessor| &predecessor.segments)
             .map(|segment| segment.units)
             .sum();
         let full = match (config.max_total_tokens, config.pool_storage_full_bytes) {
@@ -523,7 +532,7 @@ impl TokenLayout {
         let full = u32::try_from(agreed[0].max(0))
             .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
         let head = PlaneLayout::whole_granules(
-            1 + predecessor.scratch_units + cache.progress_units(),
+            1 + self.warmup_units + cache.progress_units(),
             cache.plane_bytes,
             granularity,
         );
@@ -540,7 +549,7 @@ impl TokenLayout {
             granularity,
             predecessor,
         )?;
-        let created = match layout.tail_segment_units() {
+        let created = match layout.tail_segment_units().filter(|_| !config.stage_cache) {
             Some(units) => (now.saturating_sub(head) / units) as usize,
             None => 0,
         };
@@ -568,6 +577,7 @@ impl TokenLayout {
             latent: self.latent,
             cache,
             planes: self.planes,
+            warmup_units: self.warmup_units,
         }
     }
 }
@@ -619,6 +629,7 @@ pub(crate) fn request_layout(
         latent: media.stored_latent(),
         cache: None,
         planes: None,
+        warmup_units: 0,
     })
 }
 
@@ -693,6 +704,8 @@ pub(crate) mod tests {
             max_total_tokens: None,
             world: 0,
             predecessor: None,
+            stage_cache: false,
+            cache_keys: Vec::new(),
             segments: None,
             attention_backend: "auto".into(),
             max_batch_calls: 1024,

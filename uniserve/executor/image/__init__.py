@@ -45,6 +45,7 @@ from uniserve import numerics
 from uniserve.errors import SetupError
 from uniserve.executor.predicates import split
 from uniserve.executor.text.protocol import GraphMode
+from uniserve.executor.text.warmup import context_layout
 from uniserve.media.pixels import PreparedImage, Tower, prepare_tensor_image
 from uniserve.models import ImageDecoder, ImageDenoiser, PatchEncoder
 from uniserve.nn.vae import PatchAutoencoder
@@ -60,6 +61,8 @@ from .denoiser import (
     LatentBinding,
     StepCall,
     framed_prefix,
+    warm_forwards,
+    warmup_lengths,
 )
 from .facts import ImageFacts
 from .layout import ImageLayout
@@ -483,6 +486,70 @@ class ImageExecutor:
             limits,
         )
 
+    def _denoiser_shapes(
+        self, computation: _Computation, *, graphs: bool
+    ) -> tuple[int, RowShapes | None, RowShapes | None]:
+        """The sequence-parallel degree and complete denoiser catalogs."""
+        layout = self.layout
+        assert layout is not None
+        network = self._module(computation, "image_denoiser", ImageDenoiser)
+        mesh = network.mesh
+        multiple = int(mesh.size("sp")) if "sp" in mesh.axes else 1
+        step_limits = self._step_limits()
+        condition_limits = self._condition_limits()
+        steps = (
+            self._row_shapes(
+                step_limits,
+                denoise_rows(
+                    guidance_branches=layout.guidance_branches,
+                    max_images=self.max_calls,
+                ),
+                multiple,
+            )
+            if graphs
+            else None
+        )
+        conditions = (
+            self._row_shapes(
+                condition_limits,
+                condition_rows(max_calls=condition_limits.max_rows),
+                multiple,
+            )
+            if graphs and condition_limits is not None
+            else None
+        )
+        return multiple, steps, conditions
+
+    def _warmup_lengths(self) -> list[list[int]]:
+        """Scratch tables of image phases and the text feature injection."""
+        lengths = []
+        for computation in self.placed:
+            if computation.role != DENOISER:
+                continue
+            _, step_shapes, condition_shapes = self._denoiser_shapes(
+                computation, graphs=self.graphs
+            )
+            steps = warm_forwards(
+                "step", self._step_limits(), step_shapes, self.max_slots
+            )
+            lengths.append(warmup_lengths(steps, writes=False))
+            limits = self._condition_limits()
+            if limits is not None:
+                conditions = warm_forwards(
+                    "condition", limits, condition_shapes, self.max_slots
+                )
+                lengths.append(warmup_lengths(conditions, writes=True))
+        facts = self.image_facts
+        if facts.injection is not None:
+            # Logit selection does not change the context's scratch tables.
+            context = context_layout(
+                facts.injection,
+                spatial=facts.spatial_positions(),
+                prefill_outputs=False,
+            )
+            lengths.append(list(context.lengths))
+        return lengths
+
     def manifest(self) -> dict[str, Any]:
         """What capacity planning reads of the image computations.
 
@@ -522,6 +589,7 @@ class ImageExecutor:
             "fixed_bytes": int(fixed),
             # Each slot's reference time of the solver update.
             "slot_bytes": 4 if latent is not None else 0,
+            "warmup_lengths": self._warmup_lengths(),
             "encoders": self._encoders(),
         }
 
@@ -837,9 +905,9 @@ class ImageExecutor:
                 "ledger"
             )
         network = self._module(computation, "image_denoiser", ImageDenoiser)
-        # The sequence-parallel degree divides every forward's tokens.
-        mesh = network.mesh
-        multiple = int(mesh.size("sp")) if "sp" in mesh.axes else 1
+        multiple, step_shapes, condition_shapes = self._denoiser_shapes(
+            computation, graphs=pool is not None
+        )
         tables = CacheTables.of(
             binding.unit_pool,
             binding.tables,
@@ -848,28 +916,6 @@ class ImageExecutor:
         )
         step_limits = self._step_limits()
         condition_limits = self._condition_limits()
-        graphs = pool is not None
-        step_shapes = (
-            self._row_shapes(
-                step_limits,
-                denoise_rows(
-                    guidance_branches=layout.guidance_branches,
-                    max_images=self.max_calls,
-                ),
-                multiple,
-            )
-            if graphs
-            else None
-        )
-        condition_shapes = (
-            self._row_shapes(
-                condition_limits,
-                condition_rows(max_calls=condition_limits.max_rows),
-                multiple,
-            )
-            if graphs and condition_limits is not None
-            else None
-        )
         computation.denoiser = Denoiser(
             network=network,
             owner=computation.label("image_denoiser"),
@@ -1149,19 +1195,10 @@ class ImageExecutor:
                 ):
                     if not forwards:
                         continue
-                    used = min(
-                        max(len(forward.rows) for forward in forwards),
-                        max(self.slots, 1),
-                    )
-                    length = max(
-                        prefix + (tokens if writes else 0)
-                        for forward in forwards
-                        for _, prefix, tokens in forward.rows
-                    )
                     phases.append(
                         {
                             "computation": index,
-                            "lengths": [length] * used,
+                            "lengths": warmup_lengths(forwards, writes=writes),
                             "steps": [
                                 forward.attention() for forward in forwards
                             ],

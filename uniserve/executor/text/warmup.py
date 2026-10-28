@@ -185,7 +185,7 @@ def prefill_layouts(
     *,
     pages: Sequence[tuple[int, int]],
     row_tokens: int,
-    units: int,
+    units: int | None,
     capacities: Capacities,
 ) -> list[Layout]:
     """Lay out the prefill buckets' phases, largest footprint first.
@@ -194,7 +194,8 @@ def prefill_layouts(
         shapes: The runner's graph catalogs.
         pages: Each cache group's ``(tokens per page, units per page)``.
         row_tokens: The most tokens one capture row holds.
-        units: The scratch pool's units, sentinel excluded.
+        units: The scratch pool's units, sentinel excluded; ``None`` lays
+            out each full capture before capacity planning.
         capacities: The capacities a forward is captured at.
     """
     layouts = []

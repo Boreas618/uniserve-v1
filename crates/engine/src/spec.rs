@@ -172,6 +172,14 @@ impl EngineConfig {
             .max_num_batched_tokens
             .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, |tokens| tokens as usize);
         let host_kv_cache = kv_cache.prefix_caching && kv_cache.host_tier;
+        let cache_keys = spec
+            .cache_keys
+            .iter()
+            .map(|key| {
+                <[u8; 32]>::try_from(key.as_slice())
+                    .context("a retained cache key must contain 32 bytes")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let worker_process = WorkerProcessArgs {
             executable: PathBuf::from(&workers.executable),
             // A deployment is what one daemon serves under its served name.
@@ -202,6 +210,8 @@ impl EngineConfig {
             world: spec.world,
             retire: spec.retire.clone(),
             predecessor: None,
+            stage_cache: spec.stage_cache,
+            cache_keys: cache_keys.clone(),
             received_weights: None,
             model: spec.model.clone(),
             expert_order: spec
@@ -320,6 +330,8 @@ impl EngineConfig {
             eos: facts.eos.clone(),
             end_of_image: facts.end_of_image,
             world: spec.world,
+            stage_cache: spec.stage_cache,
+            cache_keys,
             predecessor: spec.predecessor.as_ref().map(|predecessor| {
                 predecessor
                     .segments
@@ -554,6 +566,8 @@ mod tests {
             model_facts: Some(wire::ModelFacts::default()),
             world: 0,
             predecessor: None,
+            stage_cache: false,
+            cache_keys: Vec::new(),
             segments: Vec::new(),
             retire: Vec::new(),
             speculation: None,
