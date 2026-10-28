@@ -735,37 +735,50 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         return;
     }
     // The worlds that keep their weights alone release the rest of their
-    // memory on every node first (the deployment's claims cover them all,
-    // so the first scheduler asks), on a thread of its own: the change then
-    // finds it on each GPU's ledger.
-    let (id, worlds) = (resize.id, resize.keep_weights.clone());
+    // memory on every node first, and move their weights to host memory when
+    // asked (the deployment's claims cover every node, so the first
+    // scheduler asks), on a thread of its own: the change then finds it on
+    // each GPU's ledger. The answer carries each node's report of the
+    // weights kept, wrapped as `{"kept": ...}`, before the schedulers'.
+    let (id, worlds, to_host) = (
+        resize.id,
+        resize.keep_weights.clone(),
+        resize.keep_in_host_memory,
+    );
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
         .name("keep-weights".to_owned())
         .spawn(move || {
-            let kept = routing.slots.first().map_or(Ok(()), |slot| {
-                match slot.handle.keep_weights(worlds).recv() {
+            let kept = routing.slots.first().map_or(Ok(Vec::new()), |slot| {
+                match slot.handle.keep_weights(worlds, to_host).recv() {
                     Ok(kept) => kept,
                     Err(_) => Err("a scheduler stopped".to_owned()),
                 }
             });
-            if let Err(error) = kept {
-                routing.send(
-                    front,
-                    Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
-                        id,
-                        results: Vec::new(),
-                        error,
-                    })),
-                );
-                return;
-            }
+            let reports = match kept {
+                Ok(reports) => reports,
+                Err(error) => {
+                    routing.send(
+                        front,
+                        Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
+                            id,
+                            results: Vec::new(),
+                            error,
+                        })),
+                    );
+                    return;
+                }
+            };
+            let reports = reports
+                .into_iter()
+                .map(|report| format!("{{\"kept\":{report}}}"))
+                .collect();
             let answers: Vec<_> = routing
                 .slots
                 .iter()
                 .map(|slot| slot.handle.resize_cache(change))
                 .collect();
-            answer_hooked(id, answers, front, &routing);
+            answer_hooked_after(id, reports, answers, front, &routing);
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "the keep-weights thread did not start");
@@ -780,11 +793,22 @@ fn answer_hooked(
     front: usize,
     routing: &Arc<Routing>,
 ) {
+    answer_hooked_after(id, Vec::new(), answers, front, routing);
+}
+
+/// [`answer_hooked`], with `first` before the schedulers' results.
+fn answer_hooked_after(
+    id: u64,
+    first: Vec<String>,
+    answers: Vec<crossbeam_channel::Receiver<Result<Vec<String>, String>>>,
+    front: usize,
+    routing: &Arc<Routing>,
+) {
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
         .name("worker-hook".to_owned())
         .spawn(move || {
-            let mut results = Vec::new();
+            let mut results = first;
             let mut error = String::new();
             for answer in answers {
                 match answer.recv() {

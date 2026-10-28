@@ -11,6 +11,13 @@
 //! the node ends (`retire`): the world a commit superseded, or the world a
 //! rollback discarded.
 //!
+//! A previous world kept in host memory on trial (`KeepWeights` with
+//! `to_host`) has its weights moved there by the server's Transfer Server
+//! (`Request::Offload`). Every claim of a world returns that world's weights
+//! to the GPUs they left before it is answered (`Request::Restore`), after
+//! the worlds it retires released their memory: a world started again at a
+//! rollback claims, and its workers then map its weights where they were.
+//!
 //! A server of an earlier protocol than this build's is restarted with this
 //! daemon's executable before the deployment is claimed: the successor goes
 //! on with every connection and every allocation it holds.
@@ -19,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
-use proto::process::{Claim, Claimed};
+use proto::process::{Claim, Claimed, WeightsKept};
 
 /// Longest a Storage Server this daemon starts takes to listen.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -95,6 +102,7 @@ impl ClaimHolder {
         };
         if let Some(held) = self.held.get_mut(&claim.deployment) {
             if claim.retire.is_empty() && held.worlds.get(&claim.world) == Some(&scopes) {
+                restore(&mut held.client, &claim.deployment, claim.world)?;
                 return Ok(held.claimed.clone());
             }
             held.client
@@ -107,6 +115,7 @@ impl ClaimHolder {
             for world in &claim.retire {
                 held.worlds.remove(world);
             }
+            restore(&mut held.client, &claim.deployment, claim.world)?;
             held.worlds.insert(claim.world, scopes);
             tracing::info!(
                 deployment = %claim.deployment,
@@ -142,6 +151,7 @@ impl ClaimHolder {
                 claim.retire.clone(),
             )
             .with_context(|| format!("claiming deployment {}", claim.deployment))?;
+        restore(&mut client, &claim.deployment, claim.world)?;
         // A server another process started may accept no other node.
         let tcp = match client
             .call(&storage::protocol::Request::Endpoint, &[])?
@@ -174,13 +184,22 @@ impl ClaimHolder {
 
     /// Has this node's Storage Server keep the weights alone of `worlds` of
     /// `deployment` (`Request::KeepWeights`), over the claim this daemon
-    /// holds; returns how many storages it released.
+    /// holds, and with `to_host` move them to host memory
+    /// (`Request::Offload`). Returns how many storages it released, the
+    /// bytes it moved, and why it kept the weights on the GPUs when the
+    /// server refused or failed the move: the weights then stay where they
+    /// are, as a previous world kept as its weights keeps them.
     ///
     /// # Errors
     ///
     /// Fails when this daemon holds no claim of the deployment, or the
-    /// server cannot be reached or refuses.
-    pub(crate) fn keep_weights(&mut self, deployment: &str, worlds: &[u64]) -> anyhow::Result<u64> {
+    /// server cannot be reached or refuses to keep the weights alone.
+    pub(crate) fn keep_weights(
+        &mut self,
+        deployment: &str,
+        worlds: &[u64],
+        to_host: bool,
+    ) -> anyhow::Result<WeightsKept> {
         use anyhow::Context as _;
 
         let held = self
@@ -197,7 +216,34 @@ impl ClaimHolder {
             released,
             "worlds keep their weights alone"
         );
-        Ok(released)
+        let mut kept = WeightsKept {
+            released,
+            ..WeightsKept::default()
+        };
+        if !to_host {
+            return Ok(kept);
+        }
+        for &world in worlds {
+            match held.client.move_weights(world, true) {
+                Ok((storages, bytes)) => {
+                    kept.moved_bytes += bytes;
+                    tracing::info!(
+                        deployment,
+                        world,
+                        storages,
+                        bytes,
+                        "a world's weights moved to host memory"
+                    );
+                }
+                // A world that cannot is kept as its weights on the GPUs.
+                Err(error) => {
+                    tracing::warn!(deployment, world, %error, "a world's weights stay on the GPUs");
+                    kept.refused = format!("world {world}: {error}");
+                    break;
+                }
+            }
+        }
+        Ok(kept)
     }
 
     /// The memory ledgers this node's Storage Server keeps for
@@ -262,6 +308,27 @@ impl ClaimHolder {
             std::thread::sleep(RESTART_POLL);
         }
     }
+}
+
+/// Returns `world`'s weights that an offload left in host memory to the
+/// GPUs they left (`Request::Restore`), which answers at once when there
+/// are none.
+fn restore(client: &mut storage::Client, deployment: &str, world: u64) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let (storages, bytes) = client
+        .move_weights(world, false)
+        .with_context(|| format!("returning the weights of world {world} to its GPUs"))?;
+    if storages > 0 {
+        tracing::info!(
+            deployment,
+            world,
+            storages,
+            bytes,
+            "a world's weights returned from host memory"
+        );
+    }
+    Ok(())
 }
 
 /// A node's claims as a daemon hands them to its successor in a hot

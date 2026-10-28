@@ -1455,11 +1455,17 @@ pub trait Executor: Send {
         Ok(())
     }
     /// Keeps the weights alone of every world of `worlds` on the nodes of
-    /// the executor's workers (`Claims::keep_weights`). The default suits an
-    /// executor that retains no memory.
-    fn keep_weights(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
-        let _ = worlds;
-        Ok(())
+    /// the executor's workers, in host memory when `to_host`
+    /// (`Claims::keep_weights`), and returns each node's report. The default
+    /// suits an executor that retains no memory, which has no node to
+    /// report.
+    fn keep_weights(
+        &mut self,
+        worlds: &[u64],
+        to_host: bool,
+    ) -> Result<Vec<String>, ExecutorError> {
+        let _ = (worlds, to_host);
+        Ok(Vec::new())
     }
     /// The memory ledgers of the nodes of the executor's workers
     /// (`Claims::ledgers`): for each node, JSON of `{"host": ..., "ledgers":

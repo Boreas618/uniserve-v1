@@ -1129,13 +1129,14 @@ impl SchedulerHandle {
     }
 
     /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
-    /// workers, which the deployment's claims cover; the receiver gets
-    /// whether it did.
+    /// workers, which the deployment's claims cover, in host memory when
+    /// `to_host`; the receiver gets each node's report.
     pub fn keep_weights(
         &self,
         worlds: Vec<u64>,
-    ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.keep_weights(worlds)
+        to_host: bool,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.keep_weights(worlds, to_host)
     }
 
     /// Reads the memory ledgers of the nodes of the scheduler's workers,

@@ -131,8 +131,13 @@ pub(crate) struct Trial {
     pub(crate) previous_spec: wire::EngineSpec,
     pub(crate) previous_config: ServeConfig,
     pub(crate) previous: Previous,
-    /// The previous world's retention mode, as the status reports it.
+    /// The previous world's retention mode, as the status reports it: the
+    /// mode the update asked for, or `weights` when its weights could not
+    /// move to host memory.
     pub(crate) mode: PreviousWorld,
+    /// Why the previous world's weights stayed on the GPUs when the update
+    /// asked to keep them in host memory: each node's refusal.
+    pub(crate) host_refused: Option<String>,
     pub(crate) promoted: Instant,
     pub(crate) promoted_at: f64,
     /// The previous world's step time and throughput before the promotion.
@@ -460,12 +465,19 @@ fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 async fn memory_plan(
     running: &EngineClient,
     successor: Successor,
+    to_host: bool,
 ) -> (serde_json::Value, Option<String>) {
     match running
         .make_room(wire::CacheChange::Plan, successor, None)
         .await
     {
-        Ok(results) => (memory_report(&results), None),
+        Ok(results) => {
+            // The previous world kept in host memory moves the weights the
+            // successor does not map: all of the serving world's weights on
+            // each GPU, at most, when the successor loads its own.
+            let moved = to_host && successor.loads_weights;
+            (memory_report(&results, moved), None)
+        }
         Err(refusal) => (
             serde_json::json!({ "feasible": false, "refusal": refusal }),
             Some(refusal),
@@ -475,13 +487,24 @@ async fn memory_plan(
 
 /// The memory report of the engine's per-device plans (`ledger::Preparing`
 /// of the engine, as JSON): each GPU's, and each host's admission of new
-/// host memory, which a successor sharing the serving world's page pools
-/// does not need.
-fn memory_report(plans: &[String]) -> serde_json::Value {
+/// host memory. A successor sharing the serving world's page pools needs
+/// none; with `weights_to_host`, the previous world's weights move to host
+/// memory once it is kept there, which each host's admission must hold, or
+/// they stay on the GPUs (`update_config.previous_world = "weights"`).
+fn memory_report(plans: &[String], weights_to_host: bool) -> serde_json::Value {
     let gpus: Vec<serde_json::Value> = plans
         .iter()
         .filter_map(|plan| serde_json::from_str(plan).ok())
         .collect();
+    // The serving world's weights on each GPU of each host, once per GPU
+    // however many of its workers report it.
+    let mut weights: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for gpu in &gpus {
+        if let (Some(host), Some(device)) = (gpu["host"].as_str(), gpu["gpu"].as_str()) {
+            let bytes = gpu["serving"]["weights"].as_u64().unwrap_or(0);
+            weights.insert((host.to_owned(), device.to_owned()), bytes);
+        }
+    }
     let mut hosts: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for gpu in &gpus {
         let (Some(host), Some(memory)) = (gpu["host"].as_str(), gpu.get("host_memory")) else {
@@ -492,6 +515,15 @@ fn memory_report(plans: &[String]) -> serde_json::Value {
             .unwrap_or(0)
             .saturating_sub(memory["reserve"].as_u64().unwrap_or(0))
             .saturating_sub(memory["pools_unallocated"].as_u64().unwrap_or(0));
+        let required: u64 = if weights_to_host {
+            weights
+                .iter()
+                .filter(|((on, _), _)| on == host)
+                .map(|(_, bytes)| bytes)
+                .sum()
+        } else {
+            0
+        };
         hosts.entry(host.to_owned()).or_insert_with(|| {
             serde_json::json!({
                 "host": host,
@@ -499,8 +531,9 @@ fn memory_report(plans: &[String]) -> serde_json::Value {
                 "reserve": memory["reserve"],
                 "pools_unallocated": memory["pools_unallocated"],
                 "admits": room,
-                "required": 0,
-                "feasible": true,
+                "required": required,
+                "previous_world_weights": weights_to_host.then_some(required),
+                "feasible": required <= room,
             })
         });
     }
@@ -656,7 +689,14 @@ impl Leader {
         // memory ledger first: the serving world's KV cache limit beside a
         // successor, per GPU and host (`specs/online-operations.md` §6.6).
         let memory = if world_changes && !in_place && unmapped.is_empty() {
-            Some(memory_plan(&running, successor).await)
+            Some(
+                memory_plan(
+                    &running,
+                    successor,
+                    update.previous_world == PreviousWorld::Host,
+                )
+                .await,
+            )
         } else {
             None
         };
@@ -721,14 +761,6 @@ impl Leader {
                  divided alike",
                 unmapped.join(", ")
             )));
-        }
-        if update.previous_world == PreviousWorld::Host {
-            return Err(UpdateError::Refused(
-                "`update_config.previous_world = \"host\"` moves the previous world's weights \
-                 through the host's Transfer Server, which this deployment's Storage Server \
-                 does not run"
-                    .to_owned(),
-            ));
         }
         // A successor that does not fit beside the serving world on some
         // GPU is refused before anything starts, naming each item there.
@@ -814,7 +846,10 @@ impl Leader {
                 return Err(error.into());
             }
         };
-        let memory = memory_report(&shrunk);
+        let memory = memory_report(
+            &shrunk,
+            update.previous_world == PreviousWorld::Host && adds.loads_weights,
+        );
         // A successor of another parallel configuration lays its cache out
         // for the heads it holds, and one of another encoding cannot read the
         // serving world's: either maps none of its segments.
@@ -962,14 +997,58 @@ impl Leader {
         // freed: a previous world kept as its weights released, with its
         // processes, their graph pools and process memory, and keeps its
         // weights alone, so every other storage of it the successor does
-        // not map is released first. Each GPU's ledger leaves the successor
-        // all of it at once.
-        let grown = match &previous {
-            Previous::Parked(_) => successor.resize_cache(wire::CacheChange::Grow).await,
-            Previous::Weights => successor.grow_keeping_weights(vec![previous_world]).await,
-        };
-        if let Err(error) = grown {
-            warn!("the successor's KV cache did not grow: {error}");
+        // not map is released first; kept in host memory, its weights that
+        // the successor does not map move there too. Each GPU's ledger
+        // leaves the successor all of it at once. A node that cannot move
+        // the weights (no Transfer Server, or more than the host admits)
+        // keeps them on its GPUs, and the previous world is kept as its
+        // weights.
+        let to_host = update.previous_world == PreviousWorld::Host;
+        let mut mode = update.previous_world;
+        let mut host_refused = None;
+        let mut moved_bytes = 0;
+        match &previous {
+            Previous::Parked(_) => {
+                if let Err(error) = successor.resize_cache(wire::CacheChange::Grow).await {
+                    warn!("the successor's KV cache did not grow: {error}");
+                }
+            }
+            Previous::Weights => {
+                match successor
+                    .grow_keeping_weights(vec![previous_world], to_host)
+                    .await
+                {
+                    Ok(nodes) => {
+                        let refusals: Vec<String> = nodes
+                            .iter()
+                            .filter_map(|node| {
+                                let refused = node["refused"].as_str()?;
+                                Some(format!("{}: {refused}", node["host"].as_str()?))
+                            })
+                            .collect();
+                        moved_bytes = nodes
+                            .iter()
+                            .filter_map(|node| node["moved_bytes"].as_u64())
+                            .sum::<u64>();
+                        if !refusals.is_empty() {
+                            host_refused = Some(refusals.join("; "));
+                        }
+                    }
+                    Err(error) => {
+                        warn!("the successor's KV cache did not grow: {error}");
+                        if to_host {
+                            host_refused = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(refused) = &host_refused {
+            warn!(
+                refused,
+                "the previous world's weights stay on the GPUs: it is kept as its weights"
+            );
+            mode = PreviousWorld::Weights;
         }
 
         let mut served_spec = spec;
@@ -982,7 +1061,9 @@ impl Leader {
             "prepare_seconds": prepare.as_secs_f64(),
             "park_seconds": parked.as_secs_f64(),
             "pause_seconds": pause.as_secs_f64(),
-            "previous_world_kept": update.previous_world,
+            "previous_world_kept": mode,
+            "host_refused": host_refused,
+            "moved_to_host_bytes": to_host.then_some(moved_bytes),
             "numerics": if numerics_change { "changed" } else { "unchanged" },
             "parallel": if redistributes { "changed" } else { "unchanged" },
             "in_flight": if numerics_change { Some(in_flight) } else { None },
@@ -1007,7 +1088,8 @@ impl Leader {
                 previous_spec: served,
                 previous_config: current,
                 previous,
-                mode: update.previous_world,
+                mode,
+                host_refused,
                 promoted: paused,
                 promoted_at: now(),
                 baseline,
@@ -1170,6 +1252,7 @@ impl Leader {
                 "world": trial.world,
                 "previous_world": trial.previous_world,
                 "previous_world_kept": trial.mode,
+                "host_refused": trial.host_refused,
                 "seconds": trial.promoted.elapsed().as_secs_f64(),
                 "promoted_at": trial.promoted_at,
                 "pause_seconds": trial.pause.as_secs_f64(),
