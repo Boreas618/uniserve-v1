@@ -81,7 +81,7 @@ impl Scheduler {
                     .unwrap_or(usize::MAX)
                     .saturating_mul(usize::from(state.req.image.cfg_branch_count().max(1)))
             }
-            CallKind::Forward(ForwardMode::Verify) => 1 + call.input_token_ids.len(),
+            CallKind::Forward(ForwardMode::Verify) => 1 + generation::verify_drafts(call).len(),
             _ => call.bounds.max_tokens as usize,
         }
     }
@@ -236,9 +236,13 @@ impl Scheduler {
                 continue;
             }
             let next_type = self.peek_next_call_variant(id);
+            // A decoding request whose draft cache is missing takes a refill
+            // chunk, a prefill, from the budget a prefill pass leaves.
+            let refill = pass_kind != Some(BatchKind::Decode) && self.refill_due(id);
             // The batch kind check rejects only a prefill call in a decode
             // pass or the reverse; `BatchKind::Media` calls pass.
-            if let (Some(target), Some(call_variant)) = (pass_kind, next_type)
+            if !refill
+                && let (Some(target), Some(call_variant)) = (pass_kind, next_type)
                 && {
                     let candidate_kind = batch_kind(call_variant);
                     matches!(candidate_kind, BatchKind::Prefill | BatchKind::Decode)
@@ -258,7 +262,12 @@ impl Scheduler {
                 continue;
             }
             // Build one call when its exact resident resources fit.
-            if let Some(mut call) = self.next_generation_call(id, budget, rows_left) {
+            let planned = if refill {
+                self.plan_refill(id, budget)
+            } else {
+                self.next_generation_call(id, budget, rows_left)
+            };
+            if let Some(mut call) = planned {
                 // A context prefill plans within the pass's context rows;
                 // otherwise it waits for a later pass, as a call without
                 // resources does below.
@@ -515,6 +524,10 @@ impl Scheduler {
             let kind = batch_kind(call_type);
             if kind == BatchKind::Media || !self.can_schedule_next(id) {
                 continue;
+            }
+            // A refill of a missing draft cache is prefill work.
+            if self.refill_due(id) {
+                prefill_ready = true;
             }
             match kind {
                 BatchKind::Decode if state.req.is_readout() => readout_ready = true,

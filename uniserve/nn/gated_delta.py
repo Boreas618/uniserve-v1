@@ -12,6 +12,17 @@ The layer is a cache layer kept per request slot
 state live in its slot from one forward to the next, and its checkpoints at
 token prefixes in the pool's state group
 (:mod:`uniserve.prefix_cache.checkpoints`).
+
+A verification forward (:func:`uniserve.prefix_cache.slots.verification`)
+evaluates each row's tokens one recurrence step at a time, the arithmetic
+of a decode step, and leaves the rows' slots as they were: only the
+verification knows how many of a row's tokens its request accepts. It
+then advances each slot over its accepted tokens from the same inputs, so
+the state a request keeps is the one decoding those tokens would have left,
+whatever drafts followed them. A forward whose rows keep no state
+(:func:`uniserve.prefix_cache.slots.kept`, a request's earlier tokens
+evaluated again) leaves their slots unchanged and writes only their
+checkpoints.
 """
 
 from __future__ import annotations
@@ -228,6 +239,19 @@ class GatedDeltaNet(nn.Module):
         prefixes = _prefixes(attention)
         slot_rows = slots.rows()
         stateful = binding is not None and slot_rows is not None
+        verification = slots.verification()
+        if stateful and verification is not None:
+            return self._verify(
+                binding,
+                attention,
+                mixed,
+                a,
+                b,
+                slot_rows[:rows],
+                offsets,
+                prefixes,
+                verification,
+            )
 
         # Each row's state at its prefix: its checkpoint, its slot's state,
         # or zero for a request's first forward. Without a cache binding
@@ -347,10 +371,15 @@ class GatedDeltaNet(nn.Module):
                     },
                     written,
                 )
-            # Every row of a chain stores the chain's final state.
+            # Every row of a chain stores the chain's final state; a row
+            # that keeps none stores into the padding slot, which no request
+            # reads.
+            kept = slots.kept()
             recurrent.keep(
                 binding,
-                slot_rows[:rows],
+                slot_rows[:rows]
+                if kept is None
+                else torch.where(kept[:rows], slot_rows[:rows], 0),
                 {
                     "conv.values": final_window,
                     "conv.initialized": flags,
@@ -359,6 +388,176 @@ class GatedDeltaNet(nn.Module):
                 },
             )
         return output.to(mixed.dtype)
+
+    def _verify(
+        self,
+        binding,
+        attention: AttentionBatch,
+        mixed: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        rows: torch.Tensor,
+        offsets: torch.Tensor,
+        prefixes: torch.Tensor,
+        verification: slots.Verification,
+    ) -> torch.Tensor:
+        """Evaluate verification rows and defer their slots' advance.
+
+        Each row's tokens run one recurrence step at a time from its state
+        at its prefix; the slots and checkpoints stay as they were. The
+        verification's acceptance then advances each slot over its accepted
+        tokens (:meth:`_accept`), reading this forward's inputs, which it
+        keeps until then.
+        """
+        lengths = offsets[1:] - offsets[:-1]
+        steps = _steps_bound(attention, mixed.shape[0])
+        initial = recurrent.resume(binding, attention, rows)
+        output, _, _, _, _ = self._advance(
+            mixed,
+            a,
+            b,
+            initial["conv.values"].to(mixed.dtype),
+            initial["recurrent.values"].float(),
+            offsets,
+            lengths,
+            steps,
+        )
+
+        def accept(counts: torch.Tensor) -> None:
+            self._accept(
+                binding,
+                attention,
+                mixed,
+                a,
+                b,
+                rows,
+                offsets,
+                prefixes,
+                steps,
+                counts,
+            )
+
+        verification.defer(accept)
+        return output.to(mixed.dtype)
+
+    def _accept(
+        self,
+        binding,
+        attention: AttentionBatch,
+        mixed: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        rows: torch.Tensor,
+        offsets: torch.Tensor,
+        prefixes: torch.Tensor,
+        steps: int,
+        counts: torch.Tensor,
+    ) -> None:
+        """Advance each verification row's slot over its first ``counts``
+        tokens, int64 ``[rows]`` (zero leaves a slot as it was).
+
+        The steps repeat the verification forward's from the same state and
+        inputs, so the kept state is the forward's after those tokens. A
+        row whose accepted tokens reach a page boundary its tables give a
+        checkpoint writes its state there.
+        """  # noqa: D205
+        initial = recurrent.resume(binding, attention, rows)
+        checkpoints = binding.checkpoints
+        boundary = None
+        if checkpoints is not None:
+            interval = checkpoints.interval
+            reached = (prefixes + counts) // interval * interval
+            pages = torch.where(reached > prefixes, reached // interval - 1, -1)
+            units = checkpoints.units(attention, pages)
+            boundary = torch.where(units[:, 0] != 0, reached, -1)
+        _, window, state, snapshot_window, snapshot = self._advance(
+            mixed,
+            a,
+            b,
+            initial["conv.values"].to(mixed.dtype),
+            initial["recurrent.values"].float(),
+            offsets,
+            counts,
+            steps,
+            prefixes=prefixes,
+            boundary=boundary,
+        )
+        flags = torch.ones(rows.shape[0], dtype=torch.bool, device=rows.device)
+        if boundary is not None:
+            checkpoints.write(
+                units,
+                {
+                    "conv.values": snapshot_window,
+                    "conv.initialized": flags,
+                    "recurrent.values": snapshot,
+                    "recurrent.initialized": flags,
+                },
+                boundary >= 0,
+            )
+        recurrent.keep(
+            binding,
+            rows,
+            {
+                "conv.values": window,
+                "conv.initialized": flags,
+                "recurrent.values": state,
+                "recurrent.initialized": flags,
+            },
+        )
+
+    def _advance(
+        self,
+        mixed: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        window: torch.Tensor,
+        state: torch.Tensor,
+        offsets: torch.Tensor,
+        lengths: torch.Tensor,
+        steps: int,
+        *,
+        prefixes: torch.Tensor | None = None,
+        boundary: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Step each row through its first ``lengths`` tokens, one at a time.
+
+        Row ``r``'s tokens start at ``offsets[r]``; ``steps`` bounds every
+        length. Returns each token's output (``[tokens, heads, value_dim]``,
+        zero for tokens past their row's length), each row's window and
+        state after its tokens, and its window and state after the token
+        ending at ``boundary`` (an absolute position, -1 for none; rows
+        start at ``prefixes``), the final ones where it reaches none.
+        """
+        tokens = mixed.shape[0]
+        starts = offsets[:-1]
+        heads = len(self.value_heads)
+        output = torch.zeros(
+            (tokens + 1, heads, self.value_dim),
+            dtype=torch.float32,
+            device=mixed.device,
+        )
+        snapshot_window, snapshot = window, state
+        last = max(tokens - 1, 0)
+        for step in range(steps):
+            live = step < lengths
+            index = (starts + step).clamp(0, last)
+            out, shifted, stepped = self._step(
+                mixed[index], a[index], b[index], window, state
+            )
+            window = torch.where(live.view(-1, 1, 1), shifted, window)
+            state = torch.where(live.view(-1, 1, 1, 1), stepped, state)
+            # A row's output belongs to its token; a row past its length
+            # writes the extra row, which no token reads.
+            output.index_copy_(0, torch.where(live, index, tokens), out)
+            if boundary is not None and prefixes is not None:
+                hit = live & (prefixes + step + 1 == boundary)
+                snapshot_window = torch.where(
+                    hit.view(-1, 1, 1), window, snapshot_window
+                )
+                snapshot = torch.where(hit.view(-1, 1, 1, 1), state, snapshot)
+        if boundary is None:
+            snapshot_window, snapshot = window, state
+        return output[:tokens], window, state, snapshot_window, snapshot
 
     def _heads(
         self, convolved: torch.Tensor
@@ -394,6 +593,29 @@ class GatedDeltaNet(nn.Module):
         )
         return gate, beta
 
+    def _step(self, current, a, b, window, state):
+        """One token of each row: its convolution and recurrence step.
+
+        ``current`` is each row's projected channels ``[rows, channels]``,
+        ``a`` and ``b`` its decay and write inputs ``[rows, heads]``,
+        ``window`` and ``state`` its convolution window and recurrent state
+        before the token. Returns the token's output and the window and
+        state after it.
+        """
+        kernel = self.kernel
+        taps = self.conv_weight[:, 0, :].float()
+        total = current.float() * taps[:, kernel - 1] + (
+            window.float() * taps[:, : kernel - 1]
+        ).sum(-1)
+        convolved = F.silu(total.to(current.dtype))
+        shifted = torch.cat((window[..., 1:], current.unsqueeze(-1)), dim=-1)
+        query, key, value = self._heads(convolved)
+        gate, beta = self._gates(a, b)
+        output, stepped = functional.gated_delta_step(
+            query, key, value, gate, beta, state
+        )
+        return output, shifted, stepped
+
     def _steps(self, mixed, a, b, window, state, offsets):
         """One token per row; a row without tokens keeps its state.
 
@@ -405,21 +627,10 @@ class GatedDeltaNet(nn.Module):
         lengths = offsets[1:] - offsets[:-1]
         live = lengths > 0
         first = offsets[:-1].clamp(0, max(tokens - 1, 0))
-        current = mixed[first]
-        kernel = self.kernel
-        taps = self.conv_weight[:, 0, :].float()
-        total = current.float() * taps[:, kernel - 1] + (
-            window.float() * taps[:, : kernel - 1]
-        ).sum(-1)
-        convolved = F.silu(total.to(mixed.dtype))
-        shifted = torch.cat((window[..., 1:], current.unsqueeze(-1)), dim=-1)
-        final_window = torch.where(live.view(-1, 1, 1), shifted, window)
-
-        query, key, value = self._heads(convolved)
-        gate, beta = self._gates(a[first], b[first])
-        output, stepped = functional.gated_delta_step(
-            query, key, value, gate, beta, state
+        output, shifted, stepped = self._step(
+            mixed[first], a[first], b[first], window, state
         )
+        final_window = torch.where(live.view(-1, 1, 1), shifted, window)
         last = torch.where(live.view(-1, 1, 1, 1), stepped, state)
 
         # Each row's output belongs to its one token; tokens past every row
@@ -448,6 +659,16 @@ def _host_lengths(
             return None
         return prefixes.host, queries.host
     return None
+
+
+def _steps_bound(attention: AttentionBatch, tokens: int) -> int:
+    """The most tokens any row of ``attention`` holds: from the host
+    mirrors of the lengths, else ``tokens``, the forward's.
+    """  # noqa: D205
+    host = _host_lengths(attention)
+    if host is None:
+        return tokens
+    return max(host[1], default=0)
 
 
 def _crossings(

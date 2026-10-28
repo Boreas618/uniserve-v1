@@ -34,6 +34,10 @@ in prompt order, and its speculation, the draft tokens and the one-based
 terminal draft prefix, or -1. A call's record locates its tail by record
 word offset.
 
+A call that proposes drafts (:attr:`CallField.PROPOSALS`) names its
+proposed draft tokens with its range words (:attr:`RecordFlag.PROPOSALS`):
+one output word per draft, in order.
+
 Every offset into the output words is relative to the start of the words
 lent to the batch.
 """
@@ -109,6 +113,13 @@ class CallField(IntEnum):
     # The call's request key, checked against the slot's request.
     REQUEST_ID = 18
     EPOCH = 19
+    # Draft tokens the call proposes after its last committed token for
+    # its request's next verification; 0 for none.
+    PROPOSALS = 20
+    # The token after the call's last input token, which the draft cache
+    # entry of its last position reads; -1 when the call samples it or
+    # knows none.
+    LOOKAHEAD = 21
 
 
 CALL_FIELDS = len(CallField)
@@ -154,6 +165,10 @@ class CallFlag(IntFlag):
     SAMPLING_STATE = 1 << 5
     FEATURES = 1 << 6
     READOUT = 1 << 7
+    # The call evaluates tokens its request's cache already holds, from the
+    # state checkpoint at its first token, to fill its draft cache: it
+    # writes no K/V of the target and keeps no per-request state.
+    DRAFT_REFILL = 1 << 8
 
 
 class ForwardField(IntEnum):
@@ -246,7 +261,9 @@ class RecordField(IntEnum):
     SAMPLING_OFFSET = 5
     SAMPLING_EXTENT = 6
     SAMPLING_ROW = 7
-    # The call's sampled logprobs: segment index and packed row.
+    # The call's sampled logprobs: segment index and packed row. A
+    # verification's rows for its drafts' positions follow that row, one per
+    # position it may commit.
     LOGPROB_SEGMENT = 8
     LOGPROB_ROW = 9
     # The call's candidate or canvas words: output word offset and count.
@@ -279,10 +296,12 @@ class RecordFlag(IntFlag):
     CANVAS = 1 << 6
     SPECULATION = 1 << 7
     PROMPT_LOGITS_READY = 1 << 8
+    # The range words hold the call's proposed draft tokens.
+    PROPOSALS = 1 << 9
 
 
 # "TKRC" in the high word, the record layout version in the low word.
-RECORD_VERSION = 2
+RECORD_VERSION = 3
 RECORD_MAGIC = (0x544B_5243 << 32) | RECORD_VERSION
 
 
@@ -419,11 +438,19 @@ class RecordWriter:
         offset: np.ndarray,
         count: np.ndarray,
         canvas: bool = False,
+        proposals: bool = False,
     ) -> None:
-        """Set ``calls``' candidate (or ``canvas``) output words."""
+        """Set ``calls``' candidate (or ``canvas``, or proposed draft)
+        output words.
+        """  # noqa: D205
         index = np.asarray(calls, dtype=np.int64)
         self._flag(
-            index, RecordFlag.CANVAS if canvas else RecordFlag.CANDIDATES
+            index,
+            RecordFlag.PROPOSALS
+            if proposals
+            else RecordFlag.CANVAS
+            if canvas
+            else RecordFlag.CANDIDATES,
         )
         self.calls[index, RecordField.RANGE_OFFSET] = offset
         self.calls[index, RecordField.RANGE_COUNT] = count

@@ -60,6 +60,7 @@ fn ar_decode_call() -> Call {
         transition_output: None,
 
         input_image: None,
+        draft: Default::default(),
         cache_input: None,
         cache_output: None,
         input_token_ids: Vec::new(),
@@ -111,6 +112,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         transition_output: None,
 
         input_image: None,
+        draft: Default::default(),
         cache_input: (kind == CallKind::Transfer(TransferMode::CacheInstall)).then_some(BufferId {
             owner: request_key(),
             producer_call_id: CallId::new(1, 0),
@@ -154,8 +156,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
 
 fn completion_record() -> CallOutput {
     CallOutput {
-        sampled_logprob: Some(-0.25),
-        top_logprobs: vec![
+        token_logprobs: vec![vec![
             TokenLogprob {
                 token_id: 271,
                 logprob: -0.25,
@@ -166,7 +167,7 @@ fn completion_record() -> CallOutput {
                 logprob: f32::NEG_INFINITY,
                 rank: 1000,
             },
-        ],
+        ]],
         prompt_logprobs: vec![vec![TokenLogprob {
             token_id: 7,
             logprob: -0.5,
@@ -189,6 +190,7 @@ fn completion_record() -> CallOutput {
         finish_flags: FinishFlags::default(),
         media_output: None,
         cache_output: None,
+        draft_token_ids: Vec::new(),
     }
 }
 
@@ -454,8 +456,7 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
 
     let mut record = completion_record();
     record.call_id = call_id;
-    record.sampled_logprob = None;
-    record.top_logprobs.clear();
+    record.token_logprobs.clear();
     record.prompt_logprobs.clear();
     record.committed_tokens.clear();
     record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
@@ -540,8 +541,7 @@ fn a_canvas_step_its_sampling_and_its_block_round_trip() {
 
     let mut record = completion_record();
     record.call_id = CallId::new(6, 0);
-    record.sampled_logprob = None;
-    record.top_logprobs.clear();
+    record.token_logprobs.clear();
     record.prompt_logprobs.clear();
     record.committed_tokens = (0..256).collect();
     let report = batch_output(6, vec![record], Vec::new(), None, None);
@@ -658,6 +658,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             transition_output: None,
 
             input_image: None,
+            draft: Default::default(),
             cache_input: None,
             cache_output: None,
             input_token_ids: Vec::new(),
@@ -1746,6 +1747,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             transition_output: None,
 
             input_image: None,
+            draft: Default::default(),
             cache_input: (kind == CallKind::Transfer(TransferMode::CacheInstall)).then_some(
                 BufferId {
                     owner: key,
@@ -1930,8 +1932,7 @@ fn full_forward_stats() -> ForwardStats {
 
 fn full_run_result() -> BatchOutput {
     let mut ok_record = CallOutput {
-        sampled_logprob: None,
-        top_logprobs: Vec::new(),
+        token_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),
         request_key: key_for_request(100),
         call_id: CallId::new(11, 0),
@@ -1959,6 +1960,7 @@ fn full_run_result() -> BatchOutput {
         },
         media_output: None,
         cache_output: None,
+        draft_token_ids: Vec::new(),
     };
     let mut predicated_record = ok_record.clone();
     predicated_record.request_key = key_for_request(101);

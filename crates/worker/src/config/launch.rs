@@ -406,6 +406,7 @@ fn execution(
         graph_policy: descriptor.graph_policy.clone(),
         decode_graph_batch_sizes: default_decode_sizes(),
         prefill_outputs: descriptor.prefill_outputs,
+        draft_tokens: descriptor.draft_tokens,
         prefill_graph_token_sizes: default_prefill_sizes(),
         flow_graph_shapes: DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
     };

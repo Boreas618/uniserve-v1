@@ -18,14 +18,26 @@ computation (:meth:`TextComputation.execute`):
 3. has the image denoiser write latent conditionings' K/V, plans, stages,
    runs and selects every invocation (as one expert step with
    microbatches), and captures the graphs a warmup forward left to capture;
-4. copies each invocation's completion block, logprob words and prompt
-   scores into the lent words, relays sampled tokens and transition
-   decisions into the computation's staging columns, writes the calls'
-   completion records and keeps each microbatch's commit rows for
-   :meth:`TextComputation.commit`.
+4. in a deployment that speculates, runs the drafter over the positions
+   each text call evaluated (:meth:`TextComputation._draft`): their draft
+   cache entries, and the drafts of the calls that propose;
+5. copies each invocation's completion block, logprob words, prompt
+   scores and proposed drafts into the lent words, relays sampled tokens
+   and transition decisions into the computation's staging columns, writes
+   the calls' completion records and keeps each microbatch's commit rows
+   for :meth:`TextComputation.commit`.
 
 Nothing here advances slot state before the worker sealed the batch:
-:meth:`TextComputation.commit` does, past the batch's commit point.
+:meth:`TextComputation.commit` does, past the batch's commit point. A
+verification's per-request states (a recurrent layer's) are the exception
+the model owns: they advance once its selection accepts each row's tokens,
+before the draft pass reads them.
+
+A draft refill call (:attr:`CallFlag.DRAFT_REFILL`) evaluates tokens its
+request's cache already holds, between the positions its forward row
+states, to fill the request's draft cache: it writes no K/V of the target,
+keeps no per-request state, commits nothing and reports its request's
+progress unchanged.
 """
 
 from __future__ import annotations
@@ -72,11 +84,19 @@ from .protocol import (
 from .rows import (
     Prepared,
     Rows,
+    RowSource,
     TokenSelection,
     logit_layout,
     prepare_calls,
 )
-from .runner import Executed, Invocation, Plan, Relays, TextRunner
+from .runner import (
+    DraftRows,
+    Executed,
+    Invocation,
+    Plan,
+    Relays,
+    TextRunner,
+)
 from .sampling import (
     FINISH_IDS,
     OwnSelection,
@@ -125,14 +145,17 @@ class _Batch:
     # The slot and ``uint8 [1]`` device predicate of each call a predicate
     # gates (:attr:`Predicate.DEVICE`).
     predicates: list[tuple[int, torch.Tensor]]
-    # Per call of the batch: its task column and microbatch.
+    # Per call of the batch: its task column and microbatch, and whether it
+    # refills its request's draft cache.
     task: np.ndarray = field(init=False)
     microbatch: np.ndarray = field(init=False)
+    refill: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
         count = self.calls.shape[1]
         self.task = np.full(count, -1, dtype=np.int64)
         self.microbatch = np.zeros(count, dtype=np.int64)
+        self.refill = (self.calls[CallField.FLAGS] & CallFlag.DRAFT_REFILL) != 0
 
 
 @dataclass(slots=True)
@@ -150,6 +173,14 @@ class _Planned:
     plan: Plan | None = None
     mode: GraphMode = GraphMode.EAGER
     capture: Callable[[], None] | None = None
+    # The calls that proposed drafts, in proposer order, and how many each
+    # proposed; the ``proposals`` column holds them, ``drafts`` per row.
+    proposers: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int64)
+    )
+    proposed: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int64)
+    )
 
 
 class TextComputation:
@@ -339,6 +370,9 @@ class TextComputation:
             assert item.plan is not None
             item.runner.stage(item.plan, item.invocation)
         capacity = self._run(planned)
+        for item in planned:
+            if item.runner.drafts() and item.plan is not None:
+                self._draft(batch, item)
 
         written = self._outputs(planned, batch, writer, words, lent)
         self._finish(batch, planned, writer)
@@ -429,6 +463,17 @@ class TextComputation:
             columns = forward[:, row]
             rows = prepared.rows
             query = columns[ForwardField.QUERY_LEN]
+            # A draft refill evaluates the earlier tokens its forward row
+            # states, at their own positions (text alone: its logical
+            # positions are its cache positions); its call keeps its
+            # request's coordinates.
+            refill = (calls[CallField.FLAGS, text] & CallFlag.DRAFT_REFILL) != 0
+            if np.any(refill):
+                if np.any(refill & (calls[CallField.KIND, text] != 0)):
+                    raise ValueError("a draft refill is a prefill")
+                start = columns[ForwardField.SEQ_LEN] - query
+                rows.prefix[refill] = start[refill]
+                rows.position[refill] = start[refill]
             if (
                 np.any(columns[ForwardField.REQUEST_POOL_INDEX] != rows.slot)
                 or np.any(query != rows.query)
@@ -643,6 +688,7 @@ class TextComputation:
                 starts=self.tables_of(starts),
                 counts=self.tables_of(counts),
                 embeddings=embeddings,
+                refill=None if media else batch.refill[calls],
             ),
             task_calls=np.zeros(0, dtype=np.int64),
             speculation={},
@@ -1002,6 +1048,107 @@ class TextComputation:
 
         return forward
 
+    def _draft(self, batch: _Batch, item: _Planned) -> None:
+        """Run the drafter over the positions the invocation evaluated.
+
+        Each text call's row writes the draft cache entries of the
+        positions whose next token is known: the tokens it evaluated, the
+        token it sampled, or its lookahead token (:attr:`CallField.
+        LOOKAHEAD`). A verification's row covers its current token and every
+        draft: its selection, the token after the drafts it accepts, takes
+        the position after them on the device, and the entries past it are
+        replaced before any reader reads them. A call whose request's next
+        token it sampled and which asks for proposals (:attr:`CallField.
+        PROPOSALS`) proposes that many drafts after it. Calls placing vision
+        blocks and rows whose first position or prefix the device holds
+        (relayed continuations) write no entries.
+        """
+        invocation = item.invocation
+        if (
+            invocation.embeddings
+            or batch.media
+            and any(int(call) in batch.media for call in item.calls)
+        ):
+            return
+        rows = invocation.rows
+        plan = item.plan
+        assert plan is not None
+        calls = item.calls
+        columns = batch.calls[:, calls]
+        kind = batch.kind
+        tasks = batch.task[calls]
+        offsets = np.cumsum(rows.query) - rows.query
+        token_output = (columns[CallField.FLAGS] & CallFlag.TOKEN_OUTPUT) != 0
+        sampled = (tasks >= 0) & (token_output | (kind != CallKind.PREFILL))
+        lengths = rows.query.astype(np.int64).copy()
+        verify = kind == CallKind.VERIFY
+        lookahead = columns[CallField.LOOKAHEAD]
+        # The last position's next token: the selection, the lookahead, or
+        # none, which leaves the position without an entry.
+        last_known = sampled | (lookahead >= 0)
+        lengths = np.where(last_known, lengths, np.maximum(lengths - 1, 0))
+        relayed = rows.source != RowSource.HOST
+        lengths = np.where(relayed, 0, lengths)
+        live = np.flatnonzero(lengths > 0)
+        if len(live) == 0:
+            return
+
+        # The position, relative to its row's first, whose next token is a
+        # sampling row's selection before its accepted drafts advance it:
+        # a verification's first, another row's last.
+        bases = np.where(verify, 0, lengths - 1)
+        tokens: list[np.ndarray] = []
+        hidden_rows: list[np.ndarray] = []
+        pairs: list[tuple[int, int]] = []
+        cursor = 0
+        for index in live.tolist():
+            length = int(lengths[index])
+            host = rows.host_tokens(index)
+            # Position j's next token is the row's token j + 1, but for the
+            # last position of a row that sampled: its selection (which a
+            # verification's accepted drafts move onto their position), or
+            # else its lookahead.
+            following = np.empty(length, dtype=np.int64)
+            known = length - 1 if sampled[index] else min(length, len(host) - 1)
+            following[:known] = host[1 : 1 + known]
+            if known < length:
+                if sampled[index]:
+                    pairs.append(
+                        (cursor + int(bases[index]), int(tasks[index]))
+                    )
+                    # Any valid id: the selection replaces it when no draft
+                    # is rejected; otherwise the position lies past the
+                    # accepted drafts and its entry is replaced before it
+                    # is read.
+                    following[length - 1] = 0
+                else:
+                    following[length - 1] = int(lookahead[index])
+            tokens.append(following)
+            hidden_rows.append(offsets[index] + np.arange(length))
+            cursor += length
+
+        proposals = columns[CallField.PROPOSALS, live]
+        proposing = np.flatnonzero((proposals > 0) & sampled[live])
+        drafts = int(proposals[proposing].max()) if len(proposing) else 0
+        item.proposers = calls[live[proposing]]
+        item.proposed = proposals[proposing].astype(np.int64)
+        item.runner.draft(
+            plan,
+            DraftRows(
+                slots=rows.slot[live].astype(np.int64),
+                prefixes=rows.prefix[live].astype(np.int64),
+                queries=lengths[live].astype(np.int64),
+                pages=np.asarray(invocation.counts, dtype=np.int64)[:, live],
+                tokens=np.concatenate(tokens),
+                hidden_rows=np.concatenate(hidden_rows).astype(np.int64),
+                pairs=np.asarray(pairs, dtype=np.int64).reshape(-1, 2).T,
+                proposers=proposing.astype(np.int64),
+                bases=bases[live[proposing]].astype(np.int64),
+                tasks=tasks[live[proposing]].astype(np.int64),
+                proposals=drafts,
+            ),
+        )
+
     def _outputs(
         self,
         planned: Sequence[_Planned],
@@ -1066,11 +1213,14 @@ class TextComputation:
                         segment = writer.segment(
                             base, layout.words, layout.rows, layout.counts
                         )
-                        reporting = sampling.logprob_tasks
+                        # Each reporting call names its first row; a
+                        # verification's rows for its later positions
+                        # follow it.
+                        firsts = np.flatnonzero(sampling.logprob_offsets == 0)
                         writer.logprobs(
-                            item.task_calls[reporting],
+                            item.task_calls[sampling.logprob_tasks[firsts]],
                             segment,
-                            np.arange(len(reporting), dtype=np.int64),
+                            firsts.astype(np.int64),
                         )
                 if chunks is not None:
                     for chunk, call in enumerate(chunks.calls.tolist()):
@@ -1087,6 +1237,35 @@ class TextComputation:
                         ranges.extend(
                             (segment, row) for row in range(len(scored.rows))
                         )
+                if len(item.proposers):
+                    # Each proposer's drafts, the first ``proposed`` words of
+                    # its row of the proposals column, packed in proposer
+                    # order: one word per draft its call asked for, which
+                    # the worker leased with the call's words.
+                    counts = item.proposed
+                    extent = int(counts.sum())
+                    start = reserve(extent)
+                    offsets = start + np.cumsum(counts) - counts
+                    proposals = buffers["proposals"]
+                    # Consecutive proposers asking for as many drafts copy
+                    # as one block.
+                    first = 0
+                    while first < len(counts):
+                        count = int(counts[first])
+                        end = first + 1
+                        while end < len(counts) and counts[end] == count:
+                            end += 1
+                        begin = int(offsets[first])
+                        words[begin : begin + (end - first) * count].view(
+                            end - first, count
+                        ).copy_(proposals[first:end, :count], non_blocking=True)
+                        first = end
+                    writer.ranges(
+                        item.proposers,
+                        offsets,
+                        counts,
+                        proposals=True,
+                    )
                 self._relay(item)
         # Tails follow every segment: prompt ranges and speculation.
         speculation = {
@@ -1142,7 +1321,19 @@ class TextComputation:
         computation commits.
         """
         calls = batch.calls
-        active = batch.active
+        # A draft refill commits nothing: its request's progress stays.
+        refills = batch.active[batch.refill[batch.active]]
+        if len(refills):
+            writer.ran(refills)
+            writer.progress(
+                refills,
+                calls[CallField.LOGICAL, refills],
+                calls[CallField.RNG, refills],
+                calls[CallField.VISIBLE, refills],
+                calls[CallField.COMPUTED, refills],
+                calls[CallField.PROMPT_READY, refills] != 0,
+            )
+        active = batch.active[~batch.refill[batch.active]]
         count = len(active)
         prefix = np.zeros(count, dtype=np.int64)
         query = np.zeros(count, dtype=np.int64)

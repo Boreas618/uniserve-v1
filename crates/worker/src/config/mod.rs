@@ -111,6 +111,9 @@ pub struct WorkerConfig {
     pub graph_policy: String,
     pub decode_graph_batch_sizes: Vec<usize>,
     pub prefill_outputs: bool,
+    /// The most draft tokens a call proposes; zero when the deployment does
+    /// not speculate.
+    pub draft_tokens: u32,
     pub prefill_graph_token_sizes: Vec<usize>,
     /// Image capture sizes in (height, width) pixels.
     pub flow_graph_shapes: Vec<(usize, usize)>,

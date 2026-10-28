@@ -359,6 +359,8 @@ pub struct EngineConfig {
     /// scheduler holds before it rejects a submission as overloaded; `None`
     /// queues without bound.
     pub max_queued_requests: Option<usize>,
+    /// When a request whose draft cache is missing has it refilled.
+    pub refill: crate::scheduler::RefillPolicy,
     /// Per-request token ceiling for one prefill chunk.
     pub chunked_prefill_size: usize,
     /// Reuse and retain prompt cache prefixes across requests. Disabling this
@@ -454,6 +456,7 @@ impl EngineConfig {
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
             max_queued_requests: None,
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
+            refill: crate::scheduler::RefillPolicy::default(),
             prefix_cache: true,
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
@@ -860,6 +863,8 @@ impl SchedulerHandle {
                 chunked_prefill_size: config.chunked_prefill_size.max(1),
                 policy: config.schedule_policy,
                 canvas: config.worker_process.canvas_sampling,
+                draft_tokens: config.worker_process.draft_tokens as usize,
+                refill: config.refill,
             },
             config.worker_process.dtype,
             config.generation_limits,

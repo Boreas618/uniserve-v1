@@ -14,9 +14,11 @@
 //!   `HEADER + CALL_WORDS * i`: its [`flag`] bits, its progress (logical position, draws, visible
 //!   and computed lengths, its prompt logits' readiness in a flag), its
 //!   sampling completion (offset, extent and its task among the extent's
-//!   four fields), its sampled logprobs (segment and packed row), a range
-//!   of candidate or canvas words (offset, count), its tail (record word
-//!   index and words, zero without one), and two reserved words;
+//!   four fields), its sampled logprobs (segment and packed row; a
+//!   verification's rows for its drafts' positions follow that row), a range
+//!   of candidate, canvas or proposed draft words (offset, count), its tail
+//!   (record word index and words, zero without one), and two reserved
+//!   words;
 //! - the logprob segments, back to back after the calls: `[offset, count,
 //!   n, rows[n], counts[n]]`, each one packed column of the output words
 //!   (`LogprobLayout`), named by their ordinal;
@@ -40,7 +42,7 @@ use crate::{Error, Result};
 
 /// The first header word: `TKRC` in the high word, the record layout's
 /// version in the low word.
-pub(crate) const MAGIC: i64 = (0x544B_5243 << 32) | 2;
+pub(crate) const MAGIC: i64 = (0x544B_5243 << 32) | 3;
 
 /// Words of the header.
 pub(crate) const HEADER: usize = 12;
@@ -73,8 +75,10 @@ pub(crate) mod flag {
     pub(crate) const SPECULATION: i64 = 1 << 7;
     /// The request's retained prompt logits are ready after the call.
     pub(crate) const PROMPT_LOGITS_READY: i64 = 1 << 8;
+    /// Words 10-11 hold the draft tokens the call proposed, one per word.
+    pub(crate) const PROPOSALS: i64 = 1 << 9;
 
-    pub(super) const ALL: i64 = (1 << 9) - 1;
+    pub(super) const ALL: i64 = (1 << 10) - 1;
 }
 
 /// The record words the worker allocates for a batch of `calls` calls and
@@ -103,6 +107,8 @@ pub(crate) struct CallLimits {
     /// The tokens the slot's block tables hold.
     pub(crate) allocated: u64,
     pub(crate) max_tokens: u64,
+    /// The draft tokens the call may propose.
+    pub(crate) proposals: u64,
 }
 
 /// A call's progress as its record states it.
@@ -122,13 +128,17 @@ pub(crate) struct CallRecord {
     pub(crate) progress: Option<Progress>,
     /// Offset, extent and row of its sampling completion.
     pub(crate) sampling: Option<(usize, usize, usize)>,
-    /// Segment and packed row of its sampled logprobs.
+    /// Segment and packed row of its sampled logprobs. A verification's
+    /// rows follow it in the segment, one per candidate position: its
+    /// current token's, then each draft's.
     pub(crate) logprob: Option<(usize, usize)>,
     /// Segment and packed row of each scored prompt token, in prompt order;
     /// `Some` (possibly empty) for a call that scored its prompt.
     pub(crate) prompt: Option<Vec<(usize, usize)>>,
     pub(crate) candidates: Option<(usize, usize)>,
     pub(crate) canvas: Option<(usize, usize)>,
+    /// Offset and count of the draft tokens the call proposed.
+    pub(crate) proposals: Option<(usize, usize)>,
     /// The drafts a verification scored and the prefix ending at a terminal
     /// draft.
     pub(crate) speculation: Option<(Vec<u32>, Option<usize>)>,
@@ -357,10 +367,25 @@ impl Records {
             if has(flag::LOGPROB) {
                 record.logprob = Some(logprob_row(count(8)?, count(9)?)?);
             }
-            if has(flag::CANDIDATES) && has(flag::CANVAS) {
+            if [flag::CANDIDATES, flag::CANVAS, flag::PROPOSALS]
+                .into_iter()
+                .filter(|&bit| has(bit))
+                .count()
+                > 1
+            {
                 return Err(invalid(format!(
-                    "call {index} reports candidates and a canvas in one range"
+                    "call {index} reports two kinds of words in one range"
                 )));
+            }
+            if has(flag::PROPOSALS) {
+                let (offset, proposed) = range(count(10)?, count(11)?, "draft proposal")?;
+                if proposed as u64 > limit.proposals {
+                    return Err(invalid(format!(
+                        "call {index} proposed {proposed} drafts beyond its {}",
+                        limit.proposals
+                    )));
+                }
+                record.proposals = Some((offset, proposed));
             }
             if has(flag::CANDIDATES) {
                 record.candidates = Some(range(count(10)?, count(11)?, "candidate range")?);
@@ -421,6 +446,11 @@ impl Records {
                     )));
                 }
                 if has(flag::SPECULATION) {
+                    // A verification's logprob rows cover every position
+                    // it may commit.
+                    if let Some((segment, row)) = record.logprob {
+                        logprob_row(segment, row + tokens.len())?;
+                    }
                     record.speculation = Some((tokens, terminal));
                 } else if drafts > 0 {
                     return Err(invalid(format!(
@@ -480,7 +510,16 @@ impl Records {
         output.sampling_range = record
             .sampling
             .map(|(offset, extent, row)| (lent + offset, extent, row));
-        output.logprob_range = record.logprob.map(segment).transpose()?;
+        let positions = record
+            .speculation
+            .as_ref()
+            .map_or(1, |(drafts, _)| drafts.len() + 1);
+        output.logprob_ranges = match record.logprob {
+            Some((first, row)) => (row..row + positions)
+                .map(|row| segment((first, row)))
+                .collect::<Result<_>>()?,
+            None => Vec::new(),
+        };
         if let Some(prompt) = &record.prompt {
             output.prompt_logprob_ranges = prompt
                 .iter()
@@ -491,6 +530,9 @@ impl Records {
             .candidates
             .map(|(offset, count)| (lent + offset, count));
         output.canvas_range = record.canvas.map(|(offset, count)| (lent + offset, count));
+        output.proposal_range = record
+            .proposals
+            .map(|(offset, count)| (lent + offset, count));
         if let Some((drafts, terminal)) = &record.speculation {
             let progress = output.progress;
             output.set_speculation(
@@ -586,16 +628,18 @@ mod tests {
             rng: 2,
             allocated,
             max_tokens,
+            proposals: 0,
         }
     }
 
     /// A decode with sampled logprobs, a skipped call, and a verification
-    /// with prompt-free speculation: records parse into each call's ranges
-    /// and apply to its pending output at the lent offset.
+    /// with prompt-free speculation and a logprob row per position it may
+    /// commit: records parse into each call's ranges and apply to its
+    /// pending output at the lent offset.
     #[test]
     fn records_parse_and_apply_each_calls_ranges() -> Result<()> {
         use flag::*;
-        let mut writer = Writer::new(3, 20);
+        let mut writer = Writer::new(3, 32);
         writer.call(
             0,
             &[
@@ -616,7 +660,7 @@ mod tests {
             &[
                 (
                     0,
-                    RAN | PROGRESS | SAMPLING | SPECULATION | PROMPT_LOGITS_READY,
+                    RAN | PROGRESS | SAMPLING | SPECULATION | PROMPT_LOGITS_READY | LOGPROB,
                 ),
                 (1, 10),
                 (2, 2),
@@ -625,16 +669,21 @@ mod tests {
                 (5, 0),
                 (6, 2 * COMPLETION_FIELDS as i64),
                 (7, 1),
+                (8, 1),
+                (9, 0),
             ],
         );
         // One sampled row (request row 5) with two top tokens: 9 words,
-        // after the two tasks' completion words.
+        // after the two tasks' completion words; then the verification's
+        // four rows, its current token's and its three drafts', without top
+        // tokens: 12 words.
         writer.segment(10, &[5], &[2]);
+        writer.segment(19, &[0, 1, 2, 3], &[0, 0, 0, 0]);
         writer.tail(2, &[0, 3, 21, 22, 23, 2]);
         let (words, used) = writer.finish();
         let limits = [active(16, 1), CallLimits::default(), active(16, 3)];
         let records = Records::parse(&words, used, &limits, 32)?;
-        assert_eq!(records.written, 20);
+        assert_eq!(records.written, 32);
         assert_eq!(records.mode, Some(GraphMode::Replay));
         assert_eq!((records.live_tokens, records.padding_tokens), (3, 8));
         assert_eq!(records.calls[1], CallRecord::default());
@@ -655,12 +704,16 @@ mod tests {
         let mut output = PendingOutput::new(&call, RequestProgress::default(), 2)?;
         records.apply(2, &mut output, 4)?;
         assert_eq!(output.sampling_range, Some((4, 2 * COMPLETION_FIELDS, 1)));
+        assert_eq!(
+            output.logprob_ranges,
+            (0..4).map(|row| (23, 12, row)).collect::<Vec<_>>()
+        );
         assert_eq!(output.progress.cache_visible_len, 10);
         assert_eq!(output.progress.cache_computed_len, 14);
         assert!(output.progress.prompt_logits_ready);
         let mut decoded = PendingOutput::new(&call, RequestProgress::default(), 0)?;
         records.apply(0, &mut decoded, 4)?;
-        assert_eq!(decoded.logprob_range, Some((14, 9, 5)));
+        assert_eq!(decoded.logprob_ranges, vec![(14, 9, 5)]);
         assert!(decoded.prompt_logprob_ranges.is_empty());
         Ok(())
     }

@@ -181,6 +181,9 @@ pub struct WorkerProcessArgs {
     /// its prompt. Without it every prefill only writes the prefix cache, and
     /// the worker's prefill graphs stop at the final layer's cache write.
     pub prefill_outputs: bool,
+    /// The most draft tokens a call proposes with the model's drafter; zero
+    /// when the deployment does not speculate.
+    pub draft_tokens: u32,
     /// Strictly increasing prefill token counts captured as CUDA graphs;
     /// `None` keeps the rank's catalog.
     pub prefill_graph_token_sizes: Option<Vec<u32>>,

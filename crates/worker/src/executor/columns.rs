@@ -36,7 +36,7 @@ use crate::request::RequestProgress;
 use crate::{Error, ProductStore, Result, lock};
 
 /// Fields of one call's column.
-pub(crate) const CALL_FIELDS: usize = 20;
+pub(crate) const CALL_FIELDS: usize = 22;
 
 /// The call fields' names in row order, which the executor's manifest
 /// echoes (`uniserve.executor.text.protocol.CALL_FIELD_NAMES`).
@@ -61,6 +61,8 @@ pub(crate) const CALL_FIELD_NAMES: [&str; CALL_FIELDS] = [
     "canvas_step",
     "request_id",
     "epoch",
+    "proposals",
+    "lookahead",
 ];
 
 /// Fields of one forward row before its page columns.
@@ -109,6 +111,12 @@ pub(crate) mod field {
     /// started request.
     pub(crate) const REQUEST_ID: usize = 18;
     pub(crate) const EPOCH: usize = 19;
+    /// Draft tokens the call proposes for its request's next verification
+    /// (`ipc::DraftWork::proposals`).
+    pub(crate) const PROPOSALS: usize = 20;
+    /// The token after the call's last input token, which its last draft
+    /// cache entry reads; -1 for none (`ipc::DraftWork::lookahead`).
+    pub(crate) const LOOKAHEAD: usize = 21;
 }
 
 /// Bits of a call's FLAGS field: which outputs the call declares, which
@@ -127,6 +135,10 @@ pub(crate) mod flag {
     pub(crate) const FEATURES: i64 = 1 << 6;
     /// The JSON holds the call's `readout`.
     pub(crate) const READOUT: i64 = 1 << 7;
+    /// The call refills its request's draft cache
+    /// (`ipc::DraftWork::refill`): it evaluates tokens the cache holds,
+    /// writes no target K/V and keeps no per-request state.
+    pub(crate) const DRAFT_REFILL: i64 = 1 << 8;
 }
 
 /// The value of a call's KIND field.
@@ -173,6 +185,7 @@ pub(crate) fn call_column(facts: &CallFacts<'_>) -> Result<[i64; CALL_FIELDS]> {
         (call.completion_output.is_some(), flag::COMPLETION_OUTPUT),
         (call.writes_context(), flag::WRITES_CONTEXT),
         (call.writes_visual_state(), flag::WRITES_VISUAL_STATE),
+        (call.draft.refill.is_some(), flag::DRAFT_REFILL),
     ] {
         if present {
             flags |= bit;
@@ -210,6 +223,8 @@ pub(crate) fn call_column(facts: &CallFacts<'_>) -> Result<[i64; CALL_FIELDS]> {
     column[field::CANVAS_STEP] = call.canvas.map_or(-1, |step| i64::from(step.step));
     column[field::REQUEST_ID] = wide(call.request_key.request_id.0, "request id")?;
     column[field::EPOCH] = wide(call.request_key.request_epoch, "request epoch")?;
+    column[field::PROPOSALS] = i64::from(call.draft.proposals);
+    column[field::LOOKAHEAD] = call.draft.lookahead.map_or(-1, i64::from);
     Ok(column)
 }
 
@@ -401,6 +416,7 @@ pub(crate) fn column_step(
             rng: state.output.progress.rng_counter,
             allocated: u64::from(state.forward.pages.allocated),
             max_tokens: u64::from(call.bounds.max_tokens),
+            proposals: u64::from(call.draft.proposals),
         });
     }
     let calls = plan.calls.len();
@@ -636,7 +652,9 @@ mod tests {
                 -1,
                 -1,
                 9,
-                4
+                4,
+                0,
+                -1
             ]
         );
         let second = call_column(&CallFacts {
@@ -671,7 +689,9 @@ mod tests {
                 3,
                 1,
                 11,
-                2
+                2,
+                0,
+                -1
             ]
         );
 

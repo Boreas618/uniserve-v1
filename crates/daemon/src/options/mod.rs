@@ -70,6 +70,7 @@ const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
         &[
             "max_num_batched_tokens",
             "scheduler_config.chunked_prefill_size",
+            "speculative_config",
             "chat_config",
             "image_fetch_config",
         ],
@@ -203,6 +204,7 @@ pub struct ServeConfig {
     pub load_config: LoadOptions,
     pub kv_cache_config: KvCacheOptions,
     pub scheduler_config: SchedulerOptions,
+    pub speculative_config: SpeculativeOptions,
     pub migration_config: MigrationOptions,
     pub update_config: UpdateOptions,
     pub placement_config: PlacementOptions,
@@ -244,6 +246,7 @@ impl Default for ServeConfig {
             load_config: LoadOptions::default(),
             kv_cache_config: KvCacheOptions::default(),
             scheduler_config: SchedulerOptions::default(),
+            speculative_config: SpeculativeOptions::default(),
             migration_config: MigrationOptions::default(),
             update_config: UpdateOptions::default(),
             placement_config: PlacementOptions::default(),
@@ -465,6 +468,31 @@ impl Default for SchedulerOptions {
             max_batch: positive(128),
         }
     }
+}
+
+/// Speculative decoding with the model's drafter (`speculative_config`).
+///
+/// A deployment that speculates verifies each running request's draft
+/// tokens, which the model's drafter proposes from its draft cache, in one
+/// forward. A request whose draft cache is missing, such as one a world
+/// change moved, verifies none while its draft cache is refilled with the
+/// idle prefill budget of the steps, when the refill policy finds it worth
+/// its cost.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpeculativeOptions {
+    /// The most draft tokens one verification carries per request; zero
+    /// does not speculate. The draft cache and the drafter's work belong
+    /// to the world, so a change of it is a world change.
+    pub num_draft_tokens: u32,
+    /// The tokens a verification step of a request is expected to emit:
+    /// the speedup the refill policy expects over decoding one token a
+    /// step; at least one, 2.0 when unset.
+    pub expected_speedup: Option<f64>,
+    /// The time of evaluating one context token in a refill, in steps of
+    /// decoding: the refill policy's cost of each token it evaluates; not
+    /// negative, 0.01 when unset.
+    pub refill_token_cost: Option<f64>,
 }
 
 /// Rank placement without a deployment file, and product transport
@@ -1019,6 +1047,19 @@ impl ServeConfig {
             "`model` is required on the leader of several nodes: name MODEL on the command line \
              or set `model` in --config"
         );
+        let speculation = &self.speculative_config;
+        if let Some(speedup) = speculation.expected_speedup {
+            anyhow::ensure!(
+                speedup.is_finite() && speedup >= 1.0,
+                "invalid `speculative_config.expected_speedup`: {speedup} must be at least 1"
+            );
+        }
+        if let Some(cost) = speculation.refill_token_cost {
+            anyhow::ensure!(
+                cost.is_finite() && cost >= 0.0,
+                "invalid `speculative_config.refill_token_cost`: {cost} must not be negative"
+            );
+        }
         let rollback = &self.update_config.rollback;
         if let Some(rate) = rollback.failure_rate {
             anyhow::ensure!(
@@ -1159,6 +1200,8 @@ impl ServeConfig {
                 .chunked_prefill_size
                 .map(|size| bounded(size.get(), "scheduler_config.chunked_prefill_size"))
                 .transpose()?,
+            expected_speedup: self.speculative_config.expected_speedup,
+            refill_token_cost: self.speculative_config.refill_token_cost,
         };
         Ok(wire::EngineSpec {
             // A deployment is what one leader serves under its served name.
@@ -1274,6 +1317,11 @@ impl ServeConfig {
             predecessor: None,
             segments: Vec::new(),
             retire: Vec::new(),
+            speculation: (self.speculative_config.num_draft_tokens > 0).then_some(
+                wire::Speculation {
+                    num_draft_tokens: self.speculative_config.num_draft_tokens,
+                },
+            ),
         })
     }
 }

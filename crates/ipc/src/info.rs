@@ -217,11 +217,12 @@ impl PrefixCacheInfo {
             0
         };
 
-        // Exports carry K/V pages alone: a worker refuses to export the
-        // cache of a model that keeps state per request slot.
+        // Exports carry the K/V pages a request needs alone: a worker
+        // refuses to export the cache of a model that keeps state per
+        // request slot, and the draft cache stays with its rank.
         self.groups
             .iter()
-            .filter(|group| !group.kind.is_state())
+            .filter(|group| !group.kind.is_state() && !group.kind.is_draft())
             .map(|group| {
                 let published = group
                     .kind

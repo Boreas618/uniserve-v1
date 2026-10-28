@@ -58,6 +58,25 @@ fn terminal_event(
     }
 }
 
+/// Takes the log-probabilities `record` reports for its committed token at
+/// `index`: the token's own value and its entries (the token's own, then its
+/// top candidates), or nothing when the request did not ask for them.
+fn take_token_logprobs(
+    record: &mut ipc::CallOutput,
+    index: usize,
+) -> (Option<f32>, Option<Vec<TokenLogprob>>) {
+    let entries = record
+        .token_logprobs
+        .get_mut(index)
+        .map(std::mem::take)
+        .filter(|entries| !entries.is_empty());
+    let logprob = entries
+        .as_ref()
+        .and_then(|entries| entries.first())
+        .map(|entry| entry.logprob);
+    (logprob, entries)
+}
+
 /// Flushes journaled public events into the output channel in order.
 ///
 /// Returns `true` only when the receiver has closed, in which case the journal
@@ -282,8 +301,10 @@ impl Scheduler {
             std::mem::take(&mut record.committed_tokens)
         };
         for (idx, tok) in tokens.iter().copied().enumerate() {
-            let is_last = idx + 1 == tokens.len();
-            let logprob = is_last.then_some(record.sampled_logprob).flatten();
+            // Each committed token carries its own log-probabilities when
+            // the request asks for them, a verification's accepted drafts
+            // as well as the token after them.
+            let (logprob, top_logprobs) = take_token_logprobs(&mut record, idx);
             let is_round_close = self.running.get(&id).is_some_and(|st| {
                 st.req
                     .image_generation
@@ -329,8 +350,7 @@ impl Scheduler {
                 self.begin_image(id);
                 return;
             }
-            let top_logprobs = is_last.then(|| std::mem::take(&mut record.top_logprobs));
-            if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_last) {
+            if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, true) {
                 return;
             }
             if let Some(st) = self.running.get_mut(&id) {
@@ -382,7 +402,12 @@ impl Scheduler {
             self.resolve_prompt_logprobs(id, positions);
         }
 
-        if call_variant == CallKind::Forward(ForwardMode::Decode) {
+        // A verification commits its accepted drafts and the token after
+        // them, which resolve as a decode's tokens do.
+        if matches!(
+            call_variant,
+            CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
+        ) {
             return self.resolve_decode_text(id, record);
         }
 
@@ -495,13 +520,9 @@ impl Scheduler {
                             return;
                         }
 
-                        if self.emit_or_finish_und_token(
-                            id,
-                            tok,
-                            record.sampled_logprob,
-                            Some(std::mem::take(&mut record.top_logprobs)),
-                            true,
-                        ) {
+                        let last = record.committed_tokens.len() - 1;
+                        let (logprob, top_logprobs) = take_token_logprobs(&mut record, last);
+                        if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, true) {
                             return;
                         }
 
@@ -614,7 +635,8 @@ impl Scheduler {
                     .last()
                     .copied()
                     .unwrap_or(self.special_tokens.eos[0]);
-                let logprob = record.sampled_logprob;
+                let last = record.committed_tokens.len().saturating_sub(1);
+                let (logprob, top_logprobs) = take_token_logprobs(&mut record, last);
 
                 let Some(st) = self.running.get(&id) else {
                     return;
@@ -633,13 +655,7 @@ impl Scheduler {
                     return;
                 }
 
-                if self.emit_or_finish_und_token(
-                    id,
-                    tok,
-                    logprob,
-                    Some(std::mem::take(&mut record.top_logprobs)),
-                    true,
-                ) {
+                if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, true) {
                     return;
                 }
 
@@ -1637,6 +1653,9 @@ impl Scheduler {
         // A canvas deployment's requests write blocks, not their generated
         // tokens in order.
         let tokens_in_order = self.config.canvas.is_none();
+        // While a refill restores the request's draft cache, its state
+        // tables keep the checkpoint the refill continues from.
+        let refill_cursor = self.refill_cursor(id);
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -1677,6 +1696,7 @@ impl Scheduler {
         let mut published = std::mem::take(&mut state.prefix_published);
         let published_before = published.clone();
         let visible = state.cache_visible_len as usize;
+        let draft_valid = state.draft.valid as usize;
         let cache_write = state.req.cache.write;
         let isolation_key = state.req.cache.isolation_key;
         let scope = crate::kv_cache::PrefixScope::of(&state.req.cache);
@@ -1728,6 +1748,7 @@ impl Scheduler {
                 tokens,
                 &hashes,
                 computed,
+                draft_valid,
                 &mut published,
                 cache_write,
                 &source,
@@ -1750,7 +1771,10 @@ impl Scheduler {
                     &source,
                 );
             }
-            published_now && prefix_cache.coordinator.release_window(allocation, visible)
+            published_now
+                && prefix_cache
+                    .coordinator
+                    .release_window(allocation, visible, refill_cursor)
         });
         if let Some((kv_offload, worker)) = kv_offload {
             // Pages published now are offloaded to the host KV cache, but
@@ -1833,11 +1857,13 @@ fn offloads(
             continue;
         };
         let block = manager.block_size();
+        // A draft cache page's identity covers the token after it.
+        let key = table.key_tokens();
         // A reference on a published page of the table, which keeps its
         // units while it is copied.
         let held = |page: usize| {
             let reference = table.page(page)?;
-            let tokens = published.tokens.get(page * block..(page + 1) * block)?;
+            let tokens = published.tokens.get(page * block..page * block + key)?;
             pool.acquire(
                 *reference.units().first()?,
                 *hashes.get(page)?,

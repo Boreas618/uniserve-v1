@@ -115,6 +115,8 @@ impl Scheduler {
                         blocks = next;
                     }
                 }
+                // A draft refill evaluates tokens the cache holds already.
+                CallKind::Forward(ForwardMode::Prefill) if call.draft.refill.is_some() => {}
                 CallKind::Forward(ForwardMode::Prefill) => physical = physical.saturating_add(1),
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     logical = logical.saturating_add(1);
@@ -256,6 +258,10 @@ impl Scheduler {
             .and_then(|queue| queue.back());
         let phase = match pending.map(|pending| &pending.call) {
             Some(call) => match call.kind {
+                // A draft refill leaves the request's phase as it is.
+                CallKind::Forward(ForwardMode::Prefill) if call.draft.refill.is_some() => {
+                    state.phase
+                }
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => Phase::Prefill,
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
@@ -721,9 +727,34 @@ impl Scheduler {
                     })
             })
             && (!self.inflight.has_pending_calls(id)
-                || self
-                    .pending_successor_code(id)
-                    .is_some_and(|target| self.can_queue_successor(id, target)))
+                || (!self.speculation_waits(id)
+                    && self
+                        .pending_successor_code(id)
+                        .is_some_and(|target| self.can_queue_successor(id, target))))
+    }
+
+    /// Whether a speculating request's next call waits for its calls in
+    /// flight: a verification carries the drafts and starts at the token its
+    /// predecessor's result states, and nothing follows a draft refill
+    /// until its result.
+    fn speculation_waits(&self, id: RequestId) -> bool {
+        if !self.speculates() {
+            return false;
+        }
+        let refilling = self
+            .inflight
+            .pending_calls
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .any(|pending| pending.call.draft.refill.is_some());
+        refilling
+            || self.pending_successor_code(id).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
+                )
+            })
     }
 
     /// Returns whether output capacity can cover every unresolved token-producing call.

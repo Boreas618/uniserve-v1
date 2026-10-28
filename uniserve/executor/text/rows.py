@@ -251,7 +251,9 @@ def prepare_calls(
     A verification and a prefill scoring its prompt project every
     position; a decode and a call with a token output project their last;
     any other call only writes the cache. A verification's drafts are its
-    input tokens after its current token, all of them when relayed.
+    input tokens after its current token, all of them when relayed; a
+    verification without drafts evaluates its current token alone, as a
+    decode does.
 
     Args:
         calls: The step's ``int64 [CALL_FIELDS, C]`` call columns.
@@ -264,8 +266,8 @@ def prepare_calls(
 
     Raises:
         ValueError: A call is no text call, a decode has no committed
-            token, a fixed-parent verification lacks its current and draft
-            tokens, or a call extending the cache has no input token.
+            token, a fixed-parent verification lacks its current token, or a
+            call extending the cache has no input token.
     """
     index = np.asarray(indices, dtype=np.int64)
     columns = calls[:, index]
@@ -293,10 +295,8 @@ def prepare_calls(
     hosts = np.where(indexed | (decode & relay), 0, np.where(decode, 1, count))
     if np.any(decode & ~indexed & ~relay & (count < 1)):
         raise ValueError("last-sampled token source has no committed token")
-    if np.any(verify & ~relay & (hosts < 2)):
-        raise ValueError(
-            "fixed-parent verification requires current and draft tokens"
-        )
+    if np.any(verify & ~relay & (hosts < 1)):
+        raise ValueError("fixed-parent verification requires its current token")
     if np.any((hosts == 0) & ~indexed & ~relay):
         raise ValueError("text extension requires input tokens")
 

@@ -12,6 +12,7 @@ from uniserve.models import (
     DEFAULT_COMPONENT,
     CausalLM,
     ComponentEntry,
+    Drafter,
     EntryPoint,
 )
 from uniserve.nn.attention import AttentionBatch
@@ -22,16 +23,17 @@ from .config import Config
 from .transformer import Transformer, TransformerLayer
 
 
-class MultiTokenPredictor(nn.Module):
-    """The checkpoint's multi-token prediction layers.
+class MultiTokenPredictor(Drafter):
+    """The checkpoint's multi-token prediction layers, the model's drafter.
 
     Predicts the token after next from a position's final hidden state and
     the embedding of the token that follows it, as vLLM's
     ``Qwen3_5MultiTokenPredictor`` composes it: both are RMS-normalized,
     concatenated (embedding first) and projected to the hidden width, pass a
     full-attention decoder layer, and the final norm's output shares the
-    model's vocabulary head. Its layers keep no cache: a speculative decoder
-    that runs them binds their attention to a cache of its own.
+    model's vocabulary head and feeds the next draft step. Each layer's
+    attention keeps its keys and values in the draft cache
+    (``mtp.layers.<index>.attention.attention``).
     """
 
     function = "models.qwen3_5.model.MultiTokenPredictor/1"
@@ -47,7 +49,9 @@ class MultiTokenPredictor(nn.Module):
         )
         self.layers = nn.ModuleDict(
             {
-                str(index): TransformerLayer(config, False, None)
+                str(index): TransformerLayer(
+                    config, False, f"mtp.layers.{index}.attention.attention"
+                )
                 for index in range(config.mtp_num_hidden_layers)
             }
         )
@@ -83,7 +87,8 @@ class Model(CausalLM):
     ``CausalLM`` supplies ``forward``, ``embed_input_ids`` and
     ``compute_logits`` over the ``Transformer`` backbone and a
     vocabulary-parallel head. ``mtp`` holds the checkpoint's multi-token
-    prediction layers when it has any; serving's forwards do not run them.
+    prediction layers when it has any: the model's ``Drafter``, which a
+    deployment that speculates runs after each forward.
     """
 
     function = "models.qwen3_5.model.Model/1"

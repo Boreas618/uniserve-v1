@@ -594,9 +594,6 @@ impl SimRequestState {
 struct SampleOutput {
     /// Selected vocabulary token.
     token: u32,
-    /// Natural-log probability of the selected token among the candidates
-    /// the request's masks leave.
-    logprob: f32,
     /// Ranked candidates as `(token_id, logprob, rank)`, the sampled token
     /// first, then the most probable alternatives and the explicitly
     /// requested tokens, without duplicates; `rank` is the one-based
@@ -752,7 +749,6 @@ fn select_token(
 
     Some(SampleOutput {
         token: token as u32,
-        logprob: sampled_logprob,
         top,
     })
 }
@@ -972,7 +968,6 @@ impl SimEngine {
                 } else {
                     1_000 + ((request_id.0 as u32 * 7 + index as u32) % 5_000)
                 },
-                logprob: 0.0,
                 top: Vec::new(),
             })),
         }
@@ -1017,8 +1012,7 @@ impl SimEngine {
             );
         }
         let mut record = CallOutput {
-            sampled_logprob: None,
-            top_logprobs: Vec::new(),
+            token_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
             request_key: call.request_key,
             call_id: call.call_id,
@@ -1034,6 +1028,7 @@ impl SimEngine {
             finish_flags: FinishFlags::default(),
             media_output: None,
             cache_output: None,
+            draft_token_ids: Vec::new(),
         };
         set_cache_lengths(&mut record, request.cache_visible_len);
 
@@ -1154,19 +1149,21 @@ impl SimEngine {
                     // one is host-observed. A false-predicate no-op never reaches
                     // this branch, so a retracted point is never folded.
                     request.fold_penalty_token(output.token);
-                    record.sampled_logprob = request
-                        .sampling()
-                        .is_some_and(SamplingParams::generated_logprobs_requested)
-                        .then_some(output.logprob);
-                    record.top_logprobs = output
-                        .top
-                        .iter()
-                        .map(|(token_id, logprob, rank)| TokenLogprob {
-                            token_id: *token_id,
-                            logprob: *logprob,
-                            rank: *rank,
-                        })
-                        .collect();
+                    // The token's own entry leads its candidates when the
+                    // request asks for its generated tokens' logprobs.
+                    if !output.top.is_empty() {
+                        record.token_logprobs = vec![
+                            output
+                                .top
+                                .iter()
+                                .map(|(token_id, logprob, rank)| TokenLogprob {
+                                    token_id: *token_id,
+                                    logprob: *logprob,
+                                    rank: *rank,
+                                })
+                                .collect(),
+                        ];
+                    }
                 }
             }
             CallKind::Forward(ForwardMode::TokenDenoising) => {
@@ -1322,8 +1319,7 @@ impl SimEngine {
     /// The completion reports the request's unchanged progress.
     fn predicated_completion(call: &Call, request: &SimRequestState) -> CallOutput {
         CallOutput {
-            sampled_logprob: None,
-            top_logprobs: Vec::new(),
+            token_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
             request_key: call.request_key,
             call_id: call.call_id,
@@ -1339,6 +1335,7 @@ impl SimEngine {
             finish_flags: FinishFlags::default(),
             media_output: None,
             cache_output: None,
+            draft_token_ids: Vec::new(),
         }
     }
 
@@ -1828,6 +1825,7 @@ mod tests {
             transition_output: None,
 
             input_image: None,
+            draft: Default::default(),
             cache_input: None,
             cache_output: None,
             input_token_ids: Vec::new(),

@@ -218,6 +218,13 @@ pub(crate) fn export(
             "a cache export does not carry the state a model keeps per request slot".into(),
         ));
     }
+    // The draft cache is optional state of the rank that speculates: an
+    // export carries the pages its destination's target layers read.
+    if planes.plan().groups.iter().any(|group| group.draft) {
+        return Err(Error::Invalid(
+            "a cache export does not carry a speculating deployment's draft cache".into(),
+        ));
+    }
 
     let mut selected = Vec::new();
     let mut groups = Vec::new();
@@ -511,6 +518,7 @@ mod tests {
             groups: vec![CacheGroupPlan {
                 window: None,
                 state: false,
+                draft: false,
                 block_size: tokens as u32,
                 units_per_page: 1,
                 layers: vec!["a".into(), "b".into()],
@@ -686,6 +694,7 @@ mod tests {
                 groups: vec![CacheGroupPlan {
                     window: None,
                     state: false,
+                    draft: false,
                     block_size: 8,
                     units_per_page: 1,
                     layers: vec!["a".into(), "b".into()],

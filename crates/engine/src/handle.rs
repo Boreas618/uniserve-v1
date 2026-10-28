@@ -629,7 +629,7 @@ pub enum Command {
     /// Takes other scheduling limits and policy from the next step on
     /// (`Scheduler::reconfigure`), and answers whether it did.
     Configure {
-        limits: crate::scheduler::SchedulerConfig,
+        limits: Box<crate::scheduler::SchedulerConfig>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Gives back or restores KV cache memory (`Scheduler::resize_cache`),
@@ -978,6 +978,7 @@ impl CommandSender {
         limits: crate::scheduler::SchedulerConfig,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, receiver) = crossbeam_channel::bounded(1);
+        let limits = Box::new(limits);
         if let Err(error) = self.send(Command::Configure { limits, answer })
             && let Command::Configure { answer, .. } = error.0
         {

@@ -31,6 +31,14 @@ pub enum CacheGroupKind {
     /// a table names units only for the pages that hold or receive a
     /// checkpoint and the padding sentinel, unit 0, for the others.
     State,
+    /// The draft cache: the K/V of a drafter's layers, which read the whole
+    /// history. It is optional derived state: a request decodes correctly
+    /// without it, verifying no drafts, so its pages never bound a reuse
+    /// of the other groups, and a table may name the padding sentinel for
+    /// pages it holds no units for. The entry at position `i` depends on the
+    /// tokens before `i + 2`, so a page's contents depend on the token after
+    /// the page as well, which its key covers.
+    Draft,
 }
 
 impl CacheGroupKind {
@@ -38,7 +46,7 @@ impl CacheGroupKind {
     /// and for state checkpoints.
     pub const fn window(self) -> Option<u32> {
         match self {
-            Self::Full | Self::State => None,
+            Self::Full | Self::State | Self::Draft => None,
             Self::SlidingWindow { window } => Some(window),
         }
     }
@@ -46,6 +54,11 @@ impl CacheGroupKind {
     /// Whether the group holds state checkpoints rather than K/V rows.
     pub const fn is_state(self) -> bool {
         matches!(self, Self::State)
+    }
+
+    /// Whether the group holds the draft cache, which a request may lack.
+    pub const fn is_draft(self) -> bool {
+        matches!(self, Self::Draft)
     }
 }
 

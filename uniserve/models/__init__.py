@@ -1,8 +1,8 @@
 """Capability classes, model inputs and outputs, and concrete model packages.
 
-The capability classes (``CausalLM``, ``DiffusionLM``, the encoders,
-denoisers and decoders) and their inputs and outputs are exported here. The
-concrete model packages are the subpackages beside them.
+The capability classes (``CausalLM`` and its ``Drafter``, ``DiffusionLM``,
+the encoders, denoisers and decoders) and their inputs and outputs are
+exported here. The concrete model packages are the subpackages beside them.
 ``uniserve.models.registry`` maps the one architecture a checkpoint declares to
 a package here and reads that package's module-level interface:
 ``read_config`` normalizes checkpoint metadata into a typed config and may
@@ -46,6 +46,7 @@ from .diffusion_lm import (
     DiffusionLMInput,
     SelfConditioning,
 )
+from .drafter import Drafter
 from .encoder import (
     AudioEncoder,
     Encoder,
@@ -81,6 +82,7 @@ __all__ = [
     "Logits",
     "VocabShard",
     "CausalLM",
+    "Drafter",
     "DiffusionLMInput",
     "CanvasTokens",
     "SelfConditioning",

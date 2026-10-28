@@ -112,14 +112,27 @@ def _batch(pool, requests, queries, prefixes) -> AttentionBatch:
     return AttentionBatch(entries, entries[0].queries)
 
 
-def _forward(model, context, rows):
-    """Evaluate ``rows`` of ``(request, tokens, prefix)`` in one forward;
-    return each row's logits, ``[tokens, vocab]``.
-    """  # noqa: D205
+def _forward(model, context, rows, *, verification=None, writes=True):
+    """Evaluate ``rows`` of ``(request, tokens, prefix)`` in one forward.
+
+    Returns each row's logits, ``[tokens, vocab]``. A ``verification``
+    collects the slot advances of a verification forward; rows that do not
+    ``write`` read the cache their request holds and keep no state.
+    """
     requests = [request for request, _, _ in rows]
     queries = [len(tokens) for _, tokens, _ in rows]
     prefixes = [prefix for _, _, prefix in rows]
     batch = _batch(context.cache, requests, queries, prefixes)
+    if not writes:
+        batch = AttentionBatch(
+            {
+                table: replace(
+                    entry, slot_mapping=torch.full_like(entry.slot_mapping, -1)
+                )
+                for table, entry in batch.entries.items()
+            },
+            batch.queries,
+        )
     context.bind_attention(batch)
     ids = torch.cat([tokens for _, tokens, _ in rows])
     positions = torch.cat(
@@ -129,7 +142,8 @@ def _forward(model, context, rows):
         ]
     )
     slot_rows = torch.tensor([request.slot for request in requests])
-    with slots.selected(slot_rows):
+    kept = torch.full((len(rows),), writes)
+    with slots.selected(slot_rows, kept=kept, verification=verification):
         hidden = model(TextInput(ids, positions, batch, None))
     logits = model.compute_logits(
         hidden, token_indices=torch.arange(ids.numel())
@@ -303,3 +317,180 @@ def test_multi_token_prediction_layers_load_from_the_checkpoint(checkpoint):
         model.mtp.embedding_norm.weight,
         mtp["mtp.pre_fc_norm_embedding.weight"],
     )
+
+
+def test_a_verification_keeps_the_state_of_the_tokens_it_accepts(session):
+    """A verification row of the next token and three drafts yields the
+    reference's logits at each of its positions and leaves the request's
+    slot as it was; accepting three of its tokens then advances the slot
+    as decoding them would, writing the checkpoint at the boundary they
+    reach: the next position decodes to the reference's logits, and a
+    fresh request resumes from that checkpoint.
+    """  # noqa: D205
+    model, context, reference, units = session
+    tokens = _prompt(11, PROMPT + 4)
+    expected = _reference(reference, tokens)
+    request = _Request(context.cache, 1, units)
+    # The prompt ends three tokens before a page boundary, which the three
+    # accepted tokens reach.
+    boundary = PROMPT + 3
+    assert boundary % BLOCK_SIZE == 0
+    with torch.no_grad():
+        # The prompt's tables already hold the page ending at the boundary.
+        request.grow(PROMPT, {boundary})
+        _forward(model, context, [(request, tokens[:PROMPT], 0)])
+        request.grow(PROMPT + 4, set())
+        verification = slots.Verification()
+        (logits,) = _forward(
+            model,
+            context,
+            [(request, tokens[PROMPT : PROMPT + 4], PROMPT)],
+            verification=verification,
+        )
+        _close(logits, expected[PROMPT : PROMPT + 4])
+        verification.accept(torch.tensor([3]))
+        (logits,) = _forward(
+            model,
+            context,
+            [(request, tokens[boundary : boundary + 1], boundary)],
+        )
+        _close(logits, expected[boundary : boundary + 1])
+
+        fresh = _Request(context.cache, 2, units)
+        fresh.share(request, boundary)
+        fresh.grow(PROMPT + 4, set())
+        (logits,) = _forward(
+            model,
+            context,
+            [(fresh, tokens[boundary : PROMPT + 4], boundary)],
+        )
+        _close(logits, expected[boundary : PROMPT + 4])
+
+
+def test_rows_writing_no_cache_keep_no_state(session):
+    """A row evaluating a request's earlier tokens again from a checkpoint,
+    writing no cache, yields their logits and writes the checkpoint its
+    tokens reach, but leaves the request's slot at its latest token.
+    """  # noqa: D205
+    model, context, reference, units = session
+    tokens = _prompt(12, PROMPT + 1)
+    expected = _reference(reference, tokens)
+    request = _Request(context.cache, 1, units)
+    with torch.no_grad():
+        request.grow(PROMPT, {12})
+        _forward(model, context, [(request, tokens[:12], 0)])
+        _forward(model, context, [(request, tokens[12:PROMPT], 12)])
+        # The earlier tokens from the checkpoint at 12 on, again.
+        (logits,) = _forward(
+            model,
+            context,
+            [(request, tokens[12:24], 12)],
+            writes=False,
+        )
+        _close(logits, expected[12:24])
+        request.grow(PROMPT + 1, set())
+        (logits,) = _forward(
+            model, context, [(request, tokens[PROMPT:], PROMPT)]
+        )
+        _close(logits, expected[PROMPT:])
+
+
+@pytest.fixture(scope="module")
+def two_attention_layers(tmp_path_factory):
+    """A checkpoint of eight layers: two full-attention layers."""
+    root = tmp_path_factory.mktemp("qwen3_5_eight")
+    qwen3_5_checkpoint(root, layers=8)
+    return root
+
+
+def test_the_draft_group_keeps_every_other_group_s_pages(two_attention_layers):
+    """Planned with the drafter's layer, the pool keeps its columns, planes
+    and every other group as they were; the draft group's page lays the
+    layer's token blocks over every column of one unit.
+    """  # noqa: D205
+    model = _load(two_attention_layers)
+    plain = UnitPool.allocate(
+        model.cache_config, num_units=8, block_size=BLOCK_SIZE, device="cpu"
+    )
+    drafting = UnitPool.allocate(
+        model.cache_config,
+        num_units=8,
+        block_size=BLOCK_SIZE,
+        device="cpu",
+        draft=model.mtp.cache_config,
+    )
+    before, after = plain.planes, drafting.planes
+    assert after.columns == before.columns == 2
+    assert after.plane_bytes == before.plane_bytes
+    assert after.groups[: len(before.groups)] == before.groups
+    draft = after.groups[-1]
+    assert draft.draft and drafting.draft_group() == len(before.groups)
+    assert (draft.span, draft.units_per_page) == (2, 1)
+    assert draft.block_size == 2 * draft.block == 2 * BLOCK_SIZE
+
+
+def test_the_drafter_reads_the_draft_cache_it_wrote(two_attention_layers):
+    """The drafter's states over a sequence equal its states computed a
+    chunk and a token at a time, each pass reading the draft cache entries
+    the passes before it wrote: block ``j`` of a page lies in column ``j``
+    of the page's unit.
+    """  # noqa: D205
+    model = _load(two_attention_layers)
+    drafter = model.mtp
+    pool = UnitPool.allocate(
+        model.cache_config,
+        num_units=16,
+        block_size=BLOCK_SIZE,
+        device="cpu",
+        draft=drafter.cache_config,
+    )
+    group = pool.groups[pool.draft_group()]
+    table = pool.table(group.layers[0])
+    length = 3 * group.block_size + 1
+    generator = torch.Generator().manual_seed(13)
+    hidden = torch.randn(length, 32, generator=generator)
+    tokens = torch.randint(0, 61, (length,), generator=generator)
+
+    def run(units, rows):
+        """The drafter's states of ``(prefix, query)`` rows on one table."""
+        blocks = tuple(
+            unit + column * pool.num_units
+            for unit in units
+            for column in range(group.span)
+        )
+        entry = PagedInput.from_blocks(
+            blocks=(blocks,) * len(rows),
+            query_lengths=tuple(query for _, query in rows),
+            prefix_lengths=tuple(prefix for prefix, _ in rows),
+            block_size=group.block,
+            causal=True,
+            device="cpu",
+        )
+        batch = AttentionBatch({table: entry}, entry.queries)
+        context.bind_attention(batch)
+        index = torch.cat(
+            [torch.arange(prefix, prefix + query) for prefix, query in rows]
+        )
+        return drafter(
+            model.embed_input_ids(tokens[index]),
+            hidden[index],
+            index,
+            batch,
+        )
+
+    context = ExecutionContext(model, cache=pool, attention="torch")
+    with context, torch.no_grad():
+        context.prepare(TextSize(64, 3))
+        pages = -(-length // group.block_size)
+        whole = run(list(range(1, 1 + pages)), [(0, length)])
+        split = torch.cat(
+            [
+                run(list(range(5, 5 + pages)), [(0, 5)]),
+                run(list(range(5, 5 + pages)), [(5, 6)]),
+                *(
+                    run(list(range(5, 5 + pages)), [(position, 1)])
+                    for position in range(11, length)
+                ),
+            ]
+        )
+    _close(split, whole)

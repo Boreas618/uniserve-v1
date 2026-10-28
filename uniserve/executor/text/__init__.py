@@ -162,8 +162,14 @@ class TextExecutor:
         settings: The rank's deployment: ``graphs``, ``model_dtype``, the
             placed ``components``, the ``pages`` section (batch bounds,
             graph buckets, ``cache_groups``, ``image_processor``,
-            ``media_axes``) and, for an expert union that exchanges
-            tokens, the ``experts`` section (its ``microbatches``).
+            ``media_axes``, ``draft_tokens``: the most draft tokens a call
+            proposes, zero for a deployment that does not speculate) and,
+            for an expert union that exchanges tokens, the ``experts``
+            section (its ``microbatches``).
+
+    A deployment that speculates runs the model's drafter after every
+    forward of its text computations (:meth:`TextRunner.draft`), whose
+    hidden states its prefills therefore keep.
     """
 
     def __init__(self, loaded, settings: Mapping[str, Any]) -> None:
@@ -180,7 +186,10 @@ class TextExecutor:
         self.prefill_sizes = [
             int(size) for size in pages["prefill_graph_token_sizes"]
         ]
-        self.prefill_outputs = bool(pages["prefill_outputs"])
+        self.drafts = int(pages.get("draft_tokens", 0))
+        self.prefill_outputs = bool(pages["prefill_outputs"]) or bool(
+            self.drafts
+        )
         self.groups = [
             PageGroup.from_json(group) for group in pages["cache_groups"]
         ]
@@ -237,13 +246,16 @@ class TextExecutor:
             hidden=self.hidden,
             embeddings=self.image_processor,
             dtype=self.dtype,
+            drafts=self.drafts,
         )
         slot_bytes = SlotState.slot_bytes(self.vocab, self.dtype)
         runners = len(self.components) * self.microbatches
         # The padding slot's row and each state field's alignment slack.
         fixed = runners * dims.bytes() + slot_bytes + SlotState.ALIGNMENT_SLACK
+        # Each call's completion block and relay word, the logprob words,
+        # the prompt words and each call's proposed drafts.
         words = (
-            self.max_batch_calls * (COMPLETION_FIELDS + 1)
+            self.max_batch_calls * (COMPLETION_FIELDS + 1 + self.drafts)
             + self.microbatches * logprob_capacity(bounds.tokens)
             + bounds.tokens
         )
@@ -354,12 +366,18 @@ class TextExecutor:
                         f"the text runner's vocabulary ({size}) differs from "
                         f"the model's ({self.vocab})"
                     )
+                if kernel.drafts() != bool(self.drafts):
+                    raise ValueError(
+                        "a deployment that speculates keeps the draft cache "
+                        "in its pool, and only one that speculates"
+                    )
                 dims = bounds.dimensions(
                     vocab=self.vocab,
                     local_vocab=stop - start,
                     hidden=kernel.hidden_size(),
                     embeddings=self.image_processor,
                     dtype=self.dtype,
+                    drafts=self.drafts,
                 )
                 with torch.cuda.stream(stream):
                     buffers = InputBuffers(dims, device)

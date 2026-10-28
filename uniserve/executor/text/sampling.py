@@ -701,10 +701,15 @@ def _validate(task: SampleTask, vocab: int) -> None:
 
 
 def _logprobs(
-    counts: np.ndarray, vocab: int, capacity: int, logprob_capacity: int
+    counts: np.ndarray,
+    vocab: int,
+    capacity: int,
+    logprob_capacity: int,
+    exact: bool = False,
 ) -> tuple[LogprobLayout | None, tuple[int, int]]:
-    # The compact layout of the reporting tasks' words and their scoring
-    # bucket; none without a reporting task.
+    # The compact layout of the reported rows' words and their scoring
+    # bucket, or with `exact` their own count of rows; none without a
+    # reported row.
     if len(counts) == 0:
         return None, (0, 0)
     layout = LogprobLayout(
@@ -713,6 +718,8 @@ def _logprobs(
     )
     if layout.words > logprob_capacity:
         raise OutOfMemory("logprob words exceed the binding's capacity")
+    if exact:
+        return layout, (len(counts), top_bucket(int(counts.max()), vocab))
     bucket = logprob_shape(len(counts), int(counts.max()), vocab, capacity)
     return layout, bucket
 
@@ -747,11 +754,18 @@ class SamplingMetadata:
         categorical: Some task takes the general sampler.
         sorts: The general sampler sorts a whole vocabulary row for some
             task.
-        logprob_tasks: The reporting tasks, in task order.
-        logprobs: The compact layout of their words, which start the
-            binding's logprob column; ``None`` without a reporting task.
+        logprob_tasks: The task of each reported row, in task order: one
+            row per reporting task, but for a verification's task one per
+            position it may commit (its own rows).
+        logprob_offsets: Each reported row's candidate row within its task:
+            zero but for a verification's, which reports its current token
+            and each draft in order.
+        logprobs: The compact layout of the reported rows' words, which
+            start the binding's logprob column; ``None`` without a
+            reporting task.
         logprob_bucket: ``(rows, top)`` of the ``score`` graph scoring them
-            (:func:`logprob_shape`); ``(0, 0)`` without logprobs.
+            (:func:`logprob_shape`); a verification, which selects eagerly,
+            scores exactly its reported rows; ``(0, 0)`` without logprobs.
     """
 
     tasks: int
@@ -774,6 +788,7 @@ class SamplingMetadata:
     categorical: bool
     sorts: bool
     logprob_tasks: np.ndarray
+    logprob_offsets: np.ndarray
     logprobs: LogprobLayout | None
     logprob_bucket: tuple[int, int]
 
@@ -820,6 +835,7 @@ class SamplingMetadata:
         sorts = False
         sets = _TokenSets(vocab, capacity)
         reporting: list[int] = []
+        offsets: list[int] = []
         counts: list[int] = []
 
         for index, task in enumerate(tasks):
@@ -837,8 +853,13 @@ class SamplingMetadata:
             drafts[index, : len(own_drafts)] = own_drafts
             terminal[index] = controls.terminal_draft_prefix or 0
             if task.params.generated_logprobs_requested():
-                reporting.append(index)
-                counts.append(logprob_count(task.params.n_logprobs, vocab))
+                # A row per position the task may commit: a verification's
+                # current token and each draft, a single row otherwise.
+                reporting.extend([index] * task.rows)
+                offsets.extend(range(task.rows))
+                counts.extend(
+                    [logprob_count(task.params.n_logprobs, vocab)] * task.rows
+                )
 
             # The task's candidate rows, then copies of its first.
             own = np.arange(width)
@@ -857,6 +878,7 @@ class SamplingMetadata:
             vocab,
             capacity,
             logprob_capacity,
+            exact=width > 1,
         )
         return cls(
             tasks=count,
@@ -884,6 +906,7 @@ class SamplingMetadata:
             categorical=bool(np.any(paths == CATEGORICAL)),
             sorts=sorts,
             logprob_tasks=np.asarray(reporting, dtype=np.int64),
+            logprob_offsets=np.asarray(offsets, dtype=np.int64),
             logprobs=layout,
             logprob_bucket=bucket,
         )
@@ -985,6 +1008,7 @@ class SamplingMetadata:
             categorical=bool(np.any(categorical)),
             sorts=bool(np.any(table.sorts[slots] & categorical)),
             logprob_tasks=reporting.astype(np.int64),
+            logprob_offsets=np.zeros(len(reporting), dtype=np.int64),
             logprobs=layout,
             logprob_bucket=bucket,
         )

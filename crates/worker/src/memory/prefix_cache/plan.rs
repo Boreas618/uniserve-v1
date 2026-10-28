@@ -63,6 +63,10 @@ pub struct CacheGroupPlan {
     /// Whether the group's pages hold state checkpoints: each of its layers'
     /// state after the page's last token, in bytes the library lays out.
     pub state: bool,
+    /// Whether the group holds the draft cache, which a request may lack: a
+    /// drafter's K/V, each layer's page laid over the columns of its unit
+    /// (`uniserve.prefix_cache.units`).
+    pub draft: bool,
     pub block_size: u32,
     pub units_per_page: u32,
     /// Resident layer names in column order: layer `k` lies in column
@@ -95,10 +99,19 @@ impl CacheGroupPlan {
         GroupShape::new(self.block_size, self.units_per_page, window)
     }
 
+    /// Whether the group holds K/V rows a request needs: neither the state
+    /// group's checkpoints nor the optional draft cache.
+    pub(crate) fn required_rows(&self) -> bool {
+        !self.state && !self.draft
+    }
+
     /// The group as the engine sees it.
     fn kind(&self) -> CacheGroupKind {
         if self.state {
             return CacheGroupKind::State;
+        }
+        if self.draft {
+            return CacheGroupKind::Draft;
         }
         self.window.map_or(CacheGroupKind::Full, |window| {
             CacheGroupKind::SlidingWindow { window }
@@ -128,8 +141,9 @@ impl CachePlan {
         loaded: &Handle,
         block_size: usize,
         prefix_cache_dtype: Option<&str>,
+        draft: bool,
     ) -> Result<Self> {
-        let handle = Self::describe(loaded, block_size, prefix_cache_dtype)?;
+        let handle = Self::describe(loaded, block_size, prefix_cache_dtype, draft)?;
         Self::read(handle)
     }
 
@@ -140,8 +154,9 @@ impl CachePlan {
         backend: &str,
         block_size: usize,
         prefix_cache_dtype: Option<&str>,
+        draft: bool,
     ) -> Result<bool> {
-        let plan = Self::describe(loaded, block_size, prefix_cache_dtype)?;
+        let plan = Self::describe(loaded, block_size, prefix_cache_dtype, draft)?;
         Interpreter::import(&format!("{CACHE}.reads_pages"))?.call_as(&[
             loaded.view(),
             (&Any::from(tvm_ffi::String::from(backend))).into(),
@@ -153,12 +168,14 @@ impl CachePlan {
         loaded: &Handle,
         block_size: usize,
         prefix_cache_dtype: Option<&str>,
+        draft: bool,
     ) -> Result<Handle> {
         Handle::new(
             Interpreter::import(&format!("{CACHE}.cache_plan"))?.call_values(&[
                 loaded.to_any(),
                 Any::from(block_size as i64),
                 Any::from(tvm_ffi::String::from(prefix_cache_dtype.unwrap_or(""))),
+                Any::from(draft),
             ])?,
         )
     }
@@ -221,6 +238,7 @@ impl CachePlan {
             .map(|(group, layer_count)| CacheGroupPlan {
                 window: u32::try_from(windows[group]).ok(),
                 state: kinds[group] == "state",
+                draft: kinds[group] == "draft",
                 block_size: block_sizes[group],
                 units_per_page: units_per_page[group],
                 layers: layers.by_ref().take(layer_count as usize).collect(),
@@ -325,10 +343,12 @@ impl CachePlan {
     /// The units a token capacity of `tokens` takes: the whole pages of
     /// those tokens in every K/V group, and one checkpoint of the state
     /// group per request slot of `request_slots`, the latest each running
-    /// request keeps.
+    /// request keeps. The draft group's pages, optional state of those same
+    /// tokens, take units the capacity holds as far as they are free.
     pub(crate) fn token_units(&self, tokens: u64, request_slots: u64) -> u64 {
         self.groups
             .iter()
+            .filter(|group| !group.draft)
             .map(|group| {
                 let pages = if group.state {
                     request_slots
@@ -351,11 +371,11 @@ impl CachePlan {
     /// Elements `E` and scale entries `S` of the largest K/V group page,
     /// which size a cache import workspace: `E = block_size * layers *
     /// heads * dim` and `S = block_size * layers * heads`, maximized over
-    /// groups. Imports carry K/V pages alone.
+    /// groups. Imports carry the K/V pages a request needs alone.
     pub(crate) fn page_extents(&self) -> (u64, u64) {
         self.groups
             .iter()
-            .filter(|group| !group.state)
+            .filter(|group| group.required_rows())
             .fold((0, 0), |(elements, scales), group| {
                 let rows = u64::from(group.block_size)
                     * group.layers.len() as u64

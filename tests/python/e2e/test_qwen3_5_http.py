@@ -21,6 +21,13 @@ decoded tokens.
   resumes it from the checkpoint its decoding kept: it computes only the
   tokens after the checkpoint, and the client reads the same greedy tokens
   as for the request alone.
+- Speculating with the checkpoint's multi-token prediction layer
+  (``speculative_config.num_draft_tokens``), a deployment generates the
+  same greedy tokens as one that does not, verifying drafts it accepts.
+- A world change that turns speculation on moves a streaming request to
+  the successor without its draft cache: the request keeps streaming,
+  verifying no drafts, while its draft cache is refilled, then speculates;
+  the client reads the same greedy tokens as without speculation.
 
 Each test runs a Storage Server of its own, which it stops at the end.
 """
@@ -53,7 +60,8 @@ from tests.python.e2e.http_helpers import (
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3_5")]
 
 # Options of every deployment: a KV cache that holds the tests' requests
-# and their checkpoints, prompt chunks of 512 tokens, each of which
+# and their checkpoints, a host KV cache of 16 GiB on the host, which holds
+# their pages many times over, prompt chunks of 512 tokens, each of which
 # checkpoints its last page boundary, no reasoning parser, so the content is
 # the generated text alone, and FlashInfer's attention, which serves the
 # checkpoint's six query heads per KV head of width 256 (the automatic
@@ -61,6 +69,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3_5")]
 OPTIONS = (
     "dtype=bfloat16",
     "kv_cache_config.max_tokens=65536",
+    "kv_cache_config.host_gib=16",
     "scheduler_config.chunked_prefill_size=512",
     "chat_config.reasoning_parser=none",
     "attention_backend=flashinfer",
@@ -92,6 +101,11 @@ COUNT_PROMPT = (
 COUNT_TOKENS = 1200
 EARLY_TOKENS = 320
 CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
+# The draft tokens a speculating deployment verifies per request and step.
+DRAFTS = "speculative_config.num_draft_tokens=3"
+# The prompts and length of the comparison with and without speculation.
+SPECULATED = (*PROMPTS, LONG_PROMPT, COUNT_PROMPT)
+SPECULATED_TOKENS = 96
 
 
 def _checkpoint() -> str:
@@ -102,10 +116,13 @@ def _checkpoint() -> str:
 
 
 def _device() -> str:
-    """The GPU the deployment serves on (``UNISERVE_WORLD_DEVICE``, 0 by
-    default).
+    """The GPU the deployment serves on (``UNISERVE_WORLD_DEVICE``), which
+    the runner reserved for the test.
     """  # noqa: D205
-    return os.environ.get("UNISERVE_WORLD_DEVICE", "0")
+    device = os.environ.get("UNISERVE_WORLD_DEVICE", "")
+    if not device:
+        pytest.fail("UNISERVE_WORLD_DEVICE must name the test's GPU")
+    return device
 
 
 def _stop_storage_server(socket: Path) -> None:
@@ -122,8 +139,12 @@ def _stop_storage_server(socket: Path) -> None:
 
 
 @contextmanager
-def _serve(tmp_path: Path, name: str) -> Iterator[tuple[str, Path]]:
-    """A deployment serving `name` on one GPU, its URL and its log."""
+def _serve(
+    tmp_path: Path, name: str, options: tuple[str, ...] = ()
+) -> Iterator[tuple[str, Path]]:
+    """A deployment serving `name` on one GPU with `options` beside the
+    common ones, its URL and its log.
+    """  # noqa: D205
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -140,9 +161,9 @@ def _serve(tmp_path: Path, name: str) -> Iterator[tuple[str, Path]]:
         "--worker-executable",
         str(worker_executable()),
     ]
-    for option in OPTIONS:
+    for option in (*OPTIONS, *options):
         command += ["--set", option]
-    log = tmp_path / "server.log"
+    log = tmp_path / f"{name}.log"
     environment = {
         "CUDA_VISIBLE_DEVICES": _device(),
         "XDG_RUNTIME_DIR": str(runtime),
@@ -221,6 +242,17 @@ def _generate(base_url: str, name: str, prompt: str, tokens: int) -> dict:
         ],
         "usage": answer["usage"],
     }
+
+
+def _metric(base_url: str, name: str) -> float:
+    """The sum of metric `name` over every world and label."""
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith(name)
+        and line[len(name) : len(name) + 1] in ("{", " ")
+    )
 
 
 def _prefix_hits(base_url: str) -> float:
@@ -348,11 +380,12 @@ def test_a_prompt_resumes_from_the_checkpoint_of_an_earlier_one(
 
 class _Streaming:
     """A greedy request streaming on a thread of its own: the tokens it
-    read and its usage.
+    read, each position's five most likely ids and its usage.
     """  # noqa: D205
 
     def __init__(self, base_url: str, name: str):
         self.tokens: list[int] = []
+        self.top: list[list[int]] = []
         self.usage: dict | None = None
         self.error: BaseException | None = None
         self._thread = threading.Thread(
@@ -380,9 +413,14 @@ class _Streaming:
                         content = (choice.get("logprobs") or {}).get(
                             "content"
                         ) or ()
-                        self.tokens.extend(
-                            _token_id(entry["token"]) for entry in content
-                        )
+                        for entry in content:
+                            self.tokens.append(_token_id(entry["token"]))
+                            self.top.append(
+                                [
+                                    _token_id(top["token"])
+                                    for top in entry["top_logprobs"]
+                                ]
+                            )
         except BaseException as error:  # noqa: BLE001 - the test reports it.
             self.error = error
 
@@ -438,3 +476,94 @@ def test_a_world_change_resumes_a_request_from_its_checkpoint(
     )
     assert streaming.tokens == alone["tokens"]
     assert streaming.usage == alone["usage"]
+
+
+ACCEPTED = "uniserve:worker_spec_verify_accepted_tokens_total"
+DRAFTED = "uniserve:worker_spec_verify_draft_tokens_total"
+
+
+def test_speculation_generates_the_greedy_tokens_of_decoding(tmp_path: Path):
+    """Each prompt generates the greedy tokens of decoding, one request at a
+    time, whether the deployment speculates or not, compared as the
+    reference comparison compares two bfloat16 implementations (`_close`),
+    and every token a speculating request reads carries its logprobs, its
+    accepted drafts' as well as the token after them. Speculating, the
+    deployment verifies the drafts the multi-token prediction layer
+    proposes and accepts some.
+    """  # noqa: D205
+    name = "qwen3_5-decoding"
+    with _serve(tmp_path, name) as (base_url, _):
+        decoded = [
+            _generate(base_url, name, prompt, SPECULATED_TOKENS)
+            for prompt in SPECULATED
+        ]
+    name = "qwen3_5-speculation"
+    with _serve(tmp_path, name, (DRAFTS,)) as (base_url, _):
+        speculated = [
+            _generate(base_url, name, prompt, SPECULATED_TOKENS)
+            for prompt in SPECULATED
+        ]
+        drafted = _metric(base_url, DRAFTED)
+        accepted = _metric(base_url, ACCEPTED)
+
+    for plain, fast, prompt in zip(
+        decoded, speculated, SPECULATED, strict=True
+    ):
+        assert len(fast["top"]) == len(fast["tokens"])
+        agreed = _close(fast, plain, prompt)
+        print(
+            f"{prompt[:30]!r}: {agreed} of {len(plain['tokens'])} tokens "
+            "agree with decoding"
+        )
+    assert drafted > 0
+    assert accepted > 0
+
+
+def test_a_world_change_turns_speculation_on_for_a_streaming_request(
+    tmp_path: Path,
+):
+    """A streaming request moves to a successor world that speculates: it
+    keeps streaming, verifying no drafts until a refill restores its draft
+    cache, then verifies drafts; it reads the greedy tokens of the request
+    alone without speculation, compared as `_close` compares them, each
+    with its logprobs.
+    """  # noqa: D205
+    name = "qwen3_5-speculation-change"
+    with _serve(tmp_path, name) as (base_url, log):
+        alone = _generate(base_url, name, COUNT_PROMPT, COUNT_TOKENS)
+        streaming = _Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        response = httpx.put(
+            f"{base_url}/admin/config",
+            json={"set": [DRAFTS]},
+            timeout=1800,
+        )
+        assert response.status_code == 200, response.text
+        result = response.json()["result"]
+        assert result["change"] == "world", result
+        moved = len(streaming.tokens)
+        streaming.join()
+        drafted = _metric(base_url, DRAFTED)
+        accepted = _metric(base_url, ACCEPTED)
+        committed = httpx.post(
+            f"{base_url}/admin/config/commit", json={}, timeout=1800
+        )
+        assert committed.status_code == 200, committed.text
+
+    lines = _log_lines(log)
+    assert any("a request migrated" in line for line in lines), (
+        "the streaming request did not migrate to the successor"
+    )
+    assert any("refilled a request's draft cache" in line for line in lines), (
+        "the successor did not refill the request's draft cache"
+    )
+    assert len(streaming.tokens) > moved, (
+        "the stream ended before the successor served"
+    )
+
+    assert drafted > 0 and accepted > 0
+    assert len(streaming.top) == len(streaming.tokens)
+    read = {"tokens": streaming.tokens, "top": streaming.top}
+    agreed = _close(read, alone, COUNT_PROMPT)
+    print(f"{agreed} of {len(alone['tokens'])} tokens agree with decoding")
+    assert streaming.usage["prompt_tokens"] == alone["usage"]["prompt_tokens"]

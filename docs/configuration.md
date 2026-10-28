@@ -143,6 +143,16 @@ retention = "30m"
 | `chunked_prefill_size` | `8192` | Prompt tokens one request prefills in one step; token models only |
 | `max_batch` | `128` | Calls assembled into one forward batch, clamped to what the workers accept |
 
+### `speculative_config`
+
+Speculative decoding with the model's own drafter, the multi-token prediction layer of a Qwen3.5 checkpoint (`mtp_num_hidden_layers`); token models only. Every step, each decoding request's verification evaluates its committed token followed by the draft tokens the drafter proposed after its last step and commits the longest prefix of drafts the model's own selections agree with, plus the model's token after it, so a request generates the tokens it would without speculation, one or more per step. The scheduler chooses each request's draft count every step: the drafts proposed, at most `num_draft_tokens` and one fewer than the tokens the request may still generate. The drafter keeps a cache of its own per request, the draft cache: optional state held in its own group of the KV cache, published, reused and offloaded to the host KV cache as the other groups' pages are, and released from a running request when another request's required pages need the units. A request without its draft cache (a prompt prefix reused without it, a request a world change moved from a world that did not speculate, a draft cache released for another request) verifies no drafts, a verification of one token, and decodes as without speculation; a refill then evaluates the model again over the positions before the draft cache entries the request wrote itself, in chunks of the token budget a prefill step leaves, when it is worth its cost: when the request's remaining tokens times `1 - 1 / expected_speedup` exceed the refill's tokens times `refill_token_cost`. A new request writes its draft cache while it prefills and speculates from its first decoding step. Verification and the drafter run eagerly: a model that keeps a recurrent state per request (Qwen3.5) serves eagerly in any case.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `num_draft_tokens` | `0` | The most draft tokens a verification carries per request; `0` does not speculate. A world that speculates keeps the draft cache in its pool and runs the drafter, so setting or changing it is a world change (`PUT /admin/config`) |
+| `expected_speedup` | `2.0` | The refill policy's expected tokens per verification step, at least `1`; applied in place by `PUT /admin/config` |
+| `refill_token_cost` | `0.01` | The refill policy's time of evaluating one context token in a refill, in decode steps of the request, not negative; applied in place by `PUT /admin/config` |
+
 ### `migration_config`
 
 A token request that generates text moves to the engine that serves next when its world parks for a world change or a rollback, or loses the workers that hold it; it continues after the last token it delivered, with the same output and usage.

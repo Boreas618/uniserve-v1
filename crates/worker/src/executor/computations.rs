@@ -656,8 +656,9 @@ fn retire(
 /// `Batch::lease_predicates`); then one completion word per call of a prepared
 /// batch, beside the words its decoded images are lent (`step`'s preparation);
 /// otherwise per call its results' words: a readout's candidate scores, a
-/// canvas step's outcome and tokens, or a sampling completion and the words of
-/// the logprob payload the engine bounds the call by.
+/// canvas step's outcome and tokens, or a sampling completion, the words of
+/// the logprob payload the engine bounds the call by and one word per draft
+/// the call asks its drafter to propose.
 fn lease_words(
     prepares: bool,
     plan: &BatchPlan,
@@ -680,14 +681,16 @@ fn lease_words(
             let words = match (&call.readout, call.canvas) {
                 (Some(readout), _) => readout.candidate_count().max(1),
                 (None, Some(_)) => 1 + call.bounds.max_tokens as usize,
-                (None, None) => COMPLETION_FIELDS.saturating_add(
-                    usize::try_from(
-                        call.bounds
-                            .max_completion_bytes
-                            .div_ceil(PAYLOAD_BYTES_PER_WORD),
+                (None, None) => COMPLETION_FIELDS
+                    .saturating_add(
+                        usize::try_from(
+                            call.bounds
+                                .max_completion_bytes
+                                .div_ceil(PAYLOAD_BYTES_PER_WORD),
+                        )
+                        .unwrap_or(usize::MAX),
                     )
-                    .unwrap_or(usize::MAX),
-                ),
+                    .saturating_add(call.draft.proposals as usize),
             };
             total.saturating_add(words)
         })

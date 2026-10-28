@@ -40,13 +40,18 @@ pub(crate) struct PendingOutput {
     pub reports_output: bool,
     /// Element offset, packed-column length, and row within that column.
     pub sampling_range: Option<(usize, usize, usize)>,
-    pub logprob_range: Option<(usize, usize, usize)>,
+    /// One per candidate position whose token the call may commit, in
+    /// order: a verification's current token's and each draft's, one for
+    /// any other sampling call.
+    pub logprob_ranges: Vec<(usize, usize, usize)>,
     /// Each row names one scored token in its prompt chunk.
     pub prompt_logprob_ranges: Vec<(usize, usize, usize)>,
     /// Element offset and length of sign-extended FP32 score bits.
     pub candidate_range: Option<(usize, usize)>,
     /// Element offset and length of [step outcome | canvas token ids].
     pub canvas_range: Option<(usize, usize)>,
+    /// Element offset and count of the draft tokens the call proposed.
+    pub proposal_range: Option<(usize, usize)>,
     /// The output word its batch copied the call's `uint8` predicate into
     /// (`crate::executor::batch`): zero when the executor skipped the call on
     /// the device, which then reports itself predicated.
@@ -81,10 +86,11 @@ impl PendingOutput {
             row,
             reports_output: true,
             sampling_range: None,
-            logprob_range: None,
+            logprob_ranges: Vec::new(),
             prompt_logprob_ranges: Vec::new(),
             candidate_range: None,
             canvas_range: None,
+            proposal_range: None,
             predicate_word: None,
             step_index: 0,
             tensor_outputs,
@@ -230,6 +236,7 @@ impl PendingOutput {
         if self.output.status != CallStatus::Ok {
             self.progress = parent;
             self.output.committed_tokens.clear();
+            self.output.draft_token_ids.clear();
             self.output.finish_flags = Default::default();
             self.output.cache_output = None;
         }
@@ -241,8 +248,7 @@ impl PendingOutput {
         }
         if self.output.status != CallStatus::Ok || !self.reports_output {
             self.discard_media();
-            self.output.sampled_logprob = None;
-            self.output.top_logprobs.clear();
+            self.output.token_logprobs.clear();
             self.output.prompt_logprobs.clear();
             self.output.candidate_logprobs.clear();
         }
@@ -343,14 +349,33 @@ impl PendingOutput {
             }
             self.accept_tokens(values[count * 2 + row], values[count * 3 + row])?;
         }
+        // Every rank's drafter proposes the same drafts: its selections are
+        // greedy over the gathered vocabulary.
+        if let Some((offset, count)) = self.proposal_range {
+            self.output.draft_token_ids = buffer
+                .read_tokens(offset, count)?
+                .iter()
+                .copied()
+                .map(token_id)
+                .collect::<Result<_>>()?;
+        }
 
         if !self.reports_output {
             return Ok(());
         }
-        if let Some(span) = self.logprob_range {
-            let values = buffer.logprob_values(span)?;
-            self.output.sampled_logprob = values.first().map(|entry| entry.logprob);
-            self.output.top_logprobs = values.to_vec();
+        // Each committed token's row: a verification commits its accepted
+        // drafts and the token after them, the first of its positions.
+        if !self.logprob_ranges.is_empty() {
+            let committed = self.output.committed_tokens.len();
+            if committed > self.logprob_ranges.len() {
+                return Err(Error::State(
+                    "a call commits more tokens than it reports logprob rows",
+                ));
+            }
+            self.output.token_logprobs = self.logprob_ranges[..committed]
+                .iter()
+                .map(|&span| buffer.logprob_values(span).map(<[_]>::to_vec))
+                .collect::<Result<_>>()?;
         }
         self.output.prompt_logprobs = self
             .prompt_logprob_ranges
@@ -429,13 +454,13 @@ pub(crate) fn request_output(
         cache_computed_len: 0,
         step_index: 0,
         committed_tokens: Vec::new(),
-        sampled_logprob: None,
-        top_logprobs: Vec::new(),
+        token_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),
         candidate_logprobs: Vec::new(),
         finish_flags: Default::default(),
         media_output: None,
         cache_output: None,
+        draft_token_ids: Vec::new(),
     };
     set_progress(&mut output, progress)?;
     Ok(output)
@@ -496,6 +521,7 @@ mod tests {
             readout: None,
             canvas: None,
             input_image: None,
+            draft: Default::default(),
             cache_input: None,
             cache_output: None,
             latent_restore: None,

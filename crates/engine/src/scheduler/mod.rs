@@ -39,7 +39,7 @@ pub(crate) mod stats_report;
 
 pub use config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
+    DEFAULT_MAX_RUNNING_REQUESTS, RefillPolicy, SchedulerConfig,
 };
 pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
@@ -67,6 +67,7 @@ pub(crate) mod output;
 mod placement;
 mod preemption;
 mod run;
+mod speculation;
 mod world;
 
 pub(crate) use crate::executor::{
@@ -643,6 +644,11 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// request's event journal.
 const DEFAULT_OUTPUT_EVENTS: usize = 2;
 
+/// The most drafts one verification carries, which bounds the tokens it
+/// commits: a request's event journal (`EVENT_WINDOW` events beyond those
+/// consumed) holds a verification's tokens with room to spare.
+pub(crate) const MAX_VERIFY_DRAFTS: usize = 16;
+
 /// Returns the maximum number of output events one call of `kind` can
 /// add to its request's event journal.
 ///
@@ -651,6 +657,8 @@ const DEFAULT_OUTPUT_EVENTS: usize = 2;
 fn output_bound(kind: CallKind) -> usize {
     match kind {
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
+        // A verification's tokens each take an event beside a decode's.
+        CallKind::Forward(ForwardMode::Verify) => 4 + MAX_VERIFY_DRAFTS,
         CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
         _ => DEFAULT_OUTPUT_EVENTS,
     }

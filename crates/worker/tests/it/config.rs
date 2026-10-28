@@ -64,6 +64,7 @@ fn defaults() -> Value {
         "graph_policy": "off",
         "decode_graph_batch_sizes": null,
         "prefill_outputs": true,
+        "draft_tokens": 0,
         "prefill_graph_token_sizes": null,
         "flow_graph_shapes": null,
         "video_text_capacities": null,
