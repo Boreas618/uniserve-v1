@@ -84,6 +84,10 @@ struct HandedServer {
     /// its deployments claim none.
     #[serde(default)]
     worlds: Vec<(String, BTreeSet<u64>, BTreeSet<u64>)>,
+    /// Explicit committed worlds. Protocol 12 handoffs describe one
+    /// committed world implicitly as the first claimed world.
+    #[serde(default)]
+    published: Option<Vec<(String, BTreeSet<u64>)>>,
     /// The pidfds of the processes shot down that left every GPU, and of
     /// those that did not leave one in time.
     shot_finished: Vec<usize>,
@@ -351,6 +355,12 @@ impl Server {
                     )
                 })
                 .collect(),
+            published: Some(
+                self.deployments
+                    .iter()
+                    .map(|(name, deployment)| (name.clone(), deployment.published.clone()))
+                    .collect(),
+            ),
             deployments: self
                 .deployments
                 .drain()
@@ -607,6 +617,9 @@ impl Server {
             tensors,
             copies,
             deployments: {
+                let mut published = handed
+                    .published
+                    .map(|entries| entries.into_iter().collect::<HashMap<_, _>>());
                 let mut worlds: HashMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = handed
                     .worlds
                     .into_iter()
@@ -617,12 +630,17 @@ impl Server {
                     .into_iter()
                     .map(|(name, claim, head)| {
                         let (worlds, discarded) = worlds.remove(&name).unwrap_or_default();
+                        let published = match &mut published {
+                            Some(entries) => entries.remove(&name).unwrap_or_default(),
+                            None => worlds.first().copied().into_iter().collect(),
+                        };
                         (
                             name,
                             Deployment {
                                 claim,
                                 head,
                                 worlds,
+                                published,
                                 discarded,
                             },
                         )
@@ -726,6 +744,7 @@ mod tests {
         )
         .unwrap();
         let claim = head.claim(0, vec![scope.clone()], Vec::new()).unwrap();
+        head.publish_worlds(vec![0]).unwrap();
         let mut worker = Client::connect(
             &path,
             Role::Worker {
@@ -767,6 +786,46 @@ mod tests {
             .book(gpu, 1000, Some(700), vec![(Item::Process, 300)])
             .unwrap();
 
+        // Committed replicas share their outputs; a candidate's output is
+        // still private when both kinds cross the restart.
+        for world in [2, 3] {
+            head.claim(world, vec![scope.clone()], Vec::new()).unwrap();
+            let mut replica = Client::connect(
+                &path,
+                Role::Worker {
+                    scope: scope.clone(),
+                    generation: 1,
+                    claim,
+                    world,
+                },
+            )
+            .unwrap();
+            replica
+                .put(
+                    vec![TensorRecord {
+                        key: Key([world as u8; 32]),
+                        name: "replica_weight".into(),
+                        storage: 0,
+                        offset: 0,
+                        dtype: "uint8".into(),
+                        shape: vec![4],
+                        strides: vec![1],
+                        access: Access::ReadOnly,
+                    }],
+                    &[(
+                        StorageRecord {
+                            placement: Placement::Host { numa_node: None },
+                            bytes: 4,
+                            segment: None,
+                            fabric: None,
+                        },
+                        memory.as_fd(),
+                    )],
+                )
+                .unwrap();
+        }
+        head.publish_worlds(vec![2]).unwrap();
+
         // Stop the server between two rounds and hand it to a successor on
         // another thread; a sleeping process stands for the successor's.
         stop.store(true, Ordering::Release);
@@ -801,8 +860,20 @@ mod tests {
         assert_eq!(head.list().unwrap().deployments.len(), 1);
         let mut operator = Client::connect(&path, Role::Operator).unwrap();
         let listing = operator.list().unwrap();
-        assert_eq!(listing.tensors.len(), 1);
+        assert_eq!(listing.tensors.len(), 3);
         assert_eq!(listing.deployments.len(), 1);
+        let got = worker
+            .get(vec![Key([2; 32]), Key([3; 32])], Mode::Read, Vec::new())
+            .unwrap();
+        assert_eq!(got.missing, vec![Key([3; 32])]);
+        head.publish_worlds(vec![3]).unwrap();
+        assert!(
+            worker
+                .get(vec![Key([3; 32])], Mode::Read, Vec::new())
+                .unwrap()
+                .missing
+                .is_empty()
+        );
         // The ledger goes on too: its quota and the worker's booking, which
         // the successor holds against a booking past the quota.
         let (ledgers, _) = worker.ledger(vec![gpu]).unwrap();

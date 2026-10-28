@@ -92,12 +92,11 @@ use serde::{Deserialize, Serialize};
 /// location memory lies at, which `get`, `retain`, `rekey` and a transfer's
 /// tensor regions select by their `at`, and a span copy rows at a pitch; 11
 /// moves a world's weights to host memory and back (`Offload`, `Restore`,
-/// tensor regions select by their `at`, and a span copy rows at a pitch; 11
-/// moves a world's weights to host memory and back (`Offload`, `Restore`,
 /// and the Transfer Server's `Allocate`) and discards the pages a world of
 /// other numerics cannot hit (`DiscardPages`); 12 lets a process of another
-/// host read a small read-only tensor of bytes inline (`Read`).
-pub const VERSION: u32 = 12;
+/// host read a small read-only tensor of bytes inline (`Read`); 13 makes
+/// publication of committed worlds explicit (`PublishWorlds`).
+pub const VERSION: u32 = 13;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -172,10 +171,9 @@ pub enum Role {
     /// requests.
     ///
     /// An engine states its `world`: the pages it commits are that world's,
-    /// and it reads its own world's pages and those every world shares. A world newer than the deployment's
-    /// oldest claimed world is on trial: what it publishes, pages and
-    /// tensors alike, is its own until the commit retires its predecessor,
-    /// and a rollback that retires it discards them.
+    /// and it reads its own world's pages and those every world shares.
+    /// Uncommitted worlds keep pages and tensors private until publication;
+    /// retiring such a world discards its pages.
     Head {
         deployment: String,
         #[serde(default)]
@@ -892,6 +890,10 @@ pub enum Request {
         #[serde(default)]
         retire: Vec<u64>,
     },
+    /// Publish all listed committed worlds together. Claimed worlds remain
+    /// private until this request, including during preparation and trial.
+    /// Every listed world must be claimed by the head's deployment.
+    PublishWorlds { worlds: Vec<u64> },
     /// Release every tensor the caller's scope retains in the caller's world
     /// that `keys` does not list; the copies of listed keys at the locations
     /// `at` lists are retained (every copy when `at` is empty).
@@ -1210,6 +1212,7 @@ pub enum ErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reply {
+    WorldsPublished,
     Claimed {
         claim: Claim,
     },

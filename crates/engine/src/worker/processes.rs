@@ -266,6 +266,26 @@ impl ProcessClient {
         }
     }
 
+    /// Publishes the committed worlds' immutable pages on one node.
+    /// Fails if the daemon holds no claim there or the server refuses.
+    pub(crate) fn publish_worlds(
+        &mut self,
+        host: &str,
+        deployment: &str,
+        worlds: &[u64],
+    ) -> anyhow::Result<()> {
+        match self.request(request::Kind::PublishWorlds(
+            proto::process::PublishWorlds {
+                host: host.to_owned(),
+                deployment: deployment.to_owned(),
+                worlds: worlds.to_vec(),
+            },
+        ))? {
+            reply::Kind::WorldsPublished(_) => Ok(()),
+            other => anyhow::bail!("the daemon answered publishing worlds with {other:?}"),
+        }
+    }
+
     /// Has node `host`'s daemon keep the weights alone of `worlds` of
     /// `deployment` at its Storage Server, in host memory when `to_host`;
     /// returns what it released and moved, and why it kept the weights on

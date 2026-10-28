@@ -1066,7 +1066,7 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
     }
 }
 
-/// Commits the engine's world: retires the worlds `commit` names (the
+/// Commits the engine's world: publishes its pages, retires the worlds `commit` names (the
 /// predecessor), then commits every scheduler, on a thread of its own, and
 /// answers the daemon `front` with `Hooked` and every worker's report.
 fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>) {
@@ -1082,6 +1082,15 @@ fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>)
             let mut results = Vec::new();
             let mut error = String::new();
             if let Some(slot) = routing.slots.first() {
+                match slot.handle.publish_world().recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failed)) => error = failed,
+                    Err(_) => error = "a scheduler stopped".to_owned(),
+                }
+            }
+            if error.is_empty()
+                && let Some(slot) = routing.slots.first()
+            {
                 match slot
                     .handle
                     .retire(commit.retire.clone(), commit.discard_pages)

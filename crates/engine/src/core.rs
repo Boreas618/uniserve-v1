@@ -876,6 +876,13 @@ impl SchedulerHandle {
             crate::warmup::warm(&scheduler, &core_config)?;
             cores.push(scheduler);
         }
+        if config.predecessor.is_none() {
+            cores[0]
+                .publish_world()
+                .recv()
+                .context("the scheduler stopped before publication")?
+                .map_err(anyhow::Error::msg)?;
+        }
         Ok(cores)
     }
 
@@ -1186,6 +1193,11 @@ impl SchedulerHandle {
         &self,
     ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
         self.commands.describe_requests()
+    }
+
+    /// Publishes the committed world's immutable pages on every claimed node.
+    pub fn publish_world(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.publish_world()
     }
 
     /// Ends the memory of `worlds` on the nodes of the scheduler's workers,
