@@ -1115,8 +1115,11 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         assert response.status_code == 200, response.text
         report = response.json()["result"]["world"]
         assert report["kv_cache"] == "recomputed", report
+        # The preparation gave back the tail past what the successor's
+        # weights left; the trial evicts what stayed past the first segment.
+        kept = min(gpu["segments_kept"] for gpu in report["memory"]["gpus"])
         evicted = report["evicted"]
-        assert evicted["evicted_segments"] == held - 1, report
+        assert evicted["evicted_segments"] == kept - 1, report
         assert evicted["evicted_bytes"] > 0, report
         world = report["world"]
         # The previous world keeps its first segment; the successor's cache
