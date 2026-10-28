@@ -24,8 +24,10 @@
 //!   slower than its graphs did whatever the transfers do, so its baseline
 //!   holds only reports that cover eager steps alone: those that arrived
 //!   more than an [`INTERVAL`] after the switch and before the preparation
-//!   began. A switch that precedes the preparation by less leaves no
-//!   baseline, and the transfers keep their budgets.
+//!   began. The successor starts once each scheduler reported
+//!   [`EAGER_REPORTS`] of them with steps ([`eager_baseline`]), or ran no
+//!   step for [`IDLE`]: an idle scheduler has no steps to protect, and its
+//!   reports during the preparation decide nothing.
 //! - **Decision.** Once per interval, the reports that arrived since the
 //!   previous decision are read: a scheduler whose step takes more than
 //!   `1 + transfer_slowdown` times its baseline makes the leader halve the
@@ -59,6 +61,19 @@ pub(crate) const INTERVAL: Duration = Duration::from_secs(1);
 /// The fewest batches of one batch-size range that make its baseline, so
 /// that a range the load visited for a few steps does not set it.
 const MIN_BATCHES: u64 = 20;
+
+/// The reports of eager steps alone, with steps, each scheduler of a
+/// serving world that switched to eager forwards makes before its successor
+/// starts: its baseline.
+const EAGER_REPORTS: usize = 2;
+
+/// How long a scheduler may run no step before the wait for its eager
+/// baseline ends without it.
+pub(crate) const IDLE: Duration = Duration::from_millis(2500);
+
+/// How often the wait for an eager baseline reads the reports, which
+/// arrive once a second.
+const POLL: Duration = Duration::from_millis(100);
 
 /// The power-of-two range of `tokens` query tokens per batch: 0 for one
 /// token, `k` for `(2^(k-1), 2^k]`.
@@ -104,6 +119,65 @@ impl Baseline {
         let &(batch_us, batches) = self.steps.get(&(scheduler, range))?;
         (batches >= MIN_BATCHES).then(|| batch_us as f64 / batches as f64)
     }
+}
+
+/// Waits until every one of `world`'s `schedulers` schedulers either
+/// reported [`EAGER_REPORTS`] reports of eager steps alone with steps since
+/// the switch to eager forwards at `eager_since`, or ran no step for
+/// [`IDLE`], and returns those that ran none, which the preparation starts
+/// without a baseline of. The wait ends within [`IDLE`] of each scheduler's
+/// latest step, so a world that stops stepping does not hold it.
+pub(crate) async fn eager_baseline(
+    observer: &Observer,
+    world: u64,
+    schedulers: u32,
+    eager_since: Instant,
+) -> Vec<u32> {
+    loop {
+        if let Some(idle) = eager_waited(observer, world, schedulers, eager_since, Instant::now()) {
+            return idle;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The schedulers [`eager_baseline`] stops waiting for without a baseline
+/// at `now`, once every other one has its baseline; `None` while one still
+/// steps without it.
+fn eager_waited(
+    observer: &Observer,
+    world: u64,
+    schedulers: u32,
+    eager_since: Instant,
+    now: Instant,
+) -> Option<Vec<u32>> {
+    let count = schedulers as usize;
+    // Per scheduler: its reports of eager steps alone with steps, and the
+    // arrival of its latest report with steps (the switch before any).
+    let mut eager = vec![0_usize; count];
+    let mut stepped = vec![eager_since; count];
+    observer.samples(world, eager_since, now, |sample| {
+        let index = sample.scheduler as usize;
+        if index >= count || sample.batches == 0 {
+            return;
+        }
+        stepped[index] = stepped[index].max(sample.at);
+        if sample.at >= eager_since + INTERVAL {
+            eager[index] += 1;
+        }
+    });
+
+    let mut idle = Vec::new();
+    for index in 0..count {
+        if eager[index] >= EAGER_REPORTS {
+            continue;
+        }
+        if now.saturating_duration_since(stepped[index]) < IDLE {
+            return None;
+        }
+        idle.push(index as u32);
+    }
+    Some(idle)
 }
 
 /// What one interval's reports ask of the transfers' budgets.
@@ -194,18 +268,26 @@ impl Throttling {
     }
 }
 
+/// The throttles one preparation sent, which its change reports.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Throttled {
+    pub(crate) halvings: u32,
+    pub(crate) restorations: u32,
+}
+
 /// Runs `throttling` every `interval` until `done`, sending its decisions
 /// through `running`, the serving engine, and restores the budgets at the
-/// end when they stand halved. A throttle the engine cannot pass on is
-/// logged: the preparation goes on, at the budgets the Transfer Servers
-/// keep.
+/// end when they stand halved; returns the throttles the engine passed on.
+/// A throttle the engine cannot pass on is logged: the preparation goes on,
+/// at the budgets the Transfer Servers keep.
 pub(crate) async fn control(
     running: Arc<EngineClient>,
     observer: Arc<Observer>,
     mut throttling: Throttling,
     interval: Duration,
     done: CancellationToken,
-) {
+) -> Throttled {
+    let mut throttled = Throttled::default();
     let mut ticks = tokio::time::interval(interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick completes at once.
@@ -218,22 +300,33 @@ pub(crate) async fn control(
         if let Some((decision, ratio)) = throttling.decide(&observer) {
             let halve = decision == Decision::Halve;
             match running.throttle_transfers(halve).await {
-                Ok(hosts) => info!(
-                    ?decision,
-                    ratio,
-                    ?hosts,
-                    "the serving world's steps against their baseline changed the transfers' \
-                     budgets"
-                ),
+                Ok(hosts) => {
+                    if halve {
+                        throttled.halvings += 1;
+                    } else {
+                        throttled.restorations += 1;
+                    }
+                    info!(
+                        ?decision,
+                        ratio,
+                        ?hosts,
+                        "the serving world's steps against their baseline changed the \
+                         transfers' budgets"
+                    );
+                }
                 Err(error) => warn!(?decision, %error, "the transfers' budgets did not change"),
             }
         }
     }
-    if throttling.halved()
-        && let Err(error) = running.throttle_transfers(false).await
-    {
-        warn!(%error, "the transfers' budgets were not restored after the preparation");
+    if throttling.halved() {
+        match running.throttle_transfers(false).await {
+            Ok(_) => throttled.restorations += 1,
+            Err(error) => {
+                warn!(%error, "the transfers' budgets were not restored after the preparation");
+            }
+        }
     }
+    throttled
 }
 
 #[cfg(test)]
@@ -290,6 +383,46 @@ mod tests {
             throttling.decide(&observer).map(|(decision, _)| decision),
             Some(Decision::Restore)
         );
+    }
+
+    /// The successor waits for two reports of eager steps alone from each
+    /// stepping scheduler, and for no scheduler that runs no step for
+    /// [`IDLE`].
+    #[test]
+    fn the_eager_baseline_waits_for_two_reports_of_steps_or_an_idle_scheduler() {
+        let observer = Observer::default();
+        // A switch an interval back, so the reports from now on cover eager
+        // steps alone.
+        let switched = Instant::now()
+            .checked_sub(INTERVAL)
+            .expect("the clock runs past an interval");
+
+        observer.record(1, 0, &report(14_000, 10, 32));
+        observer.record(1, 1, &report(0, 0, 0));
+        assert_eq!(
+            eager_waited(&observer, 1, 2, switched, Instant::now()),
+            None
+        );
+
+        observer.record(1, 0, &report(14_000, 10, 32));
+        observer.record(1, 1, &report(0, 0, 0));
+        assert_eq!(
+            eager_waited(&observer, 1, 2, switched, Instant::now()),
+            None
+        );
+
+        // Scheduler 1 ran no step since the switch: once that lasts the idle
+        // span, the wait ends without its baseline.
+        let later = switched + IDLE;
+        assert_eq!(
+            eager_waited(&observer, 1, 2, switched, later),
+            Some(vec![1])
+        );
+
+        // A world that runs no step at all starts without any.
+        let idle = Observer::default();
+        assert_eq!(eager_waited(&idle, 1, 2, switched, Instant::now()), None);
+        assert_eq!(eager_waited(&idle, 1, 2, switched, later), Some(vec![0, 1]));
     }
 
     /// A serving world that switched to eager forwards for the preparation
@@ -378,7 +511,14 @@ mod tests {
         observer.record(1, 0, &report(20_000, 25, 32));
         assert_eq!(next(Duration::from_secs(10)), Some(true));
         done.cancel();
-        control.await.expect("the control ended");
+        let throttled = control.await.expect("the control ended");
         assert_eq!(next(Duration::from_secs(10)), Some(false));
+        assert_eq!(
+            throttled,
+            Throttled {
+                halvings: 3,
+                restorations: 2
+            }
+        );
     }
 }
