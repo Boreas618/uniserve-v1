@@ -601,6 +601,13 @@ pub enum Command {
     /// Reads the memory ledgers of the nodes of the scheduler's workers
     /// (`Executor::ledgers`), and answers with each node's.
     Ledgers(crossbeam_channel::Sender<Result<Vec<String>, String>>),
+    /// Halves, or restores when not `halve`, the byte budgets of the links
+    /// the deployment's transfers use on the nodes of the scheduler's
+    /// workers (`Executor::throttle`), and answers with those nodes' hosts.
+    Throttle {
+        halve: bool,
+        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    },
     /// Keeps the weights alone of other worlds on the nodes of the
     /// scheduler's workers, in host memory when `to_host`
     /// (`Executor::keep_weights`), and answers with each node's report.
@@ -920,6 +927,18 @@ impl CommandSender {
         let (answer, read) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Ledgers(answer));
         read
+    }
+
+    /// Halves, or restores when not `halve`, the byte budgets of the links
+    /// the deployment's transfers use (`Command::Throttle`); the receiver
+    /// gets the hosts it throttled.
+    pub fn throttle(
+        &self,
+        halve: bool,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, throttled) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Throttle { halve, answer });
+        throttled
     }
 
     /// Reports the KV cache each worker group holds now

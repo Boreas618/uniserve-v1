@@ -261,12 +261,25 @@ message EngineCommand {
     // deployment, each node's daemon over its claim, without asking a
     // worker; answered with `Hooked`, one JSON result per node.
     DescribeMemory describe_memory = 14;
+    // Halve, or restore, the byte budgets of the links the deployment's
+    // transfers use at every node's Transfer Server, each node's daemon over
+    // its claim; answered with `Hooked`.
+    ThrottleTransfers throttle_transfers = 15;
   }
 }
 
 message DescribeMemory {
   // Matches the `Hooked` answer.
   uint64 id = 1;
+}
+
+// A halving takes every link a task of the deployment copies over now, a
+// restoration (`halve` false) every link a halving reduced, which then grows
+// back gradually.
+message ThrottleTransfers {
+  // Matches the `Hooked` answer.
+  uint64 id = 1;
+  bool halve = 2;
 }
 
 // A worker hook (`uniserve.hooks`), which a plugin implements.

@@ -26,7 +26,8 @@ use anyhow::Context as _;
 use proto::Connection;
 use proto::process::{
     Claim, Downstream, Exit, Hello, KeepWeights, LedgerQuery, Node, Request, Reserve, Scope, Spawn,
-    Stop, Upstream, WeightsKept, Welcome, downstream, event, hello, reply, request, upstream,
+    Stop, ThrottleTransfers, Upstream, WeightsKept, Welcome, downstream, event, hello, reply,
+    request, upstream,
 };
 
 /// Longest the leader takes to answer a request the engine sends: a claim
@@ -270,6 +271,32 @@ impl ProcessClient {
         {
             reply::Kind::WeightsKept(kept) => Ok(kept),
             other => anyhow::bail!("the daemon answered keeping weights with {other:?}"),
+        }
+    }
+
+    /// Has node `host`'s daemon halve, or restore when not `halve`, the
+    /// byte budgets of the links `deployment`'s transfers use at its
+    /// Transfer Server.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon holds no claim there or the server refuses.
+    pub(crate) fn throttle(
+        &mut self,
+        host: &str,
+        deployment: &str,
+        halve: bool,
+    ) -> anyhow::Result<()> {
+        match self
+            .request(request::Kind::ThrottleTransfers(ThrottleTransfers {
+                host: host.to_owned(),
+                deployment: deployment.to_owned(),
+                halve,
+            }))
+            .with_context(|| format!("throttling the transfers on {host}"))?
+        {
+            reply::Kind::TransfersThrottled(_) => Ok(()),
+            other => anyhow::bail!("the daemon answered a throttle with {other:?}"),
         }
     }
 

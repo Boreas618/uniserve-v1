@@ -249,6 +249,39 @@ impl ClaimHolder {
         Ok(kept)
     }
 
+    /// Halves, or restores when not `halve`, the byte budgets of the links
+    /// `deployment`'s transfers use at this node's Transfer Server, over the
+    /// claim this daemon holds: a halving takes every link a task of the
+    /// deployment copies over now, a restoration every link a halving
+    /// reduced (`Request::Throttle` with no links).
+    ///
+    /// # Errors
+    ///
+    /// Fails when this daemon holds no claim of the deployment, or the
+    /// server cannot be reached or runs no Transfer Server.
+    pub(crate) fn throttle(&mut self, deployment: &str, halve: bool) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let held = self
+            .held
+            .get_mut(deployment)
+            .with_context(|| format!("this node holds no claim of deployment {deployment}"))?;
+        let throttle = if halve {
+            storage::protocol::Throttle::Halve
+        } else {
+            storage::protocol::Throttle::Restore
+        };
+        held.client
+            .throttle(Vec::new(), throttle)
+            .with_context(|| format!("throttling the transfers of deployment {deployment}"))?;
+        tracing::info!(
+            deployment,
+            ?throttle,
+            "changed the budgets of the transfers' links"
+        );
+        Ok(())
+    }
+
     /// The memory ledgers this node's Storage Server keeps for
     /// `deployment`, one per GPU of the node it uses, and what the host
     /// admits of new host memory, as JSON (`{"ledgers": [...],

@@ -1500,6 +1500,15 @@ impl Executor for WorkerExecutor {
         }
     }
 
+    /// Throttles the deployment's transfers on its nodes through the claims
+    /// every group shares.
+    fn throttle(&mut self, halve: bool) -> anyhow::Result<Vec<String>> {
+        match self.workers.first() {
+            Some((_, group)) => group.claims().throttle(halve),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Reads the memory ledgers of the deployment's nodes through the
     /// claims every group shares.
     fn ledgers(&mut self) -> anyhow::Result<Vec<String>> {

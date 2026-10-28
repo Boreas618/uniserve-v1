@@ -1043,6 +1043,10 @@ pub enum Request {
         update: Option<u64>,
     },
     /// From a head: halve or restore the byte budget of each of `links`.
+    /// With no links, a halving takes every link a task of the head's
+    /// deployment copies over now (a deployment changes one world at a
+    /// time, so they are its update's links), and a restoration every link
+    /// whose budget a halving reduced.
     Throttle {
         links: Vec<Link>,
         throttle: Throttle,
@@ -1393,10 +1397,14 @@ pub enum Event {
     },
     /// To the Transfer Server: cancel task `task`.
     Cancel { task: u64 },
-    /// To the Transfer Server: change the budgets of `links`.
+    /// To the Transfer Server: change the budgets of `links` and of every
+    /// link a task of `tasks` copies over; a restoration with neither
+    /// restores every link a halving reduced.
     Throttle {
         links: Vec<Link>,
         throttle: Throttle,
+        #[serde(default)]
+        tasks: Vec<u64>,
     },
     /// To the Transfer Server: register `allocations`, each given before,
     /// with its NIXL agent for another host's READs, and report with

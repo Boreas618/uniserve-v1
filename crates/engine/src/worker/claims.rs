@@ -220,6 +220,24 @@ impl Claims {
         Ok(reports)
     }
 
+    /// Halves, or restores when not `halve`, the byte budgets of the links
+    /// the deployment's transfers use on every node of the engine's, and
+    /// returns their hosts.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot reach its Transfer Server.
+    pub(crate) fn throttle(&self, halve: bool) -> anyhow::Result<Vec<String>> {
+        for host in self.scopes.keys() {
+            crate::worker::processes::lock(&self.processes)?.throttle(
+                host,
+                &self.deployment,
+                halve,
+            )?;
+        }
+        Ok(self.scopes.keys().cloned().collect())
+    }
+
     /// The memory ledgers of every node of the engine's: for each host, the
     /// JSON of its Storage Server's ledgers of the deployment and what it
     /// admits of new host memory, read by the node's daemon over its claim

@@ -198,13 +198,15 @@ pub struct Rates {
     pub tokens_per_second: f64,
 }
 
-/// One statistics report of one scheduler of one world.
-struct Sample {
-    at: Instant,
-    world: u64,
-    batch_us: u64,
-    batches: u64,
-    tokens: u64,
+/// One statistics report of one scheduler of one world: the interval's
+/// host-observed batch time, batches, query tokens and numerical faults.
+pub(crate) struct Sample {
+    pub(crate) at: Instant,
+    pub(crate) world: u64,
+    pub(crate) scheduler: u32,
+    pub(crate) batch_us: u64,
+    pub(crate) batches: u64,
+    pub(crate) tokens: u64,
     numerical_faults: u64,
 }
 
@@ -220,8 +222,8 @@ pub(crate) struct Observer {
 const OBSERVED: Duration = Duration::from_secs(600);
 
 impl Observer {
-    /// Records one scheduler's report of `world`.
-    pub(crate) fn record(&self, world: u64, stats: &SchedulerStats) {
+    /// Records the report of scheduler `scheduler` of `world`.
+    pub(crate) fn record(&self, world: u64, scheduler: u32, stats: &SchedulerStats) {
         let tokens = stats
             .worker_forward_stats
             .as_ref()
@@ -231,6 +233,7 @@ impl Observer {
         samples.push_back(Sample {
             at: now,
             world,
+            scheduler,
             batch_us: stats.batch_roundtrip_us,
             batches: stats.batch_count,
             tokens,
@@ -271,6 +274,23 @@ impl Observer {
             step_us: batch_us as f64 / batches as f64,
             tokens_per_second: tokens as f64 / span.as_secs_f64(),
         })
+    }
+
+    /// Calls `visit` with every report of `world` made in `[from, until)`,
+    /// in the order they arrived.
+    pub(crate) fn samples(
+        &self,
+        world: u64,
+        from: Instant,
+        until: Instant,
+        mut visit: impl FnMut(&Sample),
+    ) {
+        for sample in locked(&self.samples)
+            .iter()
+            .filter(|sample| sample.world == world && sample.at >= from && sample.at < until)
+        {
+            visit(sample);
+        }
     }
 
     /// The calls of `world` that produced non-finite logits since `since`.
@@ -880,7 +900,7 @@ impl Leader {
         // The serving world gives its graph memory to the successor's
         // captures first, so the shrink that follows leaves it to the
         // successor.
-        if update.eager_prepare {
+        let eager_since = if update.eager_prepare {
             self.progress("eager", None);
             if let Err(error) = running.hook("uniserve.eager", r#"{"eager":true}"#).await {
                 // Ranks that switched replay their graphs again; the others
@@ -892,7 +912,10 @@ impl Leader {
                      (update_config.eager_prepare): {error}"
                 )));
             }
-        }
+            Some(Instant::now())
+        } else {
+            None
+        };
         self.progress("shrink", None);
         // The serving world's cache gives back the tail past the limit each
         // GPU's ledger leaves it beside the successor; its requests run on.
@@ -940,11 +963,35 @@ impl Leader {
             Arc::clone(&self.engines.observer),
         );
         info!(previous_world, "preparing a successor world");
+        // While the successor prepares, its transfers yield to the serving
+        // world's steps (`update_config.transfer_slowdown`).
+        let interference = update.transfer_slowdown.map(|slowdown| {
+            let done = tokio_util::sync::CancellationToken::new();
+            let throttling = crate::interference::Throttling::new(
+                &self.engines.observer,
+                previous_world,
+                slowdown,
+                Instant::now(),
+                eager_since,
+            );
+            let task = tokio::spawn(crate::interference::control(
+                Arc::clone(running),
+                Arc::clone(&self.engines.observer),
+                throttling,
+                crate::interference::INTERVAL,
+                done.clone(),
+            ));
+            (done, task)
+        });
         let start_spec = spec.clone();
         let prepared = tokio::task::spawn_blocking(move || control.start(start_spec, sink))
             .await
             .context("the successor's start did not complete")
             .and_then(|started| started.context("the successor world did not start"));
+        if let Some((done, task)) = interference {
+            done.cancel();
+            let _ = task.await;
+        }
         let successor = match prepared {
             Ok(successor) => Arc::new(successor),
             Err(error) => {
@@ -1656,9 +1703,9 @@ mod tests {
     fn rates_average_one_worlds_batches() {
         let observer = Observer::default();
         let since = Instant::now();
-        observer.record(1, &stats(1_000, 10, 500, 0));
-        observer.record(1, &stats(3_000, 10, 500, 0));
-        observer.record(2, &stats(90_000, 1, 1, 2));
+        observer.record(1, 0, &stats(1_000, 10, 500, 0));
+        observer.record(1, 0, &stats(3_000, 10, 500, 0));
+        observer.record(2, 0, &stats(90_000, 1, 1, 2));
         let rates = observer
             .rates(1, since, Duration::from_secs(60))
             .expect("world 1 ran batches");

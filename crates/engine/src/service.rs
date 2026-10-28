@@ -532,6 +532,17 @@ fn read_requests(
                         .collect();
                     answer_hooked(describe.id, answers, front, routing);
                 }
+                Some(wire::engine_command::Kind::ThrottleTransfers(throttle)) => {
+                    // The deployment's claims cover every node, so the first
+                    // scheduler throttles them all.
+                    let answers: Vec<_> = routing
+                        .slots
+                        .first()
+                        .map(|slot| slot.handle.throttle(throttle.halve))
+                        .into_iter()
+                        .collect();
+                    answer_hooked(throttle.id, answers, front, routing);
+                }
                 Some(wire::engine_command::Kind::FlushCache(_)) => {
                     for slot in &routing.slots {
                         slot.handle.flush_cache();

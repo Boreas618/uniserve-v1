@@ -909,6 +909,13 @@ pub struct UpdateOptions {
     /// run to their end.
     #[serde(with = "values::optional_duration")]
     pub preempt_after: Option<Duration>,
+    /// How much longer than before the change a serving scheduler's step
+    /// may take while the successor prepares, as a fraction (`0.1` for
+    /// 10%), past which the leader halves the byte budgets of the links the
+    /// change's transfers use, and restores them once the steps are back
+    /// within it; unset to leave the budgets whole. Steps are compared
+    /// within their batch-size range (`docs/configuration.md`).
+    pub transfer_slowdown: Option<f64>,
     /// Whether the serving world runs its forwards eagerly while the
     /// successor prepares, giving its CUDA graph memory to the successor's
     /// captures: the serving world steps slower meanwhile, and replays its
@@ -922,6 +929,7 @@ impl Default for UpdateOptions {
             previous_world: PreviousWorld::Parked,
             rollback: RollbackOptions::default(),
             preempt_after: None,
+            transfer_slowdown: None,
             eager_prepare: false,
         }
     }
@@ -1058,6 +1066,12 @@ impl ServeConfig {
             anyhow::ensure!(
                 cost.is_finite() && cost >= 0.0,
                 "invalid `speculative_config.refill_token_cost`: {cost} must not be negative"
+            );
+        }
+        if let Some(slowdown) = self.update_config.transfer_slowdown {
+            anyhow::ensure!(
+                slowdown.is_finite() && slowdown > 0.0,
+                "invalid `update_config.transfer_slowdown`: {slowdown} must be positive"
             );
         }
         let rollback = &self.update_config.rollback;
