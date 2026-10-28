@@ -16,9 +16,10 @@ request, as a video job, is then preempted at a denoising step boundary:
   in seconds while a successor prepares for tens of them, so the request
   starts once the successor prepares, and the serving world's model group
   is paused (``SIGSTOP``, as fault-injection suites pause a process) with
-  the request mid-trajectory and resumed once the change promotes: the
-  park then lands at the step boundary the paused calls reach, whatever
-  the two durations.
+  the request mid-trajectory and resumed once the change warms the
+  successor's cache (which reads the serving scheduler's requests between
+  steps) or promotes it: the park then lands at a step boundary after the
+  paused calls, whatever the two durations.
 
 Each preempted video is the reference video, frame for frame and sample
 for sample. Preemption starts only after the public job status reports
@@ -305,14 +306,16 @@ def _wait_denoising(base_url: str, job: str, steps: int) -> int:
 
 
 # A world change's phases in their order (``GET /admin/config``).
-_PHASES = ("shrink", "prepare", "promote")
+_PHASES = ("shrink", "prepare", "warm_cache", "promote")
 
 
-def _wait_phase(base_url: str, change: Future, phase: str) -> None:
-    """Waits until the world change `change` is in `phase`, as
+def _wait_phase(base_url: str, change: Future, *phases: str) -> None:
+    """Waits until the world change `change` is in one of `phases`, as
     ``GET /admin/config`` reports it; fails when the change answers or
-    passes the phase before.
+    passes the last of them before.
     """  # noqa: D205
+    phase = " or ".join(phases)
+    last = max(_PHASES.index(name) for name in phases)
     # A successor prepares in tens of seconds; ten minutes bounds a change
     # whose preparation waits on the paused workers.
     deadline = time.monotonic() + 600
@@ -325,9 +328,9 @@ def _wait_phase(base_url: str, change: Future, phase: str) -> None:
             )
         config = httpx.get(f"{base_url}/admin/config", timeout=60).json()
         current = (config.get("update") or {}).get("phase")
-        if current == phase:
+        if current in phases:
             return
-        if current in _PHASES and _PHASES.index(current) > _PHASES.index(phase):
+        if current in _PHASES and _PHASES.index(current) > last:
             pytest.fail(f"the change passed its {phase} phase: {current}")
         time.sleep(0.05)
     raise TimeoutError(f"the world change did not reach its {phase} phase")
@@ -404,7 +407,10 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
             for worker in workers:
                 os.kill(worker, signal.SIGSTOP)
             try:
-                _wait_phase(base_url, change, "promote")
+                # Warming the successor's cache reads the requests the
+                # serving scheduler holds, which answers between steps: the
+                # workers resume once the change warms or promotes.
+                _wait_phase(base_url, change, "warm_cache", "promote")
             finally:
                 for worker in workers:
                     os.kill(worker, signal.SIGCONT)
@@ -456,7 +462,10 @@ def test_a_video_request_continues_under_another_parallel_configuration(
             for worker in workers:
                 os.kill(worker, signal.SIGSTOP)
             try:
-                _wait_phase(base_url, change, "promote")
+                # Warming the successor's cache reads the requests the
+                # serving scheduler holds, which answers between steps: the
+                # workers resume once the change warms or promotes.
+                _wait_phase(base_url, change, "warm_cache", "promote")
             finally:
                 for worker in workers:
                     os.kill(worker, signal.SIGCONT)
