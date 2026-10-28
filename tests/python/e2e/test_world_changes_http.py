@@ -1635,7 +1635,8 @@ def _follower(
         f"mkdir -m 700 {runtime} && cd {shlex.quote(str(Path.cwd()))} && "
         f"echo follower pid $$ && exec env {environment} "
         f"{shlex.quote(str(require_uniserve_binary()))} serve --nnodes 2 "
-        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1"
+        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
+        f"--worker-executable {shlex.quote(str(worker_executable()))}"
     )
     started: list[subprocess.Popen[str]] = []
     leaving = threading.Event()
