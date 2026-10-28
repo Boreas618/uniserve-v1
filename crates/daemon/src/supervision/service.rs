@@ -30,8 +30,8 @@ use std::time::Duration;
 use prost::Message as _;
 use proto::process::{
     Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node, Reply,
-    Request, Spawned, Stopped, ToMember, Upstream, Welcome, downstream, event, from_member, hello,
-    reply, request, to_member, upstream,
+    Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream, Welcome, downstream, event,
+    from_member, hello, reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
@@ -164,6 +164,14 @@ impl Local {
                 Ok(ledgers) => reply.kind = Some(reply::Kind::Ledger(LedgerReport { ledgers })),
                 Err(error) => reply.error = format!("{error:#}"),
             },
+            Some(request::Kind::ThrottleTransfers(throttle)) => {
+                match self.claims.throttle(&throttle.deployment, throttle.halve) {
+                    Ok(()) => {
+                        reply.kind = Some(reply::Kind::TransfersThrottled(TransfersThrottled {}));
+                    }
+                    Err(error) => reply.error = format!("{error:#}"),
+                }
+            }
             None => reply.error = "an empty request".to_owned(),
         }
         reply
@@ -465,6 +473,7 @@ fn route(
         Some(request::Kind::Claim(claim)) => Some(claim.host.as_str()),
         Some(request::Kind::Ledger(query)) => Some(query.host.as_str()),
         Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
+        Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
         Some(request::Kind::Stop(_)) | None => None,
     };
     let forward = |member: &mut Membership| {

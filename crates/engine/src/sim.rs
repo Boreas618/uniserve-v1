@@ -68,6 +68,9 @@ pub struct SimExecutor {
     results_on_wait: bool,
     /// Where the boundary events go while a test observes them.
     observer: Option<Sender<BatchEvent>>,
+    /// Where the throttles of the deployment's transfers go while a test
+    /// observes them: `true` for a halving, `false` for a restoration.
+    throttles: Option<Sender<bool>>,
     /// The simulator thread; `None` once the executor is closed.
     handle: Option<JoinHandle<()>>,
     /// Requests admitted by a submitted batch whose `Finish` has not been
@@ -166,6 +169,7 @@ impl SimExecutor {
             in_flight: 0,
             results_on_wait,
             observer: None,
+            throttles: None,
             handle: Some(handle),
             admissions: HashSet::new(),
             products: HashSet::new(),
@@ -181,6 +185,16 @@ impl SimExecutor {
     pub fn observe(&mut self) -> Receiver<BatchEvent> {
         let (sender, receiver) = crossbeam_channel::unbounded();
         self.observer = Some(sender);
+        receiver
+    }
+
+    /// Reports every throttle of the deployment's transfers the executor
+    /// takes (`Executor::throttle`), `true` for a halving and `false` for a
+    /// restoration, in order, to the returned receiver. The simulator runs
+    /// no transfer: a throttle changes nothing else.
+    pub fn observe_throttles(&mut self) -> Receiver<bool> {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        self.throttles = Some(sender);
         receiver
     }
 
@@ -321,6 +335,15 @@ impl Executor for SimExecutor {
                 .workers
                 .iter()
                 .any(|(id, _)| id == worker)
+    }
+
+    /// Records the throttle for an observer; the simulator throttles no
+    /// host.
+    fn throttle(&mut self, halve: bool) -> Result<Vec<String>, crate::executor::ExecutorError> {
+        if let Some(throttles) = &self.throttles {
+            let _ = throttles.send(halve);
+        }
+        Ok(Vec::new())
     }
 
     /// Returns the worker metadata.

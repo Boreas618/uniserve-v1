@@ -444,9 +444,18 @@ impl Served {
                 Some(cancelled) => *cancelled = true,
                 None => self.lanes.cancel(task),
             },
-            Event::Throttle { links, throttle } => {
-                tracing::info!(links = links.len(), ?throttle, "changing link budgets");
-                self.lanes.throttle(&links, throttle);
+            Event::Throttle {
+                links,
+                throttle,
+                tasks,
+            } => {
+                tracing::info!(
+                    links = links.len(),
+                    tasks = tasks.len(),
+                    ?throttle,
+                    "changing link budgets"
+                );
+                self.lanes.throttle(&links, &tasks, throttle);
             }
             Event::Register {
                 request,

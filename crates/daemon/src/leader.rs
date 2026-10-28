@@ -98,7 +98,7 @@ pub enum Task {
 /// `observer`, which reads each world's rates.
 pub(crate) fn stats_sink(model_name: String, observer: Arc<crate::worlds::Observer>) -> StatsSink {
     Box::new(move |world, scheduler, snapshot| {
-        observer.record(world, &snapshot);
+        observer.record(world, scheduler, &snapshot);
         metrics::record_scheduler_stats(&METRICS.scheduler, &model_name, scheduler, &snapshot);
     })
 }

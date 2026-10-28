@@ -208,6 +208,8 @@ struct TaskState {
     /// task's time on the lanes, which its end reports.
     queued: Instant,
     queued_pieces: usize,
+    /// The links its pieces copy over, which a halving of its tasks names.
+    links: HashSet<Link>,
 }
 
 /// A link's byte budget: a share of its bandwidth, and the token bucket
@@ -570,6 +572,7 @@ impl Lanes {
                 reported: Instant::now(),
                 queued: Instant::now(),
                 queued_pieces: pieces.len(),
+                links: pieces.iter().map(|(lane, _)| lane.link.clone()).collect(),
             },
         );
         for (lane, piece) in pieces {
@@ -611,14 +614,30 @@ impl Lanes {
         }
     }
 
-    /// Change the budgets of `links`.
-    pub(super) fn throttle(&mut self, links: &[Link], throttle: Throttle) {
+    /// Change the budgets of `links` and of every link a task of `tasks`
+    /// copies over; a restoration that names neither restores every link
+    /// whose budget is reduced.
+    pub(super) fn throttle(&mut self, links: &[Link], tasks: &[u64], throttle: Throttle) {
         let now = Instant::now();
         let mut state = self.shared.lock();
-        for link in links {
+        let mut changed: HashSet<Link> = links.iter().cloned().collect();
+        for task in tasks {
+            if let Some(entry) = state.tasks.get(task) {
+                changed.extend(entry.links.iter().cloned());
+            }
+        }
+        if changed.is_empty() && tasks.is_empty() && throttle == Throttle::Restore {
+            changed = state
+                .budgets
+                .iter()
+                .filter(|(_, budget)| budget.share(now) < 1.0)
+                .map(|(link, _)| link.clone())
+                .collect();
+        }
+        for link in changed {
             state
                 .budgets
-                .entry(link.clone())
+                .entry(link)
                 .or_insert_with(|| Budget::new(now))
                 .change(throttle, now);
         }

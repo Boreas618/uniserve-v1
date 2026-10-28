@@ -1468,6 +1468,15 @@ pub trait Executor: Send {
         let _ = (worlds, to_host);
         Ok(Vec::new())
     }
+    /// Halves, or restores when not `halve`, the byte budgets of the links
+    /// the deployment's transfers use on the nodes of the executor's
+    /// workers (`Claims::throttle`), and returns those nodes' hosts. The
+    /// default suits an executor that retains no memory and runs no
+    /// transfer, which throttles no host.
+    fn throttle(&mut self, halve: bool) -> Result<Vec<String>, ExecutorError> {
+        let _ = halve;
+        Ok(Vec::new())
+    }
     /// The memory ledgers of the nodes of the executor's workers
     /// (`Claims::ledgers`): for each node, JSON of `{"host": ..., "ledgers":
     /// [...], "host_memory": {...}}`. The default suits an executor that

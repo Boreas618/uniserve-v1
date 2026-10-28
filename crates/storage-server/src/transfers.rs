@@ -216,7 +216,7 @@ impl Server {
                 if !matches!(role, Role::Head { .. }) {
                     return Err(invalid("a head throttles links"));
                 }
-                self.throttle(links, *throttle)?;
+                self.throttle(&deployment, links, *throttle)?;
                 Ok(Outcome::Reply(Reply::Throttled, Vec::new()))
             }
             _ => Err(invalid("not a transfer request")),
@@ -808,15 +808,33 @@ impl Server {
     }
 
     /// See [`Request::Throttle`](storage::protocol::Request::Throttle).
-    fn throttle(&mut self, links: &[Link], throttle: Throttle) -> Result<(), (ErrorKind, String)> {
+    /// Without links, a halving names the tasks of `deployment`, whose links
+    /// the Transfer Server knows.
+    fn throttle(
+        &mut self,
+        deployment: &str,
+        links: &[Link],
+        throttle: Throttle,
+    ) -> Result<(), (ErrorKind, String)> {
         let Some(transfer_server) = self.transfers.client else {
             return Err(unavailable());
+        };
+        let tasks = if links.is_empty() && throttle == Throttle::Halve {
+            self.transfers
+                .tasks
+                .iter()
+                .filter(|(_, task)| task.deployment == deployment)
+                .map(|(&id, _)| id)
+                .collect()
+        } else {
+            Vec::new()
         };
         self.events.push((
             transfer_server,
             Event::Throttle {
                 links: links.to_vec(),
                 throttle,
+                tasks,
             },
             Vec::new(),
         ));

@@ -148,6 +148,13 @@ impl Scheduler {
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(read);
             }
+            Command::Throttle { halve, answer } => {
+                let throttled = self
+                    .executor
+                    .throttle(halve)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = answer.send(throttled);
+            }
             Command::DescribeCache(answer) => {
                 let _ = answer.send(self.describe_cache());
             }

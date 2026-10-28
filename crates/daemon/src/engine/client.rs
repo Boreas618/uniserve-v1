@@ -606,6 +606,25 @@ impl EngineClient {
             .map(Answered::results)
     }
 
+    /// Halves, or restores when not `halve`, the byte budgets of the links
+    /// the deployment's transfers use at every node's Transfer Server: a
+    /// halving takes every link a task of the deployment copies over now, a
+    /// restoration every link a halving reduced, which grows back gradually.
+    ///
+    /// Returns the hosts it throttled.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot reach its Transfer Server, or when
+    /// the engine ends first.
+    pub async fn throttle_transfers(&self, halve: bool) -> Result<Vec<String>, String> {
+        self.ask(|id| {
+            wire::engine_command::Kind::ThrottleTransfers(wire::ThrottleTransfers { id, halve })
+        })
+        .await
+        .map(Answered::results)
+    }
+
     /// Runs the worker hook `name` with the JSON `payload` on every worker
     /// once the engine's batches in flight complete, and returns each
     /// worker's JSON result.

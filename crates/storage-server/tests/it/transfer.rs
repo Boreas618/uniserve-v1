@@ -546,6 +546,73 @@ fn a_promotion_transfer_overtakes_background_transfers_on_its_link() {
     assert_eq!(read(&destination, bytes - 4096, 4096), pattern(4096, 3));
 }
 
+/// A head that names no link halves the links its deployment's tasks copy
+/// over: a task of 256 MiB over the host link, at its whole budget a matter
+/// of milliseconds, still runs after 200 ms. A restoration that names no
+/// link restores every link a halving reduced: once its budget grew back,
+/// the next task over the link ends within 200 ms again.
+#[test]
+fn a_throttle_without_links_takes_the_deployments_tasks_links() {
+    let server = serving(Gpus::Hidden);
+    let mut head = head(&server.socket);
+    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+    let bytes: u64 = 256 << 20;
+    let source = memfd(&pattern(bytes as usize, 3));
+    let destination = memfd(&vec![0; bytes as usize]);
+    worker
+        .put(
+            vec![
+                tensor(key(1), "weights", 0, 0, Access::ReadOnly),
+                tensor(key(2), "cache", 1, 0, Access::Exclusive),
+            ],
+            &[
+                (host(bytes), source.as_fd()),
+                (host(bytes), destination.as_fd()),
+            ],
+        )
+        .unwrap();
+    let copy = |worker: &mut Client, update: u64| {
+        worker
+            .transfer(
+                vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes)],
+                Priority::Background,
+                update,
+            )
+            .unwrap()
+    };
+
+    let task = copy(&mut worker, 1);
+    for _ in 0..6 {
+        head.throttle(Vec::new(), Throttle::Halve).unwrap();
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(200) {
+        worker.pump().unwrap();
+        if let Some((Event::Transferred { end, .. }, _)) = worker.next_event() {
+            panic!("a task over a halved link ended within 200 ms: {end:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    head.throttle(Vec::new(), Throttle::Restore).unwrap();
+    assert_eq!(end_of(&mut worker, task), (bytes, TransferEnd::Complete));
+    assert_eq!(
+        read(&destination, 0, bytes as usize),
+        read(&source, 0, bytes as usize)
+    );
+
+    // A share of 1/64 grows back by 1/8 of the bandwidth per second.
+    std::thread::sleep(Duration::from_secs(9));
+    let started = Instant::now();
+    let task = copy(&mut worker, 2);
+    assert_eq!(end_of(&mut worker, task), (bytes, TransferEnd::Complete));
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a task over a restored link took {:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn a_cancelled_transfer_ends_cancelled_and_stops_copying() {
     let server = serving(Gpus::Hidden);

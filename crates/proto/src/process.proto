@@ -81,6 +81,7 @@ message Request {
     Claim claim = 5;
     LedgerQuery ledger = 6;
     KeepWeights keep_weights = 7;
+    ThrottleTransfers throttle_transfers = 8;
   }
 }
 
@@ -96,6 +97,7 @@ message Reply {
     Claimed claimed = 6;
     LedgerReport ledger = 7;
     WeightsKept weights_kept = 8;
+    TransfersThrottled transfers_throttled = 9;
   }
 }
 
@@ -232,6 +234,20 @@ message WeightsKept {
   uint64 moved_bytes = 2;
   string refused = 3;
 }
+
+// Have a node's daemon halve, or restore, the byte budgets of the links the
+// deployment's transfers use at its Storage Server's Transfer Server: a
+// halving takes every link a task of the deployment copies over now, a
+// restoration every link a halving reduced (`Request::Throttle` with no
+// links).
+message ThrottleTransfers {
+  string host = 1;
+  string deployment = 2;
+  // A halving; a restoration when false.
+  bool halve = 3;
+}
+
+message TransfersThrottled {}
 
 message LedgerReport {
   // The Storage Server's `Ledger` answer as JSON: `{"ledgers": [...],
