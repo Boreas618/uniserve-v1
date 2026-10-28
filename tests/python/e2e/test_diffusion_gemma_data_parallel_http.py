@@ -95,7 +95,10 @@ def served(request, tmp_path_factory) -> Iterator[tuple[str, int, str]]:
     Yields the URL, the replica count and the topology (a key of
     ``TOPOLOGIES``).
     """
-    replicas = torch.cuda.device_count()
+    # The GPUs the GPU locks granted (``UNISERVE_WORLD_DEVICES``), else every
+    # visible one.
+    devices = os.environ.get("UNISERVE_WORLD_DEVICES", "")
+    replicas = len(devices.split(",")) if devices else torch.cuda.device_count()
     if replicas < 2:
         pytest.fail(f"data-parallel serving needs two GPUs, found {replicas}")
     precision, topology = request.param
