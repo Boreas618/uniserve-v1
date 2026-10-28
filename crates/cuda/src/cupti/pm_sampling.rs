@@ -9,9 +9,10 @@
 //! regard to streams or kernels. [`PmSampler::decode`], which may run while
 //! sampling, moves the samples completed so far from the hardware buffer
 //! into the counter data image and evaluates them into [`Sample`]s, each
-//! with its interval in CUPTI's clock ([`super::timestamp`]). A hardware
-//! buffer that overflows before a decode keeps its oldest samples and
-//! reports the overflow.
+//! with its interval in CUPTI's clock ([`super::timestamp`]). The hardware
+//! buffer must hold the samples taken between two decodes: on GB200 with
+//! `nvidia-cuda-cupti` 13.0 a buffer that wraps loses samples and can fail
+//! the next decode (`CUPTI_ERROR_UNKNOWN`), whatever its append mode.
 
 use std::ffi::{c_char, c_void};
 
@@ -24,10 +25,9 @@ use crate::Result;
 const TIME_INTERVAL: u32 = 1;
 
 /// `CUPTI_PM_SAMPLING_HARDWARE_BUFFER_APPEND_MODE_KEEP_LATEST`: a full
-/// hardware buffer overwrites its oldest records and the next decode
-/// reports the overflow. Keeping the oldest instead fails every decode once
-/// the buffer overflowed (`CUPTI_ERROR_OUT_OF_MEMORY`), losing every later
-/// sample.
+/// hardware buffer overwrites its oldest records. Keeping the oldest
+/// instead fails every decode once the buffer overflowed
+/// (`CUPTI_ERROR_OUT_OF_MEMORY`), losing every later sample.
 const KEEP_LATEST: u32 = 1;
 
 /// `CUPTI_PM_SAMPLING_DECODE_STOP_REASON_COUNTER_DATA_FULL`: the decode
@@ -128,8 +128,8 @@ pub struct Sample {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Decoded {
     pub samples: Vec<Sample>,
-    /// The hardware buffer overflowed since the last decode: samples were
-    /// lost.
+    /// Samples were lost since the last decode: the decode filled its
+    /// counter data image, whose overflowing records CUPTI drops.
     pub overflow: bool,
 }
 
@@ -222,6 +222,21 @@ impl PmSampler {
         Ok(sampler)
     }
 
+    /// The bytes of counter data one sample of `metrics` takes on the device
+    /// of ordinal `device`: what CUPTI states a counter data image of 1024
+    /// samples takes, per sample. A sampler's hardware buffer is sized from
+    /// it: on GB200 with `nvidia-cuda-cupti` 13.0 the default metrics take
+    /// about 13.6 KB of image per sample and 8 KiB of hardware buffer.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::enable`] does.
+    pub fn sample_bytes(device: usize, metrics: &[String]) -> Result<usize> {
+        const SAMPLES: u32 = 1024;
+        let sampler = Self::enable(device, metrics, 1_000_000, 1 << 20, SAMPLES)?;
+        Ok(sampler.image.len().div_ceil(SAMPLES as usize))
+    }
+
     /// Initialize the counter data image for the samples to come.
     fn initialize(&mut self) -> Result<()> {
         let cupti = cupti()?;
@@ -273,16 +288,18 @@ impl PmSampler {
         unsafe { call(&cupti.pm_stop, "cuptiPmSamplingStop", &mut params) }
     }
 
-    /// Decode the samples completed since the last decode: every record the
-    /// hardware buffer holds, in as many counter data images as they fill.
+    /// Decode the samples completed since the last decode into the counter
+    /// data image. A decode that fills the image loses the records past it,
+    /// which it reports ([`Decoded::overflow`]): on GB200 with
+    /// `nvidia-cuda-cupti` 13.0 the next decode finds none of them, whether
+    /// sampling or stopped (100 ms of samples every 20 µs decoded as 256 in
+    /// an image of 256 samples, and as 5014 in one of 8192), so the image
+    /// must hold every sample one decode takes.
     pub fn decode(&mut self) -> Result<Decoded> {
         let mut decoded = Decoded::default();
-        loop {
-            let full = self.decode_image(&mut decoded)?;
-            if !full {
-                return Ok(decoded);
-            }
-        }
+        let full = self.decode_image(&mut decoded)?;
+        decoded.overflow |= full;
+        Ok(decoded)
     }
 
     /// Decode into the counter data image, move its completed samples into
@@ -426,6 +443,39 @@ mod tests {
         }
         assert!(decoded.samples[1].start + 1_000_000_000 > started);
         assert!(decoded.samples.iter().any(|sample| sample.values[0] > 0.0));
+        Ok(())
+    }
+
+    /// A decode whose image fills takes the image's samples and reports
+    /// that it lost the rest.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_decode_that_fills_its_image_reports_the_loss() -> Result<()> {
+        use crate::cupti::tests::{SERIAL, Spin};
+        use crate::{DeviceId, Stream, lock};
+
+        let _serial = lock(&SERIAL);
+        let stream = Stream::new(DeviceId(0))?;
+        let spin = Spin::load(&stream)?;
+        let mut sampler = PmSampler::enable(
+            0,
+            &["sm__cycles_active.avg".to_owned()],
+            20_000,
+            64 << 20,
+            256,
+        )?;
+        sampler.start()?;
+        // 100 ms of a busy device sampled every 20 µs: about 5000 samples,
+        // past one image.
+        let began = std::time::Instant::now();
+        while began.elapsed() < std::time::Duration::from_millis(100) {
+            spin.launch(&stream, 132, 20_000)?;
+            stream.synchronize()?;
+        }
+        sampler.stop()?;
+        let decoded = sampler.decode()?;
+        assert_eq!(decoded.samples.len(), 256);
+        assert!(decoded.overflow);
         Ok(())
     }
 }
