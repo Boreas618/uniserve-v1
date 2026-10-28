@@ -105,6 +105,44 @@ def test_public_model_and_weight_loading_agree(tmp_path, mode):
     )
 
 
+@pytest.mark.parametrize("tied", (False, True))
+def test_dummy_loading_without_values_gives_the_same_layout(tmp_path, tied):
+    save_file(
+        {"first": torch.ones(4, 4), "second": torch.ones(4, 4)},
+        tmp_path / "model.safetensors",
+    )
+
+    def tensors(values):
+        io = loading.Config(mode="dummy", values=values)
+        model = loading.load_model(
+            Network,
+            NetworkConfig(tied=tied),
+            checkpoint=(checkpoint.Config().resolve(tmp_path, io=io),),
+            mapping=_mapping,
+            device="cpu",
+            weights=weights.Config(dtype=torch.bfloat16),
+            io=io,
+        ).model
+        return {
+            name: (
+                tuple(parameter.shape),
+                parameter.dtype,
+                parameter.untyped_storage().nbytes(),
+                parameter.storage_offset(),
+                parameter.stride(),
+            )
+            for name, parameter in model.named_parameters(
+                remove_duplicate=False
+            )
+        }, model
+
+    layout, _ = tensors(True)
+    unread, model = tensors(False)
+    assert unread == layout
+    # Shared identities stay shared without values.
+    assert (model.first.weight is model.second.weight) == tied
+
+
 @pytest.mark.parametrize("extra", (False, True))
 @pytest.mark.parametrize("mode", ("layered", "dummy"))
 @pytest.mark.parametrize("format", ("safetensors", "pt"))

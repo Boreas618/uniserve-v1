@@ -513,10 +513,11 @@ def load_model(
             the checkpoint's tensors in place of its files; ``None`` reads
             the files.
         unread: Materialize every tensor without reading the checkpoint
-            (the ``dummy`` mode of ``uniserve.loading.Config``): the model
-            has the storages, shapes, element types and encodings a load
-            gives it, not its values. A worker plans the layout of the
-            weights it then receives from another world with it.
+            or computing a value (the ``dummy`` mode of
+            ``uniserve.loading.Config`` without ``values``): the model has
+            the storages, shapes, element types and encodings a load gives
+            it, and uninitialized bytes. A rank plans the layout of the
+            weights it receives from another world with it.
     """
     weights = _text(weights)
     resolved = _resolve(
@@ -531,7 +532,9 @@ def load_model(
         source = resolved.source
         resolved = replace(
             resolved,
-            source=replace(source, io=replace(source.io, mode="dummy")),
+            source=replace(
+                source, io=replace(source.io, mode="dummy", values=False)
+            ),
         )
     device = str(device)
     generation = _text(generation_device)

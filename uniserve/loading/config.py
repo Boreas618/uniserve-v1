@@ -13,7 +13,11 @@ class Config:
     """Checkpoint IO policy: encoding, read mode, concurrency and caching.
 
     ``mode`` selects eager full reads, per-shard layered reads, or
-    deterministic dummy values. With ``mmap``, a reader reads every source
+    deterministic dummy values; dummy reads without ``values`` give every
+    tensor its storage, shape, element type and encoding but no value
+    (uninitialized bytes): the layout a load gives the model, from which a
+    rank plans the storages its weights take before it receives them.
+    With ``mmap``, a reader reads every source
     file into the page cache before its first tensor read, on
     ``num_threads`` threads (8 when unset), and maps the cached pages.
     """
@@ -25,6 +29,7 @@ class Config:
     ignore_patterns: tuple[str, ...] = ("original/**/*",)
     num_threads: int | None = None
     mmap: bool = True
+    values: bool = True
 
     def __post_init__(self):
         if self.format not in {"auto", "safetensors", "pt"}:
