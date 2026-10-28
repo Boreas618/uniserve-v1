@@ -188,8 +188,6 @@ struct Read {
 pub struct Sources {
     pub world: World,
     pub links: Vec<LinkBandwidth>,
-    /// Storage endpoint for each source GPU outside the reader's host.
-    pub remote: Vec<(Gpu, String)>,
 }
 
 /// A daemon's executable weight redistribution plan. Workers consume this
@@ -312,6 +310,5 @@ pub fn sources<E>(
     Ok(Some(Sources {
         world: World { ranks },
         links,
-        remote: Vec::new(),
     }))
 }

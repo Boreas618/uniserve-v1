@@ -1238,6 +1238,9 @@ impl Published {
                     length: layout.bytes,
                     key,
                     storage_offset: 0,
+                    binding: manifest::Binding::Local {
+                        at: Placement::Host { numa_node: None },
+                    },
                 }],
                 layout,
             },

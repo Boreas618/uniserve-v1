@@ -7,8 +7,8 @@ use std::ops::Range;
 use super::layout::{Encoding, Field, Logical, Piece, Segment};
 use super::region::{Span, atoms, volume};
 use super::{
-    Conversion, Copy, Endpoint, Error, Fill, Gpu, LinkLoad, Manifest, Mapping, Missing, Request,
-    Result, Side, Space, Staging, uuid,
+    Binding, Conversion, Copy, Endpoint, Error, Fill, Gpu, LinkLoad, Manifest, Mapping, Missing,
+    Request, Result, Side, Space, Staging,
 };
 use crate::Key;
 use crate::protocol::Memory;
@@ -27,7 +27,6 @@ const ENUMERATED_RANKS: usize = 8;
 /// its storage, or an encoded field's canonical form in a staging space.
 #[derive(Clone, Copy)]
 struct View<'a> {
-    space: Space,
     offset: u64,
     strides: &'a [u64],
     element: u64,
@@ -107,9 +106,9 @@ struct Context<'r> {
     /// Source fields by logical tensor.
     sources: HashMap<&'r str, Vec<FieldRef>>,
     /// Source regions by GPU, retained allocation, byte offset and length.
-    chunks: HashMap<(Gpu, Key, u64, u64), SourceChunk>,
+    chunks: HashMap<(Memory, Key, u64, u64), SourceChunk>,
     /// Each measured link's bandwidth in bytes per second.
-    bandwidth: HashMap<(Gpu, Gpu), f64>,
+    bandwidth: HashMap<(Memory, Memory), f64>,
 }
 
 impl<'r> Context<'r> {
@@ -117,9 +116,6 @@ impl<'r> Context<'r> {
         let mut sources: HashMap<&str, Vec<FieldRef>> = HashMap::new();
         let mut chunks = HashMap::new();
         for (rank, source) in request.source.ranks.iter().enumerate() {
-            let gpu = source
-                .gpu
-                .ok_or_else(|| Error::Invalid(format!("source rank {rank} names no GPU")))?;
             for (storage, held) in source.storages.iter().enumerate() {
                 held.layout.validate()?;
                 for (field, value) in held.layout.fields.iter().enumerate() {
@@ -131,7 +127,12 @@ impl<'r> Context<'r> {
                 }
                 for (chunk, value) in held.chunks.iter().enumerate() {
                     chunks
-                        .entry((gpu, value.key, value.storage_offset, value.length))
+                        .entry((
+                            value.binding.memory(source.gpu)?,
+                            value.key,
+                            value.storage_offset,
+                            value.length,
+                        ))
                         .or_insert((rank as u32, storage as u32, chunk as u32));
                 }
             }
@@ -139,6 +140,15 @@ impl<'r> Context<'r> {
         for target in &request.target.ranks {
             for held in &target.storages {
                 held.layout.validate()?;
+                if held
+                    .chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk.binding, Binding::Remote { .. }))
+                {
+                    return Err(Error::Invalid(
+                        "remote storage is a source; submit the request on the target host".into(),
+                    ));
+                }
             }
         }
         if request.gpus.len() < request.target.ranks.len() {
@@ -148,24 +158,16 @@ impl<'r> Context<'r> {
                 request.gpus.len()
             )));
         }
-        // Links between GPUs, as the Transfer Server measured them; a copy
-        // within one GPU takes the link from it to itself. A GPU of another
-        // host reaches this host's over the NVLink fabric (a link between
-        // the two GPUs) or by READ (a link from that host's GPU): the
-        // Transfer Server copies over the fabric whenever it can, and a
-        // pair measured both ways takes the faster.
-        let mut bandwidth: HashMap<(Gpu, Gpu), f64> = HashMap::new();
+        // Host links retain their exact endpoint. GPU UUIDs name one
+        // physical allocation across hosts, whether reached by fabric or
+        // READ; the Transfer Server uses fabric when available.
+        let mut bandwidth: HashMap<(Memory, Memory), f64> = HashMap::new();
         for measured in &request.links {
-            let pair = match (&measured.link.source, &measured.link.destination) {
-                (
-                    Memory::Device { gpu: source }
-                    | Memory::Remote {
-                        gpu: Some(source), ..
-                    },
-                    Memory::Device { gpu: destination },
-                ) => (*source, *destination),
-                _ => continue,
+            let source = match &measured.link.source {
+                Memory::Remote { gpu: Some(gpu), .. } => Memory::Device { gpu: *gpu },
+                source => source.clone(),
             };
+            let pair = (source, measured.link.destination.clone());
             let entry = bandwidth.entry(pair).or_default();
             *entry = entry.max(measured.bytes_per_second as f64);
         }
@@ -187,12 +189,46 @@ impl<'r> Context<'r> {
             .fields[at.field as usize]
     }
 
-    /// The GPU of source rank `rank`, which `Context::new` checked it
-    /// names.
-    fn source_gpu(&self, rank: u32) -> Gpu {
-        self.request.source.ranks[rank as usize]
-            .gpu
-            .unwrap_or_default()
+    fn view(&self, side: Side, at: FieldRef, form: Form) -> Result<View<'r>> {
+        let field = self.field(side, at);
+        match (form, &field.encoding) {
+            (Form::Stored, _) => Ok(View {
+                offset: field.offset,
+                strides: &field.strides,
+                element: field.element,
+                logical: &field.logical,
+            }),
+            (
+                Form::Canonical,
+                Encoding::Encoded {
+                    canonical: Some(canonical),
+                    ..
+                },
+            ) => Ok(View {
+                offset: canonical.offset,
+                strides: &canonical.strides,
+                element: field.element,
+                logical: &canonical.logical,
+            }),
+            (Form::Canonical, _) => Err(Error::Invalid(format!(
+                "field {} has no canonical form",
+                field.tensor
+            ))),
+        }
+    }
+
+    /// The available route follows the Transfer Server: a remote GPU can
+    /// use the fabric or READ, while remote host memory requires READ.
+    fn bandwidth(&self, pair: &(Memory, Memory)) -> Result<f64> {
+        let bandwidth = self.bandwidth.get(pair).copied().unwrap_or(0.0);
+        if bandwidth > 0.0 {
+            Ok(bandwidth)
+        } else {
+            Err(Error::Invalid(format!(
+                "no bandwidth is measured from {:?} to {:?}",
+                pair.0, pair.1
+            )))
+        }
     }
 
     /// The bytes of target rank `rank`'s regions that the source ranks on
@@ -205,7 +241,17 @@ impl<'r> Context<'r> {
                     continue;
                 };
                 for source in sources {
-                    if self.source_gpu(source.rank) != gpu {
+                    let rank = &self.request.source.ranks[source.rank as usize];
+                    if !rank.storages[source.storage as usize]
+                        .chunks
+                        .iter()
+                        .all(|chunk| {
+                            chunk.binding.memory(rank.gpu).ok() == Some(Memory::Device { gpu })
+                        })
+                        || !held.chunks.iter().all(|chunk| {
+                            chunk.binding.memory(Some(gpu)).ok() == Some(Memory::Device { gpu })
+                        })
+                    {
                         continue;
                     }
                     let other = self.field(Side::Source, *source);
@@ -463,7 +509,12 @@ impl<'c, 'r> Draft<'c, 'r> {
                     .map(|chunk| {
                         context
                             .chunks
-                            .get(&(gpu, chunk.key, chunk.storage_offset, chunk.length))
+                            .get(&(
+                                chunk.binding.memory(Some(gpu)).ok()?,
+                                chunk.key,
+                                chunk.storage_offset,
+                                chunk.length,
+                            ))
                             .copied()
                     })
                     .collect()
@@ -661,35 +712,24 @@ impl<'c, 'r> Draft<'c, 'r> {
         Ok(index)
     }
 
-    /// The affine view of `at` on `side` in `form`.
-    fn view(&mut self, side: Side, at: FieldRef, form: Form) -> Result<View<'r>> {
+    /// Bind a selected field's numerical view to retained bytes, creating
+    /// canonical conversion storage only for selected sources.
+    fn space(&mut self, side: Side, at: FieldRef, form: Form) -> Result<Space> {
         let field = self.context.field(side, at);
         match (form, &field.encoding) {
-            (Form::Stored, _) => Ok(View {
-                space: Space::Storage {
-                    storage: at.storage,
-                },
-                offset: field.offset,
-                strides: &field.strides,
-                element: field.element,
-                logical: &field.logical,
+            (Form::Stored, _) => Ok(Space::Storage {
+                storage: at.storage,
             }),
             (
                 Form::Canonical,
                 Encoding::Encoded {
                     group,
-                    canonical: Some(canonical),
+                    canonical: Some(_),
                     ..
                 },
             ) => {
                 let staging = self.staging(side, at.rank, group)?;
-                Ok(View {
-                    space: Space::Staging { staging },
-                    offset: canonical.offset,
-                    strides: &canonical.strides,
-                    element: field.element,
-                    logical: &canonical.logical,
-                })
+                Ok(Space::Staging { staging })
             }
             (Form::Canonical, _) => Err(Error::Invalid(format!(
                 "field {} has no canonical form",
@@ -943,48 +983,37 @@ impl<'c, 'r> Draft<'c, 'r> {
         let context = self.context;
         let mut order: Vec<usize> = (0..self.cells.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.cells[index].bytes));
-        let mut loads: BTreeMap<(Gpu, Gpu), u64> = BTreeMap::new();
+        let mut loads = BTreeMap::new();
         let mut busiest = 0.0_f64;
         for index in order {
             let cell = &self.cells[index];
-            let target_gpu = self.gpus[cell.target.rank as usize];
-            let mut best: Option<((f64, f64), (FieldRef, Form))> = None;
+            let mut best = None;
             for &(source, form) in &cell.candidates {
-                let source_gpu = context.source_gpu(source.rank);
-                let bandwidth = *context
-                    .bandwidth
-                    .get(&(source_gpu, target_gpu))
-                    .filter(|bandwidth| **bandwidth > 0.0)
-                    .ok_or_else(|| {
-                        Error::Invalid(format!(
-                            "no bandwidth is measured from GPU {} to GPU {}",
-                            uuid(&source_gpu),
-                            uuid(&target_gpu)
-                        ))
-                    })?;
-                let load = loads.get(&(source_gpu, target_gpu)).copied().unwrap_or(0);
-                let finish = (load + cell.bytes) as f64 / bandwidth;
+                let traffic = self.traffic(cell, source, form)?;
+                let mut finish = 0.0_f64;
+                for (pair, bytes) in &traffic {
+                    let load = loads.get(pair).copied().unwrap_or(0);
+                    finish = finish.max((load + bytes) as f64 / context.bandwidth(pair)?);
+                }
                 let score = (busiest.max(finish), finish);
-                if best.as_ref().is_none_or(|(current, _)| score < *current) {
-                    best = Some((score, (source, form)));
+                if best.as_ref().is_none_or(|(current, _, _)| score < *current) {
+                    best = Some((score, (source, form), traffic));
                 }
             }
-            let Some(((latest, _), chosen)) = best else {
+            let Some(((latest, _), chosen, traffic)) = best else {
                 continue;
             };
             busiest = latest;
-            let source_gpu = context.source_gpu(chosen.0.rank);
-            *loads.entry((source_gpu, target_gpu)).or_default() += cell.bytes;
+            for (pair, bytes) in traffic {
+                *loads.entry(pair).or_insert(0) += bytes;
+            }
             self.cells[index].chosen = Some(chosen);
         }
         loads
             .into_iter()
-            .map(|((source, target), bytes)| {
-                let bandwidth = context
-                    .bandwidth
-                    .get(&(source, target))
-                    .copied()
-                    .unwrap_or(f64::INFINITY);
+            .map(|(pair, bytes)| {
+                let bandwidth = context.bandwidth(&pair)?;
+                let (source, target) = pair;
                 Ok(LinkLoad {
                     seconds: bytes as f64 / bandwidth,
                     source,
@@ -993,6 +1022,109 @@ impl<'c, 'r> Draft<'c, 'r> {
                 })
             })
             .collect()
+    }
+
+    /// Charge each retained chunk's actual memory link. A logical field
+    /// may span device pages, offloaded host pages, and remote pages; its
+    /// rank's execution GPU does not determine where those bytes reside.
+    fn traffic(
+        &self,
+        cell: &Cell,
+        source: FieldRef,
+        form: Form,
+    ) -> Result<BTreeMap<(Memory, Memory), u64>> {
+        let runs = match &cell.what {
+            Block::Bytes(range) => vec![(
+                (
+                    self.context.field(Side::Source, source).offset + range.start,
+                    self.context.field(Side::Target, cell.target).offset + range.start,
+                ),
+                range.end - range.start,
+                1,
+                (0, 0),
+            )],
+            Block::Region(logical) => region_runs(
+                logical,
+                &self.context.view(Side::Source, source, form)?,
+                &self.context.view(Side::Target, cell.target, cell.form)?,
+            )?,
+        };
+        let mut traffic = BTreeMap::new();
+        for ((from, into), length, rows, (source_pitch, target_pitch)) in runs {
+            let mut row = 0;
+            let mut done = 0;
+            while row < rows {
+                let (source_memory, source_left) =
+                    self.memory_at(Side::Source, source, form, from + row * source_pitch + done)?;
+                let (target_memory, target_left) = self.memory_at(
+                    Side::Target,
+                    cell.target,
+                    cell.form,
+                    into + row * target_pitch + done,
+                )?;
+                let (bytes, count) = if done == 0 && length <= source_left && length <= target_left
+                {
+                    let fitting = |left: u64, pitch: u64| match pitch {
+                        0 => rows - row,
+                        pitch => ((left - length) / pitch + 1).min(rows - row),
+                    };
+                    (
+                        length,
+                        fitting(source_left, source_pitch).min(fitting(target_left, target_pitch)),
+                    )
+                } else {
+                    ((length - done).min(source_left).min(target_left), 1)
+                };
+                *traffic.entry((source_memory, target_memory)).or_insert(0) += bytes * count;
+                if done == 0 && bytes == length {
+                    row += count;
+                } else {
+                    done += bytes;
+                    if done == length {
+                        done = 0;
+                        row += 1;
+                    }
+                }
+            }
+        }
+        Ok(traffic)
+    }
+
+    fn memory_at(
+        &self,
+        side: Side,
+        field: FieldRef,
+        form: Form,
+        offset: u64,
+    ) -> Result<(Memory, u64)> {
+        let (world, gpu) = match side {
+            Side::Source => (
+                &self.context.request.source,
+                self.context.request.source.ranks[field.rank as usize].gpu,
+            ),
+            Side::Target => (
+                &self.context.request.target,
+                Some(self.gpus[field.rank as usize]),
+            ),
+        };
+        if form == Form::Canonical {
+            return Ok((Binding::Rank.memory(gpu)?, u64::MAX));
+        }
+        let chunks = &world.ranks[field.rank as usize].storages[field.storage as usize].chunks;
+        let index = chunks.partition_point(|chunk| chunk.offset + chunk.length <= offset);
+        let chunk = chunks
+            .get(index)
+            .filter(|chunk| chunk.offset <= offset)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "byte {offset} of storage {} is in no chunk",
+                    field.storage
+                ))
+            })?;
+        Ok((
+            chunk.binding.memory(gpu)?,
+            chunk.offset + chunk.length - offset,
+        ))
     }
 
     /// The byte copies of every block from its chosen source.
@@ -1029,14 +1161,28 @@ impl<'c, 'r> Draft<'c, 'r> {
                     });
                 }
                 Block::Region(logical) => {
-                    let into = self.view(Side::Target, cell.target, cell.form)?;
-                    let from = self.view(Side::Source, source, source_form)?;
-                    region_copies(
-                        logical,
-                        (source.rank, &from),
-                        (cell.target.rank, &into),
-                        &mut copies,
-                    )?;
+                    let target_space = self.space(Side::Target, cell.target, cell.form)?;
+                    let source_space = self.space(Side::Source, source, source_form)?;
+                    let into = self.context.view(Side::Target, cell.target, cell.form)?;
+                    let from = self.context.view(Side::Source, source, source_form)?;
+                    copies.extend(region_runs(logical, &from, &into)?.into_iter().map(
+                        |(offsets, length, rows, (source_pitch, target_pitch))| Copy {
+                            source: Endpoint {
+                                rank: source.rank,
+                                space: source_space,
+                                offset: offsets.0,
+                            },
+                            target: Endpoint {
+                                rank: cell.target.rank,
+                                space: target_space,
+                                offset: offsets.1,
+                            },
+                            length,
+                            rows,
+                            source_pitch,
+                            target_pitch,
+                        },
+                    ));
                 }
             }
         }
@@ -1064,12 +1210,7 @@ fn product_spans(logical: &Logical) -> Vec<Vec<Span>> {
 
 /// The copies that move the logical box `logical` from the source view to
 /// the target view.
-fn region_copies(
-    logical: &[Span],
-    (source_rank, from): (u32, &View<'_>),
-    (target_rank, into): (u32, &View<'_>),
-    copies: &mut Vec<Copy>,
-) -> Result<()> {
+fn region_runs(logical: &[Span], from: &View<'_>, into: &View<'_>) -> Result<Vec<Run>> {
     let mut dims = Vec::with_capacity(logical.len());
     let mut source_local = Vec::with_capacity(logical.len());
     let mut target_local = Vec::with_capacity(logical.len());
@@ -1092,27 +1233,12 @@ fn region_copies(
     }
     let source_base = from.address(&source_local);
     let target_base = into.address(&target_local);
-    for (offsets, length, rows, (source_pitch, target_pitch)) in
-        runs_two_sides(source_base, target_base, &dims, from.element)
-    {
-        copies.push(Copy {
-            source: Endpoint {
-                rank: source_rank,
-                space: from.space,
-                offset: offsets.0,
-            },
-            target: Endpoint {
-                rank: target_rank,
-                space: into.space,
-                offset: offsets.1,
-            },
-            length,
-            rows,
-            source_pitch,
-            target_pitch,
-        });
-    }
-    Ok(())
+    Ok(runs_two_sides(
+        source_base,
+        target_base,
+        &dims,
+        from.element,
+    ))
 }
 
 type Run = ((u64, u64), u64, u64, (u64, u64));

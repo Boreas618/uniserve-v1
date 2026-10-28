@@ -857,6 +857,126 @@ pub(crate) mod device {
         }
     }
 
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_manifest_stages_borrowed_device_regions_through_host_memory() {
+        use storage::manifest::Span as LogicalSpan;
+        use storage::manifest::{
+            Binding, Chunk, Encoding, Field, Logical, Manifest, Rank, Request, Segment, Storage,
+            StorageLayout, World,
+        };
+
+        let server = serving(Gpus::Visible);
+        let device = DeviceId(0);
+        let gpu = device.uuid().unwrap().0;
+        let granularity = DeviceAllocation::granularity(device).unwrap();
+        let contents = pattern(granularity, 7);
+        let (source, source_fd) = device_storage(device, &contents);
+        let (destination, destination_fd) = device_storage(device, &vec![0; granularity]);
+        let staging = memfd(&vec![0; granularity]);
+        let mut head = head(&server.socket);
+        let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+        let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+        worker
+            .put(
+                vec![
+                    tensor(key(1), "source", 0, 0, Access::ReadOnly),
+                    tensor(key(2), "staging", 1, 0, Access::Exclusive),
+                    tensor(key(3), "destination", 2, 0, Access::Exclusive),
+                ],
+                &[
+                    (record(device, granularity), source_fd.as_fd()),
+                    (host(granularity as u64), staging.as_fd()),
+                    (record(device, granularity), destination_fd.as_fd()),
+                ],
+            )
+            .unwrap();
+        let layout = StorageLayout {
+            bytes: 256,
+            fields: vec![Field {
+                tensor: "cache".into(),
+                source: "cache".into(),
+                dtype: "uint8".into(),
+                element: 1,
+                offset: 0,
+                shape: vec![256],
+                strides: vec![1],
+                encoding: Encoding::Affine,
+                logical: Logical {
+                    shape: vec![256],
+                    dims: vec!["token".into()],
+                    units: vec![1],
+                    segments: vec![vec![Segment {
+                        span: LogicalSpan {
+                            start: 0,
+                            count: 256,
+                            step: 1,
+                        },
+                        local: 0,
+                    }]],
+                },
+            }],
+        };
+        let storage = |id, storage_offset, binding| Storage {
+            layout: layout.clone(),
+            chunks: vec![Chunk {
+                offset: 0,
+                length: 256,
+                key: key(id),
+                storage_offset,
+                binding,
+            }],
+        };
+        let device_source = storage(1, 64, Binding::Rank);
+        let host_staging = storage(
+            2,
+            512,
+            Binding::Local {
+                at: Placement::Host { numa_node: None },
+            },
+        );
+        let device_target = storage(3, 1024, Binding::Rank);
+        for (from, into) in [
+            (device_source, host_staging.clone()),
+            (host_staging, device_target),
+        ] {
+            let request = Request {
+                source: World {
+                    ranks: vec![Rank {
+                        gpu: Some(gpu),
+                        storages: vec![from],
+                    }],
+                },
+                target: World {
+                    ranks: vec![Rank {
+                        gpu: Some(gpu),
+                        storages: vec![into],
+                    }],
+                },
+                gpus: vec![gpu],
+                links: head.list().unwrap().transfer.unwrap().links,
+            };
+            let manifest = Manifest::plan(&request).unwrap();
+            let spans = manifest
+                .bind(&request, &request.source)
+                .spans()
+                .collect::<storage::manifest::Result<Vec<_>>>()
+                .unwrap();
+            let task = worker.transfer(spans, Priority::Background, 1).unwrap();
+            assert_eq!(end_of(&mut worker, task), (256, TransferEnd::Complete));
+            assert_eq!(read(&staging, 512, 256), contents[64..320]);
+        }
+        let received = device_bytes(&destination);
+        assert_eq!(received[1024..1280], contents[64..320]);
+        assert!(
+            received[..1024]
+                .iter()
+                .chain(&received[1280..])
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(device_bytes(&source), contents);
+    }
+
     /// The context bytes the Transfer Server of the server on `socket`
     /// measured on `gpu` when it started.
     fn measured_context(socket: &std::path::Path, gpu: [u8; 16]) -> u64 {

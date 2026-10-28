@@ -500,8 +500,11 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
     // Every span stays inside one chunk on each side, named at its GPU, and
     // the spans write exactly the target bytes the copies write, a strided
     // copy as spans of rows rather than a span per row.
-    let spans: Vec<crate::protocol::Span> =
-        manifest.spans(&request).collect::<Result<_>>().unwrap();
+    let spans: Vec<crate::protocol::Span> = manifest
+        .bind(&request, &request.source)
+        .spans()
+        .collect::<Result<_>>()
+        .unwrap();
     assert_eq!(
         spans.iter().map(crate::protocol::Span::copied).sum::<u64>(),
         manifest.copied_bytes()
@@ -705,14 +708,23 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
     // The ranks on the other host receive from both source GPUs.
-    let remote = [gpu(2), gpu(3)];
-    let received: BTreeSet<Gpu> = manifest
+    let remote = [
+        Memory::Device { gpu: gpu(2) },
+        Memory::Device { gpu: gpu(3) },
+    ];
+    let received: BTreeSet<Memory> = manifest
         .links
         .iter()
         .filter(|load| remote.contains(&load.target) && load.bytes > 0)
-        .map(|load| load.source)
+        .map(|load| load.source.clone())
         .collect();
-    assert_eq!(received, BTreeSet::from([gpu(0), gpu(1)]));
+    assert_eq!(
+        received,
+        BTreeSet::from([
+            Memory::Device { gpu: gpu(0) },
+            Memory::Device { gpu: gpu(1) }
+        ])
+    );
 
     // The fabric's bandwidth stands for a pair also measured by READ.
     let mut fabric = request.clone();
@@ -732,7 +744,9 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
         manifest
             .links
             .iter()
-            .filter(|load| load.source == gpu(source) && remote.contains(&load.target))
+            .filter(|load| {
+                load.source == Memory::Device { gpu: gpu(source) } && remote.contains(&load.target)
+            })
             .map(|load| load.seconds * 400e9 / load.bytes as f64)
             .collect::<Vec<_>>()
     };
@@ -876,7 +890,7 @@ fn borrowed_regions_copy_between_offsets_of_the_same_allocation() {
     let mut allocation = vec![0_u8; 1_024];
     let expected: Vec<u8> = (0..256).map(|byte| (byte % 251) as u8).collect();
     allocation[64..320].copy_from_slice(&expected);
-    for span in manifest.spans(&request) {
+    for span in manifest.bind(&request, &request.source).spans() {
         let span = span.unwrap();
         for row in 0..span.rows {
             let source = (span.source_offset + row * span.source_pitch) as usize;
@@ -886,6 +900,271 @@ fn borrowed_regions_copy_between_offsets_of_the_same_allocation() {
     }
     assert_eq!(&allocation[512..768], expected.as_slice());
     assert_eq!(&allocation[64..320], expected.as_slice());
+}
+
+#[test]
+fn mixed_host_and_device_chunks_use_their_physical_links() {
+    let mut source = storage(vec![field("page", 0, &[128], vec![whole(128)], vec![0])]);
+    source = Storage::paged(source.layout, 256, &|_| Some([3; 32])).unwrap();
+    let target = source.clone();
+    source.chunks[0].binding = Binding::Local {
+        at: Placement::Host { numa_node: Some(0) },
+    };
+    let request = Request {
+        source: world(vec![(Some(gpu(0)), vec![source])]),
+        target: world(vec![(Some(gpu(1)), vec![target])]),
+        gpus: vec![gpu(1)],
+        links: vec![
+            LinkBandwidth {
+                link: Link {
+                    source: Memory::Host,
+                    destination: Memory::Device { gpu: gpu(1) },
+                },
+                bytes_per_second: 128,
+            },
+            LinkBandwidth {
+                link: Link {
+                    source: Memory::Device { gpu: gpu(0) },
+                    destination: Memory::Device { gpu: gpu(1) },
+                },
+                bytes_per_second: 256,
+            },
+        ],
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert_fields_equal(&request, &apply(&request, &manifest));
+    let traffic: BTreeMap<_, _> = manifest
+        .links
+        .iter()
+        .map(|load| (load.source.clone(), (load.bytes, load.seconds)))
+        .collect();
+    assert_eq!(
+        traffic,
+        BTreeMap::from([
+            (Memory::Host, (256, 2.0)),
+            (Memory::Device { gpu: gpu(0) }, (256, 1.0))
+        ])
+    );
+    let spans = manifest
+        .bind(&request, &request.source)
+        .spans()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        spans.iter().map(crate::protocol::Span::copied).sum::<u64>(),
+        512
+    );
+    assert!(spans.iter().any(|span| matches!(
+        span.source,
+        crate::protocol::Region::Tensor {
+            at: Some(Placement::Host { numa_node: Some(0) }),
+            ..
+        }
+    )));
+    assert!(spans.iter().any(|span| matches!(span.source, crate::protocol::Region::Tensor { at: Some(Placement::Device { gpu: on }), .. } if on == gpu(0))));
+}
+
+#[test]
+fn host_staging_round_trip_preserves_borrowed_region_offsets() {
+    let mut device = storage(vec![field("page", 0, &[64], vec![whole(64)], vec![0])]);
+    device.chunks[0].storage_offset = 64;
+    let mut host = device.clone();
+    host.chunks[0].storage_offset = 512;
+    host.chunks[0].binding = Binding::Local {
+        at: Placement::Host { numa_node: None },
+    };
+    for (source, target, from, into) in [
+        (
+            device.clone(),
+            host.clone(),
+            Memory::Device { gpu: gpu(0) },
+            Memory::Host,
+        ),
+        (host, device, Memory::Host, Memory::Device { gpu: gpu(0) }),
+    ] {
+        let request = Request {
+            source: world(vec![(Some(gpu(0)), vec![source])]),
+            target: world(vec![(Some(gpu(0)), vec![target])]),
+            gpus: vec![gpu(0)],
+            links: vec![LinkBandwidth {
+                link: Link {
+                    source: from.clone(),
+                    destination: into.clone(),
+                },
+                bytes_per_second: 256,
+            }],
+        };
+        let manifest = Manifest::plan(&request).unwrap();
+        assert_eq!(manifest.copied_bytes(), 256);
+        assert_eq!(
+            manifest.links,
+            vec![LinkLoad {
+                source: from.clone(),
+                target: into,
+                bytes: 256,
+                seconds: 1.0
+            }]
+        );
+        let spans = manifest
+            .bind(&request, &request.source)
+            .spans()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let [span] = spans.as_slice() else {
+            panic!("one contiguous page transfer")
+        };
+        let host_source = from == Memory::Host;
+        assert_eq!(
+            (span.source_offset, span.destination_offset),
+            if host_source { (512, 64) } else { (64, 512) }
+        );
+        assert_eq!(
+            matches!(
+                span.source,
+                crate::protocol::Region::Tensor {
+                    at: Some(Placement::Host { .. }),
+                    ..
+                }
+            ),
+            host_source
+        );
+        assert_eq!(
+            matches!(
+                span.destination,
+                crate::protocol::Region::Tensor {
+                    at: Some(Placement::Host { .. }),
+                    ..
+                }
+            ),
+            !host_source
+        );
+    }
+}
+
+#[test]
+fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
+    let page = storage(vec![field("page", 0, &[64], vec![whole(64)], vec![0])]);
+    let mut sources = Vec::new();
+    let mut measured = Vec::new();
+    for (endpoint, rate) in [("host-a:4100", 128), ("host-b:4100", 256)] {
+        let mut source = page.clone();
+        source.chunks[0].binding = Binding::Remote {
+            endpoint: endpoint.into(),
+            at: Placement::Host { numa_node: None },
+        };
+        sources.push((None, vec![source]));
+        measured.push(LinkBandwidth {
+            link: Link {
+                source: Memory::Remote {
+                    endpoint: endpoint.into(),
+                    gpu: None,
+                },
+                destination: Memory::Device { gpu: gpu(0) },
+            },
+            bytes_per_second: rate,
+        });
+    }
+    let request = Request {
+        source: world(sources),
+        target: world(vec![(Some(gpu(0)), vec![page])]),
+        gpus: vec![gpu(0)],
+        links: measured,
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert_eq!(
+        manifest.links,
+        vec![LinkLoad {
+            source: Memory::Remote {
+                endpoint: "host-b:4100".into(),
+                gpu: None
+            },
+            target: Memory::Device { gpu: gpu(0) },
+            bytes: 256,
+            seconds: 1.0
+        }]
+    );
+    for span in manifest.bind(&request, &request.source).spans() {
+        let span = span.unwrap();
+        let crate::protocol::Region::Remote { endpoint, region } = span.source else {
+            panic!("remote host READ")
+        };
+        assert_eq!(endpoint, "host-b:4100");
+        assert!(matches!(
+            *region,
+            crate::protocol::Region::Tensor {
+                at: Some(Placement::Host { .. }),
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn one_gpu_copy_plan_binds_to_each_submitting_host() {
+    let page = storage(vec![field("page", 0, &[64], vec![whole(64)], vec![0])]);
+    let request = Request {
+        source: world(vec![(Some(gpu(0)), vec![page.clone()])]),
+        target: world(vec![(Some(gpu(1)), vec![page])]),
+        gpus: vec![gpu(1)],
+        links: links(2),
+    };
+    let mut remote = request.source.clone();
+    for chunk in &mut remote.ranks[0].storages[0].chunks {
+        chunk.binding = Binding::Remote {
+            endpoint: "source:4100".into(),
+            at: Placement::Device { gpu: gpu(0) },
+        };
+    }
+    assert!(request.source.same_storage(&remote));
+    let manifest = Manifest::plan(&request).unwrap();
+    let local_spans = manifest
+        .bind(&request, &request.source)
+        .spans()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let remote_spans = manifest
+        .bind(&request, &remote)
+        .spans()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        remote_spans
+            .iter()
+            .map(crate::protocol::Span::copied)
+            .sum::<u64>(),
+        256
+    );
+    for (local, remote) in local_spans.iter().zip(&remote_spans) {
+        let crate::protocol::Region::Remote { endpoint, region } = &remote.source else {
+            panic!("the submitting host reads remote bytes")
+        };
+        assert_eq!(endpoint, "source:4100");
+        assert_eq!(**region, local.source);
+        assert_eq!(remote.destination, local.destination);
+        assert_eq!(
+            (
+                remote.source_offset,
+                remote.destination_offset,
+                remote.bytes,
+                remote.rows
+            ),
+            (
+                local.source_offset,
+                local.destination_offset,
+                local.bytes,
+                local.rows
+            )
+        );
+    }
+    // The same physical GPU remains a zero-copy source even when another
+    // planning host describes its transport as remote.
+    let local_target = Request {
+        source: remote,
+        target: request.source.clone(),
+        gpus: vec![gpu(0)],
+        links: links(2),
+    };
+    assert_eq!(Manifest::plan(&local_target).unwrap().copied_bytes(), 0);
 }
 
 /// A field stored in this test's encoding, whose canonical form is the

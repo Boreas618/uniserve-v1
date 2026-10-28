@@ -114,7 +114,6 @@ impl WeightKeys {
                     .transfer
                     .map(|transfer| transfer.links)
                     .unwrap_or_default(),
-                remote: Vec::new(),
             });
         for endpoint in peers {
             let mut peer = Client::connect_peer(endpoint, PEER_TIMEOUT)
@@ -130,16 +129,30 @@ impl WeightKeys {
                     .map(Some)
                     .map_err(|error| Error::Interface(error.to_string()))
             };
-            if let Some(remote) =
+            if let Some(mut remote) =
                 manifest::weights::sources(&listing, deployment, worlds, &fingerprints, read)?
             {
-                sources.remote.extend(
-                    remote
-                        .world
-                        .ranks
-                        .iter()
-                        .filter_map(|rank| rank.gpu.map(|gpu| (gpu, endpoint.clone()))),
-                );
+                for rank in &mut remote.world.ranks {
+                    for storage in &mut rank.storages {
+                        for chunk in &mut storage.chunks {
+                            let at = match chunk.binding {
+                                manifest::Binding::Rank => Placement::Device {
+                                    gpu: rank.gpu.ok_or_else(|| {
+                                        Error::Invariant(
+                                            "retained device weights name no GPU".into(),
+                                        )
+                                    })?,
+                                },
+                                manifest::Binding::Local { at }
+                                | manifest::Binding::Remote { at, .. } => at,
+                            };
+                            chunk.binding = manifest::Binding::Remote {
+                                endpoint: endpoint.clone(),
+                                at,
+                            };
+                        }
+                    }
+                }
                 sources.world.ranks.extend(remote.world.ranks);
                 sources.links.extend(remote.links);
             }
@@ -151,7 +164,8 @@ impl WeightKeys {
     /// Measures source links before the daemon assigns ranks or books memory.
     pub(crate) fn measure_sources(&self, retained: &Retained, sources: &mut Sources) -> Result<()> {
         let (device, gpu) = self.device(0)?;
-        sources.links = crate::transfer::links::measure(retained, sources, device, gpu)?;
+        sources.links =
+            crate::transfer::links::measure(retained, sources, device, Placement::Device { gpu })?;
         Ok(())
     }
 
@@ -210,7 +224,12 @@ impl WeightKeys {
                 };
                 let encoded =
                     serde_json::to_vec(&own).map_err(|error| Error::Invalid(error.to_string()))?;
-                let links = crate::transfer::links::measure(retained, sources, device, gpu)?;
+                let links = crate::transfer::links::measure(
+                    retained,
+                    sources,
+                    device,
+                    Placement::Device { gpu },
+                )?;
                 let links = gather_links(agreement, &links)?;
                 let targets = agreement
                     .all_gather_bytes(&encoded)?
@@ -383,26 +402,10 @@ impl WeightKeys {
                 && matches!(copy.target.space, Space::Storage { .. })
         });
         let spans = copies
-            .spans(&request)
+            .bind(&request, &sources.world)
+            .spans()
             .map(|span| {
                 let mut span = span.map_err(|error| Error::Interface(error.to_string()))?;
-                // A source chunk on a GPU of another node is that node's
-                // region.
-                if let Region::Tensor {
-                    at: Some(Placement::Device { gpu }),
-                    ..
-                } = &span.source
-                    && let Some(endpoint) = sources
-                        .remote
-                        .iter()
-                        .find(|(source, _)| source == gpu)
-                        .map(|(_, endpoint)| endpoint)
-                {
-                    span.source = Region::Remote {
-                        endpoint: endpoint.clone(),
-                        region: Box::new(span.source),
-                    };
-                }
                 if let Region::Tensor { key, .. } = &mut span.destination {
                     *key = *receiving.get(key).ok_or_else(|| {
                         Error::Invariant("a copy writes a chunk the rank did not create".into())
@@ -449,7 +452,6 @@ impl WeightKeys {
             spans = spans_count,
             missing = missing.len(),
             digest = %super::hex(&manifest.digest),
-            remote_sources = sources.remote.len(),
             // Each phase's end, from the start: the unread model freed,
             // the links from other nodes measured and gathered, the ranks'
             // storages gathered, the manifest selected, the chunks
