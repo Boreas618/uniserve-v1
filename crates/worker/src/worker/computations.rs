@@ -725,6 +725,16 @@ fn bind_computation(
         }
         _ => (None, Vec::new()),
     };
+    // The computation's streams share one fence step cell, so the probes
+    // its warmup captures on any of them read the steps marked on its
+    // first.
+    if let Some(fences) = crate::profiling::fences::Fences::installed() {
+        let bound: Vec<Stream> = indices
+            .iter()
+            .map(|&index| known.streams[index].clone())
+            .collect();
+        fences.bind(&bound)?;
+    }
     let staging = resources
         .pages
         .then(|| RelayStaging::allocate(computation_device, max_calls))

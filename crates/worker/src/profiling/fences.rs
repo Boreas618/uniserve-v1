@@ -174,12 +174,19 @@ const HALF: u64 = 1 << SHIFT;
 /// The tag bits of a record's epoch.
 const TAG_MASK: u64 = 0xfff;
 
+/// The next free step cell of a device whose streams hold `cells`, or the
+/// shared cell 0 once every other is taken.
+fn next_cell(cells: &HashMap<usize, usize>) -> usize {
+    let next = cells.values().copied().max().unwrap_or(0) + 1;
+    if next < CELLS { next } else { 0 }
+}
+
 /// The probe ids of the step markers.
 pub(crate) const STEP_BEGIN: u32 = 0xf_fffe;
 pub(crate) const STEP_END: u32 = 0xf_ffff;
 
-/// The step cells a device keeps: cell 0 for streams no computation owns,
-/// and one per computation stream.
+/// The step cells a device keeps: one per computation, its streams all
+/// reading and writing it, and cell 0, shared once every other is taken.
 const CELLS: usize = 64;
 
 /// How often the half being filled is read, at most.
@@ -260,7 +267,8 @@ struct DeviceFences {
     clock_out: PinnedBuffer,
     /// The stream the switch writes and calibrations go on.
     control: Stream,
-    /// Each computation stream's step cell.
+    /// The step cell of each stream that marked or probed a step, or that
+    /// a computation the worker bound runs on.
     stream_cells: Mutex<HashMap<usize, usize>>,
     reader: Mutex<Reader>,
 }
@@ -392,20 +400,42 @@ impl Fences {
         Ok(())
     }
 
-    /// The step cell of `stream`, a computation's stream the worker marks
-    /// steps on: one of its own from its first marker on, or the shared cell
-    /// once every cell is taken.
-    fn marked_cell(device: &DeviceFences, stream: &Stream) -> usize {
+    /// The step cell of the stream of handle `stream`: the one it was bound
+    /// to or first given, or a new one, or the shared cell once every cell
+    /// is taken. A marker and a probe on the same stream resolve the same
+    /// cell whichever comes first, so a probe a warmup capture records
+    /// before the stream's first step reads the steps its markers write.
+    fn cell(device: &DeviceFences, stream: usize) -> usize {
         let mut cells = lock(&device.stream_cells);
-        let next = cells.len() + 1;
-        match cells.get(&stream.raw()) {
-            Some(&cell) => cell,
-            None if next < CELLS => {
-                cells.insert(stream.raw(), next);
-                next
-            }
-            None => 0,
+        if let Some(&cell) = cells.get(&stream) {
+            return cell;
         }
+        let cell = next_cell(&cells);
+        cells.insert(stream, cell);
+        cell
+    }
+
+    /// Give the streams of one computation, all on one device, a single
+    /// step cell: the markers on its first stream, where the worker brackets
+    /// each batch, and the probes on every stream its forward runs on (a
+    /// microbatch on a fork, a capture joined into one) then share the
+    /// step. A stream already given a cell keeps it, and the others join
+    /// that cell. The worker binds each computation before its warmup
+    /// captures any probe.
+    pub(crate) fn bind(&self, streams: &[Stream]) -> Result<()> {
+        let Some(first) = streams.first() else {
+            return Ok(());
+        };
+        let fences = self.device(first.device())?;
+        let mut cells = lock(&fences.stream_cells);
+        let cell = streams
+            .iter()
+            .find_map(|stream| cells.get(&stream.raw()).copied())
+            .unwrap_or_else(|| next_cell(&cells));
+        for stream in streams {
+            cells.entry(stream.raw()).or_insert(cell);
+        }
+        Ok(())
     }
 
     fn device(&self, device: DeviceId) -> Result<&DeviceFences> {
@@ -434,10 +464,7 @@ impl Fences {
         let fences = self.device(device)?;
         // SAFETY: as above; the probe's own stream keeps its context.
         let borrowed = unsafe { Stream::borrowed(device, stream) }?;
-        let cell = lock(&fences.stream_cells)
-            .get(&stream)
-            .copied()
-            .unwrap_or(0);
+        let cell = Self::cell(fences, stream);
         fences.launch(&borrowed, component, probe, cell, None)?;
         // A session's range profiler pushes the instance's range at its
         // entry and pops it at its exit; a capture pushes none, the push
@@ -455,7 +482,7 @@ impl Fences {
     /// `stage` on `stream`, a registered computation stream.
     pub(crate) fn mark(&self, stream: &Stream, step: u64, stage: &str, begin: bool) -> Result<()> {
         let fences = self.device(stream.device())?;
-        let cell = Self::marked_cell(fences, stream);
+        let cell = Self::cell(fences, stream.raw());
         let step = step as u32;
         if begin {
             lock(&self.stages).insert(step, Arc::from(stage));
@@ -921,12 +948,16 @@ mod tests {
 mod device_tests {
     use super::*;
 
-    /// The probes of two instances, one inside the other, between a step's
-    /// markers: the step's component durations reach the histograms, the
-    /// records reach a tap of the inner component alone, probes captured
-    /// into a CUDA graph in global mode (as PyTorch captures a forward)
-    /// leave the capture valid and record at its replay, a switched-off
-    /// probe records nothing, and the clocks align.
+    /// The probes of two instances, one inside the other, on the streams of
+    /// a computation the worker bound, in the worker's order: a warmup
+    /// captures them into a CUDA graph in global mode (as PyTorch captures
+    /// a forward) before any step is marked, which leaves the capture
+    /// valid; a step replays the graph between markers on the computation's
+    /// first stream, and another runs them on its other stream (a
+    /// microbatch's fork) between the same markers. Each step's component
+    /// durations reach the histograms, the records reach a tap of the
+    /// inner component alone, a switched-off probe records nothing, and
+    /// the clocks align.
     #[test]
     #[ignore = "requires a CUDA device"]
     fn probes_between_markers_time_their_step_by_component() -> Result<()> {
@@ -951,8 +982,8 @@ mod device_tests {
             }),
         });
         let stream = Stream::new(device)?;
-        stream.synchronize()?;
-        fences.mark(&stream, 7, "decode", true)?;
+        let fork = Stream::new(device)?;
+        fences.bind(&[stream.clone(), fork.clone()])?;
         let forward = |stream: &Stream| -> Result<()> {
             // SAFETY: the stream is live on `device`.
             unsafe {
@@ -963,12 +994,21 @@ mod device_tests {
             }
             Ok(())
         };
-        forward(&stream)?;
+        let graph = capture_globally(&stream, forward)?;
+
+        fences.mark(&stream, 7, "decode", true)?;
+        graph.launch(&stream)?;
         fences.mark(&stream, 7, "decode", false)?;
 
-        let graph = capture_globally(&stream, forward)?;
+        // The fork runs after the step's begin marker and before its end.
+        let begun = cuda::Event::new(cuda::EventFlags::default());
+        let ran = cuda::Event::new(cuda::EventFlags::default());
         fences.mark(&stream, 9, "decode", true)?;
-        graph.launch(&stream)?;
+        begun.record(&stream)?;
+        fork.wait_event(&begun)?;
+        forward(&fork)?;
+        ran.record(&fork)?;
+        stream.wait_event(&ran)?;
         fences.mark(&stream, 9, "decode", false)?;
         stream.synchronize()?;
         fences.poll(true);
