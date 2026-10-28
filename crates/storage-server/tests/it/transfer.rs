@@ -1032,10 +1032,11 @@ pub(crate) mod device {
     /// GPU, the context, booked in the deployment's ledger of the GPU at the
     /// bytes it measured; once the task ended, neither the context (NVML
     /// lists the process on the GPU no more) nor its booking. A following
-    /// task on the GPU retains it again, and releases it in turn.
+    /// task on the GPU retains it again. Explicit sessions keep it between
+    /// tasks until their last owner closes or disconnects.
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn a_gpu_holds_the_transfer_servers_context_only_while_a_task_needs_it() {
+    fn a_gpu_releases_transfer_contexts_after_tasks_and_sessions_end() {
         let server = serving(Gpus::Visible);
         let pid = super::transfer_pid(&server.socket, None);
         let nvml = Nvml::init().unwrap();
@@ -1108,7 +1109,11 @@ pub(crate) mod device {
         await_release(&nvml, &mut head, first, pid);
         assert_eq!(device_bytes(&destination), source_bytes);
 
-        // The next task retains the context again.
+        // Two independent operations share the context, without creating
+        // or booking it until a task actually uses the GPU.
+        let session = worker.open_transfer(vec![gpu]).unwrap();
+        let other_session = head.open_transfer(vec![gpu]).unwrap();
+        assert_eq!(booked_context(&mut head, gpu), None);
         let tail: u64 = 2 << 20;
         let task = worker
             .transfer(
@@ -1118,6 +1123,25 @@ pub(crate) mod device {
             )
             .unwrap();
         assert_eq!(end_of(&mut worker, task), (tail, TransferEnd::Complete));
+        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        assert!(holds_context(&nvml, first, pid));
+        worker.close_transfer(session).unwrap();
+        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        head.close_transfer(other_session).unwrap();
+        await_release(&nvml, &mut head, first, pid);
+
+        // Connection closure also retires its session, after task holds.
+        worker.open_transfer(vec![gpu]).unwrap();
+        let task = worker
+            .transfer(
+                vec![span(tensor_region(1), 0, tensor_region(2), 0, tail)],
+                Priority::Warming,
+                3,
+            )
+            .unwrap();
+        assert_eq!(end_of(&mut worker, task), (tail, TransferEnd::Complete));
+        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        drop(worker);
         await_release(&nvml, &mut head, first, pid);
     }
 

@@ -95,8 +95,9 @@ use serde::{Deserialize, Serialize};
 /// and the Transfer Server's `Allocate`) and discards the pages a world of
 /// other numerics cannot hit (`DiscardPages`); 12 lets a process of another
 /// host read a small read-only tensor of bytes inline (`Read`); 13 makes
-/// publication of committed worlds explicit (`PublishWorlds`).
-pub const VERSION: u32 = 13;
+/// publication of committed worlds explicit (`PublishWorlds`); 14 adds
+/// explicitly owned transfer sessions across successive copy rounds.
+pub const VERSION: u32 = 14;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -1108,6 +1109,13 @@ pub enum Request {
         /// are cancelled together.
         update: u64,
     },
+    /// Hold the transfer contexts of these local GPUs across successive
+    /// tasks. Contexts remain lazy and quota-accounted. The session ends
+    /// explicitly or when its owning connection closes.
+    OpenTransfer { gpus: Vec<[u8; 16]> },
+    /// End a session of this connection. Submitted tasks keep their own
+    /// holds until physical completion; this releases only the session.
+    CloseTransfer { session: u64 },
     /// From a head or a worker: cancel `tasks` and, with `update`, every
     /// task of that update, of the caller's deployment. Answered at once;
     /// each task's [`Event::Transferred`] follows once the Transfer Server
@@ -1284,6 +1292,10 @@ pub enum Reply {
     Transferring {
         task: u64,
     },
+    TransferOpened {
+        session: u64,
+    },
+    TransferClosed,
     /// How many tasks a [`Request::Cancel`] cancelled.
     Cancelled {
         tasks: u64,
@@ -1475,6 +1487,9 @@ pub enum Event {
         priority: Priority,
         moves: Vec<Move>,
     },
+    /// Retain local GPU contexts between tasks of an operation. A session
+    /// with no GPUs ends its holds; task holds remain independent.
+    TransferSession { session: u64, gpus: Vec<[u8; 16]> },
     /// To the Transfer Server: cancel task `task`.
     Cancel { task: u64 },
     /// To the Transfer Server: change the budgets of `links` and of every
