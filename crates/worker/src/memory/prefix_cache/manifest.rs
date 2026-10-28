@@ -13,7 +13,12 @@ impl CachePlanes {
     /// Describe complete pages without copying or registering their backing.
     /// The scheduler owns page leases on both sides of the transfer; callers
     /// publish destinations only after the Transfer Server reports success.
-    pub(crate) fn manifest(&self, pages: &[Page], retained: &Retained) -> Result<Rank> {
+    pub(crate) fn manifest(
+        &self,
+        pages: &[Page],
+        retained: &Retained,
+        resident: bool,
+    ) -> Result<Rank> {
         let gpu = self
             .device()
             .ok_or_else(|| Error::Invalid("cache transfers require a device pool".into()))?
@@ -25,6 +30,7 @@ impl CachePlanes {
             if page.worker_group != retained.scope().group {
                 continue;
             }
+            let identity = format!("{}/{}", page.request.0, page.request.1);
             let group = plan
                 .groups
                 .get(page.group as usize)
@@ -53,18 +59,15 @@ impl CachePlanes {
                             slot % plan.columns,
                             unit,
                             "values",
+                            resident,
                         )?;
                         chunk.offset = u64::from(index) * plan.plane_bytes;
                         chunks.push(chunk);
                     }
                     let mut fields = checkpoint.fields.clone();
                     for field in &mut fields {
-                        field.tensor = format!(
-                            "{}/{}/{}",
-                            page.tensor,
-                            page.start + page.tokens,
-                            field.tensor
-                        );
+                        field.tensor =
+                            format!("{}/{}/{}", identity, page.start + page.tokens, field.tensor);
                     }
                     storages.push(Storage {
                         layout: StorageLayout {
@@ -82,7 +85,7 @@ impl CachePlanes {
                 let dim = u64::from(group.head_dim);
                 let rows = u64::from(page.tokens);
                 for (field, kind) in super::planes::FIELDS.iter().enumerate() {
-                    let tensor = format!("{}/{name}/{kind}", page.tensor);
+                    let tensor = format!("{identity}/{name}/{kind}");
                     let logical = Logical {
                         shape: vec![
                             u64::from(page.total_tokens),
@@ -121,8 +124,8 @@ impl CachePlanes {
                         let position = layer as u32 * span + part;
                         let column = position % plan.columns;
                         let unit = page.units[(position / plan.columns) as usize];
-                        let mut chunk =
-                            self.retained_region(retained, field, column, unit, "values")?;
+                        let mut chunk = self
+                            .retained_region(retained, field, column, unit, "values", resident)?;
                         chunk.offset = u64::from(part) * plan.plane_bytes;
                         chunk.length = (bytes - chunk.offset).min(plan.plane_bytes);
                         chunks.push(chunk);
@@ -152,11 +155,12 @@ impl CachePlanes {
                             let position = layer as u32 * span + part;
                             let column = position % plan.columns;
                             let unit = page.units[(position / plan.columns) as usize];
-                            let chunk =
-                                self.retained_region(retained, field, column, unit, "scale")?;
+                            let chunk = self.retained_region(
+                                retained, field, column, unit, "scale", resident,
+                            )?;
                             let tensor = format!(
                                 "{}/{name}/{kind}/scale/{}/{}/{}/{heads}/{part}/{span}",
-                                page.tensor, page.start, page.tokens, group.kv_head_offset
+                                identity, page.start, page.tokens, group.kv_head_offset
                             );
                             storages.push(raw(tensor, chunk));
                         }

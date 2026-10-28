@@ -219,6 +219,7 @@ impl ClaimHolder {
         deployment: &str,
         worlds: &[u64],
         to_host: bool,
+        cache_keys: &[Vec<u8>],
     ) -> anyhow::Result<WeightsKept> {
         use anyhow::Context as _;
 
@@ -228,8 +229,21 @@ impl ClaimHolder {
             .with_context(|| format!("this node holds no claim of deployment {deployment}"))?;
         let released = held
             .client
-            .keep_weights(worlds.to_vec())
-            .with_context(|| format!("keeping the weights alone of worlds {worlds:?}"))?;
+            .keep_weights(
+                worlds.to_vec(),
+                cache_keys
+                    .iter()
+                    .map(|key| {
+                        key.as_slice()
+                            .try_into()
+                            .map(storage::Key)
+                            .map_err(|_| anyhow::anyhow!("a retained cache key has 32 bytes"))
+                    })
+                    .collect::<anyhow::Result<_>>()?,
+            )
+            .with_context(|| {
+                format!("retaining weights and rollback cache of worlds {worlds:?}")
+            })?;
         tracing::info!(
             deployment,
             ?worlds,

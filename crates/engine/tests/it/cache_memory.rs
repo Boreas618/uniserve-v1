@@ -46,6 +46,8 @@ struct Workers {
     quota: u64,
     /// What the worker's process books beside its weights and its cache.
     process_bytes: u64,
+    /// The serving world's captured graph allocations.
+    graph_bytes: u64,
     /// What the Transfer Server books on the GPU.
     transfer_bytes: u64,
     /// What the Transfer Server's context takes on the GPU while held,
@@ -131,6 +133,13 @@ impl Workers {
             vec![WORLD],
             None,
             self.process_bytes,
+        ));
+        entries.push(entry(
+            Item::GraphPool,
+            Some(&scope),
+            vec![WORLD],
+            None,
+            self.graph_bytes,
         ));
         entries.push(entry(
             Item::TransferContext,
@@ -753,10 +762,97 @@ fn recomputation_uses_the_target_window_and_page_storage() {
     assert!((100..=200).contains(&target_bytes), "{plan}");
     assert!(plan["in_flight_kv"].as_u64().unwrap() >= 1_000, "{plan}");
     let mut aggregate = target;
-    aggregate.rank_budgets.get_mut(&[7; 16]).unwrap().in_flight = Some(700);
+    aggregate.rank_budgets.get_mut(&[7; 16]).unwrap().in_flight =
+        Some(storage::manifest::weights::CacheReservation {
+            bytes: 700,
+            mapped: 700,
+        });
     let plans = resize(&handle, CacheChange::Plan(aggregate)).unwrap();
     let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
     assert_eq!(plan["successor"]["in_flight"], 700);
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// Host staging admits the head while preserving enough device capacity
+/// for promotion. Transfer estimates use values, not unused segment padding.
+#[test]
+fn host_staging_reserves_device_segments_and_copies_only_values() {
+    let (handle, _, thread) = start(Workers {
+        quota: 12_000,
+        host_link: Some(1_000),
+        ..Workers::filling(0)
+    });
+    let target = Successor {
+        unmapped_cache: true,
+        rank_budgets: engine::RankBudgets::from([(
+            [7; 16],
+            storage::manifest::weights::RankBudget {
+                quota: 5_000,
+                cache: 1_000,
+                cache_capacity: 5_000,
+                cache_segment: 1_000,
+                in_flight: Some(storage::manifest::weights::CacheReservation {
+                    bytes: 2_100,
+                    mapped: 3_000,
+                }),
+                ..Default::default()
+            },
+        )]),
+        ..Successor::default()
+    };
+    assert!(resize(&handle, CacheChange::Plan(target.clone())).is_err());
+    let plans = resize(
+        &handle,
+        CacheChange::Plan(Successor {
+            host_cache: true,
+            ..target
+        }),
+    )
+    .unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["successor"]["in_flight"], 0);
+    assert_eq!(plan["trial_cache"], 3_000);
+    assert_eq!(plan["host_staging"], 2_100);
+    assert_eq!(plan["promotion_stall_ms"], 2_100);
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A graph pool is reclaimable only when the preparation policy actually
+/// switches its owner to eager execution.
+#[test]
+fn an_eager_predecessor_leaves_its_graph_budget_to_the_successor() {
+    let (handle, _, thread) = start(Workers {
+        quota: 12_000,
+        graph_bytes: 3_000,
+        ..Workers::filling(0)
+    });
+    let target = Successor {
+        rank_budgets: engine::RankBudgets::from([(
+            [7; 16],
+            storage::manifest::weights::RankBudget {
+                quota: 10_000,
+                weights: 5_000,
+                graphs: 1_000,
+                cache: 1_000,
+                cache_capacity: 1_000,
+                ..Default::default()
+            },
+        )]),
+        ..Successor::default()
+    };
+    assert!(resize(&handle, CacheChange::Plan(target.clone())).is_err());
+    let plans = resize(
+        &handle,
+        CacheChange::Plan(Successor {
+            eager_source: true,
+            ..target
+        }),
+    )
+    .unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["kv_limit"], 3_000);
     handle.shutdown();
     thread.join().unwrap();
 }

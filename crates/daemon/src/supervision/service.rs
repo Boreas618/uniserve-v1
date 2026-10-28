@@ -165,10 +165,12 @@ impl Local {
                 }
             }
             Some(request::Kind::KeepWeights(keep)) => {
-                match self
-                    .claims
-                    .keep_weights(&keep.deployment, &keep.worlds, keep.to_host)
-                {
+                match self.claims.keep_weights(
+                    &keep.deployment,
+                    &keep.worlds,
+                    keep.to_host,
+                    &keep.cache_keys,
+                ) {
                     Ok(kept) => reply.kind = Some(reply::Kind::WeightsKept(kept)),
                     Err(error) => reply.error = format!("{error:#}"),
                 }

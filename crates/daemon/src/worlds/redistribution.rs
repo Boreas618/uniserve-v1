@@ -11,7 +11,7 @@ use std::time::Instant;
 use anyhow::Context as _;
 use engine::launches::Agreement;
 use proto::request::wire;
-use storage::manifest::weights::{RankBudget, Sources, Transfer};
+use storage::manifest::weights::{CacheReservation, RankBudget, Sources, Transfer};
 use storage::manifest::{self, Gpu, Manifest};
 
 /// What a change of the parallel configuration does with the weights, as
@@ -27,6 +27,8 @@ pub(crate) struct Redistribution {
     pub(crate) received: Vec<wire::ReceivedWeights>,
     /// Target resources beside the retained chunks shared with its sources.
     pub(crate) budgets: BTreeMap<Gpu, RankBudget>,
+    /// Each assigned GPU's host, from its actual rank launch.
+    pub(crate) hosts: BTreeMap<Gpu, String>,
     /// What the plan reports: each GPU's mapped, copied and created bytes,
     /// each manifest's digest and link loads.
     pub(crate) report: serde_json::Value,
@@ -54,6 +56,7 @@ pub(crate) async fn plan(
     served_worlds: &[u64],
     target: &wire::EngineSpec,
     open: bool,
+    requests: &[wire::RequestPrefix],
 ) -> anyhow::Result<Option<Redistribution>> {
     let started = Instant::now();
     let shorthand = target
@@ -74,6 +77,20 @@ pub(crate) async fn plan(
     };
     let launches = engine::launches::rank_launches(&planning)
         .context("resolving the target world's launches")?;
+    let schedulers = launches
+        .iter()
+        .filter_map(|launch| launch.scheduler)
+        .max()
+        .context("the target has no request scheduler")?
+        + 1;
+    let mut prefixes = vec![Vec::new(); schedulers];
+    for request in requests {
+        let resume = request
+            .resume
+            .as_ref()
+            .context("a live request has no continuation origin")?;
+        prefixes[engine::continuation_slot(resume.request_id, schedulers)].push(request.tokens);
+    }
     let address = process_address.to_owned();
     let source_worlds = served_worlds.to_vec();
     let planned = tokio::task::spawn_blocking(move || {
@@ -206,6 +223,7 @@ pub(crate) async fn plan(
                 "group": launch.group,
                 "rank": launch.rank,
                 "device": order[index],
+                "host": launch.host,
                 "gpu": storage::protocol::gpu_name(&assigned[index]),
                 "mapped_bytes": bytes.mapped,
                 "copied_bytes": bytes.copied,
@@ -237,6 +255,21 @@ pub(crate) async fn plan(
     let mut refusals = Vec::new();
     let mut gpus_report = Vec::new();
     let mut budgets = BTreeMap::new();
+    let mut hosts = BTreeMap::new();
+    let mut reservations = BTreeMap::<Gpu, CacheReservation>::new();
+    for (index, launch) in launches.iter().enumerate() {
+        hosts.insert(assigned[index], launch.host.clone());
+        if let Some(slot) = launch.scheduler {
+            let budget = planned[index]
+                .budget
+                .as_ref()
+                .context("target rank has no capacity plan")?;
+            let reservation = budget.reserve_requests(&prefixes[slot]);
+            let total = reservations.entry(assigned[index]).or_default();
+            total.bytes += reservation.bytes;
+            total.mapped += reservation.mapped;
+        }
+    }
     for (gpu, bytes) in &per_gpu {
         let device = planned
             .iter()
@@ -256,6 +289,7 @@ pub(crate) async fn plan(
             budget.quota = budget.quota.min(quota);
         }
         budget.weights = bytes.created;
+        budget.in_flight = Some(reservations.get(gpu).copied().unwrap_or_default());
         let available = budget
             .quota
             .saturating_sub(device.resident_bytes)
@@ -300,6 +334,7 @@ pub(crate) async fn plan(
         chosen,
         received,
         budgets,
+        hosts,
         report: serde_json::json!({
             "devices": order,
             "order": if chosen { "chosen" } else { "stated" },

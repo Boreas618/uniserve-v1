@@ -298,6 +298,8 @@ message DescribeRequests {
 message RequestPrefix {
   uint64 request_id = 1;
   uint32 tokens = 2;
+  // Original continuation identity, preserved when request_id changes on migration.
+  CacheResume resume = 3;
 }
 
 message RequestsDescribed {
@@ -403,6 +405,13 @@ message ResizeCache {
   repeated RankBudget rank_budgets = 10;
   // Per-device allocation requirements override room_bytes on named GPUs.
   repeated DeviceBytes device_bytes = 11;
+  // Warm successor pages into host storage; only its writable head is
+  // resident until promotion evicts the predecessor's copied cache.
+  bool successor_host_cache = 12;
+  // Completed Host cache copies retained for rollback when execution retires.
+  repeated bytes cache_keys = 13;
+  // The predecessor releases its graph pool during preparation.
+  bool eager_source = 14;
 }
 
 message DeviceBytes {
@@ -424,9 +433,15 @@ message RankBudget {
   repeated CachePageBudget pages = 9;
   // Complete reservation supplied by multi-world request routing. Absent
   // when the engine should size its own accepted request prefixes.
-  optional uint64 in_flight = 10;
+  CacheReservation in_flight = 10;
   // Bytes of one target cache tail segment, its physical allocation unit.
   uint64 cache_segment = 11;
+}
+
+// Accepted prefix values and the device segments required to materialize them.
+message CacheReservation {
+  uint64 bytes = 1;
+  uint64 mapped = 2;
 }
 
 // Target cache page storage, after layer/head partitioning and encoding.

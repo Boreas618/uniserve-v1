@@ -241,10 +241,8 @@ message LedgerQuery {
   string deployment = 2;
 }
 
-// Have a node's daemon keep the weights alone of `worlds` of the deployment
-// at its Storage Server: their retention of every other storage ends, as a
-// previous world kept as its weights for a rollback, whose processes exited,
-// keeps no more.
+// Retain weights and the exact completed rollback cache copies of `worlds`
+// after their processes exit. Their other exclusive storages are released.
 message KeepWeights {
   string host = 1;
   string deployment = 2;
@@ -256,6 +254,7 @@ message KeepWeights {
   // Transfer Server, or the host cannot hold them) keeps them on its GPUs
   // and says why.
   bool to_host = 4;
+  repeated bytes cache_keys = 5;
 }
 
 message WeightsKept {

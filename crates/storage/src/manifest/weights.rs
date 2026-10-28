@@ -86,7 +86,15 @@ pub struct RankBudget {
     pub pages: Vec<CachePage>,
     /// A complete cross-world request reservation, when the caller routes
     /// requests from multiple predecessor engines onto this target GPU.
-    pub in_flight: Option<u64>,
+    pub in_flight: Option<CacheReservation>,
+}
+
+/// Value bytes retained for accepted prefixes and the device segments
+/// required to materialize them. Host copies need only the value bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheReservation {
+    pub bytes: u64,
+    pub mapped: u64,
 }
 
 /// Value storage added by a target cache group's logical page, including its
@@ -107,7 +115,17 @@ impl RankBudget {
             + self.graphs
             + self.fixed
             + self.weights
-            + (self.cache + self.in_flight.unwrap_or(0)).max(self.cache_capacity)
+            + (self.cache + self.in_flight.map_or(0, |cache| cache.mapped)).max(self.cache_capacity)
+    }
+
+    /// The exact value demand and segment-rounded device demand of this rank.
+    pub fn reserve_requests(&self, tokens: &[u32]) -> CacheReservation {
+        let bytes = self.request_bytes(tokens);
+        let segment = self.cache_segment.max(1);
+        CacheReservation {
+            bytes,
+            mapped: bytes.div_ceil(segment) * segment,
+        }
     }
 
     /// Writable cache needed to resume accepted request prefixes at this

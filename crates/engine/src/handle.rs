@@ -616,6 +616,7 @@ pub enum Command {
     KeepWeights {
         worlds: Vec<u64>,
         to_host: bool,
+        cache_keys: Vec<Vec<u8>>,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Reports the KV cache each worker group holds now
@@ -700,6 +701,10 @@ pub struct Successor {
     /// It maps none of the serving world's KV cache, so copied or
     /// recomputed in-flight state needs units of its own.
     pub unmapped_cache: bool,
+    /// Its copied pages reside in admitted host storage during preparation.
+    pub host_cache: bool,
+    /// The predecessor releases its graph pool during preparation.
+    pub eager_source: bool,
     /// Its graph policy captures graphs (`cuda_graph_config.policy` is not
     /// `off`), so its warmup takes a graph share where its model can be
     /// captured.
@@ -947,11 +952,13 @@ impl CommandSender {
         &self,
         worlds: Vec<u64>,
         to_host: bool,
+        cache_keys: Vec<Vec<u8>>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, kept) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::KeepWeights {
             worlds,
             to_host,
+            cache_keys,
             answer,
         });
         kept

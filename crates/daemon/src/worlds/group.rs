@@ -15,6 +15,7 @@ pub(crate) struct Trial {
     previous: Vec<Arc<Replica>>,
     current: Vec<Arc<Replica>>,
     retained: Vec<Previous>,
+    cache_backup: Vec<storage::manifest::cache::Snapshot>,
     digest: String,
     mode: PreviousWorld,
     host_refused: Option<String>,
@@ -107,8 +108,14 @@ fn add_budget(total: &mut RankBudget, rank: RankBudget) {
     total.fixed += rank.fixed;
     total.cache += rank.cache;
     total.cache_capacity += rank.cache_capacity;
+    // Each independent target owner rounds its continuation reservation
+    // before aggregation; a sum of segment sizes would overcharge it.
+    total.cache_segment = 0;
     total.weights += rank.weights;
-    total.in_flight = Some(total.in_flight.unwrap_or(0) + rank.in_flight.unwrap_or(0));
+    let aggregate = total.in_flight.get_or_insert_default();
+    let reservation = rank.in_flight.unwrap_or_default();
+    aggregate.bytes += reservation.bytes;
+    aggregate.mapped += reservation.mapped;
     total.pages.extend(rank.pages);
 }
 
@@ -120,6 +127,7 @@ async fn restore(
     candidates: &[Arc<EngineClient>],
     parked: &[u64],
     eager: bool,
+    backup: &[storage::manifest::cache::Snapshot],
 ) {
     let retiring: Vec<_> = candidates.iter().map(|client| client.world()).collect();
     for candidate in candidates {
@@ -136,7 +144,12 @@ async fn restore(
             client.commit(retiring.clone(), false).await.map(drop)
         };
         match restored {
-            Ok(()) => replica.hold.serve(Arc::clone(client)),
+            Ok(()) => match warming::restore(client, backup).await {
+                Ok(()) => replica.hold.serve(Arc::clone(client)),
+                Err(error) => replica
+                    .hold
+                    .close(format!("the predecessor cache did not restore: {error}")),
+            },
             Err(error) => replica
                 .hold
                 .close(format!("the predecessor did not resume: {error}")),
@@ -155,7 +168,7 @@ pub(crate) async fn apply(
     request: &ApplyRequest,
     target: ServeConfig,
     stated: Stated,
-    update: UpdateOptions,
+    mut update: UpdateOptions,
 ) -> Result<Applied, UpdateError> {
     let previous = leader.replicas();
     let _owners = lock_replicas(&previous).await;
@@ -192,12 +205,11 @@ pub(crate) async fn apply(
             client
                 .describe_requests()
                 .await
-                .map_err(|error| anyhow::anyhow!("reading accepted request prefixes: {error}"))?
-                .into_iter()
-                .map(|request| request.tokens),
+                .map_err(|error| anyhow::anyhow!("reading accepted request prefixes: {error}"))?,
         );
     }
     let mut budgets = BTreeMap::<Gpu, RankBudget>::new();
+    let mut hosts = BTreeMap::new();
     let mut plans = Vec::new();
     let mut refusals = Vec::new();
     for (index, spec) in specs.iter_mut().enumerate() {
@@ -231,6 +243,7 @@ pub(crate) async fn apply(
             &source_worlds,
             spec,
             false,
+            &prefixes[index],
         )
         .await?
         .context("the target ranks did not provide numerical storage budgets")?;
@@ -244,8 +257,8 @@ pub(crate) async fn apply(
             world: source_worlds[0],
             segments: Vec::new(),
         });
-        for (gpu, mut budget) in plan.budgets {
-            budget.in_flight = Some(budget.request_bytes(&prefixes[index]));
+        hosts.extend(plan.hosts);
+        for (gpu, budget) in plan.budgets {
             match budgets.entry(gpu) {
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     add_budget(entry.get_mut(), budget);
@@ -257,28 +270,38 @@ pub(crate) async fn apply(
         }
         plans.push(plan.report);
     }
-    let adds = Successor {
+    let mut adds = Successor {
         loads_weights: false,
         unmapped_cache: true,
+        host_cache: false,
+        eager_source: update.eager_prepare,
         captures_graphs: specs.iter().any(|spec| {
             spec.cuda_graphs
                 .as_ref()
                 .is_none_or(|graphs| graphs.policy != "off")
         }),
     };
-    let mut admissions = Vec::new();
-    for client in &serving {
-        let (report, refusal) = memory_plan(client, adds, &budgets, update.previous_world).await;
-        admissions.push(report);
-        if let Some(refusal) = refusal {
-            refusals.push(refusal);
-        }
+    let (admission, refusal) = memory_plan(
+        &serving,
+        &mut adds,
+        &budgets,
+        &hosts,
+        &control,
+        update.previous_world,
+    )
+    .await;
+    if let Some(refusal) = refusal {
+        refusals.push(refusal);
     }
+    for spec in &mut specs {
+        spec.stage_cache = adds.host_cache;
+    }
+    update.eager_prepare = adds.eager_source;
     let plan = serde_json::json!({
         "previous_worlds": source_worlds,
         "replicas": specs.len(),
         "redistribution": plans,
-        "memory": admissions,
+        "memory": admission,
         "feasible": refusals.is_empty(),
         "refusals": refusals,
     });
@@ -398,7 +421,8 @@ pub(crate) async fn apply(
                 .iter()
                 .any(|source| source.info().prefix_seed != candidate.info().prefix_seed);
             warming.push(async move {
-                if changed && request.in_flight == InFlight::Recompute {
+                let recompute = changed && request.in_flight == InFlight::Recompute;
+                if recompute && !adds.host_cache {
                     Ok(warming::Report {
                         recompute: Some("the update recomputes in-flight state".into()),
                         ..warming::Report::default()
@@ -407,9 +431,16 @@ pub(crate) async fn apply(
                     warming::prepare(
                         &sources,
                         candidate,
-                        changed,
+                        if recompute {
+                            warming::Reuse::Recompute
+                        } else if changed {
+                            warming::Reuse::Keep
+                        } else {
+                            warming::Reuse::Exact
+                        },
                         update.cache_tail_tokens.map(std::num::NonZeroU32::get),
                         update.cache_prefill_tokens.map(std::num::NonZeroU32::get),
+                        adds.host_cache,
                     )
                     .await
                 }
@@ -434,6 +465,10 @@ pub(crate) async fn apply(
             &candidates,
             &parked,
             update.eager_prepare,
+            &warmed
+                .iter()
+                .flat_map(|report| report.backup.clone())
+                .collect::<Vec<_>>(),
         )
         .await;
         return Err(error
@@ -468,6 +503,19 @@ pub(crate) async fn apply(
         warming::resume_prefill(&serving)
             .await
             .map_err(anyhow::Error::msg)?;
+        if adds.host_cache {
+            for source in &serving {
+                source
+                    .resize_cache(wire::CacheChange::Evict)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
+            for candidate in &candidates {
+                warming::materialize(candidate)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
         for (candidate, warmed) in candidates.iter().zip(&warmed) {
             candidate
                 .promote(
@@ -487,6 +535,10 @@ pub(crate) async fn apply(
             &candidates,
             &parked,
             update.eager_prepare,
+            &warmed
+                .iter()
+                .flat_map(|report| report.backup.clone())
+                .collect::<Vec<_>>(),
         )
         .await;
         return Err(error
@@ -497,6 +549,8 @@ pub(crate) async fn apply(
     for (ordinal, (client, mut spec)) in candidates.iter().zip(specs).enumerate() {
         spec.world = client.world();
         spec.received_weights.clear();
+        spec.stage_cache = false;
+        spec.cache_keys.clear();
         let replica = Replica::new(
             &target,
             Arc::clone(client),
@@ -520,6 +574,10 @@ pub(crate) async fn apply(
         retained: serving
             .iter()
             .map(|client| Previous::Parked(Arc::clone(client)))
+            .collect(),
+        cache_backup: warmed
+            .iter()
+            .flat_map(|report| report.backup.clone())
             .collect(),
         digest: target_digest,
         mode: update.previous_world,
@@ -550,13 +608,7 @@ pub(crate) async fn apply(
         Ordering::Relaxed,
     );
     match update.previous_world {
-        PreviousWorld::Parked => {
-            for client in &serving {
-                if let Err(error) = client.resize_cache(wire::CacheChange::Evict).await {
-                    warn!(%error, "the predecessor did not evict its unused cache");
-                }
-            }
-        }
+        PreviousWorld::Parked => {}
         PreviousWorld::Weights | PreviousWorld::Host => {
             for client in &serving {
                 close(client).await;
@@ -569,6 +621,10 @@ pub(crate) async fn apply(
                     .grow_keeping_weights(
                         source_worlds.clone(),
                         update.previous_world == PreviousWorld::Host,
+                        warmed
+                            .iter()
+                            .flat_map(|report| warming::keys(&report.backup))
+                            .collect(),
                     )
                     .await
                 {
@@ -689,6 +745,7 @@ pub(crate) async fn rollback(
                         .clone()
                         .ok_or(UpdateError::NoEngine)?;
                     spec.retire = retiring.clone();
+                    spec.cache_keys = warming::keys(&trial.cache_backup);
                     let sink = stats_sink(
                         replica.model_name.clone(),
                         Arc::clone(&replica.observer),
@@ -722,6 +779,13 @@ pub(crate) async fn rollback(
             }
         };
         replica.hold.keep(None);
+        if let Err(error) = warming::restore(&client, &trial.cache_backup).await {
+            replica
+                .hold
+                .close(format!("the predecessor cache did not restore: {error}"));
+            failures.push(error);
+            continue;
+        }
         if paused {
             replica.hold.pause();
         } else {

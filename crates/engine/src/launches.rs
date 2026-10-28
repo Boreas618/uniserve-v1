@@ -30,6 +30,8 @@ pub enum Agreement {
 /// One rank's launch, as the world's start states it.
 #[derive(Debug, Clone)]
 pub struct RankLaunch {
+    /// The request scheduler that owns this rank; dedicated experts have none.
+    pub scheduler: Option<usize>,
     /// The rank's host, by host identity.
     pub host: String,
     /// The rank's worker group and its rank there.
@@ -58,9 +60,10 @@ pub struct RankLaunch {
 /// a rank whose descriptor cannot be built.
 pub fn rank_launches(spec: &EngineSpec) -> anyhow::Result<Vec<RankLaunch>> {
     let config = EngineConfig::from_spec(spec)?;
-    let arguments = SchedulerHandle::group_arguments(&config)?.arguments;
+    let groups = SchedulerHandle::group_arguments(&config)?;
+    let arguments = groups.arguments;
     let mut launches = Vec::new();
-    for args in &arguments {
+    for (index, args) in arguments.iter().enumerate() {
         let executable = args
             .executable
             .to_str()
@@ -85,6 +88,10 @@ pub fn rank_launches(spec: &EngineSpec) -> anyhow::Result<Vec<RankLaunch>> {
                 None => (Agreement::Group(args.worker_id.clone()), rank),
             };
             launches.push(RankLaunch {
+                scheduler: args
+                    .role
+                    .serves_requests()
+                    .then_some(index / groups.per_core),
                 host: args.ranks[rank as usize].host.clone(),
                 group: args.worker_id.clone(),
                 rank,

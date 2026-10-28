@@ -549,8 +549,8 @@ impl Client {
     }
 
     /// See [`Request::KeepWeights`]. Returns how many tensors were released.
-    pub fn keep_weights(&mut self, worlds: Vec<u64>) -> Result<u64> {
-        match Self::expect(self.call(&Request::KeepWeights { worlds }, &[])?)?.reply {
+    pub fn keep_weights(&mut self, worlds: Vec<u64>, cache_keys: Vec<Key>) -> Result<u64> {
+        match Self::expect(self.call(&Request::KeepWeights { worlds, cache_keys }, &[])?)?.reply {
             Reply::Retained { released } => Ok(released),
             other => Err(unexpected("keep_weights", &other)),
         }

@@ -156,6 +156,14 @@ impl Scheduler {
             tokens.push(proto::request::wire::RequestPrefix {
                 request_id: state.req.request_id.0,
                 tokens: state.cache_visible_len,
+                resume: state
+                    .req
+                    .cache
+                    .resume
+                    .map(|resume| proto::request::wire::CacheResume {
+                        world: resume.world,
+                        request_id: resume.request_id,
+                    }),
             });
         }
         (units, tokens)

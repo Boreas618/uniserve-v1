@@ -758,6 +758,12 @@ fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
     answer_hooked(hook.id, answers, front, routing);
 }
 
+/// Assigns a continuation to a DP scheduler by its original request identity.
+/// Planning and reservation use this same assignment; `schedulers` is nonzero.
+pub fn continuation_slot(origin: u64, schedulers: usize) -> usize {
+    (origin % schedulers as u64) as usize
+}
+
 fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
     use storage::manifest::cache::Operation;
     let operation: Operation = match serde_json::from_slice(&warm.operation) {
@@ -775,7 +781,11 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
         }
     };
     let operations = match operation {
-        Operation::Reserve { prefixes, keep } => {
+        Operation::Reserve {
+            prefixes,
+            keep,
+            host,
+        } => {
             let mut assigned = vec![Vec::new(); routing.slots.len()];
             let mut routes = crate::lock(&routing.cache_routes);
             for prefix in prefixes {
@@ -783,24 +793,36 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
                     world: prefix.resume.0,
                     request_id: prefix.resume.1,
                 };
-                let next = routes.len() % routing.slots.len();
+                let next = continuation_slot(resume.request_id, routing.slots.len());
                 let slot = *routes.entry(resume).or_insert(next);
                 assigned[slot].push(prefix);
             }
             assigned
                 .into_iter()
-                .map(|prefixes| Operation::Reserve { prefixes, keep })
+                .map(|prefixes| Operation::Reserve {
+                    prefixes,
+                    keep,
+                    host,
+                })
                 .collect::<Vec<_>>()
         }
         Operation::Coverage { prefixes, keep } => {
             let mut assigned = vec![Vec::new(); routing.slots.len()];
             let routes = crate::lock(&routing.cache_routes);
+            let requests = crate::lock(&routing.requests);
             for prefix in prefixes {
                 let resume = proto::request::CacheResume {
                     world: prefix.resume.0,
                     request_id: prefix.resume.1,
                 };
-                if let Some(&slot) = routes.get(&resume) {
+                // Reserved successor pages have a continuation route; a
+                // source still serving its request has its ordinary owner.
+                let slot = routes.get(&resume).copied().or_else(|| {
+                    requests
+                        .get(&RequestId(prefix.request))
+                        .map(|request| request.slot)
+                });
+                if let Some(slot) = slot {
                     assigned[slot].push(prefix);
                 }
             }
@@ -836,6 +858,8 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
     let successor = crate::Successor {
         loads_weights: resize.successor_loads_weights,
         unmapped_cache: resize.successor_unmapped_cache,
+        host_cache: resize.successor_host_cache,
+        eager_source: resize.eager_source,
         captures_graphs: resize.successor_captures_graphs,
         // A malformed UUID names no GPU of this deployment.
         rank_budgets: resize
@@ -856,7 +880,12 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
                                 cache: weights.cache,
                                 cache_capacity: weights.cache_capacity,
                                 cache_segment: weights.cache_segment,
-                                in_flight: weights.in_flight,
+                                in_flight: weights.in_flight.as_ref().map(|cache| {
+                                    storage::manifest::weights::CacheReservation {
+                                        bytes: cache.bytes,
+                                        mapped: cache.mapped,
+                                    }
+                                }),
                                 pages: weights
                                     .pages
                                     .iter()
@@ -924,17 +953,18 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
     // scheduler asks), on a thread of its own: the change then finds it on
     // each GPU's ledger. The answer carries each node's report of the
     // weights kept, wrapped as `{"kept": ...}`, before the schedulers'.
-    let (id, worlds, to_host) = (
+    let (id, worlds, to_host, cache_keys) = (
         resize.id,
         resize.keep_weights.clone(),
         resize.keep_in_host_memory,
+        resize.cache_keys.clone(),
     );
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
         .name("keep-weights".to_owned())
         .spawn(move || {
             let kept = routing.slots.first().map_or(Ok(Vec::new()), |slot| {
-                match slot.handle.keep_weights(worlds, to_host).recv() {
+                match slot.handle.keep_weights(worlds, to_host, cache_keys).recv() {
                     Ok(kept) => kept,
                     Err(_) => Err("a scheduler stopped".to_owned()),
                 }

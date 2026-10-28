@@ -79,26 +79,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The protocol version this build speaks: 5 adds worlds (the `world` of a
-/// worker's role and of a claim, and a claim's `retire`); 6 adds the world
-/// of a head's role, whose page requests read and publish that world's
-/// pages; 7 adds transfers (the Transfer Server's role, its requests and
-/// events, and the listing's `transfer`); 8 adds transfers from other hosts
-/// (the remote region, allocation and link end, another host's Transfer
-/// Server's role and its exposures, and the registrations of the Transfer
-/// Server's NIXL agent); 9 adds the GPUs' memory ledgers (`Book`, `Ledger`,
-/// a storage's KV cache `segment`, the listing's `ledgers`) and a world kept
-/// as its weights (`KeepWeights`); 10 lets one key have a copy at each
-/// location memory lies at, which `get`, `retain`, `rekey` and a transfer's
-/// tensor regions select by their `at`, and a span copy rows at a pitch; 11
-/// moves a world's weights to host memory and back (`Offload`, `Restore`,
-/// and the Transfer Server's `Allocate`) and discards the pages a world of
-/// other numerics cannot hit (`DiscardPages`); 12 lets a process of another
-/// host read a small read-only tensor of bytes inline (`Read`); 13 makes
-/// publication of committed worlds explicit (`PublishWorlds`); 14 adds
-/// explicitly owned transfer sessions across successive copy rounds; 15
-/// admits host allocations before creating their retained backing.
-pub const VERSION: u32 = 15;
+/// Wire contract negotiated when a Storage Server client connects.
+pub const VERSION: u32 = 16;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -904,15 +886,16 @@ pub enum Request {
         #[serde(default)]
         at: Vec<Placement>,
     },
-    /// Every world of `worlds` of the head's deployment keeps its weights
-    /// alone on the host: its retention of every exclusive tensor ends (its
-    /// KV cache segments, cache flags and scales, buffer pool, latent
-    /// banks), and an exclusive tensor no other world retains is released,
-    /// so that the GPU's ledger books it no more. A previous world kept as
-    /// its weights for a rollback, whose processes exited, keeps no more;
-    /// the segments its successor maps stay the successor's. Answered with
-    /// `Retained`.
-    KeepWeights { worlds: Vec<u64> },
+    /// Worlds in the head's deployment retain their weights and the exact
+    /// `cache_keys` holding completed rollback copies. Their retention of
+    /// every other exclusive tensor ends. A tensor no other world retains
+    /// is released, while segments mapped by the successor remain retained
+    /// by that successor. Call after the predecessor's processes exit.
+    /// Answered with `Retained`.
+    KeepWeights {
+        worlds: Vec<u64>,
+        cache_keys: Vec<Key>,
+    },
     /// From a head: world `world` of its deployment keeps its weights in
     /// host memory (`update_config.previous_world = "host"`, its processes
     /// exited). Every device copy of read-only tensors that this world
