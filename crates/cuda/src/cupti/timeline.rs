@@ -10,9 +10,9 @@
 //! and driver API call. A CUDA graph's launch is recorded by its nodes
 //! ([`GraphTrace::Nodes`]: each kernel, copy and fill of the graph carries
 //! the graph's and the node's id) or as one record of the whole graph
-//! ([`GraphTrace::Whole`], `GRAPH_TRACE`), which the subscription's
-//! instantiation guard makes safe for every graph instantiated after it
-//! subscribed.
+//! ([`GraphTrace::Whole`], `GRAPH_TRACE`). Executables are instantiated in
+//! their launch's tracing mode; changing that mode requires their owners
+//! to instantiate the retained source graphs again before replay.
 //!
 //! An API call is timed from its entry callback to its exit callback in
 //! CUPTI's clock on the calling thread; nested calls (a runtime call and the
@@ -112,6 +112,13 @@ pub struct Timeline {
 
 impl Timeline {
     /// Record the process's timeline into `sink`, graphs as `graphs` says.
+    ///
+    /// CUDA graph executables must be instantiated in the tracing mode in
+    /// which they are launched. When switching to or from whole-graph
+    /// tracing, their owners reinstantiate the retained source graphs
+    /// before submitting another replay. Running a whole-trace executable
+    /// in node mode leaks CUPTI timestamp slots, eventually exhausting its
+    /// profiling buffers.
     ///
     /// # Errors
     ///
@@ -366,50 +373,103 @@ mod tests {
         Ok(())
     }
 
-    /// A graph instantiated after the process subscribed, before any timeline
-    /// recorded, is traced whole or by its nodes, as each timeline asks.
+    /// Switching tracing modes preserves every activity across more node
+    /// launches than a bounded profiling-buffer pool can hold at once.
     #[test]
-    #[ignore = "requires a CUDA device"]
-    fn a_graph_instantiated_before_the_timeline_is_traced_whole_or_by_nodes() -> Result<()> {
-        use crate::cupti::tests::{Spin, captured};
+    #[ignore = "requires a CUDA device; run in a fresh process"]
+    fn retained_graphs_record_nodes_whole_and_nodes_without_losing_timestamps() -> Result<()> {
+        use crate::cupti::check;
+        use crate::cupti::tests::{Spin, with_captured_graph};
+        use std::sync::atomic::AtomicUsize;
 
         let _serial = lock(&crate::cupti::tests::SERIAL);
         subscriber::subscribe()?;
+        // Limit the vendor's profiling pool so a missing buffer recycle
+        // fails after hundreds of launches instead of millions.
+        // SAFETY: the process's CUPTI is already loaded by the subscriber.
+        let library = unsafe { libloading::Library::new(super::super::library()).unwrap() };
+        type SetAttribute = unsafe extern "C" fn(i32, *mut usize, *mut c_void) -> i32;
+        // SAFETY: this is the CUPTI header's cuptiActivitySetAttribute ABI.
+        let set = unsafe {
+            library
+                .get::<SetAttribute>(b"cuptiActivitySetAttribute")
+                .unwrap()
+        };
+        let mut size = std::mem::size_of::<usize>();
+        let mut limit = 4usize;
+        check(
+            // SAFETY: attribute 2 takes a size_t; both pointers are live.
+            unsafe { set(2, &mut size, (&raw mut limit).cast()) },
+            "cuptiActivitySetAttribute",
+        )?;
         let stream = Stream::new(DeviceId(0))?;
         let spin = Spin::load(&stream)?;
-        let graph = captured(&stream, |stream| {
-            (0..4).try_for_each(|_| spin.launch(stream, 1, 1000))
-        })?;
-
-        let record = |graphs| -> Result<Vec<Record>> {
-            let delivered: Arc<Mutex<Vec<Record>>> = Arc::default();
-            let sink: Sink = {
-                let delivered = Arc::clone(&delivered);
-                Arc::new(move |batch: Delivered| lock(&delivered).extend(batch.records))
-            };
-            let timeline = Timeline::start(graphs, sink)?;
-            graph.launch(&stream)?;
-            stream.synchronize()?;
-            drop(timeline);
-            Ok(std::mem::take(&mut *lock(&delivered)))
-        };
-        let kernels = |records: &[Record]| {
-            records
-                .iter()
-                .filter(|record| matches!(record, Record::Kernel(kernel) if kernel.graph != 0))
-                .count()
-        };
-        let launches = |records: &[Record]| {
-            records
-                .iter()
-                .filter(|record| matches!(record, Record::Graph(_)))
-                .count()
-        };
-
-        let whole = record(GraphTrace::Whole)?;
-        assert_eq!((launches(&whole), kernels(&whole)), (1, 0));
-        let nodes = record(GraphTrace::Nodes)?;
-        assert_eq!((launches(&nodes), kernels(&nodes)), (0, 4));
-        Ok(())
+        let result = with_captured_graph(
+            &stream,
+            |stream| (0..1000).try_for_each(|_| spin.launch(stream, 1, 1)),
+            |source| {
+                for (mode, replays) in [
+                    (GraphTrace::Nodes, 1024),
+                    (GraphTrace::Whole, 1),
+                    (GraphTrace::Nodes, 1024),
+                ] {
+                    let counts = Arc::new([
+                        AtomicUsize::new(0),
+                        AtomicUsize::new(0),
+                        AtomicUsize::new(0),
+                    ]);
+                    let sink: Sink = {
+                        let counts = Arc::clone(&counts);
+                        Arc::new(move |batch: Delivered| {
+                            for record in batch.records {
+                                let (index, start, end) = match record {
+                                    Record::Kernel(kernel) if kernel.graph != 0 => {
+                                        (0, kernel.start, kernel.end)
+                                    }
+                                    Record::Graph(graph) => (1, graph.start, graph.end),
+                                    _ => continue,
+                                };
+                                counts[index].fetch_add(1, Ordering::Relaxed);
+                                if start == 0 || end <= start {
+                                    counts[2].fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        })
+                    };
+                    let timeline = Timeline::start(mode, sink)?;
+                    // The retained source is instantiated under the mode
+                    // that all of this executable's launches will use.
+                    // SAFETY: with_captured_graph keeps the source live,
+                    // and this test is its sole owner and submitter.
+                    let executable =
+                        unsafe { crate::GraphExec::instantiate(stream.device(), source)? };
+                    for replay in 0..replays {
+                        executable.launch(&stream)?;
+                        if replay % 128 == 127 {
+                            stream.synchronize()?;
+                            subscriber::flush(false);
+                        }
+                    }
+                    stream.synchronize()?;
+                    drop(executable);
+                    drop(timeline);
+                    let counts = counts.each_ref().map(|count| count.load(Ordering::Relaxed));
+                    let expected = if mode == GraphTrace::Whole {
+                        [0, 1, 0]
+                    } else {
+                        [1_024_000, 0, 0]
+                    };
+                    assert_eq!(counts, expected);
+                }
+                Ok(())
+            },
+        );
+        limit = 250;
+        check(
+            // SAFETY: restore the size_t attribute through live pointers.
+            unsafe { set(2, &mut size, (&raw mut limit).cast()) },
+            "cuptiActivitySetAttribute",
+        )?;
+        result
     }
 }

@@ -29,11 +29,29 @@ __all__ = [
     "capture",
     "pool",
     "pool_bytes",
+    "set_graph_trace",
 ]
 
 # The capture in progress (:func:`capture`), which :func:`break_graph`
 # reaches.
 _capturing: Capture | None = None
+
+# CUPTI instruments executables for the graph-trace mode enabled at
+# instantiation. Source graphs and their allocator pools stay unchanged.
+_whole_graph_trace = False
+
+
+def set_graph_trace(whole: bool) -> None:
+    """Use CUPTI's current tracing mode for subsequent graph submissions.
+
+    The collector calls this after enabling or disabling GRAPH_TRACE, at
+    a submission boundary. Each captured graph replaces its executable
+    before its next replay, retaining its source graph, tensors and RNG
+    state. Calls and graph submissions must run on the same host thread.
+    """
+    global _whole_graph_trace
+    _whole_graph_trace = whole
+
 
 # Caching-allocator option that lets a capture reuse a freed block another
 # stream used, once the capture's dependencies show that use complete.
@@ -152,6 +170,7 @@ class BreakableCUDAGraph:
         self._graphs = tuple(graphs)
         self._breaks = tuple(breaks)
         self._capture_stream = capture_stream
+        self._whole_graph_trace = _whole_graph_trace
         self.output = output
 
     @property
@@ -171,6 +190,13 @@ class BreakableCUDAGraph:
         output (views into fixed buffers or the graph's pool, overwritten by
         the next replay).
         """
+        if self._whole_graph_trace != _whole_graph_trace:
+            # CUDA retains pending launches when the old executable is
+            # destroyed; no device synchronization or numerical capture
+            # is needed. PyTorch retains the graph's generator offsets.
+            for graph in self._graphs:
+                graph.instantiate()
+            self._whole_graph_trace = _whole_graph_trace
         first, *rest = self._graphs
         first.replay()
         for work, graph in zip(self._breaks, rest, strict=True):

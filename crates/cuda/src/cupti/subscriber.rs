@@ -8,17 +8,6 @@
 //! the dispatch below. Enabling is reference-counted per callback and per
 //! activity kind, so collectors that share one start and stop independently.
 //!
-//! **Graph instantiation guard.** CUPTI's graph-level activity record
-//! (`CUPTI_ACTIVITY_KIND_GRAPH_TRACE`) crashes the process at `cuGraphLaunch`
-//! of a graph that was instantiated while that kind was disabled (observed
-//! with `nvidia-cuda-cupti` 13.0.85 on Blackwell: a segmentation fault in the
-//! launch). A graph instantiated while the kind was enabled is traced
-//! correctly afterwards, whether the kind is enabled or disabled at its
-//! launch. The subscription therefore watches every graph instantiation and
-//! enables the kind from the entry of the instantiation to its exit, so every
-//! graph the process instantiates after [`subscribe`] can later be traced as
-//! a whole. A process subscribes before it instantiates any graph.
-//!
 //! Activity buffers are delivered as CUPTI completes them; a flush thread
 //! asks CUPTI every [`FLUSH_PERIOD`] to deliver every buffer whose records
 //! completed (`cuptiActivityFlushAll` without forcing, which issues no CUDA
@@ -51,12 +40,6 @@ pub(crate) const GRAPH_TRACE: u32 = 51;
 
 /// `CUPTI_ACTIVITY_FLAG_FLUSH_FORCED`.
 const FLUSH_FORCED: u32 = 1;
-
-/// The driver calls that instantiate a graph (`CUpti_driver_api_trace_cbid`):
-/// `cuGraphInstantiate`, `cuGraphInstantiate_v2`,
-/// `cuGraphInstantiateWithFlags`, `cuGraphInstantiateWithParams` and its
-/// per-thread-stream variant.
-const INSTANTIATIONS: [u32; 5] = [513, 578, 643, 656, 657];
 
 /// Each activity buffer CUPTI fills: 1 MiB (about 4,800 kernel records),
 /// aligned as CUPTI requires. While a stream runs without pause, the buffer
@@ -92,8 +75,8 @@ static ENABLED: Mutex<Option<Enabled>> = Mutex::new(None);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Subscribe the process to CUPTI, once: the callback API with the dispatch
-/// below, the activity buffer callbacks, the graph instantiation guard and
-/// the flush thread. Later calls return the first one's outcome.
+/// below, the activity buffer callbacks and the flush thread. Later calls
+/// return the first one's outcome.
 ///
 /// # Errors
 ///
@@ -132,16 +115,7 @@ pub fn subscribe() -> Result<()> {
         })
         .as_ref()
         .map(drop)
-        .map_err(Clone::clone)?;
-    // The guard's callbacks are enabled once the subscription is published.
-    static GUARDED: OnceLock<Result<()>> = OnceLock::new();
-    GUARDED
-        .get_or_init(|| {
-            INSTANTIATIONS
-                .iter()
-                .try_for_each(|&cbid| enable_callback(DRIVER_DOMAIN, cbid))
-        })
-        .clone()
+        .map_err(Clone::clone)
 }
 
 /// Whether [`subscribe`] succeeded in this process.
@@ -322,28 +296,13 @@ unsafe extern "C" fn dispatch(_userdata: *mut c_void, domain: i32, cbid: u32, da
     if data.is_null() {
         return;
     }
-    if domain == DRIVER_DOMAIN && INSTANTIATIONS.contains(&cbid) {
-        // SAFETY: for the API domains `data` is a `CUpti_CallbackData`,
-        // whose first field is the `CUpti_ApiCallbackSite`.
-        guard(unsafe { *data.cast::<i32>() } == API_ENTER);
-    }
     if domain == DRIVER_DOMAIN {
-        // SAFETY: as above.
+        // SAFETY: CUPTI supplies CUpti_CallbackData for this API domain.
         unsafe { super::blocking::on_driver_call(cbid, data) };
     }
     if domain == DRIVER_DOMAIN || domain == RUNTIME_DOMAIN {
-        // SAFETY: as above.
+        // SAFETY: both API domains supply CUpti_CallbackData.
         unsafe { super::timeline::on_api(domain, cbid, data) };
-    }
-}
-
-/// The graph instantiation guard: the graph-level record is enabled from the
-/// entry of an instantiation to its exit.
-fn guard(entering: bool) {
-    if entering {
-        let _ = enable_kind(GRAPH_TRACE);
-    } else {
-        disable_kind(GRAPH_TRACE);
     }
 }
 
