@@ -117,6 +117,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_split_kv: true,
             fence_probes: false,
             fence_components: Vec::new(),
+            graph_pc_sampling: false,
             max_model_len: 8192,
             max_video_seconds: Self::DEFAULT_MAX_VIDEO_SECONDS,
             max_condition_rows: None,
@@ -304,6 +305,7 @@ impl WorkerProcessArgs {
             flashinfer_disable_split_kv: !self.flashinfer_split_kv,
             fence_probes: self.fence_probes,
             fence_components: self.fence_components.clone(),
+            graph_pc_sampling: self.graph_pc_sampling,
         })
     }
 }

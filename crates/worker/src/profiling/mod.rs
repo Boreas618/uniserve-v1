@@ -6,12 +6,15 @@
 //!   rank's waits for the device and record of its streams' device time.
 //! - [`fences`]: the fence probes at the model's components, always on,
 //!   exported as per-step component durations.
+//! - [`pc_sampling`]: CUPTI's PC sampling, enabled for the rank's life when
+//!   the deployment profiles its CUDA graphs' kernels.
 //! - [`session`]: a profiling session's window, collectors and file.
 
 pub(crate) mod blocking;
 pub(crate) mod counters;
 pub(crate) mod fences;
 pub(crate) mod kernels;
+pub(crate) mod pc_sampling;
 pub(crate) mod profiler;
 pub(crate) mod ranges;
 pub(crate) mod session;

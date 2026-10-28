@@ -270,6 +270,46 @@ fn delta(total: &AtomicU64, taken: &AtomicU64) -> u64 {
     now.saturating_sub(taken.fetch_max(now, Ordering::AcqRel))
 }
 
+/// The activity kinds of [`StreamActivity`] held enabled ahead of it.
+///
+/// CUPTI refuses to enable activity records once PC sampling is enabled on
+/// a context (`CUPTI_ERROR_NOT_COMPATIBLE`) unless they were enabled before
+/// it: a process that enables PC sampling for its life takes this hold
+/// first, and the stream record and timelines it starts later find the
+/// kinds enabled. Released on drop.
+pub struct KindsHold(());
+
+impl KindsHold {
+    /// Enable the stream record's kinds.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the process could not subscribe to CUPTI or CUPTI refuses
+    /// a kind.
+    pub fn take() -> Result<Self> {
+        subscriber::subscribe()?;
+        let mut enabled = Vec::new();
+        for &(kind, _) in KINDS {
+            if let Err(error) = subscriber::enable_kind(kind) {
+                for kind in enabled {
+                    subscriber::disable_kind(kind);
+                }
+                return Err(error);
+            }
+            enabled.push(kind);
+        }
+        Ok(Self(()))
+    }
+}
+
+impl Drop for KindsHold {
+    fn drop(&mut self) {
+        for &(kind, _) in KINDS {
+            subscriber::disable_kind(kind);
+        }
+    }
+}
+
 /// The process's recording of its registered streams' device activity;
 /// stops on drop. One records at a time.
 pub struct StreamActivity {

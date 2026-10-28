@@ -357,6 +357,20 @@ const CLOSED_EXIT: Duration = Duration::from_secs(60);
 /// daemon reads from its Storage Server.
 const LEDGER_READ: Duration = Duration::from_secs(10);
 
+/// Whether `target` differs from `served` in the fence probes' switch
+/// alone, which the workers change in place. Every other part of the
+/// profiling configuration shapes the CUDA graphs a world captures at its
+/// start, the probed components and whether PC sampling was enabled before
+/// the capture (`profiling_config.graph_pc_sampling`), and takes a new
+/// world.
+fn switches_probes_only(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
+    let mut switched = comparable(served);
+    if let (Some(served), Some(target)) = (switched.profiling.as_mut(), target.profiling.as_ref()) {
+        served.fence_probes = target.fence_probes;
+    }
+    switched == comparable(target)
+}
+
 /// The parts of `spec` a configuration states: without the world's identity,
 /// the layout of its cache and the worlds it retires as it starts, which
 /// the world's history sets.
@@ -858,13 +872,7 @@ impl Leader {
         // The fence probes' switch alone changes in place: every worker
         // writes its device switch at the engine's next step boundary, and
         // the graphs that captured the probes stay.
-        let mut switched = comparable(&served);
-        if let (Some(served), Some(target)) =
-            (switched.profiling.as_mut(), target_spec.profiling.as_ref())
-        {
-            served.fence_probes = target.fence_probes;
-        }
-        if switched == comparable(&target_spec) {
+        if switches_probes_only(&served, &target_spec) {
             let enabled = target_spec
                 .profiling
                 .as_ref()
@@ -1820,6 +1828,36 @@ mod tests {
     /// A change of the scheduling alone, within the batch the workers were
     /// started for, is in place for a world that a change started, whose
     /// spec carries its identity and its cache's layout.
+    #[test]
+    fn only_the_fence_probes_switch_changes_profiling_in_place() {
+        let spec = |profiling: wire::Profiling| wire::EngineSpec {
+            profiling: Some(profiling),
+            ..wire::EngineSpec::default()
+        };
+        let served = spec(wire::Profiling {
+            fence_probes: true,
+            fence_components: vec!["*.Transformer".to_owned()],
+            graph_pc_sampling: false,
+        });
+        let switched = spec(wire::Profiling {
+            fence_probes: false,
+            ..served.profiling.clone().unwrap()
+        });
+        assert!(switches_probes_only(&served, &switched));
+        for world in [
+            wire::Profiling {
+                graph_pc_sampling: true,
+                ..served.profiling.clone().unwrap()
+            },
+            wire::Profiling {
+                fence_components: vec!["*.TransformerLayer".to_owned()],
+                ..served.profiling.clone().unwrap()
+            },
+        ] {
+            assert!(!switches_probes_only(&served, &spec(world)));
+        }
+    }
+
     #[test]
     fn a_scheduling_change_of_a_successor_world_is_in_place() {
         let scheduling = |running: u32| wire::Scheduling {

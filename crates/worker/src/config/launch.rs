@@ -162,6 +162,10 @@ pub struct WorkerLaunch {
     /// The fence probes: whether they record, and the components that carry
     /// them (`crate::profiling::fences`).
     pub fences: FenceOptions,
+    /// Whether the rank enables PC sampling before it captures its CUDA
+    /// graphs and keeps it enabled for its life
+    /// (`crate::profiling::pc_sampling`).
+    pub graph_pc_sampling: bool,
 }
 
 /// The rank's fence probes.
@@ -265,6 +269,7 @@ pub fn resolve(
             enabled: descriptor.fence_probes,
             components: descriptor.fence_components.clone(),
         },
+        graph_pc_sampling: descriptor.graph_pc_sampling,
         components: descriptor.components,
     })
 }

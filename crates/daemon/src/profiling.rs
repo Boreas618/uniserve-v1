@@ -140,6 +140,15 @@ impl Leader {
         request: SessionRequest,
     ) -> Result<serde_json::Value, UpdateError> {
         request.validate().map_err(UpdateError::Refused)?;
+        // Ranks that keep PC sampling enabled for their graphs refuse the
+        // collectors CUPTI cannot run beside it.
+        let graph_pc_sampling = locked(&self.engines.served)
+            .as_ref()
+            .and_then(|spec| spec.profiling.as_ref())
+            .is_some_and(|profiling| profiling.graph_pc_sampling);
+        if graph_pc_sampling && let Some(reason) = request.refused_beside_graph_pc_sampling() {
+            return Err(UpdateError::Refused(reason));
+        }
         let profiles = &self.engines.profiles;
         if let Some(running) = locked(&profiles.session)
             .as_ref()

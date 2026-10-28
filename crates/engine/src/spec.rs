@@ -212,6 +212,10 @@ impl EngineConfig {
                 .as_ref()
                 .map(|profiling| profiling.fence_components.clone())
                 .unwrap_or_default(),
+            graph_pc_sampling: spec
+                .profiling
+                .as_ref()
+                .is_some_and(|profiling| profiling.graph_pc_sampling),
             ..graph_arguments(graphs, flashinfer)?
         };
 

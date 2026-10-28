@@ -23,6 +23,7 @@ use proto::profile::{Collector, GraphTrace, MetricRanges, SessionRequest};
 
 use super::artifact::{Message, Rows};
 use crate::profiling::fences::{Fences, Tap};
+use crate::profiling::pc_sampling;
 
 /// The PM sampler's hardware buffer: 64 MiB.
 const PM_HARDWARE_BUFFER: usize = 64 << 20;
@@ -37,9 +38,6 @@ const PM_MAX_SAMPLES: u32 = 65_536;
 /// free, for a reason not established), so a pass holds 512, about 728 MB,
 /// and the session reads it every [`super::RANGE_CYCLE`] steps.
 const MAX_RANGES: usize = 512;
-
-/// The program counters one PC sampling take holds.
-const MAX_PCS: usize = 10_000;
 
 /// A prepared collector.
 enum Prepared {
@@ -56,15 +54,27 @@ enum Prepared {
         profiler: RangeProfiler,
         ranges: MetricRanges,
     },
-    /// PC sampling of the context `context` every `2^(5 + period)` cycles,
-    /// enabled while armed. CUPTI refuses to enable activity records
-    /// (`CUPTI_ERROR_NOT_COMPATIBLE`) while PC sampling is enabled, so the
-    /// sampler is enabled at each arm after the timeline started and
-    /// disabled at each disarm before the timeline stops.
+    /// The session's own PC sampler of the context `context`, every
+    /// `2^period` cycles, enabled while armed: CUPTI refuses to enable
+    /// activity records (`CUPTI_ERROR_NOT_COMPATIBLE`) while PC sampling
+    /// samples, so it is enabled at each arm after the timeline started
+    /// and disabled at each disarm before the timeline stops. It attributes
+    /// only kernels launched outside CUDA graphs ([`pc_sampling`]).
     PcSampling {
         context: usize,
         period: u32,
         sampler: Option<PcSampler>,
+        /// Whether the stall reasons' names reached the file.
+        reasons: bool,
+    },
+    /// The rank's PC sampler ([`pc_sampling::rank`]), enabled for the
+    /// rank's life: the first arm sets the session's period and a hardware
+    /// buffer that holds it, each arm starts it and each disarm stops it,
+    /// and it stays enabled after the session.
+    RankPcSampling {
+        period: u32,
+        /// Whether the session's period and buffer are set.
+        configured: bool,
         /// Whether the stall reasons' names reached the file.
         reasons: bool,
     },
@@ -278,7 +288,13 @@ impl Collectors {
                     period,
                     sampler,
                     reasons,
-                } => PcSampler::enable(*context, *period, MAX_PCS).and_then(|mut enabled| {
+                } => PcSampler::enable(
+                    *context,
+                    *period,
+                    pc_sampling::MAX_PCS,
+                    pc_sampling::hardware_buffer(*period),
+                )
+                .and_then(|mut enabled| {
                     enabled.start()?;
                     if !*reasons {
                         self.rows
@@ -286,6 +302,26 @@ impl Collectors {
                         *reasons = true;
                     }
                     *sampler = Some(enabled);
+                    Ok(())
+                }),
+                Prepared::RankPcSampling {
+                    period,
+                    configured,
+                    reasons,
+                } => with_rank_sampler(|sampler| {
+                    if !*configured {
+                        sampler.set_period(*period)?;
+                        if let Some(bytes) = pc_sampling::hardware_buffer(*period) {
+                            sampler.set_hardware_buffer(bytes)?;
+                        }
+                        *configured = true;
+                    }
+                    sampler.start()?;
+                    if !*reasons {
+                        self.rows
+                            .send(Message::PcReasons(sampler.stall_reasons().to_vec()));
+                        *reasons = true;
+                    }
                     Ok(())
                 }),
             };
@@ -366,6 +402,13 @@ impl Collectors {
                     if taken.total_samples > 0 {
                         self.rows.send(Message::Pc(taken));
                     }
+                }),
+                Prepared::RankPcSampling { .. } => with_rank_sampler(|sampler| {
+                    let taken = sampler.take()?;
+                    if taken.total_samples > 0 {
+                        self.rows.send(Message::Pc(taken));
+                    }
+                    Ok(())
                 }),
                 _ => Ok(()),
             };
@@ -483,6 +526,13 @@ fn stop(prepared: &mut Prepared, rows: &Rows) -> std::result::Result<(), String>
             rows.send(Message::Pc(taken));
             Ok(())
         }
+        Prepared::RankPcSampling { .. } => with_rank_sampler(|sampler| {
+            sampler.stop()?;
+            let taken = sampler.take()?;
+            rows.send(Message::Pc(taken));
+            Ok(())
+        })
+        .map_err(|error| error.to_string()),
     }
 }
 
@@ -575,6 +625,13 @@ fn prepare(
         Collector::PcSampling => {
             cupti()?;
             let (context, _) = device()?;
+            if pc_sampling::rank().is_some() {
+                return Ok(Prepared::RankPcSampling {
+                    period: request.pc_sampling.period,
+                    configured: false,
+                    reasons: false,
+                });
+            }
             Ok(Prepared::PcSampling {
                 context,
                 period: request.pc_sampling.period,
@@ -583,6 +640,13 @@ fn prepare(
             })
         }
     }
+}
+
+/// Run `work` on the rank's PC sampler.
+fn with_rank_sampler(work: impl FnOnce(&mut PcSampler) -> cuda::Result<()>) -> cuda::Result<()> {
+    let sampler = pc_sampling::rank()
+        .ok_or_else(|| cuda::Error::InvalidArgument("the rank keeps no PC sampler".to_owned()))?;
+    work(&mut crate::lock(sampler))
 }
 
 /// Set the NVTX switch of the rank's ranges and of the library's; returns
