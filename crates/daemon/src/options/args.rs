@@ -93,7 +93,7 @@ pub struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     pub worker_executable: Option<PathBuf>,
     /// TOML file of serving options; the flags and `--set` override it.
-    /// `--print-config` prints every option it may state.
+    /// `--print-config` prints the resolved non-default options.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
     /// Set the option at PATH, such as `cuda_graph_config.policy=off` or
@@ -104,8 +104,7 @@ pub struct ServeArgs {
     /// option inside it.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
-    /// Print the resolved configuration, defaults included, as TOML and
-    /// exit.
+    /// Print the resolved non-default options as reloadable TOML and exit.
     #[arg(long)]
     pub print_config: bool,
     /// Take a deployment over from the daemon at the other end of the
@@ -294,13 +293,34 @@ pub fn resolve_text(text: &str, sets: &[String]) -> anyhow::Result<(ServeConfig,
     configured(tree)
 }
 
-/// Prints a configuration as TOML.
+/// Prints reloadable TOML containing the configuration's non-default options.
+/// Defaults must remain unstated: model-family and rank-assignment validation
+/// distinguish configured options from defaults belonging to other modes.
 ///
 /// # Errors
 ///
 /// Fails when a value has no TOML form.
 pub fn printed(config: &ServeConfig) -> anyhow::Result<String> {
-    toml::to_string_pretty(config).context("printing the configuration")
+    fn omit_defaults(table: &mut Table, defaults: &Table) {
+        table.retain(|key, value| {
+            let Some(default) = defaults.get(key) else {
+                return true;
+            };
+            if value == default {
+                return false;
+            }
+            if let (Value::Table(values), Value::Table(defaults)) = (value, default) {
+                omit_defaults(values, defaults);
+                return !values.is_empty();
+            }
+            true
+        });
+    }
+
+    let mut table = Table::try_from(config).context("encoding the configuration")?;
+    let defaults = Table::try_from(ServeConfig::default()).context("encoding the defaults")?;
+    omit_defaults(&mut table, &defaults);
+    toml::to_string_pretty(&table).context("printing the configuration")
 }
 
 /// `config` with the `--set` assignments `texts` applied over it, as
@@ -639,6 +659,25 @@ mod tests {
         assert_eq!(reread, config, "{text}");
     }
 
+    #[test]
+    fn exported_options_remain_valid_for_their_model_family() {
+        use models::ModelDescription::{DiffusionGemma, MiniMaxH3, Qwen3};
+
+        for (description, setting) in [
+            (Qwen3, "chat_config.reasoning_parser=none"),
+            (MiniMaxH3, "video_config.max_seconds=5"),
+            (DiffusionGemma, "readout_config.canvas=compact"),
+        ] {
+            let (config, stated) = resolved(&["m", "--set", setting]).unwrap();
+            config.validate(&stated).unwrap();
+            stated.refuse_foreign_options(description).unwrap();
+            let (reread, stated) = resolve_text(&printed(&config).unwrap(), &[]).unwrap();
+            assert_eq!(reread, config);
+            reread.validate(&stated).unwrap();
+            stated.refuse_foreign_options(description).unwrap();
+        }
+    }
+
     /// Resolves `args`, checks them, and derives the engine configuration
     /// the engine reads from the spec they state.
     fn lowered(args: &[&str]) -> anyhow::Result<(ServeConfig, engine::EngineConfig)> {
@@ -735,14 +774,11 @@ mod tests {
              [worker_groups.components.model]\ntensor_parallel_size = 2\n",
         );
         let path = deployment.to_str().unwrap();
-        assert_eq!(
-            lowered(&["m", "--worker-groups", path])
-                .unwrap()
-                .1
-                .worker_groups
-                .len(),
-            1
-        );
+        let (config, engine) = lowered(&["m", "--worker-groups", path]).unwrap();
+        assert_eq!(engine.worker_groups.len(), 1);
+        let (reread, stated) = resolve_text(&printed(&config).unwrap(), &[]).unwrap();
+        assert_eq!(reread, config);
+        reread.validate(&stated).unwrap();
         for shorthand in [
             ["--tensor-parallel-size", "2"],
             ["--set", "placement_config.device=cpu"],
