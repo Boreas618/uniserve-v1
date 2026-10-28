@@ -10,7 +10,7 @@ A UniServe server is configured by one tree of serving options and, for a placem
 2. **Flags** for the most common options, each a shortcut for one path of the tree.
 3. **`--set PATH=VALUE`**, repeatable, reaching any option by its path.
 
-Options none of them states keep their defaults. `--print-config` prints the resolved tree, defaults included, and exits; options unset by default are left out of the printout.
+Options none of them states keep their defaults. `--print-config` prints the resolved non-default options as reloadable TOML and exits. The admin API exports the same form. Reading it restores defaults without treating options belonging to other model families or rank-assignment modes as explicitly configured.
 
 ```bash
 uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
