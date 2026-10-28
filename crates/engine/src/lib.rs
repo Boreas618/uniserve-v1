@@ -57,8 +57,8 @@ pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats,
-    GroupCache, ParkedCache, PrefixCacheUsage, PrefixStats, Scheduler, SchedulerConfig,
-    SchedulerStats, SchedulerStatsReporter, TimingStats, WorkerStats,
+    GroupCache, ParkedCache, PrefixCacheUsage, PrefixStats, RefillPolicy, Scheduler,
+    SchedulerConfig, SchedulerStats, SchedulerStatsReporter, TimingStats, WorkerStats,
 };
 pub use crate::service::{run_engine, serve_requests};
 #[cfg(feature = "testing")]

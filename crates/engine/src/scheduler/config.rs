@@ -14,6 +14,48 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
+/// Default tokens a verification step of a request is expected to emit.
+const DEFAULT_EXPECTED_SPEEDUP: f64 = 2.0;
+/// Default time of evaluating one context token in a draft cache refill,
+/// in steps of decoding.
+const DEFAULT_REFILL_TOKEN_COST: f64 = 0.01;
+
+/// When a request whose draft cache is missing has it refilled.
+///
+/// A refill evaluates the target model again over the request's context
+/// before the first position whose draft cache entry is missing, the cost
+/// of a prefill of those tokens; once refilled, the request speculates. It
+/// is worth its cost when the decode steps speculation saves over the
+/// tokens the request may still generate exceed it:
+/// `remaining * (1 - 1 / expected_speedup) > tokens * token_cost`, both
+/// sides in decode steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RefillPolicy {
+    /// Tokens a verification step of a request is expected to emit; at
+    /// least one.
+    pub expected_speedup: f64,
+    /// The time of evaluating one context token in a refill, in decode
+    /// steps; not negative.
+    pub token_cost: f64,
+}
+
+impl RefillPolicy {
+    /// Whether refilling `tokens` context tokens of a request that may
+    /// still generate `remaining` tokens is worth its cost.
+    pub fn worth(&self, remaining: usize, tokens: usize) -> bool {
+        let saved = remaining as f64 * (1.0 - 1.0 / self.expected_speedup.max(1.0));
+        saved > tokens as f64 * self.token_cost.max(0.0)
+    }
+}
+
+impl Default for RefillPolicy {
+    fn default() -> Self {
+        Self {
+            expected_speedup: DEFAULT_EXPECTED_SPEEDUP,
+            token_cost: DEFAULT_REFILL_TOKEN_COST,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 /// Sequence, token, and queue limits for scheduling.
@@ -40,6 +82,12 @@ pub struct SchedulerConfig {
     /// autoregressive decode, so each request it does not read out runs
     /// under this sampling; without it the runtime serves readouts only.
     pub canvas: Option<ipc::CanvasSampling>,
+    /// The most draft tokens a verification carries per request, as the
+    /// world's workers were launched with (`EngineSpec::speculation`); zero
+    /// when the deployment does not speculate.
+    pub draft_tokens: usize,
+    /// When a request whose draft cache is missing has it refilled.
+    pub refill: RefillPolicy,
 }
 
 impl Default for SchedulerConfig {
@@ -52,6 +100,8 @@ impl Default for SchedulerConfig {
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
             max_queued_requests: None,
             canvas: None,
+            draft_tokens: 0,
+            refill: RefillPolicy::default(),
         }
     }
 }

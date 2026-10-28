@@ -181,6 +181,7 @@ fn fp8_plan() -> CachePlan {
         groups: vec![CacheGroupPlan {
             window: None,
             state: false,
+            draft: false,
             block_size: 8,
             units_per_page: 1,
             layers: vec!["a".into(), "b".into()],

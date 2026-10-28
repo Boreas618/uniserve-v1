@@ -828,6 +828,14 @@ impl Scheduler {
                     continue;
                 }
 
+                // A draft refill changes the request's draft cache alone: its
+                // progress and outputs are the request's as they were.
+                if call.draft.refill.is_some() {
+                    self.accept_refill(id, &call, &record);
+                    self.finish_pending_if_idle(id);
+                    continue;
+                }
+
                 let progress_result = if record.status == CallStatus::Ok {
                     self.running
                         .get_mut(&id)
@@ -846,10 +854,12 @@ impl Scheduler {
                 {
                     self.free_buffers(call.cache_input);
                 }
-                // An accepted forward extends the request's prefix cache: publish the
+                // An accepted forward extends the request's prefix cache and,
+                // in a speculating deployment, its draft cache: publish the
                 // prompt pages it completed, then retire sliding-window pages
                 // no later reader needs.
                 if progress_result.is_some() && matches!(call.kind, CallKind::Forward(_)) {
+                    self.record_draft(id, &call, &record);
                     self.advance_request_cache(id);
                 }
 

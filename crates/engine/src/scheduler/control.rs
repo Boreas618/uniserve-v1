@@ -164,7 +164,7 @@ impl Scheduler {
                 let _ = answer.send(self.run_hook_together(&name, &payload, &together));
             }
             Command::Configure { limits, answer } => {
-                let _ = answer.send(self.reconfigure(limits));
+                let _ = answer.send(self.reconfigure(*limits));
             }
             Command::ResizeCache { change, answer } => self.resize_cache(change, answer),
             Command::UpdateWeights {

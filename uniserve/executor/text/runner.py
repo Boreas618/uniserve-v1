@@ -35,6 +35,13 @@ forward only writes the prefix cache, keeps the hidden states and projects
 each row's last position. A prefill bucket adds one sequence holding every
 padding token, then empty sequences. Padding rows never write K/V.
 
+A runner whose pool keeps the draft cache runs the drafter after the
+forward and its selection (:meth:`TextRunner.draft`): rows of the positions
+the forward evaluated whose next token is known write their draft cache
+entries, and the rows that propose select their draft tokens. A prefill row
+that refills its request's draft cache writes no K/V of the target and
+keeps no per-request state.
+
 After the worker sealed a batch, :meth:`TextRunner.commit` installs the
 batch's commit rows into the slot state (the ``commit`` graph of their
 bucket) and copies scored chunks' retained logits.
@@ -109,7 +116,14 @@ from .sampling import (
     task_bucket,
 )
 
-__all__ = ["Executed", "Invocation", "Plan", "Relays", "TextRunner"]
+__all__ = [
+    "DraftRows",
+    "Executed",
+    "Invocation",
+    "Plan",
+    "Relays",
+    "TextRunner",
+]
 
 
 @dataclass(slots=True)
@@ -158,6 +172,9 @@ class Invocation:
         embeddings: ``(token, features)`` of each vision block, its first
             feature token counted from the forward's first token.
         relays: The selections the computation relays.
+        refill: ``bool [rows]`` the rows refilling their request's draft
+            cache, which write no cache of the target and keep no
+            per-request state; ``None`` for none.
     """
 
     kind: int
@@ -170,6 +187,51 @@ class Invocation:
     prompt: PromptChunks | None = None
     embeddings: list[tuple[int, torch.Tensor]] = field(default_factory=list)
     relays: Relays | None = None
+    refill: np.ndarray | None = None
+
+
+@dataclass(slots=True)
+class DraftRows:
+    """The rows of a forward's draft pass and the drafts they propose.
+
+    Each row evaluates consecutive positions its forward evaluated, from
+    ``prefixes[r]`` on, over its slot's draft table; each position reads
+    the target's hidden state there and the token after it.
+
+    Attributes:
+        slots: ``int64 [n]`` each row's request slot.
+        prefixes: ``int64 [n]`` each row's first position, its draft cache
+            length.
+        queries: ``int64 [n]`` each row's positions.
+        pages: ``int64 [tables, n]`` each table's selected page count.
+        tokens: ``int64 [sum queries]`` each position's next token; the
+            entries ``pairs`` names are the forward's selections.
+        hidden_rows: ``int64 [sum queries]`` each position's row of the
+            forward's hidden states.
+        pairs: ``int64 [2, s]`` (token index, task): positions whose next
+            token is the forward's selection of a task, each advanced by
+            the task's accepted drafts on the device: a verification's
+            selection follows the drafts it accepts.
+        proposers: ``int64 [p]`` the rows that propose drafts.
+        bases: ``int64 [p]`` each proposer's position, relative to its
+            row's first, whose drafter state proposes its first draft
+            before its accepted drafts advance it: its last for a prefill,
+            its first for a verification.
+        tasks: ``int64 [p]`` each proposer's task.
+        proposals: Drafts each proposer proposes.
+    """
+
+    slots: np.ndarray
+    prefixes: np.ndarray
+    queries: np.ndarray
+    pages: np.ndarray
+    tokens: np.ndarray
+    hidden_rows: np.ndarray
+    pairs: np.ndarray
+    proposers: np.ndarray
+    bases: np.ndarray
+    tasks: np.ndarray
+    proposals: int
 
 
 @dataclass(slots=True)
@@ -191,6 +253,9 @@ class Plan:
         embeddings: The forward reads the embedding columns.
         axes: Rotary position axes the rows carry.
         outputs: A prefill keeps hidden states and last-position logits.
+        verification: The forward is a verification whose rows hold
+            drafts: its per-request states advance once its selection
+            accepts each row's tokens.
         key: The graph serving the forward; ``None`` runs it eagerly.
         row_columns: A prefill's row-gather column words.
         token_ids: ``int64 [tokens]`` a prefill's tokens.
@@ -223,6 +288,7 @@ class Plan:
     embeddings: bool
     axes: int
     outputs: bool
+    verification: bool
     key: GraphKey | None
     row_columns: np.ndarray | None
     token_ids: np.ndarray | None
@@ -391,6 +457,9 @@ class TextRunner:
             dims.width,
         )
         padded = pad_rows(rows, starts, decode, padded_rows, padded_tokens)
+        if invocation.refill is not None:
+            # A refill row writes no cache of the target.
+            padded.writes[:live] &= ~np.asarray(invocation.refill, dtype=bool)
 
         finish_ids = None
         sampled_candidates = 0
@@ -452,9 +521,12 @@ class TextRunner:
         )
 
         # A forward that only writes the cache keeps no outputs, unless the
-        # graph serving it computes them.
-        outputs = not request.cache_only or (
-            isinstance(key, PrefillKey) and key.outputs
+        # graph serving it computes them or the drafter reads its hidden
+        # states.
+        outputs = (
+            not request.cache_only
+            or (isinstance(key, PrefillKey) and key.outputs)
+            or self.drafts()
         )
         # A graph of the media variant reads the device columns whatever
         # its rows hold; an eager forward reads them for rows that differ in
@@ -477,6 +549,8 @@ class TextRunner:
             embeddings=media_graph or bool(invocation.embeddings),
             axes=axes,
             outputs=bool(outputs),
+            verification=kind == CallKind.VERIFY
+            and bool(np.any(rows.query > 1)),
             key=key,
             row_columns=row_columns,
             token_ids=token_ids,
@@ -593,7 +667,11 @@ class TextRunner:
 
         scatter = 0
         if invocation.sampling is not None:
-            scatter = self._stage_selection(stage, invocation.sampling)
+            scatter = self._stage_selection(
+                stage,
+                invocation.sampling,
+                verification=plan.kind == CallKind.VERIFY,
+            )
         if len(plan.prompt):
             block = self.dims.prompt_block(plan.prompt_top)
             fields = prompt_columns(plan.prompt, block, self.dims.rows)
@@ -672,16 +750,22 @@ class TextRunner:
             self.buffers[name].view(-1)[base : base + 2 * count].view(2, count)
         )
 
-    def _stage_selection(self, stage: Stage, metadata: SamplingMetadata) -> int:
+    def _stage_selection(
+        self,
+        stage: Stage,
+        metadata: SamplingMetadata,
+        verification: bool = False,
+    ) -> int:
         """Stage a selection's inputs; return the set words to scatter.
 
         The nonzero token-set words are scattered after the copies; 0 when
-        the sets are copied whole.
+        the sets are copied whole. A ``verification`` selects from its
+        candidate columns, even with no task holding drafts.
         """
         buffers = self.buffers
         padded = pad_selection(metadata, self.dims.rows)
         self._stage_tasks(stage, padded, width=metadata.width)
-        if metadata.width > 1:
+        if metadata.width > 1 or verification:
             # A verification's candidate rows, tasks times width.
             count = len(padded.rows)
             stage.put(buffers["candidate_rows"][:count], padded.rows)
@@ -691,9 +775,30 @@ class TextRunner:
             stage.put(
                 buffers["select_drafts"][: len(padded.drafts)], padded.drafts
             )
-        reporting = len(padded.logprob_tasks)
-        stage.put(buffers["logprob_tasks"][:reporting], padded.logprob_tasks)
-        stage.put(buffers["logprob_counts"][:reporting], padded.logprob_counts)
+        if verification:
+            # Each reported row's task, candidate row and top count: a row
+            # per position each reporting task may commit.
+            reported = len(metadata.logprob_tasks)
+            if reported:
+                assert metadata.logprobs is not None
+                stage.put(
+                    buffers["verified_logprobs"][:, :reported],
+                    np.stack(
+                        [
+                            metadata.logprob_tasks,
+                            metadata.logprob_offsets,
+                            metadata.logprobs.counts,
+                        ]
+                    ),
+                )
+        else:
+            reporting = len(padded.logprob_tasks)
+            stage.put(
+                buffers["logprob_tasks"][:reporting], padded.logprob_tasks
+            )
+            stage.put(
+                buffers["logprob_counts"][:reporting], padded.logprob_counts
+            )
         if len(metadata.masks):
             stage.put(
                 buffers["select_masks"][: len(metadata.masks)], metadata.masks
@@ -824,6 +929,7 @@ class TextRunner:
             buffers["embedding_mask"] if embeddings else None,
             buffers["hidden"],
             buffers["logits"],
+            int(plan.verification),
         )
 
     def _plan_attention(self, plan: Plan) -> None:
@@ -968,10 +1074,139 @@ class TextRunner:
             buffers["prompt_tail"],
         )
 
+    # Drafts.
+
+    def drafts(self) -> bool:
+        """Whether the runner runs the drafter after its forwards."""
+        return bool(self.dims.drafts)
+
+    def draft(self, plan: Plan, draft: DraftRows) -> None:
+        """Run ``plan``'s forward's draft pass over ``draft``'s rows.
+
+        Stages the rows' packed columns, next tokens, positions and hidden
+        rows, and the windows its proposers' chained steps evaluate, then
+        runs the drafter (:meth:`CausalLMRunner.draft`) on the runner's
+        stream. A proposer's window starts after its base position and
+        holds every position a chained step takes whatever the drafts its
+        verification accepts: the base's drafts after it, then a position
+        per further proposal. The proposers' drafts are left in the
+        ``proposals`` column, in proposer order.
+        """
+        buffers = self.buffers
+        dims = self.dims
+        stride = dims.rows + 1
+        count = len(draft.queries)
+        tokens = int(draft.queries.sum())
+        if count == 0 or tokens == 0:
+            return
+        proposers = len(draft.proposers) if draft.proposals else 0
+        steps = draft.proposals - 1 if proposers else 0
+        if draft.proposals > dims.drafts:
+            raise AssertionError("a call proposes more drafts than the runner")
+        positions = np.repeat(draft.prefixes, draft.queries) + (
+            np.arange(tokens)
+            - np.repeat(np.cumsum(draft.queries) - draft.queries, draft.queries)
+        )
+        stage = Stage()
+        stage.put(
+            buffers["draft_row_columns"],
+            pack_rows(
+                draft.slots,
+                draft.prefixes,
+                draft.queries,
+                np.ones(count, dtype=bool),
+                list(draft.pages),
+                stride,
+                dims.tokens,
+            ),
+        )
+        stage.put(buffers["draft_input_ids"][:tokens], draft.tokens)
+        stage.put(buffers["draft_positions"][:tokens], positions)
+        stage.put(buffers["draft_hidden_rows"][:tokens], draft.hidden_rows)
+        sampled = draft.pairs.shape[1]
+        if sampled:
+            stage.put(buffers["draft_pairs"][:, :sampled], draft.pairs)
+        window_queries: list[int] = []
+        window_prefixes: list[int] = []
+        windows = 0
+        if proposers:
+            index = draft.proposers
+            starts = np.cumsum(draft.queries) - draft.queries
+            stage.put(
+                buffers["draft_proposing"][:, :proposers],
+                np.stack([starts[index] + draft.bases, draft.tasks]),
+            )
+            # A window starts after the proposer's base position and spans
+            # its row's positions after the base and a position per
+            # further proposal.
+            prefixes = draft.prefixes[index] + draft.bases + 1
+            queries = draft.queries[index] - 1 - draft.bases + steps
+            windows = int(queries.sum())
+            if steps and windows:
+                if windows > dims.window_tokens():
+                    raise AssertionError(
+                        "the drafter's windows exceed their columns"
+                    )
+                window_queries = [int(value) for value in queries]
+                window_prefixes = [int(value) for value in prefixes]
+                first = np.cumsum(queries) - queries
+                stage.put(
+                    buffers["draft_window_columns"],
+                    pack_rows(
+                        draft.slots[index],
+                        prefixes,
+                        queries,
+                        np.ones(proposers, dtype=bool),
+                        list(draft.pages[:, index]),
+                        stride,
+                        dims.tokens,
+                    ),
+                )
+                stage.put(buffers["draft_window_tokens"][:proposers], first)
+                stage.put(
+                    buffers["draft_window_owners"][:windows],
+                    np.repeat(np.arange(proposers, dtype=np.int64), queries),
+                )
+                stage.put(
+                    buffers["draft_window_positions"][:windows],
+                    np.repeat(prefixes, queries)
+                    + np.arange(windows)
+                    - np.repeat(first, queries),
+                )
+        with torch.cuda.stream(self.stream):
+            self.staging.submit(stage, self.stream)
+            self.kernel.draft(
+                count,
+                tokens,
+                plan.widths,
+                draft.queries.tolist(),
+                draft.prefixes.tolist(),
+                sampled,
+                proposers,
+                steps,
+                windows,
+                window_queries,
+                window_prefixes,
+                buffers["draft_row_columns"],
+                buffers["draft_window_columns"],
+                buffers["draft_input_ids"],
+                buffers["draft_positions"],
+                buffers["draft_hidden_rows"],
+                buffers["draft_pairs"],
+                buffers["draft_proposing"],
+                buffers["draft_window_tokens"],
+                buffers["draft_window_owners"],
+                buffers["draft_window_positions"],
+                buffers["hidden"],
+                buffers["completion"],
+                buffers["proposals"],
+            )
+
     def _verify(self, plan: Plan, metadata: SamplingMetadata) -> None:
         buffers = self.buffers
         inputs = buffers.select(metadata.tasks)
-        reported, top = metadata.logprob_bucket
+        reported = len(metadata.logprob_tasks)
+        _, top = metadata.logprob_bucket
         self.kernel.verify(
             plan.logit_count,
             metadata.tasks,
@@ -995,8 +1230,7 @@ class TextRunner:
             buffers["token_sets"][1],
             buffers["select_drafts"],
             inputs.terminal,
-            buffers["logprob_tasks"],
-            buffers["logprob_counts"],
+            buffers["verified_logprobs"],
             buffers["completion"],
             buffers["continuation"],
             buffers["tagged"],

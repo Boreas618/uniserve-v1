@@ -1166,13 +1166,11 @@ fn a_worker_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()>
     assert_eq!(first_record.status, CallStatus::Ok);
     // The stub's head maps 8 to 1000.
     assert_eq!(first_record.committed_tokens, vec![1000]);
-    assert!(
-        first_record
-            .sampled_logprob
-            .is_some_and(|score| score.is_finite() && score <= 0.0)
-    );
+    assert_eq!(first_record.token_logprobs.len(), 1);
+    let score = first_record.token_logprobs[0][0].logprob;
+    assert!(score.is_finite() && score <= 0.0);
     assert_eq!(
-        first_record.top_logprobs[0].token_id,
+        first_record.token_logprobs[0][0].token_id,
         first_record.committed_tokens[0]
     );
     // The first chunk scores its second token only.
@@ -1216,8 +1214,8 @@ fn a_worker_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()>
     assert_eq!(record.status, CallStatus::Ok);
     assert_eq!(record.committed_tokens, vec![1001]);
     assert_eq!(record.cache_visible_len, 3);
-    assert!(record.sampled_logprob.is_some());
-    assert_eq!(record.top_logprobs[0].token_id, 1001);
+    assert_eq!(record.token_logprobs.len(), 1);
+    assert_eq!(record.token_logprobs[0][0].token_id, 1001);
     assert!(record.prompt_logprobs.is_empty());
 
     // Retire the request in a batch that also admits and runs an
@@ -1343,7 +1341,7 @@ fn first_token_logprobs(
     assert_eq!(record.status, CallStatus::Ok);
     // The stub's head maps 8 to 1000.
     assert_eq!(record.committed_tokens, vec![1000]);
-    Ok(record.top_logprobs.clone())
+    Ok(record.token_logprobs[0].clone())
 }
 
 #[test]
@@ -2823,6 +2821,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         graph_policy: "off".into(),
         decode_graph_batch_sizes: None,
         prefill_outputs: true,
+        draft_tokens: 0,
         prefill_graph_token_sizes: None,
         flow_graph_shapes: None,
         video_text_capacities: None,
@@ -5301,13 +5300,13 @@ fn media_worker() -> anyhow::Result<()> {
                             cache_computed_len: call.coordinates.cache_computed_len + length,
                             step_index: 0,
                             committed_tokens: vec![1000],
-                            sampled_logprob: None,
-                            top_logprobs: Vec::new(),
+                            token_logprobs: Vec::new(),
                             prompt_logprobs: Vec::new(),
                             candidate_logprobs: Vec::new(),
                             finish_flags: Default::default(),
                             media_output: None,
                             cache_output: None,
+                            draft_token_ids: Vec::new(),
                         }
                     })
                     .collect();

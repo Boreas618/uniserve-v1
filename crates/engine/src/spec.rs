@@ -20,7 +20,7 @@ use crate::core::{EngineConfig, WorkerGroupConfig};
 use crate::deployment::Deployment;
 use crate::executor::TransferConfig;
 use crate::scheduler::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, SchedulerConfig,
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, RefillPolicy, SchedulerConfig,
 };
 use crate::worker::WorkerProcessArgs;
 
@@ -52,7 +52,21 @@ pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<Schedu
             .max_queued_requests
             .map(|requests| requests as usize),
         canvas: None,
+        draft_tokens: 0,
+        refill: refill_policy(scheduling),
     })
+}
+
+/// The draft cache refill policy `scheduling` states, with the engine's
+/// defaults for what it leaves out.
+pub(crate) fn refill_policy(scheduling: &Scheduling) -> RefillPolicy {
+    let defaults = RefillPolicy::default();
+    RefillPolicy {
+        expected_speedup: scheduling
+            .expected_speedup
+            .unwrap_or(defaults.expected_speedup),
+        token_cost: scheduling.refill_token_cost.unwrap_or(defaults.token_cost),
+    }
 }
 
 /// A list the spec states, `None` when absent.
@@ -176,6 +190,10 @@ impl EngineConfig {
                     stability_threshold: canvas.stability_threshold,
                 }),
             prefill_outputs: facts.prefill_outputs,
+            draft_tokens: spec
+                .speculation
+                .as_ref()
+                .map_or(0, |speculation| speculation.num_draft_tokens),
             video_text_capacities: sizes(&video.text_capacities),
             ffmpeg: PathBuf::from(&video.ffmpeg),
             // Each forward batch is bounded by the scheduler's batch and
@@ -202,6 +220,7 @@ impl EngineConfig {
             chunked_prefill_size: scheduling
                 .chunked_prefill_size
                 .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
+            refill: refill_policy(scheduling),
             prefix_cache: kv_cache.prefix_caching,
             boundary_interval: kv_cache
                 .boundary_interval
@@ -413,6 +432,7 @@ mod tests {
             predecessor: None,
             segments: Vec::new(),
             retire: Vec::new(),
+            speculation: None,
         }
     }
 

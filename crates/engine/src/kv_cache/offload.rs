@@ -150,7 +150,10 @@ impl HostCacheDemand {
     /// and cache) whose pages the host KV cache copies, at `ratio`; `None`
     /// when none does. A rank's device KV cache holds its allocatable units,
     /// those beside the sentinel and the units its warmup lends, of the
-    /// largest block size's tokens each.
+    /// tokens of the largest page of the groups that hold its context. The
+    /// draft cache's group, whose page may span several units' worth of
+    /// another group's tokens, holds derived state of those same tokens and
+    /// adds none.
     pub(crate) fn of(
         ranks: &BTreeMap<WorkerGroupId, Vec<(String, Option<PrefixCacheInfo>)>>,
         ratio: f64,
@@ -164,6 +167,7 @@ impl HostCacheDemand {
             let unit_tokens = cache
                 .groups
                 .iter()
+                .filter(|group| !group.kind.is_draft())
                 .map(|group| u64::from(group.block_size))
                 .max()
                 .unwrap_or(0);
@@ -205,20 +209,33 @@ struct CachePools {
     ranks: Vec<RankPool>,
     content: [u8; 32],
     manager: AttentionManager,
+    /// The group holds the draft cache: its pages bound no reuse, a hit
+    /// loads its leading pages every rank holds, and a page's key covers
+    /// the token after it.
+    draft: bool,
 }
 
 /// The cache groups of one worker group.
 #[derive(Clone)]
 struct WorkerPools {
     groups: Vec<CachePools>,
-    /// The largest block size of the groups: every reuse boundary is a
-    /// multiple of it.
+    /// The largest block size of the groups a request needs: every reuse
+    /// boundary is a multiple of it.
     step: usize,
 }
 
 impl WorkerPools {
     fn managers(&self) -> Vec<AttentionManager> {
         self.groups.iter().map(|group| group.manager).collect()
+    }
+
+    /// The reuse rules of the groups a request needs, which bound a reuse.
+    fn required_managers(&self) -> Vec<AttentionManager> {
+        self.groups
+            .iter()
+            .filter(|group| !group.draft)
+            .map(|group| group.manager)
+            .collect()
     }
 
     fn ranks(&self) -> usize {
@@ -528,6 +545,7 @@ impl KvOffloadManager {
                 ranks: Vec::with_capacity(ranks.len()),
                 content: [0; 32],
                 manager: GroupShape::from_group(shape).manager(),
+                draft: shape.kind.is_draft(),
             })
             .collect();
         for (rank, report) in ranks.iter().enumerate() {
@@ -567,6 +585,7 @@ impl KvOffloadManager {
         }
         let step = groups
             .iter()
+            .filter(|group| !group.draft)
             .map(|group| group.manager.block_size())
             .max()
             .unwrap_or(1);
@@ -628,7 +647,7 @@ impl KvOffloadManager {
             .get(worker)?
             .groups
             .iter()
-            .position(|group| matches!(group.manager, AttentionManager::Full(_)))
+            .position(|group| !group.draft && matches!(group.manager, AttentionManager::Full(_)))
     }
 
     /// The aligned boundaries in `(from, to]` of a prompt of `prompt_len`
@@ -698,6 +717,8 @@ impl KvOffloadManager {
         };
         for (index, (group, chain)) in pools.groups.iter().zip(keys.iter_mut()).enumerate() {
             let block = group.manager.block_size();
+            // A draft cache page's key covers the token after it.
+            let key = block + usize::from(group.draft);
             let mut parent: [u8; 32] = match chain.last() {
                 Some(last) => last.0,
                 None => {
@@ -714,13 +735,13 @@ impl KvOffloadManager {
                     digest.finalize().into()
                 }
             };
-            for page in chain.len()..tokens.len() / block {
+            for page in chain.len()..(tokens.len() + block).saturating_sub(key) / block {
                 let mut digest = Sha256::new();
                 digest.update(parent);
                 // The group, and text (`TEXT_MODALITY_TAG`).
                 digest.update((index as u32).to_le_bytes());
                 digest.update([0_u8]);
-                for token in tokens.page(page, block).iter() {
+                for token in tokens.span(page * block..page * block + key).iter() {
                     digest.update(token.to_le_bytes());
                 }
                 parent = digest.finalize().into();
@@ -854,6 +875,7 @@ impl KvOffloadManager {
             .groups
             .iter()
             .zip(&pins.groups)
+            .filter(|(group, _)| !group.draft)
             .map(|(group, pins_of)| {
                 let pages = pins.limit / group.manager.block_size();
                 manager::misses((0..pages).map(|page| {
@@ -861,7 +883,7 @@ impl KvOffloadManager {
                 }))
             })
             .collect();
-        manager::deepest_boundary(&pools.managers(), pools.step, pins.limit, &misses)
+        manager::deepest_boundary(&pools.required_managers(), pools.step, pins.limit, &misses)
             .max(pins.device)
     }
 
@@ -1030,9 +1052,18 @@ impl KvOffloadManager {
         let mut groups = Vec::with_capacity(pools.groups.len());
         for (group, pins_of) in pools.groups.iter().zip(&pins.groups) {
             // A full-attention group loads its pages from the device match
-            // to the boundary; a sliding window those of its window.
+            // to the boundary; a sliding window those of its window; the
+            // draft cache its leading pages every rank pinned.
             let needed = group.manager.needed_pages(boundary);
-            let loaded = needed.start.max(pins_of.first)..needed.end.max(pins_of.first);
+            let mut loaded = needed.start.max(pins_of.first)..needed.end.max(pins_of.first);
+            if group.draft {
+                let held = (0..loaded.end - loaded.start)
+                    .take_while(|&offset| {
+                        pins_of.present(loaded.start - pins_of.first + offset, false)
+                    })
+                    .count();
+                loaded.end = loaded.start + held;
+            }
             let positions = loaded.start - pins_of.first..loaded.end - pins_of.first;
             let mut slots = Vec::with_capacity(group.ranks.len());
             for (rank, pool) in group.ranks.iter().enumerate() {
@@ -1843,6 +1874,33 @@ mod tests {
             vec![("a".to_owned(), None)],
         )]);
         assert_eq!(HostCacheDemand::of(&none, 2.0), None);
+    }
+
+    /// A rank whose pool also keeps the draft cache, a group whose page
+    /// spans sixteen of the context group's pages, asks the host KV cache
+    /// for the tokens of its context alone, as the same rank without it.
+    #[test]
+    fn the_draft_cache_adds_no_tokens_to_the_host_cache_demand() {
+        let ranks = |groups: Vec<CacheGroup>| {
+            let mut cache = report(groups, &[], &[]);
+            cache.host_token_bytes = 100;
+            BTreeMap::from([(
+                WorkerGroupId("text".to_owned()),
+                vec![("a".to_owned(), Some(cache))],
+            )])
+        };
+        let draft = CacheGroup {
+            kind: CacheGroupKind::Draft,
+            block_size: 16 * cache_group(None).block_size,
+            layer_ids: vec![1],
+            ..cache_group(None)
+        };
+
+        let context = HostCacheDemand::of(&ranks(vec![cache_group(None)]), 2.0).unwrap();
+        let drafting = HostCacheDemand::of(&ranks(vec![cache_group(None), draft]), 2.0).unwrap();
+        // 63 allocatable units of 64-token pages, twice.
+        assert_eq!(context.tokens, 63 * 64 * 2);
+        assert_eq!(drafting.tokens, context.tokens);
     }
 
     /// Poll `kv_offload` until `done` holds, for at most ten seconds.

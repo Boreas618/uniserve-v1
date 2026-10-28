@@ -144,6 +144,7 @@ pub(crate) fn page_settings(
         "decode_graph_batch_sizes": config.decode_graph_batch_sizes,
         "prefill_graph_token_sizes": config.prefill_graph_token_sizes,
         "prefill_outputs": config.prefill_outputs,
+        "draft_tokens": config.draft_tokens,
         "cache_groups": groups,
         "canvas_sampling": config.canvas_sampling,
         "image_processor": image_processor,

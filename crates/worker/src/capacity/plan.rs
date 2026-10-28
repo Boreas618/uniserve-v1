@@ -715,6 +715,7 @@ pub(crate) mod tests {
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: crate::config::default_decode_sizes(),
             prefill_outputs: true,
+            draft_tokens: 0,
             prefill_graph_token_sizes: crate::config::default_prefill_sizes(),
             flow_graph_shapes: crate::config::DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
         }
@@ -748,6 +749,7 @@ pub(crate) mod tests {
             groups: vec![crate::memory::CacheGroupPlan {
                 window: None,
                 state: false,
+                draft: false,
                 block_size: 64,
                 units_per_page: 2,
                 layers: vec!["layers.0".into(), "layers.1".into()],
@@ -815,6 +817,50 @@ pub(crate) mod tests {
             (a, b) = (b, a % b);
         }
         a
+    }
+
+    /// A configured token capacity takes the units of the context's pages
+    /// alone: a pool that also keeps the draft cache, whose page holds a
+    /// unit's columns of sixteen times the tokens, takes as many.
+    #[test]
+    fn the_draft_cache_adds_no_units_to_a_token_capacity() {
+        let config = WorkerConfig {
+            max_total_tokens: Some(65536),
+            max_request_pool_size: 8,
+            ..cpu_config()
+        };
+        let units = |cache: &CachePlan| {
+            let mut layout = TokenLayout::new(
+                report(),
+                &config,
+                2,
+                &TokenFacts {
+                    image_processor: false,
+                    vision_feature_bytes: 0,
+                    latent_feature_bytes: 0,
+                    latent: None,
+                },
+            )
+            .unwrap();
+            layout
+                .fit_cache(cache, 0, &config, 0, None, &group())
+                .unwrap()
+                .num_units
+        };
+        let context = cache();
+        let mut drafting = cache();
+        drafting.groups.push(crate::memory::CacheGroupPlan {
+            draft: true,
+            block_size: 16 * 64,
+            units_per_page: 1,
+            layers: vec!["mtp.layers.0".into()],
+            layer_ids: vec![2],
+            ..context.groups[0].clone()
+        });
+
+        // 65536 tokens of 64-token pages of two units each.
+        assert_eq!(units(&context), 65536 / 64 * 2);
+        assert_eq!(units(&drafting), units(&context));
     }
 
     #[test]

@@ -31,6 +31,7 @@ score, padded to whole calls:
 | ``token_sets`` (finish, transitions) | int32 | ``[2, R, B]`` |
 | ``set_indices``, ``set_values`` | int64, int32 | ``[S]`` |
 | ``logprob_tasks``, ``logprob_counts`` | int64 | ``[R]`` |
+| ``verified_logprobs`` (task, candidate row, top count) | int64 | ``[3, T]`` |
 | ``prompt_rows`` (field-major) | int64 | ``[8, P]`` |
 | ``prompt_block`` | int32 | ``[1]`` |
 | ``commit`` (field-major) | int64 | ``[8, R]`` |
@@ -45,6 +46,22 @@ score, padded to whole calls:
 | ``hidden`` | model | ``[T, hidden]`` |
 | ``input_embeddings`` (multimodal) | model | ``[T, hidden]`` |
 | ``embedding_mask`` (multimodal) | uint8 | ``[T]`` |
+
+A runner that drafts (``D`` draft tokens a call proposes at most, the
+deployment's draft limit) adds the columns of its draft pass
+(:meth:`~uniserve.runner.causal_lm.CausalLMRunner.draft`), whose chained
+steps' windows hold ``Wd = 2 * D * R`` tokens at most:
+
+| Column | Element | Shape |
+| --- | --- | --- |
+| ``draft_row_columns`` | int64 | as ``row_columns`` |
+| ``draft_window_columns`` | int64 | as ``row_columns`` |
+| ``draft_input_ids``, ``draft_positions`` | int64 | ``[T]`` |
+| ``draft_hidden_rows`` | int64 | ``[T]`` |
+| ``draft_pairs``, ``draft_proposing`` | int64 | ``[2, R]`` |
+| ``draft_window_tokens`` | int64 | ``[R]`` |
+| ``draft_window_owners``, ``draft_window_positions`` | int64 | ``[Wd]`` |
+| ``proposals`` | int64 | ``[R, D]`` |
 
 The host writes the inputs: a decode's rows, a selection's tasks, a
 prefill's tokens, positions and row columns, the candidate rows of a
@@ -376,6 +393,7 @@ class TextBounds:
         hidden: int,
         embeddings: bool,
         dtype: torch.dtype,
+        drafts: int = 0,
     ) -> Dimensions:
         """Return the column dimensions of a runner of these bounds."""
         return Dimensions(
@@ -388,6 +406,7 @@ class TextBounds:
             hidden=int(hidden),
             embeddings=bool(embeddings),
             dtype=dtype,
+            drafts=int(drafts),
         )
 
 
@@ -405,6 +424,8 @@ class Dimensions:
         hidden: The model's hidden width.
         embeddings: Vision features replace token embeddings.
         dtype: The model's floating dtype.
+        drafts: Draft tokens a call proposes at most; zero for a runner
+            that does not draft.
     """
 
     rows: int
@@ -416,6 +437,7 @@ class Dimensions:
     hidden: int
     embeddings: bool
     dtype: torch.dtype
+    drafts: int = 0
 
     def row_words(self) -> int:
         """Return the row gather's column words."""
@@ -463,6 +485,8 @@ class Dimensions:
             ("set_values", torch.int32, (self.scatter_words(),)),
             ("logprob_tasks", torch.int64, (rows,)),
             ("logprob_counts", torch.int64, (rows,)),
+            # A verification reports a row per position it may commit.
+            ("verified_logprobs", torch.int64, (3, tokens)),
             ("prompt_rows", torch.int64, (PROMPT_FIELDS, self.prompt_rows())),
             ("prompt_block", torch.int32, (1,)),
             ("commit", torch.int64, (COMMIT_FIELDS, rows)),
@@ -486,7 +510,28 @@ class Dimensions:
                 ("input_embeddings", self.dtype, (tokens, self.hidden))
             )
             columns.append(("embedding_mask", torch.uint8, (tokens,)))
+        if self.drafts:
+            windows = self.window_tokens()
+            columns += [
+                ("draft_row_columns", torch.int64, (self.row_words(),)),
+                ("draft_window_columns", torch.int64, (self.row_words(),)),
+                ("draft_input_ids", torch.int64, (tokens,)),
+                ("draft_positions", torch.int64, (tokens,)),
+                ("draft_hidden_rows", torch.int64, (tokens,)),
+                ("draft_pairs", torch.int64, (2, rows)),
+                ("draft_proposing", torch.int64, (2, rows)),
+                ("draft_window_tokens", torch.int64, (rows,)),
+                ("draft_window_owners", torch.int64, (windows,)),
+                ("draft_window_positions", torch.int64, (windows,)),
+                ("proposals", torch.int64, (rows, self.drafts)),
+            ]
         return columns
+
+    def window_tokens(self) -> int:
+        """Return the tokens of the drafter's chained-step windows at most:
+        a proposer's window spans its drafts and its proposals.
+        """  # noqa: D205
+        return 2 * self.drafts * self.rows
 
     def bytes(self) -> int:
         """Return the device bytes of the columns."""

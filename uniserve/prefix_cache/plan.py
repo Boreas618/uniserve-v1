@@ -11,7 +11,9 @@ keep a request's state out of the pool: the plan lists their fields
 (``state_fields``), which the worker allocates per request slot and binds
 with the pool. Their checkpoints at token prefixes fill the pool's state
 group (:mod:`uniserve.prefix_cache.checkpoints`), whose pages the worker
-copies and the engine publishes as it does K/V pages.
+copies and the engine publishes as it does K/V pages. A deployment that
+speculates plans the draft group of the model's drafter
+(:class:`uniserve.models.Drafter`) after them, its draft cache.
 The scattered unit resets are :class:`uniserve.prefix_cache.units.UnitResets`
 and the dtype/FP8 conversion of imported pages is
 :class:`uniserve.prefix_cache.conversion.PageConversion`. Importing this
@@ -39,7 +41,7 @@ from uniserve.prefix_cache.units import (
 from uniserve.quantization import Quantizer
 
 if TYPE_CHECKING:
-    from uniserve.models import CausalLM
+    from uniserve.models import CausalLM, Drafter
 
 __all__ = [
     "CachePlan",
@@ -66,6 +68,29 @@ def _causal_lm(loaded) -> CausalLM:
     if len(found) != 1:
         raise ValueError("the K/V cache requires exactly one text model")
     return found[0]
+
+
+def _drafter(model: CausalLM) -> Drafter:
+    """The causal LM's unique drafter.
+
+    Raises:
+        ValueError: The model has no drafter, or more than one.
+    """
+    from uniserve.models import Drafter
+
+    found = [child for child in model.modules() if isinstance(child, Drafter)]
+    if len(found) != 1:
+        raise ValueError(
+            "speculative decoding requires the text model's one drafter"
+        )
+    return found[0]
+
+
+def _drafts(model: CausalLM, draft: bool) -> dict[str, mha.Config]:
+    """The draft cache's layers when the pool keeps them, else none."""
+    if not draft:
+        return {}
+    return dict(_drafter(model).cache_config.layers)
 
 
 def _storage(prefix_cache_dtype: str) -> tuple[torch.dtype | None, bool]:
@@ -109,9 +134,15 @@ def _states(model: CausalLM) -> dict[str, StateConfig]:
     }
 
 
-def _plan(model: CausalLM, block_size: int, prefix_cache_dtype: str) -> Planes:
-    """Plan the pool with ``block_size``-token pages of the widest rows and
-    the state group of the layers kept per request slot.
+def _plan(
+    model: CausalLM,
+    block_size: int,
+    prefix_cache_dtype: str,
+    drafts: Mapping[str, mha.Config],
+) -> Planes:
+    """Plan the pool with ``block_size``-token pages of the widest rows,
+    the state group of the layers kept per request slot and the draft group
+    of ``drafts``.
     """  # noqa: D205
     layers = _paged(model)
     if not layers:
@@ -126,6 +157,7 @@ def _plan(model: CausalLM, block_size: int, prefix_cache_dtype: str) -> Planes:
         quantization={name: Quantizer("fp8", axis=0) for name in layers}
         if fp8
         else None,
+        draft=Config(dict(drafts)) if drafts else None,
     )
 
 
@@ -145,6 +177,12 @@ def _group_layers(model: CausalLM, planes: Planes) -> list[list[int]]:
     names = backbone.cache_names
     result = []
     for group in planes.groups:
+        if group.draft:
+            # The drafter's layers follow every decoder layer; they form one
+            # axis of their own.
+            first = len(names)
+            result.append(list(range(first, first + len(group.layers))))
+            continue
         key = backbone.cache_layers[names.index(group.layers[0])]
         members = [
             index
@@ -208,12 +246,22 @@ class CachePlan:
 
     def kinds(self) -> list[str]:
         """Each group's kind: ``"attention"`` for K/V rows, ``"state"`` for
-        the checkpoints of the layers kept per request slot.
+        the checkpoints of the layers kept per request slot, ``"draft"``
+        for the draft cache.
         """  # noqa: D205
         return [
-            "state" if group.states else "attention"
+            "state" if group.states else "draft" if group.draft else "attention"
             for group in self.planes.groups
         ]
+
+    def drafts(self) -> dict[str, mha.Config]:
+        """The draft group's layers, by name; none without one."""
+        return {
+            name: self.configs[name]
+            for group in self.planes.groups
+            if group.draft
+            for name in group.layers
+        }
 
     def columns(self) -> int:
         """Columns per unit."""
@@ -324,24 +372,29 @@ class CachePlan:
         )
 
 
-def cache_plan(loaded, block_size: int, prefix_cache_dtype: str) -> CachePlan:
+def cache_plan(
+    loaded, block_size: int, prefix_cache_dtype: str, draft: bool = False
+) -> CachePlan:
     """Describe the rank's K/V unit pool for ``block_size``-token pages.
 
     ``block_size`` is the block size of the group with the widest token rows;
     every other group's page holds as many tokens as fit the same plane.
     ``prefix_cache_dtype`` is ``""`` for each layer's compute dtype, a dense
-    dtype name, or ``"float8_e4m3fn"`` for FP8 storage.
+    dtype name, or ``"float8_e4m3fn"`` for FP8 storage. ``draft`` plans the
+    draft group of the model's drafter, for a deployment that speculates.
 
     Raises:
         ValueError: As ``plan_units``; when the model has no resident cache
-            layer; when a group's local heads are not consecutive; or when
-            a group's resident layers are not one consecutive run of its
-            transfer axis.
+            layer; when a group's local heads are not consecutive; when a
+            group's resident layers are not one consecutive run of its
+            transfer axis; or, with ``draft``, when the model has no one
+            drafter.
     """
     model = _causal_lm(loaded)
-    planes = _plan(model, block_size, prefix_cache_dtype)
-    names = model.backbone.cache_names
-    layouts = _paged(model)
+    drafts = _drafts(model, bool(draft))
+    planes = _plan(model, block_size, prefix_cache_dtype, drafts)
+    names = (*model.backbone.cache_names, *drafts)
+    layouts = {**_paged(model), **drafts}
     states = _states(model)
 
     ids, axes = [], []
@@ -408,7 +461,7 @@ def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
         for module in model.modules()
         if getattr(module, "cache_name", None) is not None
     }
-    layouts = _paged(model)
+    layouts = {**_paged(model), **plan.drafts()}
     if any(
         name not in readers
         or not (
@@ -424,9 +477,9 @@ def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
     device = next(model.parameters()).device
     provider = resolve(backend, device=device)
     for group in plan.planes.attention:
-        pages = CachePages(
-            int(group.block_size), group.dtype, plan.planes.quantized
-        )
+        # A kernel reads a page's token blocks: a draft group's span lays
+        # them over several planes.
+        pages = CachePages(int(group.block), group.dtype, plan.planes.quantized)
         for name in group.layers:
             reader = readers[name]
             dtype = pages.compute_dtype(layouts[name].compute_dtype)

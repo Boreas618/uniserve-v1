@@ -81,6 +81,7 @@ pub(super) fn block_size(
 ) -> Result<()> {
     let text = model.declarations.has(Capability::CausalLm);
     let prefix_cache_dtype = config.prefix_cache_dtype.clone();
+    let draft = config.draft_tokens > 0;
     let block_size = resolve_block_size(
         config.block_size,
         |size| {
@@ -90,6 +91,7 @@ pub(super) fn block_size(
                     &model.attention_backend,
                     size,
                     prefix_cache_dtype.as_deref(),
+                    draft,
                 )
             } else {
                 Ok(true)
@@ -130,6 +132,7 @@ pub(super) fn cache_plan(
         model.handle(),
         block_size,
         config.prefix_cache_dtype.as_deref(),
+        config.draft_tokens > 0,
     )?))
 }
 

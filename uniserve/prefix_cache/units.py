@@ -37,6 +37,17 @@ major, then unit, then column: plane ``p`` is field ``p // (units_per_page
 holding its slot fields' bytes (``CheckpointLayout``), read and written
 through ``uniserve.prefix_cache.checkpoints``.
 
+A drafter's layers (``uniserve.models.Drafter``) form the pool's draft
+group, after the state group: the draft cache, optional derived state a
+request may lack. It keeps the pool's columns, so adding it changes no
+other group's pages. A draft group of ``L`` layers, fewer than the pool's
+``columns``, lays each layer over ``span = columns / L`` consecutive
+columns of a unit: column ``j`` of layer ``k``'s span holds token block
+``j`` of the page, so its page holds ``span`` blocks of ``plane_bytes /
+row_bytes`` tokens. Layer ``k`` reads its columns as one contiguous
+``[span * num_units, block, heads, dim]`` tensor whose block ``j *
+num_units + u`` is token block ``j`` of unit ``u``.
+
 The serving worker allocates the fields itself and constructs a ``UnitPool``
 over them; standalone library callers allocate with ``UnitPool.allocate``.
 Either way the pool only borrows its fields: unit assignment, retirement and
@@ -110,6 +121,12 @@ class CacheGroup:
             ``uint8`` for the state group.
         checkpoints: The state group's layers' checkpoints, in ``layers``
             order; empty for a K/V group.
+        draft: The group holds the draft cache: a drafter's K/V, which a
+            request may lack and whose page's last entry depends on the
+            token after the page.
+        span: Consecutive columns of a unit each layer's page spans, one
+            token block of ``block_size // span`` tokens per column; one for
+            every group but a draft group of fewer layers than columns.
     """
 
     window: int | None
@@ -120,6 +137,8 @@ class CacheGroup:
     head_dim: int
     dtype: torch.dtype
     checkpoints: tuple[CheckpointLayout, ...] = ()
+    draft: bool = False
+    span: int = 1
 
     @property
     def states(self) -> bool:
@@ -127,6 +146,11 @@ class CacheGroup:
         slot rather than K/V rows.
         """  # noqa: D205
         return bool(self.checkpoints)
+
+    @property
+    def block(self) -> int:
+        """Tokens of one column's plane: the block a kernel reads."""
+        return self.block_size // self.span
 
     @property
     def row_bytes(self) -> int:
@@ -218,6 +242,7 @@ def plan_units(
     block_size: int,
     dtype: torch.dtype | None = None,
     quantization: Mapping[str, Quantizer | None] | None = None,
+    draft: Config | None = None,
 ) -> Planes:
     """Group cache layers and derive the unit pool's column planes.
 
@@ -228,6 +253,9 @@ def plan_units(
     many tokens as fit that plane. Layers kept per request slot form the
     state group, last, whose pages hold their checkpoints at every multiple
     of the largest K/V block size (see the module documentation).
+    ``draft`` layers, a drafter's MHA layers, form the draft group after
+    them, with the pool's columns and planes (see the module
+    documentation).
 
     Args:
         config: Cache layers by module path: MHA layers, and layers whose
@@ -236,13 +264,16 @@ def plan_units(
         dtype: Logical storage dtype, or ``None`` for each layer's compute
             dtype.
         quantization: Optional per-layer quantizer of the MHA layers; every
-            layer must use the same FP8 block quantizer or none.
+            layer must use the same FP8 block quantizer or none, and the
+            draft layers store as the others do.
+        draft: The draft cache's MHA layers, or ``None`` for no draft group.
 
     Raises:
         ValueError: There is no MHA layer, a layer is neither an MHA layout
             nor indexed by request slot, quantization is mixed or
-            unsupported, ``block_size`` is not a positive power of two, or a
-            group's rows do not divide the plane into a power-of-two page.
+            unsupported, ``block_size`` is not a positive power of two, a
+            group's rows do not divide the plane into a power-of-two page,
+            or the draft layers neither divide nor fill whole units.
     """
     states = {
         name: layout
@@ -334,7 +365,92 @@ def plan_units(
                 block_size=max(group.block_size for group in groups),
             )
         )
+    if draft is not None and draft.layers:
+        groups.append(
+            _draft_group(
+                draft,
+                columns=columns,
+                plane_bytes=plane_bytes,
+                dtype=dtype,
+                quantizer=quantizer,
+            )
+        )
     return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
+
+
+def _draft_group(
+    draft: Config,
+    *,
+    columns: int,
+    plane_bytes: int,
+    dtype: torch.dtype | None,
+    quantizer: Quantizer | None,
+) -> CacheGroup:
+    """The draft group of a drafter's MHA layers over the pool's planes.
+
+    Its layers share one page shape. With ``L`` layers and ``columns`` a
+    multiple of ``L``, each layer's page spans ``columns / L`` columns of
+    one unit; with ``L`` a multiple of ``columns``, a page takes ``L /
+    columns`` units of whole-column layers, as any K/V group does.
+
+    Raises:
+        ValueError: A draft layer is no MHA layout, the layers differ in
+            page shape or bound their history, their rows do not divide the
+            plane into a power-of-two block, their count neither divides
+            nor is a multiple of the columns, or the page's tokens are no
+            power of two.
+    """
+    shapes = set()
+    for layout in draft.layers.values():
+        if not isinstance(layout, mha.Config):
+            raise ValueError("draft cache layers are MHA layers")
+        fields = layout.buffers(
+            num_blocks=1, block_size=1, dtype=dtype, quantizer=quantizer
+        )
+        shapes.add(
+            (
+                layout.window,
+                layout.num_kv_heads,
+                layout.head_indices,
+                layout.head_dim,
+                fields["key.values"].dtype,
+            )
+        )
+    if len(shapes) != 1:
+        raise ValueError("draft cache layers share one page shape")
+    window, _, head_indices, head_dim, stored = next(iter(shapes))
+    if window is not None:
+        raise ValueError("draft cache layers read the whole history")
+    row = len(head_indices) * head_dim * stored.itemsize
+    block, remainder = divmod(plane_bytes, row)
+    if remainder or block & (block - 1):
+        raise ValueError(
+            "draft K/V rows must divide the plane into power-of-two blocks"
+        )
+    layers = len(draft.layers)
+    if columns % layers == 0:
+        span, units_per_page = columns // layers, 1
+    elif layers % columns == 0:
+        span, units_per_page = 1, layers // columns
+    else:
+        raise ValueError(
+            "draft cache layers must divide the pool's columns or fill whole "
+            "units"
+        )
+    page = span * block
+    if page & (page - 1):
+        raise ValueError("a draft cache page must hold a power-of-two tokens")
+    return CacheGroup(
+        window=None,
+        block_size=page,
+        units_per_page=units_per_page,
+        layers=tuple(draft.layers),
+        num_kv_heads=len(head_indices),
+        head_dim=head_dim,
+        dtype=stored,
+        draft=True,
+        span=span,
+    )
 
 
 def _state_group(
@@ -474,33 +590,39 @@ class UnitPool:
                     )
                 first_table += group.units_per_page
                 continue
+            span = group.span
             for index, name in enumerate(group.layers):
-                row, column = divmod(index, columns)
+                # A layer's page spans columns ``[column, column + span)``
+                # of the page's unit ``row``.
+                row, column = divmod(index * span, columns)
+                spanned = slice(column, column + span)
+                blocks = span * num_units
                 views = {}
                 for field in _FIELDS:
-                    # One plane read as [units, block_size, heads, dim]; the
-                    # block id of the view is the unit id.
+                    # The planes read as [span * units, block, heads, dim];
+                    # block ``j * units + u`` is column ``column + j`` of
+                    # unit ``u``: the unit id itself for a span of one.
                     views[f"{field}.values"] = (
-                        self._fields[f"{field}.values"][column]
+                        self._fields[f"{field}.values"][spanned]
                         .view(group.dtype)
                         .view(
-                            num_units,
-                            group.block_size,
+                            blocks,
+                            group.block,
                             group.num_kv_heads,
                             group.head_dim,
                         )
                     )
                     views[f"{field}.initialized"] = self._fields[
                         f"{field}.initialized"
-                    ][column]
+                    ][spanned].view(blocks)
                     if planes.quantized:
-                        # One FP32 scale per unit of this column.
+                        # One FP32 scale per unit of each column.
                         views[f"{field}.scale"] = self._fields[
                             f"{field}.scale"
-                        ][column].view(num_units, 1, 1, 1)
+                        ][spanned].view(blocks, 1, 1, 1)
                 self._states[name] = configs[name].bind(
                     views,
-                    block_size=group.block_size,
+                    block_size=group.block,
                     dtype=None if planes.quantized else group.dtype,
                     quantizer=quantizer,
                 )
@@ -519,11 +641,13 @@ class UnitPool:
         dtype: torch.dtype | None = None,
         quantization: Mapping[str, Quantizer | None] | None = None,
         request_slots: int = 0,
+        draft: Config | None = None,
     ) -> UnitPool:
         """Allocate and reset a pool's fields for standalone library use.
 
-        ``block_size``, ``dtype`` and ``quantization`` are interpreted as by
-        ``plan_units``; ``num_units`` counts every unit, sentinel included.
+        ``block_size``, ``dtype``, ``quantization`` and ``draft`` are
+        interpreted as by ``plan_units``; ``num_units`` counts every unit,
+        sentinel included.
         Scales start at one and every other field at zero. The layers kept
         per request slot get banks of ``request_slots`` slots after the
         padding slot 0, zeroed.
@@ -535,6 +659,7 @@ class UnitPool:
             block_size=block_size,
             dtype=dtype,
             quantization=quantization,
+            draft=draft,
         )
         fields = {
             # Multiplicative scales restart at one; encoded bytes and flags
@@ -553,6 +678,8 @@ class UnitPool:
             if not isinstance(layout, mha.Config):
                 raise ValueError("a K/V unit pool requires MHA cache layers")
             configs[name] = layout
+        if draft is not None:
+            configs.update(draft.layers)
         banks = {
             f"{name}/{field}": torch.zeros(
                 (request_slots + 1, *shape), dtype=bank_dtype, device=device
@@ -589,6 +716,19 @@ class UnitPool:
         """Borrow one layer's state; the fields' owner outlives its use."""
         return self._states[name]
 
+    def holds(self, name: str) -> bool:
+        """Whether the pool keeps cache layer ``name``: a drafter's layers
+        are held only by a pool planned with the draft group.
+        """  # noqa: D205
+        return name in self._states
+
+    def draft_group(self) -> int | None:
+        """The draft group's index, ``None`` without one."""
+        for index, group in enumerate(self.planes.groups):
+            if group.draft:
+                return index
+        return None
+
     def paged(self, name: str) -> bool:
         """Whether one layer's state lies in the pool's pages (it has a
         block table) rather than in its request slots.
@@ -620,10 +760,12 @@ class UnitPool:
     def planes_of(self, group: int, field: str) -> torch.Tensor:
         """Borrow one field's planes as one group reads them.
 
-        Returns ``[columns, num_units, block_size, heads, dim]`` in the
-        group's stored dtype for ``field`` ``"key"`` or ``"value"``: the
-        group's layer ``k`` of a page's unit ``u`` is ``[k % columns, u]``.
-        Writes through a layer's state are visible here and vice versa.
+        Returns ``[columns, num_units, block, heads, dim]`` in the group's
+        stored dtype for ``field`` ``"key"`` or ``"value"``: the group's
+        layer ``k`` of a page's unit ``u`` is ``[k % columns, u]``, and a
+        draft group's span lays a layer's token blocks over consecutive
+        columns. Writes through a layer's state are visible here and vice
+        versa.
         """
         values = self.planes.groups[group]
         return (
@@ -632,7 +774,7 @@ class UnitPool:
             .view(
                 self.planes.columns,
                 self.num_units,
-                values.block_size,
+                values.block,
                 values.num_kv_heads,
                 values.head_dim,
             )

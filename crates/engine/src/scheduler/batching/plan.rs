@@ -105,7 +105,27 @@ impl Scheduler {
                     .min(self.config.chunked_prefill_size)
                     .min(budget.max(1));
                 let end = (cursor + chunk_cap.max(1)).min(n);
-                if !self.ensure_request_capacity(id, cache_visible_len as usize, end) {
+                // A speculating deployment's prompt chunk writes its draft
+                // cache entries: one before the prompt's end reads the
+                // token after it, and the last proposes drafts, whose
+                // chained steps take the positions after the prompt.
+                let draft = if self.speculates() {
+                    let prompt = &self.running.get(&id)?.req.prompt_token_ids;
+                    ipc::DraftWork {
+                        proposals: if end == n {
+                            self.proposals_for(id, cache_visible_len)
+                        } else {
+                            0
+                        },
+                        lookahead: prompt.get(end).copied(),
+                        refill: None,
+                    }
+                } else {
+                    ipc::DraftWork::default()
+                };
+                if !self.ensure_request_capacity(id, cache_visible_len as usize, end)
+                    || !self.ensure_draft_capacity(id, end, end + draft.proposals as usize)
+                {
                     return None;
                 }
                 let sampling_state = self.build_token_masks(id, 0, 0);
@@ -120,6 +140,39 @@ impl Scheduler {
                         0,
                         sampling_state,
                         generates_canvases,
+                    )
+                    .map(|mut call| {
+                        call.draft = draft;
+                        call
+                    })
+                })
+            }
+            // A speculating request verifies the drafts its last forward
+            // proposed, as many as the scheduler chooses this step: none
+            // while its draft cache is incomplete, a verification row of
+            // one token. Its successor waits for its result, which states
+            // the tokens it accepted and the drafts after them.
+            Phase::DecodeUnd if self.speculates() => {
+                let sampling_state = self.build_token_masks(id, 0, 0);
+                let input_token = self.running.get(&id)?.next_token;
+                let drafts = self.verify_drafts(id, cache_visible_len);
+                let proposals = self.proposals_for(id, cache_visible_len);
+                // The cache holds the verified tokens and, for the drafter's
+                // chained steps, the positions of the drafts it proposes.
+                let capacity_target = decode_capacity_target(
+                    logical_position as usize,
+                    drafts.len() + proposals as usize,
+                );
+                if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
+                    return None;
+                }
+                self.plan_call(id, |_scheduler, request| {
+                    generation::plan_verify(
+                        request,
+                        input_token,
+                        &drafts,
+                        proposals,
+                        sampling_state,
                     )
                 })
             }
@@ -147,7 +200,7 @@ impl Scheduler {
                 }
 
                 self.plan_call(id, |_scheduler, request| {
-                    generation::plan_decode(request, None, input_token, relay_input, sampling_state)
+                    generation::plan_decode(request, input_token, relay_input, sampling_state)
                 })
             }
             Phase::CloseCache => {

@@ -97,12 +97,14 @@ const RANKED_LOGPROB_BYTES: u64 = 12;
 /// Returns `None` when neither generated nor prompt logprobs are requested.
 /// Each reported row costs 4 bytes plus `RANKED_LOGPROB_BYTES` per entry; a
 /// row's entries are its own token and the requested top-k candidates
-/// (`n_logprobs` or `n_prompt_logprobs`). A call reports at most one
-/// generated row and `prompt_positions` prompt rows. The worker leases a
-/// batch's completion storage from the sum of its calls'
-/// `max_completion_bytes` and refuses a capture beyond its lease.
+/// (`n_logprobs` or `n_prompt_logprobs`). A call reports at most
+/// `generated_rows` generated rows, one per token it may commit (a
+/// verification's current token and drafts), and `prompt_positions` prompt
+/// rows. The worker leases a batch's completion storage from the sum of its
+/// calls' `max_completion_bytes` and refuses a capture beyond its lease.
 fn logprob_result_bytes(
     sampling: &SamplingParams,
+    generated_rows: u32,
     prompt_positions: u32,
 ) -> Result<Option<u64>, PlanningError> {
     let generated = sampling.generated_logprobs_requested();
@@ -115,6 +117,8 @@ fn logprob_result_bytes(
     let generated_bytes = generated_entries
         .unwrap_or(0)
         .checked_mul(RANKED_LOGPROB_BYTES)
+        .and_then(|bytes| bytes.checked_add(if generated { 4 } else { 0 }))
+        .and_then(|bytes| bytes.checked_mul(u64::from(generated_rows)))
         .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let per_prompt_bytes = 4_u64
         .checked_add(
@@ -128,8 +132,7 @@ fn logprob_result_bytes(
         .checked_mul(per_prompt_bytes)
         .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let bytes = generated_bytes
-        .checked_add(if generated { 4 } else { 0 })
-        .and_then(|value| value.checked_add(prompt_bytes))
+        .checked_add(prompt_bytes)
         .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     Ok(Some(bytes))
 }
@@ -649,29 +652,19 @@ pub(super) fn plan_canvas_commit(
 
 /// Plans a sampled continuation; relay inputs leave host token values empty.
 ///
-/// With `spec_token_ids` drafts the call is a verify that carries the drafts
-/// as its input tokens and may commit up to one token more than their count.
-/// Otherwise it is a decode whose input is `input_token`, or nothing when
+/// The call is a decode whose input is `input_token`, or nothing when
 /// `relay_input` continues from the predecessor's device-resident token.
 pub(super) fn plan_decode(
     request: &GenerationRequest,
-    spec_token_ids: Option<Vec<u32>>,
     input_token: u32,
     relay_input: bool,
     sampling_state: Option<SamplingState>,
 ) -> Result<Call, PlanningError> {
-    let draft_count = spec_token_ids.as_ref().map_or(0, Vec::len);
-    let kind = if draft_count == 0 {
-        CallKind::Forward(ForwardMode::Decode)
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Decode));
+    call.input_token_ids = if relay_input {
+        Vec::new()
     } else {
-        CallKind::Forward(ForwardMode::Verify)
-    };
-    let mut call = new_call(request, kind);
-    call.bounds.max_tokens = (1 + draft_count).min(u32::MAX as usize) as u32;
-    call.input_token_ids = match spec_token_ids {
-        Some(drafts) if !drafts.is_empty() => drafts,
-        _ if relay_input => Vec::new(),
-        _ => vec![input_token],
+        vec![input_token]
     };
     call.token_output = Some(output_tensor(0, DType::I64));
     call.transition_output = sampling_state
@@ -679,6 +672,68 @@ pub(super) fn plan_decode(
         .is_some_and(|state| !state.transition_token_ids.is_empty())
         .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
+    finish_plan(request, call, 0)
+}
+
+/// Plans the verification of a speculating request's next step: its
+/// committed `input_token` followed by `drafts`, the drafts its drafter
+/// proposed, of which the call commits the accepted prefix and the token
+/// after it, at most one more than their count; with no drafts it decodes
+/// one token, a verification row of length one. The call proposes
+/// `proposals` drafts for the step after it.
+pub(super) fn plan_verify(
+    request: &GenerationRequest,
+    input_token: u32,
+    drafts: &[u32],
+    proposals: u32,
+    sampling_state: Option<SamplingState>,
+) -> Result<Call, PlanningError> {
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Verify));
+    call.bounds.max_tokens = (1 + drafts.len()).min(u32::MAX as usize) as u32;
+    call.input_token_ids = std::iter::once(input_token)
+        .chain(drafts.iter().copied())
+        .collect();
+    call.draft.proposals = proposals;
+    call.token_output = Some(output_tensor(0, DType::I64));
+    call.transition_output = sampling_state
+        .as_ref()
+        .is_some_and(|state| !state.transition_token_ids.is_empty())
+        .then(|| output_tensor(3, DType::U8));
+    call.sampling_state = sampling_state;
+    finish_plan(request, call, 0)
+}
+
+/// The drafts a verification verifies: its input tokens after its current
+/// token, or all of them when it continues from its predecessor's device
+/// token.
+pub(crate) fn verify_drafts(call: &Call) -> &[u32] {
+    if call.predicate.is_some() {
+        &call.input_token_ids
+    } else {
+        call.input_token_ids.get(1..).unwrap_or_default()
+    }
+}
+
+/// Plans a refill of the speculating `request`'s draft cache over `tokens`,
+/// which its cache holds from position `start` on: the target model
+/// evaluates them again, from the state checkpoint at `start`, and the
+/// drafter writes their draft cache entries, the last reading `lookahead`,
+/// the token after them.
+pub(super) fn plan_refill(
+    request: &GenerationRequest,
+    start: u32,
+    tokens: Vec<u32>,
+    lookahead: u32,
+) -> Result<Call, PlanningError> {
+    let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
+    call.bounds.max_tokens = u32::try_from(tokens.len())
+        .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+    call.input_token_ids = tokens;
+    call.draft = ipc::DraftWork {
+        proposals: 0,
+        lookahead: Some(lookahead),
+        refill: Some(start),
+    };
     finish_plan(request, call, 0)
 }
 
@@ -894,7 +949,14 @@ fn finish_plan(
         0
     };
     let logprob_bytes = if call.token_output.is_some() {
-        logprob_result_bytes(&request.sampling, prompt_positions)?.unwrap_or(0)
+        // A verification commits up to its bound of tokens, each reporting
+        // its row; every other call reports one.
+        let generated_rows = if call.kind == CallKind::Forward(ForwardMode::Verify) {
+            call.bounds.max_tokens
+        } else {
+            1
+        };
+        logprob_result_bytes(&request.sampling, generated_rows, prompt_positions)?.unwrap_or(0)
     } else {
         0
     };
@@ -1111,7 +1173,7 @@ pub(crate) fn validate_generation_result(
                 detail: "canvas_step_limit_exceeded",
             });
         }
-        if !record.top_logprobs.is_empty() || !record.prompt_logprobs.is_empty() {
+        if !record.token_logprobs.is_empty() || !record.prompt_logprobs.is_empty() {
             return Err(GenerationResultError::Logprob {
                 detail: "unexpected_canvas_logprobs",
             });
@@ -1141,7 +1203,7 @@ pub(crate) fn validate_generation_result(
     // that a finish token among the drafts ends the commit there without an
     // extra token.
     if call_variant == CallKind::Forward(ForwardMode::Verify) {
-        let drafts = call.input_token_ids.as_slice();
+        let drafts = verify_drafts(call);
         let listed = record.committed_tokens.as_slice();
         let terminal_prefix = !listed.is_empty()
             && listed.len() <= drafts.len()
@@ -1184,41 +1246,41 @@ pub(crate) fn validate_generation_result(
     }
 
     // Generated logprobs are expected exactly when a forward call samples a
-    // token and the request asked for them; the first candidate must be the
-    // last committed token, and candidates need nonzero ranks, finite values,
-    // and distinct ids.
-    let sampled_token = sampled_tokens.last().copied();
-    let generated_candidates = record.top_logprobs.as_slice();
-    match (
-        produces_token
-            && request.sampling.generated_logprobs_requested()
-            && matches!(
-                call_variant,
-                CallKind::Forward(ForwardMode::Prefill)
-                    | CallKind::Forward(ForwardMode::Decode)
-                    | CallKind::Forward(ForwardMode::Verify)
-            ),
-        sampled_token,
-        generated_candidates.is_empty(),
-    ) {
-        (false, _, false) | (true, None, false) => {
+    // token and the request asked for them, one entry per committed token
+    // (a verification's accepted drafts and the token after them alike):
+    // each entry's first candidate is its token, and candidates need nonzero
+    // ranks, finite values, and distinct ids.
+    let reports_logprobs = produces_token
+        && request.sampling.generated_logprobs_requested()
+        && matches!(
+            call_variant,
+            CallKind::Forward(ForwardMode::Prefill)
+                | CallKind::Forward(ForwardMode::Decode)
+                | CallKind::Forward(ForwardMode::Verify)
+        );
+    let generated = record.token_logprobs.as_slice();
+    if !reports_logprobs || sampled_tokens.is_empty() {
+        if !generated.is_empty() {
             return Err(GenerationResultError::Logprob {
                 detail: "unexpected_generated_logprobs",
             });
         }
-        (true, Some(_), true) => {
-            return Err(GenerationResultError::Logprob {
-                detail: "missing_generated_logprobs",
-            });
-        }
-        (true, Some(token_id), false) => {
-            if generated_candidates[0].token_id != token_id {
+    } else if generated.len() != sampled_tokens.len() {
+        return Err(GenerationResultError::Logprob {
+            detail: "missing_generated_logprobs",
+        });
+    } else {
+        for (candidates, &token_id) in generated.iter().zip(sampled_tokens) {
+            if candidates
+                .first()
+                .is_none_or(|first| first.token_id != token_id)
+            {
                 return Err(GenerationResultError::Logprob {
                     detail: "generated_logprob_token_mismatch",
                 });
             }
             let mut token_ids = std::collections::HashSet::new();
-            if generated_candidates.iter().any(|candidate| {
+            if candidates.iter().any(|candidate| {
                 candidate.rank == 0
                     || !candidate.logprob.is_finite()
                     || !token_ids.insert(candidate.token_id)
@@ -1228,7 +1290,6 @@ pub(crate) fn validate_generation_result(
                 });
             }
         }
-        (false, _, true) | (true, None, true) => {}
     }
 
     // Prompt logprobs cover every input token of a prompt-extending prefill
@@ -1419,6 +1480,8 @@ pub(crate) struct RequestState {
     /// Already-submitted descendants must drain before scheduling resumes from
     /// the last host-observed execution result.
     pub(crate) speculative_chain_invalidated: bool,
+    /// The request's draft cache, in a deployment that speculates.
+    pub(crate) draft: super::speculation::DraftCache,
     pub(super) output: super::output::RequestOutput,
     /// Current accepted call stage. Completion processing and output
     /// resolution advance it; scheduling changes it only on an encoder-cache

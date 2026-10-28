@@ -46,6 +46,8 @@ def test_call_and_forward_columns_follow_the_worker_layout():
         "canvas_step",
         "request_id",
         "epoch",
+        "proposals",
+        "lookahead",
     )
     # Five row fields, then each cache group's first page and page count.
     assert (page_start(0), page_count(0), page_start(1)) == (5, 6, 7)

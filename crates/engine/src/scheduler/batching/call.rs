@@ -61,13 +61,18 @@ impl Scheduler {
         // unconditionally (`follows_unconditionally`). The first call and
         // host-observed transitions use the latest accepted call identity and
         // carry no predicate.
+        // A verification carries its current token among its host tokens,
+        // whose draft pass reads them, so it never continues from a
+        // device-resident token.
         let projected_successor = self.inflight.has_pending_calls(request_id);
-        let reusable_device_token =
-            if !projected_successor && self.can_reuse_resolved_token_product(request_id) {
-                latest_token
-            } else {
-                None
-            };
+        let reusable_device_token = if !projected_successor
+            && call.kind != CallKind::Forward(ForwardMode::Verify)
+            && self.can_reuse_resolved_token_product(request_id)
+        {
+            latest_token
+        } else {
+            None
+        };
         let predicate = if projected_successor {
             if self.execution_predecessor(request_id).is_none() {
                 tracing::error!(
@@ -117,6 +122,14 @@ impl Scheduler {
         // and denoising only read the request's prefix cache.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
         let cache_lengths = match call.kind {
+            // A draft refill evaluates tokens the cache holds from its start
+            // on, below `visible`.
+            CallKind::Forward(ForwardMode::Prefill) if call.draft.refill.is_some() => {
+                Some(CacheLengths {
+                    visible: call.draft.refill.unwrap_or_default(),
+                    input: call.bounds.max_tokens,
+                })
+            }
             // A context prefill's bound counts its prompt tokens and its
             // vision blocks' exact cache lengths.
             CallKind::Forward(ForwardMode::Prefill) => Some(CacheLengths {
@@ -127,9 +140,12 @@ impl Scheduler {
                     1
                 },
             }),
-            CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
-                Some(CacheLengths { visible, input: 1 })
-            }
+            CallKind::Forward(ForwardMode::Decode) => Some(CacheLengths { visible, input: 1 }),
+            // A verification evaluates its current token and its drafts.
+            CallKind::Forward(ForwardMode::Verify) => Some(CacheLengths {
+                visible,
+                input: 1 + generation::verify_drafts(&call).len() as u32,
+            }),
             CallKind::Forward(ForwardMode::TokenDenoising)
             | CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
             | CallKind::Media(MediaCall::LatentPreparation)
@@ -291,12 +307,14 @@ impl Scheduler {
                     call_forward.push(0, request_pool_idx, end, segment, true);
                 }
             } else if lengths.input > 0 {
+                // A draft refill writes no cache of the target: its
+                // tokens' K/V are the request's already.
                 call_forward.push(
                     0,
                     request_pool_idx,
                     lengths.visible + lengths.input,
                     lengths.input,
-                    true,
+                    call.draft.refill.is_none(),
                 );
             }
             // One read-only row per canvas: it attends to the visible prefix
@@ -594,6 +612,22 @@ impl Scheduler {
         self.grow_request_tables(id, read_start, total_tokens, checkpoint)
     }
 
+    /// Grows the request's tables over the positions `[read_start,
+    /// total_tokens)` a call's drafter writes past its tokens, which keep
+    /// no state checkpoint.
+    pub(in crate::scheduler) fn ensure_draft_capacity(
+        &mut self,
+        id: RequestId,
+        read_start: usize,
+        total_tokens: usize,
+    ) -> bool {
+        total_tokens <= read_start
+            || self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Never)
+    }
+
+    /// Grows the request's tables; when the pool lacks the units the tables
+    /// need, other requests' draft caches, optional state, release theirs
+    /// first ([`Self::release_drafts`]).
     fn grow_request_tables(
         &mut self,
         id: RequestId,
@@ -601,23 +635,46 @@ impl Scheduler {
         total_tokens: usize,
         checkpoint: Checkpoint,
     ) -> bool {
-        let Some(state) = self.running.get_mut(&id) else {
-            return false;
-        };
-        let (Some(allocations), Some(cache)) =
-            (state.allocations_mut(), self.storage.cache.as_ref())
-        else {
-            self.invariant_broken("a running token request is admitted with a prefix cache");
-            return false;
-        };
-        cache
-            .grow(
-                &mut allocations.prefix_cache,
-                read_start.min(u32::MAX as usize) as u32,
-                total_tokens.min(u32::MAX as usize) as u32,
+        let read_start = read_start.min(u32::MAX as usize) as u32;
+        let total_tokens = total_tokens.min(u32::MAX as usize) as u32;
+        let mut needed = None;
+        for attempt in 0..2 {
+            if attempt == 1 {
+                let Some(units) = needed else {
+                    return false;
+                };
+                if !self.release_drafts(units) {
+                    return false;
+                }
+            }
+            let Some(state) = self.running.get_mut(&id) else {
+                return false;
+            };
+            let (Some(allocations), Some(cache)) =
+                (state.allocations_mut(), self.storage.cache.as_ref())
+            else {
+                self.invariant_broken("a running token request is admitted with a prefix cache");
+                return false;
+            };
+            if cache
+                .grow(
+                    &mut allocations.prefix_cache,
+                    read_start,
+                    total_tokens,
+                    checkpoint,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+            needed = cache.coordinator.units_needed(
+                &allocations.prefix_cache,
+                read_start as usize,
+                total_tokens as usize,
                 checkpoint,
-            )
-            .is_ok()
+            );
+        }
+        false
     }
 
     /// Activates the cache tables reserved for a request.

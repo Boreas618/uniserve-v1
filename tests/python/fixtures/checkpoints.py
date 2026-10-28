@@ -391,10 +391,11 @@ def load_diffusion_gemma(root):
 QWEN3_5_MTP = "mtp.safetensors"
 
 
-def qwen3_5_checkpoint(root):
-    """Save a four-layer Qwen3.5 checkpoint and return its reference model.
+def qwen3_5_checkpoint(root, layers: int = 4):
+    """Save a Qwen3.5 checkpoint and return its reference model.
 
-    Three gated delta layers precede one full-attention layer, as every
+    The checkpoint has ``layers`` layers, a multiple of four: three gated
+    delta layers precede each full-attention layer, as every
     fourth layer of released checkpoints is full attention. The checkpoint
     also holds one multi-token prediction layer, which Transformers does
     not model: its tensors are written beside the reference's, and the
@@ -408,7 +409,7 @@ def qwen3_5_checkpoint(root):
         "vocab_size": 61,
         "hidden_size": hidden,
         "intermediate_size": intermediate,
-        "num_hidden_layers": 4,
+        "num_hidden_layers": layers,
         "num_attention_heads": heads,
         "num_key_value_heads": kv_heads,
         "head_dim": head_dim,

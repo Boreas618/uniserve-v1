@@ -246,8 +246,8 @@ def test_a_device_predicated_prefill_reads_its_tokens_as_a_gated_row():
     [
         # An ungated decode without a committed token.
         {"kind": CallKind.DECODE},
-        # A fixed-parent verification of its current token alone.
-        {"kind": CallKind.VERIFY, "tokens": 1},
+        # A fixed-parent verification without its current token.
+        {"kind": CallKind.VERIFY},
         # A prefill without tokens to extend the cache with.
         {"kind": CallKind.PREFILL},
         # A call no text forward computes.

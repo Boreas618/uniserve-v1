@@ -1009,6 +1009,7 @@ mod tests {
             readout: None,
             canvas: None,
             input_image: None,
+            draft: Default::default(),
             cache_input: None,
             cache_output: None,
             latent_restore: None,

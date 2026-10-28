@@ -260,6 +260,7 @@ impl Scheduler {
             last_state_call_id: CallId::default(),
             latest_token: None,
             speculative_chain_invalidated: false,
+            draft: Default::default(),
             // Every request starts in prefill. A request with context images
             // encodes each image's blocks ahead of the context prefill that
             // writes them into their marker gap with the text around them; a
@@ -1566,7 +1567,7 @@ impl Scheduler {
         // pages the device lacks are allocated for the loads.
         let released = match (self.storage.cache.as_ref(), state.prefix_cache_mut()) {
             (Some(cache), Some(allocation)) => {
-                cache.coordinator.release_window(allocation, boundary)
+                cache.coordinator.release_window(allocation, boundary, None)
             }
             _ => false,
         };
@@ -1579,6 +1580,22 @@ impl Scheduler {
         let Some(state) = self.running.get_mut(&id) else {
             return;
         };
+        // The draft cache pages the hit loads into units are valid once
+        // loaded, as its other pages are.
+        let draft = self.storage.cache.as_ref().and_then(|cache| {
+            let group = cache.coordinator.draft_group()?;
+            let pages = self.kv_offload.as_ref()?.hit_pages(id).get(group)?.clone();
+            let block = cache.coordinator.groups()[group].block_size;
+            let (start, end) = (pages.start * block, pages.end * block);
+            let allocation = &state.allocations()?.prefix_cache;
+            cache
+                .coordinator
+                .holds_draft(allocation, start, end)
+                .then_some((start as u32, end as u32))
+        });
+        if let Some((start, end)) = draft {
+            state.draft.record(start, end);
+        }
         // The hit's pages are computed once loaded: the first call starts
         // after them, and they are published to the device cache when that
         // call's result is accepted.
@@ -1636,12 +1653,7 @@ fn acquire_cached_prefix(
     // Queries count the tokens eligible for reuse under the same rule as the
     // prefix selection: a multiple of the largest block size that leaves at
     // least one prompt token to compute, so prefill produces logits.
-    let step = coordinator
-        .groups()
-        .iter()
-        .map(|group| group.block_size)
-        .max()
-        .unwrap_or(1);
+    let step = coordinator.max_block_size();
     let query_tokens = prompt.len().saturating_sub(1) / step * step;
     stats
         .prefix
@@ -1654,11 +1666,21 @@ fn acquire_cached_prefix(
 
     // The reused tokens are already in the prefix cache, so every prompt and cache cursor
     // starts past them, and their pages are already published.
+    // The draft cache's pages publish as the request's entries complete
+    // them; the reused ones, which the prefix holds, are its valid prefix.
     state.prefix_published = coordinator
         .groups()
         .iter()
-        .map(|group| hit.cached_tokens / group.block_size)
+        .map(|group| {
+            if group.draft {
+                hit.draft_tokens / group.block_size
+            } else {
+                hit.cached_tokens / group.block_size
+            }
+        })
         .collect();
+    state.draft = Default::default();
+    state.draft.valid = hit.draft_tokens as u32;
     state.prefix_page_hashes = hit.page_hashes;
     state.num_computed_prompt_tokens = hit.cached_tokens as u32;
     state.logical_position = state.num_computed_prompt_tokens;

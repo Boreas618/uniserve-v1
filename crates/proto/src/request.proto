@@ -930,6 +930,18 @@ message EngineSpec {
   // engine's workers start: the world on trial a rollback discards, whose
   // memory the previous world, started again on its kept weights, needs.
   repeated uint64 retire = 19;
+  // Speculative decoding with the model's drafter (`speculative_config`);
+  // absent for a deployment that does not speculate. A world that
+  // speculates keeps the drafter's draft cache in its pool, so any change
+  // of it is a world change.
+  Speculation speculation = 20;
+}
+
+// Speculative decoding with the model's drafter.
+message Speculation {
+  // The most draft tokens one verification carries per request; at least
+  // one.
+  uint32 num_draft_tokens = 1;
 }
 
 // What an engine that succeeds another maps of it.
@@ -966,6 +978,11 @@ message Scheduling {
   optional uint64 max_queued_requests = 5;
   // Absent for the engine's default.
   optional uint32 chunked_prefill_size = 6;
+  // The draft cache refill policy of a deployment that speculates
+  // (`speculative_config.expected_speedup`, `refill_token_cost`); absent
+  // for the engine's defaults.
+  optional double expected_speedup = 7;
+  optional double refill_token_cost = 8;
 }
 
 message KvCache {

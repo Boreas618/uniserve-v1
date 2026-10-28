@@ -164,10 +164,12 @@ pub struct CallOutput {
     pub step_index: u32,
     /// Token identifiers accepted by the sampler.
     pub committed_tokens: Vec<u32>,
-    /// Natural-log probability of the final accepted token, when requested.
-    pub sampled_logprob: Option<f32>,
-    /// Ranked candidates for the final accepted token.
-    pub top_logprobs: Vec<TokenLogprob>,
+    /// Each committed token's log-probabilities, in `committed_tokens`
+    /// order, when the request asks for its generated tokens': the token's
+    /// own entry, then its requested top candidates. A verification reports
+    /// one for every token it commits, accepted drafts and the token after
+    /// them alike; empty otherwise.
+    pub token_logprobs: Vec<Vec<TokenLogprob>>,
     /// Ranked candidates for each scored prompt position, in input order.
     pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
     /// Natural-log probability of every candidate of a token-denoising
@@ -179,6 +181,10 @@ pub struct CallOutput {
     pub media_output: Option<MediaOutput>,
     /// Physical cache export, including this rank's tensor locations.
     pub cache_output: Option<CacheTransfer>,
+    /// Draft tokens the drafter proposed after the call's last committed
+    /// token, in order, for the request's next verification: as many as
+    /// the call's `DraftWork::proposals` asked for, none otherwise.
+    pub draft_token_ids: Vec<u32>,
 }
 
 impl CallOutput {
@@ -228,7 +234,7 @@ impl CallOutput {
         );
         if self.status == CallStatus::Predicated {
             ensure_valid!(
-                self.committed_tokens.as_slice().is_empty(),
+                self.committed_tokens.as_slice().is_empty() && self.draft_token_ids.is_empty(),
                 "a predicated completion must select its parent without semantic output"
             );
             ensure_valid!(

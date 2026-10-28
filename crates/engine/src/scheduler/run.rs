@@ -322,6 +322,10 @@ impl Scheduler {
             chunked_prefill_size: limits.chunked_prefill_size.max(1),
             max_queued_requests: limits.max_queued_requests.map(|bound| bound.max(1)),
             canvas: self.config.canvas,
+            // The draft limit is the world's; the refill policy is a
+            // scheduling choice.
+            draft_tokens: self.config.draft_tokens,
+            refill: limits.refill,
         };
         tracing::info!(config = ?self.config, "the scheduler took new limits");
         Ok(())

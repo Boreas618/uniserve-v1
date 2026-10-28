@@ -108,6 +108,9 @@ class AttentionMetadata:
                 int(rows), int(tokens), len(self.block_size), int(width)
             )
         }
+        # Tables the model's forwards do not read: the draft cache's, whose
+        # pages the drafter reads through a batch of its own.
+        self.omitted: frozenset[int] = frozenset()
         self.block_tables = tensors["block_tables"]
         self.start_pages = tensors["start_pages"]
         self.cache_lengths = tensors["cache_lengths"]
@@ -211,6 +214,8 @@ class AttentionMetadata:
         flags = None if causal_values is None else causal_values[:rows]
         entries: dict[int, AttentionInput] = {}
         for table, width in enumerate(widths):
+            if table in self.omitted:
+                continue
             first = None
             host_first = None
             if self.windowed[table]:

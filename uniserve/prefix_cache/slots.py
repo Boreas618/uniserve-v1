@@ -10,11 +10,22 @@ afresh, whatever an earlier request left in the slot, and a row whose
 tables name a checkpoint at its prefix starts from that checkpoint
 (:mod:`uniserve.prefix_cache.checkpoints`). :func:`rows` gives the slot of
 every row (sequence) of the causal LM forward running.
+
+Two kinds of forward leave a row's slot as it was:
+
+- a forward whose rows keep no state (:func:`kept`): rows evaluating a
+  request's earlier tokens again, from a checkpoint, while the request's
+  slot holds its state at its latest token. They write their checkpoints;
+- a verification (:class:`Verification`): its rows hold a request's next
+  token and draft tokens, of which the request accepts a prefix only once
+  the forward's logits are selected. Each layer defers its slots' advance
+  to :meth:`Verification.accept`, which advances them over the accepted
+  tokens.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 import torch
@@ -23,6 +34,39 @@ from .state import State, StateConfig
 
 # The request slot of every row of the forward running, while one runs.
 _rows: torch.Tensor | None = None
+# The rows of that forward that keep their final state in their slots;
+# ``None`` when every row does.
+_kept: torch.Tensor | None = None
+# The verification that forward is, if it is one.
+_verification: Verification | None = None
+
+
+class Verification:
+    """The deferred slot advances of one verification forward.
+
+    Each cache layer kept per request slot defers, while the forward runs,
+    the advance of its rows' slots over a number of their tokens
+    (:meth:`defer`). Once the forward's selections are known, the caller
+    accepts each row's token count (:meth:`accept`) before the runner's
+    next forward, whose metadata the advances read.
+    """
+
+    def __init__(self) -> None:
+        self._advances: list[Callable[[torch.Tensor], None]] = []
+
+    def defer(self, advance: Callable[[torch.Tensor], None]) -> None:
+        """Keep one layer's advance of the forward's rows' slots."""
+        self._advances.append(advance)
+
+    def accept(self, counts: torch.Tensor) -> None:
+        """Advance every row's slots over its first ``counts`` tokens.
+
+        ``counts`` is int64 ``[rows]``, at most each row's tokens; zero
+        leaves a row's slots as they were. Each deferred advance runs once.
+        """
+        advances, self._advances = self._advances, []
+        for advance in advances:
+            advance(counts)
 
 
 def rows() -> torch.Tensor | None:
@@ -35,15 +79,38 @@ def rows() -> torch.Tensor | None:
     return _rows
 
 
+def kept() -> torch.Tensor | None:
+    """Which rows of the forward running keep their final state in their
+    slots: bool ``[rows]``, or ``None`` when every row does.
+    """  # noqa: D205
+    return _kept
+
+
+def verification() -> Verification | None:
+    """The verification the forward running is, ``None`` for another."""
+    return _verification
+
+
 @contextmanager
-def selected(slots: torch.Tensor) -> Iterator[None]:
-    """Run a forward whose rows are the request slots ``slots``."""
-    global _rows
-    previous, _rows = _rows, slots
+def selected(
+    slots: torch.Tensor,
+    *,
+    kept: torch.Tensor | None = None,
+    verification: Verification | None = None,
+) -> Iterator[None]:
+    """Run a forward whose rows are the request slots ``slots``.
+
+    ``kept`` (bool, one entry per row) names the rows that keep their final
+    state in their slots, every row when ``None``; a ``verification``
+    collects the advances of a verification forward's slots instead.
+    """
+    global _rows, _kept, _verification
+    previous = (_rows, _kept, _verification)
+    _rows, _kept, _verification = slots, kept, verification
     try:
         yield
     finally:
-        _rows = previous
+        _rows, _kept, _verification = previous
 
 
 def fields(

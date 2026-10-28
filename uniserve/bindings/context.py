@@ -906,6 +906,7 @@ class ExecutionContext:
                     getattr(child, "cache_name", None) is not None
                     and hasattr(child, "cache_state")
                     and self.cache is not None
+                    and self.cache.holds(child.cache_name)
                 ):
                     # Another cache layer type's owner reads its state and
                     # block table through ``prefix_cache.bound``.
@@ -1007,7 +1008,13 @@ class ExecutionContext:
     def _bind_attention(self, factory, layer, device, dtype, size) -> None:
         name = layer.cache_name
         state = table = None
-        if name is not None and self.cache is not None:
+        # A pool keeps a drafter's layers only when its deployment
+        # speculates; elsewhere they never run and bind no cache.
+        if (
+            name is not None
+            and self.cache is not None
+            and self.cache.holds(name)
+        ):
             state = self.cache.state(name)
             table = self.cache.table(name)
             device, dtype = state.key.device, state.key.dtype

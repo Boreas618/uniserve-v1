@@ -256,6 +256,7 @@ fn merge_completion_record(
     anyhow::ensure!(
         canonical.output.committed_tokens.as_slice()
             == rank_completion.output.committed_tokens.as_slice()
+            && canonical.output.draft_token_ids == rank_completion.output.draft_token_ids
             && canonical.output.status == rank_completion.output.status
             && canonical.output.cache_visible_len == rank_completion.output.cache_visible_len
             && canonical.output.cache_computed_len == rank_completion.output.cache_computed_len
@@ -265,8 +266,7 @@ fn merge_completion_record(
     );
     anyhow::ensure!(
         rank_completion.media.as_ref().is_ok_and(Option::is_none)
-            && rank_completion.output.sampled_logprob.is_none()
-            && rank_completion.output.top_logprobs.is_empty()
+            && rank_completion.output.token_logprobs.is_empty()
             && rank_completion.output.prompt_logprobs.is_empty()
             && rank_completion.output.candidate_logprobs.is_empty(),
         "non-designated rank returned public output"

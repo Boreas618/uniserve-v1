@@ -33,7 +33,23 @@ everywhere. The tensors of one forward are parameters of its method.
   forward, a block of rows per call, from hidden states it projects; it is
   captured per top width and launched once per block.
   :meth:`CausalLMRunner.verify` projects every position of a verification
-  forward and selects with speculative acceptance; it runs eagerly.
+  forward, selects with speculative acceptance and advances the per-request
+  states of the layers kept per request slot over each row's accepted
+  tokens (:class:`uniserve.prefix_cache.slots.Verification`); it runs
+  eagerly.
+- :meth:`CausalLMRunner.draft` runs the model's drafter
+  (:class:`uniserve.models.Drafter`) after a forward, in a deployment whose
+  cache pool keeps the draft group: over rows of positions the forward
+  evaluated, with the target's hidden states there and the tokens after
+  them, it writes their draft cache entries, and for the rows that propose
+  it selects their first draft token greedily, then runs one chained step
+  per further draft token. A position that depends on a verification's
+  acceptance is a device index, never a host value, so the pass queues
+  work without waiting for the device. It runs eagerly.
+
+A prefill row that writes no cache (a request's earlier tokens evaluated
+again, from a checkpoint, to fill its draft cache) keeps no per-request
+state either: its slot holds the state at the request's latest token.
 
 Attention operators that plan a launch on the host read the host mirrors of
 the lengths; :meth:`CausalLMRunner.plan_decode` and
@@ -53,6 +69,7 @@ import torch
 from uniserve import adapters
 from uniserve.bindings import capturing
 from uniserve.models import (
+    Drafter,
     EmbeddingReplacement,
     Logits,
     TextInput,
@@ -61,6 +78,9 @@ from uniserve.models import (
 )
 from uniserve.nn.attention import (
     AttentionBatch,
+    BlockTable,
+    PagedInput,
+    SequenceLengths,
 )
 from uniserve.nn.attention.gather import (
     gather_request_decode_inputs,
@@ -244,6 +264,31 @@ class CausalLMRunner:
         # The operators are prepared for the largest forward.
         context.prepare(TextSize(int(tokens), int(rows)))
         self.context = self._context = context
+        # The model's drafter and the draft group's table, when the pool
+        # keeps its draft cache: the deployment speculates.
+        self._drafter: Drafter | None = None
+        self._draft_table = -1
+        self._draft_group = None
+        self._units = 0
+        group = None if cache is None else cache.draft_group()
+        if group is not None:
+            from uniserve.loading.rank import capability
+
+            drafter = capability(self._model, Drafter)
+            if drafter is None:
+                raise ValueError(
+                    "a cache pool with a draft group requires the model's "
+                    "drafter"
+                )
+            self._drafter = drafter
+            self._draft_group = cache.groups[group]
+            self._draft_table = cache.table(self._draft_group.layers[0])
+            self._units = int(cache.num_units)
+        # The verification forward whose per-request states its selection
+        # advances (:meth:`prefill` with ``verification``, then
+        # :meth:`verify`).
+        self._verification: request_slots.Verification | None = None
+        self._rows = int(rows)
         self._verified_lengths = verified_lengths
         self._future_input_tokens = future_input_tokens
         self._logical_lengths = logical_lengths
@@ -280,6 +325,16 @@ class CausalLMRunner:
                 int(width),
                 placed,
             )
+            if self._draft_group is not None:
+                # The target's forwards read every table but the draft
+                # cache's, which the drafter reads through a batch of its
+                # own (:meth:`_draft_attention`).
+                self._attention_metadata.omitted = frozenset(
+                    range(
+                        self._draft_table,
+                        self._draft_table + self._draft_group.units_per_page,
+                    )
+                )
 
             # The tokens and positions a decode gathers from the slot state.
             self._decode_ids = torch.ones(
@@ -317,6 +372,12 @@ class CausalLMRunner:
     def hidden_size(self) -> int:
         """The width of the model's hidden states."""
         return int(self._model.backbone.hidden_size)
+
+    def drafts(self) -> bool:
+        """Whether the runner runs the drafter: its pool keeps the draft
+        cache.
+        """  # noqa: D205
+        return self._drafter is not None
 
     def plans_attention(self) -> bool:
         """Whether an attention operator plans each launch on the host.
@@ -635,6 +696,7 @@ class CausalLMRunner:
         embedding_mask: torch.Tensor | None,
         hidden: torch.Tensor,
         logits: torch.Tensor,
+        verification: int = 0,
     ) -> None:
         """Evaluate ``rows`` rows of host tokens over their slots' caches.
 
@@ -677,9 +739,13 @@ class CausalLMRunner:
             hidden: ``[T, hidden]`` output, every token's hidden state.
             logits: ``[R, local vocab]`` output, each row's last-position
                 logits.
+            verification: Whether the rows are a verification's: the
+                layers kept per request slot leave their slots as they were
+                until :meth:`verify` accepts each row's tokens.
 
-        The host mirrors serve an eager forward and the capture; a launched
-        graph reads the device columns.
+        A row that writes no cache keeps no per-request state. The host
+        mirrors serve an eager forward and the capture; a launched graph
+        reads the device columns.
         """
         rows, tokens = int(rows), int(tokens)
         with torch.inference_mode(), self._context.activate():
@@ -721,11 +787,21 @@ class CausalLMRunner:
                 self._token_adapters[:tokens],
             )
 
-            # The first section of the row columns is each row's slot.
+            # The first section of the row columns is each row's slot, the
+            # fourth whether it writes the cache (``pack_rows``).
+            stride = self._rows + 1
+            kept = row_columns[3 * stride : 3 * stride + rows] != 0
+            self._verification = (
+                request_slots.Verification() if int(verification) else None
+            )
             with (
                 self._context.expert_step(int(expert_capacity)),
                 adapters.selected(token_adapters),
-                request_slots.selected(row_columns[:rows]),
+                request_slots.selected(
+                    row_columns[:rows],
+                    kept=kept,
+                    verification=self._verification,
+                ),
             ):
                 if not outputs:
                     self._model.fill_cache(inputs)
@@ -1015,8 +1091,7 @@ class CausalLMRunner:
         transitions: torch.Tensor,
         drafts: torch.Tensor,
         terminal: torch.Tensor,
-        logprob_tasks: torch.Tensor,
-        logprob_counts: torch.Tensor,
+        logprob_rows: torch.Tensor,
         completion: torch.Tensor,
         continuation: torch.Tensor,
         tagged: torch.Tensor,
@@ -1041,13 +1116,22 @@ class CausalLMRunner:
                 own.
             terminal: ``[T]`` int64, the one-based length of a task's draft
                 prefix ending at its first finish token, or zero.
-            top, reported, dump: Top tokens and tasks reporting logprobs,
-                which ``logprob_tasks`` and ``logprob_counts`` name as
-                :meth:`score` does; their words are packed into
-                ``logprobs``.
+            top, reported, dump: Top tokens and the rows reporting
+                logprobs; their words are packed into ``logprobs`` and the
+                words no row reports go to word ``dump``.
+            logprob_rows: ``[3, reported]`` int64, each reported row's
+                task, candidate row and top count. A task reports a row
+                per position it may commit, its current token's and each
+                draft's: row ``j`` scores the token the task commits there,
+                its ``j``-th draft while it accepts it, else its selection,
+                under the logits of candidate row ``j``, so the rows of the
+                tokens it commits score each of them where it was selected.
 
         The other arguments are those of :meth:`select`, with draws,
-        parameters and mask rows per candidate row.
+        parameters and mask rows per candidate row. Once selected, each
+        task's row advances its per-request states over its current token
+        and accepted drafts, when the forward was a verification
+        (:meth:`prefill`); an invalid or inactive task's states stay.
         """
         tasks, width = int(tasks), int(width)
         with torch.inference_mode(), self._context.activate():
@@ -1093,18 +1177,233 @@ class CausalLMRunner:
                 transition.view(torch.bool),
                 scored,
             )
+            verification, self._verification = self._verification, None
+            if verification is not None:
+                # A task is its verification row: the row's current token
+                # and accepted drafts enter its request's state.
+                counts = torch.where(
+                    selection.valid & selection.active,
+                    selection.accepted.to(torch.int64) + 1,
+                    0,
+                )
+                verification.accept(counts)
             reported = int(reported)
             if reported:
-                chosen = logprob_tasks[:reported]
+                chosen = logprob_rows[0, :reported]
+                offsets = logprob_rows[1, :reported]
+                selected = selection.tokens.index_select(0, chosen).to(
+                    torch.int64
+                )
+                targets = selected
+                if width > 1:
+                    # A position before the accepted count commits its
+                    # draft; the first after them, the selection.
+                    accepted = selection.accepted.index_select(0, chosen).to(
+                        torch.int64
+                    )
+                    drafted = drafts.index_select(
+                        0, chosen * (width - 1) + offsets.clamp(max=width - 2)
+                    )
+                    targets = torch.where(offsets < accepted, drafted, selected)
                 scatter_logprobs(
                     projected.float(),
-                    selection.scored.index_select(0, chosen),
-                    selection.tokens.index_select(0, chosen),
-                    self._task_layout(logprob_counts[:reported]),
+                    rows.index_select(0, chosen * width + offsets),
+                    targets,
+                    self._task_layout(logprob_rows[2, :reported]),
                     int(top),
                     logprobs,
                     int(dump),
                 )
+
+    def _draft_attention(
+        self,
+        rows: int,
+        tokens: int,
+        widths: Sequence[int],
+        queries: Sequence[int],
+        prefixes: Sequence[int],
+        row_columns: torch.Tensor,
+        writes: torch.Tensor | None = None,
+    ) -> AttentionBatch:
+        """The drafter's attention over the draft cache for packed rows.
+
+        The engine's draft table names one unit per page, whose span of
+        columns holds the page's token blocks (``uniserve.prefix_cache.
+        units``); the drafter's layers read block ``j * units + u`` for
+        block ``j`` of unit ``u``. A position on a page the table holds no
+        units for (the padding sentinel) writes nothing, nor does a token
+        ``writes`` (bool ``[tokens]``) clears.
+        """
+        group = self._draft_group
+        assert group is not None
+        metadata = self._attention_metadata
+        metadata.gather(row_columns, rows, tokens, widths)
+        table = self._draft_table
+        width = int(widths[table])
+        span, block, page = int(group.span), int(group.block), group.block_size
+        units = metadata.block_tables[table, :rows, :width].to(torch.int64)
+        columns = torch.arange(span, device=units.device) * self._units
+        blocks = (units.unsqueeze(-1) + columns).reshape(rows, width * span)
+        slots = metadata.slot_mapping[table, :tokens]
+        unit = slots.div(page, rounding_mode="floor")
+        offset = slots - unit * page
+        mapped = (offset // block * self._units + unit) * block + offset % block
+        kept = (slots >= 0) & (unit > 0)
+        if writes is not None:
+            kept &= writes
+        mapped = torch.where(kept, mapped, -1)
+        query = SequenceLengths(
+            values=metadata.query_lengths[:rows],
+            offsets=metadata.query_offsets[: rows + 1],
+            host=tuple(int(value) for value in queries),
+        )
+        prefix = SequenceLengths(
+            values=metadata.cache_lengths[:rows],
+            offsets=metadata.prefix_offsets[: rows + 1],
+            host=tuple(int(value) for value in prefixes),
+        )
+        entry = PagedInput(
+            query,
+            prefix,
+            BlockTable(blocks.to(torch.int32), block),
+            mapped,
+            (True,) * rows,
+        )
+        return AttentionBatch({table: entry}, query)
+
+    def _greedy_drafts(self, states: torch.Tensor, out: torch.Tensor) -> None:
+        """Write the greedy token of each of ``states``' rows into ``out``."""
+        count = int(states.shape[0])
+        indices = torch.arange(count, device=states.device)
+        values = self._project(states, indices, count, None)
+        _, tokens = greedy(values, self._vocab)
+        out.copy_(tokens)
+
+    def draft(
+        self,
+        rows: int,
+        tokens: int,
+        widths: Sequence[int],
+        queries: Sequence[int],
+        prefixes: Sequence[int],
+        sampled: int,
+        proposers: int,
+        steps: int,
+        windows: int,
+        window_queries: Sequence[int],
+        window_prefixes: Sequence[int],
+        row_columns: torch.Tensor,
+        window_columns: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_rows: torch.Tensor,
+        pairs: torch.Tensor,
+        proposing: torch.Tensor,
+        window_tokens: torch.Tensor,
+        window_owners: torch.Tensor,
+        window_positions: torch.Tensor,
+        hidden: torch.Tensor,
+        completion: torch.Tensor,
+        proposals: torch.Tensor,
+    ) -> None:
+        """Run the drafter after a forward: write draft cache, propose.
+
+        Each of ``rows`` rows evaluates positions the forward evaluated,
+        over its slot's draft table: a position's input is the target's
+        hidden state there (row ``hidden_rows[t]`` of ``hidden``) and the
+        embedding of the token after it (``input_ids[t]``), at rotary
+        ``positions[t]``; its keys and values enter the draft cache.
+
+        A row's next token the forward selected is placed on the device,
+        where no host value names it: pair ``i`` of ``pairs`` (``[2, n]``,
+        its first ``sampled``) names a task and a token index, which its
+        task's accepted drafts (``completion[3]``, zero for a call that
+        verifies none) advance: a verification's selection follows its
+        accepted drafts, whose positions alone hold valid entries; its
+        later positions' entries are replaced before any reader reads them.
+
+        The first ``proposers`` columns of ``proposing`` (``[2, P]``: token
+        index, task, advanced as a pair's) name the positions whose drafter
+        state proposes each proposer's first draft, greedily. Each of
+        ``steps`` chained steps then evaluates one position per proposer:
+        its last state and draft at the position after them. A proposer's
+        window, ``window_queries[p]`` positions from ``window_prefixes[p]``
+        (packed in ``window_columns``, at ``window_positions``), holds every
+        position a chained step may take, whatever its acceptance; step
+        ``s`` evaluates the window with the proposer's last state and draft
+        and keeps the drafter's output, and writes the draft cache entry, of
+        the window's token ``window_tokens[p]`` advanced by its accepted
+        drafts and ``s - 1`` alone; ``window_owners[t]`` is the proposer of
+        window token ``t``. Every length is a host value and every
+        position that depends on a selection a device index, so the pass
+        never waits for the device.
+
+        Args:
+            proposals: ``int64 [R, K]`` output, each proposer's drafts in
+                proposer order.
+        """
+        drafter = self._drafter
+        if drafter is None:
+            raise AssertionError("the runner's pool keeps no draft cache")
+        rows, tokens = int(rows), int(tokens)
+        sampled, proposers = int(sampled), int(proposers)
+        accepted = completion[3]
+        with torch.inference_mode(), self._context.activate():
+            if sampled:
+                taken = pairs[:, :sampled]
+                index = taken[0] + accepted.index_select(0, taken[1])
+                input_ids.index_copy_(
+                    0, index, completion[2].index_select(0, taken[1])
+                )
+            attention = self._draft_attention(
+                rows, tokens, widths, queries, prefixes, row_columns
+            )
+            self._context.bind_attention(attention)
+            states = drafter(
+                self._model.embed_input_ids(input_ids[:tokens]),
+                hidden.index_select(0, hidden_rows[:tokens]),
+                positions[:tokens],
+                attention,
+                step=0,
+            )
+            if not proposers:
+                return
+            chosen = proposing[:, :proposers]
+            advance = accepted.index_select(0, chosen[1])
+            last = states.index_select(0, chosen[0] + advance)
+            self._greedy_drafts(last, proposals[:proposers, 0])
+            windows = int(windows)
+            if not steps or not windows:
+                return
+            # The token of each window the first chained step takes.
+            owner = window_owners[:windows]
+            first = window_tokens[:proposers] + advance
+            for step in range(1, int(steps) + 1):
+                taken = first + (step - 1)
+                writes = torch.zeros(
+                    windows, dtype=torch.bool, device=last.device
+                ).index_fill_(0, taken, True)
+                attention = self._draft_attention(
+                    proposers,
+                    windows,
+                    widths,
+                    window_queries,
+                    window_prefixes,
+                    window_columns,
+                    writes,
+                )
+                self._context.bind_attention(attention)
+                out = drafter(
+                    self._model.embed_input_ids(
+                        proposals[:proposers, step - 1].index_select(0, owner)
+                    ),
+                    last.index_select(0, owner),
+                    window_positions[:windows],
+                    attention,
+                    step=step,
+                )
+                last = out.index_select(0, taken)
+                self._greedy_drafts(last, proposals[:proposers, step])
 
     def score_prompt(
         self,
