@@ -10,6 +10,7 @@ import torch
 
 from uniserve.loading.retained import Layout, field_parts, restore_tensor
 from uniserve.nn.moe import FusedMoE
+from uniserve.quantization import QuantizedTensor
 
 
 class ResidentExperts:
@@ -31,6 +32,7 @@ class ResidentExperts:
         ]
         self.layouts = []
         self.logical = []
+        self.names: dict[int, tuple[str, ...]] = {}
         for path, layer, _ in self.layers:
             self.logical.append(layer.logical_tensors())
             layout = Layout.describe(layer, origins=loaded.origins)
@@ -68,6 +70,25 @@ class ResidentExperts:
                 .view(original.shape)
             )
         self.layouts[int(layer)] = layout.replace_fields(replacements)
+        self.names[int(layer)] = tuple(str(name) for name in names)
+
+    def fields(self, retained) -> list:
+        """Borrow transferred shards in this owner's collective field order."""
+        counts, names, fields = [], [], []
+        for index, (path, _, _) in enumerate(self.layers):
+            selected = self.names[index]
+            counts.append(len(selected))
+            for name in selected:
+                projection, field = name.split(".", 1)
+                prefix = f"{path}." if path else ""
+                value = retained.tensors[f"p:{prefix}{projection}.weight"]
+                names.append(name)
+                fields.append(
+                    value.buffers()[field]
+                    if isinstance(value, QuantizedTensor)
+                    else value
+                )
+        return [counts, names, fields]
 
     def describe(self, orders: str) -> Layout:
         """Describe resident shards in the requested global expert order."""

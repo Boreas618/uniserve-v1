@@ -203,7 +203,7 @@ struct WeightManifest {
 }
 
 /// One tensor a manifest names.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ManifestTensor {
     id: String,
     /// The checkpoint source the tensor is loaded from; empty for a tensor
@@ -1304,12 +1304,7 @@ impl Published {
                 },
             ));
         }
-        let previous: BTreeSet<_> = self
-            .manifest
-            .storages
-            .iter()
-            .flat_map(|storage| storage.storage.chunks.iter().map(|chunk| chunk.key))
-            .collect();
+        let mut retired = Vec::new();
         let mut kept = Vec::new();
         let mut kept_owners = Vec::new();
         for (owner, mut storage) in self
@@ -1325,6 +1320,8 @@ impl Published {
             if !storage.storage.layout.fields.is_empty() {
                 kept.push(storage);
                 kept_owners.push(owner);
+            } else {
+                retired.extend(storage.storage.chunks.iter().map(|chunk| chunk.key));
             }
         }
         for (owner, storage) in incoming {
@@ -1345,8 +1342,9 @@ impl Published {
             .collect();
         self.created
             .retain(|(tensor, _, _)| current.contains(&tensor.key));
-        self.shared.retain(|key| current.contains(key));
-        Ok(previous.difference(&current).copied().collect())
+        self.shared
+            .retain(|key| current.contains(key) && !retired.contains(key));
+        Ok(retired)
     }
 
     /// Keep in the manifest the storages the worker bound from `found`,

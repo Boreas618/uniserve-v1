@@ -97,6 +97,13 @@ pub struct HostGroup {
 }
 
 impl HostGroup {
+    /// Interrupt collective I/O when the owning communication group fails.
+    /// The group must be retired after closing; no operation reconnects it.
+    pub(crate) fn close(&self) {
+        for peer in self.peers.iter().flatten() {
+            let _ = peer.shutdown(std::net::Shutdown::Both);
+        }
+    }
     /// Form an independent collective channel with the same members.
     /// Call collectively before either group begins concurrent operations.
     /// `rendezvous` names the first member's reachable network interface.

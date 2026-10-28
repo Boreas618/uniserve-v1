@@ -693,6 +693,7 @@ class Layout:
         only: frozenset[str] | None = None,
         devices: frozenset[str] = frozenset(("cuda",)),
         logical: Mapping[int, Logical] | None = None,
+        resident: Layout | None = None,
     ) -> Layout:
         """The layout of ``module``'s parameters and buffers.
 
@@ -716,6 +717,11 @@ class Layout:
         if logical is not None:
             declared.update(logical)
         layout = cls([])
+        borrowed = (
+            {}
+            if resident is None
+            else {entry.id: entry for entry in resident.entries}
+        )
         index: dict[tuple[str, int], int] = {}
         for identity, tensor in tensors(module):
             if tensor.is_meta:
@@ -725,10 +731,15 @@ class Layout:
                     f"{identity} lies in {tensor.device.type} memory; "
                     "only CUDA weights are retained"
                 )
-            entry = tensor_entry(identity, tensor)
-            entry.source = origins.get(id(tensor), "")
-            entry.host = id(tensor) in host
-            entry.parts = field_parts(entry, tensor, declared.get(id(tensor)))
+            if identity in borrowed:
+                entry = borrowed[identity]
+            else:
+                entry = tensor_entry(identity, tensor)
+                entry.source = origins.get(id(tensor), "")
+                entry.host = id(tensor) in host
+                entry.parts = field_parts(
+                    entry, tensor, declared.get(id(tensor))
+                )
             layout.entries.append(entry)
             if only is not None and identity not in only:
                 continue
