@@ -158,6 +158,29 @@ impl Relaunch {
         self.start_offered(&mut standby);
     }
 
+    /// Withdraw a group's distribution while it changes. Every group offers
+    /// its committed launch again before a replacement standby can start.
+    pub(super) fn withdraw_standby(&self, index: usize) {
+        let mut standby = self.standby();
+        standby.offered[index] = None;
+        match &standby.world {
+            StandbyWorld::Starting(running) => {
+                running.cancel.store(true, Ordering::Release);
+            }
+            StandbyWorld::Parked(_) => {
+                if let StandbyWorld::Parked(groups) =
+                    std::mem::replace(&mut standby.world, StandbyWorld::Absent)
+                {
+                    drop(standby);
+                    for mut workers in groups {
+                        workers.iter_mut().for_each(WorkerProcess::terminate);
+                    }
+                }
+            }
+            StandbyWorld::Absent => {}
+        }
+    }
+
     /// Starts a standby world from the offered launches, when every group
     /// offered one, none runs, and the domain is not closing.
     fn start_offered(self: &Arc<Self>, standby: &mut Standby) {

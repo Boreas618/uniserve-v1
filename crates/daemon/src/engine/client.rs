@@ -682,6 +682,26 @@ impl EngineClient {
             .map(Answered::results)
     }
 
+    /// Commit completed expert copies and record the order in worker launches.
+    pub async fn commit_experts(
+        &self,
+        order: std::collections::HashMap<String, wire::ExpertOrder>,
+    ) -> Result<Vec<String>, String> {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        lock(&self.shared.answers).insert(id, answer);
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::CommitExperts(
+                    wire::CommitExperts { id, order },
+                )),
+            }));
+        answered
+            .await
+            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+            .map(Answered::results)
+    }
+
     /// Gives every scheduler of the engine the scheduling limits and policy
     /// `scheduling` states, from its next step on.
     ///
@@ -785,8 +805,8 @@ impl EngineClient {
     }
 
     /// Gives back the tail of the engine's KV cache until each device's
-    /// storage ledger has room for `bytes` of a profiling session's device
-    /// storage beside everything it books; the requests that hold the tail
+    /// storage ledger has room for `bytes`, overridden by `devices` on named
+    /// GPUs, beside everything it books; the requests that hold the tail
     /// run on, and the answer comes once they let it go. Returns each
     /// device's plan.
     ///
@@ -796,13 +816,24 @@ impl EngineClient {
     /// give back leave a device too little room (naming every device's
     /// bytes), while another change of the cache is in progress, or when
     /// the engine ends first.
-    pub async fn make_room_for_session(&self, bytes: u64) -> Result<Vec<String>, String> {
+    pub async fn reserve_storage(
+        &self,
+        bytes: u64,
+        devices: &std::collections::BTreeMap<storage::manifest::Gpu, u64>,
+    ) -> Result<Vec<String>, String> {
         self.ask(|id| {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
                 change: wire::CacheChange::MakeRoom as i32,
                 preempt_after_ms: None,
                 room_bytes: bytes,
+                device_bytes: devices
+                    .iter()
+                    .map(|(gpu, bytes)| wire::DeviceBytes {
+                        gpu: gpu.to_vec(),
+                        bytes: *bytes,
+                    })
+                    .collect(),
                 ..wire::ResizeCache::default()
             })
         })

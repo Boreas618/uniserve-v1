@@ -116,6 +116,9 @@ pub struct LaunchDescriptor {
     /// among themselves, each keeping whole experts, instead of dividing
     /// every expert's channels.
     pub tensor_experts: bool,
+    /// Logical expert IDs in global physical-slot order, by numerical layer.
+    #[serde(default)]
+    pub expert_order: BTreeMap<String, Vec<u32>>,
     /// `model` or `experts`.
     pub role: String,
     /// Concurrent microbatches of a disaggregated attention rank.

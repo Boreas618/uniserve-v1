@@ -27,7 +27,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path, PurePosixPath
@@ -1056,6 +1056,7 @@ def load_model(
     expert_kernels: ExpertKernels = "local",
     retained: Retained | None = None,
     load: frozenset[str] = frozenset(),
+    expert_order: Mapping[str, Sequence[int]] | None = None,
 ) -> loading.Result[ModelT]:
     """Materialize the selected capability modules through the common loader.
 
@@ -1118,4 +1119,5 @@ def load_model(
         expert_kernels=expert_kernels,
         retained=retained,
         load=load,
+        expert_order=expert_order,
     )

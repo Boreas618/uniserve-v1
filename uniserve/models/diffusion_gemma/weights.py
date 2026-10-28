@@ -229,10 +229,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         for path, prefix in experts.items()
         if path in modules
         for expert in range(config.text.num_experts)
-        if expert
-        not in range(
-            modules[path].expert_slice.start, modules[path].expert_slice.stop
-        )
+        if expert not in modules[path].resident_experts
         for name in _single_expert_names(prefix, expert)
     )
     # A tensor still read by a resident parameter is never nonresident.

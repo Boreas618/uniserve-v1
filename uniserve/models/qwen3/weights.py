@@ -153,12 +153,7 @@ def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
         f"{prefix}.{expert}.{projection}_proj.weight"
         for path, prefix in experts.items()
         for expert in range(model.config.num_experts)
-        if path not in modules
-        or not (
-            modules[path].expert_slice.start
-            <= expert
-            < modules[path].expert_slice.stop
-        )
+        if path not in modules or expert not in modules[path].resident_experts
         for projection in ("gate", "up", "down")
     )
     # Tied heads can have a redundant checkpoint copy; the embedding is the

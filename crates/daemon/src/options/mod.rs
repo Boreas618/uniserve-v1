@@ -1427,6 +1427,7 @@ impl ServeConfig {
                 graph_pc_sampling: self.profiling_config.graph_pc_sampling,
             }),
             received_weights: Vec::new(),
+            expert_order: Default::default(),
         })
     }
 }

@@ -8,6 +8,8 @@ of the provider that serves them before it is prepared, as loading stores
 them (``uniserve.loading.layout``).
 """
 
+import json
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -15,6 +17,7 @@ from torch.nn import functional as F
 from uniserve import cuda_graph
 from uniserve.backends import moe as moe_backends
 from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.routing import ExpertRouting
 from uniserve.bindings.workspace import TensorBuffers
 from uniserve.loading.layout import place
 from uniserve.models import TextSize
@@ -202,6 +205,38 @@ def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
         )
         for _ in range(16):
             assert torch.equal(graph.replay(), first)
+        stream.synchronize()
+        graph.release()
+    torch.cuda.synchronize(DEVICE)
+
+
+@torch.inference_mode()
+def test_a_captured_expert_call_reads_updated_routing():
+    generator = torch.Generator().manual_seed(41)
+    module, hidden = _positive_bf16("silu", generator)
+    ids, weights = _routes(generator)
+    expected = _reference(
+        hidden, module.up_gate.weight, module.down.weight, ids, weights, "silu"
+    )
+    _placed(module, "cutedsl")
+    routing = ExpertRouting(module)
+    original = [parameter.clone() for parameter in module.parameters()]
+    stream = torch.cuda.Stream(device=DEVICE)
+    stream.wait_stream(torch.cuda.current_stream(DEVICE))
+    with ExecutionContext(module, stream=stream, moe="cutedsl") as context:
+        context.prepare(TextSize(TOKENS, 1))
+        graph = cuda_graph.capture(
+            lambda: module(hidden, ids, weights), stream=stream
+        )
+        stream.synchronize()
+        order = [5, 2, 0, 7, 1, 6, 4, 3]
+        for parameter, value in zip(module.parameters(), original, strict=True):
+            parameter.copy_(value[order])
+        routing.commit(json.dumps({"": order}))
+        actual = graph.replay()
+        torch.testing.assert_close(
+            actual.double(), expected, rtol=_gamma(4), atol=0
+        )
         stream.synchronize()
         graph.release()
     torch.cuda.synchronize(DEVICE)

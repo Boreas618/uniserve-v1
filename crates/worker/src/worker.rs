@@ -147,6 +147,8 @@ pub(crate) struct Worker {
     weights: Vec<Arc<Storage>>,
     /// Their keys; `None` for weights the worker does not retain.
     weight_keys: Option<WeightKeys>,
+    /// Graph-addressable expert routing tables borrowed by the numerical layers.
+    expert_routing: Handle,
     /// The identity of what the loaded model's forwards compute
     /// ([`weights::model_identity`]), which keys its cache pages.
     identity: String,
@@ -295,6 +297,10 @@ impl Worker {
         )
         .map_err(phase("load"))?;
         drop(binding);
+        let expert_routing = Handle::new(
+            Interpreter::import("uniserve.bindings.routing.bind")?
+                .call_values(&[model.handle().to_any()])?,
+        )?;
         let identity = weights::model_identity(model.handle()).map_err(phase("load"))?;
         // The fence probes attach to the loaded modules before any forward
         // is captured, so that warmup captures them into the graphs.
@@ -772,6 +778,7 @@ impl Worker {
             retained,
             weights: weight_storages,
             weight_keys: keys,
+            expert_routing,
             identity,
             launch,
             bookings: Vec::new(),
@@ -816,7 +823,7 @@ impl Worker {
         }
         // The graphs were captured while received weights arrived at their
         // fixed addresses; the rank serves only once they all did.
-        if let Some((receipt, published)) = self.received.take() {
+        if let Some((mut receipt, published)) = self.received.take() {
             receipt
                 .retain(&self.retained, published)
                 .map_err(phase("warmup"))?;
@@ -941,6 +948,9 @@ impl Worker {
                 storages: self.weights.clone(),
                 keys: self.weight_keys.clone(),
                 identity: self.identity.clone(),
+                routing: self.expert_routing.clone(),
+                allocations: BTreeMap::new(),
+                rebalance: None,
             }),
             pools,
             asleep: false,
@@ -1785,6 +1795,11 @@ fn receive_weights(
     let unread = LoadedModel::unread(description, launch, meshes, experts)?;
     let storages = keys.plan(&unread, &[], None)?;
     drop(unread);
+    let storages = storages.into_transfer();
+    // Unread modules can hold Python cycles. Reclaim them and their allocator
+    // cache before creating the incoming weight allocations.
+    Interpreter::import("gc.collect")?.call_values(&[])?;
+    Interpreter::import("torch.cuda.empty_cache")?.call_values(&[])?;
     keys.receive(retained, storages, &sources, agreement, transfer)
         .map(Some)
 }

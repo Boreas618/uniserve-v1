@@ -662,6 +662,12 @@ pub enum Command {
         in_flight: WeightsInFlight,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
+    /// Commit prepared expert copies across a common step boundary.
+    CommitExperts {
+        order: std::collections::BTreeMap<String, Vec<u32>>,
+        together: Arc<crate::HookBarrier>,
+        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    },
     /// Requests orderly engine shutdown.
     Shutdown,
 }
@@ -735,11 +741,14 @@ pub enum CacheChange {
     /// into them. A resume creates them again.
     Evict,
     /// Gives back the tail of the cache until each device's storage ledger
-    /// has room for `bytes` beside everything it books (the device storage
-    /// a profiling session holds); the requests that hold the tail run on.
+    /// has room for `bytes` beside everything it books, with per-GPU values
+    /// from `devices` overriding that amount; tail holders continue running.
     /// Fails, changing nothing, when even the segments the cache cannot
     /// give back leave too little room.
-    MakeRoom { bytes: u64 },
+    MakeRoom {
+        bytes: u64,
+        devices: std::collections::BTreeMap<storage::manifest::Gpu, u64>,
+    },
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the
@@ -1097,6 +1106,23 @@ impl CommandSender {
     /// Requests orderly scheduler shutdown.
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);
+    }
+
+    pub fn commit_experts(
+        &self,
+        order: std::collections::BTreeMap<String, Vec<u32>>,
+        together: Arc<crate::HookBarrier>,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, receiver) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send(Command::CommitExperts {
+            order,
+            together,
+            answer,
+        }) && let Command::CommitExperts { answer, .. } = error.0
+        {
+            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+        }
+        receiver
     }
 }
 

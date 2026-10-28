@@ -832,17 +832,27 @@ impl Scheduler {
         payload: &str,
         together: &crate::HookBarrier,
     ) -> Result<Vec<String>, String> {
+        self.run_together(together, |scheduler| scheduler.hook_workers(name, payload))
+    }
+
+    /// Drain all participating schedulers before an operation, and keep them
+    /// drained until every participant completes it or reports its failure.
+    pub(super) fn run_together(
+        &mut self,
+        together: &crate::HookBarrier,
+        operation: impl FnOnce(&mut Self) -> Result<Vec<String>, String>,
+    ) -> Result<Vec<String>, String> {
         let closing = std::mem::replace(&mut self.closing, true);
         let ran = self
             .drain_batches()
             .inspect_err(|error| together.fail(error))
             .and_then(|()| together.meet())
             .and_then(|()| {
-                let results = self.hook_workers(name, payload);
+                let results = operation(self).inspect_err(|error| together.fail(error));
                 // Every scheduler ran the hook, or failed it, before any
                 // schedules again; a party's failure here releases the
                 // others, whose hooks ran.
-                let _ = together.meet();
+                together.meet()?;
                 results
             });
         self.closing = closing;

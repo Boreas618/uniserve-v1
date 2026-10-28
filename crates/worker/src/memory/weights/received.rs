@@ -48,10 +48,10 @@ use storage::protocol::{Access, LinkBandwidth, Priority, Region, Span};
 use storage::{Client, Key, Mode, Placement, StorageRecord, TensorRecord};
 
 use super::{
-    Found, MANIFEST_NAME, MANIFEST_VERSION, Planned, WeightKeys, WeightManifest, field_record,
-    host_bytes, storage_name,
+    Found, MANIFEST_NAME, MANIFEST_VERSION, TransferLayout, WeightKeys, WeightManifest,
+    field_record, host_bytes, storage_name,
 };
-use crate::ffi::{Backing, Interpreter};
+use crate::ffi::Backing;
 use crate::memory::allocation::Storage;
 use crate::memory::retained::Retained;
 use crate::parallel::host::HostGroup;
@@ -182,25 +182,13 @@ impl WeightKeys {
     pub(crate) fn receive(
         &self,
         retained: &Retained,
-        planned: Planned,
+        planned: TransferLayout,
         sources: &Sources,
         agreement: &HostGroup,
         transfer: Option<Transfer>,
     ) -> Result<Found> {
         let started = std::time::Instant::now();
-        let Planned {
-            layout,
-            tensors,
-            storages,
-            ..
-        } = planned;
-        drop(layout);
-        // The unread model's device memory returns before the storages are
-        // allocated: its modules may hold each other in cycles, which only
-        // the cycle collector frees, and the caching allocator keeps freed
-        // blocks until emptied.
-        Interpreter::import("gc.collect")?.call_values(&[])?;
-        Interpreter::import("torch.cuda.empty_cache")?.call_values(&[])?;
+        let TransferLayout { tensors, storages } = planned;
         let (device, gpu) = self.device(0)?;
         if storages.iter().any(|storage| storage.device != Some(0)) {
             return Err(Error::Unsupported(
@@ -365,30 +353,8 @@ impl WeightKeys {
         }
 
         let allocated = started.elapsed();
-        // The created chunks receive under their receiving keys: the
-        // Transfer Server writes only exclusive tensors.
-        if !receiving_records.is_empty() {
-            let tensors: Vec<TensorRecord> = receiving_records
-                .iter()
-                .enumerate()
-                .map(|(index, (tensor, _, _))| TensorRecord {
-                    storage: index as u32,
-                    ..tensor.clone()
-                })
-                .collect();
-            let records: Vec<(StorageRecord, std::os::fd::BorrowedFd<'_>)> = receiving_records
-                .iter()
-                .map(|(_, record, descriptor)| (*record, descriptor.as_fd()))
-                .collect();
-            retained.call("retaining receiving weight chunks", |client| {
-                client.put(tensors, &records)
-            })?;
-        }
-        drop(receiving_records);
-
         // The chunks the rank created start zeroed, the padding the
         // manifest names among them.
-        let registered = started.elapsed();
         zero_created(&mapped_storages, &writable, device)?;
         let zeroed = started.elapsed();
 
@@ -417,15 +383,8 @@ impl WeightKeys {
         let bytes: u64 = spans.iter().map(Span::copied).sum();
         let spans_count = spans.len();
         let listed = started.elapsed();
-        let task = if spans.is_empty() {
-            None
-        } else {
-            Some(retained.transfer(spans, Priority::Background, retained.world())?)
-        };
-
         // The manifest the rank retains for its position, and the fields
         // it binds: all but those of the tensors it reads.
-        let submitted = started.elapsed();
         let manifest_text = serde_json::to_string(&WeightManifest {
             version: MANIFEST_VERSION,
             fingerprints: self.fingerprint_digests(),
@@ -441,9 +400,40 @@ impl WeightKeys {
                 }
             }
         }
-        // The receiving keys stay retained, and booked, until the bytes
-        // arrived ([`Receipt::retain`]).
+        // Finish all local preparation before publishing receiving chunks.
+        // A failed transfer submission then has only these records to release.
+        if !receiving_records.is_empty() {
+            let tensors: Vec<TensorRecord> = receiving_records
+                .iter()
+                .enumerate()
+                .map(|(index, (tensor, _, _))| TensorRecord {
+                    storage: index as u32,
+                    ..tensor.clone()
+                })
+                .collect();
+            let records: Vec<(StorageRecord, std::os::fd::BorrowedFd<'_>)> = receiving_records
+                .iter()
+                .map(|(_, record, descriptor)| (*record, descriptor.as_fd()))
+                .collect();
+            retained.call("retaining receiving weight chunks", |client| {
+                client.put(tensors, &records)
+            })?;
+        }
+        drop(receiving_records);
         retained.use_keys(shared.iter().copied().chain(receiving.values().copied()));
+        let registered = started.elapsed();
+        let task = if spans.is_empty() {
+            None
+        } else {
+            match retained.transfer(spans, Priority::Background, retained.world()) {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    retained.forget(&receiving.values().copied().collect::<Vec<_>>())?;
+                    return Err(error);
+                }
+            }
+        };
+        let submitted = started.elapsed();
         tracing::info!(
             rank,
             mapped = shared.len(),
@@ -455,8 +445,8 @@ impl WeightKeys {
             // Each phase's end, from the start: the unread model freed,
             // the links from other nodes measured and gathered, the ranks'
             // storages gathered, the manifest selected, the chunks
-            // mapped and created, the receiving keys
-            // retained, the padding zeroed, the spans listed and the
+            // mapped and created, the padding zeroed, the spans listed,
+            // the receiving keys retained and the
             // transfer submitted.
             freed_ms = freed.as_millis() as u64,
             planned_ms = planned.as_millis() as u64,
@@ -487,14 +477,50 @@ impl WeightKeys {
 }
 
 impl Receipt {
+    /// Poll the transfer once; completion is consumed exactly once.
+    pub(crate) fn ready(&mut self, retained: &Retained) -> Result<bool> {
+        if let Some(task) = self.task {
+            let completion =
+                retained.call("polling expert copies", |client| client.poll_transfer(task))?;
+            let Some((bytes, end)) = completion else {
+                return Ok(false);
+            };
+            self.task = None;
+            match end {
+                storage::protocol::TransferEnd::Complete => {}
+                storage::protocol::TransferEnd::Cancelled => {
+                    return Err(Error::Interface(format!(
+                        "transfer {task} was cancelled after {bytes} bytes"
+                    )));
+                }
+                storage::protocol::TransferEnd::Failed { message } => {
+                    return Err(Error::Interface(format!(
+                        "transfer {task} failed after {bytes} bytes: {message}"
+                    )));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Cancel pending copies before releasing their exclusive destinations.
+    pub(crate) fn cancel(self, retained: &Retained) -> Result<()> {
+        if let Some(task) = self.task {
+            retained.cancel_transfer(task)?;
+        }
+        retained.forget(&self.receiving)
+    }
+
     /// Wait until the received bytes arrived, then retain the created
     /// chunks read-only under their keys, and the rank's manifest unless
     /// `published` (a publication of the tensors the rank read retains
     /// it), release the receiving keys and make the storages read-only.
-    pub(crate) fn retain(self, retained: &Retained, published: bool) -> Result<()> {
+    pub(crate) fn retain(&mut self, retained: &Retained, published: bool) -> Result<()> {
         let started = std::time::Instant::now();
         if let Some(task) = self.task {
-            retained.transferred(task)?;
+            let transferred = retained.transferred(task);
+            self.task = None;
+            transferred?;
         }
         let waited = started.elapsed();
         let manifest_memory = host_bytes(self.manifest.1.as_bytes())?;

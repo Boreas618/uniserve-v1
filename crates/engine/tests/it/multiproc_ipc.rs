@@ -2812,6 +2812,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         predecessor: None,
         segments: None,
         received_weights: None,
+        expert_order: Default::default(),
         attention_backend: "torch".into(),
         block_size: Some(16),
         max_batch_calls: 8,

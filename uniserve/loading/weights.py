@@ -289,51 +289,59 @@ def expert_assignments(
     tensors are stacked ``[E, ...]`` over all experts; otherwise they are one
     expert's matrices. The module's tensor-parallel interval of ``I`` selects
     the resident rows: local up rows first, then local gate rows. Its
-    expert-parallel ``expert_slice`` selects the resident experts: a stacked
-    tensor contributes those experts only, and one expert outside the slice
-    assigns nothing.
+    resident expert IDs select checkpoint rows in physical-slot order. A
+    stacked tensor contributes those rows only; a nonresident expert assigns
+    nothing.
     """
     local = module.intermediate_slice
     width = local.stop - local.start
     hidden = module.hidden_size
-    resident = module.expert_slice
+    resident = module.resident_experts
     if expert is None:
-        experts: tuple[slice, ...] = (resident,)
-        targets: tuple[slice, ...] = (slice(0, resident.stop - resident.start),)
+        # Keep a contiguous read for the ordinary numerical partition.
+        if resident == tuple(
+            range(module.expert_slice.start, module.expert_slice.stop)
+        ):
+            regions = [((module.expert_slice,), (slice(0, len(resident)),))]
+        else:
+            regions = [
+                ((slice(logical, logical + 1),), (slice(slot, slot + 1),))
+                for slot, logical in enumerate(resident)
+            ]
     else:
         if not 0 <= expert < module.num_experts:
             raise ValueError("expert index is outside the stacked experts")
-        if not resident.start <= expert < resident.stop:
+        if expert not in resident:
             return ()
-        experts = ()
-        offset = expert - resident.start
-        targets = (slice(offset, offset + 1),)
+        slot = resident.index(expert)
+        regions = [((), (slice(slot, slot + 1),))]
 
     result = []
-    for (weight, offset), rows in (
-        (up, slice(0, width)),
-        (gate, slice(width, 2 * width)),
-    ):
+    for experts, targets in regions:
+        for (weight, offset), rows in (
+            (up, slice(0, width)),
+            (gate, slice(width, 2 * width)),
+        ):
+            result.append(
+                Assignment(
+                    module.up_gate.weight,
+                    weight,
+                    source_slice=(
+                        *experts,
+                        slice(offset + local.start, offset + local.stop),
+                        slice(0, hidden),
+                    ),
+                    target_slice=(*targets, rows, slice(0, hidden)),
+                )
+            )
         result.append(
             Assignment(
-                module.up_gate.weight,
-                weight,
-                source_slice=(
-                    *experts,
-                    slice(offset + local.start, offset + local.stop),
-                    slice(0, hidden),
-                ),
-                target_slice=(*targets, rows, slice(0, hidden)),
+                module.down.weight,
+                down,
+                source_slice=(*experts, slice(0, hidden), local),
+                target_slice=(*targets, slice(0, hidden), slice(0, width)),
             )
         )
-    result.append(
-        Assignment(
-            module.down.weight,
-            down,
-            source_slice=(*experts, slice(0, hidden), local),
-            target_slice=(*targets, slice(0, hidden), slice(0, width)),
-        )
-    )
     return tuple(result)
 
 

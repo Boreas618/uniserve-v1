@@ -787,6 +787,40 @@ impl Service<'_> {
                     _ => serde_json::Value::Null,
                 }
             }
+            "uniserve.prepare_experts"
+            | "uniserve.start_experts"
+            | "uniserve.experts_ready"
+            | "uniserve.commit_experts"
+            | "uniserve.abort_experts" => {
+                let weights = self
+                    .maintenance
+                    .weights
+                    .as_mut()
+                    .ok_or(Error::State("the worker has no loaded weights"))?;
+                let retained = retained
+                    .as_deref()
+                    .ok_or(Error::State("expert redistribution uses retained storage"))?;
+                match name {
+                    "uniserve.prepare_experts" => weights.prepare_experts(
+                        serde_json::from_value(payload)
+                            .map_err(|error| Error::Invalid(format!("expert order: {error}")))?,
+                        retained,
+                    )?,
+                    "uniserve.start_experts" => {
+                        weights.start_experts(retained)?;
+                        serde_json::Value::Null
+                    }
+                    "uniserve.experts_ready" => serde_json::json!(weights.experts_ready(retained)?),
+                    "uniserve.commit_experts" => {
+                        weights.commit_experts(retained)?;
+                        serde_json::Value::Null
+                    }
+                    _ => {
+                        weights.abort_experts(retained)?;
+                        serde_json::Value::Null
+                    }
+                }
+            }
             "uniserve.cache_memory" => {
                 // The cache's device; a rank without a cache (an expert
                 // worker) reports its primary device's memory.

@@ -233,7 +233,7 @@ impl Replica {
         // does, the requests holding them running on.
         let device_storage = request.device_storage();
         if device_storage > 0 {
-            client.make_room_for_session(device_storage).await.map_err(|error| {
+            client.reserve_storage(device_storage, &Default::default()).await.map_err(|error| {
                 UpdateError::Refused(format!(
                     "the session holds {device_storage} bytes of device storage on each selected \
                      worker's GPU (a range_metrics pass), for which the KV cache cannot make \

@@ -1506,6 +1506,28 @@ impl Executor for WorkerExecutor {
         }
     }
 
+    fn commit_experts(
+        &mut self,
+        order: &BTreeMap<String, Vec<u32>>,
+    ) -> anyhow::Result<Vec<String>> {
+        std::thread::scope(|scope| {
+            let running = self
+                .workers
+                .iter_mut()
+                .map(|(_, group)| scope.spawn(|| group.commit_experts(order)))
+                .collect::<Vec<_>>();
+            let mut results = Vec::new();
+            for handle in running {
+                results.extend(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("expert commit thread panicked"))??,
+                );
+            }
+            Ok(results)
+        })
+    }
+
     /// Retires `worlds` through the deployment's claims, which every group
     /// shares.
     fn retire(&mut self, worlds: &[u64], discard_pages: bool) -> anyhow::Result<()> {

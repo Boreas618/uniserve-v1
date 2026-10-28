@@ -14,6 +14,7 @@
 //! cache pages are keyed by the model's fingerprint too, so the update
 //! answers the new key seed of each host page pool, which the engine takes.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cuda::Protection;
@@ -26,8 +27,9 @@ use crate::memory::CachePlan;
 use crate::memory::allocation::Storage;
 use crate::memory::prefix_cache::host::page_contents;
 use crate::memory::retained::Retained;
-use crate::memory::weights::WeightKeys;
+use crate::memory::weights::{self, Planned, Rebalance, WeightKeys};
 use crate::{Error, Result};
+use storage::manifest::weights::{Sources, Transfer};
 
 /// What an in-place weight update rewrites and renames.
 pub(crate) struct WeightUpdate {
@@ -44,9 +46,177 @@ pub(crate) struct WeightUpdate {
     /// (`weights::model_identity`), which keys its cache pages with the
     /// rewritten weights' fingerprint.
     pub(crate) identity: String,
+    /// Runtime-owned expert routing, bound before numerical graph capture.
+    pub(crate) routing: Handle,
+    /// Creating handles of the allocations currently mapped at graph addresses.
+    pub(crate) allocations: BTreeMap<storage::Key, Arc<cuda::PhysicalAllocation>>,
+    /// Background weight redistribution, before the common commit boundary.
+    pub(crate) rebalance: Option<ExpertUpdate>,
+}
+
+pub(crate) struct ExpertUpdate {
+    copies: ExpertCopies,
+    orders: BTreeMap<String, Vec<u32>>,
+    selected: String,
+}
+
+enum ExpertCopies {
+    Planned {
+        keys: WeightKeys,
+        layout: Planned,
+        sources: Sources,
+        transfer: Box<Transfer>,
+    },
+    Copying(Rebalance),
 }
 
 impl WeightUpdate {
+    /// Plan receiver-driven copies without allocating their destination storage.
+    pub(crate) fn prepare_experts(
+        &mut self,
+        orders: BTreeMap<String, Vec<u32>>,
+        retained: &Retained,
+    ) -> Result<serde_json::Value> {
+        if self.rebalance.is_some() {
+            return Err(Error::State("an expert redistribution is already prepared"));
+        }
+        let mut launch = self.launch.clone();
+        launch.expert_order.extend(orders);
+        let encoded = serde_json::to_string(&launch.expert_order)
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+        let selected: tvm_ffi::String =
+            Interpreter::import("uniserve.bindings.routing.ExpertRouting.select")?
+                .call_values(&[self.routing.to_any(), text(&encoded)])?
+                .try_into()
+                .map_err(|error| Error::numerical("expert order", &error))?;
+        let layout = Handle::new(
+            Interpreter::import("uniserve.bindings.routing.ExpertRouting.describe")?.call_values(
+                &[
+                    self.routing.to_any(),
+                    self.model.to_any(),
+                    text(selected.as_str()),
+                ],
+            )?,
+        )?;
+        let previous = self.keys.as_ref().ok_or(Error::State(
+            "expert weights must be retained before redistribution",
+        ))?;
+        self.allocations.extend(
+            previous
+                .plan(&self.model, &[], None)?
+                .allocations(&self.storages)?,
+        );
+        let description = Description::describe(&launch)?;
+        let fingerprints = LoadedModel::fingerprint(&description, &launch)?
+            .ok_or(Error::State("expert weights name their checkpoint sources"))?;
+        let devices: Vec<_> = launch
+            .execution
+            .devices()
+            .filter_map(|device| device.cuda())
+            .collect();
+        let keys = WeightKeys::new(
+            retained,
+            &fingerprints,
+            &weights::position(&launch)?,
+            &devices,
+            &super::chunk_degrees(&launch)?,
+        )?;
+        let planned = keys.plan_layout(layout)?;
+        let mut sources = keys
+            .sources(retained, &launch.storage.peers, Some(&[retained.world()]))?
+            .ok_or(Error::State(
+                "the serving world's expert weights are retained",
+            ))?;
+        let transfer = keys.plan_rebalance(retained, &planned, &mut sources)?;
+        let bytes = transfer.manifest.created_bytes(&transfer.request, 0);
+        let gpu = transfer.request.gpus[0];
+        let local: serde_json::Value = serde_json::from_str(selected.as_str())
+            .map_err(|error| Error::Interface(error.to_string()))?;
+        self.rebalance = Some(ExpertUpdate {
+            copies: ExpertCopies::Planned {
+                keys,
+                layout: planned,
+                sources,
+                transfer: Box::new(transfer),
+            },
+            orders: launch.expert_order,
+            selected: selected.as_str().to_owned(),
+        });
+        Ok(serde_json::json!({"orders": local, "gpu": gpu, "bytes": bytes}))
+    }
+
+    /// Allocate and copy only after the coordinator obtained the planned room.
+    pub(crate) fn start_experts(&mut self, retained: &Retained) -> Result<()> {
+        let mut update = self
+            .rebalance
+            .take()
+            .ok_or(Error::State("no expert redistribution is prepared"))?;
+        let ExpertCopies::Planned {
+            keys,
+            layout,
+            sources,
+            transfer,
+        } = update.copies
+        else {
+            self.rebalance = Some(update);
+            return Err(Error::State("expert copies have already started"));
+        };
+        let previous = self
+            .keys
+            .as_ref()
+            .ok_or(Error::State("the serving weights are retained"))?;
+        update.copies = ExpertCopies::Copying(keys.rebalance(
+            retained,
+            layout,
+            &self.storages,
+            previous,
+            &sources,
+            *transfer,
+        )?);
+        self.rebalance = Some(update);
+        Ok(())
+    }
+
+    pub(crate) fn experts_ready(&mut self, retained: &Retained) -> Result<bool> {
+        let update = self
+            .rebalance
+            .as_mut()
+            .ok_or(Error::State("no expert redistribution is prepared"))?;
+        match &mut update.copies {
+            ExpertCopies::Planned { .. } => Ok(false),
+            ExpertCopies::Copying(transfer) => transfer.ready(retained),
+        }
+    }
+
+    /// Publish weight mappings and tensor routing at the drained boundary.
+    pub(crate) fn commit_experts(&mut self, retained: &Retained) -> Result<()> {
+        let update = self
+            .rebalance
+            .take()
+            .ok_or(Error::State("no expert redistribution is prepared"))?;
+        let ExpertCopies::Copying(transfer) = update.copies else {
+            return Err(Error::State("expert copies have not started"));
+        };
+        let keys = transfer.commit(retained, &mut self.allocations)?;
+        Interpreter::import("uniserve.bindings.routing.ExpertRouting.commit")?
+            .call_values(&[self.routing.to_any(), text(&update.selected)])
+            .map_err(|error| {
+                Error::Invariant(format!("expert routing could not be published: {error}"))
+            })?;
+        self.keys = Some(keys);
+        self.launch.expert_order = update.orders;
+        Ok(())
+    }
+
+    pub(crate) fn abort_experts(&mut self, retained: &Retained) -> Result<()> {
+        if let Some(update) = self.rebalance.take()
+            && let ExpertCopies::Copying(transfer) = update.copies
+        {
+            transfer.abort(retained)?;
+        }
+        Ok(())
+    }
+
     /// Why the rank's weights cannot be rewritten in place, if so: stacks
     /// streamed from host memory lie in sealed host memory, and DWDP moves
     /// the routed experts into memory of the expert union.
@@ -148,4 +318,8 @@ impl WeightUpdate {
             .map(|fingerprints| fingerprints.pages(&self.identity));
         Ok(serde_json::json!({ "group": group, "page_contents": contents, "identity": identity }))
     }
+}
+
+fn text(value: &str) -> Any {
+    Any::from(tvm_ffi::String::from(value))
 }

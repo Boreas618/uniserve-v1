@@ -355,6 +355,11 @@ impl LoadedModel {
                 attention.use_tensor_core.map(Any::from).unwrap_or_default(),
                 weights(launch),
                 Any::from(unread),
+                text(
+                    &serde_json::to_string(&launch.expert_order).map_err(|error| {
+                        Error::Invalid(format!("encoding expert order: {error}"))
+                    })?,
+                ),
             ])?,
         )
     }

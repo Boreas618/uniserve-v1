@@ -188,6 +188,8 @@ class Loaded:
     # the rank loaded this model (:func:`update_weights`); ``None`` for a
     # rank without checkpoint weights.
     reload: Callable[[str, str | None], nn.Module] | None = None
+    # Runtime owner of the expert routing tensors borrowed by the model.
+    routing: Any = None
 
     @property
     def model(self) -> nn.Module:
@@ -462,6 +464,7 @@ def load_model(
     use_tensor_core: bool | None,
     weights: str | None = None,
     unread: bool = False,
+    expert_order: str = "{}",
 ) -> Loaded:
     """Materialize this rank's modules of a described model on its meshes.
 
@@ -518,6 +521,7 @@ def load_model(
             the storages, shapes, element types and encodings a load gives
             it, and uninitialized bytes. A rank plans the layout of the
             weights it receives from another world with it.
+        expert_order: Global expert permutations by layer path, as JSON.
     """
     weights = _text(weights)
     resolved = _resolve(
@@ -628,6 +632,7 @@ def load_model(
             expert_kernels=kernels,
             retained=retained,
             load=frozenset(str(name) for name in load),
+            expert_order=json.loads(str(expert_order)),
         )
         checkpoint = description
 
@@ -650,6 +655,7 @@ def load_model(
                 experts=partition,
                 tensor_experts=bool(tensor_experts),
                 expert_kernels=kernels,
+                expert_order=result.routing.orders,
             ).model
 
         module = result.model
@@ -685,6 +691,7 @@ def load_model(
             tokenizer=None if dedicated else source.tokenizer,
             origins=result.origins,
             reload=reload,
+            routing=result.routing,
         )
 
     if not dedicated and not host_only:

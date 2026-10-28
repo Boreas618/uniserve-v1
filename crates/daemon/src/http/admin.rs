@@ -53,7 +53,7 @@ pub(crate) struct AdminEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Operation {
     pub id: u64,
-    /// `config`, `commit`, `rollback`, `update_weights`,
+    /// `config`, `commit`, `rollback`, `update_weights`, `rebalance_experts`,
     /// `pause_generation`, `continue_generation`, `flush_cache`, `sleep`,
     /// `wake_up`, `load_lora_adapter`, `unload_lora_adapter`, `profile`,
     /// `hook`, `restart` or `shutdown`.
@@ -328,6 +328,7 @@ pub(crate) fn router(state: AdminState) -> Router {
         .route("/admin/shutdown", post(shutdown))
         .route("/admin/restart", post(restart))
         .route("/admin/update_weights", post(update_weights))
+        .route("/admin/rebalance_experts", post(rebalance_experts))
         .route("/admin/sleep", post(sleep))
         .route("/admin/wake_up", post(wake_up))
         .route("/admin/load_lora_adapter", post(load_lora_adapter))
@@ -693,6 +694,22 @@ async fn update_weights(State(state): State<AdminState>, body: axum::body::Bytes
                     format!("{:#}", anyhow::Error::from(error)),
                 )
             })
+    })
+    .await
+}
+
+/// Redistribute experts within each selected replica's current world.
+async fn rebalance_experts(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
+    let request: crate::experts::Rebalance = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
+    };
+    let leader = Arc::clone(&state.leader);
+    run(&state.admin, "rebalance_experts", true, async move {
+        leader
+            .rebalance_experts(request)
+            .await
+            .map_err(|error| (update_status(&error), format!("{error:#}")))
     })
     .await
 }

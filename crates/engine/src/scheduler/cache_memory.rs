@@ -97,13 +97,15 @@ impl Scheduler {
                     .ok_or(plan)
                 })
             }
-            CacheChange::MakeRoom { bytes } => self.start_room(bytes).map(|(from, plan)| {
-                from.map(|from| Pending::Shrink {
-                    from,
-                    plan: plan.clone(),
+            CacheChange::MakeRoom { bytes, devices } => {
+                self.start_room(bytes, &devices).map(|(from, plan)| {
+                    from.map(|from| Pending::Shrink {
+                        from,
+                        plan: plan.clone(),
+                    })
+                    .ok_or(plan)
                 })
-                .ok_or(plan)
-            }),
+            }
             CacheChange::Plan(successor) => {
                 let _ = answer.send(
                     self.plan_preparation(&successor)
@@ -578,7 +580,7 @@ impl Scheduler {
     }
 
     /// Withdraws the tail past what leaves every device's ledger room for
-    /// `bytes` of a profiling session's device storage beside everything it
+    /// the requested device storage beside everything it
     /// books ([`room`]); the requests holding it run on. Returns the first
     /// segment to give back, `None` when every device has the room already
     /// (or the cache is not split into segments, which gives back nothing),
@@ -587,25 +589,48 @@ impl Scheduler {
     /// Fails, withdrawing nothing, when even the segments the cache cannot
     /// give back leave a device too little room: the error names every
     /// device's bytes and ledger entries.
-    fn start_room(&mut self, bytes: u64) -> Result<(Option<u32>, Vec<String>), String> {
-        let Some(MemoryReports { cache: reports, .. }) = self.memory_reports()? else {
+    fn start_room(
+        &mut self,
+        bytes: u64,
+        devices: &std::collections::BTreeMap<storage::manifest::Gpu, u64>,
+    ) -> Result<(Option<u32>, Vec<String>), String> {
+        let Some(MemoryReports {
+            cache: reports,
+            beside,
+        }) = self.memory_reports()?
+        else {
             return Ok((None, Vec::new()));
         };
-        let first = &reports[0];
-        let held = first.held;
-        let floor = self.kept_floor(first);
+        let held = reports.first().map_or(0, |first| first.held);
+        let floor = reports.first().map_or(0, |first| self.kept_floor(first));
+        let requested = |report: &CacheMemory| {
+            report
+                .ledger
+                .as_ref()
+                .and_then(|ledger| devices.get(&ledger.gpu))
+                .copied()
+                .unwrap_or(bytes)
+        };
         let rooms = reports
             .iter()
-            .map(|report| room(report, bytes, floor))
+            .map(|report| room(report, requested(report), floor))
             .collect::<Result<Vec<_>, _>>()?;
-        if rooms.iter().any(|room| !room.feasible) {
-            return Err(room_refusal(&rooms));
-        }
         let keep = rooms
             .iter()
             .map(|room| room.segments_kept)
             .min()
             .unwrap_or(held);
+        // Dedicated expert ranks have no KV tail to release, but their
+        // allocation requirements still participate in admission.
+        let mut rooms = rooms;
+        for report in &beside {
+            if requested(report) != 0 {
+                rooms.push(room(report, requested(report), 0)?);
+            }
+        }
+        if rooms.iter().any(|room| !room.feasible) {
+            return Err(room_refusal(&rooms));
+        }
         let plans = rooms
             .iter()
             .map(|room| serde_json::to_string(room).unwrap_or_default())
@@ -613,7 +638,9 @@ impl Scheduler {
         if keep >= held {
             return Ok((None, plans));
         }
-        self.withdraw_from(reports[0].first_unit(keep), false);
+        let unit = reports[0].first_unit(keep);
+        self.offload_idle_from(unit);
+        self.withdraw_from(unit, false);
         Ok((Some(keep), plans))
     }
 

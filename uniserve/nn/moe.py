@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Literal
 
 import torch
@@ -10,7 +11,7 @@ from torch import nn
 from torch.distributed.tensor import Shard
 
 from uniserve.distributed import Communicator, DeviceMesh, Distribution
-from uniserve.distributed.distribution import BlockShard
+from uniserve.distributed.distribution import BlockShard, Segment, Span
 from uniserve.distributed.logical import Logical
 from uniserve.nn import _binding, functional
 from uniserve.nn.functional import Routes
@@ -183,8 +184,21 @@ class FusedMoE(nn.Module):
         # the runtime, so it is not a communication group of this module.
         self.expert_slice = slice(0, num_experts)
         self.expert_group = Communicator()
+        # Runtime-owned routing storage is borrowed before graph capture.
+        # Its contents may change while physical expert slots keep their shape.
+        self.logical_to_physical: torch.Tensor | None = None
+        self.expert_ids: tuple[int, ...] | None = None
 
-    def logical_tensors(self) -> Mapping[str, Logical]:
+    @property
+    def resident_experts(self) -> tuple[int, ...]:
+        """Logical expert IDs in this rank's physical slot order."""
+        if self.expert_ids is not None:
+            return self.expert_ids
+        return tuple(range(self.expert_slice.start, self.expert_slice.stop))
+
+    def logical_tensors(
+        self, expert_ids: Sequence[int] | None = None
+    ) -> Mapping[str, Logical]:
         """The logical stacked weights whose parts this rank holds.
 
         ``up_gate.weight [E, 2I, H]`` and ``down.weight [E, H, I]``, as
@@ -213,7 +227,7 @@ class FusedMoE(nn.Module):
             ),
         )
         down = Distribution(mesh, (Shard(0), Shard(2)))
-        return {
+        tensors = {
             "up_gate.weight": Logical.distributed(
                 up_gate,
                 (self.num_experts, 2 * intermediate, self.hidden_size),
@@ -227,6 +241,26 @@ class FusedMoE(nn.Module):
                 (1, 0, 1),
             ),
         }
+        ids = self.expert_ids if expert_ids is None else expert_ids
+        if ids is not None:
+            # Keep contiguous runs canonical so an unchanged expert range
+            # keeps the same retained-region description and content keys.
+            runs: list[Segment] = []
+            for local, expert in enumerate(ids):
+                if runs and runs[-1].span.start + runs[-1].span.count == expert:
+                    previous = runs[-1]
+                    runs[-1] = Segment(
+                        Span(previous.span.start, previous.span.count + 1),
+                        previous.local,
+                    )
+                else:
+                    runs.append(Segment(Span(expert, 1), local))
+            segments = tuple(runs)
+            tensors = {
+                name: replace(part, segments=(segments, *part.segments[1:]))
+                for name, part in tensors.items()
+            }
+        return tensors
 
     def forward(
         self,
@@ -248,6 +282,8 @@ class FusedMoE(nn.Module):
                 "expert routing requires [tokens, hidden] states with int32 "
                 "ids and fp32 weights of shape [tokens, top_k]"
             )
+        if self.logical_to_physical is not None:
+            topk_ids = self.logical_to_physical[topk_ids.long()]
         operator = _binding.moe.get().get(id(self))
         if operator is not None:
             result = operator(hidden, topk_ids, topk_weights, combine=combine)

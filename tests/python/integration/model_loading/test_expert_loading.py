@@ -131,9 +131,68 @@ def _module():
         )
 
 
-def test_expert_encodings_keep_values_and_per_expert_scales(tmp_path):
+def test_public_loading_routes_a_permuted_stacked_checkpoint(tmp_path):
+    generator = torch.Generator().manual_seed(37)
+    tensors = {
+        "up": torch.randn(EXPERTS, INTERMEDIATE, HIDDEN, generator=generator),
+        "gate": torch.randn(EXPERTS, INTERMEDIATE, HIDDEN, generator=generator),
+        "down": torch.randn(EXPERTS, HIDDEN, INTERMEDIATE, generator=generator),
+    }
+    save_file(tensors, tmp_path / "model.safetensors")
+    io = loading.Config()
+
+    def mapping(module):
+        return (
+            weights.ModuleMapping(
+                module,
+                "primary",
+                lambda reader: weights.expert_assignments(
+                    module,
+                    up=(reader.get("up"), 0),
+                    gate=(reader.get("gate"), 0),
+                    down=reader.get("down"),
+                ),
+                frozenset({"up_gate.weight", "down.weight"}),
+            ),
+        )
+
+    order = (2, 0, 1)
+    result = loading.load_model(
+        lambda config: FusedMoE(*config, top_k=2, activation="silu"),
+        (EXPERTS, HIDDEN, INTERMEDIATE),
+        checkpoint=(
+            checkpoint.Config(name="primary").resolve(tmp_path, io=io),
+        ),
+        mapping=mapping,
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        expert_order={"": order},
+    )
+    for slot, logical in enumerate(order):
+        torch.testing.assert_close(
+            result.model.down.weight[slot], tensors["down"][logical]
+        )
+    hidden = torch.randn(2, HIDDEN, generator=generator)
+    ids = torch.tensor([[0, 2], [2, 1]], dtype=torch.int32)
+    scores = torch.tensor([[0.25, 0.75], [0.6, 0.4]])
+    expected = torch.zeros_like(hidden)
+    for token in range(2):
+        for route in range(2):
+            expert = int(ids[token, route])
+            activated = (tensors["up"][expert] @ hidden[token]) * F.silu(
+                tensors["gate"][expert] @ hidden[token]
+            )
+            expected[token] += scores[token, route] * (
+                tensors["down"][expert] @ activated
+            )
+    torch.testing.assert_close(result.model(hidden, ids, scores), expected)
+
+
+@pytest.mark.parametrize("order", [(0, 1, 2), (2, 0, 1)])
+def test_expert_encodings_keep_values_and_per_expert_scales(tmp_path, order):
     tensors = _checkpoint(tmp_path)
     module = _module()
+    module.expert_ids = order
     _load(tmp_path, module)
 
     up_gate = module.up_gate.weight
@@ -141,10 +200,10 @@ def test_expert_encodings_keep_values_and_per_expert_scales(tmp_path):
     assert up_gate.scale_layout is ScaleLayout.LINEAR
     torch.testing.assert_close(
         up_gate.buffers()["tensor_scale"],
-        torch.tensor([0.01, 0.02, 0.03]),
+        torch.tensor([0.01 * (expert + 1) for expert in order]),
     )
     decoded, down = up_gate.dequantize(), module.down.weight.dequantize()
-    for expert in range(EXPERTS):
+    for slot, expert in enumerate(order):
 
         def reference(name):
             prefix = f"experts.{expert}.{name}_proj"
@@ -156,12 +215,12 @@ def test_expert_encodings_keep_values_and_per_expert_scales(tmp_path):
 
         # Resident rows hold each expert's up projection, then its gate.
         torch.testing.assert_close(
-            decoded[expert, :INTERMEDIATE], reference("up")
+            decoded[slot, :INTERMEDIATE], reference("up")
         )
         torch.testing.assert_close(
-            decoded[expert, INTERMEDIATE:], reference("gate")
+            decoded[slot, INTERMEDIATE:], reference("gate")
         )
-        torch.testing.assert_close(down[expert], reference("down"))
+        torch.testing.assert_close(down[slot], reference("down"))
 
     # Experts share each projection's activation encoding at the largest
     # calibrated expert scale.
