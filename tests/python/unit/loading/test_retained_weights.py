@@ -1,6 +1,6 @@
 """Publishing a loaded model's weights and binding them in a new process.
 
-A worker publishes its loaded tensors into retained storage by
+A worker publishes its loaded tensors into retained storage, storage by
 storage (``Layout``) and its successor rebuilds them over that storage from
 the manifest and the server's records (``Retained``). The test plays the
 worker's part with one CUDA byte tensor as the retained storage.
@@ -91,9 +91,9 @@ def _publish(model, only=None):
     for size in sizes:
         offsets.append(total)
         total += -(-size // 512) * 512
-    storage = torch.empty(total, dtype=torch.uint8, device=DEVICE)
+    backing = torch.empty(total, dtype=torch.uint8, device=DEVICE)
     for index, offset in enumerate(offsets):
-        layout.publish(index, storage, offset)
+        layout.publish(index, backing, offset)
     storages = layout.field_storages()
     records = {
         "field_ids": layout.field_ids(),
@@ -109,16 +109,16 @@ def _publish(model, only=None):
         "field_shapes": layout.field_shapes(),
         "field_strides": layout.field_strides(),
     }
-    return layout.manifest(), storage, records
+    return layout.manifest(), backing, records
 
 
 def test_published_weights_move_into_retained_storage_unchanged():
     model = _loaded()
     expected = _snapshot(model)
-    _, storage, _ = _publish(model)
+    _, backing, _ = _publish(model)
 
-    start = storage.data_ptr()
-    end = start + storage.numel()
+    start = backing.data_ptr()
+    end = start + backing.numel()
     for name, value in _snapshot(model).items():
         torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
     for tensor in [model.gate.weight, model.table, model.derived]:
@@ -135,12 +135,12 @@ def test_published_weights_move_into_retained_storage_unchanged():
 def test_a_new_model_binds_the_published_weights():
     published = _loaded()
     expected = _snapshot(published)
-    manifest, storage, records = _publish(published)
+    manifest, backing, records = _publish(published)
 
     # The fresh model's placeholders are dense meta tensors, as before
     # loading: binding installs the encoded weight in their place.
     model = _Model("meta")
-    retained = Retained.build(manifest, [storage], load=(), **records)
+    retained = Retained.build(manifest, [backing], load=(), **records)
     retained.install(model, {id(module) for module in model.modules()})
 
     for name, value in _snapshot(model).items():
@@ -155,7 +155,7 @@ def test_a_new_model_binds_the_published_weights():
 
 def test_a_worker_that_read_some_tensors_publishes_only_those():
     published = _loaded()
-    manifest, storage, records = _publish(published)
+    manifest, backing, records = _publish(published)
     # Its successor read the projection again and bound the rest; it
     # publishes the projection alone, under the same manifest.
     successor = _loaded()
@@ -171,7 +171,7 @@ def test_a_worker_that_read_some_tensors_publishes_only_those():
     # Binding takes the retained tensors but the projection, which the
     # binder reads itself.
     model = _Model("meta")
-    retained = Retained.build(manifest, [storage], load=read, **records)
+    retained = Retained.build(manifest, [backing], load=read, **records)
     retained.install(model, {id(module) for module in model.modules()})
     assert model.projection.weight.is_meta
     assert not model.gate.weight.is_meta

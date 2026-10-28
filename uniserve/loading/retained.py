@@ -871,36 +871,36 @@ class Layout:
     def publish(
         self,
         index: int,
-        storage: torch.Tensor,
+        backing: torch.Tensor,
         offset: int,
         written: Sequence[int] | None = None,
     ) -> None:
-        """Move storage ``index`` into ``storage`` at byte ``offset``.
+        """Move storage ``index`` into ``backing`` at byte ``offset``.
 
-        ``storage`` is a one-dimensional ``uint8`` tensor over a whole
+        ``backing`` is a one-dimensional ``uint8`` tensor over a whole
         retained storage on the storage's device, made of chunks. The
         storage's bytes in the chunks the worker created, ``written`` (flat
         ``[start, end, ...]`` byte ranges relative to the storage, one per
         chunk; all of them when ``None``), are copied; the chunks it mapped
         from another world hold the same bytes already. Every field that
-        viewed the storage is rebound to the same place in ``storage``. Each
+        viewed the storage is rebound to the same place in ``backing``. Each
         field keeps its tensor object, so every module that holds it reads
         the retained bytes. The loaded storage returns to the driver with
         the allocator cache once the cache holds ``_RELEASE_BYTES``, and
         after the last storage, so the next retained chunks can take its
-        storage; the copies have then completed.
+        device storage; the copies have then completed.
         """
         storage = self._storages[index]
         size = storage.nbytes()
-        device = storage.device
+        device = backing.device
         source = torch.empty(0, dtype=torch.uint8, device=device)
         source.set_(storage, 0, (size,), (1,))
-        target = storage.untyped_storage()
-        base = storage.storage_offset() + offset
+        target = backing.untyped_storage()
+        base = backing.storage_offset() + offset
         # One copy per chunk: a copy stays inside one allocation.
         bounds = [0, size] if written is None else [int(b) for b in written]
         for start, end in zip(bounds[::2], bounds[1::2], strict=True):
-            storage[offset + start : offset + end].copy_(source[start:end])
+            backing[offset + start : offset + end].copy_(source[start:end])
         for _, _, tensor, position in self._views[index]:
             element = tensor.element_size()
             start = base + position
