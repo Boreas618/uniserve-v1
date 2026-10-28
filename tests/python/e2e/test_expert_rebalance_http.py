@@ -9,6 +9,8 @@ expert-parallel case moves those experts between GPUs as well as slots.
 from __future__ import annotations
 
 import json
+import os
+import signal
 from pathlib import Path
 
 import httpx
@@ -19,9 +21,12 @@ from tests.python.e2e.test_world_changes_http import (
     _admin,
     _body,
     _config,
+    _pids,
     _plugin,
+    _runs,
     _serve,
     _topology,
+    _wait_until,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -34,6 +39,7 @@ from uniserve.nn.moe import FusedMoE
 
 def register(registry):
     registry.hook("expert_layers", expert_layers)
+    registry.hook("expert_distribution", expert_distribution)
 
 
 def expert_layers(payload, models):
@@ -42,6 +48,15 @@ def expert_layers(payload, models):
         for model in models
         for path, layer in model.named_modules()
         if isinstance(layer, FusedMoE)
+    }
+
+
+def expert_distribution(payload, models):
+    return {
+        path: list(layer.resident_experts)
+        for model in models
+        for path, layer in model.named_modules()
+        if isinstance(layer, FusedMoE) and path == payload["layer"]
     }
 """
 
@@ -122,3 +137,85 @@ def test_expert_rebalancing_preserves_a_stream_and_its_world(
         (tmp_path / "redistribution.json").write_text(
             json.dumps({"layer": layer, "operations": reports}, indent=2)
         )
+
+
+def test_expert_distribution_survives_daemon_and_engine_recovery(
+    tmp_path: Path,
+):
+    """A daemon handoff preserves the order used to relaunch its engine."""
+    name = "qwen3-expert-recovery"
+    environment = _plugin(tmp_path / "plugins", "experts", EXPERT_PLUGIN)
+    options = ("--set", "kv_cache_config.host_gib=8")
+    with _serve(tmp_path, name, options=options, env=environment) as (
+        base_url,
+        log,
+    ):
+        successor = None
+        try:
+            layers = _layers(base_url)
+            layer = min(layers)
+            order = list(reversed(range(layers[layer])))
+            body = {**_body(name, stream=False), "max_completion_tokens": 4096}
+            reference = httpx.post(
+                f"{base_url}/v1/chat/completions", json=body, timeout=600
+            )
+            assert reference.status_code == 200, reference.text
+            reference = reference.json()
+            expected = [
+                item["token"]
+                for item in reference["choices"][0]["logprobs"]["content"]
+            ]
+            changed = _admin(
+                base_url, "rebalance_experts", {"order": {layer: order}}
+            )
+            assert changed.status_code == 200, changed.text
+
+            streaming = Streaming(
+                base_url,
+                name,
+                body={
+                    **body,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+            )
+            streaming.wait_for(64)
+            (engine,) = _pids(log, "Engine")
+            restarted = _admin(base_url, "restart")
+            assert restarted.status_code == 200, restarted.text
+            successor = restarted.json()["result"]["pid"]
+            streaming.mark()
+            streaming.wait_for(streaming.marked + 64)
+
+            # This PID belongs to the isolated deployment started above.
+            # The successor daemon must reconstruct its committed order.
+            os.kill(engine, signal.SIGTERM)
+            _wait_until(
+                lambda: (
+                    not _runs(engine)
+                    and bool(_pids(log, "Engine") - {engine})
+                    and httpx.get(f"{base_url}/health", timeout=10).status_code
+                    == 200
+                ),
+                180,
+                "the successor daemon did not recover its engine",
+            )
+            distribution = _admin(
+                base_url, "hooks/expert_distribution", {"layer": layer}
+            )
+            assert distribution.status_code == 200, distribution.text
+            assert distribution.json()["result"]["results"] == [{layer: order}]
+            streaming.mark()
+            streaming.wait_for(streaming.marked + 64)
+            streaming.join()
+            assert streaming.tokens == expected
+            assert streaming.usage == reference["usage"]
+        finally:
+            # A hot-restarted daemon is no longer the fixture's child.
+            if successor is not None and _runs(successor):
+                os.kill(successor, signal.SIGTERM)
+                _wait_until(
+                    lambda: not _runs(successor),
+                    120,
+                    "the successor daemon did not stop",
+                )
