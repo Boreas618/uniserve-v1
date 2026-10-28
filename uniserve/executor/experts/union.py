@@ -99,6 +99,9 @@ class ExpertUnion:
         # alone, replayed by an empty microbatch of a populated step.
         self._joins: JoinGraphs | None = None
         self._microbatch_joins: list[JoinGraphs] = []
+        # The captured joins and microbatch joins an eager union set aside
+        # (:meth:`run_eager`); their pools' memory is given back meanwhile.
+        self._eager_joins: tuple[JoinGraphs, list[JoinGraphs]] | None = None
         self._warming = True
         self._closed = False
 
@@ -410,6 +413,25 @@ class ExpertUnion:
 
     # Standby: collective over the union, while no step runs.
 
+    def run_eager(self, eager: bool) -> None:
+        """Join eagerly in rotation (``eager``), as before the joins were
+        captured, or replay the captured joins again.
+
+        With the joins set aside, this rank's forwards run eagerly too
+        (:meth:`replays`), so every rank of the union submits in the same
+        rotation; the worker gives the joins' graph memory back meanwhile.
+        Every rank of the union switches between the same two steps.
+        """  # noqa: D205
+        # Both kinds of captured join live in the join pools the worker
+        # gives back: an empty microbatch of a populated step must join
+        # eagerly as well (:meth:`_microbatch_join`).
+        if eager and self._joins is not None:
+            self._eager_joins = (self._joins, self._microbatch_joins)
+            self._joins, self._microbatch_joins = None, []
+        elif not eager and self._eager_joins is not None:
+            self._joins, self._microbatch_joins = self._eager_joins
+            self._eager_joins = None
+
     def suspend(self) -> bool:
         """Release workspaces that keep their addresses; whether any did."""
         # Every exchange suspends (a collective), whatever the others did.
@@ -534,8 +556,13 @@ class ExpertUnion:
     def _release_joins(self) -> None:
         joins, self._joins = self._joins, None
         microbatch_joins, self._microbatch_joins = self._microbatch_joins, []
+        # Joins an eager union set aside are released with the others.
+        aside: list[JoinGraphs] = []
+        if self._eager_joins is not None:
+            aside = [self._eager_joins[0], *self._eager_joins[1]]
+            self._eager_joins = None
         failure: BaseException | None = None
-        for graphs in (joins, *microbatch_joins):
+        for graphs in (joins, *microbatch_joins, *aside):
             if graphs is None:
                 continue
             try:

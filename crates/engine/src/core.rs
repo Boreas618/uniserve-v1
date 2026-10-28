@@ -1164,14 +1164,16 @@ impl SchedulerHandle {
     }
 
     /// Runs the worker hook `name` with the JSON `payload` on every worker
-    /// once the batches in flight complete; the receiver gets each worker's
-    /// result, or why the hook failed.
+    /// once the batches in flight complete, together with the other
+    /// schedulers of `together` (`HookBarrier`); the receiver gets each
+    /// worker's result, or why the hook failed.
     pub fn hook(
         &self,
         name: String,
         payload: String,
+        together: Arc<crate::HookBarrier>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        self.commands.hook(name, payload)
+        self.commands.hook(name, payload, together)
     }
 
     /// Takes other scheduling limits and policy from the next step on; the

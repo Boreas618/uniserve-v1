@@ -922,6 +922,7 @@ impl Worker {
             devices: self.config.devices().filter_map(Device::cuda).collect(),
             bookings: self.bookings.clone(),
             host_cache: self.host_cache.take(),
+            graph_pools: self.graphs.pools(),
         };
         // The rank serves with CUPTI attached (`crate::profiling::cupti`),
         // unless a profiler holds it; the control thread's (this one's)

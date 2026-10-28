@@ -90,6 +90,9 @@ pub(crate) struct Maintenance {
     /// loaded no model.
     pub(crate) weights: Option<crate::worker::update::WeightUpdate>,
     pub(crate) pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
+    /// Those of `pools` that hold captured graphs alone: an eager rank gives
+    /// them back, and keeps the streams' scratch its forwards use.
+    pub(crate) graph_pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
     /// Whether the worker sleeps: its graph memory suspended and its cache
     /// given back.
     pub(crate) asleep: bool,
@@ -639,6 +642,11 @@ impl Service<'_> {
     ///   the engine sizes the world's host KV cache at, and answers what the
     ///   rank reports of each pool (`ipc::PagePoolInfo`); a rank that copies
     ///   no page through the host KV cache answers `null`;
+    /// - `uniserve.eager` (`{"eager": bool}`): serves every forward and
+    ///   expert join eagerly and gives back the captured graphs' memory, or
+    ///   restores that memory at its addresses and serves by the graphs
+    ///   again; a rank whose computations serve by their graphs alone
+    ///   refuses;
     /// - `uniserve.update_weights` (`{"model_path": path}`): rewrites the
     ///   weights in place from the checkpoint at `path`
     ///   (`crate::worker::update`), and answers the rank's worker group and
@@ -766,6 +774,56 @@ impl Service<'_> {
                 tracing::info!(tokens, pools = pools.len(), "mapped the host KV cache");
                 serde_json::to_value(pools)
                     .map_err(|error| Error::Invalid(format!("host_cache result: {error}")))?
+            }
+            "uniserve.eager" => {
+                let eager = payload["eager"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Invalid("eager names no switch".into()))?;
+                // A rank joins the union's steps of other schedulers outside
+                // its own batches, replaying captured joins from the pools
+                // given back below. The engine runs this hook once no
+                // scheduler has a batch in flight (`engine::HookBarrier`), so
+                // no step is agreed any more; the join in flight completes,
+                // and its device work with it.
+                while self.executor.backend().joining() {
+                    self.executor.backend().await_completion(EXPERT_POLL)?;
+                    self.executor.advance().map_err(|error| {
+                        Error::Invariant(format!("the expert join in flight failed: {error}"))
+                    })?;
+                }
+                // The executor switches its computations' forwards and its
+                // expert union's joins. An expert-only rank holds no
+                // computation, but its union replays captured joins from the
+                // pools given back below: a replay over unmapped pool memory
+                // faults on the device and leaves its peers waiting in the
+                // step's exchange.
+                let executor = self.executor.backend().executor();
+                // No forward or join replays a graph while its memory is given
+                // back: the executor switches before it goes and after it
+                // returns.
+                if eager {
+                    if let Some(executor) = executor {
+                        executor.run_eager(true)?;
+                    }
+                    for pool in &self.maintenance.graph_pools {
+                        pool.suspend()?;
+                    }
+                    // The ledgers no longer book the graph memory given back,
+                    // which the successor's preparation may then use.
+                    self.book_memory(false)?;
+                } else {
+                    // The graph memory is booked again before it is restored,
+                    // refused past the quota.
+                    self.book_memory(true)?;
+                    for pool in &self.maintenance.graph_pools {
+                        pool.restore()?;
+                    }
+                    if let Some(executor) = executor {
+                        executor.run_eager(false)?;
+                    }
+                }
+                tracing::info!(eager, "switched how the rank serves its forwards");
+                serde_json::json!({ "eager": eager })
             }
             "uniserve.release_cache" => {
                 let first = payload["from"]
@@ -1164,6 +1222,7 @@ mod tests {
                 devices: Vec::new(),
                 bookings: Vec::new(),
                 host_cache: None,
+                graph_pools: Vec::new(),
             },
         )
         .run()

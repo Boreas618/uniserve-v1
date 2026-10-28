@@ -675,15 +675,22 @@ fn submit_all(
     }
 }
 
-/// Runs the worker hook on every scheduler's workers, on a thread of its own
-/// so that the daemons' other commands go on, and answers the daemon
-/// `front` with `Hooked`.
+/// Runs the worker hook on every scheduler's workers, all schedulers at once
+/// (`engine::HookBarrier`), on a thread of its own so that the daemons'
+/// other commands go on, and answers the daemon `front` with `Hooked`.
 fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
     tracing::info!(hook = hook.name, "running a worker hook");
+    let together = crate::HookBarrier::new(routing.slots.len());
     let answers: Vec<_> = routing
         .slots
         .iter()
-        .map(|slot| slot.handle.hook(hook.name.clone(), hook.payload.clone()))
+        .map(|slot| {
+            slot.handle.hook(
+                hook.name.clone(),
+                hook.payload.clone(),
+                Arc::clone(&together),
+            )
+        })
         .collect();
     answer_hooked(hook.id, answers, front, routing);
 }

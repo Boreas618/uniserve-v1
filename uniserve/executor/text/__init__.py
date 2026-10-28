@@ -463,6 +463,13 @@ class TextExecutor:
         for computation in self.computations.values():
             computation.seal()
 
+    def run_eager(self, eager: bool) -> None:
+        """Serve every computation eagerly (``eager``), or by the graphs
+        captured at startup again.
+        """  # noqa: D205
+        for computation in self.computations.values():
+            computation.run_eager(eager)
+
     def reopen_experts(self) -> None:
         """Release every computation's graphs so warmup captures them anew.
 

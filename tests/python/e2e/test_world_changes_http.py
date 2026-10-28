@@ -737,6 +737,50 @@ def test_an_operator_rollback_resumes_the_previous_world(
     ), "a world read the checkpoint again rather than the retained weights"
 
 
+def _forwards(base_url: str, mode: str) -> float:
+    """The forwards every world ran in ``mode`` so far (``eager`` or
+    ``graph_replay``; ``uniserve:worker_forward_mode_counts``), once the
+    reports of what came before arrived.
+    """  # noqa: D205
+    time.sleep(REPORT_SETTLE)
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith("uniserve:worker_forward_mode_counts")
+        and f'mode="{mode}"' in line
+    )
+
+
+@pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
+def test_a_serving_world_gives_its_graph_memory_to_a_preparing_successor(
+    tmp_path: Path, topology: str
+):
+    devices, options = _topology(topology, tmp_path)
+    name = "qwen3-world-eager"
+    with _serve(tmp_path, name, devices, options) as (base_url, _log):
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        eager = _forwards(base_url, "eager")
+
+        # The serving world decodes the count eagerly while the successor
+        # prepares in its graph memory.
+        _world_change(base_url, CHANGE, "update_config.eager_prepare=true")
+        assert _forwards(base_url, "eager") > eager
+
+        # Resumed, the previous world replays its graphs again.
+        rolled = _admin(
+            base_url, "config/rollback", {"reason": "the operator's check"}
+        )
+        assert rolled.status_code == 200, rolled.text
+        replays = _forwards(base_url, "graph_replay")
+        eager = _forwards(base_url, "eager")
+        streaming.wait_for(len(streaming.tokens) + 64)
+        assert _forwards(base_url, "graph_replay") > replays
+        assert _forwards(base_url, "eager") == eager
+        streaming.join()
+
+
 # The plugin of a release that revised what the normalization computes: the
 # next world declares another revision of it, while the arithmetic stays as
 # it was, so the requests a world change moves compute the same tokens

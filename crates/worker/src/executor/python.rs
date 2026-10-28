@@ -45,6 +45,7 @@ struct Functions {
     warmup_phase: Function,
     warmup_finish: Function,
     seal: Function,
+    run_eager: Function,
     start: Function,
     release: Function,
     prepare: Function,
@@ -87,6 +88,7 @@ impl PythonExecutor {
                 warmup_phase: method("warmup_phase")?,
                 warmup_finish: method("warmup_finish")?,
                 seal: method("seal")?,
+                run_eager: method("run_eager")?,
                 start: method("start")?,
                 release: method("release")?,
                 prepare: method("prepare")?,
@@ -170,6 +172,14 @@ impl PythonExecutor {
     /// Refuse further captures: every graph serving replays is resident.
     pub(crate) fn seal(&self) -> Result<()> {
         self.unit(&self.functions.seal, Vec::new())
+    }
+
+    /// Serve every forward and expert join eagerly (`eager`), or by the
+    /// graphs captured at startup again (`uniserve.executor.run_eager`).
+    /// Fails, switching nothing, for a rank whose computations serve by
+    /// their graphs alone.
+    pub(crate) fn run_eager(&self, eager: bool) -> Result<()> {
+        self.unit(&self.functions.run_eager, vec![Argument::Bool(eager)])
     }
 
     /// The call that admits started requests (`requests`: JSON of their
