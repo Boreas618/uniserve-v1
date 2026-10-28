@@ -1951,11 +1951,13 @@ def test_a_change_across_hosts_continues_a_streaming_request(
             ledgers = _ledgers(_config(base_url))
             assert (serving["world"],) not in _worlds_of(ledgers, "weights")
 
-        # Rank assignment is part of the committed configuration. The
-        # direct start must load those same logical shards on each GPU.
-        direct_config = tmp_path / "committed.toml"
-        direct_config.write_text(_config(base_url)["config"])
-        target = ("--config", str(direct_config))
+        # The direct start loads the same logical shards on each GPU.
+        order = report["redistribution"]["devices"]
+        target += (
+            "--set",
+            f"placement_config.devices={json.dumps(order)}",
+        )
+        (tmp_path / "committed.toml").write_text(_config(base_url)["config"])
         (changed_path / "weights.json").write_text(json.dumps(changed))
 
     lines = _log_lines(log) + _log_lines(changed_path / "follower.log")
