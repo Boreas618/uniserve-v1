@@ -30,8 +30,8 @@ use std::time::Duration;
 use prost::Message as _;
 use proto::process::{
     Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node, Reply,
-    Request, Spawned, Stopped, ToMember, Upstream, WeightsKept, Welcome, downstream, event,
-    from_member, hello, reply, request, to_member, upstream,
+    Request, Spawned, Stopped, ToMember, Upstream, Welcome, downstream, event, from_member, hello,
+    reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
@@ -152,10 +152,11 @@ impl Local {
                 Err(error) => reply.error = format!("{error:#}"),
             },
             Some(request::Kind::KeepWeights(keep)) => {
-                match self.claims.keep_weights(&keep.deployment, &keep.worlds) {
-                    Ok(released) => {
-                        reply.kind = Some(reply::Kind::WeightsKept(WeightsKept { released }));
-                    }
+                match self
+                    .claims
+                    .keep_weights(&keep.deployment, &keep.worlds, keep.to_host)
+                {
+                    Ok(kept) => reply.kind = Some(reply::Kind::WeightsKept(kept)),
                     Err(error) => reply.error = format!("{error:#}"),
                 }
             }

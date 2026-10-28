@@ -339,6 +339,14 @@ message ResizeCache {
   // their state in units of its own.
   bool successor_loads_weights = 5;
   bool successor_recomputes_cache = 6;
+  // With `keep_weights`: the worlds keep their weights in host memory
+  // (`update_config.previous_world = "host"`), which moves the weights each
+  // world alone retains there through every node's Transfer Server; a node
+  // that cannot keeps them on its GPUs. The `Hooked` answer then carries
+  // each node's report first, as JSON `{"kept": {"host", "released",
+  // "moved_bytes", "refused"}}`, `refused` saying why a node kept the
+  // weights on its GPUs.
+  bool keep_in_host_memory = 7;
 }
 
 enum CacheChange {

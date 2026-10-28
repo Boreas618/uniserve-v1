@@ -958,6 +958,7 @@ def _weights_of(base_url: str) -> set[tuple[int, ...]]:
         ("parked", "commit"),
         ("parked", "rollback"),
         ("weights", "rollback"),
+        ("host", "rollback"),
     ],
 )
 def test_a_change_of_model_files_loads_the_successors_weights(
@@ -968,8 +969,9 @@ def test_a_change_of_model_files_loads_the_successors_weights(
     successor does not map; the count streaming meanwhile continues on the
     state it reached. The successor answers with its weights. A commit
     leaves its weights alone on the GPU; a rollback answers as before on the
-    previous world: parked, or started again on the weights it kept on the
-    GPU.
+    previous world: parked, started again on the weights it kept on the GPU,
+    or on the weights it kept in host memory, which return to the GPU
+    first.
     """  # noqa: D205
     name = "qwen3-world-weights"
     updated = _updated_checkpoint()
@@ -991,6 +993,11 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         assert memory["feasible"] is True, memory
         for gpu in memory["gpus"]:
             assert gpu["successor"]["weights"] == gpu["serving"]["weights"], gpu
+        if previous_world == "host":
+            # The host admits the previous world's weights in host memory.
+            for host in memory["hosts"]:
+                assert host["previous_world_weights"] > 0, host
+                assert host["feasible"] is True, host
         report = _world_change(base_url, *change)
         streaming.mark()
         world = report["world"]
@@ -1004,10 +1011,21 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         )
 
         # The successor answers with its own weights. The previous world
-        # keeps its weights on the GPU.
+        # keeps its weights on the GPU, or in host memory, which leaves the
+        # GPU's ledger with the successor's alone.
         changed = _chat(base_url, name, CACHED_PROMPT)
         assert changed != original, "the checkpoints answer alike"
-        assert _weights_of(base_url) == {(previous,), (world,)}
+        if previous_world == "host":
+            assert report["moved_to_host_bytes"] > 0, report
+            assert _weights_of(base_url) == {(world,)}
+            (kept,) = [
+                slot
+                for slot in _config(base_url)["slots"]
+                if slot["world"] == previous
+            ]
+            assert kept["state"] == "host", kept
+        else:
+            assert _weights_of(base_url) == {(previous,), (world,)}
         streaming.wait_for(streaming.marked + 32)
 
         if end == "commit":

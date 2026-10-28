@@ -126,10 +126,14 @@ impl Scheduler {
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(retired);
             }
-            Command::KeepWeights { worlds, answer } => {
+            Command::KeepWeights {
+                worlds,
+                to_host,
+                answer,
+            } => {
                 let kept = self
                     .executor
-                    .keep_weights(&worlds)
+                    .keep_weights(&worlds, to_host)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(kept);
             }

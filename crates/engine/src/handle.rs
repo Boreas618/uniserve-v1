@@ -600,11 +600,12 @@ pub enum Command {
     /// (`Executor::ledgers`), and answers with each node's.
     Ledgers(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Keeps the weights alone of other worlds on the nodes of the
-    /// scheduler's workers (`Executor::keep_weights`), and answers whether
-    /// it did.
+    /// scheduler's workers, in host memory when `to_host`
+    /// (`Executor::keep_weights`), and answers with each node's report.
     KeepWeights {
         worlds: Vec<u64>,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        to_host: bool,
+        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Reports the KV cache each worker group holds now
     /// (`Scheduler::describe_cache`).
@@ -877,13 +878,19 @@ impl CommandSender {
     }
 
     /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
-    /// workers (`Command::KeepWeights`); the receiver gets whether it did.
+    /// workers, in host memory when `to_host` (`Command::KeepWeights`); the
+    /// receiver gets each node's report.
     pub fn keep_weights(
         &self,
         worlds: Vec<u64>,
-    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        to_host: bool,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, kept) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::KeepWeights { worlds, answer });
+        let _ = self.send(Command::KeepWeights {
+            worlds,
+            to_host,
+            answer,
+        });
         kept
     }
 

@@ -1493,10 +1493,10 @@ impl Executor for WorkerExecutor {
 
     /// Keeps the weights alone of `worlds` through the deployment's claims,
     /// which every group shares.
-    fn keep_weights(&mut self, worlds: &[u64]) -> anyhow::Result<()> {
+    fn keep_weights(&mut self, worlds: &[u64], to_host: bool) -> anyhow::Result<Vec<String>> {
         match self.workers.first() {
-            Some((_, group)) => group.claims().keep_weights(worlds),
-            None => Ok(()),
+            Some((_, group)) => group.claims().keep_weights(worlds, to_host),
+            None => Ok(Vec::new()),
         }
     }
 

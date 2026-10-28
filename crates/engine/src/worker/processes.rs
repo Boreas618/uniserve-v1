@@ -26,12 +26,19 @@ use anyhow::Context as _;
 use proto::Connection;
 use proto::process::{
     Claim, Downstream, Exit, Hello, KeepWeights, LedgerQuery, Node, Request, Reserve, Scope, Spawn,
-    Stop, Upstream, Welcome, downstream, event, hello, reply, request, upstream,
+    Stop, Upstream, WeightsKept, Welcome, downstream, event, hello, reply, request, upstream,
 };
 
 /// Longest the leader takes to answer a request the engine sends: a claim
 /// may start a node's Storage Server, which takes up to 30 seconds.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Longest the leader takes to answer a request that may move a world's
+/// weights between a node's GPUs and its host memory (a claim, which
+/// returns them, and keeping them in host memory): the node's Transfer
+/// Server registers host memory of every GPU's weights and copies them
+/// over the node's host links.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The deployment's connection to its daemons, shared by its worker groups.
 pub(crate) type Processes = Arc<Mutex<ProcessClient>>;
@@ -223,8 +230,9 @@ impl ProcessClient {
     }
 
     /// Has node `host`'s daemon keep the weights alone of `worlds` of
-    /// `deployment` at its Storage Server; returns how many storages it
-    /// released.
+    /// `deployment` at its Storage Server, in host memory when `to_host`;
+    /// returns what it released and moved, and why it kept the weights on
+    /// its GPUs when it could not move them.
     ///
     /// # Errors
     ///
@@ -234,16 +242,24 @@ impl ProcessClient {
         host: &str,
         deployment: &str,
         worlds: &[u64],
-    ) -> anyhow::Result<u64> {
+        to_host: bool,
+    ) -> anyhow::Result<WeightsKept> {
+        let kind = request::Kind::KeepWeights(KeepWeights {
+            host: host.to_owned(),
+            deployment: deployment.to_owned(),
+            worlds: worlds.to_vec(),
+            to_host,
+        });
+        let timeout = if to_host {
+            MOVE_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
         match self
-            .request(request::Kind::KeepWeights(KeepWeights {
-                host: host.to_owned(),
-                deployment: deployment.to_owned(),
-                worlds: worlds.to_vec(),
-            }))
+            .request_within(kind, timeout)
             .with_context(|| format!("keeping the weights alone of worlds {worlds:?} on {host}"))?
         {
-            reply::Kind::WeightsKept(kept) => Ok(kept.released),
+            reply::Kind::WeightsKept(kept) => Ok(kept),
             other => anyhow::bail!("the daemon answered keeping weights with {other:?}"),
         }
     }
@@ -285,17 +301,20 @@ impl ProcessClient {
         server_arguments: Vec<String>,
     ) -> anyhow::Result<ipc::StorageLaunch> {
         let claimed = match self
-            .request(request::Kind::Claim(Claim {
-                host: host.to_owned(),
-                deployment: deployment.to_owned(),
-                scopes: scopes
-                    .into_iter()
-                    .map(|(group, rank)| Scope { group, rank })
-                    .collect(),
-                server_arguments,
-                world,
-                retire,
-            }))
+            .request_within(
+                request::Kind::Claim(Claim {
+                    host: host.to_owned(),
+                    deployment: deployment.to_owned(),
+                    scopes: scopes
+                        .into_iter()
+                        .map(|(group, rank)| Scope { group, rank })
+                        .collect(),
+                    server_arguments,
+                    world,
+                    retire,
+                }),
+                MOVE_TIMEOUT,
+            )
             .with_context(|| format!("claiming the deployment's storage on host {host}"))?
         {
             reply::Kind::Claimed(claimed) => claimed,
@@ -380,6 +399,15 @@ impl ProcessClient {
     /// Sends one request and waits for its answer, filing the exits that
     /// arrive meanwhile.
     fn request(&mut self, kind: request::Kind) -> anyhow::Result<reply::Kind> {
+        self.request_within(kind, REQUEST_TIMEOUT)
+    }
+
+    /// [`Self::request`], waiting at most `timeout` for the answer.
+    fn request_within(
+        &mut self,
+        kind: request::Kind,
+        timeout: Duration,
+    ) -> anyhow::Result<reply::Kind> {
         let id = self.next_request;
         self.next_request += 1;
         self.connection.send(&Upstream {
@@ -388,12 +416,12 @@ impl ProcessClient {
                 kind: Some(kind),
             })),
         })?;
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
                 !remaining.is_zero(),
-                "the daemon did not answer within {REQUEST_TIMEOUT:?}"
+                "the daemon did not answer within {timeout:?}"
             );
             let Some(message) = self
                 .connection

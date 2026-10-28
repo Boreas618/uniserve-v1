@@ -157,28 +157,57 @@ impl Claims {
     /// Keeps the weights alone of every world of `worlds` on each node of
     /// the engine's: a previous world kept as its weights, whose processes
     /// exited, keeps nothing else, so each GPU's ledger leaves the rest to
-    /// this world.
+    /// this world. With `to_host` the weights then move to host memory,
+    /// which leaves this world their device memory too; a node that cannot
+    /// move them keeps them on its GPUs.
+    ///
+    /// Returns each node's report as JSON: `{"host", "released",
+    /// "moved_bytes", "refused"}`, `refused` saying why a node kept the
+    /// weights on its GPUs when `to_host` asked otherwise.
     ///
     /// # Errors
     ///
     /// Fails when a node's daemon or Storage Server refuses.
-    pub(crate) fn keep_weights(&self, worlds: &[u64]) -> anyhow::Result<()> {
+    pub(crate) fn keep_weights(
+        &self,
+        worlds: &[u64],
+        to_host: bool,
+    ) -> anyhow::Result<Vec<String>> {
         if worlds.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut reports = Vec::with_capacity(self.scopes.len());
         for host in self.scopes.keys() {
-            crate::worker::processes::lock(&self.processes)?.keep_weights(
+            let kept = crate::worker::processes::lock(&self.processes)?.keep_weights(
                 host,
                 &self.deployment,
                 worlds,
+                to_host,
             )?;
+            if !kept.refused.is_empty() {
+                tracing::warn!(
+                    host,
+                    refused = %kept.refused,
+                    "a node keeps the weights on its GPUs"
+                );
+            }
+            reports.push(
+                serde_json::json!({
+                    "host": host,
+                    "released": kept.released,
+                    "moved_bytes": kept.moved_bytes,
+                    "refused": (!kept.refused.is_empty()).then_some(kept.refused),
+                })
+                .to_string(),
+            );
         }
         tracing::info!(
             deployment = %self.deployment,
             ?worlds,
+            to_host,
             "worlds keep their weights alone on every node of the engine"
         );
-        Ok(())
+        Ok(reports)
     }
 
     /// The memory ledgers of every node of the engine's: for each host, the
