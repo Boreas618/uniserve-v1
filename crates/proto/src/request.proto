@@ -339,6 +339,9 @@ message ResizeCache {
   // their state in units of its own.
   bool successor_loads_weights = 5;
   bool successor_recomputes_cache = 6;
+  // For a shrink or a plan: the successor's graph policy captures graphs,
+  // so its warmup takes a graph share where its model can be captured.
+  bool successor_captures_graphs = 8;
   // With `keep_weights`: the worlds keep their weights in host memory
   // (`update_config.previous_world = "host"`), which moves the weights each
   // world alone retains there through every node's Transfer Server; a node

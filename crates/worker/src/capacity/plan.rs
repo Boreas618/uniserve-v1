@@ -334,7 +334,9 @@ impl TokenLayout {
     /// Fit the cache pool beside the fixed storage and agree its unit count.
     ///
     /// The pool takes the grant left after a graph-capture reservation (10%
-    /// of the device) and the fixed storage, in whole units. Graph padding
+    /// of the device, for a rank whose graph policy captures; none for one
+    /// that serves every call eagerly) and the fixed storage, in whole
+    /// units. Graph padding
     /// takes no unit: padding rows read the sentinel unit and write no K/V.
     /// A configured token capacity sizes the pool instead. `total_bytes` is
     /// the device's total memory, zero on CPU. `unit_overhead` is device
@@ -357,7 +359,12 @@ impl TokenLayout {
             .iter()
             .map(|group| (group.block_size, group.units_per_page))
             .collect();
-        let reserved_units = graph_storage_budget_bytes(total_bytes as i64).div_ceil(unit_bytes)
+        let graphs = if config.graph_policy == "off" {
+            0
+        } else {
+            graph_storage_budget_bytes(total_bytes as i64)
+        };
+        let reserved_units = graphs.div_ceil(unit_bytes)
             + self
                 .fixed
                 .get(&config.device)
@@ -851,6 +858,41 @@ pub(crate) mod tests {
             plan.arena.transfer_bytes,
             capacity.num_units * unit * plan.arena.transfer_tickets as u64
         );
+    }
+
+    /// A rank that serves every call eagerly (its graph policy resolved to
+    /// `off`) captures nothing: its pool takes the graph share too.
+    #[test]
+    fn an_eager_rank_reserves_no_graph_share() {
+        let gib = 1u64 << 30;
+        let config = |graph_policy: &str| WorkerConfig {
+            device: Device::Cuda(DeviceId(0)),
+            max_batch_calls: 8,
+            max_batch_tokens: 2048,
+            max_request_pool_size: 8,
+            pool_storage_bytes: Some((20 * gib) as usize),
+            pool_storage_full_bytes: Some((20 * gib) as usize),
+            graph_policy: graph_policy.into(),
+            ..cpu_config()
+        };
+        let facts = TokenFacts {
+            image_processor: false,
+            vision_feature_bytes: 0,
+            latent_feature_bytes: 0,
+            latent: None,
+        };
+        let units = |config: &WorkerConfig| {
+            let mut layout = TokenLayout::new(report(), config, 2, &facts).unwrap();
+            // Without granularity the pool keeps the units it fitted.
+            layout
+                .fit_cache(&cache(), 0, config, 100 * gib, None, &group())
+                .unwrap()
+                .num_units
+        };
+        let unit = cache().unit_bytes;
+        let captured = units(&config("auto"));
+        let eager = units(&config("off"));
+        assert_eq!(eager - captured, (10 * gib).div_ceil(unit));
     }
 
     #[test]

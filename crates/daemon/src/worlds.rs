@@ -718,6 +718,10 @@ impl Leader {
             recomputes_cache: redistributes
                 || kv_encoding_changes(&served, &target_spec)
                 || (!reloaded.is_empty() && request.in_flight == InFlight::Recompute),
+            captures_graphs: target_spec
+                .cuda_graphs
+                .as_ref()
+                .is_none_or(|graphs| graphs.policy != "off"),
         };
         let running = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
         let weights = if !unmapped.is_empty() {
@@ -1723,6 +1727,7 @@ mod tests {
         let reloading = Successor {
             loads_weights: true,
             recomputes_cache: true,
+            captures_graphs: true,
         };
         let parked = steps(&gpu, PreviousWorld::Parked, reloading);
         assert_eq!(
