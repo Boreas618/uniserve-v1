@@ -87,9 +87,9 @@ impl Scheduler {
             let _ = answer.send(Err("another KV cache change is in progress".to_owned()));
             return;
         }
-        let started = match change {
+        let started = match change.clone() {
             CacheChange::Shrink { successor, .. } => {
-                self.start_shrink(successor).map(|(from, plan)| {
+                self.start_shrink(&successor).map(|(from, plan)| {
                     from.map(|from| Pending::Shrink {
                         from,
                         plan: plan.clone(),
@@ -106,7 +106,7 @@ impl Scheduler {
             }),
             CacheChange::Plan(successor) => {
                 let _ = answer.send(
-                    self.plan_preparation(successor)
+                    self.plan_preparation(&successor)
                         .map(|preparation| preparation.plans),
                 );
                 return;
@@ -492,7 +492,7 @@ impl Scheduler {
     /// every device and host.
     pub(super) fn plan_preparation(
         &mut self,
-        successor: crate::Successor,
+        successor: &crate::Successor,
     ) -> Result<Preparation, String> {
         // The units the requests in flight hold now: a successor that maps
         // none of this cache computes their state in as many of its own.
@@ -515,7 +515,14 @@ impl Scheduler {
         for report in &reports {
             let mut plan = preparing(report, floor, successor, in_flight_units)?;
             let mut kept = plan.segments_kept;
-            if let Some(capacity) = report.capacity_units {
+            // A configured capacity holds the successor's cache: the
+            // segments it inherits from this one and its head. A successor
+            // that maps none of this cache inherits none, and its own
+            // capacity sizes the cache it lays out.
+            if let Some(capacity) = report
+                .capacity_units
+                .filter(|_| !successor.recomputes_cache)
+            {
                 let head_units = report.head_bytes.div_ceil(report.unit_bytes.max(1));
                 while kept > floor && u64::from(report.first_unit(kept)) + head_units > capacity {
                     kept -= 1;
@@ -617,7 +624,7 @@ impl Scheduler {
     /// keeps all its cache, and each device's plan.
     fn start_shrink(
         &mut self,
-        successor: crate::Successor,
+        successor: &crate::Successor,
     ) -> Result<(Option<u32>, Vec<String>), String> {
         let Preparation { tail, plans } = self.plan_preparation(successor)?;
         let Some((segment, unit)) = tail else {

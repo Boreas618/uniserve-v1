@@ -196,6 +196,11 @@ impl EngineControl {
         &self.request_address
     }
 
+    /// The daemon process interface used to launch planning ranks on their nodes.
+    pub(crate) fn process_address(&self) -> &str {
+        &self.processes
+    }
+
     /// The identity the next engine this control starts takes.
     pub fn next_engine(&self) -> u64 {
         self.next_engine.load(Ordering::Relaxed)

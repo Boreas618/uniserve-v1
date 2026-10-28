@@ -50,6 +50,7 @@ use std::sync::Arc;
 
 use cuda::{DeviceAllocation, DeviceId, Protection};
 use sha2::{Digest, Sha256};
+use storage::manifest::weights::RetainedStorage;
 use storage::manifest::{self, Field, StorageLayout};
 use storage::protocol::Access;
 use storage::{Key, Mode, Placement, StorageRecord, TensorRecord};
@@ -73,15 +74,15 @@ const RETAINED: &str = "uniserve.loading.retained";
 /// alignment torch's allocator gives a storage.
 const PACK_ALIGNMENT: u64 = 512;
 
-/// The version of the manifest this worker writes and binds; a manifest of
-/// another version names no tensor this worker binds. Its `tensors` are
-/// those `uniserve.loading.retained.Layout.manifest` writes, of the same
-/// version.
-const MANIFEST_VERSION: u64 = 6;
+/// The version of the manifest this worker writes and binds
+/// (`storage::manifest::weights`); a manifest of another version names no
+/// tensor this worker binds. Its `tensors` are those
+/// `uniserve.loading.retained.Layout.manifest` writes, of the same version.
+use storage::manifest::weights::VERSION as MANIFEST_VERSION;
 
-/// The name a rank's manifest is retained under, by which a worker of
-/// another position finds the weights other worlds hold.
-const MANIFEST_NAME: &str = "weights manifest";
+/// The name a rank's manifest is retained under, by which the manifests a
+/// world retains are found.
+use storage::manifest::weights::NAME as MANIFEST_NAME;
 
 /// The identity of what `model`'s forwards compute: its components'
 /// functions and formats (`uniserve.loading.rank.identity`), which keys
@@ -212,16 +213,6 @@ struct ManifestTensor {
     fields: Vec<String>,
 }
 
-/// One retained storage of a manifest.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct RetainedStorage {
-    /// The index of the storage's device among the worker's devices;
-    /// `None` for the host region of a streamed stack.
-    device: Option<usize>,
-    #[serde(flatten)]
-    storage: manifest::Storage,
-}
-
 /// Weights a worker moved into retained memory and has not put yet: the
 /// host regions of layers streamed from host memory join them
 /// ([`Published::add_host`]) before [`Published::put`].
@@ -289,6 +280,46 @@ impl WeightKeys {
             devices,
             degrees.to_vec(),
         ))
+    }
+
+    /// The keys [`WeightKeys::new`] gives the same rank, for a rank that
+    /// plans its weights before its world starts and holds no connection to
+    /// a Storage Server: each device's GPU is read from the driver.
+    pub(crate) fn planning(
+        fingerprints: &Fingerprints,
+        position: &[u8],
+        devices: &[DeviceId],
+        degrees: &[u64],
+    ) -> Result<Self> {
+        let devices = devices
+            .iter()
+            .map(|device| Ok((*device, device.uuid()?.0)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self::keyed(
+            fingerprints,
+            position.to_vec(),
+            devices,
+            degrees.to_vec(),
+        ))
+    }
+
+    /// The storages `planned` (this rank's, [`WeightKeys::plan`]) takes on
+    /// the rank's one GPU, as a target rank of a copy manifest; `None` when
+    /// they span devices or include a stack's host region, which a rank
+    /// does not receive.
+    pub(crate) fn planned_storages(&self, planned: &Planned) -> Option<Vec<manifest::Storage>> {
+        (self.devices.len() == 1
+            && planned
+                .storages
+                .iter()
+                .all(|storage| storage.device == Some(0)))
+        .then(|| {
+            planned
+                .storages
+                .iter()
+                .map(|storage| storage.storage.clone())
+                .collect()
+        })
     }
 
     fn keyed(
@@ -820,7 +851,7 @@ impl WeightKeys {
 
     /// The fingerprint digests a manifest of this worker names, in hex
     /// (`WeightManifest::fingerprints`).
-    fn fingerprint_digests(&self) -> BTreeMap<String, String> {
+    pub(crate) fn fingerprint_digests(&self) -> BTreeMap<String, String> {
         std::iter::once((String::new(), hex(&self.structure)))
             .chain(
                 self.sources

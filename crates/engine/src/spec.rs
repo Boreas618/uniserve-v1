@@ -149,6 +149,7 @@ impl EngineConfig {
             world: spec.world,
             retire: spec.retire.clone(),
             predecessor: None,
+            received_weights: None,
             model: spec.model.clone(),
             weights: stated(&workers.weights),
             host: spec.host.clone(),
@@ -308,6 +309,19 @@ impl EngineConfig {
                     )
                 })
                 .collect(),
+            received_weights: spec
+                .received_weights
+                .iter()
+                .map(|group| {
+                    Ok((
+                        group.worker_group.clone(),
+                        ipc::ReceivedWeights {
+                            world: group.world,
+                            manifest: group.manifest.clone(),
+                        },
+                    ))
+                })
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 }
@@ -339,14 +353,56 @@ fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<WorkerGroupCon
             .cloned(),
     );
     let tensor_parallel_size = placement.tensor_parallel_size.max(1) as usize;
-    Ok(WorkerGroupConfig::data_parallel(
+    let mut groups = WorkerGroupConfig::data_parallel(
         &hosts,
         &placement.device,
         placement.data_parallel_size.max(1) as usize,
         tensor_parallel_size,
         placement.queue_depth.max(1) as usize,
         WorkerGroupConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
-    ))
+    );
+    if !placement.devices.is_empty() {
+        order_devices(&mut groups, &placement.device, &placement.devices)?;
+    }
+    Ok(groups)
+}
+
+/// Puts the shorthand's ranks, in rank order across `groups`, on the CUDA
+/// devices `devices` names by their index on each rank's host
+/// (`placement_config.devices`): a world whose ranks a daemon assigned to
+/// the GPUs that already hold most of their weights, or an operator's
+/// order.
+///
+/// # Errors
+///
+/// Fails unless `device` is CUDA, `devices` names one device per rank, and
+/// no two ranks of a host share a device.
+fn order_devices(
+    groups: &mut [WorkerGroupConfig],
+    device: &str,
+    devices: &[u32],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(device, "cuda" | "gpu"),
+        "`placement_config.devices` orders CUDA devices; `placement_config.device` is {device:?}"
+    );
+    let ranks: usize = groups.iter().map(|group| group.ranks.len()).sum();
+    anyhow::ensure!(
+        devices.len() == ranks,
+        "`placement_config.devices` names {} devices for {ranks} ranks",
+        devices.len()
+    );
+    let mut taken = std::collections::BTreeSet::new();
+    let ranks = groups.iter_mut().flat_map(|group| group.ranks.iter_mut());
+    for (rank, index) in ranks.zip(devices) {
+        anyhow::ensure!(
+            taken.insert((rank.host.clone(), *index)),
+            "`placement_config.devices` puts two ranks of host {} on device {index}",
+            rank.host
+        );
+        rank.device = format!("cuda:{index}");
+    }
+    Ok(())
 }
 
 /// The launch arguments the graph and attention-provider tables state.
@@ -444,6 +500,7 @@ mod tests {
             retire: Vec::new(),
             speculation: None,
             profiling: None,
+            received_weights: Vec::new(),
         }
     }
 
@@ -457,5 +514,92 @@ mod tests {
             format!("{error:#}").contains("cuda_graph_config.policy"),
             "{error:#}"
         );
+    }
+
+    /// A spec of `ranks` tensor-parallel ranks sharing their experts, on
+    /// the devices `devices` orders.
+    fn tensor_experts(ranks: u32, devices: &[u32]) -> EngineSpec {
+        let mut spec = spec();
+        let shorthand = spec.placement.as_mut().unwrap();
+        shorthand.tensor_parallel_size = ranks;
+        shorthand.devices = devices.to_vec();
+        spec.experts.as_mut().unwrap().expert_parallel = true;
+        spec
+    }
+
+    /// The shorthand puts its ranks, in rank order, on the devices
+    /// `placement_config.devices` names; a planned world's launches state
+    /// them, with the ranks each loads its weights with.
+    #[test]
+    fn the_shorthand_puts_ranks_on_the_devices_their_order_names() {
+        let launches = crate::launches::rank_launches(&tensor_experts(4, &[0, 2, 1, 3])).unwrap();
+        let devices: Vec<&str> = launches
+            .iter()
+            .map(|launch| launch.descriptor.device.as_str())
+            .collect();
+        assert_eq!(devices, ["cuda:0", "cuda:2", "cuda:1", "cuda:3"]);
+        for (index, launch) in launches.iter().enumerate() {
+            assert_eq!(launch.rank, index as u32);
+            assert_eq!(launch.descriptor.rank, index as u32);
+            assert_eq!(
+                launch.agreement,
+                crate::launches::Agreement::Group("model".into())
+            );
+            assert_eq!(launch.agreement_index, index as u32);
+            assert!(launch.descriptor.tensor_experts);
+            assert_eq!(launch.environment["LOCAL_RANK"], index.to_string());
+        }
+
+        // Without an order each host's ranks number its devices from zero.
+        let launches = crate::launches::rank_launches(&tensor_experts(4, &[])).unwrap();
+        let devices: Vec<&str> = launches
+            .iter()
+            .map(|launch| launch.descriptor.device.as_str())
+            .collect();
+        assert_eq!(devices, ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]);
+    }
+
+    /// Schedulers that share their experts load their weights together
+    /// over the expert union, each at its union rank.
+    #[test]
+    fn the_ranks_of_an_expert_union_load_together() {
+        let mut spec = spec();
+        let shorthand = spec.placement.as_mut().unwrap();
+        shorthand.data_parallel_size = 2;
+        shorthand.devices = vec![1, 0];
+        spec.experts.as_mut().unwrap().expert_parallel = true;
+        let launches = crate::launches::rank_launches(&spec).unwrap();
+        let planned: Vec<(&str, &str, u32)> = launches
+            .iter()
+            .map(|launch| {
+                assert_eq!(launch.agreement, crate::launches::Agreement::ExpertUnion);
+                (
+                    launch.group.as_str(),
+                    launch.descriptor.device.as_str(),
+                    launch.agreement_index,
+                )
+            })
+            .collect();
+        assert_eq!(
+            planned,
+            [("model-0", "cuda:1", 0), ("model-1", "cuda:0", 1)]
+        );
+    }
+
+    /// An order that does not name one CUDA device per rank, or puts two
+    /// ranks of a host on one device, is refused naming the option.
+    #[test]
+    fn a_device_order_of_another_length_or_a_repeated_device_is_refused() {
+        for devices in [&[0, 1, 2][..], &[0, 1, 1, 2]] {
+            let error = EngineConfig::from_spec(&tensor_experts(4, devices))
+                .expect_err("the order must be refused");
+            assert!(
+                format!("{error:#}").contains("placement_config.devices"),
+                "{error:#}"
+            );
+        }
+        let mut cpu = tensor_experts(2, &[0, 1]);
+        cpu.placement.as_mut().unwrap().device = "cpu".into();
+        assert!(EngineConfig::from_spec(&cpu).is_err());
     }
 }

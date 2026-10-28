@@ -684,6 +684,14 @@ impl Server {
             (Request::Read { deployment, key }, Role::Peer) => self
                 .read_bytes(deployment, key)
                 .map(|bytes| Outcome::Reply(Reply::Read { bytes }, Vec::new())),
+            (
+                Request::Read { deployment, key },
+                Role::Head {
+                    deployment: owner, ..
+                },
+            ) if deployment == &owner => self
+                .read_bytes(deployment, key)
+                .map(|bytes| Outcome::Reply(Reply::Read { bytes }, Vec::new())),
             (Request::Endpoint, _) => Ok(Outcome::Reply(
                 Reply::Endpoint {
                     tcp: self.tcp.as_ref().map(|(_, address)| address.clone()),

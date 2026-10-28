@@ -50,7 +50,10 @@ pub struct ExpertUnion {
     /// Leading union ranks that run attention; zero when experts are
     /// colocated with attention.
     pub attention_ranks: usize,
-    pub rendezvous: RendezvousConfig,
+    /// The union's rendezvous, which the engine names once the daemon
+    /// reserved its socket; `None` for a rank planned before its world
+    /// starts, which joins no union (`uniserve worker --plan`).
+    pub rendezvous: Option<RendezvousConfig>,
     pub exchange: String,
 }
 
@@ -157,6 +160,9 @@ pub struct WorkerLaunch {
     pub load: LoadOptions,
     /// Load the deterministic stub model.
     pub stub: bool,
+    /// The weights the rank receives from the world its own succeeds, as
+    /// the daemon planned the change; `None` binds or loads them.
+    pub received: Option<ipc::ReceivedWeights>,
     /// Placed components by name; empty for an expert-only rank.
     pub components: BTreeMap<String, ComponentConfig>,
     /// The fence probes: whether they record, and the components that carry
@@ -270,6 +276,7 @@ pub fn resolve(
             components: descriptor.fence_components.clone(),
         },
         graph_pc_sampling: descriptor.graph_pc_sampling,
+        received: descriptor.received_weights.clone(),
         components: descriptor.components,
     })
 }
@@ -324,9 +331,6 @@ fn expert_parallel(descriptor: &LaunchDescriptor) -> Result<Option<ExpertUnion>,
     let Some(value) = &descriptor.expert_parallel else {
         return Ok(None);
     };
-    let address = text(value.address.as_deref()).ok_or_else(|| {
-        DescriptorError::new("an expert-parallel union requires its store address")
-    })?;
     // A token exchange, or weight prefetch, which exchanges no tokens.
     if !TOKEN_EXCHANGES.contains(&value.exchange.as_str()) && value.exchange != WEIGHT_PREFETCH {
         return Err(DescriptorError::new(format!(
@@ -338,10 +342,10 @@ fn expert_parallel(descriptor: &LaunchDescriptor) -> Result<Option<ExpertUnion>,
         rank: value.rank as usize,
         size: value.size as usize,
         attention_ranks: value.attention_ranks as usize,
-        rendezvous: RendezvousConfig {
+        rendezvous: text(value.address.as_deref()).map(|address| RendezvousConfig {
             address,
             listen_fd: value.listen_fd,
-        },
+        }),
         exchange: value.exchange.clone(),
     }))
 }

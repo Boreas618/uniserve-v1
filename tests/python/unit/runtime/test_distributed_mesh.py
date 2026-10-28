@@ -2,10 +2,11 @@
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from uniserve.distributed import Communicator, DeviceMesh, Distribution
-from uniserve.distributed.world import initialize
+from uniserve.distributed.world import create_groups, initialize, mesh, planning
 
 pytestmark = pytest.mark.unit
 
@@ -19,6 +20,29 @@ def test_launch_rejects_unavailable_rank_device(monkeypatch):
     ):
         # The second of two ranks on a bare CUDA device, before any store.
         initialize(1, 1, 2, "cuda", None, None, None, None, None, None)
+
+
+def test_a_planning_world_names_its_ranks_and_creates_no_group():
+    # Rank 1 of a two-rank worker that is ranks 2 and 3 of a four-rank
+    # expert union: its meshes name those ranks, but nothing communicates.
+    world = planning(1, 1, 2, "cpu", 3, 4)
+    assert world.instance.ranks == (2, 3)
+    assert world.instance.rank == 1
+    assert world.experts.ranks == (0, 1, 2, 3)
+    assert world.experts.rank == 3
+    assert not dist.is_initialized()
+
+    groups = create_groups(
+        world, [2, 4], [2, 3, 0, 1, 2, 3], [True, False], [True, True]
+    )
+    assert groups == [None, None]
+    tp = mesh(world, [0, 1], [2], ["tp"], 1, ["tp"], [2], [2, 3], groups[:1])
+    assert tp.get_group("tp").ranks == (2, 3)
+    with pytest.raises(RuntimeError, match="requires initialized distributed"):
+        tp.get_group("tp").all_reduce(torch.zeros(2))
+
+    with pytest.raises(ValueError, match="expert union"):
+        planning(1, 1, 2, "cpu", 0, 4)
 
 
 def test_mesh_maps_ordered_members_and_independent_axes():

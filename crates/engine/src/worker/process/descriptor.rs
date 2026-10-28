@@ -61,6 +61,7 @@ impl Default for WorkerProcessArgs {
             world: 0,
             retire: Vec::new(),
             predecessor: None,
+            received_weights: None,
             daemon: String::new(),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
@@ -155,8 +156,37 @@ impl WorkerProcessArgs {
     }
 
     /// Returns the number of ranks in this group.
-    pub(super) fn world_size(&self) -> u32 {
+    pub(crate) fn world_size(&self) -> u32 {
         self.ranks.len() as u32
+    }
+
+    /// The variables rank `rank`'s process is started with, which the
+    /// daemon that starts it applies over its own environment.
+    ///
+    /// Fails when a host-relative rank value does not fit `u32`.
+    pub(crate) fn rank_environment(
+        &self,
+        rank: u32,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        // Torch and the numerical libraries read the host-relative pair; the
+        // global pair names the rank's place in the whole process world.
+        let (local_rank, local_world_size) = self.host_slot(rank)?;
+        let mut environment = std::collections::HashMap::from([
+            ("RANK".to_owned(), rank.to_string()),
+            ("WORLD_SIZE".to_owned(), self.world_size().to_string()),
+            ("LOCAL_RANK".to_owned(), local_rank.to_string()),
+            ("LOCAL_WORLD_SIZE".to_owned(), local_world_size.to_string()),
+        ]);
+        for (name, value) in worker_environment(|name| std::env::var_os(name)) {
+            environment.insert(name.to_owned(), value.to_string_lossy().into_owned());
+        }
+        // A standby that may suspend its NCCL communicators while it parks
+        // captures their collectives without registering graph buffers:
+        // the registrations would not survive the suspension.
+        if self.standby && self.standby_memory != proto::request::StandbyMemory::Resident {
+            environment.insert("NCCL_GRAPH_REGISTER".to_owned(), "0".to_owned());
+        }
+        Ok(environment)
     }
 
     /// Builds the typed launch descriptor the worker process consumes.
@@ -275,6 +305,7 @@ impl WorkerProcessArgs {
             max_total_tokens: self.max_total_tokens,
             predecessor: self.predecessor.clone(),
             segments: self.segments.clone(),
+            received_weights: self.received_weights.clone(),
             attention_backend: self.attention_backend.clone(),
             block_size: self.block_size,
             max_batch_calls: self.max_batch_calls,

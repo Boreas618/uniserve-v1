@@ -42,7 +42,8 @@
 //! [`Planner`] computes each pair's manifest once. [`Manifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
 //! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
-//! its Transfer Server executes.
+//! its Transfer Server executes. The source world of weights is what the
+//! manifests a world retains name ([`weights::sources`]).
 
 pub mod layout;
 mod plan;
@@ -50,6 +51,7 @@ pub mod region;
 mod tasks;
 #[cfg(test)]
 mod tests;
+pub mod weights;
 
 use std::collections::HashMap;
 use std::sync::Arc;

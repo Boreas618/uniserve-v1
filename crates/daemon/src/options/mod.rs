@@ -51,9 +51,10 @@ pub use values::{
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
 /// Options that place ranks without a deployment file, refused beside one.
-const PLACEMENT_SHORTHAND: [&str; 4] = [
+const PLACEMENT_SHORTHAND: [&str; 5] = [
     "tensor_parallel_size",
     "placement_config.device",
+    "placement_config.devices",
     "placement_config.worker_hosts",
     "placement_config.queue_depth",
 ];
@@ -504,6 +505,12 @@ pub struct SpeculativeOptions {
 pub struct PlacementOptions {
     /// Device of every rank; `cuda` numbers each host's GPUs from zero.
     pub device: String,
+    /// Each rank's CUDA device index on its host, in rank order; empty
+    /// numbers each host's ranks from zero. A change of the parallel
+    /// configuration that does not state it takes the order that leaves
+    /// the most weights on the GPUs already holding them.
+    #[serde(deserialize_with = "values::list::deserialize")]
+    pub devices: Vec<u32>,
     /// Hosts after this one the ranks spread across, in equal blocks.
     #[serde(deserialize_with = "values::list::deserialize")]
     pub worker_hosts: Vec<String>,
@@ -518,6 +525,7 @@ impl Default for PlacementOptions {
     fn default() -> Self {
         Self {
             device: "cuda".to_owned(),
+            devices: Vec::new(),
             worker_hosts: Vec::new(),
             queue_depth: positive(2),
             transfer: None,
@@ -1146,6 +1154,23 @@ impl ServeConfig {
                 );
             }
         }
+        // The shorthand puts its ranks, in rank order, on the CUDA devices
+        // the order names (the engine refuses two ranks of a host on one).
+        let devices = &self.placement_config.devices;
+        if !devices.is_empty() {
+            let ranks = self.tensor_parallel_size.get() * self.data_parallel_size.get();
+            anyhow::ensure!(
+                matches!(self.placement_config.device.as_str(), "cuda" | "gpu"),
+                "`placement_config.devices` orders CUDA devices: `placement_config.device` is {:?}",
+                self.placement_config.device
+            );
+            anyhow::ensure!(
+                devices.len() == ranks,
+                "`placement_config.devices` names {} devices for the {ranks} ranks of \
+                 `tensor_parallel_size` × `data_parallel_size`",
+                devices.len()
+            );
+        }
         // Each rank grants itself this share of every device's total
         // storage, so any finite value in (0, 1] is meaningful.
         anyhow::ensure!(
@@ -1289,6 +1314,7 @@ impl ServeConfig {
                 )?,
                 data_parallel_size: bounded(self.data_parallel_size.get(), "data_parallel_size")?,
                 device: self.placement_config.device.clone(),
+                devices: self.placement_config.devices.clone(),
                 queue_depth: bounded(
                     self.placement_config.queue_depth.get(),
                     "placement_config.queue_depth",
@@ -1400,6 +1426,7 @@ impl ServeConfig {
                 fence_components: self.profiling_config.fence_components.clone(),
                 graph_pc_sampling: self.profiling_config.graph_pc_sampling,
             }),
+            received_weights: Vec::new(),
         })
     }
 }

@@ -216,6 +216,54 @@ def initialize(
     return World(rank, size, placed, backend, instance, Communicator(), groups)
 
 
+# The backend name of a world that plans a rank's partition
+# (:func:`planning`): its groups are never created.
+PLANNING = "planning"
+
+
+def planning(
+    rank: int,
+    local_rank: int,
+    world_size: int,
+    device: str,
+    union_rank: int | None,
+    union_size: int | None,
+) -> World:
+    """A rank's world for planning its partition, without process groups.
+
+    Its communicators name the ranks of the worker and of its expert union
+    and this rank among them, which is all partitioning reads; no group is
+    created (:func:`create_groups` creates none for it), so nothing
+    communicates and no other rank need exist: a collective over one of its
+    communicators raises. A daemon plans the weights each rank of a world
+    holds with it before the world starts. The rank's device is selected as
+    :func:`initialize` selects it.
+
+    Raises:
+        ValueError: The rank is outside its world or union, or the device
+            is not visible.
+    """
+    rank, size, local_rank = int(rank), int(world_size), int(local_rank)
+    if size < 1 or not 0 <= rank < size or local_rank < 0:
+        raise ValueError(
+            "launch rank must satisfy 0 <= rank < positive world_size"
+        )
+    placed = _local_device(str(device), local_rank)
+    experts = Communicator()
+    members = tuple(range(size))
+    if union_rank is not None and union_size is not None:
+        union_rank, union_size = int(union_rank), int(union_size)
+        start = union_rank - rank
+        if start < 0 or start + size > union_size:
+            raise ValueError("worker ranks must fit inside the expert union")
+        experts = Communicator(
+            tuple(range(union_size)), union_rank, "experts", placed
+        )
+        members = tuple(range(start, start + size))
+    instance = Communicator(members, rank, "instance", placed)
+    return World(rank, size, placed, PLANNING, instance, experts)
+
+
 def _runs(counts: Sequence[int], values: Sequence[Any]) -> list[list[Any]]:
     """Split back-to-back ``values`` into runs of ``counts`` items."""
     runs, first = [], 0
@@ -252,6 +300,11 @@ def create_groups(
     for ranks, local, kept in zip(
         _runs(member_counts, members), local_sync, keep, strict=True
     ):
+        if world.backend == PLANNING:
+            # A planning world creates no group: its communicators name
+            # their members alone.
+            handles.append(None)
+            continue
         group = dist.new_group(
             ranks=[int(member) for member in ranks],
             use_local_synchronization=bool(local),

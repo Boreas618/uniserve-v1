@@ -245,9 +245,24 @@ fn an_expert_parallel_replica_names_its_union_and_store() {
     .unwrap();
     let union = launch.expert_parallel.unwrap();
     assert_eq!((union.rank, union.size), (0, 4));
-    assert_eq!(union.rendezvous.address, "10.0.0.2:29600");
-    assert_eq!(union.rendezvous.listen_fd, Some(9));
+    let rendezvous = union.rendezvous.unwrap();
+    assert_eq!(rendezvous.address, "10.0.0.2:29600");
+    assert_eq!(rendezvous.listen_fd, Some(9));
     assert_eq!(launch.execution.expert_exchange, "megamoe");
+}
+
+/// A rank planned before its world starts names its union without the
+/// store it would join: it plans its partition and joins no union.
+#[test]
+fn a_planned_expert_parallel_rank_names_its_union_without_a_store() {
+    let launch = resolved(json!({"expert_parallel": {
+        "rank": 1, "size": 4, "attention_ranks": 0, "address": null,
+        "listen_fd": null, "exchange": "alltoall",
+    }}))
+    .unwrap();
+    let union = launch.expert_parallel.unwrap();
+    assert_eq!((union.rank, union.size), (1, 4));
+    assert!(union.rendezvous.is_none());
 }
 
 #[test]

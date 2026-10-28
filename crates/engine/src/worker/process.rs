@@ -38,8 +38,6 @@ use ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerResponse};
 use crate::worker::WorkerProcessArgs;
 use crate::worker::processes::Processes;
 
-use descriptor::worker_environment;
-
 /// Maximum time `request_close` spends draining in-flight responses from a
 /// still-alive worker before it sends the shutdown request. A hung (alive but
 /// unresponsive) worker must not be able to block shutdown forever.
@@ -185,7 +183,6 @@ impl PendingWorker {
         generation: u64,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
-        let world_size = args.world_size();
 
         // argv carries the address of the engine the worker connects to and
         // what its registration states: its worker group and its rank, and
@@ -204,25 +201,7 @@ impl PendingWorker {
             generation.to_string(),
         ];
 
-        // Torch and the numerical libraries read the host-relative pair; the
-        // global pair names the rank's place in the whole process world. The
-        // daemon applies the variables over its own environment.
-        let (local_rank, local_world_size) = args.host_slot(rank)?;
-        let mut environment = std::collections::HashMap::from([
-            ("RANK".to_owned(), rank.to_string()),
-            ("WORLD_SIZE".to_owned(), world_size.to_string()),
-            ("LOCAL_RANK".to_owned(), local_rank.to_string()),
-            ("LOCAL_WORLD_SIZE".to_owned(), local_world_size.to_string()),
-        ]);
-        for (name, value) in worker_environment(|name| std::env::var_os(name)) {
-            environment.insert(name.to_owned(), value.to_string_lossy().into_owned());
-        }
-        // A standby that may suspend its NCCL communicators while it parks
-        // captures their collectives without registering graph buffers:
-        // the registrations would not survive the suspension.
-        if args.standby && args.standby_memory != proto::request::StandbyMemory::Resident {
-            environment.insert("NCCL_GRAPH_REGISTER".to_owned(), "0".to_owned());
-        }
+        let environment = args.rank_environment(rank)?;
 
         // One typed descriptor carries every launch value. The engine keeps
         // it and answers the rank's registration with it.

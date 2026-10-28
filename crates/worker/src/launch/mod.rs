@@ -27,6 +27,7 @@
 //! memory before it ends (`release_names`).
 
 mod arguments;
+mod plan;
 mod python;
 mod registration;
 mod signals;
@@ -47,12 +48,19 @@ use crate::worker::Worker;
 
 /// Run the worker and return its exit status. `python` is the environment's
 /// interpreter, which the builder thread's interpreter takes as its
-/// executable.
+/// executable. Arguments that begin with `--plan` plan one rank's weights
+/// instead ([`plan`]).
 pub(crate) fn main(argv: &[String], python: &Path) -> i32 {
     crate::logging::init();
     // Before any thread starts and any NVTX call is made: NVTX loads the
     // injection library its environment names at its first call.
     crate::profiling::ranges::inject(python);
+    if let Some(("--plan", planning)) = argv
+        .split_first()
+        .map(|(first, rest)| (first.as_str(), rest))
+    {
+        return plan::main(planning, python);
+    }
     // Installed first, before the interpreter exists: Python installs no
     // handlers of its own (`python::host`).
     let signals = match Signals::install() {

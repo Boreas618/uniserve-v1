@@ -25,6 +25,7 @@ mod deployment;
 mod executor;
 mod handle;
 mod kv_cache;
+pub mod launches;
 mod scheduler;
 mod service;
 #[cfg(feature = "testing")]
@@ -46,9 +47,9 @@ pub use crate::executor::{
     WorkerGroupId, WorkerResult,
 };
 pub use crate::handle::{
-    CacheChange, Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EventRx,
-    EventSendError, EventTx, HookBarrier, StreamCancelCause, Submission, SubmitError, Successor,
-    Wake, WeightsInFlight,
+    CacheChange, Command, CommandSender, CommandWaker, CreatedWeights, EVENT_BUFFER_CAPACITY,
+    EventRx, EventSendError, EventTx, HookBarrier, StreamCancelCause, Submission, SubmitError,
+    Successor, Wake, WeightsInFlight,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
