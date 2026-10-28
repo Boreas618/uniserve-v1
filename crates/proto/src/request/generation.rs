@@ -880,7 +880,8 @@ pub struct CachePolicy {
     /// new world computes other numerics. Its prefix lookups match the
     /// pages that world computed, it reads no host KV cache, whose pages are
     /// keyed by the world that serves, and a request continuing so writes
-    /// no page (`write`), since its pages are neither world's.
+    /// no public page (`write`), since its pages are neither world's. Its
+    /// private continuation retains them for subsequent migrations.
     #[serde(default)]
     pub state_seed: Option<u64>,
     /// Private recovered pages of a prior request. This is runtime

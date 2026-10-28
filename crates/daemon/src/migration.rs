@@ -158,8 +158,8 @@ impl Resumable {
                 // Its prompt's log-probabilities were reported where it began.
                 continuation.sampling.return_prompt_logprobs = false;
                 continuation.sampling.n_prompt_logprobs = 0;
-                // It reads the pages of the state it reached and writes none,
-                // since its later pages are neither world's.
+                // It reads the state it reached and publishes later pages
+                // only to its private continuation: they are neither world's.
                 if let Some(seed) = kept.and_then(|kept| kept.prefix_seed) {
                     continuation.cache.state_seed = Some(seed);
                     continuation.cache.write = false;
