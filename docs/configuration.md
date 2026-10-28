@@ -1,6 +1,6 @@
 # Configuration
 
-A UniServe server is configured by one tree of serving options and, for a placement other than one tensor-parallel worker group per scheduler, a deployment file. The tree's top level holds the options most deployments state; the rest sit in `*_config` tables, one per part of the system they configure.
+A UniServe server is configured by one tree of serving options and, for a parallel configuration other than one tensor-parallel worker group per scheduler, a deployment file. The tree's top level holds the options most deployments state; the rest sit in `*_config` tables, one per part of the system they configure.
 
 ## Command line
 
