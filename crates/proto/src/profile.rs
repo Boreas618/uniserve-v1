@@ -36,6 +36,13 @@ impl Collector {
         Self::PcSampling,
     ];
 
+    /// The collectors that hold a device's performance monitors while they
+    /// run. CUPTI gives the monitors to one of them at a time: the second
+    /// to start fails (`CUPTI_ERROR_HARDWARE_BUSY`, or an invalid
+    /// parameter between the range profiler and PC sampling), so a session
+    /// runs at most one.
+    pub const MONITORS: [Self; 3] = [Self::PmSampling, Self::RangeMetrics, Self::PcSampling];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Timeline => "timeline",
@@ -133,13 +140,14 @@ impl Default for RangeMetricsOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PcSamplingOptions {
-    /// Each SM samples a warp every `2^(5 + period)` cycles.
+    /// Each SM samples a warp every `2^period` cycles, `period` from 5 to
+    /// 31 (CUPTI's `CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`).
     pub period: u32,
 }
 
 impl Default for PcSamplingOptions {
     fn default() -> Self {
-        Self { period: 12 }
+        Self { period: 17 }
     }
 }
 
@@ -196,6 +204,19 @@ impl SessionRequest {
         if seen.len() != self.collectors.len() {
             return Err("a collector is named twice".to_owned());
         }
+        let monitors: Vec<&str> = self
+            .collectors
+            .iter()
+            .filter(|collector| Collector::MONITORS.contains(collector))
+            .map(|collector| collector.as_str())
+            .collect();
+        if monitors.len() > 1 {
+            return Err(format!(
+                "{} each hold the device's performance monitors, which CUPTI \
+                 gives to one profiler at a time: a session runs at most one of them",
+                monitors.join(" and ")
+            ));
+        }
         if self.steps == Some(0) {
             return Err("a window of steps holds at least one".to_owned());
         }
@@ -243,6 +264,9 @@ impl SessionRequest {
         if self.pm_sampling.metrics.is_empty() || self.range_metrics.metrics.is_empty() {
             return Err("a metric collector names at least one metric".to_owned());
         }
+        if !(5..=31).contains(&self.pc_sampling.period) {
+            return Err("pc_sampling.period is from 5 to 31".to_owned());
+        }
         if self.pm_sampling.interval_ns == 0 {
             return Err("pm_sampling.interval_ns is positive".to_owned());
         }
@@ -276,14 +300,18 @@ mod tests {
     #[test]
     fn a_request_reads_from_its_json_with_defaults() {
         let parsed: SessionRequest = serde_json::from_str(
-            r#"{"collectors": ["timeline", "pm_sampling"], "steps": 8,
+            r#"{"collectors": ["timeline", "fence_timeline", "pm_sampling"], "steps": 8,
                 "stages": ["decode"], "output_dir": "/tmp/p",
                 "pm_sampling": {"interval_ns": 50000}}"#,
         )
         .unwrap();
         assert_eq!(
             parsed.collectors,
-            [Collector::Timeline, Collector::PmSampling]
+            [
+                Collector::Timeline,
+                Collector::FenceTimeline,
+                Collector::PmSampling
+            ]
         );
         assert_eq!(parsed.pm_sampling.interval_ns, 50_000);
         assert_eq!(
@@ -321,6 +349,23 @@ mod tests {
             },
             SessionRequest {
                 pc_sampling: PcSamplingOptions { period: 20 },
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![
+                    Collector::Timeline,
+                    Collector::PmSampling,
+                    Collector::PcSampling,
+                ],
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![Collector::RangeMetrics, Collector::PcSampling],
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![Collector::PcSampling],
+                pc_sampling: PcSamplingOptions { period: 4 },
                 ..request()
             },
         ];

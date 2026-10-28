@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use cuda::cupti::pc_sampling::PcSampler;
 use cuda::cupti::pm_sampling::PmSampler;
@@ -50,7 +51,18 @@ enum Prepared {
         profiler: RangeProfiler,
         ranges: MetricRanges,
     },
-    PcSampling(PcSampler),
+    /// PC sampling of the context `context` every `2^(5 + period)` cycles,
+    /// enabled while armed. CUPTI refuses to enable activity records
+    /// (`CUPTI_ERROR_NOT_COMPATIBLE`) while PC sampling is enabled, so the
+    /// sampler is enabled at each arm after the timeline started and
+    /// disabled at each disarm before the timeline stops.
+    PcSampling {
+        context: usize,
+        period: u32,
+        sampler: Option<PcSampler>,
+        /// Whether the stall reasons' names reached the file.
+        reasons: bool,
+    },
 }
 
 /// The collectors of a session on one rank.
@@ -61,6 +73,19 @@ pub(crate) struct Collectors {
     armed: bool,
     /// The NVTX switch before a timeline armed it.
     nvtx_before: Option<bool>,
+    /// The collectors prepared and not released, a bit each ([`bit`]),
+    /// which the session reads at every step without taking the lock the
+    /// sampler thread holds while it drains.
+    running: Arc<AtomicU32>,
+}
+
+/// The bit of `collector` in [`Collectors::running`].
+pub(crate) fn bit(collector: Collector) -> u32 {
+    let index = Collector::ALL
+        .iter()
+        .position(|&known| known == collector)
+        .unwrap_or_default();
+    1 << index
 }
 
 /// The armed component-range profiler, which the probes push and pop
@@ -134,7 +159,7 @@ impl Collectors {
         let mut prepared = BTreeMap::new();
         let mut states = BTreeMap::new();
         for &collector in &request.collectors {
-            match prepare(collector, request, context.as_ref(), &rows) {
+            match prepare(collector, request, context.as_ref()) {
                 Ok(ready) => {
                     prepared.insert(collector, ready);
                     states.insert(collector.as_str().to_owned(), "prepared".to_owned());
@@ -161,6 +186,9 @@ impl Collectors {
                 }
             }
         }
+        let running = prepared
+            .keys()
+            .fold(0, |bits, &collector| bits | bit(collector));
         (
             Self {
                 context,
@@ -168,14 +196,15 @@ impl Collectors {
                 rows,
                 armed: false,
                 nvtx_before: None,
+                running: Arc::new(AtomicU32::new(running)),
             },
             states,
         )
     }
 
-    /// Whether any collector is prepared.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.prepared.is_empty()
+    /// The set of collectors prepared and not released, as [`bit`]s.
+    pub(crate) fn running(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.running)
     }
 
     /// The collectors prepared and not released.
@@ -183,8 +212,9 @@ impl Collectors {
         self.prepared.keys().copied().collect()
     }
 
-    /// Start every prepared collector; one that fails to start is
-    /// released, with its reason recorded.
+    /// Start every prepared collector, in the order of [`Collector`], which
+    /// starts the timeline before PC sampling as CUPTI requires; one that
+    /// fails to start is released, with its reason recorded.
     pub(crate) fn arm(&mut self) {
         if self.armed {
             return;
@@ -238,7 +268,21 @@ impl Collectors {
                         }));
                     }
                 }),
-                Prepared::PcSampling(sampler) => sampler.start(),
+                Prepared::PcSampling {
+                    context,
+                    period,
+                    sampler,
+                    reasons,
+                } => PcSampler::enable(*context, *period, MAX_PCS).and_then(|mut enabled| {
+                    enabled.start()?;
+                    if !*reasons {
+                        self.rows
+                            .send(Message::PcReasons(enabled.stall_reasons().to_vec()));
+                        *reasons = true;
+                    }
+                    *sampler = Some(enabled);
+                    Ok(())
+                }),
             };
             if let Err(error) = started {
                 failed.push((collector, error.to_string()));
@@ -254,7 +298,9 @@ impl Collectors {
         self.armed = true;
     }
 
-    /// Stop every armed collector and hand what it collected to the file.
+    /// Stop every armed collector and hand what it collected to the file,
+    /// in the reverse order of [`Collectors::arm`]: PC sampling is disabled
+    /// before the timeline stops.
     pub(crate) fn disarm(&mut self) {
         if !self.armed {
             return;
@@ -265,7 +311,7 @@ impl Collectors {
             .and_then(|context| context.enter().ok());
         publish_component_ranges(None);
         let mut failed = Vec::new();
-        for (&collector, prepared) in &mut self.prepared {
+        for (&collector, prepared) in self.prepared.iter_mut().rev() {
             let stopped = stop(prepared, &self.rows);
             if let Err(error) = stopped {
                 failed.push((collector, error));
@@ -308,7 +354,10 @@ impl Collectors {
                         samples: decoded.samples,
                     });
                 }),
-                Prepared::PcSampling(sampler) => sampler.take().map(|taken| {
+                Prepared::PcSampling {
+                    sampler: Some(sampler),
+                    ..
+                } => sampler.take().map(|taken| {
                     if taken.total_samples > 0 {
                         self.rows.send(Message::Pc(taken));
                     }
@@ -353,6 +402,7 @@ impl Collectors {
         let Some(mut prepared) = self.prepared.remove(&collector) else {
             return false;
         };
+        self.running.fetch_and(!bit(collector), Ordering::AcqRel);
         let _context = self
             .context
             .as_ref()
@@ -418,7 +468,11 @@ fn stop(prepared: &mut Prepared, rows: &Rows) -> std::result::Result<(), String>
             send_ranges(rows, profiler, collected);
             Ok(())
         }
-        Prepared::PcSampling(sampler) => {
+        Prepared::PcSampling { sampler, .. } => {
+            // Dropping the sampler disables PC sampling.
+            let Some(mut sampler) = sampler.take() else {
+                return Ok(());
+            };
             sampler.stop().map_err(|error| error.to_string())?;
             let taken = sampler.take().map_err(|error| error.to_string())?;
             rows.send(Message::Pc(taken));
@@ -449,7 +503,6 @@ fn prepare(
     collector: Collector,
     request: &SessionRequest,
     context: Option<&PrimaryContext>,
-    rows: &Rows,
 ) -> std::result::Result<Prepared, String> {
     let cupti = || {
         cuda::cupti::subscriber::subscribe().map_err(|error| {
@@ -517,10 +570,12 @@ fn prepare(
         Collector::PcSampling => {
             cupti()?;
             let (context, _) = device()?;
-            let sampler = PcSampler::enable(context, request.pc_sampling.period, MAX_PCS)
-                .map_err(|error| error.to_string())?;
-            rows.send(Message::PcReasons(sampler.stall_reasons().to_vec()));
-            Ok(Prepared::PcSampling(sampler))
+            Ok(Prepared::PcSampling {
+                context,
+                period: request.pc_sampling.period,
+                sampler: None,
+                reasons: false,
+            })
         }
     }
 }

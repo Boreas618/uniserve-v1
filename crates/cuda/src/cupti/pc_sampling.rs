@@ -165,9 +165,9 @@ pub struct PcSampler {
 unsafe impl Send for PcSampler {}
 
 impl PcSampler {
-    /// Enable continuous PC sampling on `context` (a `CUcontext`), sampling
-    /// every `2^(5 + period)` cycles, each take holding up to `max_pcs`
-    /// program counters.
+    /// Enable continuous PC sampling on `context` (a `CUcontext`), each SM
+    /// sampling a warp every `2^period` cycles (`period` from 5 to 31), each
+    /// take holding up to `max_pcs` program counters.
     ///
     /// # Errors
     ///

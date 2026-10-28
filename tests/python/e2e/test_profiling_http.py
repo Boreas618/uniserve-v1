@@ -8,11 +8,12 @@ Storage Server of the test's own in a runtime directory the test creates
   transformer layers' time reach the Prometheus histogram, and switching
   the probes off through ``PUT /admin/config`` is a change in place that
   stops them, until they are switched on again.
-- A session with every collector records its window of decode steps into
-  one file per worker: CUPTI's activity records and API calls, the fence
-  records, PM samples, range metrics and PC samples; the reader states
-  its contents and the Perfetto converter turns it into a trace. One
-  session runs at a time.
+- Sessions record their windows of decode steps into one file per
+  worker, together running every collector: CUPTI's activity records and
+  API calls with the fence records and PC samples, PM samples, and range
+  metrics; the reader states each file's contents and the Perfetto
+  converter turns it into a trace. One session runs at a time, and one
+  naming two collectors of the device's performance monitors is refused.
 - A session whose world is replaced ends with the world change, its file
   written.
 - The quality-of-service guard turns collectors off, costliest first, and
@@ -251,24 +252,41 @@ def test_fence_probes_report_steps_and_switch_in_place(served: str):
     assert _fence_count(served, "decode", 'component="step"') > settled
 
 
-def test_a_session_records_every_collector_into_its_file(
-    served: str, tmp_path: Path
+# Sessions that together run every collector, each holding at most one of
+# the collectors of the device's performance monitors, and the tables each
+# leaves rows in besides its steps and clocks.
+SESSIONS = {
+    "timeline": (
+        ["timeline", "fence_timeline", "pc_sampling"],
+        ("graph", "api", "fence", "pc_sample"),
+    ),
+    "pm_sampling": (["pm_sampling"], ("pm_sample",)),
+    "range_metrics": (["range_metrics"], ("range_metric",)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SESSIONS))
+def test_a_session_records_its_collectors_into_its_file(
+    served: str, tmp_path: Path, name: str
 ):
+    collectors, tables = SESSIONS[name]
     output = tmp_path / "profiles"
     request = {
-        "collectors": [
-            "timeline",
-            "fence_timeline",
-            "pm_sampling",
-            "range_metrics",
-            "pc_sampling",
-        ],
+        "collectors": collectors,
         "stages": ["decode"],
         "start_step": 5,
         "steps": 40,
         "components": ["*.TransformerLayer"],
         "output_dir": str(output),
     }
+    # Two collectors of the performance monitors are refused together.
+    conflicting = {**request, "collectors": ["pm_sampling", "pc_sampling"]}
+    refused = httpx.post(
+        f"{served}/admin/profile", json=conflicting, timeout=600
+    )
+    assert refused.status_code == 400, refused.text
+    assert "performance monitors" in refused.text, refused.text
+
     with _Load(served):
         session = _start(served, request)
         worker = session["workers"][0]
@@ -291,30 +309,29 @@ def test_a_session_records_every_collector_into_its_file(
     with ProfileFile(path) as profile:
         summary = profile.summary()
         print(json.dumps(summary, indent=2))
+        # Every collector ran to the session's end; none failed to start.
+        states = {
+            (row["name"], row["state"]) for row in profile.rows("collectors")
+        }
+        assert {state for _, state in states} == {"prepared", "ended"}, states
+        assert {name for name, _ in states} == set(collectors), states
         rows = summary["rows"]
-        for table in (
-            "graph",
-            "api",
-            "fence",
-            "pm_sample",
-            "range_metric",
-            "pc_sample",
-            "steps",
-            "clocks",
-        ):
+        for table in (*tables, "steps", "clocks"):
             assert rows.get(table, 0) > 0, table
         steps = list(profile.rows("steps"))
         taken = [step for step in steps if step["selected"]]
         assert len(taken) == 40
         assert {step["stage"] for step in taken} == {"decode"}
-        intervals = list(profile.fence_intervals())
-        assert intervals
-        assert {item["component"] for item in intervals} == {
-            "models.qwen3.transformer.TransformerLayer"
-        }
-    trace = convert([path])
-    names = {event.get("name") for event in trace["traceEvents"]}
-    assert "models.qwen3.transformer.TransformerLayer" in names
+        if "fence_timeline" in collectors:
+            intervals = list(profile.fence_intervals())
+            assert intervals
+            assert {item["component"] for item in intervals} == {
+                "models.qwen3.transformer.TransformerLayer"
+            }
+    if "fence_timeline" in collectors:
+        trace = convert([path])
+        names = {event.get("name") for event in trace["traceEvents"]}
+        assert "models.qwen3.transformer.TransformerLayer" in names
 
 
 def test_a_world_change_ends_the_session_of_the_world_it_replaces(
