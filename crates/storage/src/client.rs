@@ -290,6 +290,14 @@ impl Client {
         }
     }
 
+    /// Make the claimed, committed worlds' tensors and pages shared together.
+    pub fn publish_worlds(&mut self, worlds: Vec<u64>) -> Result<()> {
+        match Self::expect(self.call(&Request::PublishWorlds { worlds }, &[])?)?.reply {
+            Reply::WorldsPublished => Ok(()),
+            other => Err(unexpected("publishing worlds", &other)),
+        }
+    }
+
     /// See [`Request::Retain`]: retain the copies of `keys` at the
     /// locations `at` (every copy when empty). Returns how many tensors
     /// were released.

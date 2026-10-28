@@ -98,8 +98,7 @@ pub(super) const DISCARDED: u64 = u64::MAX;
 pub(super) struct Visibility {
     /// The world of the head that reads.
     pub(super) world: u64,
-    /// The deployment's worlds on trial: claimed and newer than its oldest
-    /// claimed world.
+    /// The deployment's uncommitted or discarded worlds.
     pub(super) private: BTreeSet<u64>,
 }
 

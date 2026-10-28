@@ -590,6 +590,8 @@ pub enum Command {
     /// Commits a successor scheduler (`Scheduler::commit`), and answers
     /// with what each worker reported.
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
+    /// Publishes the committed world's immutable pages on every claimed node.
+    PublishWorld(crossbeam_channel::Sender<Result<(), String>>),
     /// Ends the memory of other worlds on the nodes of the scheduler's
     /// workers, discarding the pages the scheduler's world does not hit when
     /// `discard_pages` (`Executor::retire`), and answers whether it did.
@@ -899,6 +901,13 @@ impl CommandSender {
             answer,
         });
         promoted
+    }
+
+    /// Publishes the committed world's immutable pages on every claimed node.
+    pub fn publish_world(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, published) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PublishWorld(answer));
+        published
     }
 
     /// Ends the memory of `worlds` on the nodes of the scheduler's workers,

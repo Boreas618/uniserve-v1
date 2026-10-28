@@ -1059,6 +1059,7 @@ pub(crate) mod device {
 
         let mut head = head(&server.socket);
         let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+        head.publish_worlds(vec![1]).unwrap();
         let mut previous = world_worker(&server.socket, scope("text", 0), 1, claim);
         let (own, own_fd) = device_storage(first, &own_bytes);
         let (shared, shared_fd) = device_storage(first, &shared_bytes);

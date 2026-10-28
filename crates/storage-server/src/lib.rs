@@ -159,19 +159,19 @@ struct TensorEntry {
 struct Deployment {
     claim: Claim,
     head: Option<ClientId>,
-    /// The worlds claimed and not retired. The oldest serves; those newer
-    /// are on trial and keep what they publish to themselves.
+    /// The worlds claimed and not retired.
     worlds: BTreeSet<u64>,
+    /// Committed worlds whose tensors and pages every replica may read.
+    published: BTreeSet<u64>,
     /// The worlds a rollback retired while on trial: what they publish
     /// while their processes leave stays theirs.
     discarded: BTreeSet<u64>,
 }
 
 impl Deployment {
-    /// The worlds that keep what they publish to themselves: those on
-    /// trial, claimed and newer than the oldest, and those discarded.
+    /// Uncommitted and discarded worlds keep their outputs private.
     fn private(&self) -> BTreeSet<u64> {
-        let trial = self.worlds.iter().skip(1);
+        let trial = self.worlds.difference(&self.published);
         trial.chain(&self.discarded).copied().collect()
     }
 }
@@ -760,6 +760,9 @@ impl Server {
                 },
                 Role::Head { deployment, .. },
             ) => self.claim(id, &deployment, scopes, *world, retire),
+            (Request::PublishWorlds { worlds }, Role::Head { deployment, .. }) => {
+                self.publish_worlds(id, &deployment, worlds)
+            }
             (Request::KeepWeights { worlds }, Role::Head { deployment, .. }) => {
                 self.keep_weights(id, &deployment, worlds)
             }
@@ -951,34 +954,36 @@ impl Server {
         // trial are discarded with that head, never committed, and the
         // pages of every world discarded before are relabelled as such, so
         // that the new head's worlds may take their numbers.
-        let (trial, mut discarded, mut worlds) = match self.deployments.get(deployment) {
-            Some(entry) => (
-                entry.worlds.iter().skip(1).copied().collect(),
-                entry.discarded.clone(),
-                entry.worlds.clone(),
-            ),
-            None => (BTreeSet::new(), BTreeSet::new(), BTreeSet::new()),
-        };
+        let (trial, mut discarded, mut worlds, mut published) =
+            match self.deployments.get(deployment) {
+                Some(entry) => (
+                    entry.worlds.difference(&entry.published).copied().collect(),
+                    entry.discarded.clone(),
+                    entry.worlds.clone(),
+                    entry.published.clone(),
+                ),
+                None => (
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                ),
+            };
         let mut retired: BTreeSet<u64> = retire.iter().copied().collect();
         if held.is_none() {
             retired.extend(trial.iter().filter(|&&old| old != world));
             worlds.clear();
+            published.clear();
         }
         worlds.insert(world);
         worlds.retain(|world| !retired.contains(world));
-        // A world on trial that a claim retires is rolled back: its pages
-        // are discarded. A world on trial that the deployment keeps but no
-        // longer as a trial is committed: every world reads its pages,
-        // which the KV storage now takes.
-        let oldest = worlds.first().copied();
+        published.retain(|world| worlds.contains(world));
+        // Retiring an uncommitted world discards its private pages. A
+        // committed world's immutable pages remain reusable after retirement.
         for &old in &trial {
             if retired.contains(&old) {
                 self.pages.discard_world(deployment, old);
                 discarded.insert(old);
-            } else if Some(old) == oldest {
-                for (pool, pages) in self.pages.published_by(deployment, old) {
-                    self.upload(pool, pages);
-                }
             }
         }
         if held.is_none() {
@@ -993,6 +998,7 @@ impl Server {
                 claim,
                 head: Some(id),
                 worlds,
+                published,
                 discarded,
             },
         );
@@ -1033,6 +1039,35 @@ impl Server {
             self.release_deployment(&other);
         }
         Ok(Outcome::Reply(Reply::Claimed { claim }, Vec::new()))
+    }
+
+    /// Publish a committed set atomically before any reader can observe it.
+    fn publish_worlds(
+        &mut self,
+        id: ClientId,
+        deployment: &str,
+        worlds: &[u64],
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        let entry = self
+            .deployments
+            .get_mut(deployment)
+            .filter(|entry| entry.head == Some(id))
+            .ok_or_else(|| invalid("only the claiming head publishes committed worlds"))?;
+        if worlds.iter().any(|world| !entry.worlds.contains(world)) {
+            return Err(invalid("only claimed worlds can be published"));
+        }
+        let newly: Vec<_> = worlds
+            .iter()
+            .copied()
+            .filter(|world| !entry.published.contains(world))
+            .collect();
+        entry.published.extend(worlds);
+        for world in newly {
+            for (pool, pages) in self.pages.published_by(deployment, world) {
+                self.upload(pool, pages);
+            }
+        }
+        Ok(Outcome::Reply(Reply::WorldsPublished, Vec::new()))
     }
 
     /// The deployments other than `except` that hold a claim, a tensor or a
@@ -2730,6 +2765,7 @@ fn resource(error: io::Error) -> (ErrorKind, String) {
 fn request_name(request: &Request) -> &'static str {
     match request {
         Request::Claim { .. } => "claim",
+        Request::PublishWorlds { .. } => "publish_worlds",
         Request::Retain { .. } => "retain",
         Request::KeepWeights { .. } => "keep_weights",
         Request::Get { .. } => "get",

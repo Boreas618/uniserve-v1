@@ -141,6 +141,18 @@ impl Claims {
         }))
     }
 
+    /// Publishes this committed world's immutable pages on every claimed node.
+    pub(crate) fn publish(&self) -> anyhow::Result<()> {
+        for host in self.scopes.keys() {
+            crate::worker::processes::lock(&self.processes)?.publish_worlds(
+                host,
+                &self.deployment,
+                &[self.world],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Ends the memory of every world of `worlds` on each node of the
     /// deployment, claiming the engine's own scopes there again with them
     /// retired: a tensor no other world retains is released. With

@@ -97,6 +97,7 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
     )
     .unwrap();
     let claim = head.claim(0, vec![scope()], Vec::new()).unwrap();
+    head.publish_worlds(vec![0]).unwrap();
     let mut worker = Client::connect(
         socket,
         Role::Worker {

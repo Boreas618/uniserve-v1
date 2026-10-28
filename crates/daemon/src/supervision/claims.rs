@@ -186,6 +186,22 @@ impl ClaimHolder {
         Ok(claimed)
     }
 
+    /// Publishes committed worlds through this node's deployment claim.
+    pub(crate) fn publish_worlds(
+        &mut self,
+        deployment: &str,
+        worlds: &[u64],
+    ) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        self.held
+            .get_mut(deployment)
+            .with_context(|| format!("this node holds no claim of deployment {deployment}"))?
+            .client
+            .publish_worlds(worlds.to_vec())?;
+        Ok(())
+    }
+
     /// Has this node's Storage Server keep the weights alone of `worlds` of
     /// `deployment` (`Request::KeepWeights`), over the claim this daemon
     /// holds, and with `to_host` move them to host memory

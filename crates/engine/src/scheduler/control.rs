@@ -119,6 +119,13 @@ impl Scheduler {
             Command::Commit(answer) => {
                 let _ = answer.send(self.commit());
             }
+            Command::PublishWorld(answer) => {
+                let published = self
+                    .executor
+                    .publish_world()
+                    .map_err(|error| format!("{error:#}"));
+                let _ = answer.send(published);
+            }
             Command::Retire {
                 worlds,
                 discard_pages,

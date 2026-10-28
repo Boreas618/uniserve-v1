@@ -1479,6 +1479,11 @@ pub trait Executor: Send {
     fn commit(&mut self) -> Result<Vec<String>, ExecutorError> {
         Ok(Vec::new())
     }
+    /// Publishes this world's immutable pages after its commit decision.
+    /// Executors without shared storage have nothing to publish.
+    fn publish_world(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
     /// Ends the memory of every world of `worlds` on the nodes of the
     /// executor's workers, discarding the pages their host KV caches hold of
     /// the other worlds when `discard_pages` (`Claims::retire`). The default

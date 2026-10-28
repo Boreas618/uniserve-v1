@@ -1499,6 +1499,13 @@ impl Executor for WorkerExecutor {
         })
     }
 
+    fn publish_world(&mut self) -> anyhow::Result<()> {
+        match self.workers.first() {
+            Some((_, group)) => group.claims().publish(),
+            None => Ok(()),
+        }
+    }
+
     /// Retires `worlds` through the deployment's claims, which every group
     /// shares.
     fn retire(&mut self, worlds: &[u64], discard_pages: bool) -> anyhow::Result<()> {

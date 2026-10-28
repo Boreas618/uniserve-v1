@@ -151,6 +151,19 @@ impl Local {
                 Ok(claimed) => reply.kind = Some(reply::Kind::Claimed(claimed)),
                 Err(error) => reply.error = format!("{error:#}"),
             },
+            Some(request::Kind::PublishWorlds(publish)) => {
+                match self
+                    .claims
+                    .publish_worlds(&publish.deployment, &publish.worlds)
+                {
+                    Ok(()) => {
+                        reply.kind = Some(reply::Kind::WorldsPublished(
+                            proto::process::WorldsPublished {},
+                        ))
+                    }
+                    Err(error) => reply.error = format!("{error:#}"),
+                }
+            }
             Some(request::Kind::KeepWeights(keep)) => {
                 match self
                     .claims
@@ -598,6 +611,7 @@ fn route(
         Some(request::Kind::Ledger(query)) => Some(query.host.as_str()),
         Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
         Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
+        Some(request::Kind::PublishWorlds(publish)) => Some(publish.host.as_str()),
         Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
     };
     let forward = |member: &mut Membership| {
