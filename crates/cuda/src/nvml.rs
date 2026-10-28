@@ -31,7 +31,7 @@ struct ProcessInfo {
     compute_instance_id: u32,
 }
 
-/// `nvmlStorage_v2_t`.
+/// `nvmlMemory_v2_t`.
 #[repr(C)]
 #[derive(Default)]
 struct RawMemory {
@@ -44,7 +44,7 @@ struct RawMemory {
 
 /// `NVML_STRUCT_VERSION(Memory, 2)`: the struct size with the version in the
 /// top byte.
-const NVML_STORAGE_V2: u32 = size_of::<RawMemory>() as u32 | (2 << 24);
+const NVML_MEMORY_V2: u32 = size_of::<RawMemory>() as u32 | (2 << 24);
 
 /// The signature of NVML's `_v3` process queries.
 type ProcessQuery = unsafe extern "C" fn(NvmlDevice, *mut u32, *mut ProcessInfo) -> NvmlReturn;
@@ -79,7 +79,7 @@ fn api() -> Result<&'static Api> {
                 device_by_uuid: symbol(&library, "nvmlDeviceGetHandleByUUID")?,
                 compute_processes: symbol(&library, "nvmlDeviceGetComputeRunningProcesses_v3")?,
                 graphics_processes: symbol(&library, "nvmlDeviceGetGraphicsRunningProcesses_v3")?,
-                memory_info: symbol(&library, "nvmlDeviceGetStorageInfo_v2")?,
+                memory_info: symbol(&library, "nvmlDeviceGetMemoryInfo_v2")?,
                 _library: library,
             })
         }
@@ -249,14 +249,14 @@ impl Nvml {
     pub fn memory_info(&self, device: DeviceId) -> Result<NvmlMemory> {
         let handle = self.device(device)?;
         let mut storage = RawMemory {
-            version: NVML_STORAGE_V2,
+            version: NVML_MEMORY_V2,
             ..RawMemory::default()
         };
         self.api.check(
             // SAFETY: NVML fills the local struct, whose version field names its
-            // `nvmlStorage_v2_t` layout; `handle` came from NVML for this device.
+            // `nvmlMemory_v2_t` layout; `handle` came from NVML for this device.
             unsafe { (self.api.memory_info)(handle, &mut storage) },
-            "nvmlDeviceGetStorageInfo_v2",
+            "nvmlDeviceGetMemoryInfo_v2",
         )?;
         Ok(NvmlMemory {
             total: storage.total,

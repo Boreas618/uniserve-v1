@@ -32,7 +32,7 @@ pub const MEMCPY2: u32 = 22;
 pub const NVLINK: u32 = 40;
 /// `CUPTI_ACTIVITY_KIND_PCIE`.
 pub const PCIE: u32 = 46;
-/// `CUPTI_ACTIVITY_KIND_STORAGE2`.
+/// `CUPTI_ACTIVITY_KIND_MEMORY2`.
 pub const STORAGE2: u32 = 49;
 /// `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`.
 pub const GRAPH_TRACE: u32 = super::subscriber::GRAPH_TRACE;
@@ -102,7 +102,7 @@ pub struct Fill {
     pub graph_node: u64,
 }
 
-/// A storage allocation or release (`CUpti_ActivityStorage4`).
+/// A storage allocation or release (`CUpti_ActivityMemory4`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Memory {
     /// `CUpti_ActivityMemoryOperationType`: 1 allocation, 2 release.
