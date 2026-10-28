@@ -25,6 +25,8 @@ enum Serving {
     Engine(Arc<EngineClient>),
     /// A group reshape transferred this replica's requests to these owners.
     Successor(Arc<RequestHold>),
+    /// The successor daemon owns readiness and engine recovery.
+    Remote(Arc<crate::restart::requests::RemoteHold>),
     /// No engine will serve; submissions fail with the reason.
     Closed(String),
 }
@@ -42,7 +44,7 @@ pub struct RequestHold {
 /// The state the requests migrating out of world `world` continue with,
 /// although the world that serves next computes other numerics: a world
 /// change's `in_flight = keep`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Kept {
     pub world: u64,
     /// The prefix seed of the pages a token request continues with
@@ -62,6 +64,11 @@ pub enum HoldState {
     Holding,
     /// It fails: no engine will serve.
     Closed(String),
+}
+
+enum Destination {
+    Engine(Arc<EngineClient>),
+    Remote(Arc<crate::restart::requests::RemoteHold>),
 }
 
 impl Default for RequestHold {
@@ -121,7 +128,7 @@ impl RequestHold {
         match &*self.serving.borrow() {
             Serving::Engine(client) => HoldState::Engine(client.state()),
             Serving::Holding => HoldState::Holding,
-            Serving::Successor(_) => HoldState::Holding,
+            Serving::Successor(_) | Serving::Remote(_) => HoldState::Holding,
             Serving::Closed(reason) => HoldState::Closed(reason.clone()),
         }
     }
@@ -137,6 +144,13 @@ impl RequestHold {
     /// before redirecting successors during rollback.
     pub(crate) fn redirect(&self, successor: Arc<RequestHold>) {
         self.serving.send_replace(Serving::Successor(successor));
+        self.paused.send_replace(false);
+    }
+
+    /// Transfer continuation admission to the successor daemon. The old
+    /// engine's watcher no longer owns this hold, but its streams stay open.
+    pub(crate) fn hand_over(&self, remote: Arc<crate::restart::requests::RemoteHold>) {
+        self.serving.send_replace(Serving::Remote(remote));
         self.paused.send_replace(false);
     }
 
@@ -156,7 +170,9 @@ impl RequestHold {
     pub fn client(&self) -> Option<Arc<EngineClient>> {
         match &*self.serving.borrow() {
             Serving::Engine(client) => Some(Arc::clone(client)),
-            Serving::Holding | Serving::Closed(_) | Serving::Successor(_) => None,
+            Serving::Holding | Serving::Closed(_) | Serving::Successor(_) | Serving::Remote(_) => {
+                None
+            }
         }
     }
 
@@ -188,12 +204,67 @@ impl RequestHold {
         &self,
         request: Request,
     ) -> Result<(EventStream, Option<u32>), SubmitError> {
-        self.ready().await?.submit(request).await
+        self.ready(None).await?.0.submit(request).await
     }
 
     /// Waits for this replica to accept new requests. The deployment router
     /// waits on all replicas when none is ready, without polling.
-    pub(crate) async fn ready(&self) -> Result<Arc<EngineClient>, SubmitError> {
+    pub(crate) async fn ready(
+        &self,
+        previous_world: Option<u64>,
+    ) -> Result<(Arc<EngineClient>, Option<Kept>), SubmitError> {
+        let (destination, kept) = self.destination(previous_world).await?;
+        match destination {
+            Destination::Engine(client) => Ok((client, kept)),
+            Destination::Remote(remote) => {
+                let (client, remote_kept) = remote.ready(previous_world).await?;
+                Ok((client, kept.or(remote_kept)))
+            }
+        }
+    }
+
+    /// Attach a predecessor daemon to the current engine. A further handoff
+    /// forwards the request to the final owner, which alone allocates IDs.
+    pub(crate) async fn attach(
+        &self,
+        requests: String,
+        known_engine: Option<u64>,
+        previous_world: Option<u64>,
+    ) -> Result<crate::restart::requests::Attachment, SubmitError> {
+        let (destination, kept) = self.destination(previous_world).await?;
+        match destination {
+            Destination::Engine(client) => {
+                let engine = client.engine().ok_or_else(|| {
+                    SubmitError::Unavailable("the serving engine has no process identity".into())
+                })?;
+                let first_request = if known_engine == Some(engine) {
+                    None
+                } else {
+                    let first = client.reserve_request_ids();
+                    client.attach(&requests);
+                    Some(first)
+                };
+                Ok(crate::restart::requests::Attachment {
+                    engine,
+                    world: client.world(),
+                    first_request,
+                    kept,
+                })
+            }
+            Destination::Remote(remote) => {
+                let mut attachment = remote
+                    .attach(requests, known_engine, previous_world)
+                    .await?;
+                attachment.kept = kept.or(attachment.kept);
+                Ok(attachment)
+            }
+        }
+    }
+
+    async fn destination(
+        &self,
+        previous_world: Option<u64>,
+    ) -> Result<(Destination, Option<Kept>), SubmitError> {
         let mut serving = self.serving.subscribe();
         let mut paused = self.paused.subscribe();
         loop {
@@ -201,7 +272,16 @@ impl RequestHold {
             let current = serving.borrow_and_update().clone();
             match current {
                 Serving::Engine(client) if !held && client.state() == EngineState::Ready => {
-                    return Ok(client);
+                    return Ok((
+                        Destination::Engine(client),
+                        previous_world.and_then(|world| self.kept(world)),
+                    ));
+                }
+                Serving::Remote(remote) if !held => {
+                    return Ok((
+                        Destination::Remote(remote),
+                        previous_world.and_then(|world| self.kept(world)),
+                    ));
                 }
                 Serving::Closed(reason) => return Err(SubmitError::Unavailable(reason)),
                 Serving::Successor(successor) if !held => {
@@ -209,13 +289,19 @@ impl RequestHold {
                         changed = serving.changed() => {
                             changed.map_err(|_| SubmitError::Unavailable("the daemon stopped serving requests".into()))?;
                         }
-                        ready = Box::pin(successor.ready()) => return ready,
+                        ready = Box::pin(successor.destination(previous_world)) => {
+                            let (destination, kept) = ready?;
+                            return Ok((destination, previous_world.and_then(|world| self.kept(world)).or(kept)));
+                        }
                     }
                     continue;
                 }
                 // An engine that is not ready serves nothing until whoever
                 // watches it replaces it or closes the hold.
-                Serving::Engine(_) | Serving::Holding | Serving::Successor(_) => {}
+                Serving::Engine(_)
+                | Serving::Holding
+                | Serving::Successor(_)
+                | Serving::Remote(_) => {}
             }
             let changed = tokio::select! {
                 changed = serving.changed() => changed,

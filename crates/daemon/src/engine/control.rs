@@ -115,7 +115,7 @@ impl EngineControl {
             .context("the engine spec states no workers")?;
         let standby = spec.predecessor.is_some();
         let mut control = self.spawn(engine, &executable)?;
-        let (mut reader, mut writer, hello) = self.accept(engine, &mut control)?;
+        let (mut reader, mut writer, hello) = self.accept(engine, Some(&mut control))?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
                 "the engine speaks major version {} and this daemon {}",
@@ -211,6 +211,8 @@ impl EngineControl {
     /// (`EngineClient::attach`), is welcomed, and reports itself ready.
     /// Later engines this control starts take the identities from
     /// `next_engine` on. `stats` receives its schedulers' statistics.
+    /// With no control connection, this is a borrowed front: another daemon
+    /// retains process ownership and performs recovery.
     ///
     /// # Errors
     ///
@@ -221,12 +223,12 @@ impl EngineControl {
         engine: u64,
         next_engine: u64,
         served: wire::EngineSpec,
-        mut control: Connection,
+        mut control: Option<Connection>,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
         let world = served.world;
-        let (mut reader, mut writer, hello) = self.accept(engine, &mut control)?;
+        let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
                 "the engine speaks major version {} and this daemon {}",
@@ -270,7 +272,7 @@ impl EngineControl {
                     info.into(),
                     EngineState::Ready,
                     stats,
-                    Some(control),
+                    control,
                 )
                 .map(|client| client.numbered(engine).in_world(world));
             }
@@ -435,7 +437,7 @@ impl EngineControl {
     fn accept(
         &self,
         engine: u64,
-        control: &mut Connection,
+        mut control: Option<&mut Connection>,
     ) -> anyhow::Result<(Connection, Connection, wire::Hello)> {
         let mut incoming = self
             .incoming
@@ -461,7 +463,9 @@ impl EngineControl {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error).context("accepting the engine's connection"),
             }
-            exited(control)?;
+            if let Some(control) = control.as_deref_mut() {
+                exited(control)?;
+            }
             anyhow::ensure!(
                 Instant::now() < deadline,
                 "engine {engine} did not connect within {CONNECT_TIMEOUT:?}"

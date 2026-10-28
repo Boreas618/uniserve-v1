@@ -169,7 +169,7 @@ impl Leader {
             }
             let mut ready: futures::stream::FuturesUnordered<_> = replicas
                 .into_iter()
-                .map(|replica| async move { replica.hold.ready().await.map(|_| replica) })
+                .map(|replica| async move { replica.hold.ready(None).await.map(|_| replica) })
                 .collect();
             let mut failure = None;
             loop {
@@ -1722,6 +1722,12 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
                 .is_some_and(|trial| trial.contains(world));
             if group_trial {
                 let _deployment = registry.replacing.lock().await;
+                if !client
+                    .upgrade()
+                    .is_some_and(|client| replica.hold.serves(&client))
+                {
+                    return;
+                }
                 if locked(&registry.group)
                     .as_ref()
                     .is_some_and(|trial| trial.contains(world))
@@ -1737,6 +1743,12 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
                 .is_some_and(|decision| decision.pending.contains(&world));
             if committing {
                 let _deployment = registry.replacing.lock().await;
+                if !client
+                    .upgrade()
+                    .is_some_and(|client| replica.hold.serves(&client))
+                {
+                    return;
+                }
                 if locked(&registry.commit)
                     .as_ref()
                     .is_some_and(|decision| decision.pending.contains(&world))

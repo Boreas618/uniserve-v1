@@ -17,8 +17,10 @@
 //!    attaches, and accepts on the HTTP listener (`Serving`).
 //! 4. The daemon stops accepting and finishes the requests and video jobs
 //!    it took, relaying each later change of a job to the successor
-//!    (`Job`); then it closes its connection to the engine without shutting
-//!    it down and exits.
+//!    (`Job`). The successor owns recovery and supplies engine connections
+//!    for continuations (`Resume`, `Resumed`); further handoffs forward
+//!    those requests to the current owner. Once its requests end, the daemon
+//!    closes its engine connections without shutting the engine down.
 //!
 //! No connection closes: the listener, the processes' connections and the
 //! claim cross as descriptors, and each request ends on the daemon that took
@@ -51,6 +53,8 @@ use crate::openai::video_jobs::{VideoJob, VideoJobs};
 use crate::options::Stated;
 use crate::supervision::{Daemon, HandedService};
 
+pub(crate) mod requests;
+
 /// The descriptor a successor finds the handoff socket at.
 pub const TAKEOVER_DESCRIPTOR: i32 = 3;
 
@@ -73,6 +77,18 @@ enum Message {
     Takeover(Box<Takeover>),
     /// Successor to daemon: it serves; its process id.
     Serving { pid: u32 },
+    /// A predecessor asks the admission owner for its next engine front.
+    Resume {
+        id: u64,
+        replica: usize,
+        requests: String,
+        known_engine: Option<u64>,
+        previous_world: Option<u64>,
+    },
+    Resumed {
+        id: u64,
+        attachment: Result<requests::Attachment, String>,
+    },
     /// Daemon to successor: a video job's record changed, with its
     /// artifact's descriptor once it completed.
     Job {
@@ -202,6 +218,9 @@ impl Restarter {
         let _quiet = leader.quiesce().await;
         let handoff = leader.engine_handoff()?;
         let (ours, theirs) = UnixStream::pair().context("creating the handoff socket")?;
+        // The persistent reply reader must yield to the continuations it
+        // wakes, including when the handoff channel has no further traffic.
+        ours.set_nonblocking(true)?;
         let successor = spawn(&executable, theirs)?;
         info!(pid = successor, executable = %executable.display(), "started the successor daemon");
         let mut channel = Channel::new(ours);
@@ -278,37 +297,43 @@ impl Restarter {
                 unavailable: replica.unavailable.clone(),
             });
         }
-        let jobs_handed = jobs.hand_over(job_relay(channel.stream()));
-        let service_count = service_descriptors.len();
-        descriptors.extend(service_descriptors);
-        let mut job_records = Vec::with_capacity(jobs_handed.len());
-        for (record, media) in jobs_handed {
-            let artifact = match media {
-                Some(media) => {
-                    descriptors.push(artifact_descriptor(&media)?);
-                    Some(media.len() as u64)
-                }
-                None => None,
-            };
-            job_records.push((record, artifact));
+        let writer = requests::writer(&channel)?;
+        // Serialize the snapshot before any later job update uses the same
+        // stream. Continuation requests share this writer after handoff.
+        {
+            let mut sending = crate::leader::locked(&writer);
+            let jobs_handed = jobs.hand_over(job_relay(Arc::clone(&writer)));
+            let service_count = service_descriptors.len();
+            descriptors.extend(service_descriptors);
+            let mut job_records = Vec::with_capacity(jobs_handed.len());
+            for (record, media) in jobs_handed {
+                let artifact = match media {
+                    Some(media) => {
+                        descriptors.push(artifact_descriptor(&media)?);
+                        Some(media.len() as u64)
+                    }
+                    None => None,
+                };
+                job_records.push((record, artifact));
+            }
+            let borrowed: Vec<BorrowedFd<'_>> = descriptors.iter().map(|fd| fd.as_fd()).collect();
+            send(
+                &mut sending,
+                &Message::Takeover(Box::new(Takeover {
+                    listener,
+                    replicas,
+                    adapters: crate::leader::locked(&leader.replicas.adapters).clone(),
+                    commit: crate::leader::locked(&leader.replicas.commit).clone(),
+                    pending: crate::leader::locked(&leader.replicas.pending).clone(),
+                    service,
+                    service_descriptors: service_count,
+                    admin: admin.hand_over(),
+                    jobs: job_records,
+                    then: then.map(|request| *request),
+                })),
+                &borrowed,
+            )?;
         }
-        let borrowed: Vec<BorrowedFd<'_>> = descriptors.iter().map(|fd| fd.as_fd()).collect();
-        send(
-            &mut channel,
-            &Message::Takeover(Box::new(Takeover {
-                listener,
-                replicas,
-                adapters: crate::leader::locked(&leader.replicas.adapters).clone(),
-                commit: crate::leader::locked(&leader.replicas.commit).clone(),
-                pending: crate::leader::locked(&leader.replicas.pending).clone(),
-                service,
-                service_descriptors: service_count,
-                admin: admin.hand_over(),
-                jobs: job_records,
-                then: then.map(|request| *request),
-            })),
-            &borrowed,
-        )?;
         drop(descriptors);
         self.handed_over.store(true, Ordering::Release);
         for replica in handoff {
@@ -326,10 +351,42 @@ impl Restarter {
             pid,
             "the successor serves; this daemon finishes its requests"
         );
+        let continuations = requests::Requests::new(writer);
+        for (index, replica) in leader.replicas().iter().enumerate() {
+            let client = replica
+                .hold
+                .client()
+                .context("the handed-over replica has no client")?;
+            let control = Arc::clone(
+                replica
+                    .control
+                    .get()
+                    .context("the handed-over replica has no request socket")?,
+            );
+            replica.hold.hand_over(Arc::new(requests::RemoteHold::new(
+                Arc::clone(&continuations),
+                index,
+                control,
+                client,
+            )));
+        }
         self.accepting.cancel();
-        // The job relay writes on its own handle of the socket, which stays
-        // open until this process exits.
-        drop(channel);
+        tokio::spawn(async move {
+            loop {
+                match receive(&mut channel, None).await {
+                    Ok((Message::Resumed { id, attachment }, _)) => {
+                        continuations.answer(id, attachment)
+                    }
+                    Ok((message, _)) => warn!("the successor daemon sent {message:?}"),
+                    Err(error) => {
+                        continuations.close(format!(
+                            "the successor daemon closed its continuation relay: {error:#}"
+                        ));
+                        return;
+                    }
+                }
+            }
+        });
         Ok(pid)
     }
 }
@@ -361,23 +418,13 @@ fn spawn(executable: &std::path::Path, socket: UnixStream) -> anyhow::Result<u32
 /// change is one `Job` message, with the artifact's descriptor once the job
 /// completed. A change that cannot be sent is logged: the successor holds
 /// the job's last record it received.
-fn job_relay(stream: &storage::transport::Socket) -> crate::openai::video_jobs::Relay {
-    let stream = match stream {
-        storage::transport::Socket::Unix(stream) => stream.try_clone().ok(),
-        storage::transport::Socket::Tcp(_) => None,
-    };
-    let channel = std::sync::Mutex::new(stream.map(Channel::new));
+fn job_relay(writer: requests::Writer) -> crate::openai::video_jobs::Relay {
     Box::new(move |record, media| {
-        let Ok(mut channel) = channel.lock() else {
-            return;
-        };
-        let Some(channel) = channel.as_mut() else {
-            return;
-        };
+        let mut channel = crate::leader::locked(&writer);
         let artifact = media.map(|media| (media.len() as u64, artifact_descriptor(media)));
         let sent = match artifact {
             Some((length, Ok(descriptor))) => send(
-                channel,
+                &mut channel,
                 &Message::Job {
                     record: Box::new(record.clone()),
                     artifact: Some(length),
@@ -386,7 +433,7 @@ fn job_relay(stream: &storage::transport::Socket) -> crate::openai::video_jobs::
             ),
             Some((_, Err(error))) => Err(error),
             None => send(
-                channel,
+                &mut channel,
                 &Message::Job {
                     record: Box::new(record.clone()),
                     artifact: None,
@@ -433,7 +480,14 @@ fn send(
 
 /// The next message and its descriptors, waiting up to [`STEP_TIMEOUT`].
 async fn recv(channel: &mut Channel) -> anyhow::Result<(Message, Vec<OwnedFd>)> {
-    let deadline = Instant::now() + STEP_TIMEOUT;
+    receive(channel, Some(STEP_TIMEOUT)).await
+}
+
+async fn receive(
+    channel: &mut Channel,
+    timeout: Option<Duration>,
+) -> anyhow::Result<(Message, Vec<OwnedFd>)> {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         if let Some(frame) = channel
             .next_frame::<Message>()
@@ -446,7 +500,7 @@ async fn recv(channel: &mut Channel) -> anyhow::Result<(Message, Vec<OwnedFd>)> 
             "the other daemon closed the handoff socket"
         );
         anyhow::ensure!(
-            Instant::now() < deadline,
+            deadline.is_none_or(|deadline| Instant::now() < deadline),
             "the other daemon did not answer in time"
         );
         channel.receive().context("reading the handoff socket")?;
@@ -595,7 +649,7 @@ async fn prepared_successor(
                     replica.engine,
                     replica.next_engine,
                     served.clone(),
-                    connection,
+                    Some(connection),
                     sink,
                 )?;
                 client.number_requests_from(replica.first_request);
@@ -684,12 +738,20 @@ async fn prepared_successor(
     )?;
     info!("serving the deployment the previous daemon handed over");
 
-    // The replaced daemon relays its jobs' changes until it exits.
+    // The predecessor owns its original HTTP streams; admission and engine
+    // recovery belong here. The same channel carries job updates and asks
+    // for the next front when one of those streams needs to continue.
     let relayed = Arc::clone(&video_jobs);
+    let holds = leader
+        .replicas()
+        .iter()
+        .map(|replica| Arc::clone(&replica.hold))
+        .collect::<Vec<_>>();
+    let writer = requests::writer(channel)?;
     let mut relay = std::mem::replace(channel, Channel::new(UnixStream::pair()?.0));
-    tokio::spawn(async move {
+    let relay = tokio::spawn(async move {
         loop {
-            match recv(&mut relay).await {
+            match receive(&mut relay, None).await {
                 Ok((Message::Job { record, artifact }, descriptors)) => {
                     let media = match (artifact, descriptors.into_iter().next()) {
                         (Some(length), Some(descriptor)) => {
@@ -702,6 +764,35 @@ async fn prepared_successor(
                         _ => None,
                     };
                     relayed.adopt(*record, media);
+                }
+                Ok((
+                    Message::Resume {
+                        id,
+                        replica,
+                        requests,
+                        known_engine,
+                        previous_world,
+                    },
+                    _,
+                )) => {
+                    let hold = holds.get(replica).cloned();
+                    let writer = Arc::clone(&writer);
+                    tokio::spawn(async move {
+                        let attachment = match hold {
+                            Some(hold) => hold
+                                .attach(requests, known_engine, previous_world)
+                                .await
+                                .map_err(|error| error.to_string()),
+                            None => Err(format!("the handoff has no replica {replica}")),
+                        };
+                        if let Err(error) = send(
+                            &mut crate::leader::locked(&writer),
+                            &Message::Resumed { id, attachment },
+                            &[],
+                        ) {
+                            warn!("answering a predecessor continuation failed: {error:#}");
+                        }
+                    });
                 }
                 Ok((other, _)) => warn!("the replaced daemon sent {other:?}"),
                 // The replaced daemon exited.
@@ -723,6 +814,14 @@ async fn prepared_successor(
     )
     .await;
     let handed_over = served.as_ref().is_ok_and(|handed| *handed);
+    if handed_over {
+        // A second hot restart may finish this daemon's HTTP requests while
+        // its predecessor still has streams. Keep forwarding their admission
+        // to the latest owner until that predecessor drains and disconnects.
+        let _ = relay.await;
+    } else {
+        relay.abort();
+    }
     let served = served.map(drop);
     crate::http::finish(&config, &leader, daemon, retire, handed_over, served).await
 }

@@ -503,15 +503,20 @@ impl RequestEvents {
         let hold = Arc::clone(hold);
         // A request a world change moves to a world computing other
         // numerics continues with the state it reached (`in_flight = keep`).
-        let kept = match cause {
-            MigrationCause::Drain => self.stream.world().and_then(|world| hold.kept(world)),
-            MigrationCause::Loss => None,
-        };
+        let previous_world = (cause == MigrationCause::Drain)
+            .then(|| self.stream.world())
+            .flatten();
+        // Admission resolves the current owner first. After a daemon handoff
+        // that owner supplies both the engine and the continuation's state.
+        let (client, kept) = hold
+            .ready(previous_world)
+            .await
+            .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         let mut continuation = request.continuation(&migration, kept);
         if let Request::Generation(generation) = &mut continuation {
             generation.cache.resume = self.stream.cache_resume();
         }
-        let (stream, _scheduler) = hold
+        let (stream, _scheduler) = client
             .submit(continuation.clone())
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
