@@ -231,28 +231,8 @@ impl Worker {
             |name| world.meshes(name),
         );
         let host_only = !dedicated && components.host_only();
-        let meshes: Vec<ComponentMesh> = components
-            .placed()
-            .iter()
-            .filter_map(|placed| {
-                placed.mesh.clone().map(|mesh| ComponentMesh {
-                    component: placed.name.clone(),
-                    paths: description.declarations.roots(&placed.name),
-                    mesh,
-                    units: placed.units.clone(),
-                    sequence: sequence_kind(&placed.config),
-                    projection: head_projection(&placed.config),
-                })
-            })
-            .collect();
-        let experts = launch
-            .expert_parallel
-            .as_ref()
-            .map(|union| ExpertPartition {
-                world: world.torch().clone(),
-                attention_ranks: union.attention_ranks,
-                dedicated,
-            });
+        let meshes = component_meshes(&components, &description);
+        let experts = expert_partition(&launch, &world);
         let loading = range(c"uniserve.worker.load", None);
         // The weights the rank retained when it last loaded this model on
         // this placement bind instead of loading. Loading is collective, so
@@ -1398,6 +1378,141 @@ fn allocate_plugin_buffers(device: Device) -> Result<(Option<Handle>, BTreeMap<D
     Ok((Some(held), BTreeMap::from([(index, unattributed)])))
 }
 
+/// The meshes the components the rank places load and compute on.
+fn component_meshes(components: &Components, description: &Description) -> Vec<ComponentMesh> {
+    components
+        .placed()
+        .iter()
+        .filter_map(|placed| {
+            placed.mesh.clone().map(|mesh| ComponentMesh {
+                component: placed.name.clone(),
+                paths: description.declarations.roots(&placed.name),
+                mesh,
+                units: placed.units.clone(),
+                sequence: sequence_kind(&placed.config),
+                projection: head_projection(&placed.config),
+            })
+        })
+        .collect()
+}
+
+/// The rank's partition of the routed experts over its expert union;
+/// `None` outside one.
+fn expert_partition(launch: &WorkerLaunch, world: &World) -> Option<ExpertPartition> {
+    launch
+        .expert_parallel
+        .as_ref()
+        .map(|union| ExpertPartition {
+            world: world.torch().clone(),
+            attention_ranks: union.attention_ranks,
+            dedicated: launch.execution.role == "experts",
+        })
+}
+
+/// Plans the weights of the rank `launch` describes before its world
+/// starts (`uniserve worker --plan`): the rank describes its model, builds
+/// its partition in a planning world ([`World::planning`]: the meshes its
+/// start binds, without process groups or peers), materializes its model
+/// without reading the checkpoint on its device and plans the storages its
+/// weights take, chunked and keyed exactly as its start retains them
+/// ([`WeightKeys::plan`]). It connects to no Storage Server and retains
+/// nothing; the device storage it held returns when the process exits.
+pub(crate) fn plan_rank(
+    launch: &WorkerLaunch,
+    source_world: u64,
+) -> Result<storage::manifest::weights::PlannedRank> {
+    let device = launch.device();
+    let Device::Cuda(cuda) = device else {
+        return Err(Error::Unsupported(
+            "a rank plans its weights on its CUDA device".into(),
+        ));
+    };
+    let _context = PrimaryContext::retain(cuda)?;
+    let device_storage = cuda.memory_info()?;
+    let description = Description::describe(launch)?;
+    let mut world = World::planning(launch)?;
+    let dedicated = launch.execution.role == "experts";
+    if !dedicated {
+        world.bind_components(launch, &description.declarations)?;
+    }
+    let components = Components::new(
+        &description.declarations,
+        &launch.components,
+        launch.execution.rank,
+        device,
+        |name| world.meshes(name),
+    );
+    let host_only = !dedicated && components.host_only();
+    let meshes = component_meshes(&components, &description);
+    let experts = expert_partition(launch, &world);
+    let streams_from_host = components
+        .placed()
+        .iter()
+        .any(|placed| placed.config.weights == ComponentWeights::Host);
+    let fingerprints = model_fingerprints(launch, &description, host_only)?;
+    let moved = launch
+        .expert_parallel
+        .as_ref()
+        .is_some_and(ExpertUnion::prefetches_weights);
+    let gpu = cuda.uuid()?.0;
+    // A rank whose weights are not retained, or stream from host storage,
+    // loads them: it plans no storages.
+    let keys = match fingerprints
+        .as_ref()
+        .filter(|_| !moved && !streams_from_host)
+    {
+        Some(fingerprints) => {
+            let devices: Vec<DeviceId> = launch
+                .execution
+                .devices()
+                .filter_map(|device| device.cuda())
+                .collect();
+            Some(WeightKeys::planning(
+                fingerprints,
+                &weights::position(launch)?,
+                &devices,
+                &chunk_degrees(launch)?,
+            )?)
+        }
+        None => None,
+    };
+    let Some(keys) = keys else {
+        return Ok(storage::manifest::weights::PlannedRank {
+            gpu,
+            total_bytes: device_storage.total,
+            free_bytes: device_storage.free,
+            fingerprints: BTreeMap::new(),
+            storages: None,
+            sources: None,
+        });
+    };
+    let unread = LoadedModel::unread(&description, launch, &meshes, experts.as_ref())?;
+    let planned = keys.plan(&unread, &[], None)?;
+    let storages = keys.planned_storages(&planned);
+    drop(planned);
+    drop(unread);
+    Interpreter::import("gc.collect")?.call_values(&[])?;
+    Interpreter::import("torch.cuda.empty_cache")?.call_values(&[])?;
+    let retained = Retained::connect(
+        &launch.storage,
+        &launch.group,
+        launch.execution.rank as u32,
+        launch.generation,
+    )?;
+    let mut sources = keys.sources(&retained, &launch.storage.peers, Some(source_world))?;
+    if let Some(sources) = sources.as_mut() {
+        keys.measure_sources(&retained, sources)?;
+    }
+    Ok(storage::manifest::weights::PlannedRank {
+        gpu,
+        total_bytes: device_storage.total,
+        free_bytes: device_storage.free,
+        fingerprints: keys.fingerprint_digests(),
+        storages,
+        sources,
+    })
+}
+
 /// The model fingerprints of a rank that holds CUDA weights
 /// (`uniserve.loading.retained.fingerprints`), which key its retained
 /// weights and its cache pages; `None` for the stub model and a rank
@@ -1434,13 +1549,13 @@ struct Receiving<'a> {
 }
 
 /// The weights a rank binds: `found`, those it retained at its position
-/// before, or the weights it receives from the host's other worlds
-/// (`weights::WeightKeys::receive`). The ranks that load together receive
-/// when any of them found no manifest of its own and each sees weights
-/// other worlds hold; each then materializes its model without reading
-/// the checkpoint, plans the storages its weights take, frees the model and
-/// receives into them, a rank that found its manifest included. `None`
-/// when the ranks load from the checkpoint.
+/// before, or retained weights in the deployment. Updates use the daemon's
+/// exact transfer plan; cold starts plan from available retained sources.
+/// The ranks that load together receive when any rank lacks its own manifest
+/// and every rank can see source weights. Each materializes its model
+/// without reading the checkpoint, plans the storages its weights take,
+/// frees the model and receives into them, a rank that found its manifest
+/// included. `None` when the ranks load from the checkpoint.
 fn receive_weights(
     receiving: &Receiving<'_>,
     found: Option<weights::Found>,
@@ -1454,7 +1569,19 @@ fn receive_weights(
         meshes,
         experts,
     } = *receiving;
-    let sources = keys.sources(retained, &launch.storage.peers)?;
+    let sources = keys.sources(
+        retained,
+        &launch.storage.peers,
+        launch.received.as_ref().map(|received| received.world),
+    )?;
+    let transfer = launch
+        .received
+        .as_ref()
+        .map(|received| {
+            serde_json::from_slice::<storage::manifest::weights::Transfer>(&received.manifest)
+                .map_err(|error| Error::Interface(format!("weight redistribution plan: {error}")))
+        })
+        .transpose()?;
     let votes =
         agreement.all_gather_bytes(&[u8::from(found.is_none()), u8::from(sources.is_some())])?;
     let needed = votes.iter().any(|vote| vote.first() == Some(&1));
@@ -1466,9 +1593,9 @@ fn receive_weights(
     // all lie on its GPU and are mapped.
     drop(found);
     let unread = LoadedModel::unread(description, launch, meshes, experts)?;
-    let planned = keys.plan(&unread, &[], None)?;
+    let storages = keys.plan(&unread, &[], None)?;
     drop(unread);
-    keys.receive(retained, planned, &sources, agreement)
+    keys.receive(retained, storages, &sources, agreement, transfer)
         .map(Some)
 }
 

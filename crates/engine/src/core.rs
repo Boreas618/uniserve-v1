@@ -423,6 +423,10 @@ pub struct EngineConfig {
     /// group identity, which an engine replacing a lost one of the world
     /// takes as its own; empty to lay the planes out afresh.
     pub segments: BTreeMap<String, ipc::CacheTable>,
+    /// The weights each worker group receives from the world the engine
+    /// succeeds, by group identity, as the daemon planned a change of the
+    /// parallel configuration; empty for groups that bind or load theirs.
+    pub received_weights: BTreeMap<String, ipc::ReceivedWeights>,
 }
 
 impl EngineConfig {
@@ -481,6 +485,7 @@ impl EngineConfig {
             world: 0,
             predecessor: None,
             segments: BTreeMap::new(),
+            received_weights: BTreeMap::new(),
         }
     }
 
@@ -533,33 +538,27 @@ pub struct SchedulerHandle {
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Every worker group's launch arguments ([`SchedulerHandle::group_arguments`]),
+/// and what the schedulers are assembled from.
+pub(crate) struct GroupArguments {
+    /// The model groups', scheduler by scheduler, then the expert groups'.
+    pub(crate) arguments: Vec<WorkerProcessArgs>,
+    /// The model groups each scheduler holds.
+    per_core: usize,
+    /// Each scheduler's resolved transfer edges.
+    transfers: Vec<TransferConfig>,
+    max_running_requests: usize,
+    model_workers: Vec<WorkerGroupConfig>,
+    expert_workers: Vec<WorkerGroupConfig>,
+}
+
 impl SchedulerHandle {
-    /// Launches the deployment's workers and runs one scheduler per DP rank,
-    /// `config.data_parallel_size` of them, each over its own copy of the
-    /// deployment's model worker groups.
-    ///
-    /// `config.worker_groups` lists the schedulers' model groups as equal
-    /// consecutive blocks. Each scheduler gets its own thread, executor,
-    /// cache pool, prefix cache and request rows over its own groups, the
-    /// way SGLang runs one scheduler per data-parallel rank behind its
-    /// `DataParallelController` and vLLM one engine core per data-parallel
-    /// rank. Every group of every scheduler launches through one
-    /// `WorkerGroup::spawn_all`, so the schedulers load their models at the
-    /// same time and one daemon per node serves all of them.
-    ///
-    /// Schedulers exchange no products: every configured transfer edge must
-    /// stay inside one scheduler, and each binds its default edges over its
-    /// own groups only.
-    ///
-    /// Fails when the size is zero or does not divide the groups, when the
-    /// schedulers' groups are not the same deployment on different ranks
-    /// (group count, rank counts, components, queue depth and
-    /// mem_fraction_static must match position by position), when a
-    /// configured edge crosses schedulers or names an unconfigured worker
-    /// group, when the workers of a token runtime hold too few request rows
-    /// for `max_running_requests` running requests, or when a group cannot
-    /// be launched, a scheduler cannot be built or its warmup fails.
-    pub fn start_all(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
+    /// The launch arguments of every worker group `config` places: the
+    /// model groups, scheduler by scheduler, then the dedicated expert
+    /// groups, each with its scheduler's transfer edges, its place in the
+    /// expert union and the world's per-group values (see
+    /// [`SchedulerHandle::start_all`] for what is refused).
+    pub(crate) fn group_arguments(config: &EngineConfig) -> anyhow::Result<GroupArguments> {
         let size = config.data_parallel_size;
         WorkerGroupConfig::validate_all(&config.worker_groups)?;
         let (model_workers, expert_workers): (Vec<_>, Vec<_>) = config
@@ -572,8 +571,8 @@ impl SchedulerHandle {
             "{} worker groups do not form {size} equal schedulers",
             model_workers.len()
         );
-        let core_groups: Vec<&[WorkerGroupConfig]> =
-            model_workers.chunks(model_workers.len() / size).collect();
+        let per_core = model_workers.len() / size;
+        let core_groups: Vec<&[WorkerGroupConfig]> = model_workers.chunks(per_core).collect();
         for core_group in &core_groups[1..] {
             for (group, first) in core_group.iter().zip(core_groups[0]) {
                 anyhow::ensure!(
@@ -774,7 +773,54 @@ impl SchedulerHandle {
                 .and_then(|groups| groups.get(&args.worker_id))
                 .cloned();
             args.segments = config.segments.get(&args.worker_id).cloned();
+            args.received_weights = config.received_weights.get(&args.worker_id).cloned();
         }
+
+        Ok(GroupArguments {
+            arguments,
+            per_core,
+            transfers,
+            max_running_requests,
+            model_workers,
+            expert_workers,
+        })
+    }
+
+    /// Launches the deployment's workers and runs one scheduler per DP rank,
+    /// `config.data_parallel_size` of them, each over its own copy of the
+    /// deployment's model worker groups.
+    ///
+    /// `config.worker_groups` lists the schedulers' model groups as equal
+    /// consecutive blocks. Each scheduler gets its own thread, executor,
+    /// cache pool, prefix cache and request rows over its own groups, the
+    /// way SGLang runs one scheduler per data-parallel rank behind its
+    /// `DataParallelController` and vLLM one engine core per data-parallel
+    /// rank. Every group of every scheduler launches through one
+    /// `WorkerGroup::spawn_all`, so the schedulers load their models at the
+    /// same time and one daemon per node serves all of them.
+    ///
+    /// Schedulers exchange no products: every configured transfer edge must
+    /// stay inside one scheduler, and each binds its default edges over its
+    /// own groups only.
+    ///
+    /// Fails when the size is zero or does not divide the groups, when the
+    /// schedulers' groups are not the same deployment on different ranks
+    /// (group count, rank counts, components, queue depth and
+    /// mem_fraction_static must match position by position), when a
+    /// configured edge crosses schedulers or names an unconfigured worker
+    /// group, when the workers of a token runtime hold too few request rows
+    /// for `max_running_requests` running requests, or when a group cannot
+    /// be launched, a scheduler cannot be built or its warmup fails.
+    pub fn start_all(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
+        let GroupArguments {
+            arguments,
+            per_core,
+            transfers,
+            max_running_requests,
+            model_workers,
+            expert_workers,
+        } = Self::group_arguments(&config)?;
+        let core_groups: Vec<&[WorkerGroupConfig]> = model_workers.chunks(per_core).collect();
 
         // `spawn_all` returns groups in argument order, which pairs each group
         // with its identity and, block by block, with its scheduler.
@@ -789,7 +835,7 @@ impl SchedulerHandle {
         // request capabilities, so they never become a scheduler's own.
         let mut shared = groups.split_off(model_workers.len());
         let mut groups = groups.into_iter();
-        let mut cores = Vec::with_capacity(size);
+        let mut cores = Vec::with_capacity(config.data_parallel_size);
         for (index, (core_group, transfer)) in core_groups.iter().zip(transfers).enumerate() {
             let mut workers = groups.by_ref().take(core_group.len()).collect::<Vec<_>>();
             if index == 0 {

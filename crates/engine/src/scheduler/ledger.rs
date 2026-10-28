@@ -17,11 +17,13 @@
 //!   books the context only from its first transfer on the GPU) and
 //!   less what its successor adds: a graph pool of its own, a fixed part as
 //!   large as the serving world's (process memory and exclusive storages,
-//!   for the same configuration), its head segment, and no weights or KV
-//!   cache of the keys it maps read-only. The serving world gives back the
-//!   tail segments past that limit; a limit below the segments it cannot
-//!   give back (its first, which holds the sentinel and the warmup scratch)
-//!   makes the change infeasible.
+//!   for the same configuration), its head segment, the weight chunks it
+//!   creates (those of other regions, for a world of another parallel
+//!   configuration, as the daemon's copy manifests state per GPU), and no
+//!   weights or KV cache of the keys it maps read-only. The serving world
+//!   gives back the tail segments past that limit; a limit below the
+//!   segments it cannot give back (its first, which holds the sentinel and
+//!   the warmup scratch) makes the change infeasible.
 //! - **Trial and after** ([`growable`]): a world's cache creates its
 //!   deferred segments as the ledger's room holds them. The room is the
 //!   quota less everything booked, so in the trial it is less what the
@@ -200,7 +202,9 @@ pub(super) struct Holdings {
 pub(super) struct Additions {
     /// Weights of keys the serving world does not hold: as many as it
     /// holds when the successor loads its weights from the model's files
-    /// (their keys differ), none when it maps them all.
+    /// (their keys differ), the chunks it creates on the GPU when it holds
+    /// other regions of the same weights (another parallel configuration),
+    /// none when it maps them all.
     pub(super) weights: u64,
     /// The graph pool its warmup captures in.
     pub(super) graph_pool: u64,
@@ -236,7 +240,7 @@ impl Additions {
 pub(super) fn preparing(
     report: &CacheMemory,
     floor: u32,
-    adds: crate::Successor,
+    adds: &crate::Successor,
     in_flight_units: u32,
 ) -> Result<Preparing, String> {
     let (Some(ledger), Some(scope), Some(world)) = (&report.ledger, &report.scope, report.world)
@@ -279,7 +283,7 @@ pub(super) fn preparing(
         weights: if adds.loads_weights {
             serving.weights
         } else {
-            0
+            adds.created_weights.get(&ledger.gpu).copied().unwrap_or(0)
         },
         // A successor captures graphs only when its policy captures and its
         // model can be captured.

@@ -74,9 +74,8 @@ const CHUNK_ALIGN: u64 = 64 << 10;
 /// (`devices::SAMPLE_BYTES`), so that the fixed cost of submitting a copy
 /// or posting a READ and seeing it complete is a few percent of its time
 /// at the line rate of the NVLink fabric or the host's network adapters.
-/// The pace of the link's later chunks is its measured bandwidth, so a
-/// shorter chunk, whose fixed cost would understate the link, would hold
-/// the link below its rate.
+/// Smaller retained chunks accumulate into the same byte window; their
+/// measured throughput includes the cost of submitting each copy.
 const MEASURE_BYTES: u64 = 64 << 20;
 
 /// The timed chunks of [`MEASURE_BYTES`] whose fastest gives a link from
@@ -680,17 +679,30 @@ fn chunk_bytes(bandwidth: Option<f64>, chunk: Duration) -> u64 {
     (bytes / CHUNK_ALIGN * CHUNK_ALIGN).max(MIN_CHUNK)
 }
 
-/// The timing of a link nobody measured: `piece`, a chunk of it, completed
-/// `seconds` after its submission. A contiguous chunk of [`MEASURE_BYTES`]
-/// is a sample (a shorter one, the tail of a piece, or a strided one, whose
-/// rows each cost a copy or a READ descriptor, would understate the link);
-/// returns the link's bandwidth, the fastest sample, once
-/// [`MEASURE_SAMPLES`] were taken.
-fn sample(samples: &mut Vec<f64>, piece: &Piece, seconds: f64) -> Option<f64> {
-    if piece.rows == 1 && piece.bytes == MEASURE_BYTES {
-        samples.push(piece.bytes as f64 / seconds.max(1e-6));
+/// Timed contiguous copies accumulate into equal byte windows. Small retained
+/// chunks can therefore measure a link without an artificial minimum model
+/// size; their submission costs remain part of the measured throughput.
+#[derive(Default)]
+struct Samples {
+    bytes: u64,
+    seconds: f64,
+    completed: usize,
+    fastest: f64,
+}
+
+fn sample(samples: &mut Samples, piece: &Piece, seconds: f64) -> Option<f64> {
+    if piece.rows == 1 {
+        samples.bytes += piece.bytes;
+        samples.seconds += seconds;
+        if samples.bytes >= MEASURE_BYTES {
+            let bandwidth = samples.bytes as f64 / samples.seconds.max(1e-6);
+            samples.fastest = samples.fastest.max(bandwidth);
+            samples.completed += 1;
+            samples.bytes = 0;
+            samples.seconds = 0.0;
+        }
     }
-    (samples.len() >= MEASURE_SAMPLES).then(|| samples.iter().copied().fold(0.0, f64::max))
+    (samples.completed >= MEASURE_SAMPLES).then_some(samples.fastest)
 }
 
 /// Run `lane`'s chunks on the copy engines of `device`, until nothing is
@@ -725,7 +737,7 @@ fn device_lane(
         }
     };
     let mut flight: VecDeque<(Piece, Event)> = VecDeque::with_capacity(DEPTH);
-    let mut samples = Vec::with_capacity(MEASURE_SAMPLES);
+    let mut samples = Samples::default();
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
         let piece = match shared.next(lane, bytes, !flight.is_empty()) {
@@ -868,9 +880,9 @@ fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Dur
 ///
 /// While the link is unmeasured its chunks are [`MEASURE_BYTES`] long and
 /// run one at a time, each timed from its post to its completion; the
-/// fastest of the first [`MEASURE_SAMPLES`] full chunks becomes the link's
-/// bandwidth, which the lane reports. A shorter chunk (the tail of a piece)
-/// is not timed: the fixed cost of a READ would understate the link.
+/// fastest of the first [`MEASURE_SAMPLES`] byte windows becomes the link's
+/// bandwidth. Contiguous smaller chunks accumulate bytes and elapsed time
+/// into each window.
 fn network_lane(
     shared: &Shared,
     lane: &LaneKey,
@@ -879,7 +891,7 @@ fn network_lane(
     chunk: Duration,
 ) {
     let mut flight: VecDeque<(Piece, nixl::Transfer)> = VecDeque::with_capacity(DEPTH);
-    let mut samples = Vec::with_capacity(MEASURE_SAMPLES);
+    let mut samples = Samples::default();
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
         let piece = match shared.next(lane, bytes, !flight.is_empty()) {

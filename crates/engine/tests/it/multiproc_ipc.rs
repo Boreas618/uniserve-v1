@@ -2806,6 +2806,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         max_total_tokens: Some(4096),
         predecessor: None,
         segments: None,
+        received_weights: None,
         attention_backend: "torch".into(),
         block_size: Some(16),
         max_batch_calls: 8,

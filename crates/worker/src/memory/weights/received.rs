@@ -11,15 +11,14 @@
 //! manifests the worker reads inline (`Request::Read`). The worker plans
 //! the storages its own weights take without reading the checkpoint
 //! ([`WeightKeys::plan`] over an unread model), and the ranks that load
-//! together compute one copy manifest from those sources to all of their
-//! storages (`storage::manifest`), each verifying that every rank computed
-//! the same digest before any byte moves ([`WeightKeys::receive`]).
+//! together consume the daemon's copy manifest. Cold starts without such
+//! a plan compute it from the ranks' target layouts ([`WeightKeys::receive`]).
 //!
 //! A manifest's plan weighs every block by the bandwidth of its link, so
 //! each rank first has its host's Transfer Server measure the link from
 //! every source GPU of another node into its GPU that it has not measured
-//! (two READs, or copies over the NVLink fabric, of 64 MiB of a chunk that
-//! GPU holds into a scratch storage of the rank's), and the ranks plan from
+//! (two 64 MiB windows of READs or NVLink copies, repeating a smaller
+//! retained chunk when necessary), and the ranks plan from
 //! the links all of them measured, gathered across their hosts.
 //!
 //! Each rank then allocates its storages at fixed addresses: a chunk whose
@@ -43,10 +42,9 @@ use std::sync::Arc;
 
 use cuda::{Protection, Stream};
 use sha2::{Digest, Sha256};
+use storage::manifest::weights::{Sources, Transfer};
 use storage::manifest::{self, Gpu, Manifest, Space};
-use storage::protocol::{
-    Access, LinkBandwidth, ListedTensor, Listing, Memory, Priority, Region, Span,
-};
+use storage::protocol::{Access, LinkBandwidth, Memory, Priority, Region, Span};
 use storage::{Client, Key, Mode, Placement, StorageRecord, TensorRecord};
 
 use super::{
@@ -59,16 +57,6 @@ use crate::memory::retained::Retained;
 use crate::parallel::host::HostGroup;
 use crate::{Error, Result};
 
-/// The weights the deployment's worlds retain on the host and on its other
-/// nodes: their ranks' storages, each on a GPU that holds all of its
-/// chunks, the links the host's Transfer Server measured, and the server
-/// of each source GPU of another node.
-pub(crate) struct Sources {
-    world: manifest::World,
-    links: Vec<LinkBandwidth>,
-    remote: BTreeMap<Gpu, String>,
-}
-
 /// How long another node's Storage Server may take to accept the worker's
 /// connection and answer one request: a listing and a manifest are small.
 const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -78,10 +66,6 @@ const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// the faster of the first two giving its bandwidth (its lanes'
 /// `MEASURE_BYTES`).
 const LINK_SAMPLE: u64 = 64 << 20;
-
-/// Every source storage a listing's manifests name, by GPU, once per GPU
-/// however many manifests name it.
-type ByGpu = BTreeMap<Gpu, BTreeMap<Vec<u8>, manifest::Storage>>;
 
 /// Weights a worker receives into chunks it created, until the transfer
 /// ends and they are retained read-only ([`Receipt::retain`]).
@@ -109,152 +93,74 @@ impl WeightKeys {
     /// at `peers`), of the same model, which this worker may receive:
     /// `None` when they retain none, or no Transfer Server runs to copy
     /// them. Failure to reach a peer is reported to the caller.
-    pub(crate) fn sources(&self, retained: &Retained, peers: &[String]) -> Result<Option<Sources>> {
-        // A rank whose weights span devices (a generation tower on a device
-        // of its own) loads them.
+    pub(crate) fn sources(
+        &self,
+        retained: &Retained,
+        peers: &[String],
+        world: Option<u64>,
+    ) -> Result<Option<Sources>> {
         if self.devices.len() != 1 {
             return Ok(None);
         }
+        let deployment = &retained.scope().deployment;
+        let fingerprints = self.fingerprint_digests();
         let listing = retained.call("listing the storage server", |client| client.list())?;
-        let Some(links) = listing
-            .transfer
-            .as_ref()
-            .map(|transfer| transfer.links.clone())
-            .filter(|links| !links.is_empty())
-        else {
-            return Ok(None);
-        };
-        let deployment = retained.scope().deployment.clone();
-        let mut by_gpu = ByGpu::new();
-        self.collect(
-            &listing,
-            &deployment,
-            |key| read_text(retained, key),
-            &mut by_gpu,
-        )?;
-        let mut remote = BTreeMap::new();
+        let mut sources =
+            manifest::weights::sources(&listing, deployment, world, &fingerprints, |key| {
+                read_text(retained, key)
+            })?
+            .unwrap_or_else(|| Sources {
+                world: manifest::World { ranks: Vec::new() },
+                links: listing
+                    .transfer
+                    .map(|transfer| transfer.links)
+                    .unwrap_or_default(),
+                remote: Vec::new(),
+            });
         for endpoint in peers {
             let mut peer = Client::connect_peer(endpoint, PEER_TIMEOUT)
                 .map_err(|error| storage_error_at(endpoint, "connecting", &error))?;
             let listing = peer
                 .list()
                 .map_err(|error| storage_error_at(endpoint, "listing", &error))?;
-            let read = |key: Key| {
+            let read = |key| {
                 let bytes = peer.read(deployment.clone(), key).map_err(|error| {
                     storage_error_at(endpoint, "reading a weight manifest", &error)
                 })?;
-                String::from_utf8(bytes).map(Some).map_err(|_| {
-                    Error::Interface(format!("a weight manifest at {endpoint} is not text"))
-                })
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|error| Error::Interface(error.to_string()))
             };
-            for gpu in self.collect(&listing, &deployment, read, &mut by_gpu)? {
-                remote.entry(gpu).or_insert_with(|| endpoint.clone());
+            if let Some(remote) =
+                manifest::weights::sources(&listing, deployment, world, &fingerprints, read)?
+            {
+                sources.remote.extend(
+                    remote
+                        .world
+                        .ranks
+                        .iter()
+                        .filter_map(|rank| rank.gpu.map(|gpu| (gpu, endpoint.clone()))),
+                );
+                sources.world.ranks.extend(remote.world.ranks);
+                sources.links.extend(remote.links);
             }
         }
-        // One source rank per GPU, its storages in a fixed order, so that
-        // every worker that lists the same servers plans the same manifest.
-        let ranks: Vec<manifest::Rank> = by_gpu
-            .into_iter()
-            .map(|(gpu, storages)| manifest::Rank {
-                gpu: Some(gpu),
-                storages: storages.into_values().collect(),
-            })
-            .collect();
-        if ranks.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(Sources {
-            world: manifest::World { ranks },
-            links,
-            remote,
-        }))
+        sources.world.ranks.sort_by_key(|rank| rank.gpu);
+        Ok((!sources.world.ranks.is_empty()).then_some(sources))
     }
 
-    /// Adds every source storage that `listing`'s manifests name to
-    /// `by_gpu`, reading each manifest with `read`: the storages of the
-    /// fields of this worker's fingerprints whose chunks all lie on one GPU
-    /// of the listing, read-only and retained by the deployment. Returns
-    /// the GPUs it added storages of.
-    fn collect(
-        &self,
-        listing: &Listing,
-        deployment: &str,
-        mut read: impl FnMut(Key) -> Result<Option<String>>,
-        by_gpu: &mut ByGpu,
-    ) -> Result<BTreeSet<Gpu>> {
-        let ours = |tensor: &ListedTensor| {
-            tensor.access == Access::ReadOnly
-                && tensor
-                    .retainers
-                    .iter()
-                    .any(|retainer| retainer.scope.deployment == deployment)
-        };
-        // The GPUs holding each chunk, and the manifests.
-        let mut held: HashMap<Key, BTreeSet<Gpu>> = HashMap::new();
-        let mut manifests = BTreeSet::new();
-        for tensor in listing.tensors.iter().filter(|tensor| ours(tensor)) {
-            match tensor.placement {
-                Placement::Device { gpu } => {
-                    held.entry(tensor.key).or_default().insert(gpu);
-                }
-                Placement::Host { .. } if tensor.name == MANIFEST_NAME => {
-                    manifests.insert(tensor.key);
-                }
-                Placement::Host { .. } => {}
-            }
-        }
-
-        let digests = self.fingerprint_digests();
-        let mut added = BTreeSet::new();
-        for key in manifests {
-            let Some(text) = read(key)? else {
-                continue;
-            };
-            // A manifest of another version or format names no source.
-            let Ok(manifest) = serde_json::from_str::<WeightManifest>(&text) else {
-                continue;
-            };
-            if manifest.version != MANIFEST_VERSION {
-                continue;
-            }
-            for storage in &manifest.storages {
-                // Only the fields of sources with this worker's digests
-                // hold the bytes it needs.
-                let same = storage.device.is_some()
-                    && storage.storage.layout.fields.iter().all(|field| {
-                        manifest.fingerprints.get(&field.source) == digests.get(&field.source)
-                    });
-                if !same {
-                    continue;
-                }
-                let mut gpus: Option<BTreeSet<Gpu>> = None;
-                for chunk in &storage.storage.chunks {
-                    let on = held.get(&chunk.key).cloned().unwrap_or_default();
-                    gpus = Some(match gpus {
-                        None => on,
-                        Some(gpus) => gpus.intersection(&on).copied().collect(),
-                    });
-                }
-                let identity = serde_json::to_vec(&storage.storage).map_err(|error| {
-                    Error::Invalid(format!("encoding a source storage: {error}"))
-                })?;
-                for gpu in gpus.unwrap_or_default() {
-                    added.insert(gpu);
-                    by_gpu
-                        .entry(gpu)
-                        .or_default()
-                        .insert(identity.clone(), storage.storage.clone());
-                }
-            }
-        }
-        Ok(added)
+    /// Measures source links before the daemon assigns ranks or books memory.
+    pub(crate) fn measure_sources(&self, retained: &Retained, sources: &mut Sources) -> Result<()> {
+        let (device, gpu) = self.device(0)?;
+        sources.links = measure_links(retained, sources, device, gpu)?;
+        Ok(())
     }
 
     /// Receive this rank's `planned` storages from `sources`, together
     /// with the ranks of `agreement` (the ranks that load together, every
     /// one of which calls this): the ranks plan one manifest from the
-    /// sources to all their storages and verify they computed the same
-    /// digest; then each maps the chunks a source holds on its GPU,
+    /// sources to all their storages when no daemon plan is supplied;
+    /// then each maps the chunks a source holds on its GPU,
     /// creates the rest, submits the copies into them to the Transfer
     /// Server and zeroes the padding the manifest names. Returns the
     /// storages as found weights: the tensors of the regions no source
@@ -266,6 +172,7 @@ impl WeightKeys {
         planned: Planned,
         sources: &Sources,
         agreement: &HostGroup,
+        transfer: Option<Transfer>,
     ) -> Result<Found> {
         let started = std::time::Instant::now();
         let Planned {
@@ -288,54 +195,44 @@ impl WeightKeys {
             ));
         }
 
-        // Every rank's storages as a target rank on its GPU.
-        let own = manifest::Rank {
-            gpu: Some(gpu),
-            storages: storages
-                .iter()
-                .map(|storage| storage.storage.clone())
-                .collect(),
-        };
-        let encoded = serde_json::to_vec(&own)
-            .map_err(|error| Error::Invalid(format!("encoding a target rank: {error}")))?;
         let freed = started.elapsed();
-        // Every rank plans from the links all of them measured: a rank of
-        // another host measured other links.
-        let links = measure_links(retained, sources, device, gpu)?;
-        let links = gather_links(agreement, &links)?;
-        let measured = started.elapsed();
-        let targets = agreement
-            .all_gather_bytes(&encoded)?
-            .iter()
-            .map(|bytes| {
-                serde_json::from_slice::<manifest::Rank>(bytes)
-                    .map_err(|error| Error::Interface(format!("a rank's target storages: {error}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
         let rank = agreement.index();
-        let request = manifest::Request {
-            source: sources.world.clone(),
-            gpus: targets.iter().filter_map(|target| target.gpu).collect(),
-            target: manifest::World { ranks: targets },
-            links,
+        let Transfer { request, manifest } = match transfer {
+            Some(transfer) => transfer,
+            None => {
+                // Cold starts have no daemon redistribution plan. The ranks
+                // describe their target storages through their existing group.
+                let own = manifest::Rank {
+                    gpu: Some(gpu),
+                    storages: storages
+                        .iter()
+                        .map(|storage| storage.storage.clone())
+                        .collect(),
+                };
+                let encoded =
+                    serde_json::to_vec(&own).map_err(|error| Error::Invalid(error.to_string()))?;
+                let links = measure_links(retained, sources, device, gpu)?;
+                let links = gather_links(agreement, &links)?;
+                let targets = agreement
+                    .all_gather_bytes(&encoded)?
+                    .iter()
+                    .map(|bytes| {
+                        serde_json::from_slice::<manifest::Rank>(bytes)
+                            .map_err(|error| Error::Interface(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let request = manifest::Request {
+                    source: sources.world.clone(),
+                    gpus: targets.iter().filter_map(|target| target.gpu).collect(),
+                    target: manifest::World { ranks: targets },
+                    links,
+                };
+                let manifest = Manifest::plan(&request)
+                    .map_err(|error| Error::Interface(error.to_string()))?;
+                Transfer { request, manifest }
+            }
         };
-        let gathered = started.elapsed();
-        let manifest =
-            Manifest::plan(&request).map_err(|error| Error::Interface(error.to_string()))?;
-        // Every participating rank verifies the digest before any byte
-        // moves: the ranks computed the same manifest from the same inputs.
         let planned = started.elapsed();
-        let digests = agreement.all_gather_bytes(&manifest.digest)?;
-        if !manifest.verify(&manifest.digest)
-            || digests
-                .iter()
-                .any(|digest| digest.as_slice() != manifest.digest)
-        {
-            return Err(Error::Invariant(
-                "the ranks receiving weights computed different copy manifests".into(),
-            ));
-        }
-        let verified = started.elapsed();
         let own_rank = rank as u32;
 
         // The tensors of regions no source holds, and of fields that move
@@ -496,7 +393,11 @@ impl WeightKeys {
                     at: Some(Placement::Device { gpu }),
                     ..
                 } = &span.source
-                    && let Some(endpoint) = sources.remote.get(gpu)
+                    && let Some(endpoint) = sources
+                        .remote
+                        .iter()
+                        .find(|(source, _)| source == gpu)
+                        .map(|(_, endpoint)| endpoint)
                 {
                     span.source = Region::Remote {
                         endpoint: endpoint.clone(),
@@ -552,15 +453,12 @@ impl WeightKeys {
             remote_sources = sources.remote.len(),
             // Each phase's end, from the start: the unread model freed,
             // the links from other nodes measured and gathered, the ranks'
-            // storages gathered, the manifest planned and
-            // verified, the chunks mapped and created, the receiving keys
+            // storages gathered, the manifest selected, the chunks
+            // mapped and created, the receiving keys
             // retained, the padding zeroed, the spans listed and the
             // transfer submitted.
             freed_ms = freed.as_millis() as u64,
-            measured_ms = measured.as_millis() as u64,
-            gathered_ms = gathered.as_millis() as u64,
             planned_ms = planned.as_millis() as u64,
-            verified_ms = verified.as_millis() as u64,
             allocated_ms = allocated.as_millis() as u64,
             registered_ms = registered.as_millis() as u64,
             zeroed_ms = zeroed.as_millis() as u64,
@@ -660,10 +558,9 @@ impl Receipt {
 /// The links of `sources` into `gpu`, this rank's GPU on `device`, as the
 /// host's Transfer Server measured them, after it measured the link from
 /// every source GPU of another node it had not: for each, two copies of
-/// [`LINK_SAMPLE`] bytes from the longest chunk that GPU holds into a
-/// scratch storage the rank creates and releases, one task per GPU since
-/// the copies write the same scratch. A GPU that holds no chunk that long
-/// stays unmeasured, so a plan whose blocks only it holds fails.
+/// [`LINK_SAMPLE`] byte windows from the longest retained chunk into a
+/// scratch storage the rank creates and releases. Smaller chunks repeat
+/// until the window is complete; one task per GPU owns the scratch.
 fn measure_links(
     retained: &Retained,
     sources: &Sources,
@@ -683,7 +580,7 @@ fn measure_links(
                 }
         })
     };
-    let mut unmeasured: Vec<(Gpu, String, Key)> = Vec::new();
+    let mut unmeasured: Vec<(Gpu, String, Key, u64)> = Vec::new();
     for (source, endpoint) in &sources.remote {
         if reaches(&sources.links, source) {
             continue;
@@ -694,14 +591,19 @@ fn measure_links(
             .iter()
             .filter(|rank| rank.gpu == Some(*source))
             .flat_map(|rank| rank.storages.iter().flat_map(|storage| &storage.chunks))
-            .filter(|chunk| chunk.length >= LINK_SAMPLE)
+            .filter(|chunk| chunk.length > 0)
             .max_by_key(|chunk| (chunk.length, chunk.key));
         match longest {
-            Some(chunk) => unmeasured.push((*source, endpoint.clone(), chunk.key)),
+            Some(chunk) => unmeasured.push((
+                *source,
+                endpoint.clone(),
+                chunk.key,
+                chunk.length.min(LINK_SAMPLE),
+            )),
             None => tracing::warn!(
                 gpu = %cuda::DeviceUuid(*source),
                 endpoint,
-                "another node's GPU holds no chunk long enough to measure its link"
+                "another node's GPU holds no bytes to measure its link"
             ),
         }
     }
@@ -738,28 +640,32 @@ fn measure_links(
         )
     })?;
     retained.use_keys([key]);
-    let copied = unmeasured.iter().try_for_each(|(source, endpoint, chunk)| {
-        let spans = (0..2)
-            .map(|half| Span {
-                source: Region::Remote {
-                    endpoint: endpoint.clone(),
-                    region: Box::new(Region::Tensor {
-                        key: *chunk,
-                        at: Some(Placement::Device { gpu: *source }),
-                    }),
-                },
-                source_offset: 0,
-                destination: Region::Tensor { key, at: None },
-                destination_offset: half * LINK_SAMPLE,
-                bytes: LINK_SAMPLE,
-                rows: 1,
-                source_pitch: 0,
-                destination_pitch: 0,
-            })
-            .collect();
-        let task = retained.transfer(spans, Priority::Background, retained.world())?;
-        retained.transferred(task)
-    });
+    let copied = unmeasured
+        .iter()
+        .try_for_each(|(source, endpoint, chunk, bytes)| {
+            // Repeat a retained chunk when it is smaller than the estimator's
+            // sample window. Measurement never requires a model-sized allocation.
+            let spans = (0..2 * LINK_SAMPLE.div_ceil(*bytes))
+                .map(|_| Span {
+                    source: Region::Remote {
+                        endpoint: endpoint.clone(),
+                        region: Box::new(Region::Tensor {
+                            key: *chunk,
+                            at: Some(Placement::Device { gpu: *source }),
+                        }),
+                    },
+                    source_offset: 0,
+                    destination: Region::Tensor { key, at: None },
+                    destination_offset: 0,
+                    bytes: *bytes,
+                    rows: 1,
+                    source_pitch: 0,
+                    destination_pitch: 0,
+                })
+                .collect();
+            let task = retained.transfer(spans, Priority::Background, retained.world())?;
+            retained.transferred(task)
+        });
     retained.forget(&[key])?;
     drop(scratch);
     copied?;

@@ -458,6 +458,7 @@ impl Leader {
             }),
             observer,
             profiles: crate::profiling::Profiles::default(),
+            manifests: std::sync::Mutex::new(storage::manifest::Planner::default()),
         });
         let client = Arc::new(client);
         tokio::spawn(watch_engine(Arc::clone(&engines), Arc::downgrade(&client)));
@@ -1317,6 +1318,10 @@ pub(crate) struct Engines {
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
+    /// The copy manifests of the parallel configurations the deployment
+    /// changed between, computed once per pair of source and target
+    /// (`crate::worlds::redistribution`).
+    pub(crate) manifests: std::sync::Mutex<storage::manifest::Planner>,
 }
 
 /// A LoRA adapter the workers hold.

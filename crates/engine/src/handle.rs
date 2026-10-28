@@ -671,9 +671,15 @@ pub enum WeightsInFlight {
     Abort,
 }
 
+/// The bytes of weight chunks a world succeeding the serving one creates on
+/// each GPU, by UUID, beside those it maps read-only: a successor of another
+/// parallel configuration holds other regions of the weights on a GPU
+/// (`specs/online-operations.md`, §4.7).
+pub type CreatedWeights = std::collections::BTreeMap<[u8; 16], u64>;
+
 /// What a world succeeding this one on the same devices adds beside what it
 /// shares with it, which a shrink makes room for.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Successor {
     /// It loads its weights from the model's files (their keys differ), so
     /// it holds as many beside the serving world's.
@@ -686,15 +692,20 @@ pub struct Successor {
     /// `off`), so its warmup takes a graph share where its model can be
     /// captured.
     pub captures_graphs: bool,
+    /// The weight chunks it creates on each GPU beside those it maps
+    /// read-only, when it does not load all of its weights: a world of
+    /// another parallel configuration, as the daemon planned its copy
+    /// manifests.
+    pub created_weights: CreatedWeights,
 }
 
 /// A change to the device memory of a scheduler's KV cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheChange {
-    /// Gives back the tail of the cache until each device has the memory a
-    /// world succeeding this one needs beside the memory they share; the
-    /// requests that hold the tail run on, and are recomputed only once
-    /// `preempt_after` passed, when given.
+    /// Gives back the tail of the cache until each device has the storage a
+    /// world succeeding this one needs beside the storage they share, the
+    /// weights it creates included; the requests that hold the tail run
+    /// on, and are recomputed only once `preempt_after` passed, when given.
     Shrink {
         preempt_after: Option<std::time::Duration>,
         successor: Successor,

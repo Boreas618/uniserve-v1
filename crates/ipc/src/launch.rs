@@ -154,6 +154,10 @@ pub struct LaunchDescriptor {
     /// world's rank held before its relaunch; `None` lays the planes out
     /// afresh.
     pub segments: Option<crate::CacheTable>,
+    /// The weights the rank receives from another world of its host, as
+    /// the daemon planned a change of the parallel configuration; `None`
+    /// for a rank that binds the weights it retained or loads them.
+    pub received_weights: Option<ReceivedWeights>,
     /// Attention provider name of the rank's model, as `attention_backend`
     /// gave it. The rank's attention registry (`uniserve.backends.attention`)
     /// owns the names and refuses one it does not provide when the model
@@ -219,6 +223,17 @@ pub struct LaunchDescriptor {
     /// graphs and keeps it enabled for its life.
     #[serde(default)]
     pub graph_pc_sampling: bool,
+}
+
+/// The weights a rank receives from the world its own succeeds, as the
+/// daemon planned the change (`specs/online-operations.md`, §4.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceivedWeights {
+    /// The world whose retained weights are the copy manifest's sources.
+    pub world: u64,
+    /// Serialized storage::manifest::weights::Transfer selected by the daemon.
+    pub manifest: Vec<u8>,
 }
 
 /// One rank's place in the deployment's expert-parallel union.

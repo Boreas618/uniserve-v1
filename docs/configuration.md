@@ -192,11 +192,12 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `placement_config`
 
-`device`, `worker_hosts` and `queue_depth` place ranks without a deployment file, so each is refused together with `worker_groups`, as is `tensor_parallel_size`.
+`device`, `devices`, `worker_hosts` and `queue_depth` place ranks without a deployment file, so each is refused together with `worker_groups`, as is `tensor_parallel_size`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `device` | `"cuda"` | Device of every rank; `cuda` numbers each host's GPUs from zero |
+| `devices` | `[]` | Each rank's CUDA device index on its host, in rank order; empty numbers each host's ranks from zero. A change of the parallel configuration (`PUT /admin/config`) that does not state it takes the order that leaves the most weights on the GPUs already holding them, and reports it |
 | `worker_hosts` | `[]` | Hosts after this one the ranks spread across, in equal blocks |
 | `queue_depth` | `2` | Batches in flight per rank; a deployment group states its own |
 | `transfer` | Derived per edge | Product transport per worker edge: `source[:rank]->destination[:rank]=mechanisms`, comma-separated |

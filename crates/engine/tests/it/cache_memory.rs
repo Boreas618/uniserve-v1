@@ -494,6 +494,48 @@ fn a_configured_capacity_withdraws_room_for_a_successors_head() {
     thread.join().unwrap();
 }
 
+/// A successor of another parallel configuration inherits none of the
+/// cache's segments and lays its own cache out within its own capacity:
+/// the configured capacity takes nothing back while the quota holds the
+/// successor, so the requests running on the cache keep the units they
+/// grow into.
+#[test]
+fn a_redistributing_successor_leaves_a_configured_capacity_whole() {
+    let (handle, workers, thread) = start(Workers {
+        quota: 1 << 40,
+        head_bytes: 9 * UNIT_BYTES,
+        capacity_units: Some(u64::from(SEGMENTS * SEGMENT_UNITS)),
+        ..Workers::filling(0)
+    });
+    let redistributing = Successor {
+        recomputes_cache: true,
+        ..Successor::default()
+    };
+    let plans = resize(&handle, CacheChange::Plan(redistributing.clone())).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["segments_kept"], SEGMENTS);
+    assert!(
+        resize(
+            &handle,
+            CacheChange::Shrink {
+                preempt_after: None,
+                successor: redistributing,
+            }
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        workers.lock().unwrap().hooks,
+        vec![
+            "uniserve.cache_memory".to_owned(),
+            "uniserve.cache_memory".to_owned()
+        ]
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// An expert worker's report, which holds no cache, leaves the shrink to
 /// the worker that holds it: the configured capacity withdraws room for a
 /// successor's head as it does without one.
@@ -561,6 +603,52 @@ fn a_shrink_leaves_the_successor_what_the_device_has_free() {
     assert_eq!(
         workers.lock().unwrap().hooks.last().map(String::as_str),
         Some(r#"uniserve.release_cache {"from":7}"#)
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A successor of another parallel configuration creates weight chunks on
+/// the GPU beside those it maps: the serving world's limit leaves it them,
+/// and the shrink gives back that much more of the tail. Bytes the
+/// successor creates on another GPU leave this one's limit as it was.
+#[test]
+fn the_weights_a_successor_creates_leave_the_serving_world_less_cache() {
+    let (handle, workers, thread) = start(Workers {
+        quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 3 * SEGMENT_BYTES,
+        head_bytes: 2 * SEGMENT_BYTES,
+        free_bytes: 1 << 40,
+        ..Workers::filling(0)
+    });
+    let creating = |gpu: [u8; 16]| Successor {
+        created_weights: engine::CreatedWeights::from([(gpu, 3 * SEGMENT_BYTES)]),
+        ..Successor::default()
+    };
+    let plans = resize(&handle, CacheChange::Plan(creating([8; 16]))).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["successor"]["weights"], 0);
+    assert_eq!(plan["segments_kept"], SEGMENTS);
+
+    // Three segments' bytes of weights on the cache's GPU: the quota held
+    // the cache, the head and one segment more, so the limit falls to six
+    // segments and two go back.
+    let plans = resize(&handle, CacheChange::Plan(creating([7; 16]))).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["successor"]["weights"], 3 * SEGMENT_BYTES);
+    assert_eq!(plan["segments_kept"], SEGMENTS - 2);
+
+    let shrunk = resize(
+        &handle,
+        CacheChange::Shrink {
+            preempt_after: None,
+            successor: creating([7; 16]),
+        },
+    );
+    assert!(shrunk.is_ok(), "{shrunk:?}");
+    assert_eq!(
+        workers.lock().unwrap().hooks.last().map(String::as_str),
+        Some(format!(r#"uniserve.release_cache {{"from":{}}}"#, SEGMENTS - 2).as_str())
     );
 
     handle.shutdown();

@@ -9,7 +9,7 @@
 //! engine's state changes to the client's state. When the connection closes,
 //! every request still in flight ends with an error event.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -695,9 +695,11 @@ impl EngineClient {
 
     /// Plans (`Plan`) or makes (`Shrink`) the room a world succeeding the
     /// engine's on the same devices needs beside what they share, by
-    /// `change`: what the successor adds is `successor`. A shrink recomputes
-    /// the requests that still hold the tail once `preempt_after` passed,
-    /// when given. Returns each device's plan.
+    /// `change`: what the successor adds is `successor`, and the weight
+    /// chunks it creates on each GPU `created` (bytes by GPU UUID; a world of
+    /// another parallel configuration). A shrink recomputes the requests
+    /// that still hold the tail once `preempt_after` passed, when given.
+    /// Returns each device's plan.
     ///
     /// # Errors
     ///
@@ -708,7 +710,15 @@ impl EngineClient {
         change: wire::CacheChange,
         successor: Successor,
         preempt_after: Option<Duration>,
+        created: &BTreeMap<[u8; 16], u64>,
     ) -> Result<Vec<String>, String> {
+        let created_weights: Vec<wire::CreatedWeights> = created
+            .iter()
+            .map(|(gpu, bytes)| wire::CreatedWeights {
+                gpu: gpu.to_vec(),
+                bytes: *bytes,
+            })
+            .collect();
         self.ask(|id| {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
@@ -718,6 +728,7 @@ impl EngineClient {
                 successor_loads_weights: successor.loads_weights,
                 successor_recomputes_cache: successor.recomputes_cache,
                 successor_captures_graphs: successor.captures_graphs,
+                created_weights,
                 ..wire::ResizeCache::default()
             })
         })

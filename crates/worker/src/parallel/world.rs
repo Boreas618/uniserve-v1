@@ -70,8 +70,11 @@ impl World {
         let execution = &launch.execution;
         let (host, union, store) = match &launch.expert_parallel {
             Some(union) => {
+                let union_rendezvous = union.rendezvous.as_ref().ok_or_else(|| {
+                    Error::Invalid("an expert-parallel union requires its store address".into())
+                })?;
                 let group = HostGroup::connect(
-                    rendezvous(&union.rendezvous)?,
+                    rendezvous(union_rendezvous)?,
                     union.rank,
                     union.size,
                     timeout,
@@ -79,7 +82,7 @@ impl World {
                 let start = union.rank - execution.rank;
                 let members: Vec<usize> = (start..start + execution.world_size).collect();
                 let host = group.subgroup(&members)?;
-                let store = store(&group, &union.rendezvous)?;
+                let store = store(&group, union_rendezvous)?;
                 (host, Some(group), Some(store))
             }
             None => match &launch.rendezvous {
@@ -135,6 +138,35 @@ impl World {
             torch,
             components: Vec::new(),
             destroy: Some(Interpreter::import("uniserve.distributed.world.destroy")?),
+        })
+    }
+
+    /// The world a rank plans its partition in, before the world it belongs
+    /// to starts (`distributed.world.planning`): its communicators and
+    /// component meshes ([`World::bind_components`]) name the ranks of the
+    /// worker and of its expert union, as [`World::initialize`]'s do, but
+    /// no host or torch group is joined or created, so the rank needs no
+    /// peer and any collective raises.
+    pub(crate) fn planning(launch: &WorkerLaunch) -> Result<Self> {
+        let execution = &launch.execution;
+        let member = launch.expert_parallel.as_ref();
+        let optional = |value: Option<i64>| value.map(Any::from).unwrap_or_default();
+        let torch = Handle::new(
+            Interpreter::import("uniserve.distributed.world.planning")?.call_values(&[
+                Any::from(execution.rank as i64),
+                Any::from(launch.local_rank as i64),
+                Any::from(execution.world_size as i64),
+                Any::from(tvm_ffi::String::from(execution.device.to_string().as_str())),
+                optional(member.map(|union| union.rank as i64)),
+                optional(member.map(|union| union.size as i64)),
+            ])?,
+        )?;
+        Ok(Self {
+            host: HostGroup::single(execution.rank),
+            union: None,
+            torch,
+            components: Vec::new(),
+            destroy: None,
         })
     }
 

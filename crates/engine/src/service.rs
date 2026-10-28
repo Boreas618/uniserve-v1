@@ -713,6 +713,16 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         loads_weights: resize.successor_loads_weights,
         recomputes_cache: resize.successor_recomputes_cache,
         captures_graphs: resize.successor_captures_graphs,
+        // A malformed UUID names no GPU of this deployment.
+        created_weights: resize
+            .created_weights
+            .iter()
+            .filter_map(|weights| {
+                <[u8; 16]>::try_from(weights.gpu.as_slice())
+                    .ok()
+                    .map(|gpu| (gpu, weights.bytes))
+            })
+            .collect(),
     };
     let change = match wire::CacheChange::try_from(resize.change) {
         Ok(wire::CacheChange::Shrink) => crate::CacheChange::Shrink {
@@ -745,7 +755,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         let answers: Vec<_> = routing
             .slots
             .iter()
-            .map(|slot| slot.handle.resize_cache(change))
+            .map(|slot| slot.handle.resize_cache(change.clone()))
             .collect();
         answer_hooked(resize.id, answers, front, routing);
         return;
@@ -792,7 +802,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
             let answers: Vec<_> = routing
                 .slots
                 .iter()
-                .map(|slot| slot.handle.resize_cache(change))
+                .map(|slot| slot.handle.resize_cache(change.clone()))
                 .collect();
             answer_hooked_after(id, reports, answers, front, &routing);
         });

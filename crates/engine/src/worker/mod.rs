@@ -11,13 +11,13 @@
 //! start the ranks on every node, hold the sockets their stores serve on and
 //! the deployment's Storage Server claims (`claims`).
 
-mod claims;
+pub(crate) mod claims;
 mod executor;
 mod group;
 mod incarnations;
 mod process;
-mod processes;
-mod registry;
+pub(crate) mod processes;
+pub(crate) mod registry;
 
 pub use executor::WorkerExecutor;
 pub use group::{CallReaders, WorkerGroup};
@@ -84,6 +84,10 @@ pub struct WorkerProcessArgs {
     /// whose segments the group's workers map read-only; `None` for a world
     /// that succeeds none.
     pub predecessor: Option<ipc::PredecessorCache>,
+    /// The weights the group's workers receive from the world the engine
+    /// succeeds, as the daemon planned a change of the parallel
+    /// configuration; `None` binds or loads them.
+    pub received_weights: Option<ipc::ReceivedWeights>,
     /// Model identifier or local model path.
     pub model: String,
     /// A plugin's weight source (`scheme://...`) that streams the

@@ -941,3 +941,146 @@ fn encoded_fields_move_in_canonical_form() {
     assert!(manifest.encodes.is_empty() && manifest.decodes.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
 }
+
+/// A tensor a listing lists: `key` at `location`, retained by `world` of
+/// deployment `model`.
+fn listed(key: Key, name: &str, location: Placement, world: u64) -> crate::protocol::ListedTensor {
+    let scope = crate::Scope {
+        deployment: "model".into(),
+        group: "model".into(),
+        rank: 0,
+    };
+    crate::protocol::ListedTensor {
+        key,
+        name: name.into(),
+        scopes: vec![scope.clone()],
+        retainers: vec![crate::protocol::Retainer { scope, world }],
+        placement: location,
+        storage_bytes: 0,
+        dtype: "uint8".into(),
+        shape: vec![0],
+        access: crate::protocol::Access::ReadOnly,
+        writer: None,
+    }
+}
+
+/// A weight manifest's text naming `storages` on the rank's first device,
+/// of sources with the digests `fingerprints`.
+fn weight_manifest(fingerprints: &[(&str, &str)], storages: &[&Storage]) -> String {
+    let fingerprints: BTreeMap<String, String> = fingerprints
+        .iter()
+        .map(|(source, digest)| (source.to_string(), digest.to_string()))
+        .collect();
+    let storages: Vec<weights::RetainedStorage> = storages
+        .iter()
+        .map(|storage| weights::RetainedStorage {
+            device: Some(0),
+            storage: (*storage).clone(),
+        })
+        .collect();
+    serde_json::json!({
+        "version": weights::VERSION,
+        "fingerprints": fingerprints,
+        "tensors": [],
+        "storages": storages,
+    })
+    .to_string()
+}
+
+#[test]
+fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() {
+    let held = storage(vec![field("w", 0, &[256], vec![whole(256)], vec![1])]);
+    let partial = storage(vec![field("v", 0, &[256], vec![whole(256)], vec![1])]);
+    let other = storage(vec![field("u", 0, &[256], vec![whole(256)], vec![1])]);
+    assert!(held.chunks.len() > 1);
+    let ours = [("", "structure"), ("model", "checkpoint")];
+    let manifests: BTreeMap<Key, String> = [
+        // Two of world 1's ranks name the same storage.
+        (Key([1; 32]), weight_manifest(&ours, &[&held, &partial])),
+        (Key([2; 32]), weight_manifest(&ours, &[&held])),
+        // A storage of another checkpoint holds no bytes this rank needs.
+        (
+            Key([3; 32]),
+            weight_manifest(&[("", "structure"), ("model", "another")], &[&other]),
+        ),
+        // World 2's manifest is not world 1's.
+        (Key([4; 32]), weight_manifest(&ours, &[&other])),
+    ]
+    .into_iter()
+    .collect();
+    let host = Placement::Host { numa_node: None };
+    let device = |index| Placement::Device { gpu: gpu(index) };
+    let mut tensors = vec![
+        listed(Key([1; 32]), weights::NAME, host, 1),
+        listed(Key([2; 32]), weights::NAME, host, 1),
+        listed(Key([3; 32]), weights::NAME, host, 1),
+        listed(Key([4; 32]), weights::NAME, host, 2),
+    ];
+    // GPU 0 holds every chunk of both storages, GPU 1 all of `held` but
+    // not the last chunk of `partial`; the storage of the other checkpoint
+    // and world 2's lie on GPU 0 too.
+    for chunk in &held.chunks {
+        tensors.push(listed(chunk.key, "weights", device(0), 1));
+        tensors.push(listed(chunk.key, "weights", device(1), 1));
+    }
+    for (index, chunk) in partial.chunks.iter().enumerate() {
+        tensors.push(listed(chunk.key, "weights", device(0), 1));
+        if index + 1 < partial.chunks.len() {
+            tensors.push(listed(chunk.key, "weights", device(1), 1));
+        }
+    }
+    for chunk in &other.chunks {
+        tensors.push(listed(chunk.key, "weights", device(0), 1));
+    }
+    let mut listing = crate::protocol::Listing {
+        tensors,
+        transfer: Some(crate::protocol::ListedTransfer {
+            pid: 1,
+            links: links(2),
+            contexts: Vec::new(),
+            tasks: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    let fingerprints: BTreeMap<String, String> = ours
+        .iter()
+        .map(|(source, digest)| (source.to_string(), digest.to_string()))
+        .collect();
+    let read = |key: Key| Ok::<_, ()>(manifests.get(&key).cloned());
+
+    let sources = weights::sources(&listing, "model", Some(1), &fingerprints, read)
+        .unwrap()
+        .unwrap();
+    let mut on_first = vec![held.clone(), partial.clone()];
+    on_first.sort_by_key(|storage| serde_json::to_vec(storage).unwrap());
+    assert_eq!(
+        sources.world,
+        World {
+            ranks: vec![
+                Rank {
+                    gpu: Some(gpu(0)),
+                    storages: on_first,
+                },
+                Rank {
+                    gpu: Some(gpu(1)),
+                    storages: vec![held.clone()],
+                },
+            ]
+        }
+    );
+    assert_eq!(sources.links, links(2));
+
+    // Another deployment retains none of them, and without a Transfer
+    // Server nothing is copied.
+    assert!(
+        weights::sources(&listing, "other", Some(1), &fingerprints, read)
+            .unwrap()
+            .is_none()
+    );
+    listing.transfer = None;
+    assert!(
+        weights::sources(&listing, "model", Some(1), &fingerprints, read)
+            .unwrap()
+            .is_none()
+    );
+}

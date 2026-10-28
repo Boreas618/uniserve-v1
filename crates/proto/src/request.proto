@@ -366,6 +366,18 @@ message ResizeCache {
   // For a make-room change: the device bytes each device's storage ledger
   // must have room for beside everything it books.
   uint64 room_bytes = 9;
+  // For a plan or a shrink: the bytes of weight chunks the succeeding
+  // world creates on each GPU beside those it maps read-only (a world of
+  // another parallel configuration, as the daemon planned its copy
+  // manifests); absent for a GPU where it creates none.
+  repeated CreatedWeights created_weights = 10;
+}
+
+// The bytes of weight chunks a world creates on one GPU.
+message CreatedWeights {
+  // The GPU's UUID: 16 bytes.
+  bytes gpu = 1;
+  uint64 bytes = 2;
 }
 
 enum CacheChange {
@@ -959,6 +971,19 @@ message EngineSpec {
   // The always-on profiling of the workers (`profiling_config`); absent for
   // none.
   Profiling profiling = 21;
+  // The weights each worker group receives from the world the engine
+  // succeeds, as the daemon planned a change of the parallel configuration;
+  // empty for an engine whose groups bind or load their weights.
+  repeated ReceivedWeights received_weights = 22;
+}
+
+// The weights one worker group receives from another world of its host.
+message ReceivedWeights {
+  string worker_group = 1;
+  // The world whose retained weights are the copy manifest's sources.
+  uint64 world = 2;
+  // Serialized storage::manifest::weights::Transfer chosen by the daemon.
+  bytes manifest = 3;
 }
 
 // Speculative decoding with the model's drafter.
@@ -1007,6 +1032,10 @@ message Placement {
   // The engine launches these contents even if the file changes afterwards.
   // Empty for the shorthand.
   string worker_groups_content = 8;
+  // Each rank's CUDA device index on its host, in rank order
+  // (`placement_config.devices`); empty numbers each host's ranks from
+  // zero.
+  repeated uint32 devices = 9;
 }
 
 message Scheduling {

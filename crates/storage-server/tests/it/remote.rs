@@ -185,6 +185,8 @@ fn a_process_of_another_host_reads_a_small_read_only_tensor_of_bytes() {
     let mut peer =
         Client::connect_peer(&endpoint(&host.socket), std::time::Duration::from_secs(10)).unwrap();
     assert_eq!(peer.read("model".into(), key(1)).unwrap(), text);
+    assert_eq!(head.read("model".into(), key(1)).unwrap(), text);
+    assert!(head.read("other".into(), key(1)).is_err());
     for (deployment, key, reason) in [
         ("other", key(1), "no host tensor other retains"),
         (

@@ -1451,6 +1451,11 @@ def _four_devices() -> str:
 # between: the options it serves with first, the change to the next, and
 # the options a direct start of the next states.
 PARALLEL_CHANGES = {
+    "tp1-to-tp2": (
+        (),
+        ("tensor_parallel_size=2",),
+        ("--tensor-parallel-size", "2"),
+    ),
     # Two replicas of tensor parallelism 2 becoming four expert-parallel
     # schedulers with data-parallel attention.
     "dp2-tp2-to-dep4": (
@@ -1489,21 +1494,44 @@ PARALLEL_CHANGES = {
 }
 
 
+MIB = 1 << 20
+
+# The host KV cache of a parallel change's deployment on the host, in GiB.
+HOST_CACHE_GIB = 8
+
+
+def _expert_bytes(experts: int) -> int:
+    """The bytes `experts` routed experts of the checkpoint take over all
+    of its layers: each a gate, an up and a down projection between the
+    hidden size and the expert's intermediate size, in bfloat16.
+    """  # noqa: D205
+    config = json.loads((Path(_checkpoint()) / "config.json").read_text())
+    projections = 3 * config["hidden_size"] * config["moe_intermediate_size"]
+    return experts * projections * 2 * config["num_hidden_layers"]
+
+
 @pytest.mark.parametrize("change", list(PARALLEL_CHANGES))
 def test_a_parallel_configuration_change_continues_a_streaming_request(
     tmp_path: Path, change: str
 ):
     """A change of the parallel configuration is a world change: the
     successor holds other regions of the weights on each GPU and lays its
-    KV cache out for its own heads. The count streaming across it continues
-    without failing and reads the tokens the committed world decodes for
-    the request alone, and the committed world's weights on every GPU are
-    byte for byte those of a direct start in its configuration.
+    KV cache out for its own heads. The daemon plans the change first: it
+    puts each rank on the GPU that holds most of its weights, and a GPU of
+    the serving world maps the experts it holds of its new rank. The count
+    streaming across it continues without failing and reads the tokens the
+    committed world decodes for the request alone, and the committed
+    world's weights on every GPU are byte for byte those of a direct start
+    in its configuration, on the GPUs the change put its ranks.
     """  # noqa: D205
     source, assignments, target = PARALLEL_CHANGES[change]
+    # Both worlds of the change and the direct start hold a bounded host KV
+    # cache on the host: four worlds' worth fit the host's budget.
+    source = (*source, "--set", f"kv_cache_config.host_gib={HOST_CACHE_GIB}")
+    target = (*target, "--set", f"kv_cache_config.host_gib={HOST_CACHE_GIB}")
     name = "qwen3-parallel-change"
     environment = _plugin(tmp_path / "plugins", "digest", DIGEST_PLUGIN)
-    devices = _four_devices()
+    devices = _devices() if change == "tp1-to-tp2" else _four_devices()
     changed_path = tmp_path / "changed"
     changed_path.mkdir()
     with _serve(changed_path, name, devices, source, env=environment) as (
@@ -1524,6 +1552,28 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
             f"transfer halvings {report['transfer_halvings']}, "
             f"restorations {report['transfer_restorations']})"
         )
+        redistribution = report["redistribution"]
+        assert redistribution is not None, report
+        order = redistribution["devices"]
+        print(f"{change}: ranks on devices {order} ({redistribution['order']})")
+        for planned in redistribution["gpus"]:
+            print(
+                f"{change}: {planned['gpu']} "
+                f"({'serving' if planned['serving'] else 'added'}): mapped "
+                f"{planned['mapped_bytes'] / MIB:.1f} MiB, created "
+                f"{planned['created_bytes'] / MIB:.1f} MiB, copied "
+                f"{planned['copied_bytes'] / MIB:.1f} MiB"
+            )
+        if change == "dep2-to-tep4":
+            # Each of the four ranks holds a quarter of the routed experts;
+            # a GPU of the serving world maps those of its rank.
+            config = json.loads(
+                (Path(_checkpoint()) / "config.json").read_text()
+            )
+            quarter = _expert_bytes(config["num_experts"] // 4)
+            for planned in redistribution["gpus"]:
+                if planned["serving"]:
+                    assert planned["mapped_bytes"] >= quarter, planned
         streaming.wait_for(streaming.marked + 64)
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
@@ -1536,7 +1586,12 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
 
     direct_path = tmp_path / "direct"
     direct_path.mkdir()
-    with _serve(direct_path, name, devices, target, env=environment) as (
+    ordered = (
+        *target,
+        "--set",
+        f"placement_config.devices=[{','.join(str(index) for index in order)}]",
+    )
+    with _serve(direct_path, name, devices, ordered, env=environment) as (
         base_url,
         _,
     ):

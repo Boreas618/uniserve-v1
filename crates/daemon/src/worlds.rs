@@ -15,9 +15,12 @@
 //!    scope), create the rest of their own, warm up and capture their graphs.
 //!    The serving world executes throughout. A successor of another
 //!    parallel configuration holds other regions of the logical tensors on
-//!    each GPU: it maps the weight chunks whose keys (the regions they
-//!    hold) lie on its GPUs, and none of the serving world's KV cache, which
-//!    it lays out for its own heads.
+//!    each GPU: before anything starts the daemon plans its ranks' weights,
+//!    their GPUs and the copy manifests that bring them over
+//!    ([`redistribution`]), and the successor maps the weight chunks whose
+//!    keys (the regions they hold) lie on its GPUs, receives the rest from
+//!    the serving world, and maps none of its KV cache, which it lays out
+//!    for its own heads.
 //! 2. **Promotion.** At a step boundary new requests wait, the serving world
 //!    parks (it ends every token request that resumes from its generated
 //!    tokens as migratable and executes nothing more, keeping its memory and
@@ -57,6 +60,9 @@ use crate::engine::client::{EngineClient, EngineState, Successor};
 use crate::engine::hold::Kept;
 use crate::leader::{Leader, UpdateError, locked, stats_sink};
 use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
+
+mod redistribution;
+use redistribution::Redistribution;
 
 /// How the requests in flight at a promotion continue when the new world
 /// computes other numerics than the one they ran on.
@@ -372,14 +378,15 @@ fn switches_probes_only(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 }
 
 /// The parts of `spec` a configuration states: without the world's identity,
-/// the layout of its cache and the worlds it retires as it starts, which
-/// the world's history sets.
+/// the layout of its cache, the worlds it retires as it starts and the
+/// weights it receives, which the world's history sets.
 fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
     let mut comparable = wire::EngineSpec {
         world: 0,
         predecessor: None,
         segments: Vec::new(),
         retire: Vec::new(),
+        received_weights: Vec::new(),
         ..spec.clone()
     };
     // The file path is diagnostic; the resolved contents define the ranks.
@@ -407,6 +414,7 @@ fn parallel_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool
                 placement.tensor_parallel_size,
                 placement.data_parallel_size,
                 placement.device.clone(),
+                placement.devices.clone(),
                 placement.worker_hosts.clone(),
             )
         })
@@ -536,10 +544,11 @@ fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 async fn memory_plan(
     running: &EngineClient,
     successor: Successor,
+    created: &BTreeMap<storage::manifest::Gpu, u64>,
     previous_world: PreviousWorld,
 ) -> (serde_json::Value, Option<String>) {
     match running
-        .make_room(wire::CacheChange::Plan, successor, None)
+        .make_room(wire::CacheChange::Plan, successor, None, created)
         .await
     {
         Ok(results) => (memory_report(&results, previous_world, successor), None),
@@ -684,6 +693,23 @@ fn steps(
 }
 
 impl Leader {
+    /// The digest of `target`, which names it, unless a rollback marked it
+    /// unavailable and the update does not `force` it.
+    fn available(&self, target: &ServeConfig, force: bool) -> Result<String, UpdateError> {
+        let target_digest =
+            digest(target).map_err(|error| UpdateError::Failed(error.context("digest")))?;
+        if !force
+            && let Some(unavailable) = locked(&self.engines.worlds).unavailable.get(&target_digest)
+        {
+            return Err(UpdateError::Refused(format!(
+                "the configuration {target_digest} was rolled back from world {} ({}); \
+                 apply it again with force",
+                unavailable.world, unavailable.reason
+            )));
+        }
+        Ok(target_digest)
+    }
+
     /// Changes the deployment to the configuration `request` states, as
     /// the module describes, choosing the least the change needs: nothing
     /// for the current configuration; the schedulers' next step for their
@@ -727,17 +753,7 @@ impl Leader {
         if request.config.is_none() {
             target.update_config = current.update_config.clone();
         }
-        let target_digest =
-            digest(&target).map_err(|error| UpdateError::Failed(error.context("digest")))?;
-        if !request.force
-            && let Some(unavailable) = locked(&self.engines.worlds).unavailable.get(&target_digest)
-        {
-            return Err(UpdateError::Refused(format!(
-                "the configuration {target_digest} was rolled back from world {} ({}); \
-                 apply it again with force",
-                unavailable.world, unavailable.reason
-            )));
-        }
+        let mut target_digest = self.available(&target, request.force)?;
         if target == current && target.worker_groups.is_none() {
             return Ok(Applied::Unchanged);
         }
@@ -758,13 +774,13 @@ impl Leader {
         let prepared = Leader::prepare(&target, &stated)
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-        let target_spec = wire::EngineSpec {
+        let mut target_spec = wire::EngineSpec {
             world: 0,
             predecessor: None,
             segments: Vec::new(),
             ..prepared.spec
         };
-        let world_changes = comparable(&served) != comparable(&target_spec);
+        let mut world_changes = comparable(&served) != comparable(&target_spec);
         let daemon_changes = crate::options::daemon_options_differ(&current, &target);
         if target == current && !world_changes {
             return Ok(Applied::Unchanged);
@@ -778,13 +794,62 @@ impl Leader {
         // weights.
         let unmapped = differing(&served, &target_spec);
         let reloaded = reloads(&served, &target_spec);
-        let redistributes = parallel_change(&served, &target_spec);
+        let mut redistributes = parallel_change(&served, &target_spec);
+        let running = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        // A change of the parallel configuration plans what each GPU of the
+        // successor maps, receives and creates of the weights, and, unless
+        // the update states it, the ranks' device order (§4.7). The order
+        // the daemon chose is the target configuration's.
+        let redistribution = if world_changes && redistributes && unmapped.is_empty() {
+            let planned = redistribution::plan(
+                &self.engines.manifests,
+                self.engines
+                    .control
+                    .get()
+                    .ok_or(UpdateError::NoEngine)?
+                    .process_address(),
+                running.world(),
+                &target_spec,
+                !stated.contains("placement_config.devices"),
+            )
+            .await
+            .map_err(|error| {
+                UpdateError::Refused(format!(
+                    "the change of the parallel configuration cannot be planned: {error:#}"
+                ))
+            })?;
+            if let Some(planned) = planned.as_ref().filter(|planned| planned.chosen) {
+                target.placement_config.devices = planned.devices.clone();
+                if let Some(placement) = target_spec.placement.as_mut() {
+                    placement.devices = planned.devices.clone();
+                }
+                target_digest = self.available(&target, request.force)?;
+                if target == current && target.worker_groups.is_none() {
+                    return Ok(Applied::Unchanged);
+                }
+                world_changes = comparable(&served) != comparable(&target_spec);
+                redistributes = parallel_change(&served, &target_spec);
+            }
+            planned.filter(|_| world_changes && redistributes)
+        } else {
+            None
+        };
+        if let Some(planned) = &redistribution {
+            target_spec.received_weights = planned.received.clone();
+        }
+        // The weight chunks a planned successor creates on each GPU; one of
+        // another parallel configuration the daemon did not plan loads all
+        // of its weights.
+        let created = redistribution
+            .as_ref()
+            .map(|planned| planned.created.clone())
+            .unwrap_or_default();
         // A successor of another parallel configuration or another KV cache
         // encoding maps none of the serving world's cache, and one that
         // loads other weights does so when the requests in flight compute
         // their state again.
         let successor = Successor {
-            loads_weights: !reloaded.is_empty(),
+            loads_weights: !reloaded.is_empty() || (redistributes && redistribution.is_none()),
             recomputes_cache: redistributes
                 || kv_encoding_changes(&served, &target_spec)
                 || (!reloaded.is_empty() && request.in_flight == InFlight::Recompute),
@@ -793,7 +858,6 @@ impl Leader {
                 .as_ref()
                 .is_none_or(|graphs| graphs.policy != "off"),
         };
-        let running = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
         let weights = if !unmapped.is_empty() {
             "unmapped"
         } else if successor.loads_weights {
@@ -833,9 +897,10 @@ impl Leader {
         }
         // A change a new world executes is checked against every device's
         // memory ledger first: the serving world's KV cache limit beside a
-        // successor, per GPU and host (`specs/online-operations.md` §6.6).
+        // successor, with the weights it creates, per GPU and host
+        // (`specs/online-operations.md` §6.6).
         let memory = if world_changes && !in_place && unmapped.is_empty() {
-            Some(memory_plan(&running, successor, update.previous_world).await)
+            Some(memory_plan(&running, successor, &created, update.previous_world).await)
         } else {
             None
         };
@@ -852,6 +917,7 @@ impl Leader {
             "differs": unmapped,
             "in_flight_requests": running.in_flight(),
             "memory": memory.as_ref().map(|(plan, _)| plan),
+            "redistribution": redistribution.as_ref().map(|planned| &planned.report),
         });
         if request.dry_run {
             return Ok(Applied::Planned(plan));
@@ -930,6 +996,14 @@ impl Leader {
         if let Some((_, Some(refusal))) = memory {
             return Err(UpdateError::Refused(refusal));
         }
+        let redistribution = match redistribution {
+            Some(Redistribution {
+                refusal: Some(refusal),
+                ..
+            }) => return Err(UpdateError::Refused(refusal)),
+            Some(planned) => Some(planned.report),
+            None => None,
+        };
         let report = self
             .change_world(
                 &running,
@@ -942,6 +1016,8 @@ impl Leader {
                 request.in_flight,
                 successor,
                 redistributes,
+                &created,
+                redistribution,
             )
             .await?;
         Ok(Applied::World(report))
@@ -951,7 +1027,9 @@ impl Leader {
     /// successor executing `target`, up to its trial (steps 1 to 3 of the
     /// module). A successor of another parallel configuration
     /// (`redistributes`) maps none of the serving world's KV cache, and the
-    /// requests in flight compute their state again on it.
+    /// requests in flight compute their state again on it; it creates the
+    /// weight chunks `created` states on each GPU, which the serving world's
+    /// cache makes room for.
     #[expect(
         clippy::too_many_arguments,
         reason = "one world change: both worlds' specs and configurations and its options"
@@ -968,6 +1046,8 @@ impl Leader {
         in_flight: InFlight,
         adds: Successor,
         redistributes: bool,
+        created: &BTreeMap<storage::manifest::Gpu, u64>,
+        redistribution: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
         let previous_world = running.world();
@@ -994,7 +1074,12 @@ impl Leader {
         // The serving world's cache gives back the tail past the limit each
         // GPU's ledger leaves it beside the successor; its requests run on.
         let shrunk = running
-            .make_room(wire::CacheChange::Shrink, adds, update.preempt_after)
+            .make_room(
+                wire::CacheChange::Shrink,
+                adds,
+                update.preempt_after,
+                created,
+            )
             .await
             .map_err(|error| {
                 self.progress_done();
@@ -1285,8 +1370,11 @@ impl Leader {
             mode = PreviousWorld::Weights;
         }
 
+        // A relaunch of the world binds the weights it retains: it receives
+        // none again.
         let mut served_spec = spec;
         served_spec.world = world;
+        served_spec.received_weights.clear();
         *locked(&self.engines.served) = Some(served_spec);
         *locked(&self.engines.config) = target;
         let report = serde_json::json!({
@@ -1304,6 +1392,7 @@ impl Leader {
             "evicted": evicted,
             "numerics": if numerics_change { "changed" } else { "unchanged" },
             "parallel": if redistributes { "changed" } else { "unchanged" },
+            "redistribution": redistribution,
             "in_flight": if numerics_change { Some(in_flight) } else { None },
             "weights": if adds.loads_weights {
                 "loaded"
