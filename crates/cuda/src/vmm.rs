@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use crate::driver::{
     CU_MEM_ACCESS_FLAGS_PROT_READ, CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE,
-    MemAccessDesc, MemAllocationProp, MemLocation, driver, in_context,
+    MemAccessDesc, MemAllocationProp, MemLocation, driver, in_context, reserve_addresses,
 };
 use crate::memory::DeviceAllocation;
 use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, lock, reclaim};
@@ -266,13 +266,7 @@ impl VirtualRange {
     }
 
     pub(crate) fn reserve(&mut self, bytes: usize, alignment: usize) -> Result<()> {
-        let driver = driver()?;
-        let mut address = 0;
-        driver.check(
-            // SAFETY: the driver writes the base of a new range to the local `address`.
-            unsafe { (driver.mem_address_reserve)(&mut address, bytes, alignment, 0, 0) },
-            "cuMemAddressReserve",
-        )?;
+        let address = reserve_addresses(driver()?, bytes, alignment)?;
         self.address = address;
         self.reserved = bytes;
         Ok(())

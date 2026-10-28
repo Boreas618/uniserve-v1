@@ -7,6 +7,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
@@ -271,6 +272,59 @@ pub(crate) fn driver() -> Result<&'static Driver> {
 /// initialized it, without loading it otherwise.
 pub(crate) fn initialized() -> Option<&'static Driver> {
     DRIVER.get().and_then(|driver| driver.as_ref().ok())
+}
+
+/// Where the crate's address reservations start: 4 TiB.
+///
+/// A reservation without an address hint takes the lowest free device
+/// addresses, from 13 GiB up, and CUPTI's range profiler needs free
+/// addresses among those for the device storage of its pass: on GB200 with
+/// CUDA 13 and `nvidia-cuda-cupti` 13.0, reservations without a hint that
+/// take the addresses up to 1 TiB leave a pass of 2048 ranges (2.9 GB)
+/// unable to start (`CUPTI_ERROR_UNKNOWN`), whatever the device has free,
+/// while 35 TiB of reservations hinted from 4 TiB on leave it starting. The
+/// crate's reservations, each up to a device's whole storage (a graph pool,
+/// a mapping of weights or KV cache planes), are placed from here on,
+/// leaving the lower addresses to the driver and CUPTI.
+const RESERVATIONS_BASE: u64 = 1 << 42;
+
+/// Where hinted reservations wrap back to [`RESERVATIONS_BASE`]: 128 TiB,
+/// the top of a 47-bit user address space.
+const RESERVATIONS_END: u64 = 1 << 47;
+
+/// The hint of the next reservation: past the end of the last one.
+static NEXT_RESERVATION: AtomicU64 = AtomicU64::new(RESERVATIONS_BASE);
+
+/// Reserves `bytes` of device addresses aligned to `alignment` (both
+/// multiples of the allocation granularity), hinted past the last such
+/// reservation from [`RESERVATIONS_BASE`] on; returns the range's base. The
+/// hint is a preference: the driver places a range whose hinted addresses
+/// are taken (by a reservation of another library) wherever it has room.
+///
+/// # Errors
+///
+/// Fails when the driver cannot reserve the range anywhere.
+pub(crate) fn reserve_addresses(driver: &Driver, bytes: usize, alignment: usize) -> Result<u64> {
+    let alignment = alignment.max(1) as u64;
+    let span = bytes as u64;
+    let mut hint = 0;
+    let _ = NEXT_RESERVATION.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        let start = next.next_multiple_of(alignment);
+        hint = if start + span <= RESERVATIONS_END {
+            start
+        } else {
+            RESERVATIONS_BASE.next_multiple_of(alignment)
+        };
+        Some(hint + span)
+    });
+    let mut address = 0;
+    driver.check(
+        // SAFETY: the driver writes the base of a new range to the local
+        // `address`.
+        unsafe { (driver.mem_address_reserve)(&mut address, bytes, alignment as usize, hint, 0) },
+        "cuMemAddressReserve",
+    )?;
+    Ok(address)
 }
 
 impl Driver {

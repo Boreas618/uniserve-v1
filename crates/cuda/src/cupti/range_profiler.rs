@@ -499,4 +499,29 @@ mod tests {
         assert!(range.values[0] > 0.0);
         Ok(())
     }
+
+    /// The crate's address reservations leave a pass the addresses it takes
+    /// its device storage at, however much they reserve.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_pass_starts_beside_two_tib_of_reserved_addresses() -> Result<()> {
+        use crate::cupti::tests::SERIAL;
+        use crate::{DeviceId, PrimaryContext, VirtualPool, lock};
+
+        let _serial = lock(&SERIAL);
+        let device = DeviceId(0);
+        let context = PrimaryContext::retain(device)?;
+        let pools = (0..8)
+            .map(|_| VirtualPool::reserve(device, 1 << 38))
+            .collect::<Result<Vec<_>>>()?;
+        let metrics = ["gpu__time_duration.sum".to_owned()];
+        // 2048 ranges take 2.9 GB of device storage.
+        let mut profiler =
+            RangeProfiler::enable(context.raw() as usize, 0, &metrics, Ranges::Kernels, 2048)?;
+        profiler.start()?;
+        profiler.stop()?;
+        drop(profiler);
+        drop(pools);
+        Ok(())
+    }
 }

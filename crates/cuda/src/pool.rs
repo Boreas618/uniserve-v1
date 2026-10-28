@@ -21,7 +21,7 @@
 
 use crate::driver::{
     CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE, MemAccessDesc,
-    MemAllocationProp, MemLocation, in_context,
+    MemAllocationProp, MemLocation, in_context, reserve_addresses,
 };
 use crate::{DeviceId, Error, PinnedBuffer, PrimaryContext, Result, Stream, reclaim};
 
@@ -92,13 +92,7 @@ impl VirtualPool {
             )?;
             let granularity = granularity.max(1);
             let reserved = bytes.max(1).next_multiple_of(granularity);
-            let mut address = 0;
-            driver.check(
-                // SAFETY: the driver writes the base of a new range to the
-                // local `address`.
-                unsafe { (driver.mem_address_reserve)(&mut address, reserved, granularity, 0, 0) },
-                "cuMemAddressReserve",
-            )?;
+            let address = reserve_addresses(driver, reserved, granularity)?;
             Ok((address, reserved, granularity))
         })?;
         Ok(Self {
