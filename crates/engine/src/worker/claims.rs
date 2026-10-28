@@ -88,7 +88,10 @@ impl Claims {
                     scopes,
                     // A world started again at a rollback retires the world on
                     // trial first, whose memory it needs.
-                    first.retire.clone(),
+                    crate::worker::processes::Retirement {
+                        worlds: first.retire.clone(),
+                        discard_pages: false,
+                    },
                     server_arguments.clone(),
                 )
                 .with_context(|| format!("claiming deployment {deployment} on host {host}"))?;
@@ -119,12 +122,15 @@ impl Claims {
 
     /// Ends the memory of every world of `worlds` on each node of the
     /// engine's, claiming the engine's own scopes there again with them
-    /// retired: a tensor no other world retains is released.
+    /// retired: a tensor no other world retains is released. With
+    /// `discard_pages` (the engine's world computes other numerics) each
+    /// node's page pools discard the pages the engine's world did not
+    /// publish, which it never hits.
     ///
     /// # Errors
     ///
     /// Fails when a node's daemon or Storage Server refuses the claim.
-    pub(crate) fn retire(&self, worlds: &[u64]) -> anyhow::Result<()> {
+    pub(crate) fn retire(&self, worlds: &[u64], discard_pages: bool) -> anyhow::Result<()> {
         if worlds.is_empty() {
             return Ok(());
         }
@@ -135,7 +141,10 @@ impl Claims {
                     &self.deployment,
                     self.world,
                     scopes.clone(),
-                    worlds.to_vec(),
+                    crate::worker::processes::Retirement {
+                        worlds: worlds.to_vec(),
+                        discard_pages,
+                    },
                     self.server_arguments.clone(),
                 )
                 .with_context(|| {
@@ -149,6 +158,7 @@ impl Claims {
             deployment = %self.deployment,
             world = self.world,
             ?worlds,
+            discard_pages,
             "retired worlds on every node of the engine"
         );
         Ok(())

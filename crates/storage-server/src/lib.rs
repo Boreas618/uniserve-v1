@@ -746,6 +746,9 @@ impl Server {
             (Request::KeepWeights { worlds }, Role::Head { deployment, .. }) => {
                 self.keep_weights(id, &deployment, worlds)
             }
+            (Request::DiscardPages { except }, Role::Head { deployment, .. }) => {
+                self.discard_pages(id, &deployment, *except)
+            }
             (Request::Offload { world }, Role::Head { deployment, .. }) => {
                 self.plan_move(id, &deployment, *world, true)
             }
@@ -1139,12 +1142,16 @@ impl Server {
     /// The ledgers of `gpus` (every GPU when empty) of `deployment` (every
     /// deployment when `None`).
     fn ledgers_of(&self, gpus: &[[u8; 16]], deployment: Option<&str>) -> Vec<GpuLedger> {
-        self.ledgers.ledgers(
+        let mut ledgers = self.ledgers.ledgers(
             self.held(),
             &self.transfer_contexts(),
             &|gpu| gpus.is_empty() || gpus.contains(gpu),
             &|name| deployment.is_none_or(|deployment| deployment == name),
-        )
+        );
+        for ledger in &mut ledgers {
+            ledger.host_link_bytes_per_second = self.host_link(ledger.gpu);
+        }
+        ledgers
     }
 
     /// `book`: see [`Request::Book`]. A worker books in its deployment's
@@ -1236,6 +1243,33 @@ impl Server {
             Reply::Retained { released: count },
             Vec::new(),
         ))
+    }
+
+    /// `discard_pages`: see [`Request::DiscardPages`]. Refused unless the
+    /// caller is the deployment's head.
+    fn discard_pages(
+        &mut self,
+        id: ClientId,
+        deployment: &str,
+        except: u64,
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        if !self
+            .deployments
+            .get(deployment)
+            .is_some_and(|entry| entry.head == Some(id))
+        {
+            return Err(invalid(&format!(
+                "only the head that claimed {deployment} discards its pages"
+            )));
+        }
+        let pages = self.pages.discard_except(deployment, except);
+        tracing::info!(
+            deployment,
+            except,
+            pages,
+            "discarded the pages of other worlds"
+        );
+        Ok(Outcome::Reply(Reply::Discarded { pages }, Vec::new()))
     }
 
     /// `retire`: see [`Request::Retire`]. Processes that still map the
@@ -2603,6 +2637,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Expose { .. } => "expose",
         Request::Unexpose { .. } => "unexpose",
         Request::Registered { .. } => "registered",
+        Request::DiscardPages { .. } => "discard_pages",
         Request::Offload { .. } => "offload",
         Request::Restore { .. } => "restore",
         Request::Allocated { .. } => "allocated",

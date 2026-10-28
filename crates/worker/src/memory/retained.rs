@@ -671,6 +671,7 @@ impl Retained {
                 total: 0,
                 quota: None,
                 entries: Vec::new(),
+                host_link_bytes_per_second: None,
                 transfer_context: 0,
             })
     }

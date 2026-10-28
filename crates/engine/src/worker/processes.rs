@@ -40,6 +40,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 /// over the node's host links.
 const MOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// The worlds a claim ends the memory of on a node.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Retirement {
+    pub(crate) worlds: Vec<u64>,
+    /// The claiming world hits none of the pages the others published: it
+    /// computes other numerics, so the node's page pools discard them.
+    pub(crate) discard_pages: bool,
+}
+
 /// The deployment's connection to its daemons, shared by its worker groups.
 pub(crate) type Processes = Arc<Mutex<ProcessClient>>;
 
@@ -284,7 +293,8 @@ impl ProcessClient {
         }
     }
 
-    /// Has node `host`'s daemon claim `deployment`'s `scopes` there and
+    /// Has node `host`'s daemon claim `deployment`'s `scopes` there for
+    /// `world`, ending the memory of the worlds `retirement` names, and
     /// returns the claim's storage launch.
     ///
     /// # Errors
@@ -297,7 +307,7 @@ impl ProcessClient {
         deployment: &str,
         world: u64,
         scopes: Vec<(String, u32)>,
-        retire: Vec<u64>,
+        retirement: Retirement,
         server_arguments: Vec<String>,
     ) -> anyhow::Result<ipc::StorageLaunch> {
         let claimed = match self
@@ -311,7 +321,8 @@ impl ProcessClient {
                         .collect(),
                     server_arguments,
                     world,
-                    retire,
+                    retire: retirement.worlds,
+                    discard_pages: retirement.discard_pages,
                 }),
                 MOVE_TIMEOUT,
             )

@@ -278,6 +278,8 @@ impl Ledgers {
                     .find(|(of, _)| *of == gpu)
                     .map_or(0, |&(_, bytes)| bytes),
                 total: self.totals.get(&gpu).copied().unwrap_or(0),
+                // The server sets it from the Transfer Server's links.
+                host_link_bytes_per_second: None,
                 entries: entries
                     .into_iter()
                     .map(|((item, scope, worlds, segment), bytes)| LedgerEntry {

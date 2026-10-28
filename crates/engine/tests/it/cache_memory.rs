@@ -73,6 +73,9 @@ struct Workers {
     expert_process: Option<u64>,
     /// Each hook run, with its payload.
     hooks: Vec<String>,
+    /// The bandwidth from host memory to the GPU the Transfer Server
+    /// measured, in bytes per second.
+    host_link: Option<u64>,
 }
 
 impl Workers {
@@ -153,6 +156,7 @@ impl Workers {
             total: 1 << 40,
             quota: Some(self.quota),
             entries,
+            host_link_bytes_per_second: self.host_link,
             transfer_context: self.transfer_context,
         }
     }
@@ -260,6 +264,7 @@ impl Executor for Segmented {
                 deployment: "model".into(),
                 total: 2_000,
                 quota: Some(1_000),
+                host_link_bytes_per_second: None,
                 entries: vec![LedgerEntry {
                     item: Item::Process,
                     scope: Some(Scope {
@@ -831,12 +836,18 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
 /// A successor that loads its weights from the model's files adds as many
 /// beside the serving world's, and one that maps none of the cache takes of
 /// its own the units the requests in flight hold: the plan counts both, and
-/// the shrink gives back the more of the cache.
+/// the shrink gives back the more of the cache. The plan also states the
+/// KV cache the requests in flight hold, and how long a promotion that
+/// moves it through host memory waits for it at the host link's measured
+/// bandwidth.
 #[test]
 fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
+    // Bytes per second from host memory to the GPU.
+    const HOST_LINK: u64 = 1_000;
     let (handle, _workers, thread) = start(Workers {
         weights_bytes: 2_000,
         quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 2_000,
+        host_link: Some(HOST_LINK),
         ..Workers::filling(0)
     });
     let plan_of = |successor| -> serde_json::Value {
@@ -844,7 +855,12 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
         serde_json::from_str(&plans[0]).unwrap()
     };
     // Mapping the weights and the cache, it needs nothing beside them.
-    assert_eq!(plan_of(Successor::default())["kv_limit"], 8_000);
+    let mapped = plan_of(Successor::default());
+    assert_eq!(mapped["kv_limit"], 8_000);
+    assert_eq!(
+        (&mapped["in_flight_kv"], &mapped["promotion_stall_ms"]),
+        (&serde_json::json!(0), &serde_json::json!(0))
+    );
 
     let reloaded = plan_of(Successor {
         loads_weights: true,
@@ -870,6 +886,57 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
         recomputed["kv_limit"].as_i64().unwrap(),
         6_000 - in_flight as i64
     );
+    assert_eq!(recomputed["in_flight_kv"], in_flight);
+    assert_eq!(
+        recomputed["promotion_stall_ms"],
+        (in_flight * 1000).div_ceil(HOST_LINK)
+    );
+    // A successor that maps the cache takes none of its own, but the
+    // requests in flight hold as much.
+    let mapped = plan_of(Successor::default());
+    assert_eq!(mapped["successor"]["in_flight"], 0);
+    assert_eq!(mapped["in_flight_kv"], in_flight);
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A parked world whose successor maps none of its cache gives back every
+/// segment past its first, which a world that serves refuses; resumed at a
+/// rollback, it creates them again.
+#[test]
+fn a_parked_world_evicts_its_cache_past_its_first_segment() {
+    let (handle, workers, thread) = start(Workers::filling(0));
+    assert!(resize(&handle, CacheChange::Evict).is_err());
+
+    let parked = handle
+        .park()
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(parked.is_ok(), "{parked:?}");
+    let evicted = resize(&handle, CacheChange::Evict).unwrap();
+    let evicted: serde_json::Value = serde_json::from_str(&evicted[0]).unwrap();
+    assert_eq!(evicted["evicted_segments"], SEGMENTS - 1);
+    assert_eq!(
+        evicted["evicted_bytes"],
+        u64::from(SEGMENTS - 1) * SEGMENT_BYTES
+    );
+    assert_eq!(workers.lock().unwrap().held, 1);
+
+    // The rollback resumes the world, which creates its cache again and
+    // serves a request on all of it.
+    let resumed = handle
+        .resume()
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(resumed.is_ok(), "{resumed:?}");
+    assert!(resize(&handle, CacheChange::Restore).is_ok());
+    assert_eq!(workers.lock().unwrap().held, SEGMENTS);
+    let mut request = handle.submit(request(1, 20, 4)).unwrap();
+    assert!(matches!(
+        terminal(&mut request),
+        Some(Event::Finished { .. })
+    ));
 
     handle.shutdown();
     thread.join().unwrap();

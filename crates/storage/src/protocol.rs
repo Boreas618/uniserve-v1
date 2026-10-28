@@ -92,7 +92,10 @@ use serde::{Deserialize, Serialize};
 /// location memory lies at, which `get`, `retain`, `rekey` and a transfer's
 /// tensor regions select by their `at`, and a span copy rows at a pitch; 11
 /// moves a world's weights to host memory and back (`Offload`, `Restore`,
-/// and the Transfer Server's `Allocate`).
+/// tensor regions select by their `at`, and a span copy rows at a pitch; 11
+/// moves a world's weights to host memory and back (`Offload`, `Restore`,
+/// and the Transfer Server's `Allocate`) and discards the pages a world of
+/// other numerics cannot hit (`DiscardPages`).
 pub const VERSION: u32 = 11;
 
 /// The earliest client version the server serves: a client of version 4
@@ -325,6 +328,12 @@ pub struct GpuLedger {
     /// deployment states for the GPU; `None` until one states one.
     pub quota: Option<u64>,
     pub entries: Vec<LedgerEntry>,
+    /// The bandwidth of copies from host memory to the GPU, in bytes per
+    /// second, as the host's Transfer Server measured it when it started;
+    /// `None` while none did. What returns from host memory to the GPU
+    /// takes its bytes over this time.
+    #[serde(default)]
+    pub host_link_bytes_per_second: Option<u64>,
     /// The device memory the Transfer Server's CUDA context takes on the
     /// GPU while it holds one, as it measured it when it started; 0 when no
     /// Transfer Server measured the GPU. The ledger books it as an entry
@@ -846,6 +855,14 @@ pub enum Request {
     /// leaves their memory to the other world. Answered with `Moved` once
     /// every copy ended; refused while no Transfer Server runs.
     Offload { world: u64 },
+    /// From a head: every page of the deployment's page pools that world
+    /// `except` did not publish is discarded, as a rollback discards a
+    /// world's: those nobody reads leave the pools, the others once their
+    /// readers unpin them. A committed world that computes other numerics
+    /// than its predecessors (another root of its pages' keys) hits none of
+    /// their pages, which only the retired worlds could. Answered with
+    /// `Discarded`.
+    DiscardPages { except: u64 },
     /// From a head: world `world`'s weights that `Offload` moved to host
     /// memory return to the GPUs they came from, before its processes start
     /// again: its Transfer Server creates device memory of each storage's
@@ -1191,6 +1208,10 @@ pub enum Reply {
     /// The server took a report of its Transfer Server's
     /// ([`Request::Measured`], [`Request::Copied`], [`Request::Registered`]).
     Noted,
+    /// How many pages a `DiscardPages` discarded.
+    Discarded {
+        pages: u64,
+    },
     /// What an `Offload` or a `Restore` moved: its storages and their bytes.
     Moved {
         storages: u64,
@@ -1384,9 +1405,6 @@ pub enum Event {
         request: u64,
         allocations: Vec<Allocation>,
     },
-    /// To the Transfer Server: the exposure its registrations of `request`
-    /// served ended; they go once no other exposure holds them.
-    Deregister { request: u64 },
     /// To the Transfer Server: create device memory of at least `bytes` on
     /// GPU `gpu`, retainable through a POSIX descriptor and addressed by
     /// every GPU that can, send its descriptor with
@@ -1397,6 +1415,9 @@ pub enum Event {
         gpu: [u8; 16],
         bytes: u64,
     },
+    /// To the Transfer Server: the exposure its registrations of `request`
+    /// served ended; they go once no other exposure holds them.
+    Deregister { request: u64 },
     /// To a head: the prefetch `tag` ended. `results[i]` is whether the pool
     /// holds the page of the prefetch's key `i`.
     Prefetched { tag: u64, results: Vec<bool> },

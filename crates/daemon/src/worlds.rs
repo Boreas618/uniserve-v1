@@ -138,6 +138,10 @@ pub(crate) struct Trial {
     /// Why the previous world's weights stayed on the GPUs when the update
     /// asked to keep them in host memory: each node's refusal.
     pub(crate) host_refused: Option<String>,
+    /// Whether the world on trial keys its pages otherwise than the previous
+    /// world (another prefix seed): committed, it hits none of the pages the
+    /// previous world published, which the host KV caches then discard.
+    pub(crate) pages_change: bool,
     pub(crate) promoted: Instant,
     pub(crate) promoted_at: f64,
     /// The previous world's step time and throughput before the promotion.
@@ -465,19 +469,13 @@ fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 async fn memory_plan(
     running: &EngineClient,
     successor: Successor,
-    to_host: bool,
+    previous_world: PreviousWorld,
 ) -> (serde_json::Value, Option<String>) {
     match running
         .make_room(wire::CacheChange::Plan, successor, None)
         .await
     {
-        Ok(results) => {
-            // The previous world kept in host memory moves the weights the
-            // successor does not map: all of the serving world's weights on
-            // each GPU, at most, when the successor loads its own.
-            let moved = to_host && successor.loads_weights;
-            (memory_report(&results, moved), None)
-        }
+        Ok(results) => (memory_report(&results, previous_world, successor), None),
         Err(refusal) => (
             serde_json::json!({ "feasible": false, "refusal": refusal }),
             Some(refusal),
@@ -486,16 +484,27 @@ async fn memory_plan(
 }
 
 /// The memory report of the engine's per-device plans (`ledger::Preparing`
-/// of the engine, as JSON): each GPU's, and each host's admission of new
-/// host memory. A successor sharing the serving world's page pools needs
-/// none; with `weights_to_host`, the previous world's weights move to host
-/// memory once it is kept there, which each host's admission must hold, or
-/// they stay on the GPUs (`update_config.previous_world = "weights"`).
-fn memory_report(plans: &[String], weights_to_host: bool) -> serde_json::Value {
-    let gpus: Vec<serde_json::Value> = plans
+/// of the engine, as JSON) for a successor that adds `successor` and a
+/// previous world kept as `previous_world`: each GPU's, with what each
+/// step of `specs/online-operations.md` §6.5 frees there ([`steps`]), and
+/// each host's admission of new host memory. A successor sharing the
+/// serving world's page pools needs none; a previous world kept in host
+/// memory moves there the weights a successor that loads its own does not
+/// map (all of the serving world's on each GPU, at most), which each host's
+/// admission must hold, or they stay on the GPUs.
+fn memory_report(
+    plans: &[String],
+    previous_world: PreviousWorld,
+    successor: Successor,
+) -> serde_json::Value {
+    let weights_to_host = previous_world == PreviousWorld::Host && successor.loads_weights;
+    let mut gpus: Vec<serde_json::Value> = plans
         .iter()
         .filter_map(|plan| serde_json::from_str(plan).ok())
         .collect();
+    for gpu in &mut gpus {
+        gpu["steps"] = steps(gpu, previous_world, successor);
+    }
     // The serving world's weights on each GPU of each host, once per GPU
     // however many of its workers report it.
     let mut weights: BTreeMap<(String, String), u64> = BTreeMap::new();
@@ -541,6 +550,69 @@ fn memory_report(plans: &[String], weights_to_host: bool) -> serde_json::Value {
         "feasible": gpus.iter().all(|gpu| gpu["feasible"] == true),
         "gpus": gpus,
         "hosts": hosts.into_values().collect::<Vec<_>>(),
+    })
+}
+
+/// What each step of `specs/online-operations.md` §6.5 frees on the GPU of
+/// the plan `gpu` (`ledger::Preparing` of the engine), in bytes, and the
+/// promotion stall of moving the requests' KV cache in flight through host
+/// memory (step 3), for a successor that adds `successor` and a previous
+/// world kept as `previous_world`. In the preparing phase: the idle cached
+/// pages of the tail the serving world gives back (step 1), the rest of
+/// that tail (step 2), the warm copies a successor that recomputes the
+/// cache would otherwise prepare on the device (step 3) and the serving
+/// world's graph pool (step 4). In the trial: the previous world's KV cache
+/// segments the successor does not map, past its first (step 5, a parked
+/// previous world), its weights the successor does not map (step 6, kept in
+/// host memory), and its processes' graph pool, process memory and
+/// exclusive storages with those segments (step 7, kept as its weights or
+/// in host memory).
+fn steps(
+    gpu: &serde_json::Value,
+    previous_world: PreviousWorld,
+    successor: Successor,
+) -> serde_json::Value {
+    let bytes = |value: &serde_json::Value| value.as_u64().unwrap_or(0);
+    let serving = &gpu["serving"];
+    let kv_kept = bytes(&gpu["kv_kept"]);
+    let idle = bytes(&gpu["idle_cached_tail"]);
+    let tail = bytes(&gpu["serving_kv_cache"]).saturating_sub(kv_kept);
+    // The previous world's segments the successor does not map: all it
+    // keeps when the successor maps none of its cache.
+    let unmapped = if successor.recomputes_cache {
+        kv_kept
+    } else {
+        0
+    };
+    let parked = previous_world == PreviousWorld::Parked;
+    serde_json::json!({
+        "preparation": {
+            "idle_prefix_pages": idle,
+            "kv_tail": tail.saturating_sub(idle),
+            "warm_copies": bytes(&gpu["successor"]["in_flight"]),
+            "graph_pool": bytes(&serving["graph_pool"]),
+        },
+        "trial": {
+            "unmapped_kv_segments": if parked {
+                unmapped.saturating_sub(bytes(&gpu["kv_floor"]))
+            } else {
+                0
+            },
+            "weights_to_host": if previous_world == PreviousWorld::Host && successor.loads_weights {
+                bytes(&serving["weights"])
+            } else {
+                0
+            },
+            "processes": if parked {
+                0
+            } else {
+                bytes(&serving["graph_pool"])
+                    + bytes(&serving["process"])
+                    + bytes(&serving["exclusive"])
+                    + unmapped
+            },
+        },
+        "promotion_stall_ms": gpu["promotion_stall_ms"],
     })
 }
 
@@ -689,14 +761,7 @@ impl Leader {
         // memory ledger first: the serving world's KV cache limit beside a
         // successor, per GPU and host (`specs/online-operations.md` §6.6).
         let memory = if world_changes && !in_place && unmapped.is_empty() {
-            Some(
-                memory_plan(
-                    &running,
-                    successor,
-                    update.previous_world == PreviousWorld::Host,
-                )
-                .await,
-            )
+            Some(memory_plan(&running, successor, update.previous_world).await)
         } else {
             None
         };
@@ -846,10 +911,7 @@ impl Leader {
                 return Err(error.into());
             }
         };
-        let memory = memory_report(
-            &shrunk,
-            update.previous_world == PreviousWorld::Host && adds.loads_weights,
-        );
+        let memory = memory_report(&shrunk, update.previous_world, adds);
         // A successor of another parallel configuration lays its cache out
         // for the heads it holds, and one of another encoding cannot read the
         // serving world's: either maps none of its segments.
@@ -1007,8 +1069,25 @@ impl Leader {
         let mut mode = update.previous_world;
         let mut host_refused = None;
         let mut moved_bytes = 0;
+        let mut evicted: Option<serde_json::Value> = None;
         match &previous {
-            Previous::Parked(_) => {
+            Previous::Parked(parked) => {
+                // A parked previous world whose cache the successor maps none
+                // of keeps it for a rollback alone: it evicts every segment
+                // past its first once their idle pages reached the host KV
+                // cache, and the successor grows into them (step 5 of
+                // `specs/online-operations.md` §6.5). A rollback reads them
+                // back from there and computes the rest again.
+                if adds.recomputes_cache {
+                    match parked.resize_cache(wire::CacheChange::Evict).await {
+                        Ok(results) => {
+                            evicted = results
+                                .iter()
+                                .find_map(|result| serde_json::from_str(result).ok());
+                        }
+                        Err(error) => warn!("the parked world did not evict its KV cache: {error}"),
+                    }
+                }
                 if let Err(error) = successor.resize_cache(wire::CacheChange::Grow).await {
                     warn!("the successor's KV cache did not grow: {error}");
                 }
@@ -1064,6 +1143,7 @@ impl Leader {
             "previous_world_kept": mode,
             "host_refused": host_refused,
             "moved_to_host_bytes": to_host.then_some(moved_bytes),
+            "evicted": evicted,
             "numerics": if numerics_change { "changed" } else { "unchanged" },
             "parallel": if redistributes { "changed" } else { "unchanged" },
             "in_flight": if numerics_change { Some(in_flight) } else { None },
@@ -1090,6 +1170,7 @@ impl Leader {
                 previous,
                 mode,
                 host_refused,
+                pages_change,
                 promoted: paused,
                 promoted_at: now(),
                 baseline,
@@ -1132,7 +1213,10 @@ impl Leader {
                 warn!("the previous world's engine process: {error:#}");
             }
         }
-        let results = match client.commit(vec![trial.previous_world]).await {
+        let results = match client
+            .commit(vec![trial.previous_world], trial.pages_change)
+            .await
+        {
             Ok(results) => results,
             Err(error) => {
                 let world = trial.world;
@@ -1617,6 +1701,69 @@ mod tests {
             &comparable(&target),
             Some(&capacity)
         ));
+    }
+
+    /// Each step of a world change frees what its retention mode and the
+    /// successor leave to it: the tail's idle pages and the rest of the tail
+    /// in the preparation; in the trial, a parked previous world's segments
+    /// the successor does not map, past its first, or, kept as its weights
+    /// or in host memory, its processes with those segments, and in host
+    /// memory its weights the successor does not map.
+    #[test]
+    fn each_step_frees_what_the_mode_and_the_successor_leave_it() {
+        let gpu = serde_json::json!({
+            "serving": {"weights": 600, "graph_pool": 50, "process": 30, "exclusive": 5},
+            "serving_kv_cache": 800,
+            "kv_kept": 500,
+            "kv_floor": 100,
+            "idle_cached_tail": 120,
+            "successor": {"in_flight": 70},
+            "promotion_stall_ms": 9,
+        });
+        let reloading = Successor {
+            loads_weights: true,
+            recomputes_cache: true,
+        };
+        let parked = steps(&gpu, PreviousWorld::Parked, reloading);
+        assert_eq!(
+            parked["preparation"],
+            serde_json::json!({
+                "idle_prefix_pages": 120,
+                "kv_tail": 180,
+                "warm_copies": 70,
+                "graph_pool": 50,
+            })
+        );
+        assert_eq!(
+            parked["trial"],
+            serde_json::json!({
+                "unmapped_kv_segments": 400,
+                "weights_to_host": 0,
+                "processes": 0,
+            })
+        );
+        assert_eq!(parked["promotion_stall_ms"], 9);
+
+        let host = steps(&gpu, PreviousWorld::Host, reloading);
+        assert_eq!(
+            host["trial"],
+            serde_json::json!({
+                "unmapped_kv_segments": 0,
+                "weights_to_host": 600,
+                "processes": 585,
+            })
+        );
+        // A successor that maps the weights and the cache leaves the trial
+        // the previous world's processes alone.
+        let weights = steps(&gpu, PreviousWorld::Weights, Successor::default());
+        assert_eq!(
+            weights["trial"],
+            serde_json::json!({
+                "unmapped_kv_segments": 0,
+                "weights_to_host": 0,
+                "processes": 85,
+            })
+        );
     }
 
     /// A world change carries over a change of the build, and one of the

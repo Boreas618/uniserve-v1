@@ -166,6 +166,21 @@ struct PublishedPage {
     source: Arc<WorkerEndpoint>,
     /// The page's units in page order; the first one keys the page.
     units: Box<[UnitId]>,
+    /// The page's key in the host KV cache, once the page was offloaded
+    /// there: a withdrawal that evicts the page has its copy verified or
+    /// made again under it first.
+    host_key: Option<storage::Key>,
+}
+
+/// An idle cached page held while a withdrawal evicts it, so that its units
+/// keep their bytes until its host KV cache copy is verified or made: its
+/// reference, cache group, the worker that retains it and its key in the
+/// host KV cache, when it was offloaded there.
+pub(crate) struct IdlePage {
+    pub(crate) page: PageRef,
+    pub(crate) group: u32,
+    pub(crate) source: Arc<WorkerEndpoint>,
+    pub(crate) host_key: Option<storage::Key>,
 }
 
 /// Pool state guarded by one mutex.
@@ -453,6 +468,20 @@ impl BlockPool {
         inner.withdrawn_held()
     }
 
+    /// The units from `first` on, short of the withdrawn ones, that hold
+    /// published pages no request holds: the idle cached pages a withdrawal
+    /// from `first` evicts.
+    pub(crate) fn cached_from(&self, first: u32) -> u32 {
+        let inner = lock(&self.inner);
+        let end = inner.withdrawn.min(inner.meta.len() as u32);
+        (first.min(end)..end)
+            .filter(|&unit| {
+                let meta = &inner.meta[unit as usize];
+                meta.state == UnitState::Cached && meta.published.is_some()
+            })
+            .count() as u32
+    }
+
     /// The withdrawn units requests still hold.
     pub(crate) fn withdrawn_held(&self) -> usize {
         lock(&self.inner).withdrawn_held()
@@ -597,6 +626,8 @@ impl BlockPool {
                     tokens: page.tokens.clone(),
                     source: Arc::clone(source),
                     units: units.into_iter().map(UnitId).collect(),
+                    // The predecessor's offloads keyed the pages it published.
+                    host_key: None,
                 },
             );
             inner.hash_to_pages.entry(page.hash).or_default().push(head);
@@ -738,6 +769,7 @@ impl BlockPool {
                 tokens: tokens.to_vec(),
                 source: Arc::clone(source),
                 units: page.units.clone(),
+                host_key: None,
             },
         );
         inner.hash_to_pages.entry(hash).or_default().push(head);
@@ -805,6 +837,66 @@ impl BlockPool {
             units,
             pool: Arc::downgrade(&self.inner),
         })
+    }
+
+    /// Notes `key` as the host KV cache key of the published page `page`,
+    /// which is being offloaded there under it.
+    pub(crate) fn set_host_key(&self, page: &PageRef, key: storage::Key) {
+        let mut inner = lock(&self.inner);
+        if let Some(published) = inner.pages.get_mut(&page.units[0].0)
+            && published.units == page.units
+        {
+            published.host_key = Some(key);
+        }
+    }
+
+    /// Acquires every idle cached page with a unit from `first` on, short of
+    /// the withdrawn units: the pages a withdrawal from `first` evicts, held
+    /// so that their bytes stay until the caller lets them go.
+    pub(crate) fn acquire_idle_from(&self, first: u32) -> Vec<IdlePage> {
+        let mut inner = lock(&self.inner);
+        let end = inner.withdrawn.min(inner.meta.len() as u32);
+        let heads: Vec<u32> = inner
+            .pages
+            .iter()
+            .filter(|(_, page)| {
+                page.units.iter().any(|unit| (first..end).contains(&unit.0))
+                    && page.units.iter().all(|unit| {
+                        let meta = &inner.meta[unit.0 as usize];
+                        meta.state == UnitState::Cached && meta.ref_cnt == 0
+                    })
+            })
+            .map(|(&head, _)| head)
+            .collect();
+        let mut idle = Vec::with_capacity(heads.len());
+        for head in heads {
+            let Some(page) = inner.pages.get(&head) else {
+                continue;
+            };
+            let (units, group, source, host_key) = (
+                page.units.clone(),
+                page.group,
+                Arc::clone(&page.source),
+                page.host_key,
+            );
+            for unit in units.iter() {
+                inner.fq_unlink(unit.0);
+                let meta = &mut inner.meta[unit.0 as usize];
+                meta.ref_cnt += 1;
+                meta.state = UnitState::Active;
+            }
+            idle.push(IdlePage {
+                page: PageRef {
+                    units,
+                    pool: Arc::downgrade(&self.inner),
+                },
+                group,
+                source,
+                host_key,
+            });
+        }
+        inner.stats.free = inner.free_count;
+        idle
     }
 
     /// Returns the number of published prefix pages, referenced or not.
@@ -2232,6 +2324,28 @@ mod tests {
         assert_eq!((pool.usable_units(), pool.free_units()), (15, 8));
         drop(allocation);
         assert_eq!(pool.free_units(), 15);
+    }
+
+    /// The idle cached pages from a unit on are those published pages no
+    /// request holds: a page still held, an unpublished free unit and a
+    /// withdrawn unit do not count.
+    #[test]
+    fn cached_pages_from_a_unit_count_the_idle_published_ones() {
+        let pool = BlockPool::new(16, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let source = endpoint();
+        let prompt: Vec<u32> = (100..112).collect();
+        // Twelve pages on units 1..=12, all held by the request.
+        let held = publish(&coordinator, &pool, &prompt, &source);
+        assert_eq!(pool.cached_from(1), 0);
+
+        // Released, they are cached and idle.
+        drop(held);
+        assert_eq!(pool.cached_from(1), 12);
+        assert_eq!(pool.cached_from(9), 4);
+        // A withdrawal from unit 11 evicts the two pages there.
+        pool.withdraw(11);
+        assert_eq!(pool.cached_from(9), 2);
     }
 
     #[test]

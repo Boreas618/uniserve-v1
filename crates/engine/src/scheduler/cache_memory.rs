@@ -24,6 +24,7 @@ use super::ledger::{CacheMemory, Preparing, growable, preparing};
 use super::*;
 use crate::executor::WorkerGroupId;
 use crate::handle::CacheChange;
+use crate::kv_cache::PageRef;
 
 /// A shrink, sleep or weight update that waits for the requests holding
 /// the withdrawn units to let them go (`Scheduler::resize_cache`,
@@ -104,6 +105,7 @@ impl Scheduler {
                 return;
             }
             CacheChange::Sleep => Ok(self.start_sleep().ok_or_else(Vec::new)),
+            CacheChange::Evict => self.start_evict(),
             CacheChange::Restore => {
                 let _ = answer.send(self.restore_cache(None));
                 return;
@@ -485,13 +487,9 @@ impl Scheduler {
         &mut self,
         successor: crate::Successor,
     ) -> Result<Preparation, String> {
-        // A successor that maps none of this cache computes the state of
-        // the requests in flight in units of its own: those they hold now.
-        let in_flight_units = if successor.recomputes_cache {
-            self.migrating_units()
-        } else {
-            0
-        };
+        // The units the requests in flight hold now: a successor that maps
+        // none of this cache computes their state in as many of its own.
+        let in_flight_units = self.migrating_units();
         let Some(MemoryReports {
             cache: reports,
             beside,
@@ -535,6 +533,9 @@ impl Scheduler {
             plan.kv_kept = (0..kept as usize)
                 .map(|index| report.segment_bytes(index))
                 .sum();
+            plan.idle_cached_tail = self.storage.cache().map_or(0, |cache| {
+                u64::from(cache.block_pool.cached_from(report.first_unit(kept))) * report.unit_bytes
+            });
             keep = keep.min(kept);
             plans.push(plan);
         }
@@ -569,8 +570,119 @@ impl Scheduler {
         let Some((segment, unit)) = tail else {
             return Ok((None, plans));
         };
+        // The idle cached pages of the tail reach the host KV cache before
+        // the tail is given back (step 1 of `specs/online-operations.md`
+        // §6.5): a later prompt reads them back from there.
+        self.offload_idle_from(unit);
         self.withdraw_from(unit, false);
         Ok((Some(segment), plans))
+    }
+
+    /// Withdraws every segment of a parked world's cache past its first
+    /// (and past those it inherited and does not own yet), once the idle
+    /// cached pages they hold reached the host KV cache (step 5 of
+    /// `specs/online-operations.md` §6.5): its successor maps none of them
+    /// and grows into their memory, and a rollback that resumes this world
+    /// creates them again and reads the pages back from the host KV cache.
+    /// No request runs on a parked world. Answers, once the workers gave the
+    /// segments back, with what it evicted.
+    fn start_evict(&mut self) -> Result<Result<Pending, Vec<String>>, String> {
+        if !self.parks() {
+            return Err("only a parked world evicts its KV cache".to_owned());
+        }
+        let Some(reports) = self.cache_memory()? else {
+            return Ok(Err(Vec::new()));
+        };
+        let first = &reports[0];
+        let inherited = self
+            .storage
+            .cache()
+            .map_or(0..0, |cache| cache.block_pool.inherited());
+        let floor = (1..first.held)
+            .rev()
+            .find(|&index| first.first_unit(index) < inherited.end)
+            .map_or(1, |index| index + 1);
+        if floor >= first.held {
+            return Ok(Err(Vec::new()));
+        }
+        let unit = first.first_unit(floor);
+        let bytes: u64 = (floor as usize..first.held as usize)
+            .map(|index| first.segment_bytes(index))
+            .sum();
+        let pages = self.offload_idle_from(unit);
+        self.withdraw_from(unit, false);
+        let evicted = serde_json::json!({
+            "evicted_segments": first.held - floor,
+            "evicted_bytes": bytes,
+            "offloaded_pages": pages,
+        });
+        tracing::info!(%evicted, "a parked world evicts its KV cache past its first segment");
+        Ok(Ok(Pending::Shrink {
+            from: floor,
+            plan: vec![evicted.to_string()],
+        }))
+    }
+
+    /// Holds every idle cached page a withdrawal from `unit` evicts and has
+    /// the host KV cache verify or make its copy under the key it was
+    /// offloaded with: a page the pool holds already is released at once,
+    /// another once its copy commits. Pages of a sliding-window group, and
+    /// pages never offloaded (no host KV cache serves their worker), are
+    /// evicted without a copy: a later prompt computes them again. Returns
+    /// how many pages wait for their copies.
+    fn offload_idle_from(&mut self, unit: u32) -> usize {
+        let (Some(cache), Some(kv_offload)) = (self.storage.cache(), self.kv_offload.as_mut())
+        else {
+            return 0;
+        };
+        let idle = cache.block_pool.acquire_idle_from(unit);
+        let workers: Vec<(WorkerGroupId, ipc::WorkerEndpoint)> = self
+            .executor
+            .info()
+            .workers
+            .iter()
+            .map(|(id, worker)| (id.clone(), worker.endpoint.clone()))
+            .collect();
+        let mut offloads: BTreeMap<(WorkerGroupId, usize), (Vec<storage::Key>, Vec<PageRef>)> =
+            BTreeMap::new();
+        for page in idle {
+            let worker = workers
+                .iter()
+                .find(|(_, endpoint)| *endpoint == *page.source)
+                .map(|(id, _)| id.clone());
+            let group = page.group as usize;
+            let full = worker.as_ref().is_some_and(|worker| {
+                kv_offload.serves(worker)
+                    && matches!(
+                        kv_offload.managers(worker).get(group),
+                        Some(crate::kv_cache::manager::AttentionManager::Full(_))
+                    )
+            });
+            // Dropping the page lets the withdrawal evict it uncopied.
+            if let (Some(worker), Some(key), true) = (worker, page.host_key, full) {
+                let entry = offloads.entry((worker, group)).or_default();
+                entry.0.push(key);
+                entry.1.push(page.page);
+            }
+        }
+        let mut waiting = 0;
+        for ((worker, group), (keys, pages)) in offloads {
+            waiting += pages.len();
+            kv_offload.offload(
+                &worker,
+                group,
+                keys,
+                pages,
+                crate::kv_cache::OffloadKind::Pages,
+            );
+        }
+        if waiting > 0 {
+            tracing::info!(
+                pages = waiting,
+                "the idle cached pages of the withdrawn units go to the host KV cache first"
+            );
+        }
+        waiting
     }
 
     /// Withdraws every unit and lets the requests that run finish or

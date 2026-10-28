@@ -1448,10 +1448,11 @@ pub trait Executor: Send {
         Ok(Vec::new())
     }
     /// Ends the memory of every world of `worlds` on the nodes of the
-    /// executor's workers (`Claims::retire`). The default suits an executor
-    /// that retains no memory.
-    fn retire(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
-        let _ = worlds;
+    /// executor's workers, discarding the pages their host KV caches hold of
+    /// the other worlds when `discard_pages` (`Claims::retire`). The default
+    /// suits an executor that retains no memory.
+    fn retire(&mut self, worlds: &[u64], discard_pages: bool) -> Result<(), ExecutorError> {
+        let _ = (worlds, discard_pages);
         Ok(())
     }
     /// Keeps the weights alone of every world of `worlds` on the nodes of

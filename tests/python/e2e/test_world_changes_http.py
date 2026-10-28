@@ -1054,6 +1054,86 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         assert _weights_of(base_url) == {(previous,)}
 
 
+# A prompt longer than one segment of the KV cache (an eighth of its 32768
+# tokens), which leaves the next prompt's pages in later segments.
+FILL_PROMPT = "Name one colour of the rainbow. " * 900
+
+
+def _segments_of(base_url: str, world: int) -> int:
+    """The KV cache segments `world` holds on the deployment's GPUs."""
+    return sum(
+        1
+        for ledger in _ledgers(_config(base_url))
+        for entry in ledger["entries"]
+        if entry["item"] == "cache_segment" and world in entry["worlds"]
+    )
+
+
+def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
+    tmp_path: Path,
+):
+    """A change to other model files whose requests in flight compute their
+    state again maps none of the serving world's KV cache. The previous
+    world, parked, evicts every segment past its first once the idle pages
+    there reached the host KV cache, and the successor's cache grows into
+    their memory; the dry run states what that frees. A rollback creates
+    the segments again and reads the evicted pages back from the host KV
+    cache, answering as before.
+    """  # noqa: D205
+    name = "qwen3-world-evict"
+    change = [
+        f"model={_updated_checkpoint()}",
+        "update_config.previous_world=parked",
+    ]
+    with _serve(tmp_path, name, options=WEIGHTS_SHARE) as (base_url, _log):
+        # The prompt's pages lie past the first segment.
+        _chat(base_url, name, FILL_PROMPT)
+        original = _chat(base_url, name, CACHED_PROMPT)
+        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        previous = serving["world"]
+        held = _segments_of(base_url, previous)
+        assert held > 1
+
+        planned = httpx.put(
+            f"{base_url}/admin/config",
+            json={"set": change, "in_flight": "recompute", "dry_run": True},
+            timeout=1800,
+        )
+        assert planned.status_code == 200, planned.text
+        plan = planned.json()["result"]["plan"]
+        assert plan["kv_cache"] == "recomputed", plan
+        for gpu in plan["memory"]["gpus"]:
+            steps = gpu["steps"]
+            assert steps["trial"]["unmapped_kv_segments"] > 0, gpu
+            assert steps["promotion_stall_ms"] is not None, gpu
+
+        response = httpx.put(
+            f"{base_url}/admin/config",
+            json={"set": change, "in_flight": "recompute"},
+            timeout=1800,
+        )
+        assert response.status_code == 200, response.text
+        report = response.json()["result"]["world"]
+        assert report["kv_cache"] == "recomputed", report
+        evicted = report["evicted"]
+        assert evicted["evicted_segments"] == held - 1, report
+        assert evicted["evicted_bytes"] > 0, report
+        world = report["world"]
+        # The previous world keeps its first segment; the successor's cache
+        # grew past its head segment into the memory freed.
+        assert _segments_of(base_url, previous) == 1
+        assert _segments_of(base_url, world) > 1
+        assert _chat(base_url, name, CACHED_PROMPT) != original
+
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        assert rolled.json()["result"]["world"] == previous
+        assert _segments_of(base_url, previous) == held
+        answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
+        assert answer == original
+        assert hits > 0, "the evicted pages were not read back"
+
+
 # The faults the world on trial meets, by the hook that arms each, and the
 # options the successor serves with for it: a stalled job is found after
 # half the watchdog's timeout.

@@ -1470,6 +1470,64 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
     assert_eq!(contents(got.storages.remove(0).1), b"good");
 }
 
+/// A committed world of other numerics hits none of the pages its
+/// predecessors published: the head discards them, those nobody reads at
+/// once and a pinned one when it is unpinned, while the committed world's
+/// own pages stay. Only the head discards pages.
+#[test]
+fn a_world_of_other_numerics_keeps_only_its_own_pages_once_committed() {
+    use storage::protocol::{PageLevel, Request};
+
+    let server = Running::start();
+    let mut daemon = head(&server.socket);
+    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut serving_worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let pool = trial_pool(&mut serving_worker);
+    let mut serving = engine_head(&server.socket, 1);
+    publish(&mut serving, pool, &[key(5), key(6)]);
+    daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut successor = engine_head(&server.socket, 2);
+    publish(&mut successor, pool, &[key(7)]);
+    // The serving world reads one of its pages as the commit comes.
+    serving
+        .call(
+            &Request::Pin {
+                pool,
+                reader: scope("text", 0),
+                keys: vec![key(6)],
+            },
+            &[],
+        )
+        .unwrap();
+
+    // The commit retires world 1; world 2 computes other numerics.
+    daemon.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    assert_eq!(daemon.discard_pages(2).unwrap(), 2);
+    assert_eq!(
+        levels(&mut successor, pool, &[key(5), key(6), key(7)]),
+        vec![PageLevel::Absent, PageLevel::Absent, PageLevel::Host]
+    );
+    // The pinned page leaves the pool once unpinned.
+    assert_eq!(daemon.list().unwrap().page_pools[0].ready, 2);
+    serving
+        .call(
+            &Request::Unpin {
+                pool,
+                reader: scope("text", 0),
+                keys: vec![key(6)],
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(daemon.list().unwrap().page_pools[0].ready, 1);
+
+    // A worker is no head.
+    assert_eq!(
+        server_error(serving_worker.discard_pages(2)),
+        ErrorKind::Invalid
+    );
+}
+
 /// What the serving world published stays the serving world's to read when
 /// only the world on trial still retains it: a previous world restarted on
 /// its weights maps the cache segments it published again.

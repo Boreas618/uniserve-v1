@@ -158,6 +158,19 @@ pub(super) struct Preparing {
     pub(super) segments_kept: u32,
     pub(super) segments_held: u32,
     pub(super) kv_kept: u64,
+    /// The bytes of the units past the kept segments that hold idle cached
+    /// pages: what evicting the prefix cache's idle pages from the tail
+    /// frees before the requests holding the rest of it end (step 1 of
+    /// `specs/online-operations.md` §6.5).
+    pub(super) idle_cached_tail: u64,
+    /// The KV cache the requests in flight hold on the device, which a
+    /// promotion that moves it to the successor through host memory copies
+    /// back over the host link (step 3).
+    pub(super) in_flight_kv: u64,
+    /// How long such a promotion waits for that copy at the host link's
+    /// measured bandwidth, in milliseconds; `None` before the Transfer
+    /// Server measured the link.
+    pub(super) promotion_stall_ms: Option<u64>,
     /// Whether the limit holds the segments the serving world cannot give
     /// back.
     pub(super) feasible: bool,
@@ -211,10 +224,10 @@ impl Additions {
 
 /// The serving world's KV cache limit on the device of `report` in the
 /// preparing phase beside a successor that adds `adds`, and the segments it
-/// keeps within it, of which `floor` it cannot give back. A successor that
-/// computes the state of the requests in flight again takes the
-/// `in_flight_units` they hold of its own. Fails for a worker that reports
-/// no ledger or no quota.
+/// keeps within it, of which `floor` it cannot give back. The requests in
+/// flight hold `in_flight_units`, which a successor that computes their
+/// state again takes of its own. Fails for a worker that reports no ledger
+/// or no quota.
 pub(super) fn preparing(
     report: &CacheMemory,
     floor: u32,
@@ -267,8 +280,17 @@ pub(super) fn preparing(
         process: serving.process,
         exclusive: serving.exclusive,
         head_segment: report.head_bytes,
-        in_flight: u64::from(in_flight_units) * report.unit_bytes,
+        in_flight: if adds.recomputes_cache {
+            u64::from(in_flight_units) * report.unit_bytes
+        } else {
+            0
+        },
     };
+    let in_flight_kv = u64::from(in_flight_units) * report.unit_bytes;
+    let promotion_stall_ms = ledger
+        .host_link_bytes_per_second
+        .filter(|&bandwidth| bandwidth > 0)
+        .map(|bandwidth| in_flight_kv.saturating_mul(1000).div_ceil(bandwidth));
     let beside = ledger.used() + unbooked_context - serving_kv_cache + successor.total();
     // The successor's grant is never more than the device has free, so its
     // additions and the Transfer Server's context not created yet must fit
@@ -312,6 +334,10 @@ pub(super) fn preparing(
         segments_kept,
         segments_held: report.held,
         kv_kept: kept,
+        // The caller counts the idle cached pages past the kept segments.
+        idle_cached_tail: 0,
+        in_flight_kv,
+        promotion_stall_ms,
         feasible: kv_floor as i64 <= kv_limit,
         entries: ledger.entries.iter().map(LedgerEntry::describe).collect(),
         host_memory: report.host_memory,

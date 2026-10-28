@@ -471,6 +471,14 @@ impl Client {
         }
     }
 
+    /// See [`Request::DiscardPages`]. Returns how many pages were discarded.
+    pub fn discard_pages(&mut self, except: u64) -> Result<u64> {
+        match Self::expect(self.call(&Request::DiscardPages { except }, &[])?)?.reply {
+            Reply::Discarded { pages } => Ok(pages),
+            other => Err(unexpected("discard_pages", &other)),
+        }
+    }
+
     /// See [`Request::KeepWeights`]. Returns how many tensors were released.
     pub fn keep_weights(&mut self, worlds: Vec<u64>) -> Result<u64> {
         match Self::expect(self.call(&Request::KeepWeights { worlds }, &[])?)?.reply {
