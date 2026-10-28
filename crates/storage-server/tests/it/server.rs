@@ -1051,7 +1051,7 @@ fn a_page_pool_the_hosts_memory_cannot_hold_is_refused() {
 }
 
 /// A worker of `scope` in `world`.
-fn world_worker(socket: &Path, scope: Scope, world: u64, claim: Claim) -> Client {
+pub(crate) fn world_worker(socket: &Path, scope: Scope, world: u64, claim: Claim) -> Client {
     Client::connect(
         socket,
         Role::Worker {
@@ -1669,10 +1669,10 @@ fn one_key_keeps_a_copy_at_each_location() {
 
 /// The GPU the ledger tests book on, which no process touches: the server
 /// never interprets a storage, so a memfd stands for device memory.
-const GPU: [u8; 16] = [0x5a; 16];
+pub(crate) const GPU: [u8; 16] = [0x5a; 16];
 
 /// A storage of `bytes` on [`GPU`], of KV cache `segment` when given.
-fn device(bytes: u64, segment: Option<storage::Segment>) -> StorageRecord {
+pub(crate) fn device(bytes: u64, segment: Option<storage::Segment>) -> StorageRecord {
     StorageRecord {
         placement: Placement::Device { gpu: GPU },
         bytes,
@@ -1686,14 +1686,14 @@ fn segment(world: u64, ordinal: u32) -> Option<storage::Segment> {
 }
 
 /// The deployment's ledger of [`GPU`] as `client` reads it.
-fn ledger(client: &mut Client) -> storage::GpuLedger {
+pub(crate) fn ledger(client: &mut Client) -> storage::GpuLedger {
     let (ledgers, _) = client.ledger(vec![GPU]).unwrap();
     assert_eq!(ledgers.len(), 1, "{ledgers:?}");
     ledgers.into_iter().next().unwrap()
 }
 
 /// The bytes of `ledger`'s entries of `item` held by exactly `worlds`.
-fn booked(ledger: &storage::GpuLedger, item: Item, worlds: &[u64]) -> u64 {
+pub(crate) fn booked(ledger: &storage::GpuLedger, item: Item, worlds: &[u64]) -> u64 {
     ledger.bytes(|entry| entry.item == item && entry.worlds == worlds)
 }
 
@@ -1874,6 +1874,56 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
             &storage::protocol::Request::KeepWeights { worlds: vec![1] },
             &[],
         )
+        .unwrap();
+    assert!(
+        matches!(
+            refused.reply,
+            storage::protocol::Reply::Error {
+                kind: ErrorKind::Invalid,
+                ..
+            }
+        ),
+        "{:?}",
+        refused.reply
+    );
+}
+
+/// A head moves a world's weights between its GPUs and host memory only
+/// through the Transfer Server: without one, an offload of weights is
+/// refused and moves nothing, while a world with no weights to move (none
+/// that it alone retains on a GPU, none in host memory) is answered at once.
+/// Only the head moves weights.
+#[test]
+fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let storages = [memfd(&[1; 4]), memfd(&[2; 4])];
+    first
+        .put(
+            vec![
+                tensor(key(1), "weights", 0, 0, Access::ReadOnly),
+                tensor(key(2), "values#0/0", 1, 0, Access::Exclusive),
+            ],
+            &[
+                (device(200, None), storages[0].as_fd()),
+                (device(50, segment(1, 0)), storages[1].as_fd()),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        server_error(head.move_weights(1, true)),
+        ErrorKind::Unavailable
+    );
+    assert_eq!(booked(&ledger(&mut head), Item::Weights, &[1]), 200);
+    // World 2 retains nothing; world 1 has nothing in host memory.
+    assert_eq!(head.move_weights(2, true).unwrap(), (0, 0));
+    assert_eq!(head.move_weights(1, false).unwrap(), (0, 0));
+    // A worker is no head.
+    let refused = first
+        .call(&storage::protocol::Request::Offload { world: 1 }, &[])
         .unwrap();
     assert!(
         matches!(

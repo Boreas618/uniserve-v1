@@ -456,6 +456,21 @@ impl Client {
         }
     }
 
+    /// See [`Request::Offload`] (`to_host`) and [`Request::Restore`].
+    /// Returns how many storages moved and their bytes, once every copy
+    /// ended.
+    pub fn move_weights(&mut self, world: u64, to_host: bool) -> Result<(u64, u64)> {
+        let request = if to_host {
+            Request::Offload { world }
+        } else {
+            Request::Restore { world }
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
+            Reply::Moved { storages, bytes } => Ok((storages, bytes)),
+            other => Err(unexpected("move_weights", &other)),
+        }
+    }
+
     /// See [`Request::KeepWeights`]. Returns how many tensors were released.
     pub fn keep_weights(&mut self, worlds: Vec<u64>) -> Result<u64> {
         match Self::expect(self.call(&Request::KeepWeights { worlds }, &[])?)?.reply {

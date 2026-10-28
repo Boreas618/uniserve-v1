@@ -648,6 +648,40 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
     );
 }
 
+/// An offload of a world's weights that the host cannot hold is refused
+/// whole under the host rule: nothing moves, and the GPU's ledger still
+/// books the weights.
+#[test]
+fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
+    use crate::server::{booked, device, ledger, world_worker};
+
+    let server = serving(Gpus::Hidden);
+    let mut head = head(&server.socket);
+    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    // A storage's record states its size; no host holds an exbibyte.
+    let bytes = 1 << 60;
+    let storage = memfd(&[1; 4]);
+    first
+        .put(
+            vec![tensor(key(1), "weights", 0, 0, Access::ReadOnly)],
+            &[(device(bytes, None), storage.as_fd())],
+        )
+        .unwrap();
+
+    match head.move_weights(1, true) {
+        Err(storage::Error::Server {
+            kind: ErrorKind::Resource,
+            message,
+        }) => assert!(message.contains("the host can hold"), "{message}"),
+        other => panic!("expected a refusal under the host rule, got {other:?}"),
+    }
+    assert_eq!(
+        booked(&ledger(&mut head), storage::Item::Weights, &[1]),
+        bytes
+    );
+}
+
 /// GPU tests: device memory the test process allocates and retains at the
 /// server, as a worker does.
 pub(crate) mod device {
@@ -665,7 +699,7 @@ pub(crate) mod device {
     };
 
     use super::{Gpus, end_of, pattern, read, serving, span, tensor_region};
-    use crate::server::{head, host, key, memfd, scope, tensor, worker};
+    use crate::server::{head, host, key, memfd, scope, tensor, worker, world_worker};
 
     /// A retained device allocation of `bytes` on `device` holding
     /// `contents`, with its descriptor.
@@ -913,6 +947,109 @@ pub(crate) mod device {
         assert!(ledger.used() <= quota);
         assert!(!holds_context(&nvml, first, pid));
         assert_eq!(device_bytes(&destination), vec![0; granularity]);
+    }
+
+    /// The weights booked on `gpu` in `head`'s ledger of it: each entry's
+    /// worlds and bytes, sorted.
+    fn weights_on(head: &mut storage::Client, gpu: [u8; 16]) -> Vec<(Vec<u64>, u64)> {
+        let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
+        let mut weights: Vec<(Vec<u64>, u64)> = ledgers
+            .iter()
+            .flat_map(|ledger| &ledger.entries)
+            .filter(|entry| entry.item == storage::Item::Weights)
+            .map(|entry| (entry.worlds.clone(), entry.bytes))
+            .collect();
+        weights.sort();
+        weights
+    }
+
+    /// The weights a world alone retains move to host memory and back
+    /// through the Transfer Server, bytes intact: the offload leaves them in
+    /// host memory and the GPU's ledger without them, while the weights its
+    /// successor maps stay on the GPU; the restore returns them to the GPU
+    /// they left and to its ledger.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_worlds_own_weights_move_to_host_memory_and_back() {
+        let server = serving(Gpus::Visible);
+        let first = DeviceId(0);
+        let gpu = first.uuid().unwrap().0;
+        let granularity = DeviceAllocation::granularity(first).unwrap();
+        let size = granularity as u64;
+        let own_bytes = pattern(granularity, 7);
+        let shared_bytes = pattern(granularity, 13);
+
+        let mut head = head(&server.socket);
+        let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+        let mut previous = world_worker(&server.socket, scope("text", 0), 1, claim);
+        let (own, own_fd) = device_storage(first, &own_bytes);
+        let (shared, shared_fd) = device_storage(first, &shared_bytes);
+        previous
+            .put(
+                vec![
+                    tensor(key(1), "own", 0, 0, Access::ReadOnly),
+                    tensor(key(2), "shared", 1, 0, Access::ReadOnly),
+                ],
+                &[
+                    (record(first, granularity), own_fd.as_fd()),
+                    (record(first, granularity), shared_fd.as_fd()),
+                ],
+            )
+            .unwrap();
+        head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+        let mut successor = world_worker(&server.socket, scope("text", 0), 2, claim);
+        successor
+            .get(vec![key(2)], storage::Mode::Read, Vec::new())
+            .unwrap();
+        // The previous world's processes exited: the server alone holds its
+        // memory.
+        drop(previous);
+        drop((own, own_fd, shared, shared_fd));
+        assert_eq!(
+            weights_on(&mut head, gpu),
+            [(vec![1], size), (vec![1, 2], size)]
+        );
+
+        // The bytes of world 1's own weights wherever they lie, copied into
+        // host memory of the successor's: a copy retains nothing.
+        let copy = memfd(&vec![0; granularity]);
+        successor
+            .put(
+                vec![tensor(key(3), "copy", 0, 0, Access::Exclusive)],
+                &[(host(size), copy.as_fd())],
+            )
+            .unwrap();
+        let mut update = 0;
+        let mut own_weights = |successor: &mut storage::Client| {
+            update += 1;
+            let task = successor
+                .transfer(
+                    vec![span(tensor_region(1), 0, tensor_region(3), 0, size)],
+                    Priority::Background,
+                    update,
+                )
+                .unwrap();
+            assert_eq!(end_of(successor, task), (size, TransferEnd::Complete));
+            read(&copy, 0, granularity)
+        };
+        let placement = |head: &mut storage::Client| {
+            let listing = head.list().unwrap();
+            let listed = listing.tensors.iter().find(|listed| listed.key == key(1));
+            listed.unwrap().placement
+        };
+
+        assert_eq!(head.move_weights(1, true).unwrap(), (1, size));
+        assert_eq!(weights_on(&mut head, gpu), [(vec![1, 2], size)]);
+        assert!(matches!(placement(&mut head), Placement::Host { .. }));
+        assert_eq!(own_weights(&mut successor), own_bytes);
+
+        assert_eq!(head.move_weights(1, false).unwrap(), (1, size));
+        assert_eq!(
+            weights_on(&mut head, gpu),
+            [(vec![1], size), (vec![1, 2], size)]
+        );
+        assert_eq!(placement(&mut head), Placement::Device { gpu });
+        assert_eq!(own_weights(&mut successor), own_bytes);
     }
 
     #[test]

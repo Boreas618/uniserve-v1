@@ -72,6 +72,10 @@ struct HandedServer {
     clients: Vec<HandedClient>,
     next_client: ClientId,
     storages: Vec<(u64, StorageRecord, usize)>,
+    /// The host copies of worlds' weights, with the GPU each left
+    /// ([`crate::moves`]); a predecessor that moved no weights hands none.
+    #[serde(default)]
+    moved: Vec<(u64, [u8; 16])>,
     next_storage: u64,
     tensors: Vec<(Key, HandedTensor)>,
     deployments: Vec<(String, Claim, Option<ClientId>)>,
@@ -308,8 +312,10 @@ impl Server {
             .collect();
         let mut storages = Vec::with_capacity(self.storages.len());
         let mut storage_descriptors = Vec::with_capacity(self.storages.len());
+        let mut moved = Vec::new();
         for (id, storage) in std::mem::take(&mut self.storages) {
             storages.push((id, storage.record, storage.tensors));
+            moved.extend(storage.moved_from.map(|gpu| (id, gpu)));
             storage_descriptors.push(storage._descriptor);
         }
         let (pages, pool_descriptors) = self.pages.hand_over();
@@ -331,6 +337,7 @@ impl Server {
             clients,
             next_client: self.next_client,
             storages,
+            moved,
             next_storage: self.next_storage,
             tensors,
             worlds: self
@@ -567,6 +574,7 @@ impl Server {
                 },
             );
         }
+        let moved: HashMap<u64, [u8; 16]> = handed.moved.into_iter().collect();
         let mut storages = HashMap::with_capacity(handed.storages.len());
         for (id, record, count) in handed.storages {
             storages.insert(
@@ -575,6 +583,8 @@ impl Server {
                     record,
                     _descriptor: next()?,
                     tensors: count,
+                    moved_from: moved.get(&id).copied(),
+                    moving: false,
                 },
             );
         }
@@ -625,6 +635,7 @@ impl Server {
             ledgers: handed.ledgers,
             kv_storage: KvStorage::new(connector),
             transfers: Transfers::new(transfer),
+            moves: crate::moves::Moves::default(),
             events: Vec::new(),
             relaunch: handed.relaunch,
             restart: None,

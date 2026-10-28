@@ -32,6 +32,7 @@ mod child;
 mod kv_storage;
 mod ledger;
 pub mod mooncake;
+mod moves;
 mod pages;
 mod restart;
 mod serve;
@@ -125,6 +126,12 @@ struct StorageEntry {
     _descriptor: OwnedFd,
     /// Tensors over the storage; the storage is released with its last.
     tensors: usize,
+    /// For the host copy of a world's weights ([`moves`]): the GPU the
+    /// storage left, which a restore returns it to.
+    moved_from: Option<[u8; 16]>,
+    /// Whether a move is filling the storage, which holds no tensor until
+    /// the move ends.
+    moving: bool,
 }
 
 struct TensorEntry {
@@ -179,6 +186,8 @@ enum Outcome {
     /// A peer's exposure, answered once the Transfer Server registered its
     /// regions.
     Exposing(transfers::Exposing),
+    /// A head's weight move, answered once its copies ended.
+    Moving(moves::Planned),
 }
 
 /// A descriptor that travels with a reply.
@@ -215,6 +224,8 @@ pub struct Server {
     ledgers: ledger::Ledgers,
     kv_storage: KvStorage,
     transfers: transfers::Transfers,
+    /// The worlds' weights moving between GPUs and host memory.
+    moves: moves::Moves,
     /// Events to send once the request being handled is answered.
     events: Vec<(ClientId, Event, Vec<Attachment>)>,
     /// The arguments a hot restart's successor starts with.
@@ -254,6 +265,7 @@ impl Server {
             ledgers: ledger::Ledgers::default(),
             kv_storage: KvStorage::new(connector),
             transfers: transfers::Transfers::new(transfer),
+            moves: moves::Moves::default(),
             events: Vec::new(),
             relaunch: Vec::new(),
             restart: None,
@@ -608,6 +620,11 @@ impl Server {
                     self.begin_exposure(id, request_id, exposing);
                     self.send_events();
                 }
+                Ok(Outcome::Moving(planned)) => {
+                    // Holds the connection until the move's copies end.
+                    self.begin_move(id, request_id, planned);
+                    self.send_events();
+                }
                 Ok(Outcome::Wait(victims)) => {
                     for victim in victims {
                         let gpus = self.gpus_held_by(&victim.pidfd);
@@ -728,6 +745,24 @@ impl Server {
             ) => self.claim(id, &deployment, scopes, *world, retire),
             (Request::KeepWeights { worlds }, Role::Head { deployment, .. }) => {
                 self.keep_weights(id, &deployment, worlds)
+            }
+            (Request::Offload { world }, Role::Head { deployment, .. }) => {
+                self.plan_move(id, &deployment, *world, true)
+            }
+            (Request::Restore { world }, Role::Head { deployment, .. }) => {
+                self.plan_move(id, &deployment, *world, false)
+            }
+            (
+                Request::Allocated {
+                    request,
+                    bytes,
+                    failure,
+                },
+                Role::Transfer,
+            ) => {
+                let descriptor = descriptors.into_iter().next();
+                self.allocated(*request, *bytes, failure.as_deref(), descriptor);
+                Ok(Outcome::Reply(Reply::Noted, Vec::new()))
             }
             (Request::Ledger { gpus }, role) => {
                 let deployment = match &role {
@@ -1503,6 +1538,8 @@ impl Server {
                         record: *record,
                         _descriptor: descriptor,
                         tensors: 0,
+                        moved_from: None,
+                        moving: false,
                     },
                 );
                 id
@@ -1561,8 +1598,9 @@ impl Server {
                 },
             );
         }
-        // A storage no tensor names is not retained.
-        self.storages.retain(|_, entry| entry.tensors > 0);
+        // A storage no tensor names is not retained, unless a move fills it.
+        self.storages
+            .retain(|_, entry| entry.tensors > 0 || entry.moving);
         Ok(Outcome::Reply(Reply::Put, Vec::new()))
     }
 
@@ -2565,6 +2603,9 @@ fn request_name(request: &Request) -> &'static str {
         Request::Expose { .. } => "expose",
         Request::Unexpose { .. } => "unexpose",
         Request::Registered { .. } => "registered",
+        Request::Offload { .. } => "offload",
+        Request::Restore { .. } => "restore",
+        Request::Allocated { .. } => "allocated",
     }
 }
 

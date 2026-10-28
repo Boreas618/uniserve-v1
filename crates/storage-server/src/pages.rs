@@ -368,7 +368,7 @@ impl Pools {
         numa_node: Option<u32>,
         slots: u64,
     ) -> io::Result<u64> {
-        let descriptor = pool_memory(slots * shape.page_bytes, numa_node)?;
+        let descriptor = shared_memory("uniserve-page-pool", slots * shape.page_bytes, numa_node)?;
         let pool = self.next;
         self.next += 1;
         self.pools.insert(
@@ -1220,9 +1220,10 @@ impl Pool {
     }
 }
 
-/// A memfd of `bytes`, backed by huge pages when the host has them to give,
-/// whose pages are allocated on `numa_node` when one is given.
-fn pool_memory(bytes: u64, numa_node: Option<u32>) -> io::Result<OwnedFd> {
+/// A memfd named `name` of `bytes`, backed by huge pages when the host has
+/// them to give, whose pages are allocated on `numa_node` when one is
+/// given: a page pool, or the host copy of a world's weights.
+pub(crate) fn shared_memory(name: &str, bytes: u64, numa_node: Option<u32>) -> io::Result<OwnedFd> {
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 
     // Huge pages hold a pool in fewer TLB entries for the copies that read
@@ -1231,15 +1232,12 @@ fn pool_memory(bytes: u64, numa_node: Option<u32>) -> io::Result<OwnedFd> {
     // is made and dropped here before the pool is handed out.
     const HUGE_PAGE: u64 = 2 << 20;
     let huge = bytes.next_multiple_of(HUGE_PAGE);
-    let (descriptor, size) = match memfd_create(
-        "uniserve-page-pool",
-        MemfdFlags::CLOEXEC | MemfdFlags::HUGETLB,
-    ) {
+    let (descriptor, size) = match memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::HUGETLB) {
         Ok(descriptor) if ftruncate(&descriptor, huge).is_ok() && reserves(&descriptor, huge) => {
             (descriptor, huge)
         }
         _ => {
-            let descriptor = memfd_create("uniserve-page-pool", MemfdFlags::CLOEXEC)?;
+            let descriptor = memfd_create(name, MemfdFlags::CLOEXEC)?;
             ftruncate(&descriptor, bytes)?;
             (descriptor, bytes)
         }
@@ -1545,7 +1543,7 @@ mod tests {
             .and_then(|node| node.parse().ok())
             .unwrap_or(0);
         let bytes = 4 << 20;
-        let descriptor = pool_memory(bytes, Some(node)).unwrap();
+        let descriptor = shared_memory("uniserve-page-pool", bytes, Some(node)).unwrap();
 
         // A worker's first touch allocates the pages, wherever it runs.
         // SAFETY: a new shared mapping of the memfd, unmapped below.

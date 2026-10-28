@@ -90,8 +90,10 @@ use serde::{Deserialize, Serialize};
 /// a storage's KV cache `segment`, the listing's `ledgers`) and a world kept
 /// as its weights (`KeepWeights`); 10 lets one key have a copy at each
 /// location memory lies at, which `get`, `retain`, `rekey` and a transfer's
-/// tensor regions select by their `at`, and a span copy rows at a pitch.
-pub const VERSION: u32 = 10;
+/// tensor regions select by their `at`, and a span copy rows at a pitch; 11
+/// moves a world's weights to host memory and back (`Offload`, `Restore`,
+/// and the Transfer Server's `Allocate`).
+pub const VERSION: u32 = 11;
 
 /// The earliest client version the server serves: a client of version 4
 /// knows no worlds, and its requests act on world 0; a client of version 4
@@ -833,6 +835,25 @@ pub enum Request {
     /// the segments its successor maps stay the successor's. Answered with
     /// `Retained`.
     KeepWeights { worlds: Vec<u64> },
+    /// From a head: world `world` of its deployment keeps its weights in
+    /// host memory (`update_config.previous_world = "host"`, its processes
+    /// exited). Every device copy of read-only tensors that this world
+    /// alone retains moves to host memory: the server creates host memory of
+    /// each storage's size, admitted under the host rule as one (refused,
+    /// moving nothing, when the host cannot hold it all), has its Transfer
+    /// Server copy each storage there, and then the tensors' copies lie in
+    /// host memory and the device storages are released: each GPU's ledger
+    /// leaves their memory to the other world. Answered with `Moved` once
+    /// every copy ended; refused while no Transfer Server runs.
+    Offload { world: u64 },
+    /// From a head: world `world`'s weights that `Offload` moved to host
+    /// memory return to the GPUs they came from, before its processes start
+    /// again: its Transfer Server creates device memory of each storage's
+    /// size on its GPU, admitted against the GPU's ledger (refused, moving
+    /// nothing, past the quota), and copies each storage there; then the
+    /// tensors' copies lie on those GPUs again and the host copies are
+    /// released. Answered with `Moved` once every copy ended.
+    Restore { world: u64 },
     /// The copies of `keys` that exist at the locations `at` lists (at
     /// every location when `at` is empty), with their storages'
     /// descriptors, and the keys with no such copy.
@@ -1057,6 +1078,14 @@ pub enum Request {
         ranges: Vec<Registered>,
         failure: Option<String>,
     },
+    /// From the Transfer Server: the device memory of the server's
+    /// [`Event::Allocate`] `request`, `bytes` long, whose POSIX descriptor
+    /// travels with the request; or `failure` says why there is none.
+    Allocated {
+        request: u64,
+        bytes: u64,
+        failure: Option<String>,
+    },
 }
 
 /// Why a request failed.
@@ -1162,6 +1191,11 @@ pub enum Reply {
     /// The server took a report of its Transfer Server's
     /// ([`Request::Measured`], [`Request::Copied`], [`Request::Registered`]).
     Noted,
+    /// What an `Offload` or a `Restore` moved: its storages and their bytes.
+    Moved {
+        storages: u64,
+        bytes: u64,
+    },
     /// The regions of a [`Request::Expose`], registered with the NIXL agent
     /// of this host's Transfer Server for the exposure `exposure`: the
     /// agent's `metadata`, which a READ's agent loads to reach them, and
@@ -1353,6 +1387,16 @@ pub enum Event {
     /// To the Transfer Server: the exposure its registrations of `request`
     /// served ended; they go once no other exposure holds them.
     Deregister { request: u64 },
+    /// To the Transfer Server: create device memory of at least `bytes` on
+    /// GPU `gpu`, retainable through a POSIX descriptor and addressed by
+    /// every GPU that can, send its descriptor with
+    /// [`Request::Allocated`], and keep no handle of it: the server holds
+    /// the memory from then on, which a world's restored weights take.
+    Allocate {
+        request: u64,
+        gpu: [u8; 16],
+        bytes: u64,
+    },
     /// To a head: the prefetch `tag` ended. `results[i]` is whether the pool
     /// holds the page of the prefetch's key `i`.
     Prefetched { tag: u64, results: Vec<bool> },

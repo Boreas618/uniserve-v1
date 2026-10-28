@@ -23,6 +23,10 @@
 //!    closes cancel tasks ([`Event::Cancel`]); each still ends with its
 //!    report, since bytes may be in flight until then.
 //!
+//! The server submits tasks of its own too: a world's weights moving
+//! between its GPUs and host memory ([`crate::moves`]) copy whole storages,
+//! and each task's end goes to its move rather than to a client.
+//!
 //! A span's source on another host ([`Region::Remote`]) is forwarded as
 //! that host's region ([`Allocation::Remote`]), which this server cannot
 //! check: the Transfer Server has that host's server expose it and READs
@@ -59,8 +63,8 @@ use crate::{Attachment, ClientId, Outcome, Server, StorageId, invalid};
 
 /// A task the Transfer Server runs, as the server keeps it.
 pub(super) struct Task {
-    /// The submitter, which the task's events go to.
-    client: ClientId,
+    /// Who learns of the task's progress and end.
+    owner: Owner,
     deployment: String,
     update: u64,
     priority: Priority,
@@ -68,6 +72,15 @@ pub(super) struct Task {
     bytes: u64,
     copied: u64,
     cancelled: bool,
+}
+
+/// Who submitted a task, and learns of its progress and end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// A head or a worker, which receives its events.
+    Client(ClientId),
+    /// Item `index` of the server's own weight move `number`.
+    Move { number: u64, index: usize },
 }
 
 /// The Transfer Server process, its connection and its tasks.
@@ -537,7 +550,7 @@ impl Server {
         self.transfers.tasks.insert(
             task,
             Task {
-                client,
+                owner: Owner::Client(client),
                 deployment: deployment.to_owned(),
                 update,
                 priority,
@@ -563,6 +576,77 @@ impl Server {
             Vec::new(),
         ));
         Ok(task)
+    }
+
+    /// Have the Transfer Server copy the whole of storage `source` into
+    /// storage `target`, `bytes` of each, for item `index` of the weight
+    /// move `number` of `deployment` ([`crate::moves`]), which learns of its
+    /// end ([`Server::moved`]). Weight moves wait for no promotion.
+    pub(super) fn copy_storage(
+        &mut self,
+        deployment: &str,
+        (source, target): (StorageId, StorageId),
+        bytes: u64,
+        (number, index): (u64, usize),
+    ) -> Result<(), (ErrorKind, String)> {
+        let Some(transfer_server) = self.transfers.client else {
+            return Err(unavailable());
+        };
+        let (Some(from), Some(to)) = (self.storages.get(&source), self.storages.get(&target))
+        else {
+            return Err(invalid("a moved storage was released"));
+        };
+        let resolved = |storage: StorageId, record: &storage::protocol::StorageRecord| Resolved {
+            allocation: Allocation::Storage { storage },
+            memory: crate::moves::memory_of(record),
+            base: 0,
+            bytes: record.bytes,
+            attachment: Some(Attachment::Storage(storage)),
+            writable: false,
+        };
+        let from = resolved(source, &from.record);
+        let to = Resolved {
+            writable: true,
+            ..resolved(target, &to.record)
+        };
+        // One row of the whole storage; its pitches are unused.
+        let moves = vec![Move {
+            source: from.allocation.clone(),
+            source_offset: 0,
+            destination: to.allocation.clone(),
+            destination_offset: 0,
+            bytes,
+            rows: 1,
+            source_pitch: bytes,
+            destination_pitch: bytes,
+        }];
+        self.give(transfer_server, from.allocation.clone(), &from);
+        self.give(transfer_server, to.allocation.clone(), &to);
+
+        let task = self.transfers.next_task;
+        self.transfers.next_task += 1;
+        self.transfers.tasks.insert(
+            task,
+            Task {
+                owner: Owner::Move { number, index },
+                deployment: deployment.to_owned(),
+                update: 0,
+                priority: Priority::Background,
+                bytes,
+                copied: 0,
+                cancelled: false,
+            },
+        );
+        self.events.push((
+            transfer_server,
+            Event::Transfer {
+                task,
+                priority: Priority::Background,
+                moves,
+            },
+            Vec::new(),
+        ));
+        Ok(())
     }
 
     /// Give the Transfer Server `allocation` with its descriptor, unless it
@@ -745,15 +829,22 @@ impl Server {
             return;
         };
         entry.copied = bytes;
-        let client = entry.client;
-        let event = match end {
-            Some(end) => {
-                self.transfers.tasks.remove(&task);
-                Event::Transferred { task, bytes, end }
+        let owner = entry.owner;
+        if end.is_some() {
+            self.transfers.tasks.remove(&task);
+        }
+        match (owner, end) {
+            (Owner::Client(client), Some(end)) => {
+                self.events
+                    .push((client, Event::Transferred { task, bytes, end }, Vec::new()));
             }
-            None => Event::TransferProgress { task, bytes },
-        };
-        self.events.push((client, event, Vec::new()));
+            (Owner::Client(client), None) => {
+                self.events
+                    .push((client, Event::TransferProgress { task, bytes }, Vec::new()));
+            }
+            (Owner::Move { number, index }, Some(end)) => self.moved(number, index, &end),
+            (Owner::Move { .. }, None) => {}
+        }
     }
 
     /// A client's connection closed: the tasks it submitted are cancelled,
@@ -775,7 +866,7 @@ impl Server {
             self.transfers.live.remove(&number);
             self.deregister(number);
         }
-        let cancelled = self.cancel_where(|_, task| task.client == id);
+        let cancelled = self.cancel_where(|_, task| task.owner == Owner::Client(id));
         if cancelled > 0 {
             tracing::info!(
                 tasks = cancelled,
@@ -792,19 +883,25 @@ impl Server {
         self.transfers.given.clear();
         self.transfers.links.clear();
         self.transfers.contexts.clear();
+        let failed = TransferEnd::Failed {
+            message: "the Transfer Server ended".into(),
+        };
         for (task, entry) in std::mem::take(&mut self.transfers.tasks) {
-            self.events.push((
-                entry.client,
-                Event::Transferred {
-                    task,
-                    bytes: entry.copied,
-                    end: TransferEnd::Failed {
-                        message: "the Transfer Server ended".into(),
+            match entry.owner {
+                Owner::Client(client) => self.events.push((
+                    client,
+                    Event::Transferred {
+                        task,
+                        bytes: entry.copied,
+                        end: failed.clone(),
                     },
-                },
-                Vec::new(),
-            ));
+                    Vec::new(),
+                )),
+                Owner::Move { number, index } => self.moved(number, index, &failed),
+            }
         }
+        // The device memory it was creating for a move is never reported.
+        self.moves_lost_allocations();
         // Its agent ended with it: the exposures it held end, the regions it
         // was registering are refused, and the next one registers them when
         // a peer asks again.
@@ -929,7 +1026,7 @@ fn error_reply((kind, message): (ErrorKind, String)) -> Reply {
     Reply::Error { kind, message }
 }
 
-fn unavailable() -> (ErrorKind, String) {
+pub(super) fn unavailable() -> (ErrorKind, String) {
     (
         ErrorKind::Unavailable,
         "no Transfer Server is connected".into(),

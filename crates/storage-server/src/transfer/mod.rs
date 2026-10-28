@@ -48,6 +48,13 @@
 //! events and the lanes' reports meanwhile, and places the bookings the
 //! other threads wait for.
 //!
+//! It also creates device memory the server holds from then on: a world's
+//! weights returning from host memory need memory on their GPUs, and the
+//! server creates no CUDA context ([`Event::Allocate`]). It creates the
+//! allocation on a helper, retainable through a POSIX descriptor, sends the
+//! descriptor ([`Request::Allocated`]) and drops its own handle: the
+//! descriptor keeps the memory, and the server gives it back for the copy.
+//!
 //! It reports each task's progress and end ([`Request::Copied`]) only
 //! after the host saw the copies complete (an event its lane queried, or a
 //! READ it polled), so no CUDA event crosses a process. It ends when the
@@ -61,7 +68,7 @@ mod network;
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -194,8 +201,8 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
             server.handle(event, descriptors);
         }
         while let Ok(done) = server.finished.try_recv() {
-            if let Some(report) = server.finish(done) {
-                server.send(&mut client, &report)?;
+            if let Some((report, descriptor)) = server.finish(done) {
+                server.send_with(&mut client, &report, descriptor.as_ref())?;
             }
         }
         while let Ok(booking) = server.bookings.try_recv() {
@@ -261,6 +268,13 @@ enum Done {
         request: u64,
         holds: Vec<Hold>,
         registered: Result<(Vec<u8>, Vec<Registered>), String>,
+    },
+    /// The device memory of the server's allocation `request`: its POSIX
+    /// descriptor and its size, rounded up to the GPU's granularity; or
+    /// why it could not be created.
+    Allocated {
+        request: u64,
+        allocated: Result<(OwnedFd, u64), String>,
     },
 }
 
@@ -330,7 +344,18 @@ struct Served {
 
 impl Served {
     fn send(&mut self, client: &mut Client, request: &Request) -> Result<(), Error> {
-        self.replies.push(client.submit(request, &[])?);
+        self.send_with(client, request, None)
+    }
+
+    /// Send `request` with `descriptor` travelling beside it.
+    fn send_with(
+        &mut self,
+        client: &mut Client,
+        request: &Request,
+        descriptor: Option<&OwnedFd>,
+    ) -> Result<(), Error> {
+        let descriptors: Vec<_> = descriptor.iter().map(|fd| fd.as_fd()).collect();
+        self.replies.push(client.submit(request, &descriptors)?);
         Ok(())
     }
 
@@ -427,6 +452,11 @@ impl Served {
                 request,
                 allocations,
             } => self.register(request, &allocations),
+            Event::Allocate {
+                request,
+                gpu,
+                bytes,
+            } => self.allocate(request, gpu, bytes),
             Event::Deregister { request } => {
                 if let Some(holds) = self.exposures.remove(&request) {
                     // The last hold of a GPU releases its context, which
@@ -558,9 +588,36 @@ impl Served {
         });
     }
 
+    /// Create `bytes` of device memory on GPU `gpu` for the server's
+    /// allocation `request`, on a helper: creating tens of gigabytes takes
+    /// a while, and the lanes' reports go on meanwhile.
+    fn allocate(&mut self, request: u64, gpu: [u8; 16], bytes: u64) {
+        let held = self
+            .gpus
+            .by_uuid(gpu)
+            .map(|found| (found.device, found.readers.clone()))
+            .ok_or_else(|| {
+                format!(
+                    "GPU {} is not visible to the Transfer Server",
+                    cuda::DeviceUuid(gpu)
+                )
+            })
+            .and_then(|(device, readers)| Ok((self.contexts.hold(device)?, device, readers)));
+        self.helpers.spawn(move || {
+            // The allocation is made in the GPU's session, whose context the
+            // ledgers book while it is held; the session closes once the
+            // last hold ends, after the allocation's handle was released.
+            let allocated = held.and_then(|(hold, device, readers)| {
+                hold.session()?;
+                device_memory(device, bytes, &readers)
+            });
+            Some(Done::Allocated { request, allocated })
+        });
+    }
+
     /// Take what a helper finished; returns the report it makes to the
-    /// server.
-    fn finish(&mut self, done: Done) -> Option<Request> {
+    /// server, with the descriptor that travels beside it.
+    fn finish(&mut self, done: Done) -> Option<(Request, Option<OwnedFd>)> {
         match done {
             Done::Sources {
                 task,
@@ -586,34 +643,58 @@ impl Served {
                 }
                 None
             }
+            Done::Allocated { request, allocated } => Some(match allocated {
+                Ok((descriptor, bytes)) => (
+                    Request::Allocated {
+                        request,
+                        bytes,
+                        failure: None,
+                    },
+                    Some(descriptor),
+                ),
+                Err(message) => {
+                    tracing::warn!(message, "creating device memory for the server failed");
+                    (
+                        Request::Allocated {
+                            request,
+                            bytes: 0,
+                            failure: Some(message),
+                        },
+                        None,
+                    )
+                }
+            }),
             Done::Registered {
                 request,
                 holds,
                 registered,
-            } => Some(match registered {
-                Ok((metadata, ranges)) => {
-                    self.exposures.insert(request, holds);
-                    Request::Registered {
-                        request,
-                        metadata,
-                        ranges,
-                        failure: None,
+            } => Some((
+                match registered {
+                    Ok((metadata, ranges)) => {
+                        self.exposures.insert(request, holds);
+                        Request::Registered {
+                            request,
+                            metadata,
+                            ranges,
+                            failure: None,
+                        }
                     }
-                }
-                Err(message) => {
-                    tracing::warn!(message, "registering memory for another host failed");
-                    self.helpers.spawn(move || {
-                        drop(holds);
-                        None
-                    });
-                    Request::Registered {
-                        request,
-                        metadata: Vec::new(),
-                        ranges: Vec::new(),
-                        failure: Some(message),
+                    Err(message) => {
+                        tracing::warn!(message, "registering memory for another host failed");
+                        self.helpers.spawn(move || {
+                            drop(holds);
+                            None
+                        });
+                        Request::Registered {
+                            request,
+                            metadata: Vec::new(),
+                            ranges: Vec::new(),
+                            failure: Some(message),
+                        }
                     }
-                }
-            }),
+                },
+                None,
+            )),
         }
     }
 
@@ -808,6 +889,25 @@ pub(crate) fn memory_name(memory: &Memory) -> String {
             None => format!("{endpoint} host"),
         },
     }
+}
+
+/// `bytes` of device memory on `device`, which every GPU of `readers` can
+/// address, retainable through a POSIX descriptor: the descriptor and the
+/// size, rounded up to the device's granularity. The allocation's handle
+/// and mapping here are dropped; the descriptor alone keeps the memory.
+fn device_memory(
+    device: cuda::DeviceId,
+    bytes: u64,
+    readers: &[cuda::DeviceId],
+) -> Result<(OwnedFd, u64), String> {
+    let length = usize::try_from(bytes).map_err(|_| format!("{bytes} bytes overflow"))?;
+    let allocation = cuda::DeviceAllocation::retainable(device, length, readers)
+        .map_err(|error| format!("creating {bytes} bytes of device memory: {error}"))?;
+    let descriptor = allocation
+        .export_descriptor()
+        .map_err(|error| format!("exporting device memory: {error}"))?
+        .ok_or_else(|| "a retainable allocation exported no descriptor".to_owned())?;
+    Ok((descriptor, allocation.len() as u64))
 }
 
 /// Empty the wake pipe.
