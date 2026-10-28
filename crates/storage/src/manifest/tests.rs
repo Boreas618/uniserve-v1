@@ -2,7 +2,7 @@
 //! after the mappings, conversions, copies and fills equal what the
 //! target holds when it loads its regions directly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::protocol::{Link, Memory, Placement};
 
@@ -499,13 +499,21 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
             });
     assert_eq!(mapped.len(), 4);
     // Every span stays inside one chunk on each side, named at its GPU, and
-    // the spans move the copies' bytes.
+    // the spans write exactly the target bytes the copies write, a strided
+    // copy as spans of rows rather than a span per row.
     let spans: Vec<crate::protocol::Span> =
         manifest.spans(&request).collect::<Result<_>>().unwrap();
     assert_eq!(
-        spans.iter().map(|span| span.bytes).sum::<u64>(),
+        spans.iter().map(crate::protocol::Span::copied).sum::<u64>(),
         manifest.copied_bytes()
     );
+    let rows: u64 = manifest.copies.iter().map(|copy| copy.rows).sum();
+    assert!(
+        (spans.len() as u64) < rows,
+        "{} spans for {rows} rows",
+        spans.len()
+    );
+    // A chunk's GPU, key and offset in its storage, by its key at a GPU.
     let chunk = |region: &crate::protocol::Region, world: &World, gpus: &[Gpu]| {
         let crate::protocol::Region::Tensor {
             key,
@@ -518,10 +526,18 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
             .ranks
             .iter()
             .zip(gpus)
-            .filter(|(_, held)| *held == gpu)
-            .flat_map(|(rank, _)| rank.storages.iter().flat_map(|storage| &storage.chunks))
-            .find(|chunk| chunk.key == *key)
-            .map(|chunk| chunk.length)
+            .enumerate()
+            .filter(|(_, (_, held))| *held == gpu)
+            .flat_map(|(rank, (held, _))| {
+                held.storages
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(storage, value)| {
+                        value.chunks.iter().map(move |chunk| (rank, storage, chunk))
+                    })
+            })
+            .find(|(_, _, chunk)| chunk.key == *key)
+            .map(|(rank, storage, chunk)| (rank, storage, chunk.offset, chunk.length))
             .expect("a span names a chunk its rank holds")
     };
     let source_gpus: Vec<Gpu> = request
@@ -530,15 +546,37 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
         .iter()
         .map(|rank| rank.gpu.unwrap())
         .collect();
+    let mut written = BTreeSet::new();
     for span in &spans {
-        assert!(
-            span.source_offset + span.bytes <= chunk(&span.source, &request.source, &source_gpus)
-        );
-        assert!(
-            span.destination_offset + span.bytes
-                <= chunk(&span.destination, &request.target, &manifest.gpus)
-        );
+        let extent = |pitch: u64| (span.rows - 1) * pitch + span.bytes;
+        let (_, _, _, source_length) = chunk(&span.source, &request.source, &source_gpus);
+        assert!(span.source_offset + extent(span.source_pitch) <= source_length);
+        let (rank, storage, start, length) =
+            chunk(&span.destination, &request.target, &manifest.gpus);
+        assert!(span.destination_offset + extent(span.destination_pitch) <= length);
+        for row in 0..span.rows {
+            let first = start + span.destination_offset + row * span.destination_pitch;
+            for byte in first..first + span.bytes {
+                assert!(
+                    written.insert((rank, storage, byte)),
+                    "a byte is written twice"
+                );
+            }
+        }
     }
+    let mut expected = BTreeSet::new();
+    for copy in &manifest.copies {
+        let Space::Storage { storage } = copy.target.space else {
+            continue;
+        };
+        for row in 0..copy.rows {
+            let first = copy.target.offset + row * copy.target_pitch;
+            for byte in first..first + copy.length {
+                expected.insert((copy.target.rank as usize, storage as usize, byte));
+            }
+        }
+    }
+    assert_eq!(written, expected);
 }
 
 #[test]

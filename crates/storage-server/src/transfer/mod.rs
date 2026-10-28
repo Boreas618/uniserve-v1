@@ -651,6 +651,9 @@ impl Served {
             destination: self.end(&destination, runner, imports, holds)?,
             destination_offset: copy.destination_offset,
             bytes: copy.bytes,
+            rows: copy.rows,
+            source_pitch: copy.source_pitch,
+            destination_pitch: copy.destination_pitch,
         };
         Ok((LaneKey { link, runner }, piece))
     }

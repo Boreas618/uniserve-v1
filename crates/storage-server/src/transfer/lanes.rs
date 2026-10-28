@@ -51,7 +51,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cuda::{DeviceId, Event, EventFlags, Stream, memcpy_async};
+use cuda::{DeviceId, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream, memcpy_async};
 use storage::protocol::{Link, LinkBandwidth, Memory, Priority, Throttle, TransferEnd};
 
 use super::contexts::{Contexts, Hold};
@@ -177,7 +177,21 @@ pub(super) struct Piece {
     pub(super) source_offset: u64,
     pub(super) destination: End,
     pub(super) destination_offset: u64,
+    /// The bytes of each row.
     pub(super) bytes: u64,
+    /// Rows at the pitches, row `r` from `source_offset + r *
+    /// source_pitch` to `destination_offset + r * destination_pitch`; one
+    /// row is a plain copy.
+    pub(super) rows: u64,
+    pub(super) source_pitch: u64,
+    pub(super) destination_pitch: u64,
+}
+
+impl Piece {
+    /// The bytes the piece copies.
+    fn copied(&self) -> u64 {
+        self.bytes * self.rows
+    }
 }
 
 /// A task as the lanes run it.
@@ -190,6 +204,10 @@ struct TaskState {
     /// How the task ends, once a cancellation or a failure decided it.
     end: Option<TransferEnd>,
     reported: Instant,
+    /// When the task's pieces were queued, and how many there were: the
+    /// task's time on the lanes, which its end reports.
+    queued: Instant,
+    queued_pieces: usize,
 }
 
 /// A link's byte budget: a share of its bandwidth, and the token bucket
@@ -294,13 +312,24 @@ impl State {
         let queue = self.queues.get_mut(lane)?;
         let level = queue.levels.iter_mut().find(|level| !level.is_empty())?;
         let front = level.front_mut()?;
-        let bytes = front.bytes.min(chunk);
         let mut taken = front.clone();
-        taken.bytes = bytes;
-        front.bytes -= bytes;
-        front.source_offset += bytes;
-        front.destination_offset += bytes;
-        let whole = front.bytes == 0;
+        let whole = if front.rows > 1 {
+            // Rows at a pitch are taken whole, as many as fit the chunk,
+            // and at least one.
+            let rows = (chunk / front.bytes).clamp(1, front.rows);
+            taken.rows = rows;
+            front.rows -= rows;
+            front.source_offset += rows * front.source_pitch;
+            front.destination_offset += rows * front.destination_pitch;
+            front.rows == 0
+        } else {
+            let bytes = front.bytes.min(chunk);
+            taken.bytes = bytes;
+            front.bytes -= bytes;
+            front.source_offset += bytes;
+            front.destination_offset += bytes;
+            front.bytes == 0
+        };
         if whole {
             level.pop_front();
         }
@@ -343,6 +372,13 @@ impl State {
         if state.pieces == 0 && state.running == 0 {
             let end = state.end.take().unwrap_or(TransferEnd::Complete);
             let copied = state.copied;
+            tracing::info!(
+                task,
+                pieces = state.queued_pieces,
+                bytes = copied,
+                lanes_ms = now.duration_since(state.queued).as_millis() as u64,
+                "a transfer task left the lanes"
+            );
             self.tasks.remove(&task);
             self.reports.push((task, copied, Some(end)));
             return true;
@@ -439,7 +475,7 @@ impl Shared {
     fn complete(&self, piece: &Piece, failure: Option<String>) {
         let (reported, purged) =
             self.lock()
-                .complete(piece.task, piece.bytes, failure, Instant::now());
+                .complete(piece.task, piece.copied(), failure, Instant::now());
         drop(purged);
         if reported {
             self.wake_main();
@@ -532,6 +568,8 @@ impl Lanes {
                 copied: 0,
                 end: None,
                 reported: Instant::now(),
+                queued: Instant::now(),
+                queued_pieces: pieces.len(),
             },
         );
         for (lane, piece) in pieces {
@@ -677,7 +715,7 @@ fn device_lane(
         if let Some(bandwidth) = bandwidth {
             shared.pace(
                 &lane.link,
-                piece.bytes,
+                piece.copied(),
                 bandwidth,
                 (DEPTH as u64 * bytes) as f64,
             );
@@ -700,12 +738,30 @@ fn device_lane(
         // The submitter keeps the source unchanged and the destination
         // unread until the task ends.
         let submitted = unsafe {
-            memcpy_async(
-                destination + piece.destination_offset,
-                source + piece.source_offset,
-                piece.bytes as usize,
-                &stream,
-            )
+            if piece.rows > 1 {
+                // Rows at a pitch run as one pitched copy.
+                let mut batch = PitchedBatch::new(SourceOrder::Stream);
+                batch
+                    .push(Pitched {
+                        destination: destination + piece.destination_offset,
+                        destination_pitch: piece.destination_pitch as usize,
+                        destination_layer: 0,
+                        source: source + piece.source_offset,
+                        source_pitch: piece.source_pitch as usize,
+                        source_layer: 0,
+                        width: piece.bytes as usize,
+                        height: piece.rows as usize,
+                        depth: 1,
+                    })
+                    .and_then(|()| batch.submit(&stream))
+            } else {
+                memcpy_async(
+                    destination + piece.destination_offset,
+                    source + piece.source_offset,
+                    piece.bytes as usize,
+                    &stream,
+                )
+            }
         };
         if let Err(error) = submitted {
             fatal("submitting a copy", &error);
@@ -718,7 +774,7 @@ fn device_lane(
             // A link nobody measured: its first chunk alone times it.
             wait(&event);
             let seconds = started.elapsed().as_secs_f64().max(1e-6);
-            let learned = piece.bytes as f64 / seconds;
+            let learned = piece.copied() as f64 / seconds;
             bandwidth = Some(learned);
             shared.learned(&lane.link, learned);
             shared.complete(&piece, None);
@@ -745,7 +801,7 @@ fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Dur
         if let Some(bandwidth) = bandwidth {
             shared.pace(
                 &lane.link,
-                piece.bytes,
+                piece.copied(),
                 bandwidth,
                 (DEPTH as u64 * bytes) as f64,
             );
@@ -756,15 +812,19 @@ fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Dur
             .and_then(|destination| Ok((destination, piece.source.address(Runner::Host)?)));
         match addresses {
             Ok((destination, source)) => {
-                // SAFETY: both ranges lie within mappings the piece holds
-                // (the server checked every span against its allocation).
-                // `copy` allows the two to overlap within one allocation.
-                unsafe {
-                    std::ptr::copy(
-                        (source + piece.source_offset) as *const u8,
-                        (destination + piece.destination_offset) as *mut u8,
-                        piece.bytes as usize,
-                    );
+                for row in 0..piece.rows {
+                    // SAFETY: every row lies within mappings the piece holds
+                    // (the server checked each span's rows against its
+                    // allocation). `copy` allows the two to overlap within
+                    // one allocation.
+                    unsafe {
+                        std::ptr::copy(
+                            (source + piece.source_offset + row * piece.source_pitch) as *const u8,
+                            (destination + piece.destination_offset + row * piece.destination_pitch)
+                                as *mut u8,
+                            piece.bytes as usize,
+                        );
+                    }
                 }
                 shared.complete(&piece, None);
             }
@@ -812,7 +872,7 @@ fn network_lane(
         if let Some(bandwidth) = bandwidth {
             shared.pace(
                 &lane.link,
-                piece.bytes,
+                piece.copied(),
                 bandwidth,
                 (DEPTH as u64 * bytes) as f64,
             );

@@ -260,6 +260,11 @@ impl Network {
                     },
                     destination_offset: copy.destination_offset,
                     bytes: copy.bytes,
+                    // The server refuses rows at a pitch from another host:
+                    // a READ copies one contiguous run.
+                    rows: 1,
+                    source_pitch: 0,
+                    destination_pitch: 0,
                 },
             ));
         }

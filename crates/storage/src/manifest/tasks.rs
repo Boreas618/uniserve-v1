@@ -5,9 +5,10 @@
 //! holds: every chunk of a storage is retained under its key on its GPU,
 //! and each staging space of a manifest is retained under
 //! [`Manifest::staging_key`] on its rank's GPU, so a span names the copy of
-//! a key at a GPU ([`Region::Tensor`]). A copy whose bytes cross chunks on
-//! either side splits at every chunk bound, and a strided copy yields one
-//! span per row. The submitter keeps the sources unchanged and the
+//! a key at a GPU ([`Region::Tensor`]). A strided copy is one span of rows
+//! at its pitches for each run of rows that lies in one chunk on each side;
+//! a row that crosses a chunk bound on either side splits there into spans
+//! of one row. The submitter keeps the sources unchanged and the
 //! destinations unread until the transfer ends.
 
 use super::{Copy, Endpoint, Error, Gpu, Manifest, Request, Result, Side, Space, World};
@@ -115,6 +116,9 @@ pub struct Spans<'m> {
 }
 
 impl Spans<'_> {
+    /// The next span of `copy`, from row `self.row` and byte `self.done` of
+    /// it: as many whole rows as lie in one chunk on each side, or the part
+    /// of a row up to the nearer chunk bound.
     fn span(&self, copy: &Copy) -> Result<Span> {
         let source_offset = copy.source.offset + self.row * copy.source_pitch + self.done;
         let target_offset = copy.target.offset + self.row * copy.target_pitch + self.done;
@@ -124,6 +128,27 @@ impl Spans<'_> {
         let (destination, destination_at, destination_left) =
             self.manifest
                 .locate(self.request, Side::Target, &copy.target, target_offset)?;
+        if self.done == 0 && copy.length <= source_left && copy.length <= destination_left {
+            // Whole rows: row `r` from here lies in both chunks while
+            // `r * pitch + length` fits what each holds from here.
+            let left = copy.rows - self.row;
+            let fitting = |held: u64, pitch: u64| match pitch {
+                0 => left,
+                pitch => ((held - copy.length) / pitch + 1).min(left),
+            };
+            let rows = fitting(source_left, copy.source_pitch)
+                .min(fitting(destination_left, copy.target_pitch));
+            return Ok(Span {
+                source,
+                source_offset: source_at,
+                destination,
+                destination_offset: destination_at,
+                bytes: copy.length,
+                rows,
+                source_pitch: if rows > 1 { copy.source_pitch } else { 0 },
+                destination_pitch: if rows > 1 { copy.target_pitch } else { 0 },
+            });
+        }
         let bytes = (copy.length - self.done)
             .min(source_left)
             .min(destination_left);
@@ -136,6 +161,9 @@ impl Spans<'_> {
             destination,
             destination_offset: destination_at,
             bytes,
+            rows: 1,
+            source_pitch: 0,
+            destination_pitch: 0,
         })
     }
 }
@@ -147,19 +175,27 @@ impl Iterator for Spans<'_> {
         let copy = *self.manifest.copies.get(self.copy)?;
         let span = self.span(&copy);
         match &span {
+            // Whole rows advance the row; a part of a row advances within
+            // it.
+            Ok(span) if self.done == 0 && span.bytes == copy.length => {
+                self.row += span.rows;
+            }
             Ok(span) => {
                 self.done += span.bytes;
                 if self.done == copy.length {
                     self.done = 0;
                     self.row += 1;
-                    if self.row == copy.rows {
-                        self.row = 0;
-                        self.copy += 1;
-                    }
                 }
             }
             // A failed span ends the iteration after reporting it.
-            Err(_) => self.copy = self.manifest.copies.len(),
+            Err(_) => {
+                self.copy = self.manifest.copies.len();
+                return Some(span);
+            }
+        }
+        if self.row == copy.rows {
+            self.row = 0;
+            self.copy += 1;
         }
         Some(span)
     }

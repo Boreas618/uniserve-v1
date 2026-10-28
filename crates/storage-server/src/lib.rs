@@ -68,6 +68,10 @@ use storage::transport::Connection;
 /// NVML.
 const NVML_POLL: Duration = Duration::from_millis(20);
 
+/// How long one request may hold the single-threaded server before it is
+/// logged: every other client's request waits meanwhile.
+const SLOW_REQUEST: Duration = Duration::from_millis(100);
+
 type ClientId = u64;
 type StorageId = u64;
 /// One copy of a tensor: its key and where its storage lies.
@@ -568,11 +572,24 @@ impl Server {
             let Some((request_id, request, descriptors)) = client.queue.pop_front() else {
                 return;
             };
+            let started = std::time::Instant::now();
             let outcome = self.handle(id, &request, descriptors);
+            let handled = started.elapsed();
             match outcome {
                 Ok(Outcome::Reply(reply, storages)) => {
                     self.answer(id, request_id, reply, &storages);
                     self.send_events();
+                    // The server is single-threaded: a request that holds
+                    // it this long delays every other client's.
+                    let served = started.elapsed();
+                    if served >= SLOW_REQUEST {
+                        tracing::info!(
+                            request = request_name(&request),
+                            handled_ms = handled.as_millis() as u64,
+                            served_ms = served.as_millis() as u64,
+                            "a request held the server"
+                        );
+                    }
                 }
                 Ok(Outcome::KvStorage(mut task)) => {
                     if let Task::Lookup { request, .. } = &mut task {

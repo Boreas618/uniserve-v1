@@ -162,6 +162,25 @@ pub(crate) fn span(
         destination,
         destination_offset: offset,
         bytes,
+        rows: 1,
+        source_pitch: 0,
+        destination_pitch: 0,
+    }
+}
+
+/// `rows` rows of `bytes` bytes at the pitches, from `source_offset` of
+/// `source` to `offset` of `destination`.
+pub(crate) fn rows_span(
+    (source, source_offset, source_pitch): (Region, u64, u64),
+    (destination, offset, destination_pitch): (Region, u64, u64),
+    bytes: u64,
+    rows: u64,
+) -> Span {
+    Span {
+        rows,
+        source_pitch,
+        destination_pitch,
+        ..span(source, source_offset, destination, offset, bytes)
     }
 }
 
@@ -282,6 +301,54 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
 }
 
 #[test]
+fn a_span_of_rows_copies_each_row_at_its_pitches() {
+    let server = serving(Gpus::Hidden);
+    let mut head = head(&server.socket);
+    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+    let source_bytes = pattern(64, 3);
+    let source = memfd(&source_bytes);
+    let destination = memfd(&[0; 64]);
+    worker
+        .put(
+            vec![
+                tensor(key(1), "weights", 0, 0, Access::ReadOnly),
+                tensor(key(2), "weights receiving", 1, 0, Access::Exclusive),
+            ],
+            &[(host(64), source.as_fd()), (host(64), destination.as_fd())],
+        )
+        .unwrap();
+
+    // Four rows of four bytes, 16 bytes apart in the source from byte 2,
+    // 8 bytes apart in the destination from byte 0: a column of a matrix
+    // of 16-byte rows gathered into a matrix of 8-byte rows.
+    let task = worker
+        .transfer(
+            vec![rows_span(
+                (tensor_region(1), 2, 16),
+                (tensor_region(2), 0, 8),
+                4,
+                4,
+            )],
+            Priority::Background,
+            1,
+        )
+        .unwrap();
+    assert_eq!(end_of(&mut worker, task), (16, TransferEnd::Complete));
+    let copied = read(&destination, 0, 64);
+    for row in 0..4 {
+        let target = row * 8;
+        let source = 2 + row * 16;
+        assert_eq!(
+            &copied[target..target + 4],
+            &source_bytes[source..source + 4]
+        );
+        assert_eq!(&copied[target + 4..target + 8], &[0; 4]);
+    }
+    assert_eq!(&copied[32..], &[0; 32]);
+}
+
+#[test]
 fn a_transfer_is_refused_whole_unless_every_span_fits_memory_of_its_deployment() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
@@ -314,6 +381,20 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_memory_of_its_deployment()
         vec![span(tensor_region(1), 0, tensor_region(2), 30, 8)],
         // An unknown tensor.
         vec![span(tensor_region(9), 0, tensor_region(2), 0, 8)],
+        // Rows overlap when a pitch is shorter than a row.
+        vec![rows_span(
+            (tensor_region(1), 0, 4),
+            (tensor_region(2), 0, 8),
+            8,
+            2,
+        )],
+        // The last of four rows 8 bytes apart reaches past byte 32.
+        vec![rows_span(
+            (tensor_region(1), 0, 8),
+            (tensor_region(2), 4, 8),
+            8,
+            4,
+        )],
         // A good span does not carry a bad one.
         vec![
             span(tensor_region(1), 0, tensor_region(2), 0, 8),

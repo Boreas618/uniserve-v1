@@ -450,14 +450,30 @@ impl Server {
         let mut needed: BTreeMap<Allocation, Resolved> = BTreeMap::new();
         let mut bytes = 0_u64;
         for span in spans {
-            if span.bytes == 0 {
+            if span.bytes == 0 || span.rows == 0 {
                 return Err(invalid("a span copies at least one byte"));
             }
+            // Rows at a pitch: each pitch holds a row, and every row lies
+            // in the span's regions, which its extent from the first row's
+            // start to the last row's end checks.
+            if span.rows > 1
+                && (span.source_pitch < span.bytes || span.destination_pitch < span.bytes)
+            {
+                return Err(invalid(
+                    "a span's rows overlap: a pitch is shorter than a row",
+                ));
+            }
+            let extent = |pitch: u64| {
+                (span.rows - 1)
+                    .checked_mul(pitch)
+                    .and_then(|start| start.checked_add(span.bytes))
+                    .ok_or_else(|| invalid("a span's rows overflow"))
+            };
             let destination = self.resolve(deployment, &span.destination, true)?;
             let destination_offset = within(
                 &destination,
                 span.destination_offset,
-                span.bytes,
+                extent(span.destination_pitch)?,
                 "destination",
             )?;
             let crossing =
@@ -470,6 +486,11 @@ impl Server {
                     if matches!(destination.allocation, Allocation::Fabric { .. }) {
                         return Err(crossing);
                     }
+                    if span.rows > 1 {
+                        return Err(invalid(
+                            "a span of several rows reads no storage of another host",
+                        ));
+                    }
                     (remote(deployment, endpoint, region)?, span.source_offset)
                 }
                 region => {
@@ -479,14 +500,21 @@ impl Server {
                     {
                         return Err(crossing);
                     }
-                    let offset = within(&source, span.source_offset, span.bytes, "source")?;
+                    let offset = within(
+                        &source,
+                        span.source_offset,
+                        extent(span.source_pitch)?,
+                        "source",
+                    )?;
                     let allocation = source.allocation.clone();
                     need(&mut needed, source);
                     (allocation, offset)
                 }
             };
-            bytes = bytes
-                .checked_add(span.bytes)
+            bytes = span
+                .bytes
+                .checked_mul(span.rows)
+                .and_then(|copied| bytes.checked_add(copied))
                 .ok_or_else(|| invalid("the spans' bytes overflow"))?;
             moves.push(Move {
                 source,
@@ -494,6 +522,9 @@ impl Server {
                 destination: destination.allocation.clone(),
                 destination_offset,
                 bytes: span.bytes,
+                rows: span.rows,
+                source_pitch: span.source_pitch,
+                destination_pitch: span.destination_pitch,
             });
             need(&mut needed, destination);
         }
@@ -514,6 +545,13 @@ impl Server {
                 copied: 0,
                 cancelled: false,
             },
+        );
+        tracing::info!(
+            task,
+            spans = moves.len(),
+            bytes,
+            ?priority,
+            "forwarding a transfer task"
         );
         self.events.push((
             transfer_server,
