@@ -71,6 +71,8 @@ A device KV cache is split along its units into eight segments, each of every la
 
 The serving scheduler reserves the copy plan's additional storage on each GPU, releasing available KV tail segments as needed while requests continue. The Transfer Server copies retained expert regions into that storage. At a common computation boundary, workers remap the completed allocations at their captured weight addresses and update logical-to-physical routing tensors. The world, CUDA Graph addresses, request state and numerical weights remain the same. Once the operation finishes, the cache can grow into the released storage. The response lists each replica's world, requested order and allocation plan.
 
+Distributed weight data parallelism (DWDP) prepares the resident shards, peer mappings and prefetch buffers of the requested distribution in the background; admission includes these allocations. Commit replaces the backing of the existing composite weight addresses and the prefetch copy plans together. A component that streams dense projections from host storage keeps those host allocations while its resident experts are redistributed.
+
 The committed distribution is included in worker recovery launches and daemon handoff. A failure during preparation releases incoming copies and leaves the active distribution intact. A failure during publication triggers the existing engine recovery path with the committed distribution; a world on trial follows its normal rollback policy. A redistribution that changes rank shapes requires a configuration change through `PUT /admin/config`.
 
 ## LoRA adapters

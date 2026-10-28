@@ -855,7 +855,7 @@ impl Service<'_> {
                     .as_mut()
                     .ok_or(Error::State("the worker has no loaded weights"))?;
                 let retained = retained
-                    .as_deref()
+                    .as_ref()
                     .ok_or(Error::State("expert redistribution uses retained storage"))?;
                 match name {
                     "uniserve.prepare_experts" => weights.prepare_experts(

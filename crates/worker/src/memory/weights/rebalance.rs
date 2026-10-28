@@ -7,8 +7,8 @@ use std::sync::Arc;
 use storage::manifest::weights::{Sources, Transfer};
 use storage::{Key, Mode, Placement};
 
-use super::{Planned, Receipt, WeightKeys, WeightManifest, read_text};
-use crate::ffi::{Backing, Interpreter, integers};
+use super::{MANIFEST_VERSION, Planned, Published, Receipt, WeightKeys, WeightManifest, read_text};
+use crate::ffi::{Backing, Handle, Interpreter, MemoryKind, integers};
 use crate::memory::allocation::Storage;
 use crate::memory::retained::Retained;
 use crate::parallel::host::HostGroup;
@@ -26,6 +26,8 @@ pub(crate) struct Rebalance {
     descriptors: Option<Vec<Vec<(usize, OwnedFd)>>>,
     previous: BTreeSet<Key>,
     incoming: BTreeSet<Key>,
+    bound: Handle,
+    publication: Published,
 }
 
 impl WeightKeys {
@@ -99,18 +101,52 @@ impl WeightKeys {
                     .collect()
             })
             .collect();
-        let incoming: BTreeSet<Key> = chunks
+        let mut incoming: BTreeSet<Key> = chunks
             .iter()
             .flatten()
             .map(|(_, key)| *key)
             .chain([self.manifest])
             .collect();
+        let text = read_text(retained, previous.manifest)?
+            .ok_or(Error::State("the active weight manifest is retained"))?;
+        let previous_manifest: WeightManifest = serde_json::from_str(&text)
+            .map_err(|error| Error::Interface(format!("weight manifest: {error}")))?;
         let previous = previous.retained_keys(retained)?;
+        let mut publication = Published {
+            keys: self.clone(),
+            layout: planned.layout.clone(),
+            manifest: WeightManifest {
+                version: MANIFEST_VERSION,
+                fingerprints: self.fingerprint_digests(),
+                tensors: planned.tensors.clone(),
+                storages: planned.storages.clone(),
+            },
+            storages: targets.clone(),
+            created: Vec::new(),
+            shared: chunks.iter().flatten().map(|(_, key)| *key).collect(),
+        };
+        let host = previous_manifest
+            .storages
+            .into_iter()
+            .filter(|storage| storage.device.is_none());
+        let host_owners = live
+            .iter()
+            .filter(|owner| matches!(owner.device(), MemoryKind::PinnedHost | MemoryKind::Host));
+        for (storage, owner) in host.zip(host_owners) {
+            incoming.extend(storage.storage.chunks.iter().map(|chunk| chunk.key));
+            publication
+                .shared
+                .extend(storage.storage.chunks.iter().map(|chunk| chunk.key));
+            publication.manifest.storages.push(storage);
+            publication.storages.push(Arc::clone(owner));
+        }
         // Each rank plans its own receiver; the source manifests describe the
         // whole world. The engine synchronizes publication across all ranks.
+        let mut description = planned.into_transfer();
+        description.tensors.retain(|tensor| !tensor.host);
         let found = self.receive(
             retained,
-            planned.into_transfer(),
+            description,
             sources,
             &HostGroup::single(0),
             Some(transfer),
@@ -125,6 +161,7 @@ impl WeightKeys {
                 "expert source manifests must cover every requested weight",
             ));
         }
+        let bound = found.bind(&BTreeSet::new())?;
         let (backing, receipt) = found.into_storages();
         Ok(Rebalance {
             keys: self.clone(),
@@ -135,6 +172,8 @@ impl WeightKeys {
             descriptors: None,
             previous,
             incoming,
+            bound,
+            publication,
         })
     }
 }
@@ -183,6 +222,10 @@ impl Planned {
     ) -> Result<BTreeMap<Key, Arc<cuda::PhysicalAllocation>>> {
         let mut allocations = BTreeMap::new();
         for (storage, layout) in self.targets(live)?.iter().zip(&self.storages) {
+            if storage.allocation().is_some() {
+                // DWDP owns creating handles in its resident peer storage.
+                continue;
+            }
             for (index, chunk) in layout.storage.chunks.iter().enumerate() {
                 if let Some(allocation) = storage.physical_allocation(index)? {
                     allocations.insert(chunk.key, allocation);
@@ -194,6 +237,17 @@ impl Planned {
 }
 
 impl Rebalance {
+    /// Finish background copies on a preparation thread, without blocking the
+    /// serving worker's control hook. The returned tensor views borrow backing
+    /// retained by this operation until the distributed owner finishes staging.
+    pub(crate) fn wait(&mut self, retained: &Retained) -> Result<&Handle> {
+        if let Some(receipt) = self.receipt.as_mut() {
+            receipt.retain(retained, true)?;
+        }
+        self.receipt = None;
+        self.ready(retained)?;
+        Ok(&self.bound)
+    }
     /// Retain completed copies and acquire their original descriptors.
     /// Imported CUDA handles cannot be re-exported as allocation descriptors.
     pub(crate) fn ready(&mut self, retained: &Retained) -> Result<bool> {
@@ -203,7 +257,7 @@ impl Rebalance {
             return Ok(false);
         }
         if let Some(receipt) = self.receipt.as_mut() {
-            receipt.retain(retained, false)?;
+            receipt.retain(retained, true)?;
         }
         self.receipt = None;
         if self.descriptors.is_none() {
@@ -255,14 +309,19 @@ impl Rebalance {
     /// the first remap invalidates the worker; it must recover from its launch
     /// distribution before any numerical call resumes.
     pub(crate) fn commit(
-        self,
+        mut self,
         retained: &Retained,
         allocations: &mut BTreeMap<Key, Arc<cuda::PhysicalAllocation>>,
-    ) -> Result<WeightKeys> {
+        resident: Option<(Handle, Vec<Arc<Storage>>)>,
+    ) -> Result<(WeightKeys, Vec<Arc<Storage>>)> {
         let descriptors = self
             .descriptors
             .ok_or(Error::State("expert copies must complete before commit"))?;
-        for (storage, chunks) in self.backing.iter().zip(&self.chunks) {
+        for ((storage, chunks), target) in self.backing.iter().zip(&self.chunks).zip(&self.targets)
+        {
+            if target.allocation().is_some() {
+                continue;
+            }
             for (index, (_, key)) in chunks.iter().enumerate() {
                 if let Some(allocation) = storage.physical_allocation(index)? {
                     allocations.insert(*key, allocation);
@@ -270,6 +329,10 @@ impl Rebalance {
             }
         }
         for (target, allocations) in self.targets.iter().zip(&descriptors) {
+            if target.allocation().is_some() {
+                // The distributed owner remaps its complete composite views.
+                continue;
+            }
             let borrowed = allocations
                 .iter()
                 .map(|(bytes, fd)| (*bytes, fd))
@@ -280,6 +343,19 @@ impl Rebalance {
                 ))
             })?;
         }
+        if let Some((layout, owners)) = resident {
+            let staged = self.publication.replace_resident(layout, &owners)?;
+            retained.forget(&staged)?;
+        }
+        self.incoming = self
+            .publication
+            .manifest
+            .storages
+            .iter()
+            .flat_map(|storage| storage.storage.chunks.iter().map(|chunk| chunk.key))
+            .chain([self.keys.manifest])
+            .collect();
+        let storages = self.publication.put(retained)?;
         let retired = self
             .previous
             .difference(&self.incoming)
@@ -287,7 +363,7 @@ impl Rebalance {
             .collect::<Vec<_>>();
         retained.forget(&retired)?;
         allocations.retain(|key, _| self.incoming.contains(key));
-        Ok(self.keys)
+        Ok((self.keys, storages))
     }
 
     /// Release only this preparation's allocations, preserving live aliases.

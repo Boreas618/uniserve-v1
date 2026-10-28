@@ -147,6 +147,12 @@ impl DeviceAllocation {
         range.map(0, rounded, handle)?;
         range.grant(&devices, Protection::ReadWrite)?;
 
+        if retainable {
+            // Storage Server records account these physical pages. NVML also
+            // attributes them to their creator while this owner stays alive.
+            crate::vmm::count_created(device, rounded, true);
+        }
+
         Ok(Self {
             device,
             address: range.address(),
@@ -234,6 +240,20 @@ impl DeviceAllocation {
                 let _guard = context.enter()?;
                 range.grant(access, protection)
             }
+        }
+    }
+}
+
+impl Drop for DeviceAllocation {
+    fn drop(&mut self) {
+        if matches!(
+            self.kind,
+            Kind::Exportable {
+                retainable: true,
+                ..
+            }
+        ) {
+            crate::vmm::count_created(self.device, self.bytes, false);
         }
     }
 }

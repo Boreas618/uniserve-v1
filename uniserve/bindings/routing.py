@@ -85,8 +85,16 @@ class ExpertRouting:
             resolved[path] = ids
         return resolved
 
-    def describe(self, loaded, orders: str) -> Layout:
+    def describe(
+        self,
+        loaded,
+        orders: str,
+        host_paths: Sequence[str] = (),
+        resident: Layout | None = None,
+    ) -> Layout:
         """Describe requested weights without changing live routing."""
+        from uniserve.loading import host_weights
+
         resolved = self.resolve(json.loads(orders))
         logical = {}
         for path, ids in resolved.items():
@@ -97,8 +105,14 @@ class ExpertRouting:
                 logical[id(layer.get_parameter(name))] = part
         return Layout.describe(
             loaded.root,
+            host=frozenset(
+                id(parameter)
+                for path in host_paths
+                for parameter in host_weights.streamed(loaded, str(path))
+            ),
             origins=loaded.origins,
             logical=logical,
+            resident=resident,
         )
 
     def select(self, orders: str) -> str:

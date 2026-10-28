@@ -431,117 +431,6 @@ fn plan(copies: Vec<(usize, usize, usize, usize)>) -> CopyBatch {
 /// The library module of expert exchanges and distributed expert weights.
 const MODULE: &str = "uniserve.distributed.experts";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
-    use cuda::{PinnedBuffer, memset_d8};
-    use std::net::TcpListener;
-
-    #[test]
-    #[ignore = "requires two CUDA devices"]
-    fn distributed_weights_replacement_preserves_borrowed_fields() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap().to_string();
-        let ranks = [
-            Rendezvous::serve(&address, listener),
-            Rendezvous::connect(&address),
-        ];
-        let threads: Vec<_> = ranks
-            .into_iter()
-            .enumerate()
-            .map(|(rank, rendezvous)| {
-                std::thread::spawn(move || -> Result<()> {
-                    let device = DeviceId(rank as i32);
-                    let group = HostGroup::connect(rendezvous, rank, 2, STARTUP_TIMEOUT)?;
-                    let page = DeviceAllocation::granularity(device)?;
-                    // A shard boundary inside a page exercises persistent neighbor
-                    // bytes as well as the reusable remote prefetch slots.
-                    let bytes = page + 256;
-                    let stream = Stream::new(device)?;
-                    let make =
-                        |owner: usize| -> Result<(Vec<DeviceAllocation>, Vec<Vec<ShardField>>)> {
-                            let allocations = (0..4)
-                                .map(|layer| {
-                                let allocation = DeviceAllocation::linear(device, bytes)?;
-                                    // SAFETY: the new allocation owns the filled range.
-                                    unsafe {
-                                        memset_d8(
-                                            allocation.address(),
-                                            (11 + owner * 4 + layer) as u8,
-                                            bytes,
-                                            &stream,
-                                        )
-                                    }?;
-                                    Ok(allocation)
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            stream.synchronize()?;
-                            let fields = allocations
-                                .iter()
-                                .map(|allocation| {
-                                    vec![ShardField {
-                                        name: "up_gate.weight".into(),
-                                        address: allocation.address(),
-                                        bytes,
-                                    }]
-                                })
-                                .collect();
-                            Ok((allocations, fields))
-                        };
-                    let (original, fields) = make(rank)?;
-                    let (weights, views) =
-                        ExpertWeights::build(&group, device, "local", &fields, &stream)?;
-                    drop(original);
-                    let host = PinnedBuffer::new(device, bytes * 2)?;
-                    let verify =
-                        |swapped: bool| -> Result<()> {
-                            for (layer, fields) in views.iter().enumerate() {
-                                weights.submit(layer, &stream)?;
-                                // SAFETY: the owner retains every borrowed field and
-                                // the readback is drained before host inspection.
-                                unsafe {
-                                    memcpy_async(
-                                        host.address(),
-                                        fields[0].address(),
-                                        bytes * 2,
-                                        &stream,
-                                    )
-                                }?;
-                                stream.synchronize()?;
-                                // SAFETY: the preceding stream synchronization completed
-                                // every write to this pinned buffer.
-                                let observed = unsafe { host.as_slice() };
-                                for peer in 0..2 {
-                                    let logical = if swapped { peer ^ 1 } else { peer };
-                                    assert!(observed[peer * bytes..(peer + 1) * bytes].iter()
-                                .all(|value| *value == (11 + logical * 4 + layer) as u8));
-                                }
-                            }
-                            Ok(())
-                        };
-                    verify(false)?;
-                    let (incoming, fields) = make(rank ^ 1)?;
-                    let (successor, _) =
-                        ExpertWeights::build(&group, device, "local", &fields, &stream)?;
-                    drop(incoming);
-                    group.barrier()?;
-                    weights.replace(successor)?;
-                    group.barrier()?;
-                    verify(true)?;
-                    // No rank retires peer-readable allocations while another
-                    // rank's final readback is still in flight.
-                    group.barrier()?;
-                    Ok(())
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().unwrap().unwrap();
-        }
-    }
-}
-
 // Distributed expert weights of a rank (DWDP): setup is collective over the
 // expert union, after loading and before capacity planning. `weight_fields`
 // places each layer's weights for its kernels and lists this rank's shards;
@@ -597,15 +486,27 @@ impl DwdpUpdate {
     /// Build a successor from completed borrowed shard views. Collective over
     /// every expert rank; run concurrently on all ranks on background threads.
     /// The caller retains the input allocations until this method returns.
-    pub(crate) fn prepare(&self, fields: &[Vec<ShardField>]) -> Result<ExpertWeights> {
+    pub(crate) fn prepare(&self, retained: &Handle) -> Result<ExpertWeights> {
+        let listed: tvm_ffi::Array<Any> =
+            Interpreter::import("uniserve.loading.expert_weights.ResidentExperts.fields")?
+                .call_values(&[self.layout.to_any(), retained.to_any()])?
+                .try_into()
+                .map_err(|error| Error::numerical("distributed expert fields", &error))?;
+        let fields = shard_fields(&listed)?;
         let (weights, _) = ExpertWeights::build(
             &self.group,
             self.weights.device,
             &self.host,
-            fields,
+            &fields,
             &self.stream,
         )?;
         Ok(weights)
+    }
+
+    /// Break a failed generation's collective I/O before retiring the worker.
+    /// Collective failure requires group recovery; this channel is not reused.
+    pub(crate) fn cancel(&self) {
+        self.group.close();
     }
 
     /// Publish a staged generation locally at a common drained step boundary.
@@ -615,6 +516,26 @@ impl DwdpUpdate {
         self.weights.replace(successor)?;
         bind_resident(&self.layout, &self.names, self.weights.resident()?)
     }
+}
+
+fn shard_fields(listed: &tvm_ffi::Array<Any>) -> Result<Vec<Vec<ShardField>>> {
+    let mismatch = |error: tvm_ffi::Error| Error::numerical("distributed expert fields", &error);
+    let part = |index: usize| listed.get(index).map_err(mismatch);
+    let counts = crate::ffi::integers(part(0)?).map_err(mismatch)?;
+    let names = tvm_ffi::Array::<tvm_ffi::String>::try_from(part(1)?).map_err(mismatch)?;
+    let shards = tvm_ffi::Array::<tvm_ffi::Tensor>::try_from(part(2)?).map_err(mismatch)?;
+    let mut fields = names.iter().zip(shards.iter()).map(|(name, shard)| {
+        let bits = usize::from(shard.dtype().bits) * usize::from(shard.dtype().lanes);
+        ShardField {
+            name: name.as_str().to_owned(),
+            address: shard.data_ptr() as u64,
+            bytes: shard.numel() * bits / 8,
+        }
+    });
+    Ok(counts
+        .iter()
+        .map(|&count| fields.by_ref().take(count as usize).collect())
+        .collect())
 }
 
 fn bind_resident(
@@ -680,28 +601,11 @@ impl DwdpManager {
         // The number of fields of each layer, then every field's name and
         // shard, the layers back to back.
         let function = format!("{MODULE}.weight_fields");
-        let mismatch = |error: tvm_ffi::Error| Error::numerical(&function, &error);
         let listed: tvm_ffi::Array<Any> =
             Interpreter::import(&function)?.call_as(&[model.handle().view()])?;
-        let part = |index: usize| listed.get(index).map_err(mismatch);
-        let counts = crate::ffi::integers(part(0)?).map_err(mismatch)?;
-        let names = tvm_ffi::Array::<tvm_ffi::String>::try_from(part(1)?).map_err(mismatch)?;
-        // Shard tensors stay referenced by `shards` through the setup copies.
-        let shards = tvm_ffi::Array::<tvm_ffi::Tensor>::try_from(part(2)?).map_err(mismatch)?;
-        let mut fields = names.iter().zip(shards.iter()).map(|(name, shard)| {
-            let bits = usize::from(shard.dtype().bits) * usize::from(shard.dtype().lanes);
-            ShardField {
-                name: name.as_str().to_owned(),
-                address: shard.data_ptr() as u64,
-                bytes: shard.numel() * bits / 8,
-            }
-        });
-        let layers: Vec<Vec<ShardField>> = counts
-            .iter()
-            .map(|&count| fields.by_ref().take(count as usize).collect())
-            .collect();
+        let layers = shard_fields(&listed)?;
         let (weights, views) = ExpertWeights::build(union_group, device, host, &layers, &stream)?;
-        drop(shards);
+        drop(listed);
         let resident = Handle::new(
             Interpreter::import("uniserve.loading.expert_weights.ResidentExperts")?
                 .call_values(&[model.handle().to_any()])?,
@@ -1014,5 +918,116 @@ impl HostWeights {
             slots.len()
         );
         Ok(Self { stack })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
+    use cuda::{PinnedBuffer, memset_d8};
+    use std::net::TcpListener;
+
+    #[test]
+    #[ignore = "requires two CUDA devices"]
+    fn distributed_weights_replacement_preserves_borrowed_fields() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let ranks = [
+            Rendezvous::serve(&address, listener),
+            Rendezvous::connect(&address),
+        ];
+        let threads: Vec<_> = ranks
+            .into_iter()
+            .enumerate()
+            .map(|(rank, rendezvous)| {
+                std::thread::spawn(move || -> Result<()> {
+                    let device = DeviceId(rank as i32);
+                    let group = HostGroup::connect(rendezvous, rank, 2, STARTUP_TIMEOUT)?;
+                    let page = DeviceAllocation::granularity(device)?;
+                    // A shard boundary inside a page exercises persistent neighbor
+                    // bytes as well as the reusable remote prefetch slots.
+                    let bytes = page + 256;
+                    let stream = Stream::new(device)?;
+                    let make =
+                        |owner: usize| -> Result<(Vec<DeviceAllocation>, Vec<Vec<ShardField>>)> {
+                            let allocations = (0..4)
+                                .map(|layer| {
+                                    let allocation = DeviceAllocation::linear(device, bytes)?;
+                                    // SAFETY: the new allocation owns the filled range.
+                                    unsafe {
+                                        memset_d8(
+                                            allocation.address(),
+                                            (11 + owner * 4 + layer) as u8,
+                                            bytes,
+                                            &stream,
+                                        )
+                                    }?;
+                                    Ok(allocation)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            stream.synchronize()?;
+                            let fields = allocations
+                                .iter()
+                                .map(|allocation| {
+                                    vec![ShardField {
+                                        name: "up_gate.weight".into(),
+                                        address: allocation.address(),
+                                        bytes,
+                                    }]
+                                })
+                                .collect();
+                            Ok((allocations, fields))
+                        };
+                    let (original, fields) = make(rank)?;
+                    let (weights, views) =
+                        ExpertWeights::build(&group, device, "local", &fields, &stream)?;
+                    drop(original);
+                    let host = PinnedBuffer::new(device, bytes * 2)?;
+                    let verify =
+                        |swapped: bool| -> Result<()> {
+                            for (layer, fields) in views.iter().enumerate() {
+                                weights.submit(layer, &stream)?;
+                                // SAFETY: the owner retains every borrowed field and
+                                // the readback is drained before host inspection.
+                                unsafe {
+                                    memcpy_async(
+                                        host.address(),
+                                        fields[0].address(),
+                                        bytes * 2,
+                                        &stream,
+                                    )
+                                }?;
+                                stream.synchronize()?;
+                                // SAFETY: the preceding stream synchronization completed
+                                // every write to this pinned buffer.
+                                let observed = unsafe { host.as_slice() };
+                                for peer in 0..2 {
+                                    let logical = if swapped { peer ^ 1 } else { peer };
+                                    assert!(observed[peer * bytes..(peer + 1) * bytes].iter()
+                                .all(|value| *value == (11 + logical * 4 + layer) as u8));
+                                }
+                            }
+                            Ok(())
+                        };
+                    verify(false)?;
+                    let (incoming, fields) = make(rank ^ 1)?;
+                    let (successor, _) =
+                        ExpertWeights::build(&group, device, "local", &fields, &stream)?;
+                    drop(incoming);
+                    group.barrier()?;
+                    weights.replace(successor)?;
+                    group.barrier()?;
+                    verify(true)?;
+                    // No rank retires peer-readable allocations while another
+                    // rank's final readback is still in flight.
+                    group.barrier()?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
     }
 }

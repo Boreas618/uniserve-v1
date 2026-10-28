@@ -685,7 +685,7 @@ pub fn created_bytes(device: DeviceId) -> u64 {
 
 /// Counts `bytes` more (or, with `held` false, fewer) created bytes on
 /// `device`.
-fn count_created(device: DeviceId, bytes: usize, held: bool) {
+pub(crate) fn count_created(device: DeviceId, bytes: usize, held: bool) {
     let mut created = lock(&CREATED);
     let entry = created.entry(device.0).or_default();
     *entry = if held {

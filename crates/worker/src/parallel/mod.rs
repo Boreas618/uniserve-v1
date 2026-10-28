@@ -9,5 +9,5 @@ mod weight_prefetch;
 pub(crate) mod world;
 
 pub(crate) use weight_prefetch::{
-    DwdpManager, DwdpUpdate, ExpertWeights, HostRetention, HostWeights, ShardField,
+    DwdpManager, DwdpUpdate, ExpertWeights, HostRetention, HostWeights,
 };

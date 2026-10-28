@@ -71,13 +71,31 @@ def _layers(base_url: str) -> dict[str, int]:
     return layers
 
 
-@pytest.mark.parametrize("topology", ["single", "experts"])
+@pytest.mark.parametrize("topology", ["single", "experts", "dwdp", "host"])
 def test_expert_rebalancing_preserves_a_stream_and_its_world(
     tmp_path: Path, topology: str
 ):
     """Both redistribution directions preserve the request and world."""
     name = "qwen3-expert-rebalance"
-    devices, options = _topology(topology, tmp_path)
+    if topology == "dwdp":
+        devices, options = _topology("experts", tmp_path)
+        options = (*options, "--set", "moe_config.exchange=dwdp")
+    elif topology == "host":
+        devices, _ = _topology("single", tmp_path)
+        groups = tmp_path / "host-weights.toml"
+        groups.write_text(
+            '[[worker_groups]]\nid = "model"\nranks = ["cuda:0"]\n'
+            "queue_depth = 8\n[worker_groups.components.model]\n"
+            'weights = "host"\n'
+        )
+        options = (
+            "--worker-groups",
+            str(groups),
+            "--set",
+            "cuda_graph_config.policy=off",
+        )
+    else:
+        devices, options = _topology(topology, tmp_path)
     environment = _plugin(tmp_path / "plugins", "experts", EXPERT_PLUGIN)
     options = (*options, "--set", "kv_cache_config.host_gib=8")
     with _serve(tmp_path, name, devices, options, env=environment) as (

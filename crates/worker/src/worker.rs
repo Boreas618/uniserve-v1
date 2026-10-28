@@ -149,6 +149,8 @@ pub(crate) struct Worker {
     weight_keys: Option<WeightKeys>,
     /// Graph-addressable expert routing tables borrowed by the numerical layers.
     expert_routing: Handle,
+    distributed_weights: Option<Arc<crate::parallel::DwdpUpdate>>,
+    host_paths: Vec<String>,
     /// The identity of what the loaded model's forwards compute
     /// ([`weights::model_identity`]), which keys its cache pages.
     identity: String,
@@ -382,6 +384,7 @@ impl Worker {
         };
         let weights = DwdpManager::start(&launch, &world, &model, &streams, &host)
             .map_err(phase("experts"))?;
+        let distributed_weights = weights.as_ref().map(DwdpManager::update);
         // Host-resident layer weights release their device storage before
         // capacity planning measures free memory.
         // A stack's host region is published with a whole load and bound
@@ -408,6 +411,7 @@ impl Worker {
         // addresses; warmup retains them once they arrived
         // ([`Worker::warmup`]).
         let received = receipt.map(|receipt| (receipt, published.is_some()));
+        retained.forget(&retired).map_err(phase("load"))?;
         let weight_storages = match published {
             Some(published) => {
                 drop(bound);
@@ -415,7 +419,6 @@ impl Worker {
             }
             None => bound,
         };
-        retained.forget(&retired).map_err(phase("load"))?;
         // Plugins allocate the memory their kernels communicate through
         // before capacity planning measures free memory.
         let (plugin_buffers, unattributed) =
@@ -807,6 +810,8 @@ impl Worker {
             weights: weight_storages,
             weight_keys: keys,
             expert_routing,
+            distributed_weights,
+            host_paths,
             identity,
             launch,
             bookings: Vec::new(),
@@ -974,12 +979,14 @@ impl Worker {
             weights: Some(update::WeightUpdate {
                 launch: self.launch.clone(),
                 model: self.model.handle().clone(),
-                storages: self.weights.clone(),
-                keys: self.weight_keys.clone(),
+                storages: std::mem::take(&mut self.weights),
+                keys: self.weight_keys.take(),
                 identity: self.identity.clone(),
                 routing: self.expert_routing.clone(),
                 allocations: BTreeMap::new(),
                 rebalance: None,
+                distributed: self.distributed_weights.take(),
+                host_paths: self.host_paths.clone(),
             }),
             pools,
             asleep: false,
