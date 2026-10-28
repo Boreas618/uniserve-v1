@@ -726,7 +726,7 @@ impl Scheduler {
                 group,
                 keys,
                 pages,
-                crate::kv_cache::OffloadKind::Pages,
+                crate::kv_cache::OffloadKind::Evicted,
             );
         }
         if waiting > 0 {

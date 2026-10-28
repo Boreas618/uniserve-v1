@@ -53,7 +53,7 @@ use rustix::event::{PollFd, PollFlags, poll};
 use crate::mooncake::BATCH_PAGES;
 pub use child::Launch;
 use kv_storage::{KvStorage, Task};
-pub use pages::DEFAULT_POOL_BYTES;
+pub use pages::{DEFAULT_POOL_BYTES, STAGING_POOL_BYTES};
 pub use restart::{Pending as RestartPending, TAKEOVER_DESCRIPTOR, relaunch_arguments};
 pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
 use shoot::ShootDowns;
@@ -1102,6 +1102,21 @@ impl Server {
                     host.available, host.pools_unallocated, host.reserve
                 ),
             ));
+        }
+        Ok(())
+    }
+
+    /// Admit a staging pool of `bytes` the host's room cannot hold
+    /// ([`STAGING_POOL_BYTES`]): one a KV storage stands behind, no larger
+    /// than the bound, which the host's available memory less what the
+    /// pools have yet to allocate holds, from the server's reserve.
+    fn admit_staging(&self, bytes: u64) -> Result<(), ()> {
+        if !self.kv_storage.present() || bytes > STAGING_POOL_BYTES {
+            return Err(());
+        }
+        let host = self.host_memory().map_err(|_| ())?;
+        if bytes > host.available.saturating_sub(host.pools_unallocated) {
+            return Err(());
         }
         Ok(())
     }
@@ -2321,8 +2336,10 @@ impl Server {
                         .map_err(resource)?;
                     // A pool the host cannot hold first takes the place of
                     // the deployment's pools no world maps any more, whose
-                    // pages a previous world left.
-                    if self.admit_host(slots * shape.page_bytes).is_err() {
+                    // pages a previous world left; a staging pool a KV
+                    // storage stands behind is admitted from the reserve.
+                    let bytes = slots * shape.page_bytes;
+                    if self.admit_host(bytes).is_err() {
                         let unreferenced: Vec<u64> = self
                             .pages
                             .unreferenced(&scope.deployment)
@@ -2331,7 +2348,15 @@ impl Server {
                             .collect();
                         let released = self.pages.release_pools(&unreferenced);
                         self.pools_released(&released);
-                        self.admit_host(slots * shape.page_bytes)?;
+                        if let Err(refused) = self.admit_host(bytes) {
+                            self.admit_staging(bytes).map_err(|()| refused)?;
+                            tracing::info!(
+                                deployment = %scope.deployment,
+                                bytes,
+                                "admitted a staging page pool from the host's reserve: its \
+                                 pages pass through it into the KV storage"
+                            );
+                        }
                     }
                     self.pages
                         .create(&scope.deployment, *shape, *numa_node, slots)
@@ -2453,25 +2478,42 @@ impl Server {
                 host_bytes,
             } => {
                 let per_token: u64 = token_bytes.iter().sum();
+                // What the host admits of new pools, counting the
+                // deployment's pools no world maps, which a new one
+                // replaces.
+                let room = || -> Result<u64, (ErrorKind, String)> {
+                    let releasable: u64 = self
+                        .pages
+                        .unreferenced(deployment)
+                        .iter()
+                        .map(|(_, bytes)| bytes)
+                        .sum();
+                    Ok((available_memory().map_err(resource)? + releasable)
+                        .saturating_sub(self.pages.unallocated())
+                        .saturating_sub(self.host_reserve))
+                };
                 let budget = match host_bytes {
                     Some(bytes) => *bytes,
-                    None => {
-                        let releasable: u64 = self
-                            .pages
-                            .unreferenced(deployment)
-                            .iter()
-                            .map(|(_, bytes)| bytes)
-                            .sum();
-                        let available = (available_memory().map_err(resource)? + releasable)
-                            .saturating_sub(self.pages.unallocated())
-                            .saturating_sub(self.host_reserve);
-                        available / 5 * 4
-                    }
+                    None => room()? / 5 * 4,
                 };
-                let held = match budget.checked_div(per_token) {
+                let mut held = match budget.checked_div(per_token) {
                     Some(fits) => fits.min(*tokens),
                     None => *tokens,
                 };
+                // With a KV storage, a world the host holds fewer tokens
+                // for, or whose stated bytes it cannot admit, still stages
+                // its pages through pools of at most `STAGING_POOL_BYTES`
+                // on each rank, which pass them into the KV storage.
+                let staging = token_bytes
+                    .iter()
+                    .max()
+                    .and_then(|rank| STAGING_POOL_BYTES.checked_div(*rank))
+                    .unwrap_or(0);
+                if self.kv_storage.present()
+                    && (held < staging || held.saturating_mul(per_token) > room()?)
+                {
+                    held = staging.min(*tokens);
+                }
                 tracing::info!(
                     deployment,
                     world,

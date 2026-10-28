@@ -41,6 +41,22 @@
 //!   recycled until the copy commits. The next text batch the worker group
 //!   runs copies the pages (`Batch::page_offloads`), and the batch's output
 //!   commits them, or aborts them when the batch failed.
+//! - **Evictions.** A world change evicts idle cached pages from the device
+//!   once their copies commit (`specs/online-operations.md` §6.5, steps 1
+//!   and 5; [`OffloadKind::Evicted`]). A pool answers `Full` for a page it
+//!   has no slot for: every slot is reserved, pinned or uploading, as when
+//!   the host's memory held a pool smaller than the pages the device
+//!   evicts. Without a KV storage, such a page is evicted uncopied, and a
+//!   later prompt computes it again. With one, every page a pool commits
+//!   reaches the KV storage, and the pool frees slots as the connector's
+//!   uploads end, so the page waits for a slot instead and holds its units
+//!   until its copy commits: the evicted pages pass through the pool into
+//!   the KV storage, from which a later admission prefetches them. A page
+//!   gives up only when its pool grants the eviction no slot for
+//!   [`EVICTION_STALL`]. A host whose memory holds no pool of the world's
+//!   still gives a server with a KV storage small staging pools
+//!   (`storage_server::STAGING_POOL_BYTES` on each rank), through which
+//!   the pages pass the same way.
 //!
 //! A page's key chains the keys of its group's pages before it: `h_i =
 //! SHA-256(h_{i-1} || group || modality || tokens)` over full pages, each
@@ -186,6 +202,15 @@ impl HostCacheDemand {
         })
     }
 }
+
+/// How often the pages of an eviction that a pool had no slot for ask it
+/// again: a connector's upload of a batch of pages takes milliseconds.
+const EVICTION_RETRY: Duration = Duration::from_millis(10);
+
+/// How long the pages of an eviction wait for slots after their pool last
+/// granted the eviction one, before they are evicted uncopied: a pool whose
+/// uploads end frees slots well within it.
+const EVICTION_STALL: Duration = Duration::from_secs(30);
 
 /// How long admission waits for a prefetch of `tokens` tokens: one second,
 /// and a quarter second per 1024 tokens.
@@ -372,6 +397,10 @@ pub(crate) enum OffloadKind {
     /// anchor: the cache group and key of the last full-attention page
     /// before the window's boundary.
     Window { anchor: Option<(usize, Key)> },
+    /// Full-attention pages the device evicts once their copies commit:
+    /// with a KV storage behind the pools, a page a pool has no slot for
+    /// waits for one (the module's "Evictions").
+    Evicted,
 }
 
 /// The reservations of one offload of published pages.
@@ -381,7 +410,25 @@ struct Reservation {
     keys: Vec<Key>,
     pages: Vec<Arc<PageRef>>,
     window: bool,
+    /// Pages the device evicts once their copies commit
+    /// ([`OffloadKind::Evicted`]).
+    evicted: bool,
+    /// For pages of an eviction asking again: when their pool last granted
+    /// the eviction a slot.
+    progressed: Option<Instant>,
     answered: usize,
+}
+
+/// Pages of an eviction that one rank's pool had no slot for, waiting for
+/// one (the module's "Evictions"). Each holds its page's units.
+struct Deferred {
+    worker: WorkerGroupId,
+    group: usize,
+    rank: usize,
+    keys: Vec<Key>,
+    pages: Vec<Arc<PageRef>>,
+    /// When the pool last granted the eviction a slot.
+    progressed: Instant,
 }
 
 /// One page offload waiting for, or carried by, a batch.
@@ -428,17 +475,26 @@ pub(crate) struct KvOffloadManager {
     /// Offloads carried by submitted batches, by batch, with the worker
     /// group that runs it.
     carried: HashMap<u64, (WorkerGroupId, Vec<Offload>)>,
+    /// Whether a KV storage keeps every page the pools commit
+    /// (`kv_cache_config.mooncake`).
+    kv_storage: bool,
+    /// Pages of evictions waiting for slots, which ask their pools again
+    /// from `retry_at` on.
+    deferred: Vec<Deferred>,
+    retry_at: Instant,
 }
 
 impl KvOffloadManager {
     /// Connect to this host's Storage Server, at `socket`, as a head of
     /// `world` of `deployment`, offloading sliding windows every
-    /// `boundary_interval` pages of a long prompt.
+    /// `boundary_interval` pages of a long prompt. `kv_storage` states
+    /// whether a KV storage keeps every page the pools commit.
     pub(crate) fn connect(
         socket: &std::path::Path,
         deployment: &str,
         world: u64,
         boundary_interval: usize,
+        kv_storage: bool,
     ) -> anyhow::Result<Self> {
         let client = Client::connect(
             socket,
@@ -463,6 +519,9 @@ impl KvOffloadManager {
             next_reservation: 1,
             queued: HashMap::new(),
             carried: HashMap::new(),
+            kv_storage,
+            deferred: Vec::new(),
+            retry_at: Instant::now(),
         })
     }
 
@@ -1280,9 +1339,11 @@ impl KvOffloadManager {
         }
     }
 
-    /// Whether answers are awaited, which the scheduler polls for.
+    /// Whether answers are awaited, which the scheduler polls for, or pages
+    /// of an eviction wait to ask their pools again.
     pub(crate) fn waiting(&self) -> bool {
         !self.pending.is_empty()
+            || !self.deferred.is_empty()
             || self
                 .pins
                 .values()
@@ -1316,7 +1377,7 @@ impl KvOffloadManager {
         let mut submitted = 0;
         for (rank, pool) in cache.ranks.iter().enumerate() {
             let window = match kind {
-                OffloadKind::Pages => None,
+                OffloadKind::Pages | OffloadKind::Evicted => None,
                 OffloadKind::Window { anchor } => Some(PageWindow {
                     anchor: anchor.and_then(|(group, key)| {
                         let pool = pools.groups.get(group)?.ranks.get(rank)?.pool;
@@ -1346,6 +1407,8 @@ impl KvOffloadManager {
                     keys,
                     pages: pages.into_iter().map(Arc::new).collect(),
                     window: matches!(kind, OffloadKind::Window { .. }),
+                    evicted: matches!(kind, OffloadKind::Evicted),
+                    progressed: None,
                     answered: cache.ranks.len() - submitted,
                 },
             );
@@ -1353,10 +1416,11 @@ impl KvOffloadManager {
     }
 
     /// Whether published pages are still on their way to the host KV cache:
-    /// slots being reserved, offloads waiting for or carried by a batch, or
-    /// their commits unanswered.
+    /// slots being reserved or waited for, offloads waiting for or carried
+    /// by a batch, or their commits unanswered.
     pub(crate) fn offloading(&self) -> bool {
         !self.reservations.is_empty()
+            || !self.deferred.is_empty()
             || self.queued.values().any(|offloads| !offloads.is_empty())
             || !self.carried.is_empty()
             || self
@@ -1426,9 +1490,11 @@ impl KvOffloadManager {
     }
 
     /// `worker`'s ranks were replaced: the offloads waiting for its batches
-    /// and those its batches carried are aborted, and its admission pins
+    /// and those its batches carried are aborted, the pages of its
+    /// evictions waiting for slots released, and its admission pins
     /// released.
     pub(crate) fn worker_failed(&mut self, worker: &WorkerGroupId) {
+        self.deferred.retain(|deferred| deferred.worker != *worker);
         let mut lost = self.queued.remove(worker).unwrap_or_default();
         let batches: Vec<u64> = self
             .carried
@@ -1585,12 +1651,77 @@ impl KvOffloadManager {
                 (Purpose::Settle, _) => {}
             }
         }
+        self.retry_deferred();
         admissions
+    }
+
+    /// Has the pages of evictions waiting for slots ask their pools again,
+    /// every [`EVICTION_RETRY`]. Pages whose pool granted the eviction no
+    /// slot for [`EVICTION_STALL`] are released, evicted uncopied.
+    fn retry_deferred(&mut self) {
+        let now = Instant::now();
+        if self.deferred.is_empty() || now < self.retry_at {
+            return;
+        }
+        self.retry_at = now + EVICTION_RETRY;
+        for deferred in std::mem::take(&mut self.deferred) {
+            if now.duration_since(deferred.progressed) >= EVICTION_STALL {
+                tracing::warn!(
+                    pages = deferred.keys.len(),
+                    rank = deferred.rank,
+                    "a host KV cache pool granted an eviction no slot for {EVICTION_STALL:?}: \
+                     its pages are evicted uncopied"
+                );
+                continue;
+            }
+            let Some(group) = self
+                .workers
+                .get(&deferred.worker)
+                .and_then(|pools| pools.groups.get(deferred.group))
+            else {
+                continue;
+            };
+            let ranks = group.ranks.len();
+            let Some(pool) = group.ranks.get(deferred.rank).cloned() else {
+                continue;
+            };
+            let id = self.next_reservation;
+            self.next_reservation += 1;
+            let request = Request::Reserve {
+                pool: pool.pool,
+                writer: pool.scope.clone(),
+                keys: deferred.keys.clone(),
+                window: None,
+            };
+            let purpose = Purpose::Reserve {
+                offload: id,
+                rank: deferred.rank,
+            };
+            // Only this rank answers: the reservation is done with its
+            // answer.
+            if self.submit(pool.client, &request, purpose) {
+                self.reservations.insert(
+                    id,
+                    Reservation {
+                        worker: deferred.worker,
+                        group: deferred.group,
+                        keys: deferred.keys,
+                        pages: deferred.pages,
+                        window: false,
+                        evicted: true,
+                        progressed: Some(deferred.progressed),
+                        answered: ranks - 1,
+                    },
+                );
+            }
+        }
     }
 
     /// `rank` answered reservation `id` with `slots`: its reserved pages
     /// wait for a batch. A window whose pages the pool could not all store
-    /// is aborted on that rank: a window missing one page is useless.
+    /// is aborted on that rank: a window missing one page is useless. Pages
+    /// of an eviction the pool had no slot for wait for one when a KV
+    /// storage keeps what the pool evicts for them.
     fn reserved(&mut self, id: u64, rank: usize, slots: &[PageSlot]) {
         let Some(reservation) = self.reservations.get_mut(&id) else {
             return;
@@ -1615,26 +1746,58 @@ impl KvOffloadManager {
                     .collect();
                 aborted = Some((client, pool, keys));
             } else {
+                let defer = reservation.evicted && self.kv_storage;
+                let (mut waiting, mut granted) = ((Vec::new(), Vec::new()), false);
                 for ((key, page), slot) in
                     reservation.keys.iter().zip(&reservation.pages).zip(slots)
                 {
-                    if let PageSlot::Reserved { slot } = slot {
-                        self.queued
-                            .entry(reservation.worker.clone())
-                            .or_default()
-                            .push(Offload {
-                                client,
-                                copy: PageCopy {
-                                    rank: rank as u32,
-                                    pool,
-                                    group_id: reservation.group as u32,
-                                    slot: *slot,
-                                    units: page.units().to_vec(),
-                                },
-                                key: *key,
-                                _page: Arc::clone(page),
-                            });
+                    match slot {
+                        PageSlot::Reserved { slot } => {
+                            granted = true;
+                            self.queued
+                                .entry(reservation.worker.clone())
+                                .or_default()
+                                .push(Offload {
+                                    client,
+                                    copy: PageCopy {
+                                        rank: rank as u32,
+                                        pool,
+                                        group_id: reservation.group as u32,
+                                        slot: *slot,
+                                        units: page.units().to_vec(),
+                                    },
+                                    key: *key,
+                                    _page: Arc::clone(page),
+                                });
+                        }
+                        PageSlot::Full if defer => {
+                            waiting.0.push(*key);
+                            waiting.1.push(Arc::clone(page));
+                        }
+                        _ => {}
                     }
+                }
+                if !waiting.0.is_empty() {
+                    if reservation.progressed.is_none() {
+                        tracing::info!(
+                            pages = waiting.0.len(),
+                            rank,
+                            "pages of an eviction wait for slots of the host KV cache, which \
+                             its uploads to the KV storage free"
+                        );
+                    }
+                    let progressed = match reservation.progressed {
+                        Some(progressed) if !granted => progressed,
+                        _ => Instant::now(),
+                    };
+                    self.deferred.push(Deferred {
+                        worker: reservation.worker.clone(),
+                        group: reservation.group,
+                        rank,
+                        keys: waiting.0,
+                        pages: waiting.1,
+                        progressed,
+                    });
                 }
             }
         }
@@ -1657,6 +1820,7 @@ impl KvOffloadManager {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1681,6 +1845,12 @@ mod tests {
 
     impl Running {
         fn start() -> Self {
+            Self::reserving(0)
+        }
+
+        /// A server that leaves `host_reserve` bytes of the host's
+        /// available memory to other processes.
+        fn reserving(host_reserve: u64) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("storage.sock");
             let (listener, lock) = storage::socket::bind(&socket).unwrap().unwrap();
@@ -1695,7 +1865,7 @@ mod tests {
             let stopped = Arc::clone(&stop);
             let thread = std::thread::spawn(move || {
                 let _lock = lock;
-                let mut server = Server::new(listener, 64 * 16, 0, None, None).unwrap();
+                let mut server = Server::new(listener, 64 * 16, host_reserve, None, None).unwrap();
                 server
                     .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                     .unwrap();
@@ -1722,8 +1892,13 @@ mod tests {
     }
 
     /// A connector standing in for Mooncake, which holds every page and
-    /// reads each into its slot, until `stop` reads true.
-    fn connector(socket: &std::path::Path, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    /// reads each into its slot, until `stop` reads true. The keys of the
+    /// pages it is given go to `uploaded`.
+    fn connector(
+        socket: &std::path::Path,
+        stop: Arc<AtomicBool>,
+        uploaded: Arc<std::sync::Mutex<HashSet<Key>>>,
+    ) -> std::thread::JoinHandle<()> {
         let mut client = Client::connect(socket, Role::Connector).unwrap();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
@@ -1731,7 +1906,12 @@ mod tests {
                 while let Some((event, _)) = client.next_event() {
                     let (task, pages) = match event {
                         Event::Exists { task, keys, .. } => (task, keys.len()),
-                        Event::Download { task, pages, .. } | Event::Upload { task, pages, .. } => {
+                        Event::Download { task, pages, .. } => (task, pages.len()),
+                        Event::Upload { task, pages, .. } => {
+                            uploaded
+                                .lock()
+                                .unwrap()
+                                .extend(pages.iter().map(|(key, _)| *key));
                             (task, pages.len())
                         }
                         _ => continue,
@@ -1924,10 +2104,10 @@ mod tests {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[3]);
         let stop = Arc::new(AtomicBool::new(false));
-        let mooncake = connector(&server.socket, Arc::clone(&stop));
+        let mooncake = connector(&server.socket, Arc::clone(&stop), Arc::default());
 
         let mut kv_offload =
-            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL)
+            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL, false)
                 .unwrap();
         let cache = report(vec![cache_group(None)], &pools, &[3]);
         let text = WorkerGroupId("text".into());
@@ -1964,7 +2144,7 @@ mod tests {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[4, 5]);
         let mut kv_offload =
-            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL)
+            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL, false)
                 .unwrap();
         let cache = report(
             vec![cache_group(None), cache_group(Some(128))],
@@ -2044,7 +2224,7 @@ mod tests {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[4, 5]);
         let mut kv_offload =
-            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL)
+            KvOffloadManager::connect(&server.socket, "model", 0, DEFAULT_BOUNDARY_INTERVAL, false)
                 .unwrap();
         let cache = report(
             vec![cache_group(None), cache_group(Some(128))],
@@ -2083,7 +2263,8 @@ mod tests {
     fn sliding_windows_offload_before_aligned_boundaries() {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[6, 7]);
-        let mut kv_offload = KvOffloadManager::connect(&server.socket, "model", 0, 4).unwrap();
+        let mut kv_offload =
+            KvOffloadManager::connect(&server.socket, "model", 0, 4, false).unwrap();
         let cache = report(
             vec![cache_group(None), cache_group(Some(128))],
             &pools,
@@ -2109,5 +2290,101 @@ mod tests {
             kv_offload.offload_boundaries(&text, 640, 300, 600),
             [512, 576]
         );
+    }
+
+    /// Evicts 100 pages of one full-attention group through a pool of 64
+    /// slots on a server that leaves `host_reserve` bytes to other
+    /// processes, with a KV storage behind it or not: carries every offload
+    /// the pool reserves in a batch and commits it, until nothing is on its
+    /// way out. Returns the pages copied into the pool, the keys the
+    /// connector uploaded and the keys evicted, once every page's units are
+    /// back.
+    fn evict_through_a_small_pool(
+        kv_storage: bool,
+        host_reserve: u64,
+    ) -> (usize, HashSet<Key>, Vec<Key>) {
+        let server = Running::reserving(host_reserve);
+        let stop = Arc::new(AtomicBool::new(false));
+        let uploaded = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mooncake =
+            kv_storage.then(|| connector(&server.socket, Arc::clone(&stop), Arc::clone(&uploaded)));
+        let (_worker, pools) = worker_pools(&server, &[8]);
+
+        let mut kv_offload = KvOffloadManager::connect(
+            &server.socket,
+            "model",
+            0,
+            DEFAULT_BOUNDARY_INTERVAL,
+            kv_storage,
+        )
+        .unwrap();
+        let cache = report(vec![cache_group(None)], &pools, &[8]);
+        let text = WorkerGroupId("text".into());
+        assert!(kv_offload.add_worker(
+            &text,
+            &[RankCache {
+                local: true,
+                cache: &cache,
+            }]
+        ));
+
+        let prompt: Vec<u32> = (0..100 * 64 + 1).collect();
+        let keys = kv_offload.page_keys(&text, &prompt, None, prompt.len())[0][..100].to_vec();
+        let block_pool = BlockPool::new(128, 0);
+        let free = block_pool.free_units();
+        kv_offload.offload(
+            &text,
+            0,
+            keys.clone(),
+            block_pool.allocate(100, 1).unwrap(),
+            OffloadKind::Evicted,
+        );
+        let (mut batch, mut copied) = (0, 0);
+        poll_until(&mut kv_offload, |kv_offload| {
+            batch += 1;
+            copied += kv_offload.take_offloads(&text, batch).len();
+            kv_offload.completed(batch, true);
+            !kv_offload.offloading()
+        });
+        // No page holds its units past its copy's commit, or past being
+        // evicted uncopied.
+        assert_eq!(block_pool.free_units(), free);
+
+        stop.store(true, Ordering::Release);
+        if let Some(mooncake) = mooncake {
+            mooncake.join().unwrap();
+        }
+        let uploaded = uploaded.lock().unwrap().clone();
+        (copied, uploaded, keys)
+    }
+
+    /// An eviction of more pages than its pool holds passes every page
+    /// through the pool into the KV storage: the pages the pool has no slot
+    /// for wait until the connector's uploads free slots.
+    #[test]
+    fn an_eviction_passes_more_pages_than_its_pool_holds_into_the_kv_storage() {
+        let (copied, uploaded, keys) = evict_through_a_small_pool(true, 0);
+        assert_eq!(copied, 100);
+        assert_eq!(uploaded, keys.into_iter().collect::<HashSet<_>>());
+    }
+
+    /// Without a KV storage, an eviction copies what its pool holds, and
+    /// the pages it has no slot for are evicted uncopied.
+    #[test]
+    fn without_a_kv_storage_an_eviction_copies_what_its_pool_holds() {
+        let (copied, uploaded, _) = evict_through_a_small_pool(false, 0);
+        assert_eq!(copied, 64);
+        assert!(uploaded.is_empty());
+    }
+
+    /// A host that admits no page pool, its whole memory reserved, still
+    /// stages pages through a small pool when a KV storage keeps what the
+    /// pools commit: an eviction passes every page through it into the KV
+    /// storage.
+    #[test]
+    fn an_eviction_from_a_host_that_admits_no_pool_reaches_the_kv_storage() {
+        let (copied, uploaded, keys) = evict_through_a_small_pool(true, u64::MAX);
+        assert_eq!(copied, 100);
+        assert_eq!(uploaded, keys.into_iter().collect::<HashSet<_>>());
     }
 }
