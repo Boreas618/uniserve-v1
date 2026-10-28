@@ -931,6 +931,7 @@ impl SchedulerHandle {
             config.worker_process.dtype,
             config.generation_limits,
         )?;
+        scheduler.set_world(config.world);
         scheduler.set_prefix_reuse(config.prefix_cache);
         scheduler.set_state_interval(config.state_interval);
         scheduler.set_trial(config.predecessor.is_some());

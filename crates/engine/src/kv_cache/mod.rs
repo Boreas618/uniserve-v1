@@ -138,6 +138,7 @@ pub struct IndexedPage {
     pub hash: u64,
     pub tokens: Vec<u32>,
     pub units: Vec<u32>,
+    pub resume: Option<proto::request::CacheResume>,
 }
 
 /// Aggregate cache counters retained by the block pool.
@@ -164,8 +165,9 @@ struct PublishedPage {
     tokens: Vec<u32>,
     /// Loaded Worker whose rank group retains the page.
     source: Arc<WorkerEndpoint>,
-    /// Private recovery pages can only be read by that request's continuation.
-    resume: Option<proto::request::CacheResume>,
+    /// The same immutable bytes may serve public reuse and several private
+    /// continuations. `None` names the public alias; no alias copies units.
+    aliases: Vec<Option<proto::request::CacheResume>>,
     /// The page's units in page order; the first one keys the page.
     units: Box<[UnitId]>,
     /// The page's key in the host KV cache, once the page was offloaded
@@ -359,7 +361,7 @@ impl PoolInner {
                 page.group == group
                     && page.source.as_ref() == source
                     && page.tokens == tokens
-                    && page.resume == resume
+                    && page.aliases.contains(&resume)
             })
         })
     }
@@ -590,14 +592,15 @@ impl BlockPool {
         let mut pages: Vec<IndexedPage> = inner
             .pages
             .values()
-            .filter(|page| {
-                page.resume.is_none() && page.units.iter().all(|unit| unit.0 < inner.withdrawn)
-            })
-            .map(|page| IndexedPage {
-                group: page.group,
-                hash: page.hash,
-                tokens: page.tokens.clone(),
-                units: page.units.iter().map(|unit| unit.0).collect(),
+            .filter(|page| page.units.iter().all(|unit| unit.0 < inner.withdrawn))
+            .flat_map(|page| {
+                page.aliases.iter().map(|resume| IndexedPage {
+                    group: page.group,
+                    hash: page.hash,
+                    tokens: page.tokens.clone(),
+                    units: page.units.iter().map(|unit| unit.0).collect(),
+                    resume: *resume,
+                })
             })
             .collect();
         pages.sort_by_key(|page| page.units.first().copied());
@@ -626,16 +629,32 @@ impl BlockPool {
             else {
                 continue;
             };
-            if units.is_empty()
-                || units.iter().any(|unit| {
-                    !inner.inherited.contains(unit)
-                        || inner.meta[*unit as usize].published.is_some()
-                        || inner.meta[*unit as usize].ref_cnt > 0
-                })
+            let Some(&head) = units.first() else {
+                continue;
+            };
+            if let Some(existing) = inner.pages.get_mut(&head)
+                && existing.hash == page.hash
+                && existing.group == page.group
+                && existing.tokens == page.tokens
+                && existing
+                    .units
+                    .iter()
+                    .map(|unit| unit.0)
+                    .eq(units.iter().copied())
+                && existing.source == *source
             {
+                if !existing.aliases.contains(&page.resume) {
+                    existing.aliases.push(page.resume);
+                }
                 continue;
             }
-            let head = units[0];
+            if units.iter().any(|unit| {
+                !inner.inherited.contains(unit)
+                    || inner.meta[*unit as usize].published.is_some()
+                    || inner.meta[*unit as usize].ref_cnt > 0
+            }) {
+                continue;
+            }
             for unit in &units {
                 let meta = &mut inner.meta[*unit as usize];
                 meta.published = Some(head);
@@ -644,7 +663,7 @@ impl BlockPool {
             inner.pages.insert(
                 head,
                 PublishedPage {
-                    resume: None,
+                    aliases: vec![page.resume],
                     hash: page.hash,
                     group: page.group,
                     tokens: page.tokens.clone(),
@@ -659,6 +678,22 @@ impl BlockPool {
             imported += 1;
         }
         imported
+    }
+
+    /// Retires a completed request's private aliases without invalidating
+    /// public reuse or another continuation of the same physical pages.
+    pub(crate) fn forget_resume(&self, resume: proto::request::CacheResume) {
+        let mut inner = lock(&self.inner);
+        let mut retired = Vec::new();
+        for (&head, page) in &mut inner.pages {
+            page.aliases.retain(|alias| *alias != Some(resume));
+            if page.aliases.is_empty() {
+                retired.push(head);
+            }
+        }
+        for head in retired {
+            inner.remove_page(head);
+        }
     }
 
     /// Returns the allocatable units, excluding the unit-zero sentinel.
@@ -759,8 +794,8 @@ impl BlockPool {
     /// Callers publish only pages whose contents the worker has already
     /// computed. The call does nothing when `source` already publishes these
     /// exact tokens under `hash` in `group` on some page. Otherwise any
-    /// earlier identity of the page is removed first, so a page carries at
-    /// most one hash.
+    /// earlier numerical identity of the page is removed first. Equal bytes
+    /// keep their public and private aliases on the same physical units.
     pub(crate) fn publish(
         &self,
         page: &PageRef,
@@ -778,6 +813,18 @@ impl BlockPool {
             return;
         }
 
+        let head = page.units[0].0;
+        if let Some(published) = inner.pages.get_mut(&head)
+            && published.units == page.units
+            && published.hash == hash
+            && published.group == group
+            && published.tokens == tokens
+            && published.source == *source
+        {
+            published.aliases.push(resume);
+            return;
+        }
+
         // A unit belongs to at most one page, so the page's first unit keys
         // its identity; any earlier identity of these units is replaced.
         for unit in page.units.iter() {
@@ -785,14 +832,13 @@ impl BlockPool {
                 inner.remove_page(head);
             }
         }
-        let head = page.units[0].0;
         for unit in page.units.iter() {
             inner.meta[unit.0 as usize].published = Some(head);
         }
         inner.pages.insert(
             head,
             PublishedPage {
-                resume,
+                aliases: vec![resume],
                 hash,
                 group,
                 tokens: tokens.to_vec(),
@@ -847,7 +893,7 @@ impl BlockPool {
             || page.group != group
             || page.tokens != tokens
             || page.source.as_ref() != source
-            || page.resume != resume
+            || !page.aliases.contains(&resume)
         {
             return None;
         }
@@ -892,7 +938,7 @@ impl BlockPool {
             .pages
             .iter()
             .filter(|(_, page)| {
-                page.resume.is_none()
+                page.aliases.contains(&None)
                     && page.units.iter().any(|unit| (first..end).contains(&unit.0))
                     && page.units.iter().all(|unit| {
                         let meta = &inner.meta[unit.0 as usize];
@@ -1299,14 +1345,14 @@ impl BlockTable {
     }
 
     /// Releases the units of the held pages before absolute logical page
-    /// `bound` except page `keep`, then retires the pages before `keep`.
+    /// `bound` except `keep`, then retires the leading pages without units.
     ///
     /// A state table keeps the checkpoint a refill of the request's draft
     /// cache continues from while its decoding moves on.
-    fn retire_around(&mut self, keep: usize, bound: usize) {
+    fn retire_except(&mut self, keep: &[Option<usize>], bound: usize) {
         let mut released = false;
         for page in self.start_page..bound.min(self.end_page()) {
-            if page == keep {
+            if keep.contains(&Some(page)) {
                 continue;
             }
             if let Some(entry) = self.pages.get_mut(page - self.start_page)
@@ -1319,7 +1365,14 @@ impl BlockTable {
         if released {
             self.clear_sent();
         }
-        self.retire_before(keep);
+        self.retire_before(
+            keep.iter()
+                .flatten()
+                .copied()
+                .min()
+                .unwrap_or(bound)
+                .min(bound),
+        );
     }
 
     /// Whether every page covering tokens `[start, end)` holds units.
@@ -1884,7 +1937,7 @@ impl PrefixCacheCoordinator {
     /// completed, and every later call reads from at least `visible -
     /// window`. Pages that lie entirely before that bound are retired; a
     /// published page stays matchable as `Cached`. A state group keeps the
-    /// checkpoint ending at `visible`, the one a later call may start from,
+    /// latest complete checkpoint, which a migrating request continues from,
     /// and the one ending at `refill`, from which a refill of the request's
     /// draft cache continues. Full-attention tables are unchanged. Returns
     /// `false` when the tables do not match the groups.
@@ -1900,13 +1953,20 @@ impl PrefixCacheCoordinator {
         for table in &mut allocation.tables {
             if let Some(window) = table.shape.window {
                 let bound = visible.saturating_sub(window) / table.shape.block_size;
-                let keep = refill
-                    .filter(|&tokens| table.shape.state && tokens > 0)
-                    .map(|tokens| tokens / table.shape.block_size - 1)
-                    .filter(|&page| page < bound);
-                match keep {
-                    Some(page) => table.retire_around(page, bound),
-                    None => table.retire_before(bound),
+                if table.shape.state {
+                    // Decode can cross many page boundaries between state
+                    // checkpoints. Keep the latest page actually written,
+                    // excluding partial pages and future reservations.
+                    let complete = (visible / table.shape.block_size).min(table.end_page());
+                    let latest = (table.start_page..complete)
+                        .rev()
+                        .find(|&page| table.page(page).is_some());
+                    let refill = refill
+                        .and_then(|tokens| (tokens / table.shape.block_size).checked_sub(1))
+                        .filter(|&page| table.page(page).is_some());
+                    table.retire_except(&[latest, refill], bound);
+                } else {
+                    table.retire_before(bound);
                 }
             }
         }
@@ -2199,7 +2259,24 @@ impl PrefixCacheCoordinator {
             return Some(result);
         };
 
-        for (table, (start, references)) in allocation.tables.iter_mut().zip(acquired) {
+        let source = Arc::new(source.clone());
+        for (group, (table, (start, references))) in
+            allocation.tables.iter_mut().zip(acquired).enumerate()
+        {
+            if let Some(resume) = scope.resume {
+                for (offset, reference) in references.iter().enumerate() {
+                    let page = start + offset;
+                    let first = page * table.shape.block_size;
+                    pool.publish(
+                        reference,
+                        group as u32,
+                        result.page_hashes[group][page],
+                        &prompt[first..first + table.shape.key_tokens()],
+                        &source,
+                        Some(resume),
+                    );
+                }
+            }
             if table.shape.draft {
                 result.draft_tokens = references.len() * table.shape.block_size;
             }
@@ -2230,8 +2307,8 @@ impl PrefixCacheCoordinator {
     /// it leaves the window. The draft cache's pages publish once its
     /// entries are valid through their last token (`draft_tokens`): each
     /// entry reads the token after its own. Returns `true` without
-    /// publishing when prefix caching is disabled, `cache_write` is false,
-    /// or `hashes` is empty (a request excluded from prefix caching), and
+    /// publishing when neither public reuse nor a private continuation is
+    /// eligible, or `hashes` is empty, and
     /// `false` when the tables or hashes do not match the groups.
     #[expect(
         clippy::too_many_arguments,
@@ -2248,8 +2325,10 @@ impl PrefixCacheCoordinator {
         published: &mut Vec<usize>,
         cache_write: bool,
         source: &Arc<WorkerEndpoint>,
+        resume: Option<proto::request::CacheResume>,
     ) -> bool {
-        if !self.prefix_enabled || !cache_write || hashes.is_empty() {
+        let public = self.prefix_enabled && cache_write;
+        if (!public && resume.is_none()) || hashes.is_empty() {
             return true;
         }
         if !self.matches(allocation) || hashes.len() != self.groups.len() {
@@ -2279,7 +2358,12 @@ impl PrefixCacheCoordinator {
                 };
                 let first = page * block_size;
                 let span = tokens.span(first..first + table.shape.key_tokens());
-                pool.publish(reference, group as u32, *hash, &span, source, None);
+                if public {
+                    pool.publish(reference, group as u32, *hash, &span, source, None);
+                }
+                if let Some(resume) = resume {
+                    pool.publish(reference, group as u32, *hash, &span, source, Some(resume));
+                }
             }
             published[group] = published[group].max(complete);
         }
@@ -2405,7 +2489,15 @@ mod tests {
         assert_eq!(pool.free_units(), 6);
         drop(allocation);
         assert_eq!(pool.free_units(), 7);
-        assert!(pool.export().is_empty());
+        let successor = BlockPool::new(16, 0);
+        successor.inherit(8..16);
+        successor.import(&pool.export(), 8, &source);
+        assert_eq!(
+            coordinator
+                .probe_prefix(&successor, &tokens, false, true, scope, &source)
+                .cached_tokens,
+            4,
+        );
         assert!(pool.acquire_idle_from(1).is_empty());
     }
 
@@ -2423,7 +2515,20 @@ mod tests {
             }),
             ..Default::default()
         };
-        for (read, images, expected) in [(true, false, 4), (false, false, 0), (true, true, 0)] {
+        for (request, (read, images, expected)) in
+            [(true, false, 4), (false, false, 0), (true, true, 0)]
+                .into_iter()
+                .enumerate()
+        {
+            // Each policy is a fresh request, before it acquires a private
+            // alias to any public prefix it is allowed to read.
+            let scope = PrefixScope {
+                resume: scope.resume.map(|resume| proto::request::CacheResume {
+                    request_id: resume.request_id + request as u64,
+                    ..resume
+                }),
+                ..scope
+            };
             assert_eq!(
                 coordinator
                     .probe_prefix(&pool, &tokens, read, images, scope, &source)
@@ -2447,6 +2552,152 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn mapped_pages_preserve_public_and_private_reuse_on_the_same_units() {
+        let pool = BlockPool::new(16, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let tokens = vec![1, 2, 3, 4, 5];
+        drop(publish(&coordinator, &pool, &tokens, &source));
+        let resume = proto::request::CacheResume {
+            world: 3,
+            request_id: 7,
+        };
+        let scope = PrefixScope {
+            resume: Some(resume),
+            ..Default::default()
+        };
+        let mut allocation = coordinator.empty();
+        assert_eq!(
+            coordinator
+                .acquire_prefix(&pool, &mut allocation, &tokens, true, false, scope, &source,)
+                .unwrap()
+                .cached_tokens,
+            4
+        );
+        drop(allocation);
+
+        let successor = BlockPool::new(32, 0);
+        successor.inherit(16..32);
+        successor.import(&pool.export(), 16, &source);
+        successor.take_inherited();
+        let free = successor.free_units();
+        let mut public = coordinator.empty();
+        let mut private = coordinator.empty();
+        for (allocation, scope, read) in [
+            (&mut public, PrefixScope::default(), true),
+            (&mut private, scope, false),
+        ] {
+            assert_eq!(
+                coordinator
+                    .acquire_prefix(&successor, allocation, &tokens, read, false, scope, &source,)
+                    .unwrap()
+                    .cached_tokens,
+                4
+            );
+        }
+        assert_eq!(successor.free_units(), free - 1);
+        drop((public, private));
+        successor.forget_resume(resume);
+        assert_eq!(
+            coordinator
+                .probe_prefix(&successor, &tokens, false, false, scope, &source,)
+                .cached_tokens,
+            0
+        );
+        assert_eq!(
+            coordinator
+                .probe_prefix(
+                    &successor,
+                    &tokens,
+                    true,
+                    false,
+                    PrefixScope::default(),
+                    &source,
+                )
+                .cached_tokens,
+            4
+        );
+    }
+
+    #[test]
+    fn private_publication_keeps_the_latest_completed_state_checkpoint() {
+        let pool = BlockPool::new(64, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), state(4, 2)]);
+        let source = endpoint();
+        let tokens: Vec<_> = (1..=25).collect();
+        let resume = proto::request::CacheResume {
+            world: 3,
+            request_id: 7,
+        };
+        let scope = PrefixScope {
+            resume: Some(resume),
+            ..Default::default()
+        };
+        let mut allocation = coordinator.empty();
+        let lookup = coordinator
+            .acquire_prefix(
+                &pool,
+                &mut allocation,
+                &tokens,
+                false,
+                false,
+                scope,
+                &source,
+            )
+            .unwrap();
+        let mut published = Vec::new();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 0, 10, Checkpoint::Boundary)
+            .unwrap();
+        for (start, end) in [(0, 10), (10, 14), (14, 18)] {
+            if start > 0 {
+                coordinator
+                    .ensure_capacity(&pool, &mut allocation, start, end, Checkpoint::Interval(8))
+                    .unwrap();
+            }
+            assert!(coordinator.publish_computed(
+                &pool,
+                &allocation,
+                CachedTokens::prompt(&tokens),
+                &lookup.page_hashes,
+                end,
+                0,
+                &mut published,
+                false,
+                &source,
+                Some(resume),
+            ));
+            assert!(coordinator.release_window(&mut allocation, end, None));
+            let checkpoint = if end < 16 { 8 } else { 16 };
+            assert!(allocation.tables[1].holds(checkpoint - 4, checkpoint));
+            assert_eq!(
+                coordinator
+                    .probe_prefix(&pool, &tokens, false, false, scope, &source,)
+                    .cached_tokens,
+                checkpoint
+            );
+            assert_eq!(
+                coordinator
+                    .probe_prefix(&pool, &tokens, true, false, PrefixScope::default(), &source,)
+                    .cached_tokens,
+                0
+            );
+        }
+        // A future checkpoint's reserved units are not yet a completed state.
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 18, 24, Checkpoint::Interval(8))
+            .unwrap();
+        assert!(coordinator.release_window(&mut allocation, 22, None));
+        assert!(allocation.tables[1].holds(12, 16));
+        assert_eq!(
+            coordinator
+                .probe_prefix(&pool, &tokens, false, false, scope, &source,)
+                .cached_tokens,
+            16
+        );
     }
 
     fn full(block_size: usize, units_per_page: usize) -> GroupShape {
@@ -2503,6 +2754,7 @@ mod tests {
             &mut published,
             true,
             source,
+            None,
         ));
         allocation
     }
@@ -2651,6 +2903,7 @@ mod tests {
             &mut published,
             true,
             &source,
+            None,
         ));
         assert_eq!(published, vec![4]);
 
@@ -2933,7 +3186,7 @@ mod tests {
         assert_eq!(allocation.tables[1].fresh_units(0), units[3..6].to_vec());
 
         // Publication skips the pages without a checkpoint; release keeps
-        // the checkpoint a later call may start from, then retires it.
+        // the latest completed checkpoint across non-checkpoint boundaries.
         let mut published = Vec::new();
         assert!(coordinator.publish_computed(
             &pool,
@@ -2945,16 +3198,12 @@ mod tests {
             &mut published,
             true,
             &source,
+            None,
         ));
         assert!(coordinator.release_window(&mut allocation, 8, None));
         assert_eq!(allocation.tables[1].start_page(), 1);
         assert!(coordinator.release_window(&mut allocation, 10, None));
-        assert_eq!(allocation.tables[1].start_page(), 2);
-        assert!(
-            units[3..6]
-                .iter()
-                .all(|unit| pool.unit_state(*unit) == UnitState::Cached)
-        );
+        assert!(allocation.tables[1].holds(4, 8));
 
         // The second chunk checkpoints boundary 16; decoding checkpoints
         // boundary 24, a multiple of the interval, but not boundary 20, in

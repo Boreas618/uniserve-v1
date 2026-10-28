@@ -571,6 +571,8 @@ message IndexedPage {
   uint64 hash = 2;
   repeated uint32 tokens = 3;
   repeated uint32 units = 4;
+  // Absent for public reuse; present for a private continuation of these units.
+  CacheResume resume = 5;
 }
 
 // One scheduler's statistics of the last reporting interval.

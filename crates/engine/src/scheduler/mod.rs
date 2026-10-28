@@ -447,6 +447,7 @@ pub struct Scheduler {
     latent_dtype: Option<DType>,
     /// `engine_id` of every `RequestKey` this scheduler issues.
     engine_id: u64,
+    world: u64,
     /// Engine-wide counter for product generations, drawn by
     /// `generation::register_call` and `Scheduler::media_completion_product`;
     /// both fail once a generation would exceed `u32::MAX`.

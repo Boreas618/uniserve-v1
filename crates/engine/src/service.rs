@@ -1080,7 +1080,8 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                 let promoting: Vec<_> = routing
                     .slots
                     .iter()
-                    .map(|slot| {
+                    .enumerate()
+                    .map(|(slot_index, slot)| {
                         let parked = slot
                             .handle
                             .cache_group()
@@ -1099,6 +1100,12 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                         hash: page.hash,
                                         tokens: page.tokens.clone(),
                                         units: page.units.clone(),
+                                        resume: page.resume.as_ref().map(|resume| {
+                                            proto::request::CacheResume {
+                                                world: resume.world,
+                                                request_id: resume.request_id,
+                                            }
+                                        }),
                                     })
                                     .collect(),
                                 held_units: indexed.held_units,
@@ -1107,6 +1114,9 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                 reserving: indexed.reserving,
                             })
                             .unwrap_or_default();
+                        for resume in parked.pages.iter().filter_map(|page| page.resume) {
+                            crate::lock(&routing.cache_routes).insert(resume, slot_index);
+                        }
                         let (recompute, grows) = (promote.recompute, promote.grows);
                         scope.spawn(move || slot.handle.promote(parked, recompute, grows))
                     })
@@ -1159,7 +1169,8 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
     let answers: Vec<_> = routing
         .slots
         .iter()
-        .map(|slot| (slot.handle.cache_group(), slot.handle.park()))
+        .enumerate()
+        .map(|(index, slot)| (index, slot.handle.cache_group(), slot.handle.park()))
         .collect();
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
@@ -1167,9 +1178,12 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
         .spawn(move || {
             let mut index = Vec::new();
             let mut error = String::new();
-            for (group, answer) in answers {
+            for (slot_index, group, answer) in answers {
                 match answer.recv() {
                     Ok(Ok(parked)) => {
+                        for resume in parked.pages.iter().filter_map(|page| page.resume) {
+                            crate::lock(&routing.cache_routes).insert(resume, slot_index);
+                        }
                         if let Some(group) = group {
                             index.push(wire::GroupIndex {
                                 worker_group: group,
@@ -1181,6 +1195,10 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
                                         hash: page.hash,
                                         tokens: page.tokens,
                                         units: page.units,
+                                        resume: page.resume.map(|resume| wire::CacheResume {
+                                            world: resume.world,
+                                            request_id: resume.request_id,
+                                        }),
                                     })
                                     .collect(),
                                 held_units: parked.held_units,

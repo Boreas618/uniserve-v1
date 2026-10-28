@@ -1651,6 +1651,12 @@ impl Scheduler {
         let mut allocations = None;
         let mut guidance_prefix = None;
         if let Some(mut st) = self.running.remove(&id) {
+            if matches!(terminal, TokenTerminal::Finished { .. })
+                && let Some(resume) = st.req.cache.resume
+                && let Some(cache) = &self.storage.cache
+            {
+                cache.block_pool.forget_resume(resume);
+            }
             let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
             if st.worker_registered {
                 let retained_buffers = self.storage.retained_buffers(request_key);
@@ -1876,8 +1882,12 @@ impl Scheduler {
                 &mut published,
                 cache_write,
                 &source,
+                scope.resume,
             );
-            if published_now && let Some((kv_offload, worker)) = kv_offload.as_ref() {
+            if published_now
+                && cache_write
+                && let Some((kv_offload, worker)) = kv_offload.as_ref()
+            {
                 reserved = offloads(
                     kv_offload,
                     worker,

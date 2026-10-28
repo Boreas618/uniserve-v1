@@ -9,8 +9,9 @@
 //!   denoising step boundary once its trajectory is stored (`preemption`),
 //!   lets its readouts finish, and once nothing runs, offloads
 //!   the pages it reserved for the host KV cache and executes nothing more.
-//!   It answers with its prefix cache index: every published page with its
-//!   units, which the successor reads from the planes it maps read-only.
+//!   It answers with its cache index: every published page's public and
+//!   private continuation aliases with their units, which the successor
+//!   reads from the planes it maps read-only without duplicating the bytes.
 //!   Its memory and index stay as they were, so a rollback resumes it.
 //! - **Promote** (the successor): its workers copy the predecessor's cache
 //!   flags and scales of the units they inherit (`uniserve.adopt_cache`),
@@ -55,8 +56,8 @@ struct CacheReport {
     scratch_units: u32,
 }
 
-/// What a parked scheduler hands the world that succeeds it: its prefix
-/// cache index, and the units and count of the requests it ended as
+/// What a parked scheduler hands the world that succeeds it: its public and
+/// private cache index, and the units and count of the requests it ended as
 /// migratable, which the successor's cache must hold to continue them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParkedCache {
