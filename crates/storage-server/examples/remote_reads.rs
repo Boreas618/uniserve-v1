@@ -62,7 +62,6 @@
 //!   --source 10.0.0.2:41234 --links device,host --rounds 4
 //! ```
 
-use std::collections::HashMap;
 use std::io::Write as _;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt as _;
@@ -70,6 +69,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail, ensure};
+use clap::Parser as _;
 use cuda::{
     CopyBatch, DeviceAllocation, DeviceAttribute, DeviceId, PinnedBuffer, ShareableHandle,
     SourceOrder, Stream,
@@ -81,7 +81,7 @@ use storage::protocol::{
 use storage::{Access, Client, Key, Placement, Role, Scope, StorageRecord, TensorRecord};
 
 /// The two roles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Mode {
     Hold,
     Read,
@@ -91,7 +91,7 @@ enum Mode {
 /// host tensor through the holder's Storage Server (a NIXL READ), or its
 /// device storage by the fabric handle the holder exported (a copy over
 /// the NVLink fabric, which the reader's Transfer Server imports).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Source {
     Device,
     Host,
@@ -99,15 +99,6 @@ enum Source {
 }
 
 impl Source {
-    fn parse(name: &str) -> anyhow::Result<Self> {
-        match name {
-            "device" => Ok(Self::Device),
-            "host" => Ok(Self::Host),
-            "fabric" => Ok(Self::Fabric),
-            other => bail!("unknown source {other:?} (device, host, fabric)"),
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::Device => "device",
@@ -174,137 +165,95 @@ fn unhex(text: &str) -> anyhow::Result<Vec<u8>> {
         .collect()
 }
 
-/// The command line.
+/// Publish or read retained tensors across hosts.
+#[derive(clap::Parser)]
 struct Options {
+    #[arg(value_enum)]
     mode: Mode,
+    #[arg(long)]
     socket: PathBuf,
+    #[arg(long, default_value = "remote-reads")]
     deployment: String,
-    /// The GPU of the role's device storage; `None` (`--gpu none`) for host
-    /// storage alone.
-    gpu: Option<DeviceId>,
+    /// CUDA ordinal, or "none" for host storage alone.
+    #[arg(long, default_value = "0")]
+    gpu: String,
+    #[arg(long = "mib", default_value = "2048", value_parser = parse_mib)]
     bytes: u64,
+    #[arg(long, default_value = "17")]
     seed: u64,
-    /// The file whose existence ends the holder (`hold` only).
+    /// A file on shared storage whose creation ends the holder.
+    #[arg(long, required_if_eq("mode", "hold"))]
     release: Option<PathBuf>,
-    /// The holder's endpoint (`read` only).
+    #[arg(long, required_if_eq("mode", "read"))]
     source: Option<String>,
-    /// The holder's device storage by its fabric handle (`read` with the
-    /// `fabric` link only).
-    fabric: Option<Fabric>,
+    #[arg(long, requires = "fabric_gpu")]
+    fabric: Option<String>,
+    #[arg(long, requires = "fabric")]
+    fabric_gpu: Option<String>,
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "device,host")]
     links: Vec<Source>,
+    #[arg(long, default_value = "4")]
     rounds: u32,
-    /// Whether the reader reads into host storage (`--into host`) rather
-    /// than into device storage on its GPU (`--into device`, the default
-    /// with a GPU).
+    #[arg(long = "into", default_value = "device", value_parser = parse_target, action = clap::ArgAction::Set)]
     into_host: bool,
-    /// How the holder publishes its host source: read-only (`--host-access
-    /// read-only`, the default, as weights kept on the host are) or
-    /// writable (`--host-access exclusive`, as host page pools are).
+    #[arg(long, default_value = "read-only", value_parser = parse_access)]
     host_access: Access,
-    /// Whether the holder records its device source's fabric handle with
-    /// the server (`--record-fabric yes`, the default), so that a reader of
-    /// the same NVLink fabric copies it over NVLink rather than READ it.
+    #[arg(long, default_value = "yes", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     record_fabric: bool,
-    /// How long one read may take before the reader gives up on it.
+    /// Timeout for one read, including its first registration.
+    #[arg(long = "patience-s", default_value = "300", value_parser = parse_seconds)]
     patience: Duration,
 }
 
 impl Options {
-    fn parse() -> anyhow::Result<Self> {
-        let mut arguments = std::env::args().skip(1);
-        let mode = match arguments.next().as_deref() {
-            Some("hold") => Mode::Hold,
-            Some("read") => Mode::Read,
-            other => bail!("the first argument is the role, hold or read, not {other:?}"),
-        };
-        let mut values: HashMap<String, String> = HashMap::new();
-        while let Some(flag) = arguments.next() {
-            let name = flag
-                .strip_prefix("--")
-                .with_context(|| format!("unexpected argument {flag:?}"))?;
-            let value = arguments
-                .next()
-                .with_context(|| format!("{flag} needs a value"))?;
-            values.insert(name.to_owned(), value);
+    fn gpu(&self) -> anyhow::Result<Option<DeviceId>> {
+        match self.gpu.as_str() {
+            "none" => Ok(None),
+            ordinal => Ok(Some(DeviceId(ordinal.parse()?))),
         }
-        let mut take = |name: &str, default: Option<&str>| -> anyhow::Result<String> {
-            values
-                .remove(name)
-                .or_else(|| default.map(str::to_owned))
-                .with_context(|| format!("--{name} is required"))
-        };
+    }
 
-        let options = Self {
-            mode,
-            socket: take("socket", None)?.into(),
-            deployment: take("deployment", Some("remote-reads"))?,
-            gpu: match take("gpu", Some("0"))?.as_str() {
-                "none" => None,
-                ordinal => Some(DeviceId(ordinal.parse()?)),
-            },
-            bytes: take("mib", Some("2048"))?.parse::<u64>()? << 20,
-            seed: take("seed", Some("17"))?.parse()?,
-            release: match mode {
-                Mode::Hold => Some(take("release", None)?.into()),
-                Mode::Read => None,
-            },
-            source: match mode {
-                Mode::Read => Some(take("source", None)?),
-                Mode::Hold => None,
-            },
-            fabric: match (
-                take("fabric", Some(""))?.as_str(),
-                take("fabric-gpu", Some(""))?.as_str(),
-            ) {
-                ("", "") => None,
-                ("", _) | (_, "") => bail!("--fabric and --fabric-gpu go together"),
-                (handle, gpu) => Some(Fabric {
+    fn fabric(&self) -> anyhow::Result<Option<Fabric>> {
+        self.fabric
+            .as_ref()
+            .zip(self.fabric_gpu.as_ref())
+            .map(|(handle, gpu)| {
+                Ok(Fabric {
                     handle: unhex(handle)?,
                     gpu: unhex(gpu)?
                         .try_into()
                         .map_err(|_| anyhow::anyhow!("--fabric-gpu is a 16-byte UUID"))?,
                     bytes: 0,
-                }),
-            },
-            links: match mode {
-                Mode::Read => take("links", Some("device,host"))?
-                    .split(',')
-                    .map(Source::parse)
-                    .collect::<anyhow::Result<_>>()?,
-                Mode::Hold => Vec::new(),
-            },
-            rounds: match mode {
-                Mode::Read => take("rounds", Some("4"))?.parse()?,
-                Mode::Hold => 0,
-            },
-            record_fabric: match take("record-fabric", Some("yes"))?.as_str() {
-                "yes" => true,
-                "no" => false,
-                other => bail!("--record-fabric is yes or no, not {other:?}"),
-            },
-            host_access: match take("host-access", Some("read-only"))?.as_str() {
-                "read-only" => Access::ReadOnly,
-                "exclusive" => Access::Exclusive,
-                other => bail!("--host-access is read-only or exclusive, not {other:?}"),
-            },
-            into_host: match take("into", Some("device"))?.as_str() {
-                "host" => true,
-                "device" => false,
-                other => bail!("--into is device or host, not {other:?}"),
-            },
-            // By default far past a 2 GiB read at one network port's
-            // bandwidth, the first read's setup included.
-            patience: match mode {
-                Mode::Read => Duration::from_secs_f64(take("patience-s", Some("300"))?.parse()?),
-                Mode::Hold => Duration::ZERO,
-            },
-        };
-        if let Some(unknown) = values.keys().next() {
-            bail!("unknown option --{unknown} for this role");
-        }
-        ensure!(options.bytes > 0, "--mib must be positive");
-        Ok(options)
+                })
+            })
+            .transpose()
     }
+}
+
+fn parse_mib(text: &str) -> anyhow::Result<u64> {
+    let mib: u64 = text.parse()?;
+    ensure!(mib > 0, "--mib must be positive");
+    Ok(mib << 20)
+}
+
+fn parse_target(text: &str) -> anyhow::Result<bool> {
+    match text {
+        "host" => Ok(true),
+        "device" => Ok(false),
+        _ => bail!("expected host or device"),
+    }
+}
+
+fn parse_access(text: &str) -> anyhow::Result<Access> {
+    match text {
+        "read-only" => Ok(Access::ReadOnly),
+        "exclusive" => Ok(Access::Exclusive),
+        _ => bail!("expected read-only or exclusive"),
+    }
+}
+
+fn parse_seconds(text: &str) -> anyhow::Result<Duration> {
+    Ok(Duration::try_from_secs_f64(text.parse()?)?)
 }
 
 /// The current wall-clock time in Unix seconds.
@@ -314,44 +263,18 @@ fn wall() -> f64 {
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
-/// `text` as a JSON string literal.
-fn quoted(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            character if (character as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", character as u32));
-            }
-            character => out.push(character),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Print one JSON line: `event` and the already-encoded `fields`, stamped
-/// with the wall-clock time.
-fn emit(event: &str, fields: &[(&str, String)]) {
-    let mut line = format!("{{\"t\":{:.6},\"event\":{}", wall(), quoted(event));
-    for (name, value) in fields {
-        line.push_str(&format!(",{}:{value}", quoted(name)));
-    }
-    line.push('}');
+/// Print one JSON line with the wall-clock time and structured fields.
+fn emit(event: &str, fields: serde_json::Value) {
+    let mut value = fields;
+    value["t"] = serde_json::json!(wall());
+    value["event"] = serde_json::json!(event);
     let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{line}");
+    let _ = writeln!(stdout, "{value}");
     let _ = stdout.flush();
 }
 
-fn uuid_hex(gpu: &[u8; 16]) -> String {
-    uuid_hex_bytes(gpu)
-}
-
 /// `bytes` in hexadecimal.
-fn uuid_hex_bytes(bytes: &[u8]) -> String {
+fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -533,14 +456,14 @@ fn host_storage(bytes: u64, node: Option<u32>, seed: Option<u64>) -> anyhow::Res
 /// The holder: publish its sources and keep them until `--release`
 /// exists.
 fn hold(options: &Options) -> anyhow::Result<()> {
-    let numa_node = options
-        .gpu
+    let gpu = options.gpu()?;
+    let numa_node = gpu
         .and_then(|gpu| gpu.attribute(DeviceAttribute::HostNumaId).ok())
         .and_then(|node| u32::try_from(node).ok());
     let (mut head, mut worker) = connect(options)?;
 
     // The device source, on a GPU, holding its sequence.
-    let device = match options.gpu {
+    let device = match gpu {
         Some(gpu) => {
             let (device, descriptor, mut record) = device_storage(gpu, options.bytes)?;
             // The allocation's creator exports its fabric handle, which a
@@ -611,21 +534,15 @@ fn hold(options: &Options) -> anyhow::Result<()> {
     };
     emit(
         "holding",
-        &[
-            ("endpoint", quoted(&endpoint)),
-            (
-                "gpu",
-                quoted(&match options.gpu {
-                    Some(gpu) => uuid_hex(&gpu.uuid()?.0),
-                    None => "none".to_owned(),
-                }),
-            ),
-            ("bytes", host_bytes.to_string()),
-            (
-                "fabric",
-                quoted(&fabric_handle.map_or_else(String::new, |handle| uuid_hex_bytes(&handle))),
-            ),
-        ],
+        serde_json::json!({
+            "endpoint": endpoint,
+            "gpu": match gpu {
+                Some(gpu) => hex(&gpu.uuid()?.0),
+                None => "none".to_owned(),
+            },
+            "bytes": host_bytes,
+            "fabric": fabric_handle.map_or_else(String::new, |handle| hex(&handle)),
+        }),
     );
 
     // The sources stay published until the harness creates the release
@@ -640,7 +557,7 @@ fn hold(options: &Options) -> anyhow::Result<()> {
     // starts afresh.
     worker.retain(Vec::new(), Vec::new())?;
     drop((worker, head, device, host));
-    emit("released", &[]);
+    emit("released", serde_json::json!({}));
     Ok(())
 }
 
@@ -766,7 +683,11 @@ fn read(options: &Options) -> anyhow::Result<()> {
     let source = options.source.clone().context("--source is required")?;
     let (mut head, mut worker) = connect(options)?;
 
-    let into = if options.into_host { None } else { options.gpu };
+    let into = if options.into_host {
+        None
+    } else {
+        options.gpu()?
+    };
     let (mut destination, bytes) = match into {
         Some(gpu) => {
             let (allocation, descriptor, record) = device_storage(gpu, options.bytes)?;
@@ -809,7 +730,7 @@ fn read(options: &Options) -> anyhow::Result<()> {
 
     // The holder's fabric handle names its whole device storage, as long
     // as the destination.
-    let fabric = options.fabric.as_ref().map(|fabric| Fabric {
+    let fabric = options.fabric()?.map(|fabric| Fabric {
         handle: fabric.handle.clone(),
         gpu: fabric.gpu,
         bytes: bytes as u64,
@@ -863,13 +784,13 @@ fn read(options: &Options) -> anyhow::Result<()> {
             }
             emit(
                 "read",
-                &[
-                    ("link", quoted(link.name())),
-                    ("round", round.to_string()),
-                    ("bytes", bytes.to_string()),
-                    ("seconds", format!("{seconds:.6}")),
-                    ("gbps", format!("{:.3}", bytes as f64 / seconds / 1e9)),
-                ],
+                serde_json::json!({
+                    "link": link.name(),
+                    "round": round,
+                    "bytes": bytes,
+                    "seconds": seconds,
+                    "gbps": bytes as f64 / seconds / 1e9,
+                }),
             );
         }
     }
@@ -880,30 +801,26 @@ fn read(options: &Options) -> anyhow::Result<()> {
     let transfer = listing
         .transfer
         .context("the Transfer Server left before the listing")?;
-    let measured: Vec<String> = transfer
+    let measured: Vec<serde_json::Value> = transfer
         .links
         .iter()
         .filter_map(|measured| match &measured.link.source {
             Memory::Remote {
                 endpoint,
                 gpu: remote,
-            } if *endpoint == source => Some(format!(
-                "{{\"source\":{},\"destination\":{},\"bytes_per_second\":{}}}",
-                quoted(&remote.map_or_else(|| "host".to_owned(), |gpu| uuid_hex(&gpu))),
-                quoted(&match &measured.link.destination {
-                    Memory::Device { gpu } => uuid_hex(gpu),
+            } if *endpoint == source => Some(serde_json::json!({
+                "source": remote.map_or_else(|| "host".to_owned(), |gpu| hex(&gpu)),
+                "destination": match &measured.link.destination {
+                    Memory::Device { gpu } => hex(gpu),
                     Memory::Host => "host".to_owned(),
                     other => format!("{other:?}"),
-                }),
-                measured.bytes_per_second
-            )),
+                },
+                "bytes_per_second": measured.bytes_per_second,
+            })),
             _ => None,
         })
         .collect();
-    emit(
-        "links",
-        &[("measured", format!("[{}]", measured.join(",")))],
-    );
+    emit("links", serde_json::json!({"measured": measured}));
     // The server retains the destination past this connection: the scope
     // retains it no more, so the next reader of the deployment publishes
     // its own.
@@ -912,12 +829,16 @@ fn read(options: &Options) -> anyhow::Result<()> {
 }
 
 fn main() {
-    let result = Options::parse().and_then(|options| match options.mode {
+    let options = Options::parse();
+    let result = match options.mode {
         Mode::Hold => hold(&options),
         Mode::Read => read(&options),
-    });
+    };
     if let Err(error) = result {
-        emit("error", &[("message", quoted(&format!("{error:#}")))]);
+        emit(
+            "error",
+            serde_json::json!({"message": format!("{error:#}")}),
+        );
         std::process::exit(1);
     }
 }
