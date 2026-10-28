@@ -452,8 +452,9 @@ pub(crate) async fn end(
     }
 }
 
-/// End the running session, if any, because its world stops executing:
-/// before a successor's promotion parks it, or as a trial rolls back.
+/// End the running session, if any, because its world stops executing or
+/// gives back storage its graphs address: as a world change starts, as the
+/// world sleeps, or as a trial rolls back.
 pub(crate) async fn end_for_world(
     replica: &crate::leader::Replica,
     client: Option<&EngineClient>,

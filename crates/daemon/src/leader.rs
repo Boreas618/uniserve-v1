@@ -1508,6 +1508,9 @@ impl Replica {
         if !hold.pause() {
             self.sleep_paused.store(true, Ordering::Release);
         }
+        // A sleeping world runs nothing to profile, and gives back the
+        // storage its graphs address: its session ends first.
+        crate::profiling::end_for_world(self, Some(&client), "sleep").await;
         let results = client
             .resize_cache(wire::CacheChange::Sleep)
             .await

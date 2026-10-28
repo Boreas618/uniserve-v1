@@ -14,6 +14,16 @@
 //! their launch's tracing mode; changing that mode requires their owners
 //! to instantiate the retained source graphs again before replay.
 //!
+//! A serving process traces graphs whole as its standing mode
+//! ([`trace_graphs_whole`]), from before it instantiates any graph: CUPTI's
+//! node instrumentation of an executable (any per-node kind: kernels,
+//! copies or fills) does not survive the process unmapping and mapping
+//! again the storage its graphs address (a sleep, a world change's eager
+//! preparation or cache shrink); its next launch faults inside CUPTI, in
+//! `cuGraphLaunch` (observed with `nvidia-cuda-cupti` 13.0.85, driver
+//! 580.82.07), while whole-graph records and no records at all replay
+//! correctly. A node timeline suspends the standing mode while it records.
+//!
 //! An API call is timed from its entry callback to its exit callback in
 //! CUPTI's clock on the calling thread; nested calls (a runtime call and the
 //! driver calls it makes) pair by their order. The decoded [`Record`]s reach
@@ -81,6 +91,36 @@ static RECORDING: Mutex<Option<Recording>> = Mutex::new(None);
 /// Whether API calls are recorded; read by every callback.
 static APIS: AtomicBool = AtomicBool::new(false);
 
+/// Whether whole-graph records are the process's standing graph tracing
+/// mode ([`trace_graphs_whole`]).
+static STANDING_WHOLE: AtomicBool = AtomicBool::new(false);
+
+/// Make whole-graph records (`GRAPH_TRACE`) the process's standing graph
+/// tracing mode, for its life: CUPTI records each graph launch as one
+/// record and instruments none of its nodes. Call it once, after
+/// subscribing and before the process instantiates any CUDA graph, so that
+/// every executable is instantiated in this mode.
+///
+/// # Errors
+///
+/// Fails when the process has not subscribed to CUPTI or CUPTI refuses
+/// the kind.
+pub fn trace_graphs_whole() -> Result<()> {
+    subscriber::enable_kind(records::GRAPH_TRACE)?;
+    STANDING_WHOLE.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// The process's standing graph tracing mode: the mode its executables are
+/// instantiated in while no timeline records.
+pub fn standing() -> GraphTrace {
+    if STANDING_WHOLE.load(Ordering::Acquire) {
+        GraphTrace::Whole
+    } else {
+        GraphTrace::Nodes
+    }
+}
+
 /// An API call that returned, whose name is interned at the next delivery.
 struct Returned {
     domain: i32,
@@ -108,6 +148,9 @@ thread_local! {
 pub struct Timeline {
     kinds: Vec<u32>,
     domains: Vec<i32>,
+    /// Whether this node timeline suspended the standing whole-graph
+    /// records, which its drop resumes.
+    suspended_whole: bool,
 }
 
 impl Timeline {
@@ -118,7 +161,9 @@ impl Timeline {
     /// tracing, their owners reinstantiate the retained source graphs
     /// before submitting another replay. Running a whole-trace executable
     /// in node mode leaks CUPTI timestamp slots, eventually exhausting its
-    /// profiling buffers.
+    /// profiling buffers. A node timeline suspends the standing whole-graph
+    /// records ([`trace_graphs_whole`]) until it drops; its owner ends it
+    /// before the process unmaps storage its graphs address.
     ///
     /// # Errors
     ///
@@ -145,7 +190,12 @@ impl Timeline {
         let mut timeline = Self {
             kinds: Vec::new(),
             domains: Vec::new(),
+            suspended_whole: false,
         };
+        if graphs == GraphTrace::Nodes && standing() == GraphTrace::Whole {
+            subscriber::disable_kind(records::GRAPH_TRACE);
+            timeline.suspended_whole = true;
+        }
         for kind in kinds {
             subscriber::enable_kind(kind)?;
             timeline.kinds.push(kind);
@@ -177,6 +227,13 @@ impl Drop for Timeline {
             delivery.recording
         };
         *recording = None;
+        drop(recording);
+        // Should CUPTI refuse the kind it enabled before, the standing mode
+        // becomes node records, which `standing` answers to the graphs'
+        // owners.
+        if self.suspended_whole && subscriber::enable_kind(records::GRAPH_TRACE).is_err() {
+            STANDING_WHOLE.store(false, Ordering::Release);
+        }
     }
 }
 
