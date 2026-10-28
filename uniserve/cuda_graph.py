@@ -37,7 +37,9 @@ __all__ = [
 _capturing: Capture | None = None
 
 # CUPTI instruments executables for the graph-trace mode enabled at
-# instantiation. Source graphs and their allocator pools stay unchanged.
+# instantiation. Source graphs and their allocator pools stay unchanged. A
+# serving rank traces graphs whole as its standing mode and sets this before
+# it captures any graph; a node timeline switches it for its duration.
 _whole_graph_trace = False
 
 

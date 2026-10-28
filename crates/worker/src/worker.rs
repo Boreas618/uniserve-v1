@@ -192,9 +192,12 @@ impl Worker {
             Device::Cpu => None,
         };
         // Subscribe before loading modules and capturing graphs so the
-        // shared collectors observe their CUDA resource lifetimes.
-        if context.is_some() {
-            crate::profiling::counters::subscribe();
+        // shared collectors observe their CUDA resource lifetimes, and the
+        // graphs it captures are instantiated in its standing tracing mode.
+        if context.is_some() && crate::profiling::counters::subscribe() {
+            Interpreter::import("uniserve.cuda_graph.set_graph_trace")?
+                .call_values(&[Any::from(true)])
+                .map_err(phase("device"))?;
         }
         // PC sampling for the rank's CUDA graphs, enabled before it
         // captures any (`crate::profiling::pc_sampling`).
