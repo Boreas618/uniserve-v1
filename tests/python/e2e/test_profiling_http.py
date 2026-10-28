@@ -53,6 +53,7 @@ OPTIONS = (
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
+    'profiling_config.fence_components=["*.TransformerLayer"]',
 )
 PROMPT = (
     "Count from 1 to 3000, separated by commas and spaces. "
@@ -82,8 +83,8 @@ def _stop_storage_server(socket: Path) -> None:
 
 @pytest.fixture(scope="module")
 def served(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    """A Qwen3 deployment serving with the default fence probes, which the
-    module's tests share.
+    """A Qwen3 deployment serving with fence probes on its transformer
+    layers, which the module's tests share.
     """  # noqa: D205
     tmp_path = tmp_path_factory.mktemp("served")
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))

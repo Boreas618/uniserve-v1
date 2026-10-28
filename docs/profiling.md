@@ -30,6 +30,16 @@ A probe first reads a device switch, a word per component and a master word in d
 | `uniserve:worker_fence_step_seconds` | `stage`, `component` | A histogram of per-step durations on the device: for each step of the stage (its call kind, such as `prefill` or `decode`), the summed time of the component's probed instances, or the step's span for `step`; buckets from 10 µs to 10 s |
 | `uniserve:worker_fence_records_lost` | | Probe records overwritten before the worker read them |
 
+**Cost.** Every probe is a kernel launch in each replay of a captured graph, whether it records or not. The always-on budget is LMTracer's reported 0.58%. On GB200 with Qwen3-30B-A3B in bfloat16 (decode of 512 tokens per request, 60 s per point, probes switched off and on alternately in one server, four pairs per point), the step time measured:
+
+| Probed components | Probes per step | On against off, 1 request | On against off, 32 requests | Off against no probe |
+| --- | --- | --- | --- | --- |
+| `*.Transformer` (the default) | 2 | −0.73%, −0.19% | −3.5%, +5.8% | within the ±5–10% spread between servers |
+| `*.TransformerLayer` | 96 | +1.71% (+0.79 to +2.76%) | +1.15% (−3.54 to +3.32%) | within the spread between servers |
+| `*` | 2028 | +18.4% | +18.6% | +21% to +36% |
+
+Each probe thus costs about a microsecond of every step even when switched off, and about another microsecond when it records, so the default probes each model's decoder stack only; probing every layer costs 1–2% and every component 15–35%.
+
 `profiling_config.fence_probes = false` switches every probe off in place: `PUT /admin/config` with that assignment has every worker write its device switch at the engine's next step boundary, and the graphs keep their probes, each of which then returns at once. Changing `fence_components` changes which modules carry probes in the captured graphs, which is a new world (`docs/admin.md`).
 
 ## Profiling sessions
