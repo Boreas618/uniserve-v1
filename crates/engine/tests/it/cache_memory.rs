@@ -1258,9 +1258,11 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
 /// beside the serving world's, and one that maps none of the cache takes of
 /// its own the units the requests in flight hold: the plan counts both, and
 /// the shrink gives back the more of the cache. The plan also states the
-/// KV cache the requests in flight hold, and how long a promotion that
-/// moves it through host memory waits for it at the host link's measured
-/// bandwidth.
+/// KV cache the requests in flight hold. A successor that warms its copies
+/// on the device has them before promotion, which waits for none; one whose
+/// copies reside in host storage holds none of them on the device, stages
+/// both layouts there, and its promotion waits for the copy back at the
+/// host link's measured bandwidth.
 #[test]
 fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
     // Bytes per second from host memory to the GPU.
@@ -1309,8 +1311,17 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
         6_000 - in_flight as i64
     );
     assert_eq!(recomputed["in_flight_kv"], in_flight);
+    assert_eq!(recomputed["promotion_stall_ms"], 0);
+    let staged = plan_of(Successor {
+        loads_weights: true,
+        unmapped_cache: true,
+        host_cache: true,
+        ..Successor::default()
+    });
+    assert_eq!(staged["successor"]["in_flight"], 0, "{staged}");
+    assert_eq!(staged["host_staging"], 2 * in_flight, "{staged}");
     assert_eq!(
-        recomputed["promotion_stall_ms"],
+        staged["promotion_stall_ms"],
         (in_flight * 1000).div_ceil(HOST_LINK)
     );
     // A successor that maps the cache takes none of its own, but the
