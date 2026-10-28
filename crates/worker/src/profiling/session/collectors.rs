@@ -29,13 +29,16 @@ use crate::profiling::pc_sampling;
 /// buffer hold.
 const PM_MIN_SAMPLES: u64 = 256;
 
-/// The ranges one range profiler pass holds. Starting a pass takes about
-/// 1.42 MB of device storage per range (with one metric); on a GB200 rank
-/// that has warmed up, a pass of 1024 ranges starts and one of 2048 fails
-/// (`cuptiRangeProfilerStart` answers `CUPTI_ERROR_UNKNOWN` with 128 GB
-/// free, for a reason not established), so a pass holds 512, about 728 MB,
-/// and the session reads it every [`super::RANGE_CYCLE`] steps.
-const MAX_RANGES: usize = 512;
+/// The device storage a session of `request` holds on the device of rank
+/// `rank` while it runs ([`SessionRequest::device_storage`]), for a session
+/// that selects the rank; 0 otherwise.
+pub(crate) fn device_storage(request: &SessionRequest, rank: u32) -> u64 {
+    if request.workers.is_empty() || request.workers.contains(&rank) {
+        request.device_storage()
+    } else {
+        0
+    }
+}
 
 /// A prepared collector.
 enum Prepared {
@@ -624,12 +627,18 @@ fn prepare(
                     Ranges::User
                 }
             };
-            RangeProfiler::enable(context, device, &options.metrics, ranges, MAX_RANGES)
-                .map_err(|error| error.to_string())
-                .map(|profiler| Prepared::RangeMetrics {
-                    profiler,
-                    ranges: options.ranges,
-                })
+            RangeProfiler::enable(
+                context,
+                device,
+                &options.metrics,
+                ranges,
+                options.pass_ranges,
+            )
+            .map_err(|error| error.to_string())
+            .map(|profiler| Prepared::RangeMetrics {
+                profiler,
+                ranges: options.ranges,
+            })
         }
         Collector::PcSampling => {
             cupti()?;

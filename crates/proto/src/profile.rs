@@ -124,6 +124,21 @@ pub enum MetricRanges {
 /// µs outrun it (`docs/profiling.md`).
 pub const PM_MIN_INTERVAL_NS: u64 = 20_000;
 
+/// The kernel and graph launches of one step a `range_metrics` pass makes
+/// room for: a pass of `pass_ranges` ranges is read every
+/// `pass_ranges / RANGE_STEP_LAUNCHES` recorded steps.
+pub const RANGE_STEP_LAUNCHES: usize = 32;
+
+/// The device storage a range profiler pass takes per range. CUPTI takes it
+/// at the pass's first start, in whole [`RANGE_STORAGE_GRANULE`]s, and keeps
+/// it until the profiler is disabled. Measured on GB200 with
+/// `nvidia-cuda-cupti` 13.0, the same for one to four metrics and for
+/// either range mode.
+const RANGE_STORAGE: u64 = 1_421_312;
+
+/// The unit CUPTI takes a pass's device storage in: 2 MiB.
+const RANGE_STORAGE_GRANULE: u64 = 2 << 20;
+
 /// The `range_metrics` collector's options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -131,6 +146,11 @@ pub struct RangeMetricsOptions {
     /// Metric names one pass collects.
     pub metrics: Vec<String>,
     pub ranges: MetricRanges,
+    /// The ranges one pass holds, at least [`RANGE_STEP_LAUNCHES`]: its
+    /// device storage grows with them ([`Self::pass_storage`]), and the
+    /// worker reads it every `pass_ranges / RANGE_STEP_LAUNCHES` recorded
+    /// steps. The default, 512, takes 728 MB.
+    pub pass_ranges: usize,
 }
 
 impl Default for RangeMetricsOptions {
@@ -138,7 +158,21 @@ impl Default for RangeMetricsOptions {
         Self {
             metrics: vec!["gpu__time_duration.sum".to_owned()],
             ranges: MetricRanges::Kernel,
+            pass_ranges: 512,
         }
+    }
+}
+
+impl RangeMetricsOptions {
+    /// The device storage one pass takes: 1,421,312 bytes per range,
+    /// rounded up to 2 MiB.
+    pub fn pass_storage(&self) -> u64 {
+        (self.pass_ranges as u64 * RANGE_STORAGE).next_multiple_of(RANGE_STORAGE_GRANULE)
+    }
+
+    /// Every how many recorded steps the worker reads a pass.
+    pub fn read_steps(&self) -> u64 {
+        (self.pass_ranges / RANGE_STEP_LAUNCHES).max(1) as u64
     }
 }
 
@@ -202,6 +236,18 @@ pub struct SessionRequest {
 }
 
 impl SessionRequest {
+    /// The device storage the session holds on the GPU of each worker it
+    /// selects while it runs: a range profiler pass for `range_metrics`
+    /// ([`RangeMetricsOptions::pass_storage`]); 0 otherwise. The worker
+    /// books it in the GPU's storage ledger beside its process.
+    pub fn device_storage(&self) -> u64 {
+        if self.collectors.contains(&Collector::RangeMetrics) {
+            self.range_metrics.pass_storage()
+        } else {
+            0
+        }
+    }
+
     /// Why a deployment whose ranks keep PC sampling enabled
     /// (`profiling_config.graph_pc_sampling`) refuses this request, if it
     /// does: CUPTI then refuses PM sampling (the device's performance
@@ -313,6 +359,14 @@ impl SessionRequest {
                  512 MiB holds the samples of a busy device",
                 PcSamplingOptions::MIN_PERIOD,
                 PcSamplingOptions::MIN_PERIOD
+            ));
+        }
+        if self.range_metrics.pass_ranges < RANGE_STEP_LAUNCHES
+            || u32::try_from(self.range_metrics.pass_ranges).is_err()
+        {
+            return Err(format!(
+                "range_metrics.pass_ranges is from {RANGE_STEP_LAUNCHES} to {}",
+                u32::MAX
             ));
         }
         if self.pm_sampling.interval_ns < PM_MIN_INTERVAL_NS {
@@ -461,6 +515,14 @@ mod tests {
             SessionRequest {
                 collectors: vec![Collector::PcSampling],
                 pc_sampling: PcSamplingOptions { period: 11 },
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![Collector::RangeMetrics],
+                range_metrics: RangeMetricsOptions {
+                    pass_ranges: 16,
+                    ..RangeMetricsOptions::default()
+                },
                 ..request()
             },
             SessionRequest {

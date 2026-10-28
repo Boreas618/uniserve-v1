@@ -434,6 +434,103 @@ pub(super) fn refusal(plans: &[Preparing]) -> String {
     lines.join("\n")
 }
 
+/// One device's room for the device storage a profiling session holds:
+/// what its ledger and its free storage leave, and the tail segments the KV
+/// cache gives back to make the rest. Reported per GPU by the change's plan
+/// and refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct Room {
+    pub(super) host: String,
+    /// The GPU, as `nvidia-smi` names it.
+    pub(super) gpu: String,
+    pub(super) quota: u64,
+    /// What the ledger books.
+    pub(super) booked: u64,
+    /// The device's free storage when planned.
+    pub(super) free: u64,
+    /// The device storage the session holds.
+    pub(super) bytes: u64,
+    /// The bytes of the segments the cache cannot give back.
+    pub(super) kv_floor: u64,
+    /// The segments the cache keeps of those it holds.
+    pub(super) segments_kept: u32,
+    pub(super) segments_held: u32,
+    /// Whether giving back every segment past the floor makes the room.
+    pub(super) feasible: bool,
+    /// Every entry of the GPU's ledger.
+    pub(super) entries: Vec<String>,
+}
+
+/// The room on the device of `report` for `bytes` of device storage beside
+/// everything its ledger books, of whose segments the cache cannot give
+/// back the first `floor`: the cache keeps all it holds when the ledger's
+/// room and the device's free storage hold `bytes` already, and otherwise
+/// the largest prefix whose given-back tail makes the rest (each segment
+/// given back frees its bytes of both). Fails for a worker that reports no
+/// ledger or no quota.
+pub(super) fn room(report: &CacheMemory, bytes: u64, floor: u32) -> Result<Room, String> {
+    let Some(ledger) = &report.ledger else {
+        return Err("a worker that holds a split KV cache reports no storage ledger".to_owned());
+    };
+    let gpu = storage::protocol::gpu_name(&ledger.gpu);
+    let quota = ledger
+        .quota
+        .ok_or_else(|| format!("no world states a quota in the storage ledger of GPU {gpu}"))?;
+    // A process outside the deployment may hold more of the device than the
+    // quota leaves it.
+    let available = quota.saturating_sub(ledger.used()).min(report.free_bytes);
+    let mut freed = 0;
+    let mut kept = report.held;
+    while available + freed < bytes && kept > floor {
+        kept -= 1;
+        freed += report.segment_bytes(kept as usize);
+    }
+    Ok(Room {
+        host: report.host.clone(),
+        gpu,
+        quota,
+        booked: ledger.used(),
+        free: report.free_bytes,
+        bytes,
+        kv_floor: (0..floor.min(report.held))
+            .map(|index| report.segment_bytes(index as usize))
+            .sum(),
+        segments_kept: kept,
+        segments_held: report.held,
+        feasible: available + freed >= bytes,
+        entries: ledger.entries.iter().map(LedgerEntry::describe).collect(),
+    })
+}
+
+/// Why a profiling session's device storage does not fit: for every device,
+/// what its ledger books of its quota, its free storage and the KV cache it
+/// cannot give back.
+pub(super) fn room_refusal(rooms: &[Room]) -> String {
+    let bytes = rooms.first().map_or(0, |room| room.bytes);
+    let mut lines = vec![format!(
+        "{bytes} bytes of device storage for a profiling session do not fit: on a GPU the KV \
+         cache's segments past those it cannot give back leave too little room"
+    )];
+    for room in rooms {
+        lines.push(format!(
+            "host {} GPU {}: {} of a quota of {} bytes booked and {} bytes free; {} bytes of \
+             {} KV cache segments it cannot give back{}",
+            room.host,
+            room.gpu,
+            room.booked,
+            room.quota,
+            room.free,
+            room.kv_floor,
+            room.segments_held,
+            if room.feasible { "" } else { " (no room)" },
+        ));
+        for entry in &room.entries {
+            lines.push(format!("  ledger: {entry}"));
+        }
+    }
+    lines.join("\n")
+}
+
 /// How many of the segments of `report` past those it holds fit the
 /// ledger's room now, and the device's free memory; with `released`, also
 /// what the processes of the other world book, which end as they exit (a

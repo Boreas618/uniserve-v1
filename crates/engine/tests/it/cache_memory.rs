@@ -700,6 +700,74 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
     thread.join().unwrap();
 }
 
+/// Room for a profiling session's device storage on a GPU whose quota the
+/// cache and the process fill: 1500 bytes take the last two segments, which
+/// the request holding units 1..=27 keeps until it ends, before the workers
+/// give them back; once the session's storage is released, a growth
+/// creates them again. A ledger with room withdraws nothing, and storage
+/// that even every segment past the first does not make room for is
+/// refused, naming the bytes, with the cache kept whole.
+#[test]
+fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
+    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let mut holder = handle
+        .submit(request_of(1, 26 * BLOCK as usize + 6, 8))
+        .unwrap();
+    assert!(next_token(&mut holder, Duration::from_secs(10)).is_some());
+
+    let made = handle.resize_cache(CacheChange::MakeRoom { bytes: 1_500 });
+    assert!(
+        matches!(terminal(&mut holder), Some(Event::Finished { .. })),
+        "the request holding the tail runs to its end"
+    );
+    assert!(
+        made.recv_timeout(Duration::from_secs(10))
+            .expect("the scheduler answers")
+            .is_ok()
+    );
+    assert_eq!(
+        workers.lock().unwrap().hooks,
+        vec![
+            "uniserve.cache_memory".to_owned(),
+            r#"uniserve.release_cache {"from":6}"#.to_owned(),
+        ]
+    );
+
+    // The room is there: nothing more is given back.
+    assert!(resize(&handle, CacheChange::MakeRoom { bytes: 1_500 }).is_ok());
+    assert_eq!(workers.lock().unwrap().held, 6);
+    // The session books its storage, and releases it as it ends.
+    workers.lock().unwrap().process_bytes = 5_000;
+    assert!(resize(&handle, CacheChange::Grow).is_ok());
+    assert_eq!(
+        workers.lock().unwrap().held,
+        6,
+        "the session's storage holds the room"
+    );
+    workers.lock().unwrap().process_bytes = 3_500;
+    assert!(resize(&handle, CacheChange::Grow).is_ok());
+    assert_eq!(workers.lock().unwrap().held, SEGMENTS);
+
+    let error = resize(&handle, CacheChange::MakeRoom { bytes: 7_500 }).unwrap_err();
+    assert!(
+        error.contains("7500 bytes of device storage for a profiling session do not fit"),
+        "{error}"
+    );
+    assert!(
+        error.contains("11500 of a quota of 11500 bytes booked"),
+        "{error}"
+    );
+    assert_eq!(workers.lock().unwrap().held, SEGMENTS);
+    let mut served = handle.submit(request(2, 30, 1)).unwrap();
+    assert!(matches!(
+        terminal(&mut served),
+        Some(Event::Finished { .. })
+    ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// A successor whose process books more than the cache past its first
 /// segment holds (7 segments of 1000 bytes) does not fit: the serving
 /// world's limit of 500 bytes cannot hold its first segment. The shrink

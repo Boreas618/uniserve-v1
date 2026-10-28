@@ -725,6 +725,32 @@ impl EngineClient {
         .map(Answered::results)
     }
 
+    /// Gives back the tail of the engine's KV cache until each device's
+    /// storage ledger has room for `bytes` of a profiling session's device
+    /// storage beside everything it books; the requests that hold the tail
+    /// run on, and the answer comes once they let it go. Returns each
+    /// device's plan.
+    ///
+    /// # Errors
+    ///
+    /// Fails, changing nothing, when even the segments the cache cannot
+    /// give back leave a device too little room (naming every device's
+    /// bytes), while another change of the cache is in progress, or when
+    /// the engine ends first.
+    pub async fn make_room_for_session(&self, bytes: u64) -> Result<Vec<String>, String> {
+        self.ask(|id| {
+            wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+                id,
+                change: wire::CacheChange::MakeRoom as i32,
+                preempt_after_ms: None,
+                room_bytes: bytes,
+                ..wire::ResizeCache::default()
+            })
+        })
+        .await
+        .map(Answered::results)
+    }
+
     /// Has every worker rewrite its weights in place from the checkpoint at
     /// `model_path`, the requests in flight continuing as `in_flight` says,
     /// and returns what each reported.

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proto::profile::{Collector, SessionRequest, SessionStart};
+use proto::request::wire;
 use serde::Serialize;
 use tracing::{info, warn};
 
@@ -103,6 +104,11 @@ pub struct Session {
     pub baseline: Option<Rates>,
     pub overhead: Option<Overhead>,
     pub guard: Vec<GuardAction>,
+    /// The device storage the session holds on each selected worker's GPU
+    /// (`SessionRequest::device_storage`), which the workers book in the
+    /// GPUs' storage ledgers: the KV cache gave back tail segments for it
+    /// where a ledger lacked room, and grows back once the session ends.
+    pub device_storage: u64,
 }
 
 /// The deployment's sessions.
@@ -177,8 +183,38 @@ impl Leader {
             request: request.clone(),
         })
         .map_err(|error| UpdateError::Failed(error.into()))?;
-        let results = self.hook("uniserve.profile_start", &payload).await?;
+        // The device storage the collectors hold on each selected worker's
+        // GPU must fit its storage ledger: where it lacks room, the KV cache
+        // gives back tail segments first, as a world change's preparation
+        // does, the requests holding them running on.
+        let device_storage = request.device_storage();
+        if device_storage > 0 {
+            client.make_room_for_session(device_storage).await.map_err(|error| {
+                UpdateError::Refused(format!(
+                    "the session holds {device_storage} bytes of device storage on each selected \
+                     worker's GPU (a range_metrics pass), for which the KV cache cannot make \
+                     room: {error}"
+                ))
+            })?;
+        }
+        // A worker that cannot start the session, or whose GPU's storage
+        // ledger cannot fit the device storage its collectors would hold,
+        // leaves the session to the workers that started it, which end it.
+        let results = match self.hook("uniserve.profile_start", &payload).await {
+            Ok(results) => results,
+            Err(error) => {
+                self.abandon_profile(id, device_storage, &client).await;
+                return Err(error);
+            }
+        };
         let workers = answers(&results);
+        if let Some(refusal) = workers
+            .iter()
+            .find_map(|worker| worker["refused"].as_str().map(str::to_owned))
+        {
+            self.abandon_profile(id, device_storage, &client).await;
+            return Err(UpdateError::Refused(refusal));
+        }
         // The collectors some selected worker runs.
         let collectors: BTreeSet<Collector> = workers
             .iter()
@@ -211,6 +247,7 @@ impl Leader {
             baseline,
             overhead: None,
             guard: Vec::new(),
+            device_storage,
         };
         let answer = serde_json::to_value(&session).unwrap_or_default();
         *locked(&profiles.session) = Some(session);
@@ -246,6 +283,24 @@ impl Leader {
         end(&self.engines, client.as_deref(), id, reason, true).await;
         Ok(serde_json::to_value(self.profile_status()).unwrap_or_default())
     }
+
+    /// End session `id` on the workers that started it after another
+    /// worker refused or failed to: the session never ran, and each worker
+    /// that started it closes its file and releases its collectors and
+    /// their booked storage. The KV cache grows back into the room it made
+    /// for the session's `device_storage`.
+    async fn abandon_profile(&self, id: u64, device_storage: u64, client: &EngineClient) {
+        let payload = serde_json::json!({ "session": id, "reason": "not started" }).to_string();
+        if let Err(error) = self.hook("uniserve.profile_stop", &payload).await {
+            warn!(
+                session = id,
+                "ending a session other workers did not start failed: {error}"
+            );
+        }
+        if device_storage > 0 {
+            grow_back(client, id).await;
+        }
+    }
 }
 
 impl Profiles {
@@ -272,14 +327,34 @@ impl Profiles {
 /// runs: every worker writes its file. A session whose world no longer
 /// executes on `client` ends without its workers' answers, which wrote what
 /// they recorded as their world closed or keep it in their files' logs.
+/// Grow the engine's KV cache back into the room session `id` made for its
+/// device storage, once the workers released it.
+async fn grow_back(client: &EngineClient, id: u64) {
+    match client.resize_cache(wire::CacheChange::Grow).await {
+        Ok(_) => info!(
+            session = id,
+            "the KV cache grew back after the profiling session"
+        ),
+        Err(error) => warn!(
+            session = id,
+            "growing the KV cache back after the profiling session failed: {error}"
+        ),
+    }
+}
+
+/// End session `id` for `reason`: the workers of a world that still serves
+/// write their files, and, with `grow`, the KV cache grows back into the
+/// room the session made for its device storage; a world that stops
+/// executing (a world change's promotion, a rollback) keeps its cache as
+/// the change left it.
 pub(crate) async fn end(
     engines: &crate::leader::Engines,
     client: Option<&EngineClient>,
     id: u64,
     reason: &str,
-    hooked: bool,
+    grow: bool,
 ) {
-    let world = {
+    let (world, device_storage) = {
         let mut session = locked(&engines.profiles.session);
         let Some(running) = session
             .as_mut()
@@ -290,14 +365,14 @@ pub(crate) async fn end(
         engines.profiles.progress(running, &engines.observer);
         // Ending from here on: a second end finds it ended.
         running.state = "ending".to_owned();
-        running.world
+        (running.world, running.device_storage)
     };
     let mut files = Vec::new();
     let mut failure = None;
     // Only a world that still serves writes its files: a failed one's
     // workers keep what they committed (the files' write-ahead logs).
-    if let Some(client) = client
-        .filter(|client| hooked && client.world() == world && client.state() == EngineState::Ready)
+    if let Some(client) =
+        client.filter(|client| client.world() == world && client.state() == EngineState::Ready)
     {
         let payload = serde_json::json!({ "session": id, "reason": reason }).to_string();
         match tokio::time::timeout(STOP_TIMEOUT, client.hook("uniserve.profile_stop", &payload))
@@ -310,6 +385,9 @@ pub(crate) async fn end(
                     "the workers did not end it within {STOP_TIMEOUT:?}"
                 ))
             }
+        }
+        if grow && device_storage > 0 {
+            grow_back(client, id).await;
         }
     }
     let mut session = locked(&engines.profiles.session);
@@ -341,7 +419,7 @@ pub(crate) async fn end_for_world(
         .filter(|session| session.state == "running")
         .map(|session| session.id);
     if let Some(id) = running {
-        end(engines, client, id, reason, true).await;
+        end(engines, client, id, reason, false).await;
     }
 }
 

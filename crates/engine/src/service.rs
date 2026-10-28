@@ -722,6 +722,9 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         Ok(wire::CacheChange::Grow) => crate::CacheChange::Grow,
         Ok(wire::CacheChange::Plan) => crate::CacheChange::Plan(successor),
         Ok(wire::CacheChange::Evict) => crate::CacheChange::Evict,
+        Ok(wire::CacheChange::MakeRoom) => crate::CacheChange::MakeRoom {
+            bytes: resize.room_bytes,
+        },
         Ok(wire::CacheChange::Restore) => crate::CacheChange::Restore,
         Ok(wire::CacheChange::Sleep) => crate::CacheChange::Sleep,
         Ok(wire::CacheChange::Wake) => crate::CacheChange::Wake,

@@ -989,19 +989,50 @@ impl Service<'_> {
             "uniserve.profile_start" => {
                 let start: proto::profile::SessionStart = serde_json::from_value(payload)
                     .map_err(|error| Error::Invalid(format!("profile_start: {error}")))?;
+                let rank = self.maintenance.rank;
                 let device = self.maintenance.devices.first().copied();
-                self.executor
-                    .backend_mut()
-                    .start_session(start, self.maintenance.rank, device)?
+                // The device storage the session's collectors will hold is
+                // booked with the rank's process before they start, so the
+                // ledger's plans count it while the session holds it; a
+                // ledger that cannot fit it refuses the session.
+                let held =
+                    crate::profiling::session::collectors::device_storage(&start.request, rank);
+                match self.book_profiling(device, held)? {
+                    Some(refusal) => serde_json::json!({
+                        "rank": rank,
+                        "selected": true,
+                        "refused": format!(
+                            "range_metrics holds {held} bytes of device storage for its range \
+                             profiler pass, which the ledger of the rank's GPU cannot fit: \
+                             {refusal}"
+                        ),
+                    }),
+                    None => match self
+                        .executor
+                        .backend_mut()
+                        .start_session(start, rank, device)
+                    {
+                        Ok(answer) => answer,
+                        Err(error) => {
+                            self.unbook_profiling(device);
+                            return Err(error);
+                        }
+                    },
+                }
             }
             "uniserve.profile_stop" => {
                 let session = payload["session"]
                     .as_u64()
                     .ok_or_else(|| Error::Invalid("profile_stop names no session".into()))?;
                 let reason = payload["reason"].as_str().unwrap_or("stopped");
-                self.executor
-                    .backend_mut()
-                    .stop_session(session, reason, self.maintenance.rank)
+                let answer = self.executor.backend_mut().stop_session(
+                    session,
+                    reason,
+                    self.maintenance.rank,
+                );
+                // The ended session's collectors hold no device storage.
+                self.unbook_profiling(self.maintenance.devices.first().copied());
+                answer
             }
             "uniserve.profile_release" => {
                 let session = payload["session"]
@@ -1053,6 +1084,62 @@ impl Service<'_> {
             booking.submit(retained, graphs)?;
         }
         Ok(())
+    }
+
+    /// Books `bytes` of device storage a profiling session's collectors
+    /// hold on `device` with the rank's process in the device's ledger,
+    /// replacing what an earlier session booked. Answers the ledger's
+    /// refusal, with the booking unchanged, when it cannot fit them. A rank
+    /// that books nothing (`LocalMemory`, or a parked standby, which books
+    /// at its promotion) books none of them either.
+    fn book_profiling(
+        &mut self,
+        device: Option<cuda::DeviceId>,
+        bytes: u64,
+    ) -> crate::Result<Option<String>> {
+        let (Some(retained), Some(device)) = (self.maintenance.retained.clone(), device) else {
+            return Ok(None);
+        };
+        if self.standby.is_some() {
+            return Ok(None);
+        }
+        let graphs = !self.maintenance.asleep;
+        let Some(booking) = self
+            .maintenance
+            .bookings
+            .iter_mut()
+            .find(|booking| booking.device == device)
+        else {
+            return Ok(None);
+        };
+        if booking.profiling == bytes {
+            return Ok(None);
+        }
+        let booked = std::mem::replace(&mut booking.profiling, bytes);
+        match booking.submit(&retained, graphs) {
+            Ok(_) => Ok(None),
+            Err(error) => {
+                booking.profiling = booked;
+                match error {
+                    // `Retained::book` answers the server's refusal of a
+                    // booking past the quota so.
+                    Error::Unsupported(refusal) => Ok(Some(refusal)),
+                    error => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Books no profiling storage on `device` any more. A failure leaves
+    /// the larger booking in the ledger, which only overstates the rank's
+    /// storage, so it is logged rather than failing the session's end.
+    fn unbook_profiling(&mut self, device: Option<cuda::DeviceId>) {
+        let failure = match self.book_profiling(device, 0) {
+            Ok(None) => return,
+            Ok(Some(refusal)) => refusal,
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!("unbooking the ended profiling session's device storage failed: {failure}");
     }
 
     /// Makes the device memory beside the KV cache hold a checkpoint of the

@@ -719,6 +719,12 @@ pub enum CacheChange {
     /// hold reached the host KV cache, so that the successor's cache grows
     /// into them. A resume creates them again.
     Evict,
+    /// Gives back the tail of the cache until each device's storage ledger
+    /// has room for `bytes` beside everything it books (the device storage
+    /// a profiling session holds); the requests that hold the tail run on.
+    /// Fails, changing nothing, when even the segments the cache cannot
+    /// give back leave too little room.
+    MakeRoom { bytes: u64 },
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the

@@ -274,8 +274,10 @@ pub enum Item {
     GraphPool,
     /// What a worker process holds on the device beside the storages the
     /// server retains and its graph pool: its CUDA context, communicator
-    /// buffers, PyTorch's allocations, Rust's arenas and tables, and the
-    /// product storage it has yet to make resident. Booked by the worker.
+    /// buffers, PyTorch's allocations, Rust's arenas and tables, the
+    /// product storage it has yet to make resident, and the device storage
+    /// a profiling session's collectors hold while it runs. Booked by the
+    /// worker.
     Process,
     /// Device memory a process holds to stage transfers. Booked by the
     /// process.

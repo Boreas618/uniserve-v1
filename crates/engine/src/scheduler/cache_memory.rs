@@ -20,7 +20,7 @@
 //! rewrites the weights while the workers sleep, so that the cache's memory
 //! holds the new checkpoint as it loads.
 
-use super::ledger::{CacheMemory, Preparing, growable, preparing};
+use super::ledger::{CacheMemory, Preparing, growable, preparing, room, room_refusal};
 use super::*;
 use crate::executor::WorkerGroupId;
 use crate::handle::CacheChange;
@@ -97,6 +97,13 @@ impl Scheduler {
                     .ok_or(plan)
                 })
             }
+            CacheChange::MakeRoom { bytes } => self.start_room(bytes).map(|(from, plan)| {
+                from.map(|from| Pending::Shrink {
+                    from,
+                    plan: plan.clone(),
+                })
+                .ok_or(plan)
+            }),
             CacheChange::Plan(successor) => {
                 let _ = answer.send(
                     self.plan_preparation(successor)
@@ -502,15 +509,7 @@ impl Scheduler {
         };
         let first = &reports[0];
         let held = first.held;
-        // The last segment that stays: the first, and every inherited one.
-        let inherited = self
-            .storage
-            .cache()
-            .map_or(0..0, |cache| cache.block_pool.inherited());
-        let floor = (1..held)
-            .rev()
-            .find(|&index| first.first_unit(index) < inherited.end)
-            .map_or(1, |index| index + 1);
+        let floor = self.kept_floor(first);
         let mut keep = held;
         let mut plans: Vec<Preparing> = Vec::new();
         for report in &reports {
@@ -556,6 +555,60 @@ impl Scheduler {
             tail: (keep < held).then(|| (keep, first.first_unit(keep))),
             plans,
         })
+    }
+
+    /// The segments of a cache split as `first` reports that it cannot give
+    /// back: the first, which holds the padding and warmup units, and every
+    /// segment it inherited and does not own yet.
+    fn kept_floor(&mut self, first: &CacheMemory) -> u32 {
+        let inherited = self
+            .storage
+            .cache()
+            .map_or(0..0, |cache| cache.block_pool.inherited());
+        (1..first.held)
+            .rev()
+            .find(|&index| first.first_unit(index) < inherited.end)
+            .map_or(1, |index| index + 1)
+    }
+
+    /// Withdraws the tail past what leaves every device's ledger room for
+    /// `bytes` of a profiling session's device storage beside everything it
+    /// books ([`room`]); the requests holding it run on. Returns the first
+    /// segment to give back, `None` when every device has the room already
+    /// (or the cache is not split into segments, which gives back nothing),
+    /// and each device's plan.
+    ///
+    /// Fails, withdrawing nothing, when even the segments the cache cannot
+    /// give back leave a device too little room: the error names every
+    /// device's bytes and ledger entries.
+    fn start_room(&mut self, bytes: u64) -> Result<(Option<u32>, Vec<String>), String> {
+        let Some(MemoryReports { cache: reports, .. }) = self.memory_reports()? else {
+            return Ok((None, Vec::new()));
+        };
+        let first = &reports[0];
+        let held = first.held;
+        let floor = self.kept_floor(first);
+        let rooms = reports
+            .iter()
+            .map(|report| room(report, bytes, floor))
+            .collect::<Result<Vec<_>, _>>()?;
+        if rooms.iter().any(|room| !room.feasible) {
+            return Err(room_refusal(&rooms));
+        }
+        let keep = rooms
+            .iter()
+            .map(|room| room.segments_kept)
+            .min()
+            .unwrap_or(held);
+        let plans = rooms
+            .iter()
+            .map(|room| serde_json::to_string(room).unwrap_or_default())
+            .collect();
+        if keep >= held {
+            return Ok((None, plans));
+        }
+        self.withdraw_from(reports[0].first_unit(keep), false);
+        Ok((Some(keep), plans))
     }
 
     /// Withdraws the tail past what each device's limit keeps

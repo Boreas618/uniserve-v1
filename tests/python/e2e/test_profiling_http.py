@@ -16,6 +16,8 @@ Storage Server of the test's own in a runtime directory the test creates
   the Perfetto
   converter turns it into a trace. One session runs at a time, and one
   naming two collectors of the device's performance monitors is refused.
+- A range_metrics session books its range profiler pass's device storage
+  with the worker's process item in the GPU's ledger until it ends.
 - A session whose world is replaced ends with the world change, its file
   written.
 - The quality-of-service guard turns collectors off, costliest first, and
@@ -33,7 +35,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.python.e2e.profiling_helpers import NAME, serve
+from tests.python.e2e.profiling_helpers import NAME, RANGE_PASS_STORAGE, serve
 from tests.python.e2e.profiling_helpers import Load as _Load
 from tests.python.e2e.profiling_helpers import ended as _ended
 from tests.python.e2e.profiling_helpers import profile as _profile
@@ -210,6 +212,39 @@ def test_a_session_records_its_collectors_into_its_file(
         trace = convert([path])
         names = {event.get("name") for event in trace["traceEvents"]}
         assert "models.qwen3.transformer.TransformerLayer" in names
+
+
+def _process_bytes(base_url: str) -> int:
+    """The bytes the worker's process item books in its GPU's ledger."""
+    status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+    entries = [
+        entry
+        for node in status["ledgers"]
+        for ledger in node["ledgers"]
+        for entry in ledger["entries"]
+        if entry["item"] == "process"
+    ]
+    assert len(entries) == 1, entries
+    return entries[0]["bytes"]
+
+
+def test_a_range_metrics_session_books_its_pass_while_it_runs(
+    served: str, tmp_path: Path
+):
+    before = _process_bytes(served)
+    _start(
+        served,
+        {
+            "collectors": ["range_metrics"],
+            "stages": ["decode"],
+            "output_dir": str(tmp_path / "profiles"),
+        },
+    )
+    assert _process_bytes(served) == before + RANGE_PASS_STORAGE
+    stopped = httpx.delete(f"{served}/admin/profile", timeout=600)
+    assert stopped.status_code == 200, stopped.text
+    assert _ended(served, 60)["end_reason"] == "operator"
+    assert _process_bytes(served) == before
 
 
 def test_a_world_change_ends_the_session_of_the_world_it_replaces(
