@@ -1237,6 +1237,7 @@ impl Published {
                     offset: 0,
                     length: layout.bytes,
                     key,
+                    storage_offset: 0,
                 }],
                 layout,
             },

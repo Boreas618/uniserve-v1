@@ -859,6 +859,35 @@ fn column_views_with_gaps_between_rows_redistribute() {
     assert_fields_equal(&request, &apply(&request, &manifest));
 }
 
+#[test]
+fn borrowed_regions_copy_between_offsets_of_the_same_allocation() {
+    let mut source = storage(vec![field("page", 0, &[64], vec![whole(64)], vec![0])]);
+    assert_eq!(source.chunks.len(), 1);
+    source.chunks[0].storage_offset = 64;
+    let mut target = source.clone();
+    target.chunks[0].storage_offset = 512;
+    let request = Request {
+        source: world(vec![(Some(gpu(0)), vec![source])]),
+        target: world(vec![(Some(gpu(0)), vec![target])]),
+        gpus: vec![gpu(0)],
+        links: links(1),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    let mut allocation = vec![0_u8; 1_024];
+    let expected: Vec<u8> = (0..256).map(|byte| (byte % 251) as u8).collect();
+    allocation[64..320].copy_from_slice(&expected);
+    for span in manifest.spans(&request) {
+        let span = span.unwrap();
+        for row in 0..span.rows {
+            let source = (span.source_offset + row * span.source_pitch) as usize;
+            let target = (span.destination_offset + row * span.destination_pitch) as usize;
+            allocation.copy_within(source..source + span.bytes as usize, target);
+        }
+    }
+    assert_eq!(&allocation[512..768], expected.as_slice());
+    assert_eq!(&allocation[64..320], expected.as_slice());
+}
+
 /// A field stored in this test's encoding, whose canonical form is the
 /// affine field itself at offset zero of its group's staging space.
 fn encoded(mut field: Field, group: &str) -> Field {
