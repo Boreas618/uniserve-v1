@@ -1591,23 +1591,24 @@ impl Replica {
             Some(planned) => Some(planned.report),
             None => None,
         };
-        let report = self
-            .change_world(
-                &running,
-                served,
-                current,
-                target,
-                target_spec,
-                target_digest,
-                &update,
-                request.in_flight,
-                successor,
-                redistributes,
-                &budgets,
-                &target_hosts,
-                redistribution,
-            )
-            .await?;
+        // The world change holds every stage's state across its awaits; boxed,
+        // it does not grow the caller's future by that much.
+        let report = Box::pin(self.change_world(
+            &running,
+            served,
+            current,
+            target,
+            target_spec,
+            target_digest,
+            &update,
+            request.in_flight,
+            successor,
+            redistributes,
+            &budgets,
+            &target_hosts,
+            redistribution,
+        ))
+        .await?;
         Ok(Applied::World(report))
     }
 
@@ -2131,11 +2132,7 @@ impl Replica {
             .trial
             .take()
             .ok_or_else(|| UpdateError::Refused("no world is on trial".into()))?;
-        begin_commit(
-            registry,
-            &[Arc::clone(self)],
-            vec![trial.previous_world],
-        );
+        begin_commit(registry, &[Arc::clone(self)], vec![trial.previous_world]);
         if let Previous::Parked(previous) = trial.previous {
             close(&previous).await;
         }
