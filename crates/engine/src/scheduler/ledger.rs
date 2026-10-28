@@ -242,6 +242,7 @@ pub(super) fn preparing(
     floor: u32,
     adds: &crate::Successor,
     in_flight_units: u32,
+    in_flight_tokens: &[u32],
 ) -> Result<Preparing, String> {
     let (Some(ledger), Some(scope), Some(world)) = (&report.ledger, &report.scope, report.world)
     else {
@@ -253,6 +254,8 @@ pub(super) fn preparing(
             storage::protocol::gpu_name(&ledger.gpu)
         )
     })?;
+    let target = adds.rank_budgets.get(&ledger.gpu);
+    let quota = target.map_or(quota, |target| quota.min(target.quota));
     let own = |item: Item| ledger.bytes(|entry| entry.item == item && report.owns(entry));
     let serving = Holdings {
         weights: ledger.bytes(|entry| entry.item == Item::Weights && entry.worlds.contains(&world)),
@@ -283,22 +286,33 @@ pub(super) fn preparing(
         weights: if adds.loads_weights {
             serving.weights
         } else {
-            adds.created_weights.get(&ledger.gpu).copied().unwrap_or(0)
+            target.map_or(0, |target| target.weights)
         },
         // A successor captures graphs only when its policy captures and its
         // model can be captured.
-        graph_pool: if adds.captures_graphs && report.capturable {
+        graph_pool: if let Some(target) = target {
+            target.graphs
+        } else if adds.captures_graphs && report.capturable {
             report.graph_share_bytes
         } else {
             0
         },
-        process: serving.process,
-        exclusive: serving.exclusive,
-        head_segment: report.head_bytes,
-        in_flight: if adds.recomputes_cache {
-            u64::from(in_flight_units) * report.unit_bytes
-        } else {
-            0
+        process: target.map_or(serving.process, |target| {
+            target.process.max(serving.process)
+        }),
+        exclusive: target.map_or(serving.exclusive, |target| target.fixed),
+        head_segment: target.map_or(report.head_bytes, |target| target.cache),
+        in_flight: {
+            let requests = if adds.recomputes_cache {
+                target.map_or(u64::from(in_flight_units) * report.unit_bytes, |target| {
+                    target.request_bytes(in_flight_tokens)
+                })
+            } else {
+                0
+            };
+            target.map_or(requests, |target| {
+                requests.max(target.cache_capacity.saturating_sub(target.cache))
+            })
         },
     };
     let in_flight_kv = u64::from(in_flight_units) * report.unit_bytes;

@@ -671,11 +671,9 @@ pub enum WeightsInFlight {
     Abort,
 }
 
-/// The bytes of weight chunks a world succeeding the serving one creates on
-/// each GPU, by UUID, beside those it maps read-only: a successor of another
-/// parallel configuration holds other regions of the weights on a GPU
-/// (`specs/online-operations.md`, §4.7).
-pub type CreatedWeights = std::collections::BTreeMap<[u8; 16], u64>;
+/// Target rank resources by GPU UUID, including the concrete weight chunks
+/// created beside retained source chunks.
+pub type RankBudgets = std::collections::BTreeMap<[u8; 16], storage::manifest::weights::RankBudget>;
 
 /// What a world succeeding this one on the same devices adds beside what it
 /// shares with it, which a shrink makes room for.
@@ -692,11 +690,8 @@ pub struct Successor {
     /// `off`), so its warmup takes a graph share where its model can be
     /// captured.
     pub captures_graphs: bool,
-    /// The weight chunks it creates on each GPU beside those it maps
-    /// read-only, when it does not load all of its weights: a world of
-    /// another parallel configuration, as the daemon planned its copy
-    /// manifests.
-    pub created_weights: CreatedWeights,
+    /// Its target numerical capacity and concrete transfer allocations.
+    pub rank_budgets: RankBudgets,
 }
 
 /// A change to the device memory of a scheduler's KV cache.

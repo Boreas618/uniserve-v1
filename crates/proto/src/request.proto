@@ -366,18 +366,30 @@ message ResizeCache {
   // For a make-room change: the device bytes each device's storage ledger
   // must have room for beside everything it books.
   uint64 room_bytes = 9;
-  // For a plan or a shrink: the bytes of weight chunks the succeeding
-  // world creates on each GPU beside those it maps read-only (a world of
-  // another parallel configuration, as the daemon planned its copy
-  // manifests); absent for a GPU where it creates none.
-  repeated CreatedWeights created_weights = 10;
+  // Target rank capacities and concrete transfer allocations on each GPU.
+  repeated RankBudget rank_budgets = 10;
 }
 
-// The bytes of weight chunks a world creates on one GPU.
-message CreatedWeights {
+// Resources a target rank adds beside retained source chunks.
+message RankBudget {
   // The GPU's UUID: 16 bytes.
   bytes gpu = 1;
+  uint64 weights = 2;
+  uint64 quota = 3;
+  uint64 process = 4;
+  uint64 graphs = 5;
+  uint64 fixed = 6;
+  uint64 cache = 7;
+  uint64 cache_capacity = 8;
+  repeated CachePageBudget pages = 9;
+}
+
+// Target cache page storage, after layer/head partitioning and encoding.
+message CachePageBudget {
+  uint32 tokens = 1;
   uint64 bytes = 2;
+  optional uint32 window = 3;
+  bool state = 4;
 }
 
 enum CacheChange {

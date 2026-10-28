@@ -231,6 +231,12 @@ impl LoadedModel {
             load,
             false,
         )?;
+        Self::from_handle(description, handle)
+    }
+
+    /// Read numerical facts from a materialized rank, including a rank
+    /// whose storage has been allocated without checkpoint values.
+    pub(crate) fn from_handle(description: Description, handle: Handle) -> Result<Self> {
         let backend: tvm_ffi::String =
             Interpreter::import(&format!("{LOADING}.attention_backend"))?
                 .call_as(&[handle.view()])?;

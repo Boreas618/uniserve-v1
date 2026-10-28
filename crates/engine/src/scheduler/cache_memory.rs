@@ -494,9 +494,7 @@ impl Scheduler {
         &mut self,
         successor: &crate::Successor,
     ) -> Result<Preparation, String> {
-        // The units the requests in flight hold now: a successor that maps
-        // none of this cache computes their state in as many of its own.
-        let in_flight_units = self.migrating_units();
+        let (in_flight_units, in_flight_tokens) = self.migrating_cache();
         let Some(MemoryReports {
             cache: reports,
             beside,
@@ -513,7 +511,7 @@ impl Scheduler {
         let mut keep = held;
         let mut plans: Vec<Preparing> = Vec::new();
         for report in &reports {
-            let mut plan = preparing(report, floor, successor, in_flight_units)?;
+            let mut plan = preparing(report, floor, successor, in_flight_units, &in_flight_tokens)?;
             let mut kept = plan.segments_kept;
             // A configured capacity holds the successor's cache: the
             // segments it inherits from this one and its head. A successor
@@ -549,7 +547,7 @@ impl Scheduler {
         // Server: its successor adds beside it what it holds, and the limit
         // left (of no cache) must not be negative.
         for report in beside.iter().filter(|report| report.ledger.is_some()) {
-            plans.push(preparing(report, 0, successor, 0)?);
+            plans.push(preparing(report, 0, successor, 0, &in_flight_tokens)?);
         }
         if plans.iter().any(|plan| !plan.feasible) {
             return Err(super::ledger::refusal(&plans));

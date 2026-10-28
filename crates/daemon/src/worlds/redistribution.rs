@@ -1,4 +1,4 @@
-//! The daemon plans retained weights, rank placement and device memory before
+//! The daemon plans retained weights, rank assignment and device storage before
 //! a successor starts. Planning ranks run on their actual nodes through the
 //! deployment process interface; each describes its target layout and measures
 //! the links to retained sources. The daemon caches and sends executable copy
@@ -11,7 +11,7 @@ use std::time::Instant;
 use anyhow::Context as _;
 use engine::launches::Agreement;
 use proto::request::wire;
-use storage::manifest::weights::{Sources, Transfer};
+use storage::manifest::weights::{RankBudget, Sources, Transfer};
 use storage::manifest::{self, Gpu, Manifest};
 
 /// What a change of the parallel configuration does with the weights, as
@@ -25,8 +25,8 @@ pub(crate) struct Redistribution {
     pub(crate) chosen: bool,
     /// Executable weight transfer for each worker group.
     pub(crate) received: Vec<wire::ReceivedWeights>,
-    /// The bytes of weight chunks the successor creates on each GPU.
-    pub(crate) created: BTreeMap<Gpu, u64>,
+    /// Target resources beside the retained chunks shared with its sources.
+    pub(crate) budgets: BTreeMap<Gpu, RankBudget>,
     /// What the plan reports: each GPU's mapped, copied and created bytes,
     /// each manifest's digest and link loads.
     pub(crate) report: serde_json::Value,
@@ -223,37 +223,60 @@ pub(crate) async fn plan(
         }));
     }
 
-    // A GPU the serving world holds no weights on has none of its KV cache
-    // to give back: what the successor creates there must fit in its free
-    // storage.
+    // A new GPU has no serving KV tail to reclaim. Admission must fit the
+    // target's complete initial footprint within both its static quota and
+    // physical free storage, beside every resident world of the deployment.
     let serving: BTreeSet<Gpu> = sources
         .iter()
         .flat_map(|sources| sources.world.ranks.iter().filter_map(|rank| rank.gpu))
         .collect();
     let mut refusals = Vec::new();
     let mut gpus_report = Vec::new();
+    let mut budgets = BTreeMap::new();
     for (gpu, bytes) in &per_gpu {
-        let free = planned
+        let device = planned
             .iter()
             .find(|rank| rank.gpu == *gpu)
-            .map(|rank| rank.free_bytes);
+            .context("target GPU has no resource measurement")?;
+        let target = &planned[assigned
+            .iter()
+            .position(|assigned| assigned == gpu)
+            .context("target GPU has no assigned rank")?];
+        let mut budget = target
+            .budget
+            .clone()
+            .context("target rank has no capacity plan")?;
+        budget.quota = ((budget.quota as u128 * device.total_bytes as u128)
+            / target.total_bytes as u128) as u64;
+        if let Some(quota) = device.device_quota {
+            budget.quota = budget.quota.min(quota);
+        }
+        budget.weights = bytes.created;
+        let available = budget
+            .quota
+            .saturating_sub(device.resident_bytes)
+            .min(device.free_bytes);
         let serves = serving.contains(gpu);
-        if !serves && let Some(free) = free.filter(|free| bytes.created > *free) {
+        if !serves && budget.required() > available {
             refusals.push(format!(
-                "GPU {} holds none of the serving world's weights and has {free} bytes free, \
-                 but the successor creates {} bytes of weights there",
+                "GPU {} has {available} bytes available within its quota and physical free storage, \
+                 but the target requires {} bytes (weights {}, process {}, graphs {}, fixed {}, cache {})",
                 storage::protocol::gpu_name(gpu),
-                bytes.created
+                budget.required(), budget.weights, budget.process, budget.graphs, budget.fixed, budget.cache,
             ));
         }
         gpus_report.push(serde_json::json!({
             "gpu": storage::protocol::gpu_name(gpu),
             "serving": serves,
-            "free_bytes": free,
+            "free_bytes": device.free_bytes,
+            "resident_bytes": device.resident_bytes,
+            "available_bytes": available,
+            "budget": budget,
             "mapped_bytes": bytes.mapped,
             "copied_bytes": bytes.copied,
             "created_bytes": bytes.created,
         }));
+        budgets.insert(*gpu, budget);
     }
     let chosen = open && same_sources;
     let refusal = (!refusals.is_empty()).then(|| refusals.join("; "));
@@ -272,10 +295,7 @@ pub(crate) async fn plan(
         devices: order.clone(),
         chosen,
         received,
-        created: per_gpu
-            .iter()
-            .map(|(gpu, bytes)| (*gpu, bytes.created))
-            .collect(),
+        budgets,
         report: serde_json::json!({
             "devices": order,
             "order": if chosen { "chosen" } else { "stated" },

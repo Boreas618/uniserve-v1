@@ -71,6 +71,54 @@ pub(super) fn log_capacity(config: &WorkerConfig, plan: &Plan) {
 /// workers': one, on the device's primary stream.
 const COMPUTATION_COLUMNS: usize = 1;
 
+/// Initial writable cache storage at the target layout. Explicit token
+/// capacity is reserved in full on a new GPU; automatic capacity must at
+/// least hold the sentinel and the pages needed to advance a request.
+pub(super) fn cache_budget(
+    launch: &WorkerLaunch,
+    config: &WorkerConfig,
+    plan: &Plan,
+    budget: &mut storage::manifest::weights::RankBudget,
+) -> Result<()> {
+    let Some(cache) = plan.cache.as_ref() else {
+        return Ok(());
+    };
+    let units = 1 + cache.progress_units();
+    let units = match config.device {
+        Device::Cuda(device) => crate::memory::prefix_cache::planes::PlaneLayout::whole_granules(
+            units,
+            cache.plane_bytes,
+            HandleType::Descriptor.granularity(device)? as u64,
+        ),
+        Device::Cpu => units,
+    };
+    let columns = PrefixCache::import_workers(plan.info.max_unresolved_calls as usize)
+        + COMPUTATION_COLUMNS
+        + usize::from(launch.storage.host_kv_cache);
+    let unit_bytes = cache.unit_bytes + columns as u64 * UnitColumn::bytes(1);
+    budget.cache = u64::from(units) * unit_bytes;
+    budget.cache_capacity = if config.max_total_tokens.is_some() {
+        plan.info
+            .prefix_cache
+            .as_ref()
+            .map_or(0, |cache| u64::from(cache.num_units) * unit_bytes)
+    } else {
+        budget.cache
+    };
+    budget.pages = cache
+        .groups
+        .iter()
+        .filter(|group| !group.draft)
+        .map(|group| storage::manifest::weights::CachePage {
+            tokens: group.block_size,
+            bytes: u64::from(group.units_per_page) * unit_bytes,
+            window: group.window,
+            state: group.state,
+        })
+        .collect();
+    Ok(())
+}
+
 /// Resolve the rank's KV block size into `config`: the largest of at most
 /// 64 tokens every resident cache layer's attention reads, agreed over the
 /// worker group. Collective, at the same point of every rank's startup.

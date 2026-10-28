@@ -50,6 +50,12 @@ pub struct PlannedRank {
     pub gpu: Gpu,
     pub total_bytes: u64,
     pub free_bytes: u64,
+    /// Resident deployment storage and the Transfer Server context needed
+    /// beside this rank, measured from the device ledger.
+    pub resident_bytes: u64,
+    pub device_quota: Option<u64>,
+    /// Target numerical capacity, independent of the source rank's layout.
+    pub budget: Option<RankBudget>,
     /// The digest of what determines the bytes of the rank's tensors, by
     /// checkpoint source, in hex as a manifest states them: the storages it
     /// receives are of sources with the same digests ([`sources`]).
@@ -61,6 +67,103 @@ pub struct PlannedRank {
     pub storages: Option<Vec<Storage>>,
     /// Retained source weights and measured links on the deployment's nodes.
     pub sources: Option<Sources>,
+}
+
+/// What a successor rank must hold on its GPU before it can serve.
+/// Weight bytes are filled from the concrete transfer manifest; the other
+/// quantities come from the target rank's numerical and executor layouts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankBudget {
+    pub quota: u64,
+    pub process: u64,
+    pub graphs: u64,
+    pub fixed: u64,
+    pub cache: u64,
+    pub cache_capacity: u64,
+    pub weights: u64,
+    pub pages: Vec<CachePage>,
+}
+
+/// Storage of a target cache group's logical page, including its resident
+/// layers, heads, numerical encoding and per-unit index columns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePage {
+    pub tokens: u32,
+    pub bytes: u64,
+    pub window: Option<u32>,
+    pub state: bool,
+}
+
+impl RankBudget {
+    /// Storage the new rank adds beside already retained chunks.
+    pub fn required(&self) -> u64 {
+        self.process + self.graphs + self.fixed + self.cache.max(self.cache_capacity) + self.weights
+    }
+
+    /// Writable cache needed to resume accepted request prefixes at this
+    /// target layout. Windowed attention keeps the pages intersecting its
+    /// history; recurrent layers keep an input and an output checkpoint.
+    pub fn request_bytes(&self, tokens: &[u32]) -> u64 {
+        tokens
+            .iter()
+            .filter(|&&tokens| tokens > 0)
+            .map(|&tokens| {
+                self.pages
+                    .iter()
+                    .map(|page| {
+                        let count = if page.state {
+                            2
+                        } else {
+                            let first = page
+                                .window
+                                .map_or(0, |window| tokens.saturating_sub(window) / page.tokens);
+                            tokens.div_ceil(page.tokens) - first
+                        };
+                        u64::from(count) * page.bytes
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{CachePage, RankBudget};
+
+    #[test]
+    fn request_storage_follows_target_pages_windows_and_state() {
+        let budget = RankBudget {
+            pages: vec![
+                CachePage {
+                    tokens: 8,
+                    bytes: 128,
+                    window: None,
+                    state: false,
+                },
+                CachePage {
+                    tokens: 4,
+                    bytes: 32,
+                    window: Some(5),
+                    state: false,
+                },
+                CachePage {
+                    tokens: 8,
+                    bytes: 16,
+                    window: None,
+                    state: true,
+                },
+            ],
+            ..Default::default()
+        };
+        // Eight tokens fit one full-attention page, two window pages,
+        // and the input/output recurrent checkpoints. Token nine adds
+        // another full-attention page while the window still spans two.
+        assert_eq!(budget.request_bytes(&[0]), 0);
+        assert_eq!(budget.request_bytes(&[8]), 224);
+        assert_eq!(budget.request_bytes(&[9]), 352);
+        assert_eq!(budget.request_bytes(&[8, 9]), 576);
+    }
 }
 
 /// What a reader takes from a manifest's text: its version, fingerprints

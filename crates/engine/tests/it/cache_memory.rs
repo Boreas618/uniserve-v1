@@ -622,7 +622,15 @@ fn the_weights_a_successor_creates_leave_the_serving_world_less_cache() {
         ..Workers::filling(0)
     });
     let creating = |gpu: [u8; 16]| Successor {
-        created_weights: engine::CreatedWeights::from([(gpu, 3 * SEGMENT_BYTES)]),
+        rank_budgets: engine::RankBudgets::from([(
+            gpu,
+            storage::manifest::weights::RankBudget {
+                quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 3 * SEGMENT_BYTES,
+                weights: 3 * SEGMENT_BYTES,
+                cache: 2 * SEGMENT_BYTES,
+                ..Default::default()
+            },
+        )]),
         ..Successor::default()
     };
     let plans = resize(&handle, CacheChange::Plan(creating([8; 16]))).unwrap();
@@ -651,6 +659,89 @@ fn the_weights_a_successor_creates_leave_the_serving_world_less_cache() {
         Some(format!(r#"uniserve.release_cache {{"from":{}}}"#, SEGMENTS - 2).as_str())
     );
 
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A reshape can change both the quota and the numerical buffers. The
+/// serving cache gives back the target's complete initial capacity, without
+/// charging that capacity twice as a head plus a configured pool.
+#[test]
+fn a_target_rank_reserves_its_own_capacity_within_its_quota() {
+    let (handle, _, thread) = start(Workers {
+        quota: 20_000,
+        head_bytes: 9_000,
+        ..Workers::filling(0)
+    });
+    let target = Successor {
+        rank_budgets: engine::RankBudgets::from([(
+            [7; 16],
+            storage::manifest::weights::RankBudget {
+                quota: 10_000,
+                weights: 1_000,
+                process: 1_000,
+                graphs: 500,
+                fixed: 500,
+                cache: 1_000,
+                cache_capacity: 2_000,
+                pages: Vec::new(),
+            },
+        )]),
+        ..Successor::default()
+    };
+    let plans = resize(&handle, CacheChange::Plan(target.clone())).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["quota"], 10_000);
+    assert_eq!(plan["kv_limit"], 5_000);
+    assert_eq!(plan["segments_kept"], 5);
+    resize(
+        &handle,
+        CacheChange::Shrink {
+            preempt_after: None,
+            successor: target.clone(),
+        },
+    )
+    .unwrap();
+    let plans = resize(&handle, CacheChange::Plan(target)).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["segments_held"], 5);
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+#[test]
+fn recomputation_uses_the_target_window_and_page_storage() {
+    let (handle, _, thread) = start(Workers {
+        quota: 20_000,
+        ..Workers::filling(0)
+    });
+    let mut running = handle.submit(request(1, 4, 10_000)).unwrap();
+    assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+    let target = Successor {
+        recomputes_cache: true,
+        rank_budgets: engine::RankBudgets::from([(
+            [7; 16],
+            storage::manifest::weights::RankBudget {
+                quota: 20_000,
+                cache: 1_000,
+                pages: vec![storage::manifest::weights::CachePage {
+                    tokens: 32,
+                    bytes: 100,
+                    window: Some(4),
+                    state: false,
+                }],
+                ..Default::default()
+            },
+        )]),
+        ..Successor::default()
+    };
+    let plans = resize(&handle, CacheChange::Plan(target)).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    // Four history tokens intersect at most two of the target's 32-token
+    // pages, while the source retains the complete accepted prefix.
+    let target_bytes = plan["successor"]["in_flight"].as_u64().unwrap();
+    assert!((100..=200).contains(&target_bytes), "{plan}");
+    assert!(plan["in_flight_kv"].as_u64().unwrap() >= 1_000, "{plan}");
     handle.shutdown();
     thread.join().unwrap();
 }

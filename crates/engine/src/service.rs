@@ -714,13 +714,36 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         recomputes_cache: resize.successor_recomputes_cache,
         captures_graphs: resize.successor_captures_graphs,
         // A malformed UUID names no GPU of this deployment.
-        created_weights: resize
-            .created_weights
+        rank_budgets: resize
+            .rank_budgets
             .iter()
             .filter_map(|weights| {
                 <[u8; 16]>::try_from(weights.gpu.as_slice())
                     .ok()
-                    .map(|gpu| (gpu, weights.bytes))
+                    .map(|gpu| {
+                        (
+                            gpu,
+                            storage::manifest::weights::RankBudget {
+                                weights: weights.weights,
+                                quota: weights.quota,
+                                process: weights.process,
+                                graphs: weights.graphs,
+                                fixed: weights.fixed,
+                                cache: weights.cache,
+                                cache_capacity: weights.cache_capacity,
+                                pages: weights
+                                    .pages
+                                    .iter()
+                                    .map(|page| storage::manifest::weights::CachePage {
+                                        tokens: page.tokens,
+                                        bytes: page.bytes,
+                                        window: page.window,
+                                        state: page.state,
+                                    })
+                                    .collect(),
+                            },
+                        )
+                    })
             })
             .collect(),
     };
