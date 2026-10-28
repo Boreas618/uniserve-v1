@@ -118,6 +118,25 @@ impl Scheduler {
         self.poll_park();
     }
 
+    /// The cache units the requests that would leave as migratable at a
+    /// park hold now: those a successor computing their state again takes
+    /// of its own.
+    pub(super) fn migrating_units(&self) -> u32 {
+        self.running
+            .values()
+            .filter(|state| state.req.is_migratable() && !state.terminal_intent.is_terminal())
+            .map(|state| {
+                state.allocations.as_ref().map_or(0, |allocations| {
+                    allocations
+                        .block_tables()
+                        .iter()
+                        .map(|table| table.unit_ids().len() as u32)
+                        .sum()
+                })
+            })
+            .sum()
+    }
+
     /// Completes a park once no request is queued, runs or retires and no
     /// batch is in flight.
     pub(super) fn poll_park(&mut self) {

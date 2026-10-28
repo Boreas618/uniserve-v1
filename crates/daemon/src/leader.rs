@@ -906,7 +906,7 @@ pub(crate) fn configurable(
 /// Whether the daemon processes requests for the checkpoint at `path` as
 /// it does for the served model at `served`: the same tokenizer, tokenizer
 /// settings, generation defaults and chat template, byte for byte.
-async fn same_processing(served: &str, path: &str) -> Result<(), String> {
+pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), String> {
     use crate::model::assets::model_files::ResolvedModelFiles;
     let resolve = |model: &str| {
         let model = model.to_owned();

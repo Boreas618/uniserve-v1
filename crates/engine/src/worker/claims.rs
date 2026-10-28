@@ -86,7 +86,9 @@ impl Claims {
                     deployment,
                     first.world,
                     scopes,
-                    Vec::new(),
+                    // A world started again at a rollback retires the world on
+                    // trial first, whose memory it needs.
+                    first.retire.clone(),
                     server_arguments.clone(),
                 )
                 .with_context(|| format!("claiming deployment {deployment} on host {host}"))?;

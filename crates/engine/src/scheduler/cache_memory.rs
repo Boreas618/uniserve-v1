@@ -87,15 +87,20 @@ impl Scheduler {
             return;
         }
         let started = match change {
-            CacheChange::Shrink { .. } => self.start_shrink().map(|(from, plan)| {
-                from.map(|from| Pending::Shrink {
-                    from,
-                    plan: plan.clone(),
+            CacheChange::Shrink { successor, .. } => {
+                self.start_shrink(successor).map(|(from, plan)| {
+                    from.map(|from| Pending::Shrink {
+                        from,
+                        plan: plan.clone(),
+                    })
+                    .ok_or(plan)
                 })
-                .ok_or(plan)
-            }),
-            CacheChange::Plan => {
-                let _ = answer.send(self.plan_preparation().map(|preparation| preparation.plans));
+            }
+            CacheChange::Plan(successor) => {
+                let _ = answer.send(
+                    self.plan_preparation(successor)
+                        .map(|preparation| preparation.plans),
+                );
                 return;
             }
             CacheChange::Sleep => Ok(self.start_sleep().ok_or_else(Vec::new)),
@@ -117,6 +122,7 @@ impl Scheduler {
                 let preempt_at = match change {
                     CacheChange::Shrink {
                         preempt_after: Some(after),
+                        ..
                     } => Some(std::time::Instant::now() + after),
                     _ => None,
                 };
@@ -475,7 +481,17 @@ impl Scheduler {
     /// Fails, changing nothing, when a device's limit cannot hold the
     /// segments the cache keeps in any case: the error names every item of
     /// every device and host.
-    pub(super) fn plan_preparation(&mut self) -> Result<Preparation, String> {
+    pub(super) fn plan_preparation(
+        &mut self,
+        successor: crate::Successor,
+    ) -> Result<Preparation, String> {
+        // A successor that maps none of this cache computes the state of
+        // the requests in flight in units of its own: those they hold now.
+        let in_flight_units = if successor.recomputes_cache {
+            self.migrating_units()
+        } else {
+            0
+        };
         let Some(MemoryReports {
             cache: reports,
             beside,
@@ -500,7 +516,7 @@ impl Scheduler {
         let mut keep = held;
         let mut plans: Vec<Preparing> = Vec::new();
         for report in &reports {
-            let mut plan = preparing(report, floor)?;
+            let mut plan = preparing(report, floor, successor, in_flight_units)?;
             let mut kept = plan.segments_kept;
             if let Some(capacity) = report.capacity_units {
                 let head_units = report.head_bytes.div_ceil(report.unit_bytes.max(1));
@@ -526,7 +542,7 @@ impl Scheduler {
         // Server: its successor adds beside it what it holds, and the limit
         // left (of no cache) must not be negative.
         for report in beside.iter().filter(|report| report.ledger.is_some()) {
-            plans.push(preparing(report, 0)?);
+            plans.push(preparing(report, 0, successor, 0)?);
         }
         if plans.iter().any(|plan| !plan.feasible) {
             return Err(super::ledger::refusal(&plans));
@@ -545,8 +561,11 @@ impl Scheduler {
     /// ([`Self::plan_preparation`]); the requests holding it run on.
     /// Returns the first segment to give back, `None` when every device
     /// keeps all its cache, and each device's plan.
-    fn start_shrink(&mut self) -> Result<(Option<u32>, Vec<String>), String> {
-        let Preparation { tail, plans } = self.plan_preparation()?;
+    fn start_shrink(
+        &mut self,
+        successor: crate::Successor,
+    ) -> Result<(Option<u32>, Vec<String>), String> {
+        let Preparation { tail, plans } = self.plan_preparation(successor)?;
         let Some((segment, unit)) = tail else {
             return Ok((None, plans));
         };

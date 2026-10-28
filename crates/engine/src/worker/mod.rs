@@ -76,6 +76,10 @@ pub struct WorkerProcessArgs {
     /// The world the group's workers belong to, which keys the memory they
     /// create and retains what they use.
     pub world: u64,
+    /// Worlds of the deployment whose memory ends on every node before the
+    /// group's workers start: a world on trial a rollback discards, whose
+    /// memory the previous world, started again, needs.
+    pub retire: Vec<u64>,
     /// The KV cache of the predecessor world's group of the same identity,
     /// whose segments the group's workers map read-only; `None` for a world
     /// that succeeds none.

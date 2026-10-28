@@ -137,7 +137,7 @@ pub(super) struct Preparing {
     /// The serving world's KV cache segments of this worker.
     pub(super) serving_kv_cache: u64,
     /// What the successor adds beside what it maps read-only.
-    pub(super) successor: Successor,
+    pub(super) successor: Additions,
     /// The Transfer Server's context and staging.
     pub(super) transfer: u64,
     /// What else the ledger books on the GPU: other workers of the
@@ -179,9 +179,10 @@ pub(super) struct Holdings {
 
 /// What a successor world adds on the device in the preparing phase.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub(super) struct Successor {
-    /// Weights of keys the serving world does not hold: none, since a world
-    /// change maps every weight of the same key.
+pub(super) struct Additions {
+    /// Weights of keys the serving world does not hold: as many as it
+    /// holds when the successor loads its weights from the model's files
+    /// (their keys differ), none when it maps them all.
     pub(super) weights: u64,
     /// The graph pool its warmup captures in.
     pub(super) graph_pool: u64,
@@ -191,12 +192,13 @@ pub(super) struct Successor {
     pub(super) exclusive: u64,
     /// Its head segment.
     pub(super) head_segment: u64,
-    /// What it prepares for the requests in flight: nothing, since it maps
-    /// their KV cache read-only.
+    /// What it prepares for the requests in flight: nothing when it maps
+    /// their KV cache read-only, the units they hold now when it computes
+    /// their state again in units of its own.
     pub(super) in_flight: u64,
 }
 
-impl Successor {
+impl Additions {
     fn total(&self) -> u64 {
         self.weights
             + self.graph_pool
@@ -208,10 +210,17 @@ impl Successor {
 }
 
 /// The serving world's KV cache limit on the device of `report` in the
-/// preparing phase, and the segments it keeps within it, of which `floor`
-/// it cannot give back. Fails for a worker that reports no ledger or no
-/// quota.
-pub(super) fn preparing(report: &CacheMemory, floor: u32) -> Result<Preparing, String> {
+/// preparing phase beside a successor that adds `adds`, and the segments it
+/// keeps within it, of which `floor` it cannot give back. A successor that
+/// computes the state of the requests in flight again takes the
+/// `in_flight_units` they hold of its own. Fails for a worker that reports
+/// no ledger or no quota.
+pub(super) fn preparing(
+    report: &CacheMemory,
+    floor: u32,
+    adds: crate::Successor,
+    in_flight_units: u32,
+) -> Result<Preparing, String> {
     let (Some(ledger), Some(scope), Some(world)) = (&report.ledger, &report.scope, report.world)
     else {
         return Err("a worker that holds a split KV cache reports no memory ledger".to_owned());
@@ -248,13 +257,17 @@ pub(super) fn preparing(report: &CacheMemory, floor: u32) -> Result<Preparing, S
             + serving_kv_cache
             + transfer,
     );
-    let successor = Successor {
-        weights: 0,
+    let successor = Additions {
+        weights: if adds.loads_weights {
+            serving.weights
+        } else {
+            0
+        },
         graph_pool: report.graph_share_bytes,
         process: serving.process,
         exclusive: serving.exclusive,
         head_segment: report.head_bytes,
-        in_flight: 0,
+        in_flight: u64::from(in_flight_units) * report.unit_bytes,
     };
     let beside = ledger.used() + unbooked_context - serving_kv_cache + successor.total();
     // The successor's grant is never more than the device has free, so its

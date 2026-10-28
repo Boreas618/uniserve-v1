@@ -928,6 +928,114 @@ def test_a_world_of_other_numerics_continues_the_requests_in_flight(
         assert streaming.usage == reference_usage
 
 
+def _updated_checkpoint() -> str:
+    """Another checkpoint of the model, of the same files but for other
+    weights (``UNISERVE_QWEN3_UPDATED_MODEL``).
+    """  # noqa: D205
+    checkpoint = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL", "")
+    if not checkpoint or not Path(checkpoint).is_dir():
+        pytest.fail(
+            "UNISERVE_QWEN3_UPDATED_MODEL must name another checkpoint of "
+            "the model, with other weights"
+        )
+    return checkpoint
+
+
+# The share of the GPU a deployment whose successor loads every weight
+# again serves with: both worlds' weights, the successor's graph share and
+# both KV caches fit in it.
+WEIGHTS_SHARE = ("--set", "mem_fraction_static=0.9")
+
+
+def _weights_of(base_url: str) -> set[tuple[int, ...]]:
+    """The sets of worlds holding weights on the deployment's GPUs."""
+    return _worlds_of(_ledgers(_config(base_url)), "weights")
+
+
+@pytest.mark.parametrize(
+    ("previous_world", "end"),
+    [
+        ("parked", "commit"),
+        ("parked", "rollback"),
+        ("weights", "rollback"),
+    ],
+)
+def test_a_change_of_model_files_loads_the_successors_weights(
+    tmp_path: Path, previous_world: str, end: str
+):
+    """A world change to other model files of the same model loads the
+    successor's weights from them beside the serving world's, which the
+    successor does not map; the count streaming meanwhile continues on the
+    state it reached. The successor answers with its weights. A commit
+    leaves its weights alone on the GPU; a rollback answers as before on the
+    previous world: parked, or started again on the weights it kept on the
+    GPU.
+    """  # noqa: D205
+    name = "qwen3-world-weights"
+    updated = _updated_checkpoint()
+    change = (
+        f"model={updated}",
+        f"update_config.previous_world={previous_world}",
+    )
+    with _serve(tmp_path, name, options=WEIGHTS_SHARE) as (base_url, _log):
+        original = _chat(base_url, name, CACHED_PROMPT)
+        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        previous = serving["world"]
+        assert _weights_of(base_url) == {(previous,)}
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+
+        # The plan counts the successor's weights beside the serving
+        # world's, and fits.
+        memory = _planned_memory(base_url, *change)
+        assert memory["feasible"] is True, memory
+        for gpu in memory["gpus"]:
+            assert gpu["successor"]["weights"] == gpu["serving"]["weights"], gpu
+        report = _world_change(base_url, *change)
+        streaming.mark()
+        world = report["world"]
+        assert (report["weights"], report["kv_cache"]) == ("loaded", "mapped")
+        assert report["numerics"] == "changed", report
+        assert report["previous_world_kept"] == previous_world, report
+        print(
+            f"{previous_world}: promotion pause "
+            f"{report['pause_seconds']:.3f} s, "
+            f"preparation {report['prepare_seconds']:.1f} s"
+        )
+
+        # The successor answers with its own weights. The previous world
+        # keeps its weights on the GPU.
+        changed = _chat(base_url, name, CACHED_PROMPT)
+        assert changed != original, "the checkpoints answer alike"
+        assert _weights_of(base_url) == {(previous,), (world,)}
+        streaming.wait_for(streaming.marked + 32)
+
+        if end == "commit":
+            committed = _admin(base_url, "config/commit")
+            assert committed.status_code == 200, committed.text
+            _wait_until(
+                lambda: _weights_of(base_url) == {(world,)},
+                60,
+                "the previous world's weights outlived the commit",
+            )
+            streaming.join()
+            # The committed world answers with the successor's weights. Its
+            # answer during the trial shared its batch with the count, whose
+            # greedy decoding may part from an answer computed alone.
+            assert _chat(base_url, name, CACHED_PROMPT) != original
+            return
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        result = rolled.json()["result"]
+        assert result["world"] == previous, result
+        print(
+            f"{previous_world}: rollback pause {result['pause_seconds']:.3f} s"
+        )
+        streaming.join()
+        assert _chat(base_url, name, CACHED_PROMPT) == original
+        assert _weights_of(base_url) == {(previous,)}
+
+
 # The faults the world on trial meets, by the hook that arms each, and the
 # options the successor serves with for it: a stalled job is found after
 # half the watchdog's timeout.

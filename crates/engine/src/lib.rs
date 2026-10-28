@@ -47,8 +47,8 @@ pub use crate::executor::{
 };
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EventRx,
-    EventSendError, EventTx, HookBarrier, StreamCancelCause, Submission, SubmitError, Wake,
-    WeightsInFlight,
+    EventSendError, EventTx, HookBarrier, StreamCancelCause, Submission, SubmitError, Successor,
+    Wake, WeightsInFlight,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.

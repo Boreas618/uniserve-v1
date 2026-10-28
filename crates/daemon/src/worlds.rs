@@ -53,7 +53,7 @@ use proto::request::wire;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::engine::client::{EngineClient, EngineState};
+use crate::engine::client::{EngineClient, EngineState, Successor};
 use crate::engine::hold::Kept;
 use crate::leader::{Leader, UpdateError, locked, stats_sink};
 use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
@@ -301,13 +301,15 @@ const CLOSED_EXIT: Duration = Duration::from_secs(60);
 /// daemon reads from its Storage Server.
 const LEDGER_READ: Duration = Duration::from_secs(10);
 
-/// The parts of `spec` a configuration states: without the world's identity
-/// and the layout of its cache, which the world's history sets.
+/// The parts of `spec` a configuration states: without the world's identity,
+/// the layout of its cache and the worlds it retires as it starts, which
+/// the world's history sets.
 fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
     wire::EngineSpec {
         world: 0,
         predecessor: None,
         segments: Vec::new(),
+        retire: Vec::new(),
         ..spec.clone()
     }
 }
@@ -355,7 +357,6 @@ fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'stat
         }
     };
     differs("the deployment", served.deployment == target.deployment);
-    differs("the model", served.model == target.model);
     differs("the host", served.host == target.host);
     // The queue depth and memory fraction of the same ranks.
     let sizing = |spec: &wire::EngineSpec| {
@@ -371,37 +372,99 @@ fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'stat
         parallel || sizing(served) == sizing(target),
     );
     differs("the product transport", served.transfer == target.transfer);
-    // The KV cache but its page size, which a parallel change covers.
-    let cache = |spec: &wire::EngineSpec| {
-        spec.kv_cache.clone().map(|cache| wire::KvCache {
-            block_size: None,
-            ..cache
-        })
-    };
-    differs("the KV cache", cache(served) == cache(target));
+    // The KV cache but its page size, which a parallel change covers, and
+    // its encoding, which the successor computes again in a cache of its own
+    // (`kv_encoding_changes`).
+    differs("the KV cache", same_kv_cache_layout(served, target));
     differs("the video options", served.video == target.video);
+    parts
+}
+
+/// The parts of the engine spec a world change changes that key the
+/// weights by what they are loaded from (`reloads`): the model's files, the
+/// dtype, the quantization, the load format and the weight source. The
+/// successor loads the weights of other keys from the model's files and
+/// maps those whose keys stay.
+fn reloads(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'static str> {
+    let mut parts = Vec::new();
+    if served.model != target.model {
+        parts.push("the model");
+    }
     if let (Some(old), Some(new)) = (&served.workers, &target.workers) {
-        differs("the dtype", old.dtype == new.dtype);
-        differs(
-            "the quantization",
-            old.quantization_config == new.quantization_config,
-        );
-        differs("the load format", old.load_format == new.load_format);
-        differs("the weight source", old.weights == new.weights);
+        for (name, same) in [
+            ("the dtype", old.dtype == new.dtype),
+            (
+                "the quantization",
+                old.quantization_config == new.quantization_config,
+            ),
+            ("the load format", old.load_format == new.load_format),
+            ("the weight source", old.weights == new.weights),
+        ] {
+            if !same {
+                parts.push(name);
+            }
+        }
     }
     parts
 }
 
-/// Whether a world succeeding the one `running` executes fits beside it on
-/// every device, from each GPU's memory ledger: the report `PUT
+/// The encoding of a world's KV cache: its configured dtype, else the
+/// compute dtype each layer's cache follows, with the quantization that may
+/// scale it.
+fn kv_encoding(spec: &wire::EngineSpec) -> (String, String, String) {
+    let configured = spec
+        .kv_cache
+        .as_ref()
+        .map(|kv| kv.dtype.clone())
+        .unwrap_or_default();
+    let (compute, quantization) = spec
+        .workers
+        .as_ref()
+        .map_or_else(Default::default, |workers| {
+            (workers.dtype.clone(), workers.quantization_config.clone())
+        });
+    (configured, compute, quantization)
+}
+
+/// Whether the successor's KV cache is encoded otherwise than the serving
+/// world's, which it then cannot read: a class-丙 change of
+/// `specs/online-operations.md` §4.6 without a conversion, so the requests
+/// in flight compute their state again and the successor maps none of the
+/// serving world's segments.
+fn kv_encoding_changes(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
+    kv_encoding(served) != kv_encoding(target)
+}
+
+/// Whether two specs' KV caches are the same but for their dtype and their
+/// page size, which a successor that maps none of the cache lays out anew.
+fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
+    let layout = |spec: &wire::EngineSpec| {
+        spec.kv_cache.clone().map(|kv| wire::KvCache {
+            dtype: String::new(),
+            block_size: None,
+            ..kv
+        })
+    };
+    layout(served) == layout(target)
+}
+
+/// Whether a world succeeding the one `running` executes, which adds
+/// `successor` beside what it shares with it, fits beside it on every
+/// device, from each GPU's memory ledger: the report `PUT
 /// /admin/config` plans with, and the refusal when it does not fit. The
 /// serving engine computes, for each worker that holds the KV cache, what
 /// the serving world, the successor and the Transfer Server hold on its GPU
 /// and the KV cache limit that leaves the serving world, and fails, with
 /// every item of every GPU and host, when a limit cannot hold the segments
 /// the serving world keeps in any case.
-async fn memory_plan(running: &EngineClient) -> (serde_json::Value, Option<String>) {
-    match running.resize_cache(wire::CacheChange::Plan).await {
+async fn memory_plan(
+    running: &EngineClient,
+    successor: Successor,
+) -> (serde_json::Value, Option<String>) {
+    match running
+        .make_room(wire::CacheChange::Plan, successor, None)
+        .await
+    {
         Ok(results) => (memory_report(&results), None),
         Err(refusal) => (
             serde_json::json!({ "feasible": false, "refusal": refusal }),
@@ -533,27 +596,67 @@ impl Leader {
         let daemon_changes = crate::options::daemon_options_differ(&current, &target);
 
         // A world change: what each derived state of the serving world
-        // becomes in its successor.
+        // becomes in its successor. Weights of other keys are loaded from the
+        // model's files and those whose keys stay are mapped; the KV cache
+        // is mapped unless the successor cannot read it (another encoding)
+        // or the requests in flight compute their state again under other
+        // weights.
         let unmapped = differing(&served, &target_spec);
+        let reloaded = reloads(&served, &target_spec);
         let redistributes = parallel_change(&served, &target_spec);
+        // A successor of another parallel configuration or another KV cache
+        // encoding maps none of the serving world's cache, and one that
+        // loads other weights does so when the requests in flight compute
+        // their state again.
+        let successor = Successor {
+            loads_weights: !reloaded.is_empty(),
+            recomputes_cache: redistributes
+                || kv_encoding_changes(&served, &target_spec)
+                || (!reloaded.is_empty() && request.in_flight == InFlight::Recompute),
+        };
         let running = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
-        let (weights, kv_cache) = if !unmapped.is_empty() {
-            ("unmapped", "unmapped")
+        let weights = if !unmapped.is_empty() {
+            "unmapped"
+        } else if successor.loads_weights {
+            "loaded"
         } else if redistributes {
-            ("redistributed", "recomputed")
+            "redistributed"
         } else {
-            ("mapped", "mapped")
+            "mapped"
+        };
+        let kv_cache = if !unmapped.is_empty() {
+            "unmapped"
+        } else if successor.recomputes_cache {
+            "recomputed"
+        } else {
+            "mapped"
         };
         let in_place = crate::leader::configurable(
             &comparable(&served),
             &comparable(&target_spec),
             running.info().capacity.as_ref(),
         );
+        // A successor serving other model files processes requests as the
+        // daemon does only with the same tokenizer, templates, generation
+        // defaults and model facts.
+        if served.model != target_spec.model {
+            crate::leader::same_processing(&served.model, &target_spec.model)
+                .await
+                .map_err(UpdateError::Refused)?;
+            if served.model_facts != target_spec.model_facts {
+                return Err(UpdateError::Refused(format!(
+                    "the model at {} has other generation limits, control tokens or context \
+                     length than the served model, which change how requests are processed: \
+                     deploy it instead",
+                    target_spec.model
+                )));
+            }
+        }
         // A change a new world executes is checked against every device's
         // memory ledger first: the serving world's KV cache limit beside a
         // successor, per GPU and host (`specs/online-operations.md` §6.6).
         let memory = if world_changes && !in_place && unmapped.is_empty() {
-            Some(memory_plan(&running).await)
+            Some(memory_plan(&running, successor).await)
         } else {
             None
         };
@@ -566,6 +669,7 @@ impl Leader {
             "in_flight": request.in_flight,
             "weights": weights,
             "kv_cache": kv_cache,
+            "reloads": reloaded,
             "differs": unmapped,
             "in_flight_requests": running.in_flight(),
             "memory": memory.as_ref().map(|(plan, _)| plan),
@@ -612,8 +716,9 @@ impl Leader {
         }
         if !unmapped.is_empty() {
             return Err(UpdateError::Refused(format!(
-                "the update changes {}, which keys the weights and the KV cache the successor \
-                 world maps: a world change maps them only where their keys stay",
+                "the update changes {}, which decides how the successor world divides the \
+                 weights and the KV cache: a world change carries over only what keeps them \
+                 divided alike",
                 unmapped.join(", ")
             )));
         }
@@ -640,6 +745,7 @@ impl Leader {
                 target_digest,
                 &update,
                 request.in_flight,
+                successor,
                 redistributes,
             )
             .await?;
@@ -665,6 +771,7 @@ impl Leader {
         target_digest: String,
         update: &crate::options::UpdateOptions,
         in_flight: InFlight,
+        adds: Successor,
         redistributes: bool,
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
@@ -689,7 +796,7 @@ impl Leader {
         // The serving world's cache gives back the tail past the limit each
         // GPU's ledger leaves it beside the successor; its requests run on.
         let shrunk = running
-            .resize_cache_within(wire::CacheChange::Shrink, update.preempt_after)
+            .make_room(wire::CacheChange::Shrink, adds, update.preempt_after)
             .await
             .map_err(|error| {
                 self.progress_done();
@@ -709,9 +816,9 @@ impl Leader {
         };
         let memory = memory_report(&shrunk);
         // A successor of another parallel configuration lays its cache out
-        // for the heads it holds, so it maps none of the serving world's
-        // segments.
-        let segments = if redistributes {
+        // for the heads it holds, and one of another encoding cannot read the
+        // serving world's: either maps none of its segments.
+        let segments = if adds.recomputes_cache {
             Vec::new()
         } else {
             running.describe_cache().await.map_err(|error| {
@@ -776,7 +883,9 @@ impl Leader {
         let trajectories_change = before.latent_seed != after.latent_seed;
         let numerics_change = pages_change || trajectories_change;
         let hold = Arc::clone(self.migrator.hold());
-        if numerics_change && in_flight == InFlight::Keep {
+        // A request keeps the state it reached only where the successor maps
+        // it: the old key counts as the new one for those requests alone.
+        if numerics_change && in_flight == InFlight::Keep && !adds.recomputes_cache {
             hold.keep(Some(Kept {
                 world: previous_world,
                 prefix_seed: pages_change.then_some(before.prefix_seed),
@@ -801,9 +910,12 @@ impl Leader {
             }
         };
         let parked = paused.elapsed();
+        // The requests in flight compute their state again when the change
+        // asks it of other numerics, and where the successor maps none of it.
+        let recompute =
+            (numerics_change && in_flight == InFlight::Recompute) || adds.recomputes_cache;
         // A previous world kept parked keeps its memory until the commit; one
         // kept as its weights frees the rest as the successor serves.
-        let recompute = redistributes || (numerics_change && in_flight == InFlight::Recompute);
         let grows = update.previous_world != PreviousWorld::Parked;
         if let Err(error) = successor.promote(index, recompute, grows).await {
             hold.keep(None);
@@ -874,6 +986,14 @@ impl Leader {
             "numerics": if numerics_change { "changed" } else { "unchanged" },
             "parallel": if redistributes { "changed" } else { "unchanged" },
             "in_flight": if numerics_change { Some(in_flight) } else { None },
+            "weights": if adds.loads_weights {
+                "loaded"
+            } else if redistributes {
+                "redistributed"
+            } else {
+                "mapped"
+            },
+            "kv_cache": if adds.recomputes_cache { "recomputed" } else { "mapped" },
             "memory": memory,
         });
         {
@@ -1180,7 +1300,13 @@ pub(crate) async fn rollback(
         Previous::Weights => {
             let control = Arc::clone(engines.control.get().ok_or(UpdateError::NoEngine)?);
             let sink = stats_sink(engines.model_name.clone(), Arc::clone(&engines.observer));
-            let spec = trial.previous_spec.clone();
+            // The world on trial, closed, is retired before the previous
+            // world's workers start: they need its memory (weights of its
+            // own included) within the deployment's quota.
+            let spec = wire::EngineSpec {
+                retire: vec![trial.world],
+                ..trial.previous_spec.clone()
+            };
             let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
                 .await
                 .context("the previous world's start did not complete")
@@ -1410,14 +1536,18 @@ mod tests {
         ));
     }
 
-    /// Only the parts that key the weights and the KV cache a successor
-    /// maps differ; the build and the scheduling do not.
+    /// A world change carries over a change of the build, and one of the
+    /// weights' sources (the successor loads them) or of the KV cache's
+    /// encoding (the successor maps none of it), apart from a parallel
+    /// change; a change of the KV cache's size is not carried over.
     #[test]
-    fn differing_names_the_parts_that_key_shared_state() {
+    fn a_change_reloads_weights_and_recomputes_the_cache_it_cannot_read() {
         let served = wire::EngineSpec {
             model: "a".into(),
+            kv_cache: Some(wire::KvCache::default()),
             workers: Some(wire::Workers {
                 executable: "old".into(),
+                dtype: "bfloat16".into(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1427,8 +1557,36 @@ mod tests {
             workers.executable = "new".into();
         }
         assert!(differing(&served, &target).is_empty());
+        assert!(reloads(&served, &target).is_empty());
+        assert!(!kv_encoding_changes(&served, &target));
+
         target.model = "b".into();
-        assert_eq!(differing(&served, &target), vec!["the model"]);
+        assert!(differing(&served, &target).is_empty());
+        assert_eq!(reloads(&served, &target), vec!["the model"]);
+        assert!(!kv_encoding_changes(&served, &target));
+
+        // The cache follows the compute dtype unless it states its own.
+        if let Some(workers) = target.workers.as_mut() {
+            workers.dtype = "float16".into();
+        }
+        assert!(kv_encoding_changes(&served, &target));
+        if let Some(kv) = target.kv_cache.as_mut() {
+            kv.dtype = "fp8_e4m3".into();
+        }
+        assert!(differing(&served, &target).is_empty());
+        assert!(kv_encoding_changes(&served, &target));
+
+        // The page size is a parallel change; the cache's size is not
+        // carried over.
+        if let Some(kv) = target.kv_cache.as_mut() {
+            kv.block_size = Some(32);
+        }
+        assert!(differing(&served, &target).is_empty());
+        assert!(parallel_change(&served, &target));
+        if let Some(kv) = target.kv_cache.as_mut() {
+            kv.max_tokens = Some(1024);
+        }
+        assert_eq!(differing(&served, &target), vec!["the KV cache"]);
     }
 
     /// Another parallel configuration redistributes the weights and the KV
