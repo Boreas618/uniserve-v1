@@ -48,6 +48,88 @@ where
     }
 }
 
+/// The meeting point of the schedulers that run one worker hook together
+/// ([`Command::Hook`]).
+///
+/// The schedulers of one engine serve ranks of one expert union, and a rank
+/// joins the union's steps of other schedulers outside its own. A hook that
+/// changes how a rank runs the union's steps (its captured joins, the
+/// memory they replay from) must find no step of any scheduler in flight,
+/// and every rank must have run it before any scheduler steps again. Each
+/// scheduler meets the others twice: once its batches in flight completed,
+/// and once it ran the hook.
+///
+/// A scheduler that cannot reach a meeting fails the barrier, which releases
+/// the others with its reason instead of leaving them waiting.
+pub struct HookBarrier {
+    parties: usize,
+    state: Mutex<HookMeeting>,
+    met: std::sync::Condvar,
+}
+
+/// The barrier's current meeting: who arrived, its sequence number, and
+/// why it failed.
+struct HookMeeting {
+    arrived: usize,
+    meeting: u64,
+    failed: Option<String>,
+}
+
+impl HookBarrier {
+    /// A barrier for `parties` schedulers (at least one).
+    pub fn new(parties: usize) -> Arc<Self> {
+        Arc::new(Self {
+            parties: parties.max(1),
+            state: Mutex::new(HookMeeting {
+                arrived: 0,
+                meeting: 0,
+                failed: None,
+            }),
+            met: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Waits until every party arrived at the current meeting.
+    ///
+    /// # Errors
+    ///
+    /// Why a party failed the barrier, before or while this one waited.
+    pub fn meet(&self) -> Result<(), String> {
+        let mut state = lock(&self.state);
+        if let Some(reason) = &state.failed {
+            return Err(reason.clone());
+        }
+        let meeting = state.meeting;
+        state.arrived += 1;
+        if state.arrived == self.parties {
+            state.arrived = 0;
+            state.meeting += 1;
+            self.met.notify_all();
+            return Ok(());
+        }
+        while state.meeting == meeting && state.failed.is_none() {
+            state = self
+                .met
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        match &state.failed {
+            Some(reason) if state.meeting == meeting => Err(reason.clone()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Releases every party waiting now or later with `reason`; the first
+    /// reason stands.
+    pub fn fail(&self, reason: &str) {
+        let mut state = lock(&self.state);
+        if state.failed.is_none() {
+            state.failed = Some(reason.to_owned());
+        }
+        self.met.notify_all();
+    }
+}
+
 /// Cloneable command wake backed by a live notifier or a no-op value.
 #[derive(Clone, Default)]
 pub enum CommandWaker {
@@ -532,9 +614,13 @@ pub enum Command {
     FlushCache,
     /// Runs the worker hook `name` with `payload` on every worker once the
     /// batches in flight complete, and answers with each worker's result.
+    /// Every scheduler `together` names runs it at once: none runs it
+    /// before all have no batch in flight, and none schedules again before
+    /// all ran it.
     Hook {
         name: String,
         payload: String,
+        together: Arc<HookBarrier>,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Takes other scheduling limits and policy from the next step on
@@ -818,20 +904,27 @@ impl CommandSender {
         let _ = self.send(Command::FlushCache);
     }
 
-    /// Runs the worker hook `name` (`Command::Hook`); the receiver gets
-    /// each worker's result, or why the hook failed.
+    /// Runs the worker hook `name` (`Command::Hook`) together with the
+    /// other schedulers of `together`; the receiver gets each worker's
+    /// result, or why the hook failed.
     pub fn hook(
         &self,
         name: String,
         payload: String,
+        together: Arc<HookBarrier>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, receiver) = crossbeam_channel::bounded(1);
         if let Err(error) = self.send(Command::Hook {
             name,
             payload,
+            together,
             answer,
-        }) && let Command::Hook { answer, .. } = error.0
+        }) && let Command::Hook {
+            answer, together, ..
+        } = error.0
         {
+            // The schedulers waiting for this one go on without it.
+            together.fail("the scheduler stopped");
             let _ = answer.send(Err("the scheduler stopped".to_owned()));
         }
         receiver
@@ -1176,5 +1269,64 @@ mod tests {
         clone.shutdown();
 
         assert!(matches!(rx.recv().unwrap(), Command::Shutdown));
+    }
+
+    /// Schedulers meeting at a hook barrier pass each meeting only once
+    /// every one arrived: no party passes the second meeting before the
+    /// last has passed the first and arrived again.
+    #[test]
+    fn hook_barrier_parties_meet_each_time_all_arrive() {
+        let together = HookBarrier::new(3);
+        let passed = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            for party in 0..3 {
+                let together = Arc::clone(&together);
+                let passed = Arc::clone(&passed);
+                scope.spawn(move || {
+                    for meeting in 0..2 {
+                        together.meet().unwrap();
+                        passed.lock().unwrap().push((meeting, party));
+                    }
+                });
+            }
+        });
+        let passed = passed.lock().unwrap();
+        assert_eq!(passed.len(), 6);
+        // Every pass of the first meeting precedes every pass of the second.
+        let last_first = passed.iter().rposition(|&(meeting, _)| meeting == 0);
+        let first_second = passed.iter().position(|&(meeting, _)| meeting == 1);
+        assert!(last_first < first_second);
+    }
+
+    /// A party that cannot reach a meeting releases the parties waiting
+    /// there, and those that arrive later, with its reason.
+    #[test]
+    fn a_failed_hook_barrier_releases_its_parties_with_the_reason() {
+        let together = HookBarrier::new(3);
+        let waiting = {
+            let together = Arc::clone(&together);
+            std::thread::spawn(move || together.meet())
+        };
+        // The waiting party arrived; the barrier fails before the third does.
+        while lock(&together.state).arrived == 0 {
+            std::thread::yield_now();
+        }
+        together.fail("the engine failed before the hook ran");
+        assert_eq!(
+            waiting.join().unwrap(),
+            Err("the engine failed before the hook ran".to_owned())
+        );
+        assert_eq!(
+            together.meet(),
+            Err("the engine failed before the hook ran".to_owned())
+        );
+    }
+
+    /// A barrier of one party never waits.
+    #[test]
+    fn a_hook_barrier_of_one_party_passes_at_once() {
+        let together = HookBarrier::new(1);
+        assert_eq!(together.meet(), Ok(()));
+        assert_eq!(together.meet(), Ok(()));
     }
 }

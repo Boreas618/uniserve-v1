@@ -881,6 +881,11 @@ pub struct UpdateOptions {
     /// run to their end.
     #[serde(with = "values::optional_duration")]
     pub preempt_after: Option<Duration>,
+    /// Whether the serving world runs its forwards eagerly while the
+    /// successor prepares, giving its CUDA graph memory to the successor's
+    /// captures: the serving world steps slower meanwhile, and replays its
+    /// graphs again if it serves on or resumes.
+    pub eager_prepare: bool,
 }
 
 impl Default for UpdateOptions {
@@ -889,6 +894,7 @@ impl Default for UpdateOptions {
             previous_world: PreviousWorld::Parked,
             rollback: RollbackOptions::default(),
             preempt_after: None,
+            eager_prepare: false,
         }
     }
 }

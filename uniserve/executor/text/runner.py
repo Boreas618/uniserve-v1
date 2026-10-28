@@ -300,6 +300,21 @@ class TextRunner:
         # The commit the computation's last executed batch left for this
         # runner.
         self.pending: CommitWork | None = None
+        # The graph pool an eager runner set aside (:meth:`run_eager`).
+        self._eager_pool: Any | None = None
+
+    def run_eager(self, eager: bool) -> None:
+        """Serve every forward eagerly at its live shape (``eager``), or by
+        the graphs captured at startup again.
+
+        The graphs stay captured: the worker gives their memory back while
+        the runner is eager and restores it at the same addresses before the
+        runner replays them again.
+        """  # noqa: D205
+        if eager and self.pool is not None:
+            self._eager_pool, self.pool = self.pool, None
+        elif not eager and self._eager_pool is not None:
+            self.pool, self._eager_pool = self._eager_pool, None
 
     # Planning.
 

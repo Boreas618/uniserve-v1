@@ -611,6 +611,12 @@ impl WorkerBackend {
             .is_some_and(WorkerMemory::awaiting_acknowledgment))
     }
 
+    /// Whether a join of the union's step is in flight
+    /// ([`Self::join_expert_step`]).
+    pub(crate) fn joining(&self) -> bool {
+        self.joining.is_some()
+    }
+
     pub(crate) fn join_expert_step(
         &mut self,
         leaving: bool,

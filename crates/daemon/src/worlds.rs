@@ -142,6 +142,10 @@ pub(crate) struct Trial {
     pub(crate) outcomes: (u64, u64),
     /// How long requests waited at the promotion.
     pub(crate) pause: Duration,
+    /// Whether the previous world serves eagerly since the successor
+    /// prepared (`update_config.eager_prepare`): its graphs replay again if
+    /// it resumes.
+    pub(crate) eager: bool,
 }
 
 /// A configuration a rollback marked unavailable, and why.
@@ -665,6 +669,22 @@ impl Leader {
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
         let previous_world = running.world();
+        // The serving world gives its graph memory to the successor's
+        // captures first, so the shrink that follows leaves it to the
+        // successor.
+        if update.eager_prepare {
+            self.progress("eager", None);
+            if let Err(error) = running.hook("uniserve.eager", r#"{"eager":true}"#).await {
+                // Ranks that switched replay their graphs again; the others
+                // switch nothing.
+                replay_graphs(running, true).await;
+                self.progress_done();
+                return Err(UpdateError::Refused(format!(
+                    "the serving world cannot run eagerly while its successor prepares \
+                     (update_config.eager_prepare): {error}"
+                )));
+            }
+        }
         self.progress("shrink", None);
         // The serving world's cache gives back the tail past the limit each
         // GPU's ledger leaves it beside the successor; its requests run on.
@@ -677,7 +697,16 @@ impl Leader {
                     "the KV cache did not make room for a successor world; the serving world \
                      serves on: {error}"
                 )
-            })?;
+            });
+        // A shrink refused or failed leaves the serving world serving: it
+        // replays its graphs again when it ran eagerly for the successor.
+        let shrunk = match shrunk {
+            Ok(shrunk) => shrunk,
+            Err(error) => {
+                replay_graphs(running, update.eager_prepare).await;
+                return Err(error.into());
+            }
+        };
         let memory = memory_report(&shrunk);
         // A successor of another parallel configuration lays its cache out
         // for the heads it holds, so it maps none of the serving world's
@@ -713,6 +742,7 @@ impl Leader {
             Err(error) => {
                 self.progress_done();
                 let restored = running.resize_cache(wire::CacheChange::Restore).await;
+                replay_graphs(running, update.eager_prepare).await;
                 return Err(match restored {
                     Ok(_) => error.context("the serving world serves on"),
                     Err(restoring) => error.context(format!(
@@ -765,6 +795,7 @@ impl Leader {
                 hold.serve(Arc::clone(running));
                 self.close(&successor).await;
                 self.restore_tail(running).await;
+                replay_graphs(running, update.eager_prepare).await;
                 self.progress_done();
                 return Err(anyhow::anyhow!("the serving world did not park: {error}").into());
             }
@@ -780,6 +811,7 @@ impl Leader {
             hold.serve(Arc::clone(running));
             self.close(&successor).await;
             self.restore_tail(running).await;
+            replay_graphs(running, update.eager_prepare).await;
             self.progress_done();
             return Err(anyhow::anyhow!(
                 "the successor world was not promoted; the previous world resumed: {error}"
@@ -862,6 +894,7 @@ impl Leader {
                 thresholds: update.rollback.clone(),
                 outcomes: crate::leader::outcomes(),
                 pause,
+                eager: update.eager_prepare,
             });
             worlds.last = Some(report.clone());
         }
@@ -1072,6 +1105,17 @@ impl Leader {
     }
 }
 
+/// Has `running`, which served eagerly while a successor prepared (when
+/// `eager`), replay its graphs again now that it serves on.
+async fn replay_graphs(running: &Arc<EngineClient>, eager: bool) {
+    if !eager {
+        return;
+    }
+    if let Err(error) = running.hook("uniserve.eager", r#"{"eager":false}"#).await {
+        warn!("the serving world did not replay its graphs again: {error}");
+    }
+}
+
 /// Shuts the engine `client` serves down and waits for its process.
 async fn close(client: &Arc<EngineClient>) {
     let closed = Arc::clone(client);
@@ -1130,6 +1174,7 @@ pub(crate) async fn rollback(
                 hold.close(format!("the previous world did not resume: {error}"));
                 anyhow::anyhow!("the previous world did not resume: {error}")
             })?;
+            replay_graphs(&previous, trial.eager).await;
             previous
         }
         Previous::Weights => {

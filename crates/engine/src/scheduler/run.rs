@@ -742,18 +742,58 @@ impl Scheduler {
     /// and scheduling nothing meanwhile, and returns each worker's result.
     pub(super) fn run_hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
         let closing = std::mem::replace(&mut self.closing, true);
+        let drained = self.drain_batches();
+        self.closing = closing;
+        drained?;
+        self.hook_workers(name, payload)
+    }
+
+    /// Runs the worker hook `name` as [`Self::run_hook`] does, together
+    /// with the engine's other schedulers (`HookBarrier`): it runs once
+    /// every scheduler's batches in flight completed, and this scheduler
+    /// schedules again only once every one ran it. Meanwhile its ranks go on
+    /// joining the union's steps of schedulers still completing theirs.
+    pub(super) fn run_hook_together(
+        &mut self,
+        name: &str,
+        payload: &str,
+        together: &crate::HookBarrier,
+    ) -> Result<Vec<String>, String> {
+        let closing = std::mem::replace(&mut self.closing, true);
+        let ran = self
+            .drain_batches()
+            .inspect_err(|error| together.fail(error))
+            .and_then(|()| together.meet())
+            .and_then(|()| {
+                let results = self.hook_workers(name, payload);
+                // Every scheduler ran the hook, or failed it, before any
+                // schedules again; a party's failure here releases the
+                // others, whose hooks ran.
+                let _ = together.meet();
+                results
+            });
+        self.closing = closing;
+        ran
+    }
+
+    /// Completes the batches in flight, scheduling nothing new while the
+    /// caller set `closing`.
+    fn drain_batches(&mut self) -> Result<(), String> {
         while !(self.inflight.pending_batches.is_empty()
             && self.inflight.pending_submissions.is_empty())
         {
             if self.fatal {
-                self.closing = closing;
                 return Err("the engine failed before the hook ran".to_owned());
             }
             if !self.step_nonblocking() {
                 self.park_for_progress();
             }
         }
-        self.closing = closing;
+        Ok(())
+    }
+
+    /// Runs the worker hook on every worker, its batches complete.
+    fn hook_workers(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
         let results = self
             .executor
             .hook(name, payload)

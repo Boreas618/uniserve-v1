@@ -454,6 +454,10 @@ impl Executor for SimExecutor {
             | "uniserve.sleep"
             | "uniserve.wake" => serde_json::Value::Null,
             "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
+            "uniserve.eager" => {
+                let payload: serde_json::Value = serde_json::from_str(payload)?;
+                serde_json::json!({ "eager": payload["eager"] })
+            }
             "uniserve.attach_cupti" | "uniserve.detach_cupti" => {
                 serde_json::json!({ "attached": false, "stream_activity": false })
             }

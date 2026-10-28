@@ -1338,6 +1338,13 @@ class TextComputation:
         for runner in self.runners:
             runner.graphs.seal()
 
+    def run_eager(self, eager: bool) -> None:
+        """Serve eagerly (``eager``) or by the captured graphs again, on
+        every runner (:meth:`TextRunner.run_eager`).
+        """  # noqa: D205
+        for runner in self.runners:
+            runner.run_eager(eager)
+
     def reopen(self) -> None:
         """Release every runner's graphs and accept captures again.
 

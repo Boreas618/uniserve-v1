@@ -150,9 +150,10 @@ impl Scheduler {
             Command::Hook {
                 name,
                 payload,
+                together,
                 answer,
             } => {
-                let _ = answer.send(self.run_hook(&name, &payload));
+                let _ = answer.send(self.run_hook_together(&name, &payload, &together));
             }
             Command::Configure { limits, answer } => {
                 let _ = answer.send(self.reconfigure(limits));

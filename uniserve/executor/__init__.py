@@ -379,6 +379,9 @@ class _TextComputations:
     def seal(self) -> None:
         self.text.seal()
 
+    def run_eager(self, eager: bool) -> None:
+        self.text.run_eager(eager)
+
     def start(self, requests: list[Mapping[str, Any]]):
         return self.text.start(requests)
 
@@ -820,6 +823,34 @@ class Executor:
         for served in self._served:
             served.seal()
         self._sealed = True
+
+    def run_eager(self, eager: bool) -> None:
+        """Serve every forward and expert join eagerly (``eager``), or by
+        the graphs captured at startup again.
+
+        A serving world runs eagerly while a successor prepares, so that the
+        worker can give its graph memory to the successor's captures
+        (``update_config.eager_prepare``); the graphs stay captured.
+
+        Raises:
+            ValueError: A computation of the rank serves only by its graphs.
+        """  # noqa: D205
+        # Only text computations serve every forward eagerly as well; a rank
+        # holding others switches none.
+        graphs_alone = [
+            type(served).__name__.lstrip("_")
+            for served in self._served
+            if not isinstance(served, _TextComputations)
+        ]
+        if graphs_alone:
+            raise ValueError(
+                f"{', '.join(graphs_alone)} serve by their captured graphs "
+                "alone"
+            )
+        for served in self._served:
+            served.run_eager(eager)
+        if self._union is not None:
+            self._union.run_eager(eager)
 
     @contextlib.contextmanager
     def _serving(self) -> Iterator[None]:
