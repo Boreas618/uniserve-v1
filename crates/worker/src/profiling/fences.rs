@@ -196,8 +196,10 @@ pub(crate) const PARTIAL_READ: Duration = Duration::from_secs(1);
 /// for before they are counted as lost.
 const VISIBILITY: Duration = Duration::from_millis(50);
 
-/// How long a calibration waits for its timestamp on the host.
-const CALIBRATION_WAIT: Duration = Duration::from_micros(500);
+/// How long a calibration spins for its timestamp on the host before it
+/// blocks until the clock kernel completes: on a busy device the kernel
+/// queues behind the device's work for longer.
+const CALIBRATION_SPIN: Duration = Duration::from_micros(500);
 
 /// The steps whose end marker has not been read that a device keeps; older
 /// ones (a batch that failed between its markers) are dropped.
@@ -820,10 +822,14 @@ impl DeviceFences {
 
     /// One calibration sample: the clock kernel's `%globaltimer` against the
     /// host clocks around its appearance. Keeps and returns the best sample.
+    ///
+    /// The sample's uncertainty is half the host's window from before the
+    /// launch to the value's appearance: a kernel that queued behind the
+    /// device's work gives a wide sample, which a narrower one replaces.
     fn calibrate(&self) -> Result<Alignment> {
         // SAFETY: the word is pinned host memory no device work addresses
-        // now: the last calibration's kernel stored into it before its value
-        // was observed.
+        // now: a calibration returns only once its kernel has stored into
+        // it.
         unsafe { std::ptr::write_volatile(self.clock_out.as_ptr().cast::<u64>(), 0) };
         let mut out = self.clock_out.address();
         let mut parameters: [*mut c_void; 1] = [(&raw mut out).cast()];
@@ -837,10 +843,18 @@ impl DeviceFences {
             if value != 0 {
                 break value;
             }
-            if started.elapsed() > CALIBRATION_WAIT {
-                return Err(Error::State(
-                    "the clock kernel did not run within the calibration's wait",
-                ));
+            if started.elapsed() > CALIBRATION_SPIN {
+                // Blocking until the kernel completes ends the sample, and
+                // keeps the next calibration, which zeroes the word, from
+                // reading this kernel's late store as its own.
+                self.control.synchronize()?;
+                // SAFETY: as above; the kernel completed.
+                let value =
+                    unsafe { std::ptr::read_volatile(self.clock_out.as_ptr().cast::<u64>()) };
+                if value == 0 {
+                    return Err(Error::State("the clock kernel completed without its time"));
+                }
+                break value;
             }
             std::hint::spin_loop();
         };
