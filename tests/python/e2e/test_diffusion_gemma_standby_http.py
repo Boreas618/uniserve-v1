@@ -36,6 +36,7 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    granted_devices,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -156,7 +157,10 @@ def test_a_megamoe_world_promotes_its_standby_world_when_a_rank_is_lost(
         "--set",
         f"worker_config.standby_storage={standby_storage}",
     ]
-    env = {"CUDA_VISIBLE_DEVICES": "0,1", "XDG_RUNTIME_DIR": str(runtime)}
+    env = {
+        "CUDA_VISIBLE_DEVICES": granted_devices(2),
+        "XDG_RUNTIME_DIR": str(runtime),
+    }
     log = tmp_path / "server.log"
     try:
         with server_process(command, base_url, log, timeout_s=1800, env=env):
