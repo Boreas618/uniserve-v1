@@ -50,7 +50,7 @@ use crate::capacity::checks;
 use crate::capacity::device::{DeviceBooking, DeviceBudget, total_bytes};
 use crate::capacity::plan::Plan;
 use crate::config::placement::{Capability, Components, GroupPlacement};
-use crate::config::{Device, ExpertUnion, WorkerConfig, WorkerLaunch};
+use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
@@ -1617,17 +1617,11 @@ pub(crate) fn plan_rank(
         .iter()
         .any(|placed| placed.config.weights == ComponentWeights::Host);
     let fingerprints = model_fingerprints(launch, &description, host_only)?;
-    let moved = launch
-        .expert_parallel
-        .as_ref()
-        .is_some_and(ExpertUnion::prefetches_weights);
     let gpu = cuda.uuid()?.0;
     // A rank whose weights are not retained, or stream from host storage,
-    // loads them: it plans no storages.
-    let keys = match fingerprints
-        .as_ref()
-        .filter(|_| !moved && !streams_from_host)
-    {
+    // loads them: it plans no storages. A DWDP rank retains its loaded
+    // shards, whose experts then live in its resident peer storage.
+    let keys = match fingerprints.as_ref().filter(|_| !streams_from_host) {
         Some(fingerprints) => {
             let devices: Vec<DeviceId> = launch
                 .execution
@@ -1861,20 +1855,15 @@ fn agree_load(
     Ok(weights::Load::union(needs))
 }
 
-/// The keys of the rank's retained weights, or `None` when its weights are
-/// not retained: a rank without a model fingerprint, and a rank whose
-/// expert weights move to memory of the expert union after loading
-/// (`dwdp`).
+/// The keys of the rank's retained weights, or `None` for a rank without a
+/// model fingerprint. A DWDP rank's retained experts are the resident
+/// shards its distributed owner publishes after loading.
 fn weight_keys(
     launch: &WorkerLaunch,
     fingerprints: Option<&weights::Fingerprints>,
     retained: &Retained,
 ) -> Result<Option<WeightKeys>> {
-    let moved = launch
-        .expert_parallel
-        .as_ref()
-        .is_some_and(ExpertUnion::prefetches_weights);
-    let Some(fingerprints) = fingerprints.filter(|_| !moved) else {
+    let Some(fingerprints) = fingerprints else {
         return Ok(None);
     };
     let devices: Vec<DeviceId> = launch
