@@ -1301,6 +1301,15 @@ impl SchedulerHandle {
         self.commands.update_weights(model_path, in_flight)
     }
 
+    /// Commit background expert copies and preserve the order on rank recovery.
+    pub fn commit_experts(
+        &self,
+        order: BTreeMap<String, Vec<u32>>,
+        together: Arc<crate::HookBarrier>,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.commit_experts(order, together)
+    }
+
     /// Gives back or restores KV cache memory; the receiver gets what each
     /// worker reported, or why the change failed.
     pub fn resize_cache(

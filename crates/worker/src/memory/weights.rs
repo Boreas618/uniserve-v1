@@ -59,12 +59,14 @@ use tvm_ffi::Any;
 use super::allocation::{Storage, StorageView};
 use super::retained::Retained;
 
+mod rebalance;
 mod received;
 use crate::config::WorkerLaunch;
 use crate::ffi::{
     Backing, DType, Handle, Interpreter, integer_list, integers, list, strings, texts,
 };
 use crate::{Error, Result};
+pub(crate) use rebalance::Rebalance;
 pub(crate) use received::Receipt;
 
 /// The library module that describes, publishes and binds retained weights.
@@ -696,6 +698,11 @@ impl WeightKeys {
                     .unwrap_or_default(),
             ])?,
         )?;
+        self.plan_layout(layout)
+    }
+
+    /// Chunk a numerical layout supplied by loading or expert redistribution.
+    pub(crate) fn plan_layout(&self, layout: Handle) -> Result<Planned> {
         let method = |name: &str| Interpreter::import(&format!("{RETAINED}.Layout.{name}"));
         let numbers = |name: &str| -> Result<Vec<i64>> {
             integers(method(name)?.call_values(&[layout.to_any()])?)
@@ -877,6 +884,22 @@ pub(crate) struct Planned {
     sizes: Vec<i64>,
     storages: Vec<RetainedStorage>,
     placed: Members,
+}
+
+/// A transfer's numerical description, independent of the model that supplied it.
+pub(crate) struct TransferLayout {
+    tensors: Vec<ManifestTensor>,
+    storages: Vec<RetainedStorage>,
+}
+
+impl Planned {
+    /// Release the borrowed Python layout before allocating transfer targets.
+    pub(crate) fn into_transfer(self) -> TransferLayout {
+        TransferLayout {
+            tensors: self.tensors,
+            storages: self.storages,
+        }
+    }
 }
 
 /// Each torch storage's retained storage and its byte offset there.
@@ -1407,6 +1430,7 @@ pub(crate) fn position(launch: &WorkerLaunch) -> Result<Vec<u8>> {
         "generation_device": execution.generation_device.is_some(),
         "expert_union": union,
         "tensor_experts": launch.tensor_experts,
+        "expert_order": launch.expert_order,
     }))
     .map_err(|error| Error::Invalid(format!("encoding the rank's position: {error}")))
 }

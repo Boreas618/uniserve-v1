@@ -522,13 +522,13 @@ pub(super) fn room(report: &CacheMemory, bytes: u64, floor: u32) -> Result<Room,
     })
 }
 
-/// Why a profiling session's device storage does not fit: for every device,
+/// Why the requested device storage does not fit: for every device,
 /// what its ledger books of its quota, its free storage and the KV cache it
 /// cannot give back.
 pub(super) fn room_refusal(rooms: &[Room]) -> String {
     let bytes = rooms.first().map_or(0, |room| room.bytes);
     let mut lines = vec![format!(
-        "{bytes} bytes of device storage for a profiling session do not fit: on a GPU the KV \
+        "{bytes} bytes of additional device storage do not fit: on a GPU the KV \
          cache's segments past those it cannot give back leave too little room"
     )];
     for room in rooms {

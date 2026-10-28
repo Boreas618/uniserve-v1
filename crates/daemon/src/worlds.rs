@@ -402,6 +402,7 @@ fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
         segments: Vec::new(),
         retire: Vec::new(),
         received_weights: Vec::new(),
+        expert_order: Default::default(),
         ..spec.clone()
     };
     // The file path is diagnostic; the resolved contents define the ranks.

@@ -1,10 +1,13 @@
 """Routed experts evaluate each token's selected experts with its weights."""
 
+import json
+
 import pytest
 import torch
 from torch.nn import functional as F
 
 from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.routing import ExpertRouting
 from uniserve.models import TextSize
 from uniserve.nn.moe import FusedMoE, TopK
 
@@ -73,6 +76,31 @@ def test_routing_must_match_the_declared_top_k_and_dtypes():
         module(hidden, torch.zeros(3, 2, dtype=torch.int64), weights)
     with pytest.raises(ValueError, match=r"\[tokens, top_k\]"):
         module(hidden, torch.zeros(3, 3, dtype=torch.int32), torch.ones(3, 3))
+
+
+def test_expert_reordering_preserves_logical_routes():
+    module = _module("silu")
+    routing = ExpertRouting(module)
+    hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8) / 24
+    ids = torch.tensor([[0, 3], [1, 2], [2, 0]], dtype=torch.int32)
+    weights = torch.tensor([[0.2, 0.8], [0.4, 0.6], [0.7, 0.3]])
+    expected = _expected(module, hidden, ids, weights)
+    original = [parameter.detach().clone() for parameter in module.parameters()]
+
+    for order in ([2, 0, 3, 1], [3, 2, 1, 0]):
+        # The runtime installs weights at fixed slots before publishing the
+        # corresponding routing table. Logical router IDs stay unchanged.
+        with torch.no_grad():
+            for parameter, value in zip(
+                module.parameters(), original, strict=True
+            ):
+                parameter.copy_(value[order])
+        routing.commit(json.dumps({"": order}))
+        torch.testing.assert_close(module(hidden, ids, weights), expected)
+
+    with pytest.raises(ValueError, match="permutation"):
+        routing.resolve({"": [0, 0, 1, 2]})
+    torch.testing.assert_close(module(hidden, ids, weights), expected)
 
 
 def test_top_k_selects_and_optionally_renormalizes_softmax_weights():

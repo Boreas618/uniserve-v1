@@ -127,6 +127,7 @@ impl Default for WorkerProcessArgs {
             min_video_seconds: None,
             expert_parallel: None,
             tensor_experts: false,
+            expert_order: Default::default(),
             expert_microbatches: Self::DEFAULT_EXPERT_MICROBATCHES,
         }
     }
@@ -286,6 +287,7 @@ impl WorkerProcessArgs {
                 })
                 .transpose()?,
             tensor_experts: self.tensor_experts,
+            expert_order: self.expert_order.clone(),
             role: serde_name(&self.role)?,
             expert_microbatches: self.expert_microbatches,
             distributed_backend: self.distributed_backend.clone(),

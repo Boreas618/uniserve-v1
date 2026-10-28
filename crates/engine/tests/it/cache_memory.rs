@@ -908,26 +908,32 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
         .unwrap();
     assert!(next_token(&mut holder, Duration::from_secs(10)).is_some());
 
-    let made = handle.resize_cache(CacheChange::MakeRoom { bytes: 1_500 });
+    let made = handle.resize_cache(CacheChange::MakeRoom {
+        bytes: 1_500,
+        devices: Default::default(),
+    });
     assert!(
         matches!(terminal(&mut holder), Some(Event::Finished { .. })),
         "the request holding the tail runs to its end"
     );
-    assert!(
-        made.recv_timeout(Duration::from_secs(10))
-            .expect("the scheduler answers")
-            .is_ok()
-    );
-    assert_eq!(
-        workers.lock().unwrap().hooks,
-        vec![
-            "uniserve.cache_memory".to_owned(),
-            r#"uniserve.release_cache {"from":6}"#.to_owned(),
-        ]
-    );
+    let reports = made
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers")
+        .unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&reports[0]).unwrap();
+    assert_eq!(plan["segments_kept"], 6);
 
     // The room is there: nothing more is given back.
-    assert!(resize(&handle, CacheChange::MakeRoom { bytes: 1_500 }).is_ok());
+    assert!(
+        resize(
+            &handle,
+            CacheChange::MakeRoom {
+                bytes: 1_500,
+                devices: Default::default()
+            }
+        )
+        .is_ok()
+    );
     assert_eq!(workers.lock().unwrap().held, 6);
     // The session books its storage, and releases it as it ends.
     workers.lock().unwrap().process_bytes = 5_000;
@@ -941,9 +947,16 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
     assert!(resize(&handle, CacheChange::Grow).is_ok());
     assert_eq!(workers.lock().unwrap().held, SEGMENTS);
 
-    let error = resize(&handle, CacheChange::MakeRoom { bytes: 7_500 }).unwrap_err();
+    let error = resize(
+        &handle,
+        CacheChange::MakeRoom {
+            bytes: 7_500,
+            devices: Default::default(),
+        },
+    )
+    .unwrap_err();
     assert!(
-        error.contains("7500 bytes of device storage for a profiling session do not fit"),
+        error.contains("7500 bytes of additional device storage do not fit"),
         "{error}"
     );
     assert!(
@@ -957,6 +970,49 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
         Some(Event::Finished { .. })
     ));
 
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+#[test]
+fn room_accounts_for_each_devices_allocation_and_dedicated_experts() {
+    let (handle, _workers, thread) = start(Workers {
+        experts: true,
+        expert_process: Some(900),
+        ..Workers::filling(3_500)
+    });
+    let request = |expert_bytes| CacheChange::MakeRoom {
+        bytes: 0,
+        devices: [([7; 16], 1_500), ([8; 16], expert_bytes)].into(),
+    };
+    // A dedicated expert GPU cannot borrow the attention GPU's cache room.
+    let error = resize(&handle, request(101)).unwrap_err();
+    assert!(
+        error.contains("900 of a quota of 1000 bytes booked"),
+        "{error}"
+    );
+    let mut served = handle.submit(request_of(1, 8, 2)).unwrap();
+    assert!(matches!(
+        terminal(&mut served),
+        Some(Event::Finished { .. })
+    ));
+
+    let reports = resize(&handle, request(100)).unwrap();
+    let plans = reports
+        .iter()
+        .map(|report| serde_json::from_str::<serde_json::Value>(report).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(plans.len(), 2);
+    assert!(plans.iter().all(|plan| plan["feasible"] == true));
+    let attention = plans.iter().find(|plan| plan["bytes"] == 1_500).unwrap();
+    assert_eq!(attention["segments_kept"], 6);
+    let experts = plans.iter().find(|plan| plan["bytes"] == 100).unwrap();
+    assert_eq!(experts["segments_held"], 0);
+    let mut served = handle.submit(request_of(2, 8, 2)).unwrap();
+    assert!(matches!(
+        terminal(&mut served),
+        Some(Event::Finished { .. })
+    ));
     handle.shutdown();
     thread.join().unwrap();
 }

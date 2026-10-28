@@ -336,26 +336,15 @@ impl Bytes {
 /// What target rank `rank` of `request` maps, copies and creates under
 /// `manifest`: every chunk it does not map it creates.
 fn rank_bytes(manifest: &Manifest, request: &manifest::Request, rank: u32) -> Bytes {
-    let mapped: BTreeSet<(u32, u32)> = manifest
-        .mappings
-        .iter()
-        .filter(|mapping| mapping.rank == rank)
-        .map(|mapping| (mapping.storage, mapping.chunk))
-        .collect();
     let mut bytes = Bytes::default();
-    for (storage, held) in request.target.ranks[rank as usize]
+    let total: u64 = request.target.ranks[rank as usize]
         .storages
         .iter()
-        .enumerate()
-    {
-        for (chunk, value) in held.chunks.iter().enumerate() {
-            if mapped.contains(&(storage as u32, chunk as u32)) {
-                bytes.mapped += value.length;
-            } else {
-                bytes.created += value.length;
-            }
-        }
-    }
+        .flat_map(|storage| &storage.chunks)
+        .map(|chunk| chunk.length)
+        .sum();
+    bytes.created = manifest.created_bytes(request, rank);
+    bytes.mapped = total - bytes.created;
     bytes.copied = manifest
         .copies
         .iter()

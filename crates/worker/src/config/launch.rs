@@ -152,6 +152,8 @@ pub struct WorkerLaunch {
     /// among themselves, each keeping whole experts and the group summing
     /// their outputs, instead of dividing every expert's channels.
     pub tensor_experts: bool,
+    /// Logical expert IDs in global physical-slot order, by numerical layer.
+    pub expert_order: BTreeMap<String, Vec<u32>>,
     /// `None` for the stub model.
     pub model: Option<ModelSource>,
     pub data_plane: DataPlane,
@@ -261,6 +263,7 @@ pub fn resolve(
         rendezvous,
         expert_parallel: experts,
         tensor_experts: descriptor.tensor_experts,
+        expert_order: descriptor.expert_order,
         model: model.map(|path| ModelSource {
             path,
             quantization: descriptor.quantization_config.to_string(),

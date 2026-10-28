@@ -264,6 +264,8 @@ pub struct WorkerProcessArgs {
     /// among themselves, each keeping whole experts and the group summing
     /// their outputs, instead of dividing every expert's channels.
     pub tensor_experts: bool,
+    /// Logical expert IDs in global physical-slot order, retained on recovery.
+    pub expert_order: std::collections::BTreeMap<String, Vec<u32>>,
     /// Independent numerical microbatches overlapping attention and remote experts.
     pub expert_microbatches: u32,
 }

@@ -69,8 +69,6 @@ struct Segments {
     device: DeviceId,
     address: u64,
     bytes: usize,
-    /// The shortest segment's length, the most one copy may address.
-    segment_bytes: u64,
     mapping: Mutex<SegmentedMapping>,
 }
 
@@ -288,7 +286,6 @@ impl Storage {
                 device,
                 address,
                 bytes,
-                segment_bytes: lengths.iter().min().map_or(0, |&length| length as u64),
                 mapping: Mutex::new(mapping),
             }),
         }))
@@ -350,6 +347,20 @@ impl Storage {
     /// device work may access it any more.
     pub(crate) fn release_segment(&self, index: usize) -> Result<()> {
         Ok(lock(&self.segments()?.mapping).release(index)?)
+    }
+
+    /// Install completed allocations at these addresses, once computations
+    /// have drained. Their owner keeps creating handles for fabric exports.
+    pub(crate) fn remap(&self, allocations: &[(usize, &OwnedFd)]) -> Result<()> {
+        Ok(lock(&self.segments()?.mapping).remap(allocations, Protection::ReadOnly)?)
+    }
+
+    /// Keep a segment's creating handle across remapping or alias retirement.
+    pub(crate) fn physical_allocation(
+        &self,
+        index: usize,
+    ) -> Result<Option<Arc<cuda::PhysicalAllocation>>> {
+        Ok(lock(&self.segments()?.mapping).allocation(index))
     }
 
     /// Map an allocation the host's Storage Server retains, `bytes` long,
@@ -591,7 +602,13 @@ impl Backing for Storage {
 
     fn copy_span(&self) -> u64 {
         match &self.kind {
-            Kind::Segmented(segments) => segments.segment_bytes,
+            Kind::Segmented(segments) => {
+                let mapping = lock(&segments.mapping);
+                (0..mapping.segments())
+                    .map(|index| mapping.segment_len(index) as u64)
+                    .min()
+                    .unwrap_or(0)
+            }
             _ => u64::MAX,
         }
     }

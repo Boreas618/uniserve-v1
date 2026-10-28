@@ -204,6 +204,11 @@ impl EngineConfig {
             predecessor: None,
             received_weights: None,
             model: spec.model.clone(),
+            expert_order: spec
+                .expert_order
+                .iter()
+                .map(|(path, order)| (path.clone(), order.experts.clone()))
+                .collect(),
             weights: stated(&workers.weights),
             host: spec.host.clone(),
             queue_depth: placement.queue_depth.max(1) as usize,
@@ -554,6 +559,7 @@ mod tests {
             speculation: None,
             profiling: None,
             received_weights: Vec::new(),
+            expert_order: Default::default(),
         }
     }
 

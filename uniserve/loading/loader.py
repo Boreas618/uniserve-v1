@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 from torch import nn
@@ -23,6 +23,9 @@ from .config import Config
 from .layout import ExpertKernels, finalize
 from .retained import Retained, tensors
 
+if TYPE_CHECKING:
+    from uniserve.bindings.routing import ExpertRouting
+
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
 
@@ -39,6 +42,7 @@ class Result(Generic[ModelT]):
     sources: tuple[checkpoint_module.Source, ...]
     reports: tuple[weight_options.Report, ...]
     origins: dict[int, str]
+    routing: ExpertRouting
 
 
 def _origins(
@@ -231,6 +235,7 @@ def load_model(
     expert_kernels: ExpertKernels = "local",
     retained: Retained | None = None,
     load: frozenset[str] = frozenset(),
+    expert_order: Mapping[str, Sequence[int]] | None = None,
 ) -> Result[ModelT]:
     """Construct on meta, bind partitions, then materialize selected modules.
 
@@ -248,6 +253,9 @@ def load_model(
     inheriting a selected ancestor's mesh. Encoded weights end in the layout
     of the kernels that read them (``uniserve.loading.layout``);
     ``expert_kernels`` names those of the routed experts.
+    ``expert_order`` lists logical expert IDs in global physical-slot order
+    for selected module paths, preserving each rank's slot count. The result
+    owns routing tensors borrowed by those numerical layers.
 
     With ``retained``, the selected modules take the tensors a worker
     published when it last loaded this model at this position
@@ -258,6 +266,8 @@ def load_model(
     them takes (``_reads``), load as without ``retained``, and the reports
     cover them alone.
     """
+    from uniserve.bindings.routing import ExpertRouting, select_experts
+
     with torch.device("meta"):
         model = model_class(config)
     if not isinstance(model, nn.Module):
@@ -314,6 +324,8 @@ def load_model(
             )
     if experts is not None:
         partition_experts(model, experts)
+    if expert_order:
+        select_experts(model, expert_order)
 
     # Declaring the mappings may also prune the model to the modules a
     # pipeline stage holds, so it precedes installing retained tensors too.
@@ -334,7 +346,13 @@ def load_model(
         ).close()
         retained.install(model, selected)
         model.eval()
-        return Result(model, checkpoint, (), _origins(declared))
+        return Result(
+            model,
+            checkpoint,
+            (),
+            _origins(declared),
+            ExpertRouting(model, expert_order),
+        )
 
     parameters = {
         id(parameter)
@@ -406,4 +424,10 @@ def load_model(
     )
     finalize(model, experts=expert_kernels)
     model.eval()
-    return Result(model, checkpoint, reports, _origins(declared))
+    return Result(
+        model,
+        checkpoint,
+        reports,
+        _origins(declared),
+        ExpertRouting(model, expert_order),
+    )

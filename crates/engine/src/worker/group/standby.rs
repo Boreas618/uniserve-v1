@@ -208,6 +208,20 @@ impl WorkerGroup {
         )
     }
 
+    /// Record recovery's distribution before publishing it in the live ranks.
+    /// Standbys capture the new order through their ordinary startup path.
+    pub(crate) fn commit_experts(
+        &mut self,
+        order: &std::collections::BTreeMap<String, Vec<u32>>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.drop_standby();
+        self.relaunch.0.withdraw_standby(self.relaunch.1);
+        self.process_args.expert_order = order.clone();
+        let result = self.hook("uniserve.commit_experts", "")?;
+        self.start_standby();
+        Ok(result)
+    }
+
     /// Promote the parked standby in place of the failed ranks, which the
     /// caller terminated, and start a new standby. Returns `None` without a
     /// parked standby; otherwise whether the promotion succeeded, after

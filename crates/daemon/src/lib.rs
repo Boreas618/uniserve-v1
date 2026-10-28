@@ -28,6 +28,7 @@
 //!   daemon.
 
 pub mod engine;
+pub mod experts;
 pub mod http;
 pub mod input;
 mod interference;

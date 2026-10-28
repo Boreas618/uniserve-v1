@@ -624,6 +624,7 @@ class Layout:
         origins: Mapping[int, str] | None = None,
         only: frozenset[str] | None = None,
         devices: frozenset[str] = frozenset(("cuda",)),
+        logical: Mapping[int, Logical] | None = None,
     ) -> Layout:
         """The layout of ``module``'s parameters and buffers.
 
@@ -636,12 +637,16 @@ class Layout:
         ``devices`` are the device types the tensors may lie on: CUDA for
         a worker's retention; a caller describing a model loaded elsewhere
         (on the host, to plan its redistribution) names that device.
+        ``logical`` overrides selected tensors' logical regions for a target
+        distribution, without changing the model's live declarations.
 
         Raises:
             ValueError: A tensor lies outside ``devices``.
         """
         origins = {} if origins is None else origins
         declared = logical_tensors(module)
+        if logical is not None:
+            declared.update(logical)
         layout = cls([])
         index: dict[tuple[str, int], int] = {}
         for identity, tensor in tensors(module):
@@ -699,6 +704,10 @@ class Layout:
     def storage_bytes(self) -> list[int]:
         """Each storage's bytes."""
         return [storage.nbytes() for storage in self._storages]
+
+    def storage_addresses(self) -> list[int]:
+        """Each storage's base address, for retaining numerical tensor views."""
+        return [storage.data_ptr() for storage in self._storages]
 
     def _fields(self) -> Iterator[tuple[int, _Entry, str, torch.Tensor]]:
         for index, views in enumerate(self._views):

@@ -198,6 +198,24 @@ impl Scheduler {
             } => {
                 self.update_weights(model_path, in_flight, answer);
             }
+            Command::CommitExperts {
+                order,
+                together,
+                answer,
+            } => {
+                let committed = self.run_together(&together, |scheduler| {
+                    scheduler
+                        .executor
+                        .commit_experts(&order)
+                        .map_err(|error| format!("{error:#}"))
+                });
+                if let Err(error) = &committed {
+                    // Recovery uses the committed distribution. No scheduler
+                    // may issue a batch through a partially changed union.
+                    self.fail(format!("expert commit failed: {error}"));
+                }
+                let _ = answer.send(committed);
+            }
             Command::Shutdown => return true,
         }
         false

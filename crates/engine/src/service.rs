@@ -557,6 +557,23 @@ fn read_requests(
                     }
                 }
                 Some(wire::engine_command::Kind::Hook(hook)) => run_hook(hook, front, routing),
+                Some(wire::engine_command::Kind::CommitExperts(commit)) => {
+                    let order = commit
+                        .order
+                        .iter()
+                        .map(|(path, order)| (path.clone(), order.experts.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let together = crate::HookBarrier::new(routing.slots.len());
+                    let answers = routing
+                        .slots
+                        .iter()
+                        .map(|slot| {
+                            slot.handle
+                                .commit_experts(order.clone(), Arc::clone(&together))
+                        })
+                        .collect();
+                    answer_hooked(commit.id, answers, front, routing);
+                }
                 Some(wire::engine_command::Kind::ResizeCache(resize)) => {
                     resize_cache(&resize, front, routing);
                 }
@@ -840,6 +857,15 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         Ok(wire::CacheChange::Evict) => crate::CacheChange::Evict,
         Ok(wire::CacheChange::MakeRoom) => crate::CacheChange::MakeRoom {
             bytes: resize.room_bytes,
+            devices: resize
+                .device_bytes
+                .iter()
+                .filter_map(|device| {
+                    <[u8; 16]>::try_from(device.gpu.as_slice())
+                        .ok()
+                        .map(|gpu| (gpu, device.bytes))
+                })
+                .collect(),
         },
         Ok(wire::CacheChange::Restore) => crate::CacheChange::Restore,
         Ok(wire::CacheChange::Sleep) => crate::CacheChange::Sleep,

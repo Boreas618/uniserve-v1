@@ -1578,6 +1578,15 @@ pub trait Executor: Send {
         let _ = payload;
         anyhow::bail!("this executor runs no worker hook ({name})")
     }
+
+    /// Commit prepared expert allocations and retain their order for recovery.
+    fn commit_experts(
+        &mut self,
+        order: &BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<String>, ExecutorError> {
+        let _ = order;
+        anyhow::bail!("this executor holds no expert weights")
+    }
 }
 
 #[cfg(test)]
