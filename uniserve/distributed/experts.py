@@ -297,8 +297,8 @@ def weight_fields(model) -> list[Any]:
 
     Each layer's weights are placed in the CuTeDSL kernels' representation
     before the worker publishes them; the full-extent views later bound
-    keep that representation. Every field except a scalar or per-expert
-    ``tensor_scale`` (which stays resident in full) is sharded over the
+    keep that representation. Every field except a scalar
+    ``tensor_scale`` (which stays resident) is sharded over the
     expert group by its leading (expert) axis.
 
     Returns:
@@ -343,7 +343,7 @@ def weight_fields(model) -> list[Any]:
                 else [("weight", weight)]
             )
             for field, value in parts:
-                if field == "tensor_scale":
+                if field == "tensor_scale" and value.ndim == 0:
                     continue
                 names.append(f"{name}.{field}")
                 shards.append(value.contiguous())
@@ -380,12 +380,8 @@ def bind_weights(
         if isinstance(weight, QuantizedTensor):
             buffers = {}
             for field, value in weight.buffers().items():
-                if field == "tensor_scale":
-                    # Kernels derive their scales at preparation, so these
-                    # few immutable values stay fully resident.
-                    buffers[field] = (
-                        value if value.ndim == 0 else group.all_gather(value)
-                    )
+                if field == "tensor_scale" and value.ndim == 0:
+                    buffers[field] = value
                 else:
                     buffers[field] = full(field, value)
             placed = weight.quantizer.from_tensors(

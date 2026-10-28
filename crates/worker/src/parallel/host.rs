@@ -97,6 +97,26 @@ pub struct HostGroup {
 }
 
 impl HostGroup {
+    /// Form an independent collective channel with the same members.
+    /// Call collectively before either group begins concurrent operations.
+    /// `rendezvous` names the first member's reachable network interface.
+    pub(crate) fn duplicate(&self, rendezvous: &str) -> Result<Self> {
+        let (listener, address) = if self.rank() == 0 {
+            let (listener, address) = bind_beside(rendezvous)?;
+            (Some(listener), Some(address))
+        } else {
+            (None, None)
+        };
+        let address = self.broadcast_bytes(address.as_deref().map(str::as_bytes), 0)?;
+        let address = String::from_utf8(address)
+            .map_err(|_| Error::transport("the collective address is not text"))?;
+        let rendezvous = match listener {
+            Some(listener) => Rendezvous::serve(address, listener),
+            None => Rendezvous::connect(address),
+        };
+        Self::connect(rendezvous, self.rank(), self.size(), STARTUP_TIMEOUT)
+    }
+
     /// A group of one member, which needs no connections.
     pub(crate) fn single(rank: usize) -> Self {
         Self {

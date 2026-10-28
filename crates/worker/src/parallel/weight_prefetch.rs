@@ -47,6 +47,9 @@ pub(crate) struct WeightStorage {
     published: Vec<crate::transfer::PeerStorage>,
     slots: Vec<DeviceAllocation>,
     composites: Vec<Arc<Storage>>,
+    shards: Vec<Vec<(StorageView, usize)>>,
+    copies: Vec<Vec<(usize, usize, usize, usize)>>,
+    plans: Vec<CopyBatch>,
 }
 
 /// Distributed expert weights: every rank keeps its expert shard resident
@@ -66,8 +69,6 @@ pub(crate) struct WeightStorage {
 /// compute events alone.
 pub(crate) struct ExpertWeights {
     device: DeviceId,
-    /// Layer `i`'s peer reads into its slots, as one batch.
-    plans: Vec<CopyBatch>,
     /// Every address the plans and the composite views use; `None` once
     /// released.
     storage: Mutex<Option<WeightStorage>>,
@@ -97,19 +98,25 @@ impl ExpertWeights {
             published: Vec::new(),
             slots: Vec::new(),
             composites: Vec::new(),
+            shards: Vec::new(),
+            copies: Vec::new(),
+            plans: Vec::new(),
         };
         match Self::map(group, device, host, layers, stream, &mut storage) {
-            Ok((copies, views, (resident_bytes, buffer_bytes, transfer_bytes))) => Ok((
-                Self {
-                    device,
-                    plans: copies.into_iter().map(plan).collect(),
-                    storage: Mutex::new(Some(storage)),
-                    resident_bytes,
-                    buffer_bytes,
-                    transfer_bytes,
-                },
-                views,
-            )),
+            Ok((copies, views, (resident_bytes, buffer_bytes, transfer_bytes))) => {
+                storage.plans = copies.iter().cloned().map(plan).collect();
+                storage.copies = copies;
+                Ok((
+                    Self {
+                        device,
+                        storage: Mutex::new(Some(storage)),
+                        resident_bytes,
+                        buffer_bytes,
+                        transfer_bytes,
+                    },
+                    views,
+                ))
+            }
             Err(error) => {
                 // Peers may read the pages a failed setup published.
                 crate::leak(storage);
@@ -140,6 +147,7 @@ impl ExpertWeights {
         for (index, fields) in layers.iter().enumerate() {
             let mut layer_copies = Vec::new();
             let mut layer_views = Vec::new();
+            let mut shard_views = Vec::new();
             for field in fields {
                 let shard = field.bytes;
                 let total = shard * size;
@@ -250,6 +258,13 @@ impl ExpertWeights {
                     }
                 }
                 stream.synchronize()?;
+                shard_views.push((
+                    StorageView::whole(
+                        Arc::clone(published.local()) as Arc<dyn Backing>,
+                        DType::U8,
+                    )?,
+                    begin - first,
+                ));
                 layer_views.push(StorageView::contiguous(
                     Arc::clone(&composite) as Arc<dyn Backing>,
                     0,
@@ -261,7 +276,11 @@ impl ExpertWeights {
             }
             copies.push(layer_copies);
             views.push(layer_views);
+            storage.shards.push(shard_views);
         }
+        // Every peer has finished the persistent edge copies before a rank
+        // can publish or discard this completed generation.
+        group.barrier()?;
         Ok((
             copies,
             views,
@@ -277,16 +296,100 @@ impl ExpertWeights {
     fn submit(&self, layer: usize, stream: &Stream) -> Result<()> {
         // Held through the submission, so a release cannot interleave.
         let storage = lock(&self.storage);
-        if storage.is_none() {
-            return Err(Error::State("distributed expert weights are closed"));
-        }
-        let plan = self
+        let storage = storage
+            .as_ref()
+            .ok_or(Error::State("distributed expert weights are closed"))?;
+        let plan = storage
             .plans
             .get(layer)
             .ok_or_else(|| Error::Invalid(format!("expert layer {layer} has no copy plan")))?;
         // SAFETY: `storage` retains every address the plan uses until it is
         // released, after the caller drained the streams it submitted on.
         unsafe { plan.submit(stream) }?;
+        Ok(())
+    }
+
+    /// Borrow the true resident shards, before full composite tensors replace
+    /// the model's local parameters. Numerical manifests use these views;
+    /// reusable prefetch slots never describe immutable source weights.
+    fn resident(&self) -> Result<Vec<Vec<(Handle, usize)>>> {
+        let storage = lock(&self.storage);
+        let storage = storage
+            .as_ref()
+            .ok_or(Error::State("distributed expert weights are closed"))?;
+        storage
+            .shards
+            .iter()
+            .map(|layer| {
+                layer
+                    .iter()
+                    .map(|(view, offset)| Ok((view.handle()?.clone(), *offset)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub(crate) fn resident_storages(&self) -> Result<Vec<Arc<Storage>>> {
+        let storage = lock(&self.storage);
+        let storage = storage
+            .as_ref()
+            .ok_or(Error::State("distributed expert weights are closed"))?;
+        Ok(storage
+            .published
+            .iter()
+            .map(|field| Arc::clone(field.local()))
+            .collect())
+    }
+
+    /// Install a fully prepared successor at the existing composite addresses.
+    /// All ranks must drain compute and prefetch before entering this local
+    /// operation, and resume only after every rank committed. The successor's
+    /// peer mappings and creating allocations stay owned by this instance.
+    pub(crate) fn replace(&self, successor: Self) -> Result<()> {
+        let mut active = lock(&self.storage);
+        let current = active
+            .as_ref()
+            .ok_or(Error::State("distributed expert weights are closed"))?;
+        let mut incoming = successor
+            .release()
+            .ok_or(Error::State("the successor expert weights are live"))?;
+        if current.composites.len() != incoming.composites.len()
+            || current
+                .composites
+                .iter()
+                .zip(&incoming.composites)
+                .any(|(target, source)| target.bytes() != source.bytes())
+        {
+            return Err(Error::Invalid(
+                "expert replacement must preserve field extents".into(),
+            ));
+        }
+        for copies in &mut incoming.copies {
+            for (_, destination, _, _) in copies {
+                let (target, source) = current
+                    .composites
+                    .iter()
+                    .zip(&incoming.composites)
+                    .find(|(_, source)| {
+                        let start = source.address() as usize;
+                        (start..start + source.bytes()).contains(destination)
+                    })
+                    .ok_or(Error::State("a peer read writes a composite weight field"))?;
+                *destination =
+                    target.address() as usize + (*destination - source.address() as usize);
+            }
+        }
+        incoming.plans = incoming.copies.iter().cloned().map(plan).collect();
+        for (target, source) in current.composites.iter().zip(&incoming.composites) {
+            if let Err(error) = target.remap_alias(source) {
+                // Other ranks may already have installed this generation's
+                // peer mappings. Keep their creating handles until exit.
+                crate::leak(incoming);
+                return Err(error);
+            }
+        }
+        incoming.composites.clone_from(&current.composites);
+        *active = Some(incoming);
         Ok(())
     }
 
@@ -328,6 +431,117 @@ fn plan(copies: Vec<(usize, usize, usize, usize)>) -> CopyBatch {
 /// The library module of expert exchanges and distributed expert weights.
 const MODULE: &str = "uniserve.distributed.experts";
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
+    use cuda::{PinnedBuffer, memset_d8};
+    use std::net::TcpListener;
+
+    #[test]
+    #[ignore = "requires two CUDA devices"]
+    fn distributed_weights_replacement_preserves_borrowed_fields() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let ranks = [
+            Rendezvous::serve(&address, listener),
+            Rendezvous::connect(&address),
+        ];
+        let threads: Vec<_> = ranks
+            .into_iter()
+            .enumerate()
+            .map(|(rank, rendezvous)| {
+                std::thread::spawn(move || -> Result<()> {
+                    let device = DeviceId(rank as i32);
+                    let group = HostGroup::connect(rendezvous, rank, 2, STARTUP_TIMEOUT)?;
+                    let page = DeviceAllocation::granularity(device)?;
+                    // A shard boundary inside a page exercises persistent neighbor
+                    // bytes as well as the reusable remote prefetch slots.
+                    let bytes = page + 256;
+                    let stream = Stream::new(device)?;
+                    let make =
+                        |owner: usize| -> Result<(Vec<DeviceAllocation>, Vec<Vec<ShardField>>)> {
+                            let allocations = (0..4)
+                                .map(|layer| {
+                                let allocation = DeviceAllocation::linear(device, bytes)?;
+                                    // SAFETY: the new allocation owns the filled range.
+                                    unsafe {
+                                        memset_d8(
+                                            allocation.address(),
+                                            (11 + owner * 4 + layer) as u8,
+                                            bytes,
+                                            &stream,
+                                        )
+                                    }?;
+                                    Ok(allocation)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            stream.synchronize()?;
+                            let fields = allocations
+                                .iter()
+                                .map(|allocation| {
+                                    vec![ShardField {
+                                        name: "up_gate.weight".into(),
+                                        address: allocation.address(),
+                                        bytes,
+                                    }]
+                                })
+                                .collect();
+                            Ok((allocations, fields))
+                        };
+                    let (original, fields) = make(rank)?;
+                    let (weights, views) =
+                        ExpertWeights::build(&group, device, "local", &fields, &stream)?;
+                    drop(original);
+                    let host = PinnedBuffer::new(device, bytes * 2)?;
+                    let verify =
+                        |swapped: bool| -> Result<()> {
+                            for (layer, fields) in views.iter().enumerate() {
+                                weights.submit(layer, &stream)?;
+                                // SAFETY: the owner retains every borrowed field and
+                                // the readback is drained before host inspection.
+                                unsafe {
+                                    memcpy_async(
+                                        host.address(),
+                                        fields[0].address(),
+                                        bytes * 2,
+                                        &stream,
+                                    )
+                                }?;
+                                stream.synchronize()?;
+                                // SAFETY: the preceding stream synchronization completed
+                                // every write to this pinned buffer.
+                                let observed = unsafe { host.as_slice() };
+                                for peer in 0..2 {
+                                    let logical = if swapped { peer ^ 1 } else { peer };
+                                    assert!(observed[peer * bytes..(peer + 1) * bytes].iter()
+                                .all(|value| *value == (11 + logical * 4 + layer) as u8));
+                                }
+                            }
+                            Ok(())
+                        };
+                    verify(false)?;
+                    let (incoming, fields) = make(rank ^ 1)?;
+                    let (successor, _) =
+                        ExpertWeights::build(&group, device, "local", &fields, &stream)?;
+                    drop(incoming);
+                    group.barrier()?;
+                    weights.replace(successor)?;
+                    group.barrier()?;
+                    verify(true)?;
+                    // No rank retires peer-readable allocations while another
+                    // rank's final readback is still in flight.
+                    group.barrier()?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+    }
+}
+
 // Distributed expert weights of a rank (DWDP): setup is collective over the
 // expert union, after loading and before capacity planning. `weight_fields`
 // places each layer's weights for its kernels and lists this rank's shards;
@@ -340,10 +554,88 @@ const MODULE: &str = "uniserve.distributed.experts";
 /// The rank's distributed expert weights and their prefetch schedule.
 pub(crate) struct DwdpManager {
     weights: Arc<ExpertWeights>,
+    update: Arc<DwdpUpdate>,
     /// `bind_prefetch`'s object (`WeightPrefetch`), which the executor
     /// passes to every binding's expert calls.
     prefetch: Handle,
     closed: bool,
+}
+
+/// Online redistribution's access to the distributed weight owner.
+/// Its collective channel and stream are independent of serving, so staging
+/// a successor does not park token execution or interleave control messages.
+pub(crate) struct DwdpUpdate {
+    weights: Arc<ExpertWeights>,
+    group: super::host::HostGroup,
+    host: String,
+    stream: Stream,
+    layout: Handle,
+    names: Vec<Vec<String>>,
+}
+
+impl DwdpUpdate {
+    /// Additional physical bytes while both generations coexist. Staging
+    /// includes reusable prefetch slots as well as immutable resident pages.
+    pub(crate) fn required_bytes(&self) -> usize {
+        self.weights.resident_bytes + self.weights.buffer_bytes
+    }
+
+    /// The layout and owning allocations of the live resident expert shards.
+    pub(crate) fn layout(&self, orders: &str) -> Result<Handle> {
+        Handle::new(
+            Interpreter::import("uniserve.loading.expert_weights.ResidentExperts.describe")?
+                .call_values(&[
+                    self.layout.to_any(),
+                    Any::from(tvm_ffi::String::from(orders)),
+                ])?,
+        )
+    }
+
+    pub(crate) fn storages(&self) -> Result<Vec<Arc<Storage>>> {
+        self.weights.resident_storages()
+    }
+    /// Build a successor from completed borrowed shard views. Collective over
+    /// every expert rank; run concurrently on all ranks on background threads.
+    /// The caller retains the input allocations until this method returns.
+    pub(crate) fn prepare(&self, fields: &[Vec<ShardField>]) -> Result<ExpertWeights> {
+        let (weights, _) = ExpertWeights::build(
+            &self.group,
+            self.weights.device,
+            &self.host,
+            fields,
+            &self.stream,
+        )?;
+        Ok(weights)
+    }
+
+    /// Publish a staged generation locally at a common drained step boundary.
+    /// This call does not perform a collective; the engine holds all ranks
+    /// until each has installed its aliases and logical routing tables.
+    pub(crate) fn commit(&self, successor: ExpertWeights) -> Result<()> {
+        self.weights.replace(successor)?;
+        bind_resident(&self.layout, &self.names, self.weights.resident()?)
+    }
+}
+
+fn bind_resident(
+    layout: &Handle,
+    names: &[Vec<String>],
+    fields: Vec<Vec<(Handle, usize)>>,
+) -> Result<()> {
+    let bind = Interpreter::import("uniserve.loading.expert_weights.ResidentExperts.bind")?;
+    for (index, (names, fields)) in names.iter().zip(fields).enumerate() {
+        let mut arguments = vec![
+            layout.to_any(),
+            Any::from(index as i64),
+            Any::from(crate::ffi::strings(names)),
+            Any::from(crate::ffi::integer_list(
+                fields.iter().map(|(_, offset)| *offset as i64),
+            )),
+        ];
+        arguments.extend(fields.iter().map(|(view, _)| view.to_any()));
+        bind.call_values(&arguments)?;
+    }
+    Ok(())
 }
 
 /// A worker error raised back into the calling numerical code.
@@ -410,6 +702,15 @@ impl DwdpManager {
             .collect();
         let (weights, views) = ExpertWeights::build(union_group, device, host, &layers, &stream)?;
         drop(shards);
+        let resident = Handle::new(
+            Interpreter::import("uniserve.loading.expert_weights.ResidentExperts")?
+                .call_values(&[model.handle().to_any()])?,
+        )?;
+        let names: Vec<Vec<String>> = layers
+            .iter()
+            .map(|fields| fields.iter().map(|field| field.name.clone()).collect())
+            .collect();
+        bind_resident(&resident, &names, weights.resident()?)?;
         let bind = Interpreter::import(&format!("{MODULE}.bind_weights"))?;
         for (layer, (fields, views)) in layers.iter().zip(views).enumerate() {
             // The views' wrappings and the call take one handoff.
@@ -434,12 +735,25 @@ impl DwdpManager {
         );
 
         let weights = Arc::new(weights);
+        let rendezvous = union
+            .rendezvous
+            .as_ref()
+            .ok_or(Error::State("DWDP requires its union rendezvous"))?;
+        let update = Arc::new(DwdpUpdate {
+            weights: Arc::clone(&weights),
+            group: union_group.duplicate(&rendezvous.address)?,
+            host: host.to_owned(),
+            stream: Stream::new(device)?,
+            layout: resident,
+            names,
+        });
         let prefetch = Handle::new(
             Interpreter::import(&format!("{MODULE}.bind_prefetch"))?
                 .call_values(&[model.handle().to_any(), Any::from(copy_function(&weights))])?,
         )?;
         Ok(Some(Self {
             weights,
+            update,
             prefetch,
             closed: false,
         }))
@@ -448,6 +762,10 @@ impl DwdpManager {
     /// The object bindings pass to their expert calls.
     pub(crate) fn prefetch(&self) -> &Handle {
         &self.prefetch
+    }
+
+    pub(crate) fn update(&self) -> Arc<DwdpUpdate> {
+        Arc::clone(&self.update)
     }
 
     /// Drain the schedule's copies and release the weights after every

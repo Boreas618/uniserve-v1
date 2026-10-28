@@ -90,7 +90,7 @@ impl PeerStorage {
         host: &str,
         group: &HostGroup,
     ) -> Result<Self> {
-        let local = Storage::exportable(device, bytes, &[])?;
+        let local = Storage::retained_device(device, bytes)?;
         let allocation: &DeviceAllocation = local
             .allocation()
             .ok_or_else(|| Error::Invariant("peer storage is device memory".into()))?;

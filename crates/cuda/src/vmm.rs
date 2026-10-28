@@ -492,6 +492,57 @@ impl PeerMapping {
         self.range.grant(&self.access, protection)
     }
 
+    /// Replace this mapping's backing with another mapping's physical pages.
+    ///
+    /// Both ranges must have the same device and byte extent. The destination
+    /// keeps its virtual address, including pointers captured by CUDA graphs.
+    /// The caller drains all accesses before replacing it. Source mappings and
+    /// their creating allocations remain owned independently.
+    ///
+    /// A driver failure after unmapping leaves the destination unusable; its
+    /// execution owner must retire it rather than resume numerical work.
+    pub fn remap_from(&mut self, source: &Self) -> Result<()> {
+        if self.device != source.device || self.bytes != source.bytes {
+            return Err(Error::invalid(
+                "alias replacement requires one device and byte extent",
+            ));
+        }
+        let context = PrimaryContext::retain(self.device)?;
+        let _guard = context.enter()?;
+        let driver = driver()?;
+
+        // Acquire every reference before changing a live mapping. The temporary
+        // range releases acquired references if the driver rejects an import.
+        let mut incoming = VirtualRange::new(context);
+        let mut segments = Vec::with_capacity(source.range.mapped.len());
+        for &(address, bytes) in &source.range.mapped {
+            let mut handle = 0;
+            driver.check(
+                // SAFETY: source owns a live mapping beginning at address.
+                unsafe {
+                    (driver.mem_retain_allocation_handle)(&mut handle, address as *mut c_void)
+                },
+                "cuMemRetainAllocationHandle",
+            )?;
+            incoming.adopt(handle);
+            segments.push(((address - source.address) as usize, bytes, handle));
+        }
+        while let Some(&(address, bytes)) = self.range.mapped.last() {
+            driver.check(
+                // SAFETY: this range owns the mapping and all users drained it.
+                unsafe { (driver.mem_unmap)(address, bytes) },
+                "cuMemUnmap",
+            )?;
+            self.range.mapped.pop();
+        }
+        // Old references can retire asynchronously after the aliases vanished.
+        std::mem::swap(&mut self.range.handles, &mut incoming.handles);
+        for (offset, bytes, handle) in segments {
+            self.range.map(offset, bytes, handle)?;
+        }
+        self.range.grant(&self.access, Protection::ReadWrite)
+    }
+
     /// Maps whole exportable allocations of one device contiguously, without
     /// copying, so that `parts[i]` starts at the sum of the preceding lengths.
     pub fn alias(parts: &[&DeviceAllocation]) -> Result<Self> {
