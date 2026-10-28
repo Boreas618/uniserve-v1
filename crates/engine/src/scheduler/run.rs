@@ -225,6 +225,7 @@ impl Scheduler {
             transfer_capacity,
             latent_dtype,
             engine_id: 1,
+            world: 0,
             next_product_generation: 1,
             next_request_epoch: 1,
             running_order: Vec::new(),
@@ -338,6 +339,11 @@ impl Scheduler {
     /// whose requests hand their KV cache to a decode group.
     pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
         self.placement.prefill_groups = groups.into_iter().collect();
+    }
+
+    /// Sets the world that owns new requests' private cache continuations.
+    pub(crate) fn set_world(&mut self, world: u64) {
+        self.world = world;
     }
 
     /// Enables or disables reusable prefix caching.

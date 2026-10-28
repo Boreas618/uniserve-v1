@@ -90,7 +90,7 @@ impl Scheduler {
     /// refuses the request, and with `RejectionKind::Overloaded` when the
     /// waiting bound is reached. A rejection is sent on `event_tx` and its
     /// send result is ignored.
-    pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
+    pub(super) fn enqueue(&mut self, mut req: GenerationRequest, event_tx: EventTx) {
         let max_cache_tokens = match self.validate_submission(&req) {
             Ok(tokens) => tokens,
             Err(message) => {
@@ -133,6 +133,12 @@ impl Scheduler {
                 message: "scheduler waiting queue is full".into(),
             });
             return;
+        }
+        if req.is_migratable() && req.cache.resume.is_none() {
+            req.cache.resume = Some(proto::request::CacheResume {
+                world: self.world,
+                request_id: req.request_id.0,
+            });
         }
         let st = self.request_state(req, event_tx, max_cache_tokens, continuation);
 
