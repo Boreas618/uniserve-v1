@@ -67,6 +67,8 @@ SERVED_MODEL = "diffusion-gemma-host-kv-cache"
 # at a multiple of it.
 STEP = 64
 BOUNDARY_INTERVAL = 32
+# Host storage the test's host KV cache may take, in GiB (per host).
+HOST_GIB = 32
 INTERVAL_TOKENS = BOUNDARY_INTERVAL * STEP
 # The tokens of a prompt after the records it shares with another: the
 # question and the chat template's end of the turn.
@@ -176,6 +178,11 @@ def test_a_restarted_engine_loads_full_pages_and_aligned_windows(
         "8192",
         "--set",
         f"kv_cache_config.boundary_interval={BOUNDARY_INTERVAL}",
+        # The host KV cache holds one prompt of at most 8192 tokens; left at
+        # twice the device's token capacity it would pin hundreds of GiB of
+        # the host, which test runs share.
+        "--set",
+        f"kv_cache_config.host_gib={HOST_GIB}",
     ]
     env = {
         "CUDA_VISIBLE_DEVICES": gpu_device(),
