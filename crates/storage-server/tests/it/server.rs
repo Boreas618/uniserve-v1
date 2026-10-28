@@ -45,6 +45,16 @@ impl Running {
     /// A server that runs the Transfer Server `transfer` names for its
     /// socket.
     pub(crate) fn with_transfer(transfer: impl FnOnce(&Path) -> Option<Launch>) -> Self {
+        Self::serving(0, transfer)
+    }
+
+    /// A server that leaves `host_reserve` bytes of the host's available
+    /// memory to other processes.
+    fn reserving(host_reserve: u64) -> Self {
+        Self::serving(host_reserve, |_| None)
+    }
+
+    fn serving(host_reserve: u64, transfer: impl FnOnce(&Path) -> Option<Launch>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
         let transfer = transfer(&socket);
@@ -63,7 +73,7 @@ impl Running {
         let thread = std::thread::spawn(move || {
             let _lock = lock;
             // Pools of four 16-byte pages.
-            let mut server = Server::new(listener, 64, 0, None, transfer).unwrap();
+            let mut server = Server::new(listener, 64, host_reserve, None, transfer).unwrap();
             server.listen_tcp(tcp).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
@@ -1590,6 +1600,73 @@ fn a_host_sizes_the_host_kv_cache_of_a_world_in_tokens() {
     assert_eq!(ask(4096, Some(64 << 20)), 4096);
     // The host's available memory holds a few thousand tokens.
     assert_eq!(ask(4096, None), 4096);
+}
+
+/// A host that admits no page pool, its whole memory reserved, holds no
+/// token of a world's host KV cache and refuses its pools. Once a KV
+/// storage keeps what the pools commit (a connector connected), it holds
+/// what a staging pool of `STAGING_POOL_BYTES` holds on each rank, and
+/// admits such a pool from its reserve, though no larger one: pages pass
+/// through it into the KV storage.
+#[test]
+fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
+    use storage::protocol::{PageShape, Reply, Request};
+    use storage_server::STAGING_POOL_BYTES;
+
+    let server = Running::reserving(u64::MAX);
+    let mut daemon = head(&server.socket);
+    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut engine = engine_head(&server.socket, 1);
+    let mut ask = |tokens: u64, host_bytes: Option<u64>| {
+        let answer = engine
+            .call(
+                &Request::HostCache {
+                    tokens,
+                    token_bytes: vec![1024, 3072],
+                    host_bytes,
+                },
+                &[],
+            )
+            .unwrap();
+        let Reply::HostCache { tokens } = answer.reply else {
+            panic!("the host KV cache was not sized: {:?}", answer.reply);
+        };
+        tokens
+    };
+    let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    // The slots of a pool of pages of 16 bytes the worker asks for of
+    // `bytes`, or `None` when the host refuses it.
+    let mut pool = |bytes: u64| {
+        let shape = PageShape {
+            layout: key(3),
+            kv_head_offset: 0,
+            kv_head_count: 2,
+            page_bytes: 16,
+        };
+        let request = Request::PagePool {
+            shape,
+            numa_node: None,
+            bytes: Some(bytes),
+        };
+        match worker.call(&request, &[]).unwrap().reply {
+            Reply::PagePool { slots, .. } => Some(slots),
+            Reply::Error { .. } => None,
+            reply => panic!("a page pool request answered {reply:?}"),
+        }
+    };
+
+    assert_eq!(ask(1 << 20, None), 0);
+    assert_eq!(pool(32), None);
+
+    let _connector = Client::connect(&server.socket, Role::Connector).unwrap();
+    // The larger rank takes 3072 bytes a token; a stated budget the host
+    // cannot admit stages as well.
+    let staging = STAGING_POOL_BYTES / 3072;
+    assert_eq!(ask(1 << 20, None), staging);
+    assert_eq!(ask(1 << 20, Some(64 << 30)), staging);
+    assert_eq!(ask(64, None), 64);
+    assert_eq!(pool(STAGING_POOL_BYTES + 16), None);
+    assert_eq!(pool(STAGING_POOL_BYTES), Some(STAGING_POOL_BYTES / 16));
 }
 
 /// A server serves clients of its protocol and of every earlier one from

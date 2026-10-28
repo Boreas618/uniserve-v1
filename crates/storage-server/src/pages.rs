@@ -44,6 +44,14 @@ type ClientId = u64;
 /// worker maps it.
 pub const DEFAULT_POOL_BYTES: u64 = 64 << 30;
 
+/// The host memory a rank's page pools take at most when the host's memory
+/// holds none of the pools a world asks for and a KV storage keeps every
+/// page the pools commit: staging pools, through which pages pass into the
+/// KV storage on their way out of the device (`specs/online-operations.md`
+/// §6.5). The server admits them from its reserve, never past the host's
+/// available memory.
+pub const STAGING_POOL_BYTES: u64 = 256 << 20;
+
 /// One slot's state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Slot {

@@ -887,6 +887,7 @@ impl SchedulerHandle {
                     &config.worker_process.host,
                     config.boundary_interval,
                     config.host_cache,
+                    config.worker_process.kv_storage.is_some(),
                 )
                 .context("sizing the world's host KV cache")?;
         }

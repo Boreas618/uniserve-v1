@@ -54,6 +54,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -282,8 +283,13 @@ def _serve(
     devices: str | None = None,
     options: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
+    storage: tuple[str, ...] | None = None,
 ) -> Iterator[tuple[str, Path]]:
-    """A deployment serving `name` on `devices`, its URL and its log."""
+    """A deployment serving `name` on `devices`, its URL and its log.
+
+    With `storage`, a Storage Server started by hand with those options
+    serves the deployment, which starts none of its own.
+    """
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -310,6 +316,23 @@ def _serve(
         **(env or {}),
     }
     try:
+        if storage is not None:
+            socket = runtime / "uniserve" / "storage.sock"
+            socket.parent.mkdir(mode=0o700)
+            subprocess.run(
+                [
+                    str(require_uniserve_binary()),
+                    "storage",
+                    "serve",
+                    "--socket",
+                    str(socket),
+                    "--daemon",
+                    *storage,
+                ],
+                env={**os.environ, **environment},
+                check=True,
+                timeout=120,
+            )
         with server_process(
             command, base_url, log, timeout_s=900, env=environment
         ):
@@ -1068,6 +1091,60 @@ def test_a_change_of_model_files_loads_the_successors_weights(
 # A prompt longer than one segment of the KV cache (an eighth of its 32768
 # tokens), which leaves the next prompt's pages in later segments.
 FILL_PROMPT = "Name one colour of the rainbow. " * 900
+# Another such prompt, which shares no page with the first.
+SECOND_FILL_PROMPT = "Name one planet of the solar system. " * 900
+
+# The KV storage behind the host KV cache (`kv_cache_config.mooncake`): the
+# Mooncake master this host runs (`host:port`) and the library its clients
+# load (`libmooncake_store.so`).
+MOONCAKE_MASTER = os.environ.get("UNISERVE_MOONCAKE_MASTER")
+MOONCAKE_LIBRARY = os.environ.get("MOONCAKE_STORE_LIBRARY")
+
+
+# A prompt of 17 pages of 64 tokens, which the fill prompts cached after it
+# push out of a small host KV cache, and which a rollback prefetches from
+# the KV storage whole.
+LONG_CACHED_PROMPT = "Describe the sea in one sentence. " * 160
+
+
+def _mooncake_options() -> tuple[str, ...]:
+    """Mooncake behind the host KV cache. The deployment's Storage Server
+    gives Mooncake a segment of 4 GiB, which holds every page.
+    """  # noqa: D205
+    return (
+        "--set",
+        f'kv_cache_config.mooncake.master="{MOONCAKE_MASTER}"',
+        "--set",
+        "kv_cache_config.mooncake.global_segment_gib=4",
+        "--set",
+        f'kv_cache_config.mooncake.library="{MOONCAKE_LIBRARY}"',
+    )
+
+
+def _no_pool_storage() -> tuple[str, ...]:
+    """The options of a Storage Server whose host admits no page pool, its
+    whole memory reserved, with Mooncake behind its pools: it stages the
+    pages of each rank through a pool of `STAGING_POOL_BYTES` (256 MiB).
+    """  # noqa: D205
+    return (
+        "--host-reserve-gib",
+        str(1 << 20),
+        "--mooncake-master",
+        str(MOONCAKE_MASTER),
+        "--mooncake-segment-bytes",
+        str(4 << 30),
+        "--mooncake-library",
+        str(MOONCAKE_LIBRARY),
+    )
+
+
+# Without a Mooncake master and its library, the cases with a KV storage
+# do not run.
+WITHOUT_MOONCAKE = pytest.mark.skipif(
+    not (MOONCAKE_MASTER and MOONCAKE_LIBRARY),
+    reason="no Mooncake master (UNISERVE_MOONCAKE_MASTER) and library "
+    "(MOONCAKE_STORE_LIBRARY)",
+)
 
 
 def _segments_of(base_url: str, world: int) -> int:
@@ -1080,8 +1157,16 @@ def _segments_of(base_url: str, world: int) -> int:
     )
 
 
+@pytest.mark.parametrize(
+    "host_cache",
+    [
+        "host",
+        pytest.param("kv_storage", marks=WITHOUT_MOONCAKE),
+        pytest.param("no_host_pool", marks=WITHOUT_MOONCAKE),
+    ],
+)
 def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
-    tmp_path: Path,
+    tmp_path: Path, host_cache: str
 ):
     """A change to other model files whose requests in flight compute their
     state again maps none of the serving world's KV cache. The previous
@@ -1090,16 +1175,36 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
     their memory; the dry run states what that frees. A rollback creates
     the segments again and reads the evicted pages back from the host KV
     cache, answering as before.
+
+    With `kv_storage`, the host KV cache of 1 GiB holds about 10900 tokens
+    of Qwen3-30B-A3B at 96 KiB a token, fewer than the pages the change
+    evicts, and Mooncake keeps what it commits: every evicted page passes
+    through it into the KV storage, from which the rollback reads back what
+    the host KV cache no longer holds. With `no_host_pool`, the host admits
+    no page pool at all, and the pages pass through a staging pool into the
+    KV storage.
     """  # noqa: D205
     name = "qwen3-world-evict"
     change = [
         f"model={_updated_checkpoint()}",
         "update_config.previous_world=parked",
     ]
-    with _serve(tmp_path, name, options=WEIGHTS_SHARE) as (base_url, _log):
+    options, storage, cached = WEIGHTS_SHARE, None, CACHED_PROMPT
+    if host_cache == "kv_storage":
+        options += ("--set", "kv_cache_config.host_gib=1", *_mooncake_options())
+        cached = LONG_CACHED_PROMPT
+    if host_cache == "no_host_pool":
+        options += _mooncake_options()
+        storage, cached = _no_pool_storage(), LONG_CACHED_PROMPT
+    with _serve(tmp_path, name, options=options, storage=storage) as (
+        base_url,
+        _log,
+    ):
         # The prompt's pages lie past the first segment.
         _chat(base_url, name, FILL_PROMPT)
-        original = _chat(base_url, name, CACHED_PROMPT)
+        original = _chat(base_url, name, cached)
+        if host_cache != "host":
+            _chat(base_url, name, SECOND_FILL_PROMPT)
         (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
         previous = serving["world"]
         held = _segments_of(base_url, previous)
@@ -1137,13 +1242,13 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         # grew past its head segment into the memory freed.
         assert _segments_of(base_url, previous) == 1
         assert _segments_of(base_url, world) > 1
-        assert _chat(base_url, name, CACHED_PROMPT) != original
+        assert _chat(base_url, name, cached) != original
 
         rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
         assert rolled.status_code == 200, rolled.text
         assert rolled.json()["result"]["world"] == previous
         assert _segments_of(base_url, previous) == held
-        answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
+        answer, hits = _hits_of(base_url, name, cached)
         assert answer == original
         assert hits > 0, "the evicted pages were not read back"
 

@@ -358,11 +358,13 @@ impl Scheduler {
     /// its own until its commit): ranks on `host` through its Storage Server's
     /// socket, the others through their servers' TCP addresses. Sliding
     /// windows are offloaded every `boundary_interval` pages of a long
-    /// prompt. The world's host KV cache holds one token count on every
-    /// rank, of `size` (`crate::kv_cache::HostCacheDemand`): its device
-    /// tokens times the ratio, or what the stated bytes of each host hold,
-    /// which every rank maps its pools at (`uniserve.host_cache`). A failure to reach
-    /// this host's server leaves the host KV cache off.
+    /// prompt, and `kv_storage` states whether a KV storage keeps every
+    /// page the pools commit (`kv_cache_config.mooncake`). The world's host
+    /// KV cache holds one token count on every rank, of `size`
+    /// (`crate::kv_cache::HostCacheDemand`): its device tokens times the
+    /// ratio, or what the stated bytes of each host hold, which every rank
+    /// maps its pools at (`uniserve.host_cache`). A failure to reach this
+    /// host's server leaves the host KV cache off.
     ///
     /// # Errors
     ///
@@ -375,6 +377,7 @@ impl Scheduler {
         host: &str,
         boundary_interval: usize,
         size: crate::kv_cache::HostCacheSize,
+        kv_storage: bool,
     ) -> anyhow::Result<()> {
         let socket = storage::socket::default_socket();
         let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(
@@ -382,6 +385,7 @@ impl Scheduler {
             deployment,
             world,
             boundary_interval,
+            kv_storage,
         ) {
             Ok(kv_offload) => kv_offload,
             Err(error) => {

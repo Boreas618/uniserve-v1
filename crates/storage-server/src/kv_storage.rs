@@ -65,6 +65,12 @@ impl KvStorage {
         }
     }
 
+    /// Whether a KV storage keeps the pages the pools commit: the server
+    /// runs a connector, or one is connected.
+    pub(super) fn present(&self) -> bool {
+        self.process.configured() || self.client.is_some()
+    }
+
     /// The identity of a new task.
     pub(super) fn next_task(&mut self) -> u64 {
         let id = self.next;
