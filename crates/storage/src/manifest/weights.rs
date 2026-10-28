@@ -82,6 +82,9 @@ pub struct RankBudget {
     pub cache_capacity: u64,
     pub weights: u64,
     pub pages: Vec<CachePage>,
+    /// A complete cross-world request reservation, when the caller routes
+    /// requests from multiple predecessor engines onto this target GPU.
+    pub in_flight: Option<u64>,
 }
 
 /// Storage of a target cache group's logical page, including its resident
@@ -97,7 +100,11 @@ pub struct CachePage {
 impl RankBudget {
     /// Storage the new rank adds beside already retained chunks.
     pub fn required(&self) -> u64 {
-        self.process + self.graphs + self.fixed + self.cache.max(self.cache_capacity) + self.weights
+        self.process
+            + self.graphs
+            + self.fixed
+            + self.weights
+            + (self.cache + self.in_flight.unwrap_or(0)).max(self.cache_capacity)
     }
 
     /// Writable cache needed to resume accepted request prefixes at this

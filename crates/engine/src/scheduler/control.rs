@@ -158,6 +158,9 @@ impl Scheduler {
             Command::DescribeCache(answer) => {
                 let _ = answer.send(self.describe_cache());
             }
+            Command::DescribeRequests(answer) => {
+                let _ = answer.send(self.migrating_cache().1);
+            }
             Command::FlushCache => {
                 let pages = self.storage.flush_prefix_cache();
                 tracing::info!(pages, "flushed the prefix cache");

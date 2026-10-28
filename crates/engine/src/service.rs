@@ -521,6 +521,9 @@ fn read_requests(
                 Some(wire::engine_command::Kind::DescribeCache(describe)) => {
                     describe_caches(describe.id, front, routing);
                 }
+                Some(wire::engine_command::Kind::DescribeRequests(describe)) => {
+                    describe_requests(describe.id, front, routing);
+                }
                 Some(wire::engine_command::Kind::DescribeMemory(describe)) => {
                     // The deployment's claims cover every node, so the first
                     // scheduler reads them all.
@@ -731,6 +734,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
                                 fixed: weights.fixed,
                                 cache: weights.cache,
                                 cache_capacity: weights.cache_capacity,
+                                in_flight: weights.in_flight,
                                 pages: weights
                                     .pages
                                     .iter()
@@ -1155,6 +1159,41 @@ fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "the cache description thread did not start");
+    }
+}
+
+/// Collect each scheduler's accepted request inventory without stopping it.
+fn describe_requests(id: u64, front: usize, routing: &Arc<Routing>) {
+    let answers: Vec<_> = routing
+        .slots
+        .iter()
+        .map(|slot| slot.handle.describe_requests())
+        .collect();
+    let routing = Arc::clone(routing);
+    let spawned = std::thread::Builder::new()
+        .name("describe-requests".to_owned())
+        .spawn(move || {
+            let mut requests = Vec::new();
+            let mut error = String::new();
+            for answer in answers {
+                match answer.recv() {
+                    Ok(prefixes) => requests.extend(prefixes),
+                    Err(_) => error = "a scheduler stopped".to_owned(),
+                }
+            }
+            routing.send(
+                front,
+                Frame::plain(from_engine::Kind::RequestsDescribed(
+                    wire::RequestsDescribed {
+                        id,
+                        error,
+                        requests,
+                    },
+                )),
+            );
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "the request inventory thread did not start");
     }
 }
 
