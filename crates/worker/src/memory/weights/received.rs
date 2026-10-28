@@ -49,7 +49,7 @@ use storage::{Client, Key, Mode, Placement, StorageRecord, TensorRecord};
 
 use super::{
     Found, MANIFEST_NAME, MANIFEST_VERSION, Planned, WeightKeys, WeightManifest, field_record,
-    host_bytes, read_text, storage_name,
+    host_bytes, storage_name,
 };
 use crate::ffi::{Backing, Interpreter};
 use crate::memory::allocation::Storage;
@@ -107,7 +107,12 @@ impl WeightKeys {
         let listing = retained.call("listing the storage server", |client| client.list())?;
         let mut sources =
             manifest::weights::sources(&listing, deployment, world, &fingerprints, |key| {
-                read_text(retained, key)
+                let bytes = retained.call("reading a weight manifest", |client| {
+                    client.read(deployment.clone(), key)
+                })?;
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|error| Error::Interface(error.to_string()))
             })?
             .unwrap_or_else(|| Sources {
                 world: manifest::World { ranks: Vec::new() },

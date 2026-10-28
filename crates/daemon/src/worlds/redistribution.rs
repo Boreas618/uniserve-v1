@@ -50,6 +50,7 @@ pub(crate) struct Redistribution {
 pub(crate) async fn plan(
     manifests: &Mutex<manifest::Planner>,
     process_address: &str,
+    target_world: u64,
     served_world: u64,
     target: &wire::EngineSpec,
     open: bool,
@@ -64,8 +65,12 @@ pub(crate) async fn plan(
         && shorthand.worker_groups.is_empty()
         && matches!(shorthand.device.as_str(), "cuda" | "gpu");
     // Preserve the declared device set. Assignment may permute its ranks,
-    // but may not introduce GPUs outside the deployment's placement.
-    let planning = target.clone();
+    // but may not introduce GPUs outside the deployment's device set. The
+    // planning claim belongs to the successor, preserving serving visibility.
+    let planning = wire::EngineSpec {
+        world: target_world,
+        ..target.clone()
+    };
     let launches = engine::launches::rank_launches(&planning)
         .context("resolving the target world's launches")?;
     let address = process_address.to_owned();

@@ -808,6 +808,11 @@ impl Leader {
                     .get()
                     .ok_or(UpdateError::NoEngine)?
                     .process_address(),
+                self.engines
+                    .control
+                    .get()
+                    .ok_or(UpdateError::NoEngine)?
+                    .next_engine(),
                 running.world(),
                 &target_spec,
                 !stated.contains("placement_config.devices"),
