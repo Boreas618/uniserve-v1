@@ -911,6 +911,12 @@ impl EngineClient {
         self.shared.next_id.load(Ordering::Relaxed)
     }
 
+    /// Reserve the same request-ID interval used by daemon handoff for an
+    /// attached front. Engine request IDs are shared across all its fronts.
+    pub(crate) fn reserve_request_ids(&self) -> u64 {
+        self.shared.next_id.fetch_add(1 << 32, Ordering::Relaxed)
+    }
+
     /// Numbers this client's requests from `first` on, so that they never
     /// take the identity of another daemon's request to the same engine.
     pub fn number_requests_from(&self, first: u64) {
@@ -952,7 +958,13 @@ impl EngineClient {
 
 impl Drop for EngineClient {
     fn drop(&mut self) {
-        self.shutdown();
+        // A handed-over or borrowed front owns only its requests. Closing
+        // it must not terminate the engine another daemon controls.
+        if lock(&self.control).is_some() {
+            self.shutdown();
+        } else {
+            self.detach();
+        }
     }
 }
 
