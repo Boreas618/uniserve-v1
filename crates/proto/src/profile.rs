@@ -118,6 +118,12 @@ pub enum MetricRanges {
     Component,
 }
 
+/// The shortest `pm_sampling` interval, nanoseconds: on GB200 a worker's
+/// read decodes and evaluates a sample of the default metrics in about 14
+/// µs, so samples every 20 µs keep one thread about 70% busy and every 10
+/// µs outrun it (`docs/profiling.md`).
+pub const PM_MIN_INTERVAL_NS: u64 = 20_000;
+
 /// The `range_metrics` collector's options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -309,8 +315,12 @@ impl SessionRequest {
                 PcSamplingOptions::MIN_PERIOD
             ));
         }
-        if self.pm_sampling.interval_ns == 0 {
-            return Err("pm_sampling.interval_ns is positive".to_owned());
+        if self.pm_sampling.interval_ns < PM_MIN_INTERVAL_NS {
+            return Err(format!(
+                "pm_sampling.interval_ns is at least {PM_MIN_INTERVAL_NS}: a worker decodes \
+                 about 70,000 samples a second on one thread, and shorter intervals lose \
+                 samples"
+            ));
         }
         Ok(())
     }
@@ -451,6 +461,14 @@ mod tests {
             SessionRequest {
                 collectors: vec![Collector::PcSampling],
                 pc_sampling: PcSamplingOptions { period: 11 },
+                ..request()
+            },
+            SessionRequest {
+                collectors: vec![Collector::PmSampling],
+                pm_sampling: PmSamplingOptions {
+                    interval_ns: 10_000,
+                    ..PmSamplingOptions::default()
+                },
                 ..request()
             },
         ];

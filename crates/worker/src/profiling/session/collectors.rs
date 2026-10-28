@@ -25,11 +25,9 @@ use super::artifact::{Message, Rows};
 use crate::profiling::fences::{Fences, Tap};
 use crate::profiling::pc_sampling;
 
-/// The PM sampler's hardware buffer: 64 MiB.
-const PM_HARDWARE_BUFFER: usize = 64 << 20;
-
-/// The samples one PM decode takes at most.
-const PM_MAX_SAMPLES: u32 = 65_536;
+/// The fewest samples a PM sampler's counter data image and hardware
+/// buffer hold.
+const PM_MIN_SAMPLES: u64 = 256;
 
 /// The ranges one range profiler pass holds. Starting a pass takes about
 /// 1.42 MB of device storage per range (with one metric); on a GB200 rank
@@ -386,9 +384,7 @@ impl Collectors {
             let drained = match prepared {
                 Prepared::PmSampling(sampler) => sampler.decode().map(|decoded| {
                     if decoded.overflow {
-                        tracing::warn!(
-                            "PM sampling's hardware buffer overflowed: samples were lost"
-                        );
+                        tracing::warn!("a PM sampling read filled its image: samples were lost");
                     }
                     self.rows.send(Message::Pm {
                         metrics: sampler.metrics(),
@@ -505,6 +501,9 @@ fn stop(prepared: &mut Prepared, rows: &Rows) -> std::result::Result<(), String>
         Prepared::PmSampling(sampler) => {
             sampler.stop().map_err(|error| error.to_string())?;
             let decoded = sampler.decode().map_err(|error| error.to_string())?;
+            if decoded.overflow {
+                tracing::warn!("a PM sampling read filled its image: samples were lost");
+            }
             rows.send(Message::Pm {
                 metrics: sampler.metrics(),
                 samples: decoded.samples,
@@ -590,15 +589,25 @@ fn prepare(
             cupti()?;
             let (_, device) = device()?;
             let options = &request.pm_sampling;
-            PmSampler::enable(
-                device,
-                &options.metrics,
-                options.interval_ns,
-                PM_HARDWARE_BUFFER,
-                PM_MAX_SAMPLES,
-            )
-            .map_err(|error| error.to_string())
-            .map(Prepared::PmSampling)
+            // The image and the hardware buffer hold twice the samples taken
+            // between two reads: a read whose image fills loses the samples
+            // past it. The buffer takes the image's bytes per sample, which
+            // exceed a raw record's (on GB200, 13.6 KB of image against 8 KiB
+            // of buffer for the default metrics).
+            let per_read = (super::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
+            let samples = (2 * per_read).max(PM_MIN_SAMPLES);
+            PmSampler::sample_bytes(device, &options.metrics)
+                .and_then(|bytes| {
+                    PmSampler::enable(
+                        device,
+                        &options.metrics,
+                        options.interval_ns,
+                        (samples as usize * bytes).next_multiple_of(1 << 20),
+                        u32::try_from(samples).unwrap_or(u32::MAX),
+                    )
+                })
+                .map_err(|error| error.to_string())
+                .map(Prepared::PmSampling)
         }
         Collector::RangeMetrics => {
             cupti()?;
