@@ -43,8 +43,8 @@ use std::sync::Arc;
 use cuda::{Protection, Stream};
 use sha2::{Digest, Sha256};
 use storage::manifest::weights::{Sources, Transfer};
-use storage::manifest::{self, Gpu, Manifest, Space};
-use storage::protocol::{Access, LinkBandwidth, Memory, Priority, Region, Span};
+use storage::manifest::{self, Manifest, Space};
+use storage::protocol::{Access, LinkBandwidth, Priority, Region, Span};
 use storage::{Client, Key, Mode, Placement, StorageRecord, TensorRecord};
 
 use super::{
@@ -60,12 +60,6 @@ use crate::{Error, Result};
 /// How long another node's Storage Server may take to accept the worker's
 /// connection and answer one request: a listing and a manifest are small.
 const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// The bytes of one timed copy of a link measurement: the Transfer Server
-/// measures a link from another host by its contiguous chunks of 64 MiB,
-/// the faster of the first two giving its bandwidth (its lanes'
-/// `MEASURE_BYTES`).
-const LINK_SAMPLE: u64 = 64 << 20;
 
 /// Weights a worker receives into chunks it created, until the transfer
 /// ends and they are retained read-only ([`Receipt::retain`]).
@@ -157,7 +151,7 @@ impl WeightKeys {
     /// Measures source links before the daemon assigns ranks or books memory.
     pub(crate) fn measure_sources(&self, retained: &Retained, sources: &mut Sources) -> Result<()> {
         let (device, gpu) = self.device(0)?;
-        sources.links = measure_links(retained, sources, device, gpu)?;
+        sources.links = crate::transfer::links::measure(retained, sources, device, gpu)?;
         Ok(())
     }
 
@@ -216,7 +210,7 @@ impl WeightKeys {
                 };
                 let encoded =
                     serde_json::to_vec(&own).map_err(|error| Error::Invalid(error.to_string()))?;
-                let links = measure_links(retained, sources, device, gpu)?;
+                let links = crate::transfer::links::measure(retained, sources, device, gpu)?;
                 let links = gather_links(agreement, &links)?;
                 let targets = agreement
                     .all_gather_bytes(&encoded)?
@@ -560,147 +554,6 @@ impl Receipt {
     }
 }
 
-/// The links of `sources` into `gpu`, this rank's GPU on `device`, as the
-/// host's Transfer Server measured them, after it measured the link from
-/// every source GPU of another node it had not: for each, two copies of
-/// [`LINK_SAMPLE`] byte windows from the longest retained chunk into a
-/// scratch storage the rank creates and releases. Smaller chunks repeat
-/// until the window is complete; one task per GPU owns the scratch.
-fn measure_links(
-    retained: &Retained,
-    sources: &Sources,
-    device: cuda::DeviceId,
-    gpu: Gpu,
-) -> Result<Vec<LinkBandwidth>> {
-    let into = Memory::Device { gpu };
-    let reaches = |links: &[LinkBandwidth], source: &Gpu| {
-        links.iter().any(|measured| {
-            measured.link.destination == into
-                && match &measured.link.source {
-                    Memory::Device { gpu: from }
-                    | Memory::Remote {
-                        gpu: Some(from), ..
-                    } => from == source,
-                    _ => false,
-                }
-        })
-    };
-    let mut unmeasured: Vec<(Gpu, String, Key, u64)> = Vec::new();
-    for (source, endpoint) in &sources.remote {
-        if reaches(&sources.links, source) {
-            continue;
-        }
-        let longest = sources
-            .world
-            .ranks
-            .iter()
-            .filter(|rank| rank.gpu == Some(*source))
-            .flat_map(|rank| rank.storages.iter().flat_map(|storage| &storage.chunks))
-            .filter(|chunk| chunk.length > 0)
-            .max_by_key(|chunk| (chunk.length, chunk.key));
-        match longest {
-            Some(chunk) => unmeasured.push((
-                *source,
-                endpoint.clone(),
-                chunk.key,
-                chunk.length.min(LINK_SAMPLE),
-            )),
-            None => tracing::warn!(
-                gpu = %cuda::DeviceUuid(*source),
-                endpoint,
-                "another node's GPU holds no bytes to measure its link"
-            ),
-        }
-    }
-    if unmeasured.is_empty() {
-        return Ok(sources.links.clone());
-    }
-
-    let started = std::time::Instant::now();
-    let bytes = 2 * LINK_SAMPLE;
-    let scratch = Storage::segmented(device, &[bytes as usize], &[])?;
-    let descriptor = scratch.create_segment(0)?;
-    let key = measuring_key(retained.world(), &gpu);
-    retained.call("retaining a link measurement's scratch", |client| {
-        client.put(
-            vec![TensorRecord {
-                key,
-                name: "link measurement scratch".into(),
-                storage: 0,
-                offset: 0,
-                dtype: "uint8".into(),
-                shape: vec![bytes],
-                strides: vec![1],
-                access: Access::Exclusive,
-            }],
-            &[(
-                StorageRecord {
-                    placement: Placement::Device { gpu },
-                    bytes,
-                    segment: None,
-                    fabric: None,
-                },
-                descriptor.as_fd(),
-            )],
-        )
-    })?;
-    retained.use_keys([key]);
-    let copied = unmeasured
-        .iter()
-        .try_for_each(|(source, endpoint, chunk, bytes)| {
-            // Repeat a retained chunk when it is smaller than the estimator's
-            // sample window. Measurement never requires a model-sized allocation.
-            let spans = (0..2 * LINK_SAMPLE.div_ceil(*bytes))
-                .map(|_| Span {
-                    source: Region::Remote {
-                        endpoint: endpoint.clone(),
-                        region: Box::new(Region::Tensor {
-                            key: *chunk,
-                            at: Some(Placement::Device { gpu: *source }),
-                        }),
-                    },
-                    source_offset: 0,
-                    destination: Region::Tensor { key, at: None },
-                    destination_offset: 0,
-                    bytes: *bytes,
-                    rows: 1,
-                    source_pitch: 0,
-                    destination_pitch: 0,
-                })
-                .collect();
-            let task = retained.transfer(spans, Priority::Background, retained.world())?;
-            retained.transferred(task)
-        });
-    retained.forget(&[key])?;
-    drop(scratch);
-    copied?;
-
-    // The Transfer Server reports a link it measured before the end of the
-    // task that measured it.
-    let listing = retained.call("listing the storage server", |client| client.list())?;
-    let links = listing
-        .transfer
-        .map(|transfer| transfer.links)
-        .unwrap_or_default();
-    let missing: Vec<String> = unmeasured
-        .iter()
-        .filter(|(source, ..)| !reaches(&links, source))
-        .map(|(source, ..)| cuda::DeviceUuid(*source).to_string())
-        .collect();
-    if !missing.is_empty() {
-        tracing::warn!(
-            ?missing,
-            "the links from these GPUs of another node stay unmeasured"
-        );
-    }
-    tracing::info!(
-        gpus = unmeasured.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "measured the links from another node's GPUs"
-    );
-    Ok(links)
-}
-
 /// Every link the ranks of `agreement` measured, each rank giving `links`,
 /// in one order on every rank: a link measured by several (each rank of a
 /// host lists the same) takes the highest bandwidth.
@@ -719,17 +572,6 @@ fn gather_links(agreement: &HostGroup, links: &[LinkBandwidth]) -> Result<Vec<Li
         }
     }
     Ok(merged.into_values().collect())
-}
-
-/// The key a rank's link measurement scratch on `gpu` is retained under in
-/// world `world`.
-fn measuring_key(world: u64, gpu: &Gpu) -> Key {
-    // Scratch is named by its owner, not by the bytes the transfer writes.
-    let mut key = [0; 32];
-    key[..8].copy_from_slice(b"linkbw\0\0");
-    key[8..16].copy_from_slice(&world.to_le_bytes());
-    key[16..].copy_from_slice(gpu);
-    Key(key)
 }
 
 /// A failure of a request to another node's Storage Server at `endpoint`.
