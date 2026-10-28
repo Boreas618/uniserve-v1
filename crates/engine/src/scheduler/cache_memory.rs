@@ -494,7 +494,8 @@ impl Scheduler {
         &mut self,
         successor: &crate::Successor,
     ) -> Result<Preparation, String> {
-        let (in_flight_units, in_flight_tokens) = self.migrating_cache();
+        let (in_flight_units, prefixes) = self.migrating_cache();
+        let in_flight_tokens: Vec<u32> = prefixes.iter().map(|prefix| prefix.tokens).collect();
         let Some(MemoryReports {
             cache: reports,
             beside,

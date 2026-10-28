@@ -137,7 +137,7 @@ impl Scheduler {
 
     /// Source units and accepted prefix lengths of requests that can move.
     /// The target sizes recomputation from these lengths at its own layout.
-    pub(super) fn migrating_cache(&self) -> (u32, Vec<u32>) {
+    pub(super) fn migrating_cache(&self) -> (u32, Vec<proto::request::wire::RequestPrefix>) {
         let mut units = 0;
         let mut tokens = Vec::new();
         for state in self
@@ -152,7 +152,10 @@ impl Scheduler {
                     .map(|table| table.unit_ids().len() as u32)
                     .sum::<u32>()
             });
-            tokens.push(state.cache_visible_len);
+            tokens.push(proto::request::wire::RequestPrefix {
+                request_id: state.req.request_id.0,
+                tokens: state.cache_visible_len,
+            });
         }
         (units, tokens)
     }

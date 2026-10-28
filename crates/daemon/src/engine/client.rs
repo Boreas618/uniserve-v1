@@ -167,6 +167,7 @@ enum Answered {
     Index(Vec<wire::GroupIndex>),
     /// Each worker group's KV cache segments (`CacheDescribed`).
     Segments(Vec<wire::CacheSegments>),
+    Prefixes(Vec<wire::RequestPrefix>),
 }
 
 impl Shared {
@@ -553,6 +554,22 @@ impl EngineClient {
         }
     }
 
+    /// Accepted prefixes of running requests that can move to a successor.
+    /// Request IDs belong to this engine; queued and terminal requests hold
+    /// no state in this inventory.
+    ///
+    /// # Errors
+    /// Fails when the engine or one of its schedulers stops before replying.
+    pub async fn describe_requests(&self) -> Result<Vec<wire::RequestPrefix>, String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::DescribeRequests(wire::DescribeRequests { id }))
+            .await?
+        {
+            Answered::Prefixes(prefixes) => Ok(prefixes),
+            _ => Err("the engine answered a request inventory with something else".to_owned()),
+        }
+    }
+
     /// Grows the engine's KV cache as [`Self::resize_cache`] does, once the
     /// worlds of `keep_weights` (a previous world kept as its weights, whose
     /// processes exited) released every storage but their weights on every
@@ -722,6 +739,7 @@ impl EngineClient {
                 fixed: budget.fixed,
                 cache: budget.cache,
                 cache_capacity: budget.cache_capacity,
+                in_flight: budget.in_flight,
                 pages: budget
                     .pages
                     .iter()
@@ -897,7 +915,7 @@ impl Answered {
     fn results(self) -> Vec<String> {
         match self {
             Self::Results(results) => results,
-            Self::Index(_) | Self::Segments(_) => Vec::new(),
+            Self::Index(_) | Self::Segments(_) | Self::Prefixes(_) => Vec::new(),
         }
     }
 }
@@ -1021,6 +1039,15 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 if let Some(answer) = lock(&shared.answers).remove(&described.id) {
                     let _ = answer.send(if described.error.is_empty() {
                         Ok(Answered::Segments(described.segments))
+                    } else {
+                        Err(described.error)
+                    });
+                }
+            }
+            Some(from_engine::Kind::RequestsDescribed(described)) => {
+                if let Some(answer) = lock(&shared.answers).remove(&described.id) {
+                    let _ = answer.send(if described.error.is_empty() {
+                        Ok(Answered::Prefixes(described.requests))
                     } else {
                         Err(described.error)
                     });

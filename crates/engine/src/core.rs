@@ -1181,6 +1181,13 @@ impl SchedulerHandle {
         self.commands.describe_cache()
     }
 
+    /// Accepted cache lengths of requests that can move to a successor.
+    pub fn describe_requests(
+        &self,
+    ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
+        self.commands.describe_requests()
+    }
+
     /// Ends the memory of `worlds` on the nodes of the scheduler's workers,
     /// which the deployment's claims cover, discarding the pages the
     /// scheduler's world does not hit when `discard_pages`; the receiver

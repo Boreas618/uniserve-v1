@@ -619,6 +619,8 @@ pub enum Command {
     /// Reports the KV cache each worker group holds now
     /// (`Scheduler::describe_cache`).
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
+    /// Accepted prefixes of running requests that can move to another world.
+    DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
     /// Revokes every cached prefix page, so that later prompts compute
     /// their prefixes anew; requests in flight keep their pages.
     FlushCache,
@@ -960,6 +962,15 @@ impl CommandSender {
     ) -> crossbeam_channel::Receiver<Result<Vec<crate::scheduler::GroupCache>, String>> {
         let (answer, described) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::DescribeCache(answer));
+        described
+    }
+
+    /// Read accepted cache lengths of requests that can move to a successor.
+    pub fn describe_requests(
+        &self,
+    ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
+        let (answer, described) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::DescribeRequests(answer));
         described
     }
 

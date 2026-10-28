@@ -52,6 +52,7 @@ message FromEngine {
     Configured configured = 6;
     Parked parked = 7;
     CacheDescribed cache_described = 8;
+    RequestsDescribed requests_described = 9;
   }
 }
 
@@ -265,12 +266,29 @@ message EngineCommand {
     // transfers use at every node's Transfer Server, each node's daemon over
     // its claim; answered with `Hooked`.
     ThrottleTransfers throttle_transfers = 15;
+    // Accepted prefix lengths used to budget a successor's request state.
+    DescribeRequests describe_requests = 16;
   }
 }
 
 message DescribeMemory {
   // Matches the `Hooked` answer.
   uint64 id = 1;
+}
+
+message DescribeRequests {
+  uint64 id = 1;
+}
+
+message RequestPrefix {
+  uint64 request_id = 1;
+  uint32 tokens = 2;
+}
+
+message RequestsDescribed {
+  uint64 id = 1;
+  string error = 2;
+  repeated RequestPrefix requests = 3;
 }
 
 // A halving takes every link a task of the deployment copies over now, a
@@ -382,6 +400,9 @@ message RankBudget {
   uint64 cache = 7;
   uint64 cache_capacity = 8;
   repeated CachePageBudget pages = 9;
+  // Complete reservation supplied by multi-world request routing. Absent
+  // when the engine should size its own accepted request prefixes.
+  optional uint64 in_flight = 10;
 }
 
 // Target cache page storage, after layer/head partitioning and encoding.

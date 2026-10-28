@@ -686,6 +686,7 @@ fn a_target_rank_reserves_its_own_capacity_within_its_quota() {
                 cache: 1_000,
                 cache_capacity: 2_000,
                 pages: Vec::new(),
+                in_flight: None,
             },
         )]),
         ..Successor::default()
@@ -718,6 +719,13 @@ fn recomputation_uses_the_target_window_and_page_storage() {
     });
     let mut running = handle.submit(request(1, 4, 10_000)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+    let prefixes = handle
+        .describe_requests()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(prefixes.len(), 1);
+    assert_eq!(prefixes[0].request_id, 1);
+    assert!(prefixes[0].tokens >= 4 * BLOCK);
     let target = Successor {
         recomputes_cache: true,
         rank_budgets: engine::RankBudgets::from([(
@@ -736,13 +744,18 @@ fn recomputation_uses_the_target_window_and_page_storage() {
         )]),
         ..Successor::default()
     };
-    let plans = resize(&handle, CacheChange::Plan(target)).unwrap();
+    let plans = resize(&handle, CacheChange::Plan(target.clone())).unwrap();
     let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
     // Four history tokens intersect at most two of the target's 32-token
     // pages, while the source retains the complete accepted prefix.
     let target_bytes = plan["successor"]["in_flight"].as_u64().unwrap();
     assert!((100..=200).contains(&target_bytes), "{plan}");
     assert!(plan["in_flight_kv"].as_u64().unwrap() >= 1_000, "{plan}");
+    let mut aggregate = target;
+    aggregate.rank_budgets.get_mut(&[7; 16]).unwrap().in_flight = Some(700);
+    let plans = resize(&handle, CacheChange::Plan(aggregate)).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(plan["successor"]["in_flight"], 700);
     handle.shutdown();
     thread.join().unwrap();
 }

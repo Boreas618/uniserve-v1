@@ -305,7 +305,9 @@ pub(super) fn preparing(
         in_flight: {
             let requests = if adds.recomputes_cache {
                 target.map_or(u64::from(in_flight_units) * report.unit_bytes, |target| {
-                    target.request_bytes(in_flight_tokens)
+                    target
+                        .in_flight
+                        .unwrap_or_else(|| target.request_bytes(in_flight_tokens))
                 })
             } else {
                 0
