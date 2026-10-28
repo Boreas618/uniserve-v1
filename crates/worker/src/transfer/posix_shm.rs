@@ -1,4 +1,4 @@
-//! The shared-storage mechanism: a POSIX segment of this host holding a copy
+//! The shared-memory mechanism: a POSIX segment of this host holding a copy
 //! of the export behind a readiness word and one acknowledgment word per
 //! consumer slot ([`SharedBuffer`]), its export, its reads and in-place
 //! borrows ([`SharedRead`]).
@@ -410,7 +410,7 @@ impl Drop for SharedRead {
 }
 
 impl Transport {
-    /// The read of a shared-storage export of this host into `destination`
+    /// The read of a shared-memory export of this host into `destination`
     /// (see [`Transport::issue_fetch`]).
     pub(super) fn shared_read(
         &self,
@@ -506,7 +506,7 @@ impl Transport {
         Ok(locator)
     }
 
-    /// Borrow whole leading rows of a shared-storage export of this host in
+    /// Borrow whole leading rows of a shared-memory export of this host in
     /// place. `region` is in logical coordinates; releasing the returned
     /// read ends the claim.
     pub fn borrow(&self, locator: &Locator, region: Option<&[Range<u64>]>) -> Result<SharedRead> {

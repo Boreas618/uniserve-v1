@@ -34,7 +34,7 @@ from ..types import RequestRecord, TaskRequest
 _TIMING_HEADERS = (
     "x-inference-time-s",
     "x-stage-durations",
-    "x-peak-storage-mb",
+    "x-peak-memory-mb",
 )
 
 # vLLM-Omni and FastVideo present a request's references grouped by media
@@ -346,5 +346,5 @@ async def _body(
                     record,
                     response.headers.get("x-inference-time-s"),
                     response.headers.get("x-stage-durations"),
-                    response.headers.get("x-peak-storage-mb"),
+                    response.headers.get("x-peak-memory-mb"),
                 )

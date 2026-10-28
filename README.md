@@ -235,7 +235,7 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   executor/, runner/          Batch execution per computation and its CUDA graphs
   request/, sampling/         Request progress and sampling state
   storage/                     KV, latent, tensor, request-slot and output backing
-  transfer/                   Local, shared-storage, CUDA VMM and channel transfers
+  transfer/                   Local, shared-memory, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host pools, capacity planning
 crates/uniserve/              The `uniserve` executable: `serve`, `engine`, `worker` and `storage`

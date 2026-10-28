@@ -358,7 +358,7 @@ impl Drop for PinnedBuffer {
 }
 
 /// A page-locked registration of existing host storage (`cuMemHostRegister`,
-/// portable), for example a POSIX shared-storage mapping used as a DMA source
+/// portable), for example a POSIX shared-memory mapping used as a DMA source
 /// or destination.
 ///
 /// Unregistration is synchronous, on the dropping thread, because the owner

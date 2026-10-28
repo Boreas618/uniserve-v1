@@ -9,7 +9,7 @@ use std::time::Duration;
 use proto::request::{ArtifactMedia as _, wire};
 use proto::{Connection, MappedMedia};
 
-/// An anonymous shared-storage file holding `bytes`.
+/// An anonymous shared-memory file holding `bytes`.
 fn storage(bytes: &[u8]) -> OwnedFd {
     let name = c"artifact";
     // SAFETY: memfd_create takes a NUL-terminated name and flags.

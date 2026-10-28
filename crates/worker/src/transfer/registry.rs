@@ -1,4 +1,4 @@
-//! Registered source storage shared by local, shared-storage and device reads.
+//! Registered source storage shared by local, shared-memory and device reads.
 
 use std::collections::HashMap;
 use std::sync::Arc;

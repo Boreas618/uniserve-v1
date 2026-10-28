@@ -24,11 +24,11 @@ pub enum TransferTransport {
         /// Endpoint-local export key.
         key: u64,
     },
-    /// POSIX shared-storage export with endpoint-driven readiness and ownership.
+    /// POSIX shared-memory export with endpoint-driven readiness and ownership.
     PosixShm {
         /// Publishing address-space incarnation and reader-lease endpoint.
         endpoint: String,
-        /// Shared-storage object name.
+        /// Shared-memory object name.
         name: String,
     },
     /// CUDA VMM export of device storage, which a consumer maps by
@@ -678,9 +678,9 @@ impl Locator {
             TransferTransport::PosixShm { endpoint, name } => {
                 ensure_valid!(
                     !endpoint.is_empty(),
-                    "shared-storage transfer endpoint is empty"
+                    "shared-memory transfer endpoint is empty"
                 );
-                ensure_valid!(!name.is_empty(), "shared-storage transfer name is empty");
+                ensure_valid!(!name.is_empty(), "shared-memory transfer name is empty");
             }
             TransferTransport::CudaVmm {
                 endpoint,

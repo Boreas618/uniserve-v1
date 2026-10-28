@@ -17,7 +17,7 @@
 //! from other ranks reach it before the batch executes
 //! ([`crate::executor::inputs`]), and every input the executor's preparation
 //! names is then leased from it ([`bind_prepared`]); host codecs read some
-//! inputs in place from their shared-storage exports instead. [`bind_outputs`]
+//! inputs in place from their shared-memory exports instead. [`bind_outputs`]
 //! reserves a call's outputs at their scheduler placement and [`export`]
 //! publishes a written one.
 
@@ -263,7 +263,7 @@ pub(crate) struct ProductCall {
     pub(crate) reports: usize,
     /// How the call publishes what its tasks wrote once they finished.
     pub(crate) publication: Option<Publication>,
-    /// Inputs read in place from their shared-storage exports, released once
+    /// Inputs read in place from their shared-memory exports, released once
     /// the call's host tasks finished.
     pub(crate) borrowed: Vec<Arc<Mutex<SharedRead>>>,
 }
@@ -291,7 +291,7 @@ struct Prepared {
     /// `products`, `encoded` or `media`.
     publication: Option<String>,
     /// For a call reading rows of a round's decoded frames: the round
-    /// position each read takes, read in place from its shared-storage
+    /// position each read takes, read in place from its shared-memory
     /// export or leased.
     #[serde(default)]
     read_rows: Option<Vec<u32>>,
@@ -390,7 +390,7 @@ pub(crate) struct PreparedOwners<'a> {
     pub(crate) encoders: Option<&'a EncoderHostPool>,
     /// The stream device products host tasks wrote are fenced on.
     pub(crate) host_stream: Option<Arc<CUDAStream>>,
-    /// The inputs host codecs read in place from their shared-storage
+    /// The inputs host codecs read in place from their shared-memory
     /// exports instead of leasing them from the product store.
     pub(crate) borrowed: &'a HashSet<BufferId>,
 }
@@ -766,7 +766,7 @@ pub(crate) fn publish(
     Ok(())
 }
 
-/// A borrowed shared-storage row as host bytes, viewed as long as the read
+/// A borrowed shared-memory row as host bytes, viewed as long as the read
 /// lives.
 struct MappedBytes {
     mapping: Arc<SharedMapping>,
@@ -805,7 +805,7 @@ fn row_view(read: &SharedRead) -> Result<StorageView> {
 }
 
 /// Row `row` of a round's decoded frames, read in place from its
-/// shared-storage export on this host.
+/// shared-memory export on this host.
 fn borrow_row(
     owners: &PreparedOwners<'_>,
     plan: &BatchPlan,

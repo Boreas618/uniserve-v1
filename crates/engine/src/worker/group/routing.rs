@@ -15,7 +15,7 @@ use crate::worker::IncarnationRegistry;
 
 /// Refuses a placement whose muxer or media reader is not on the engine's host.
 ///
-/// Both exchange POSIX shared-storage objects with the engine by name, and such
+/// Both exchange POSIX shared-memory objects with the engine by name, and such
 /// a name resolves in one host's namespace: the engine opens the artifact a
 /// muxer publishes, and the media reader opens the condition media the engine
 /// published. Either placed elsewhere would fail on the first request, so the
@@ -33,12 +33,12 @@ pub(crate) fn refuse_shared_storage_off_engine_host(
         (
             MediaCall::Muxing,
             "muxing",
-            "the artifact it publishes is a shared-storage object",
+            "the artifact it publishes is a shared-memory object",
         ),
         (
             MediaCall::MediaReading,
             "media reading",
-            "the condition media it reads are shared-storage objects",
+            "the condition media it reads are shared-memory objects",
         ),
     ] {
         let Some(component) = media_components.get(&call) else {

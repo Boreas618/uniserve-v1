@@ -463,7 +463,7 @@ class Conditions:
         )
         name = str(source["name"])
         try:
-            # The shared-storage object is a seekable file FFmpeg reads
+            # The shared-memory object is a seekable file FFmpeg reads
             # directly.
             input_file = open(f"/dev/shm/{name}", "rb")
         except OSError as error:

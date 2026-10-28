@@ -1,4 +1,4 @@
-//! Owned, physically backed POSIX shared-storage allocations.
+//! Owned, physically backed POSIX shared-memory allocations.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Owns a shared-storage name. Open descriptors and mappings retain the kernel
+/// Owns a shared-memory name. Open descriptors and mappings retain the kernel
 /// allocation independently; dropping this owner prevents subsequent opens.
 #[derive(Debug)]
 pub struct SharedMemory {

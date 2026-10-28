@@ -1501,7 +1501,7 @@ class VideoExecutor:
             return _nothing()
         row_bytes = _row_width(call["outputs"][0])
         # One read per unit: the unit's row of the round's decoded frames,
-        # read in place from its shared-storage export or leased.
+        # read in place from its shared-memory export or leased.
         return {
             "reads": [0 for _ in run],
             "read_rows": list(run),

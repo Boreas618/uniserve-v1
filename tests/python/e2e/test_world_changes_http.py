@@ -24,7 +24,7 @@ the same request alone, with the same usage.
   stream continues on it, and the configuration is marked unavailable:
   applying it again is refused unless forced.
 - A fault of the world on trial rolls it back by itself: a worker process
-  that exits, a job that never ends, an illegal storage access, non-finite
+  that exits, a job that never ends, an illegal memory access, non-finite
   logits, and the exit of its engine process. A plugin of the test's
   (``FAULT_PLUGIN``) arms each fault in the workers of the world the admin
   API reaches, the one on trial, so the production code has no test path.
@@ -1529,7 +1529,7 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
         # The configuration is marked with the fault's first error.
         cause = {
             "non_finite": "non-finite logits",
-            "illegal_access": "illegal storage access",
+            "illegal_access": "illegal memory access",
             "stall": "stalled",
         }.get(fault, f"world {world}")
         assert cause in unavailable["reason"], unavailable

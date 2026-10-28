@@ -63,7 +63,7 @@ pub type Notify = Arc<dyn Fn() + Send + Sync>;
 /// The physical retirement signal of an export, a read or a cache import.
 pub type Retirement = Completion<Notify>;
 
-/// Reader acknowledgment words in the header of a shared-storage segment or
+/// Reader acknowledgment words in the header of a shared-memory segment or
 /// a pooled VMM chunk: one per consumer slot, which a reader sets to
 /// [`CLAIMED`] before it copies and to [`ACKNOWLEDGED`] after; the producer
 /// reuses the storage only once every claimed word is acknowledged.

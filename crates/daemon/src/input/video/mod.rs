@@ -381,7 +381,7 @@ impl VideoService {
     /// # Errors
     ///
     /// Returns `ServeError::Video` naming the field at fault, or failing
-    /// when processing's own resources or the shared-storage allocation fail,
+    /// when processing's own resources or the shared-memory allocation fail,
     /// and `ServeError::ContextLengthExceeded` for a presentation longer than
     /// the prompt capacity.
     pub async fn process(

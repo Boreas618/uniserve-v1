@@ -11,7 +11,7 @@ use ipc::{ErrorCallIdentity, WorkerResponseError};
 /// Invalid submissions and operations on unavailable worker state.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A socket, thread, shared-storage object or peer exchange failed, or a
+    /// A socket, thread, shared-memory object or peer exchange failed, or a
     /// peer sent what its protocol does not allow. `source` is the error
     /// that caused it, when one did.
     #[error("{what}")]
@@ -123,7 +123,7 @@ pub(crate) const fn traces(code: ErrorCode) -> bool {
 /// message: an exception the numerical library raised, or a worker error
 /// whose message embeds a lower-level failure.
 const FATAL_CUDA_MESSAGES: &[&str] = &[
-    "illegal storage access",
+    "illegal memory access",
     "cudaerrorillegaladdress",
     "device-side assert",
     "cudaerrorlaunchfailure",
@@ -399,7 +399,7 @@ mod tests {
         let error = WorkerError::classify(
             numerical(
                 "OutOfMemory",
-                "CUDA out of memory after an illegal storage access",
+                "CUDA out of memory after an illegal memory access",
             ),
             Some("decode"),
         );
@@ -407,7 +407,7 @@ mod tests {
         assert!(error.fatal);
         assert_eq!(
             error.response().message,
-            "decode: text.forward: CUDA out of memory after an illegal storage access"
+            "decode: text.forward: CUDA out of memory after an illegal memory access"
         );
         assert_eq!(error.traceback(), Some("Traceback"));
     }
