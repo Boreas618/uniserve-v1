@@ -79,8 +79,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire contract negotiated when a Storage Server client connects.
-pub const VERSION: u32 = 16;
+/// Wire contract negotiated when a Storage Server client connects. Committed
+/// pages stay reusable by content key until ordinary eviction; only a
+/// world's uncommitted publications are discarded when it retires.
+pub const VERSION: u32 = 17;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -907,14 +909,6 @@ pub enum Request {
     /// leaves their memory to the other world. Answered with `Moved` once
     /// every copy ended; refused while no Transfer Server runs.
     Offload { world: u64 },
-    /// From a head: every page of the deployment's page pools that world
-    /// `except` did not publish is discarded, as a rollback discards a
-    /// world's: those nobody reads leave the pools, the others once their
-    /// readers unpin them. A committed world that computes other numerics
-    /// than its predecessors (another root of its pages' keys) hits none of
-    /// their pages, which only the retired worlds could. Answered with
-    /// `Discarded`.
-    DiscardPages { except: u64 },
     /// From a head: world `world`'s weights that `Offload` moved to host
     /// memory return to the GPUs they came from, before its processes start
     /// again: its Transfer Server creates device memory of each storage's
@@ -1292,10 +1286,6 @@ pub enum Reply {
     /// The server took a report of its Transfer Server's
     /// ([`Request::Measured`], [`Request::Copied`], [`Request::Registered`]).
     Noted,
-    /// How many pages a `DiscardPages` discarded.
-    Discarded {
-        pages: u64,
-    },
     /// What an `Offload` or a `Restore` moved: its storages and their bytes.
     Moved {
         storages: u64,

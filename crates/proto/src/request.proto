@@ -544,10 +544,7 @@ message Commit {
   // Worlds whose memory ends on every node of the engine: the predecessor,
   // whose processes are gone.
   repeated uint64 retire = 2;
-  // The committed world computes other numerics than its predecessor
-  // (another root of its pages' keys): every node's host KV cache discards
-  // the pages it did not publish, which it never hits.
-  bool discard_pages = 3;
+  reserved 3;
 }
 
 // A request for the engine's KV cache segments.

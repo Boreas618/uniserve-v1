@@ -1272,7 +1272,7 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
     let retired = routing
         .slots
         .first()
-        .map(|slot| slot.handle.retire(resume.retire.clone(), false));
+        .map(|slot| slot.handle.retire(resume.retire.clone()));
     let answers: Vec<_> = routing
         .slots
         .iter()
@@ -1331,7 +1331,6 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
 fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>) {
     tracing::info!(
         retire = ?commit.retire,
-        discard_pages = commit.discard_pages,
         "the engine's world is committed"
     );
     let routing = Arc::clone(routing);
@@ -1350,11 +1349,7 @@ fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>)
             if error.is_empty()
                 && let Some(slot) = routing.slots.first()
             {
-                match slot
-                    .handle
-                    .retire(commit.retire.clone(), commit.discard_pages)
-                    .recv()
-                {
+                match slot.handle.retire(commit.retire.clone()).recv() {
                     Ok(Ok(())) => {}
                     Ok(Err(failed)) => error = failed,
                     Err(_) => error = "a scheduler stopped".to_owned(),

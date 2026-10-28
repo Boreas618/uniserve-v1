@@ -770,9 +770,6 @@ impl Server {
             (Request::KeepWeights { worlds, cache_keys }, Role::Head { deployment, .. }) => {
                 self.keep_weights(id, &deployment, worlds, cache_keys)
             }
-            (Request::DiscardPages { except }, Role::Head { deployment, .. }) => {
-                self.discard_pages(id, &deployment, *except)
-            }
             (Request::Offload { world }, Role::Head { deployment, .. }) => {
                 self.plan_move(id, &deployment, *world, true)
             }
@@ -1330,33 +1327,6 @@ impl Server {
             Reply::Retained { released: count },
             Vec::new(),
         ))
-    }
-
-    /// `discard_pages`: see [`Request::DiscardPages`]. Refused unless the
-    /// caller is the deployment's head.
-    fn discard_pages(
-        &mut self,
-        id: ClientId,
-        deployment: &str,
-        except: u64,
-    ) -> Result<Outcome, (ErrorKind, String)> {
-        if !self
-            .deployments
-            .get(deployment)
-            .is_some_and(|entry| entry.head == Some(id))
-        {
-            return Err(invalid(&format!(
-                "only the head that claimed {deployment} discards its pages"
-            )));
-        }
-        let pages = self.pages.discard_except(deployment, except);
-        tracing::info!(
-            deployment,
-            except,
-            pages,
-            "discarded the pages of other worlds"
-        );
-        Ok(Outcome::Reply(Reply::Discarded { pages }, Vec::new()))
     }
 
     /// `retire`: see [`Request::Retire`]. Processes that still map the
@@ -2854,7 +2824,6 @@ fn request_name(request: &Request) -> &'static str {
         Request::Expose { .. } => "expose",
         Request::Unexpose { .. } => "unexpose",
         Request::Registered { .. } => "registered",
-        Request::DiscardPages { .. } => "discard_pages",
         Request::Offload { .. } => "offload",
         Request::Restore { .. } => "restore",
         Request::Allocated { .. } => "allocated",
