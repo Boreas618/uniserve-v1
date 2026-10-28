@@ -143,9 +143,13 @@ pub(super) struct Preparing {
     /// What else the ledger books on the GPU: other workers of the
     /// deployment on it.
     pub(super) others: u64,
-    /// The serving world's KV cache limit: the quota less every other item
-    /// (negative when the other items overrun the quota).
+    /// The serving world's KV cache limit: the quota less every other item,
+    /// and no more than the device's free storage with that cache leaves the
+    /// successor (negative when the other items overrun either).
     pub(super) kv_limit: i64,
+    /// The device's free storage when planned: what processes outside the
+    /// deployment, which no ledger books, leave the deployment's worlds.
+    pub(super) free: u64,
     /// The bytes of the segments the serving world cannot give back (its
     /// first segment, and segments it inherited and does not own yet).
     pub(super) kv_floor: u64,
@@ -253,7 +257,14 @@ pub(super) fn preparing(report: &CacheMemory, floor: u32) -> Result<Preparing, S
         in_flight: 0,
     };
     let beside = ledger.used() + unbooked_context - serving_kv_cache + successor.total();
-    let kv_limit = quota as i64 - beside as i64;
+    // The successor's grant is never more than the device has free, so its
+    // additions and the Transfer Server's context not created yet must fit
+    // in the free storage and the tail the serving world gives back: a
+    // process outside the deployment may hold more of the device than the
+    // quota leaves it.
+    let within_free = report.free_bytes as i64 + serving_kv_cache as i64
+        - (successor.total() + unbooked_context) as i64;
+    let kv_limit = (quota as i64 - beside as i64).min(within_free);
 
     // The largest prefix of the held segments within the limit, at least
     // the floor.
@@ -283,6 +294,7 @@ pub(super) fn preparing(report: &CacheMemory, floor: u32) -> Result<Preparing, S
         transfer,
         others,
         kv_limit,
+        free: report.free_bytes,
         kv_floor,
         segments_kept,
         segments_held: report.held,
@@ -307,8 +319,8 @@ pub(super) fn refusal(plans: &[Preparing]) -> String {
         let serving = &plan.serving;
         let successor = &plan.successor;
         lines.push(format!(
-            "host {} GPU {} ({} of world {}): {} of a quota of {} bytes; KV cache limit {} \
-             bytes, {} of which it cannot give back{}",
+            "host {} GPU {} ({} of world {}): {} of a quota of {} bytes and {} bytes free; KV \
+             cache limit {} bytes, {} of which it cannot give back{}",
             plan.host,
             plan.gpu,
             plan.scope,
@@ -319,6 +331,7 @@ pub(super) fn refusal(plans: &[Preparing]) -> String {
                 "does not fit"
             },
             plan.quota,
+            plan.free,
             plan.kv_limit,
             plan.kv_floor,
             if plan.feasible { "" } else { " (infeasible)" },

@@ -264,9 +264,11 @@ impl Executor for Segmented {
                 }],
                 transfer_context: 0,
             });
+            // The device has free what its total leaves beside the process.
+            let free = workers.expert_process.map_or(0, |process| 2_000 - process);
             results.push(
                 serde_json::json!({
-                    "free_bytes": 0,
+                    "free_bytes": free,
                     "host": "node1",
                     "scope": {"deployment": "model", "group": "experts", "rank": 0},
                     "world": WORLD,
@@ -497,6 +499,44 @@ fn a_worker_without_a_cache_leaves_the_shrink_to_the_others() {
             "uniserve.cache_memory".to_owned(),
             r#"uniserve.release_cache {"from":5}"#.to_owned(),
         ]
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A process outside the deployment may hold more of the device than the
+/// quota leaves it: the successor's grant is no more than the device has
+/// free, so the plan keeps no more of the serving world's cache than the
+/// free storage with it leaves the successor's additions, and the shrink
+/// gives back the rest though the quota would hold it.
+#[test]
+fn a_shrink_leaves_the_successor_what_the_device_has_free() {
+    // The quota holds the whole cache beside the successor's head segment;
+    // the device has 1500 bytes free.
+    let (handle, workers, thread) = start(Workers {
+        quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 3 * SEGMENT_BYTES,
+        head_bytes: 2 * SEGMENT_BYTES,
+        free_bytes: 1_500,
+        ..Workers::filling(0)
+    });
+    let plans = resize(&handle, CacheChange::Plan).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    // 1500 free and the 8000 of the cache, less the 2000 of the head.
+    assert_eq!(plan["kv_limit"], 7_500);
+    assert_eq!(plan["free"], 1_500);
+    assert_eq!(plan["segments_kept"], 7);
+
+    let shrunk = resize(
+        &handle,
+        CacheChange::Shrink {
+            preempt_after: None,
+        },
+    );
+    assert!(shrunk.is_ok(), "{shrunk:?}");
+    assert_eq!(
+        workers.lock().unwrap().hooks.last().map(String::as_str),
+        Some(r#"uniserve.release_cache {"from":7}"#)
     );
 
     handle.shutdown();
