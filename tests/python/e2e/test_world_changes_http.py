@@ -1887,7 +1887,12 @@ def test_a_change_across_hosts_continues_a_streaming_request(
     deployment = tmp_path / "deployment.toml"
     if moved_to is not None:
         _deployment_file(deployment, "rank-0", ranks)
-        source = target = ("--worker-groups", str(deployment))
+        source = target = (
+            "--worker-groups",
+            str(deployment),
+            "--data-parallel-size",
+            str(ranks),
+        )
     if ranks > 1:
         source += ("--set", "moe_config.expert_parallel=true")
         target += ("--set", "moe_config.expert_parallel=true")
@@ -1952,11 +1957,14 @@ def test_a_change_across_hosts_continues_a_streaming_request(
             assert (serving["world"],) not in _worlds_of(ledgers, "weights")
 
         # The direct start loads the same logical shards on each GPU.
-        order = report["redistribution"]["devices"]
-        target += (
-            "--set",
-            f"placement_config.devices={json.dumps(order)}",
-        )
+        # A deployment file already fixes every rank's device; the
+        # shorthand takes the assignment selected during preparation.
+        if moved_to is None:
+            order = report["redistribution"]["devices"]
+            target += (
+                "--set",
+                f"placement_config.devices={json.dumps(order)}",
+            )
         (tmp_path / "committed.toml").write_text(_config(base_url)["config"])
         (changed_path / "weights.json").write_text(json.dumps(changed))
 
