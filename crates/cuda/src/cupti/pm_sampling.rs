@@ -23,8 +23,16 @@ use crate::Result;
 /// nanoseconds of a fixed-frequency source.
 const TIME_INTERVAL: u32 = 1;
 
-/// `CUPTI_PM_SAMPLING_HARDWARE_BUFFER_APPEND_MODE_KEEP_OLDEST`.
-const KEEP_OLDEST: u32 = 0;
+/// `CUPTI_PM_SAMPLING_HARDWARE_BUFFER_APPEND_MODE_KEEP_LATEST`: a full
+/// hardware buffer overwrites its oldest records and the next decode
+/// reports the overflow. Keeping the oldest instead fails every decode once
+/// the buffer overflowed (`CUPTI_ERROR_OUT_OF_MEMORY`), losing every later
+/// sample.
+const KEEP_LATEST: u32 = 1;
+
+/// `CUPTI_PM_SAMPLING_DECODE_STOP_REASON_COUNTER_DATA_FULL`: the decode
+/// filled the counter data image before it decoded every record.
+const COUNTER_DATA_FULL: u32 = 1;
 
 #[repr(C)]
 struct EnableParams {
@@ -187,7 +195,7 @@ impl PmSampler {
             hardware_buffer,
             interval: interval_ns,
             trigger: TIME_INTERVAL,
-            append: KEEP_OLDEST,
+            append: KEEP_LATEST,
         };
         // SAFETY: as above; the configuration outlives the sampler's use
         // (this value owns it).
@@ -265,8 +273,22 @@ impl PmSampler {
         unsafe { call(&cupti.pm_stop, "cuptiPmSamplingStop", &mut params) }
     }
 
-    /// Decode the samples completed since the last decode.
+    /// Decode the samples completed since the last decode: every record the
+    /// hardware buffer holds, in as many counter data images as they fill.
     pub fn decode(&mut self) -> Result<Decoded> {
+        let mut decoded = Decoded::default();
+        loop {
+            let full = self.decode_image(&mut decoded)?;
+            if !full {
+                return Ok(decoded);
+            }
+        }
+    }
+
+    /// Decode into the counter data image, move its completed samples into
+    /// `decoded` and empty it; returns whether the image filled before every
+    /// record was decoded.
+    fn decode_image(&mut self, decoded: &mut Decoded) -> Result<bool> {
         let cupti = cupti()?;
         let mut decode = DecodeParams {
             struct_size: struct_size!(DecodeParams, overflow),
@@ -280,6 +302,7 @@ impl PmSampler {
         // SAFETY: the struct is CUPTI's parameter struct; the image is the
         // initialized counter data image.
         unsafe { call(&cupti.pm_decode, "cuptiPmSamplingDecodeData", &mut decode)? };
+        decoded.overflow |= decode.overflow != 0;
         let mut info = DataInfoParams {
             struct_size: struct_size!(DataInfoParams, completed),
             private: std::ptr::null_mut(),
@@ -297,10 +320,7 @@ impl PmSampler {
                 &mut info,
             )?;
         }
-        let mut decoded = Decoded {
-            samples: Vec::with_capacity(info.completed),
-            overflow: decode.overflow != 0,
-        };
+        decoded.samples.reserve(info.completed);
         for index in 0..info.completed {
             let mut sample = SampleInfoParams {
                 struct_size: struct_size!(SampleInfoParams, end),
@@ -328,7 +348,7 @@ impl PmSampler {
             });
         }
         self.initialize()?;
-        Ok(decoded)
+        Ok(decode.stop_reason == COUNTER_DATA_FULL && info.completed > 0)
     }
 
     fn object_params(&self) -> ObjectParams {
