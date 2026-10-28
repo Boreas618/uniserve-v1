@@ -113,7 +113,9 @@ pub(crate) async fn plan(
         .map(|launch| device_index(&launch.descriptor.device))
         .collect::<anyhow::Result<_>>()?;
     let storages = |index: usize| planned[index].storages.clone().unwrap_or_default();
-    let same_sources = sources.iter().all(|other| other.world == sources[0].world);
+    let same_sources = sources
+        .iter()
+        .all(|other| other.world.same_storage(&sources[0].world));
     let mut assigned: Vec<Gpu> = planned.iter().map(|rank| rank.gpu).collect();
     if open && same_sources {
         // Node placement is declared by the deployment. Permute its ranks
@@ -216,8 +218,8 @@ pub(crate) async fn plan(
             "digest": hex(&manifest.digest),
             "copied_bytes": manifest.copied_bytes(),
             "links": manifest.links.iter().map(|link| serde_json::json!({
-                "source": storage::protocol::gpu_name(&link.source),
-                "target": storage::protocol::gpu_name(&link.target),
+                "source": link.source,
+                "target": link.target,
                 "bytes": link.bytes,
                 "seconds": link.seconds,
             })).collect::<Vec<_>>(),

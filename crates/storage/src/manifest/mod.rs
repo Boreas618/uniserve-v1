@@ -38,7 +38,7 @@
 //!    holds are reported ([`Missing`]) for the target to load.
 //!
 //! A [`Planner`] caches each pair's executable manifest. Participating
-//! workers consume that concrete plan. [`Manifest::spans`]
+//! workers consume that concrete plan. [`BoundManifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
 //! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
 //! its Transfer Server executes. The source world of weights is what the
@@ -59,10 +59,10 @@ use serde::{Deserialize, Serialize};
 
 pub use layout::{Canonical, Encoding, Field, Logical, Piece, Segment, StorageLayout};
 pub use region::Span;
-pub use tasks::Spans;
+pub use tasks::{BoundManifest, Spans};
 
 use crate::Key;
-use crate::protocol::LinkBandwidth;
+use crate::protocol::{LinkBandwidth, Memory, Placement};
 
 /// Why a manifest cannot be computed or applied.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +86,47 @@ pub struct Chunk {
     /// First byte within the retained allocation. Logical cache pages can
     /// borrow several regions of the same retained plane segment.
     pub storage_offset: u64,
+    pub binding: Binding,
+}
+
+/// Where retained bytes reside, relative to the Transfer Server executing
+/// this request. Rank storage follows the rank's assigned GPU; host
+/// staging and remote sources carry an explicit physical location.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Binding {
+    Rank,
+    Local { at: Placement },
+    Remote { endpoint: String, at: Placement },
+}
+
+impl Binding {
+    /// The physical memory owning these bytes. GPU UUIDs have global
+    /// identity; host allocations keep their local or remote endpoint.
+    pub fn memory(&self, gpu: Option<Gpu>) -> Result<Memory> {
+        match self {
+            Self::Rank => gpu
+                .map(|gpu| Memory::Device { gpu })
+                .ok_or_else(|| Error::Invalid("rank storage names no GPU".into())),
+            Self::Local {
+                at: Placement::Host { .. },
+            } => Ok(Memory::Host),
+            Self::Local {
+                at: Placement::Device { gpu },
+            } => Ok(Memory::Device { gpu: *gpu }),
+            Self::Remote {
+                at: Placement::Device { gpu },
+                ..
+            } => Ok(Memory::Device { gpu: *gpu }),
+            Self::Remote {
+                endpoint,
+                at: Placement::Host { .. },
+            } => Ok(Memory::Remote {
+                endpoint: endpoint.clone(),
+                gpu: None,
+            }),
+        }
+    }
 }
 
 /// One storage of a rank: its layout and its chunks.
@@ -115,6 +156,7 @@ impl Storage {
                     offset: window.start,
                     length: window.end - window.start,
                     storage_offset: 0,
+                    binding: Binding::Rank,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -146,10 +188,11 @@ impl Storage {
             .map(|page| {
                 let window = page * page_bytes..(page + 1) * page_bytes;
                 Ok(Chunk {
-                    storage_offset: 0,
                     key: layout.chunk_key(&window, fingerprint)?,
                     offset: window.start,
                     length: page_bytes,
+                    storage_offset: 0,
+                    binding: Binding::Rank,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -161,24 +204,11 @@ impl Storage {
 /// it.
 pub type Gpu = [u8; 16];
 
-/// A GPU's UUID in its usual text form.
-pub(crate) fn uuid(gpu: &Gpu) -> String {
-    let hex: String = gpu.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!(
-        "GPU-{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
-}
-
 /// One rank of a world.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rank {
-    /// The GPU the rank's storages lie on; `None` for a target rank, which
-    /// the manifest assigns a GPU.
+    /// The rank's execution GPU; `None` for a target rank whose GPU is
+    /// assigned by the manifest. Each chunk separately binds its memory.
     pub gpu: Option<Gpu>,
     pub storages: Vec<Storage>,
 }
@@ -189,6 +219,31 @@ pub struct World {
     pub ranks: Vec<Rank>,
 }
 
+impl World {
+    /// Whether the same ordered ranks retain the same numerical storage
+    /// in the same physical memory. A GPU's local and remote bindings are
+    /// views of one allocation, while host endpoints remain distinct.
+    pub fn same_storage(&self, other: &Self) -> bool {
+        self.ranks.len() == other.ranks.len()
+            && self.ranks.iter().zip(&other.ranks).all(|(one, two)| {
+                one.gpu == two.gpu
+                    && one.storages.len() == two.storages.len()
+                    && one.storages.iter().zip(&two.storages).all(|(a, b)| {
+                        a.layout == b.layout
+                            && a.chunks.len() == b.chunks.len()
+                            && a.chunks.iter().zip(&b.chunks).all(|(x, y)| {
+                                x.offset == y.offset
+                                    && x.length == y.length
+                                    && x.key == y.key
+                                    && x.storage_offset == y.storage_offset
+                                    && x.binding.memory(one.gpu).ok()
+                                        == y.binding.memory(two.gpu).ok()
+                            })
+                    })
+            })
+    }
+}
+
 /// What a manifest is computed from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -196,10 +251,10 @@ pub struct Request {
     pub target: World,
     /// The GPUs the target world's ranks may take, at least one per rank.
     pub gpus: Vec<Gpu>,
-    /// The bandwidth of every link between them, as the host's Transfer
+    /// The bandwidth of every physical memory link, as the host's Transfer
     /// Server measured it (the listing's `transfer.links`): when it started
     /// for the links within its host, at their first use for the links from
-    /// another host's GPUs (over the NVLink fabric, or READ). A copy within
+    /// another host's device or host memory (over the NVLink fabric, or READ). A copy within
     /// one GPU takes the link from it to itself, and every link a block may
     /// take must be measured.
     pub links: Vec<LinkBandwidth>,
@@ -322,8 +377,8 @@ pub struct Missing {
 /// The bytes a manifest moves over one link and their estimated time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkLoad {
-    pub source: Gpu,
-    pub target: Gpu,
+    pub source: Memory,
+    pub target: Memory,
     pub bytes: u64,
     pub seconds: f64,
 }

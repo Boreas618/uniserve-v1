@@ -2,16 +2,17 @@
 //! Storage Server retains ([`crate::protocol::Request::Transfer`]).
 //!
 //! The Transfer Server knows memory only as regions the Storage Server
-//! holds: every chunk of a storage is retained under its key on its GPU,
+//! holds: every chunk is retained under its key in its bound host or device memory,
 //! and each staging space of a manifest is retained under
 //! [`Manifest::staging_key`] on its rank's GPU, so a span names the copy of
-//! a key at a GPU ([`Region::Tensor`]). A strided copy is one span of rows
+//! a key at its physical memory ([`Region::Tensor`]), wrapped in
+//! [`Region::Remote`] when another host owns it. A strided copy is one span of rows
 //! at its pitches for each run of rows that lies in one chunk on each side;
 //! a row that crosses a chunk bound on either side splits there into spans
 //! of one row. The submitter keeps the sources unchanged and the
 //! destinations unread until the transfer ends.
 
-use super::{Copy, Endpoint, Error, Gpu, Manifest, Request, Result, Side, Space, World};
+use super::{Binding, Copy, Endpoint, Error, Gpu, Manifest, Request, Result, Side, Space, World};
 use crate::Key;
 use crate::protocol::{Placement, Region, Span};
 
@@ -24,14 +25,35 @@ impl Manifest {
         Key(digest.finish())
     }
 
-    /// The spans that execute the copies of a manifest computed from
-    /// `request`, copy by copy and row by row: submitted as transfers
-    /// after the source conversions ran, and followed by the target
-    /// conversions.
-    pub fn spans<'m>(&'m self, request: &'m Request) -> Spans<'m> {
-        Spans {
+    /// Bind this plan to the source allocations visible to the submitting
+    /// host. `sources` must describe the same ranks, layouts and retained
+    /// chunks as `request.source`, in the same order; only their transport
+    /// bindings may differ. GPU assignments and numerical copies stay fixed.
+    pub fn bind<'m>(&'m self, request: &'m Request, sources: &'m World) -> BoundManifest<'m> {
+        BoundManifest {
             manifest: self,
             request,
+            sources,
+        }
+    }
+}
+
+/// An executable plan viewed from one submitting host. Source locations
+/// are resolved here once; consumers submit the resulting regions directly.
+#[derive(Clone, Copy)]
+pub struct BoundManifest<'m> {
+    manifest: &'m Manifest,
+    request: &'m Request,
+    sources: &'m World,
+}
+
+impl<'m> BoundManifest<'m> {
+    /// Copies as Transfer Server spans, after source conversions and
+    /// before target conversions. Both allocations remain retained until
+    /// their transfer completes.
+    pub fn spans(self) -> Spans<'m> {
+        Spans {
+            bound: self,
             copy: 0,
             row: 0,
             done: 0,
@@ -41,41 +63,34 @@ impl Manifest {
     /// The region holding the byte at `offset` of `endpoint` of a rank of
     /// `side`, the offset in it, and the bytes the region holds from there
     /// on.
-    fn locate(
-        &self,
-        request: &Request,
-        side: Side,
-        endpoint: &Endpoint,
-        offset: u64,
-    ) -> Result<(Region, u64, u64)> {
+    fn locate(&self, side: Side, endpoint: &Endpoint, offset: u64) -> Result<(Region, u64, u64)> {
         let (world, gpu): (&World, Option<Gpu>) = match side {
             Side::Source => (
-                &request.source,
-                request
-                    .source
+                self.sources,
+                self.sources
                     .ranks
                     .get(endpoint.rank as usize)
                     .and_then(|rank| rank.gpu),
             ),
             Side::Target => (
-                &request.target,
-                self.gpus.get(endpoint.rank as usize).copied(),
+                &self.request.target,
+                self.manifest.gpus.get(endpoint.rank as usize).copied(),
             ),
         };
-        let gpu =
-            gpu.ok_or_else(|| Error::Invalid(format!("rank {} has no GPU", endpoint.rank)))?;
-        let at = Some(Placement::Device { gpu });
         match endpoint.space {
             Space::Staging { staging } => {
+                let gpu = gpu
+                    .ok_or_else(|| Error::Invalid(format!("rank {} has no GPU", endpoint.rank)))?;
                 let bytes = self
+                    .manifest
                     .stagings
                     .get(staging as usize)
                     .map(|staging| staging.bytes)
                     .ok_or_else(|| Error::Invalid(format!("staging {staging} does not exist")))?;
                 Ok((
                     Region::Tensor {
-                        key: self.staging_key(staging),
-                        at,
+                        key: self.manifest.staging_key(staging),
+                        at: Some(Placement::Device { gpu }),
                     },
                     offset,
                     bytes.saturating_sub(offset),
@@ -96,7 +111,7 @@ impl Manifest {
                         Error::Invalid(format!("byte {offset} of storage {storage} is in no chunk"))
                     })?;
                 Ok((
-                    Region::Tensor { key: chunk.key, at },
+                    chunk.binding.region(chunk.key, gpu)?,
                     chunk.storage_offset + offset - chunk.offset,
                     chunk.offset + chunk.length - offset,
                 ))
@@ -105,10 +120,30 @@ impl Manifest {
     }
 }
 
-/// The spans of a manifest's copies ([`Manifest::spans`]).
+impl Binding {
+    /// Bind a retained allocation to the region consumed by the Transfer
+    /// Server. Remote regions are READ sources; targets must be local.
+    pub fn region(&self, key: Key, gpu: Option<Gpu>) -> Result<Region> {
+        let at = match self {
+            Self::Rank => Placement::Device {
+                gpu: gpu.ok_or_else(|| Error::Invalid("rank storage names no GPU".into()))?,
+            },
+            Self::Local { at } | Self::Remote { at, .. } => *at,
+        };
+        let region = Region::Tensor { key, at: Some(at) };
+        Ok(match self {
+            Self::Remote { endpoint, .. } => Region::Remote {
+                endpoint: endpoint.clone(),
+                region: Box::new(region),
+            },
+            _ => region,
+        })
+    }
+}
+
+/// The spans of a bound manifest's copies ([`BoundManifest::spans`]).
 pub struct Spans<'m> {
-    manifest: &'m Manifest,
-    request: &'m Request,
+    bound: BoundManifest<'m>,
     /// The copy, its row and the bytes of the row done.
     copy: usize,
     row: u64,
@@ -123,11 +158,11 @@ impl Spans<'_> {
         let source_offset = copy.source.offset + self.row * copy.source_pitch + self.done;
         let target_offset = copy.target.offset + self.row * copy.target_pitch + self.done;
         let (source, source_at, source_left) =
-            self.manifest
-                .locate(self.request, Side::Source, &copy.source, source_offset)?;
+            self.bound
+                .locate(Side::Source, &copy.source, source_offset)?;
         let (destination, destination_at, destination_left) =
-            self.manifest
-                .locate(self.request, Side::Target, &copy.target, target_offset)?;
+            self.bound
+                .locate(Side::Target, &copy.target, target_offset)?;
         if self.done == 0 && copy.length <= source_left && copy.length <= destination_left {
             // Whole rows: row `r` from here lies in both chunks while
             // `r * pitch + length` fits what each holds from here.
@@ -172,7 +207,7 @@ impl Iterator for Spans<'_> {
     type Item = Result<Span>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let copy = *self.manifest.copies.get(self.copy)?;
+        let copy = *self.bound.manifest.copies.get(self.copy)?;
         let span = self.span(&copy);
         match &span {
             // Whole rows advance the row; a part of a row advances within
@@ -189,7 +224,7 @@ impl Iterator for Spans<'_> {
             }
             // A failed span ends the iteration after reporting it.
             Err(_) => {
-                self.copy = self.manifest.copies.len();
+                self.copy = self.bound.manifest.copies.len();
                 return Some(span);
             }
         }
