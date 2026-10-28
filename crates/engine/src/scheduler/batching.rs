@@ -204,6 +204,9 @@ impl Scheduler {
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
         let mut budget: usize = self.config.max_num_batched_tokens;
+        // Warming bounds only new prefix writes. Decode and unrelated
+        // numerical calls keep their normal scheduling budgets.
+        let mut prefill_budget = self.warming.prefill_tokens.unwrap_or(usize::MAX);
         // Context calls expand into one forward row per text/image segment.
         // The worker's input buffers and the pass's call bound limit those
         // numerical rows, independently of the number of requests batched.
@@ -262,10 +265,20 @@ impl Scheduler {
                 continue;
             }
             // Build one call when its exact resident resources fit.
-            let planned = if refill {
-                self.plan_refill(id, budget)
+            let writes_prefix =
+                refill || next_type.is_some_and(|kind| batch_kind(kind) == BatchKind::Prefill);
+            let call_budget = if writes_prefix {
+                budget.min(prefill_budget)
             } else {
-                self.next_generation_call(id, budget, rows_left)
+                budget
+            };
+            if call_budget == 0 {
+                continue;
+            }
+            let planned = if refill {
+                self.plan_refill(id, call_budget)
+            } else {
+                self.next_generation_call(id, call_budget, rows_left)
             };
             if let Some(mut call) = planned {
                 // A context prefill plans within the pass's context rows;
@@ -334,6 +347,9 @@ impl Scheduler {
                 };
                 let cost = self.call_token_cost(&call);
                 budget = budget.saturating_sub(cost);
+                if prefill {
+                    prefill_budget = prefill_budget.saturating_sub(cost);
+                }
                 if call.readout.is_some() {
                     let rows = self.running.get(&id).and_then(|state| {
                         let start = self.scheduled_readout_rows(id)?;

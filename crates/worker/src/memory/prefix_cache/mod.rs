@@ -22,6 +22,7 @@ mod access;
 pub(super) mod block_tables;
 pub(crate) mod host;
 mod imports;
+mod manifest;
 pub(super) mod plan;
 pub(crate) mod planes;
 mod transfers;

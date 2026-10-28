@@ -164,6 +164,8 @@ struct PublishedPage {
     tokens: Vec<u32>,
     /// Loaded Worker whose rank group retains the page.
     source: Arc<WorkerEndpoint>,
+    /// Private recovery pages can only be read by that request's continuation.
+    resume: Option<proto::request::CacheResume>,
     /// The page's units in page order; the first one keys the page.
     units: Box<[UnitId]>,
     /// The page's key in the host KV cache, once the page was offloaded
@@ -350,12 +352,21 @@ impl PoolInner {
         group: u32,
         tokens: &[u32],
         source: &WorkerEndpoint,
+        resume: Option<proto::request::CacheResume>,
     ) -> Option<u32> {
-        self.hash_to_pages.get(&hash)?.iter().copied().find(|head| {
-            self.pages.get(head).is_some_and(|page| {
-                page.group == group && page.source.as_ref() == source && page.tokens == tokens
+        self.hash_to_pages
+            .get(&hash)?
+            .iter()
+            .copied()
+            .filter(|head| {
+                self.pages.get(head).is_some_and(|page| {
+                    page.group == group
+                        && page.source.as_ref() == source
+                        && page.tokens == tokens
+                        && (page.resume.is_none() || page.resume == resume)
+                })
             })
-        })
+            .min_by_key(|head| self.pages[head].resume.is_none())
     }
 }
 
@@ -375,6 +386,21 @@ impl PageRef {
     /// Returns the page's units in page order.
     pub(crate) fn units(&self) -> &[UnitId] {
         &self.units
+    }
+}
+
+impl Clone for PageRef {
+    fn clone(&self) -> Self {
+        if let Some(pool) = self.pool.upgrade() {
+            let mut inner = lock(&pool);
+            for unit in &self.units {
+                inner.meta[unit.0 as usize].ref_cnt += 1;
+            }
+        }
+        Self {
+            units: self.units.clone(),
+            pool: Weak::clone(&self.pool),
+        }
     }
 }
 
@@ -569,7 +595,9 @@ impl BlockPool {
         let mut pages: Vec<IndexedPage> = inner
             .pages
             .values()
-            .filter(|page| page.units.iter().all(|unit| unit.0 < inner.withdrawn))
+            .filter(|page| {
+                page.resume.is_none() && page.units.iter().all(|unit| unit.0 < inner.withdrawn)
+            })
             .map(|page| IndexedPage {
                 group: page.group,
                 hash: page.hash,
@@ -621,6 +649,7 @@ impl BlockPool {
             inner.pages.insert(
                 head,
                 PublishedPage {
+                    resume: None,
                     hash: page.hash,
                     group: page.group,
                     tokens: page.tokens.clone(),
@@ -744,9 +773,13 @@ impl BlockPool {
         hash: u64,
         tokens: &[u32],
         source: &Arc<WorkerEndpoint>,
+        resume: Option<proto::request::CacheResume>,
     ) {
         let mut inner = lock(&self.inner);
-        if inner.find_page(hash, group, tokens, source).is_some() {
+        if inner
+            .find_page(hash, group, tokens, source, resume)
+            .is_some()
+        {
             return;
         }
 
@@ -764,6 +797,7 @@ impl BlockPool {
         inner.pages.insert(
             head,
             PublishedPage {
+                resume,
                 hash,
                 group,
                 tokens: tokens.to_vec(),
@@ -790,9 +824,10 @@ impl BlockPool {
         group: u32,
         tokens: &[u32],
         source: &WorkerEndpoint,
+        resume: Option<proto::request::CacheResume>,
     ) -> Option<(UnitId, bool)> {
         let inner = lock(&self.inner);
-        let head = inner.find_page(hash, group, tokens, source)?;
+        let head = inner.find_page(hash, group, tokens, source, resume)?;
         Some((UnitId(head), inner.meta[head as usize].in_fq))
     }
 
@@ -809,6 +844,7 @@ impl BlockPool {
         group: u32,
         tokens: &[u32],
         source: &WorkerEndpoint,
+        resume: Option<proto::request::CacheResume>,
     ) -> Option<PageRef> {
         let mut inner = lock(&self.inner);
         let page = inner.pages.get(&head.0)?;
@@ -816,6 +852,7 @@ impl BlockPool {
             || page.group != group
             || page.tokens != tokens
             || page.source.as_ref() != source
+            || (page.resume.is_some() && page.resume != resume)
         {
             return None;
         }
@@ -860,7 +897,8 @@ impl BlockPool {
             .pages
             .iter()
             .filter(|(_, page)| {
-                page.units.iter().any(|unit| (first..end).contains(&unit.0))
+                page.resume.is_none()
+                    && page.units.iter().any(|unit| (first..end).contains(&unit.0))
                     && page.units.iter().all(|unit| {
                         let meta = &inner.meta[unit.0 as usize];
                         meta.state == UnitState::Cached && meta.ref_cnt == 0
@@ -1411,6 +1449,7 @@ struct PrefixSelection {
 pub(crate) struct PrefixScope {
     pub(crate) isolation_key: Option<u64>,
     pub(crate) state_seed: Option<u64>,
+    pub(crate) resume: Option<proto::request::CacheResume>,
 }
 
 impl PrefixScope {
@@ -1419,6 +1458,7 @@ impl PrefixScope {
         Self {
             isolation_key: cache.isolation_key,
             state_seed: cache.state_seed,
+            resume: cache.resume,
         }
     }
 }
@@ -1466,6 +1506,10 @@ impl PrefixCacheCoordinator {
     /// seed of what the pool's workers compute (`prefix_seed`).
     pub(crate) fn set_seed(&mut self, seed: u64) {
         self.hash_seed = seed;
+    }
+
+    pub(crate) fn seed(&self) -> u64 {
+        self.hash_seed
     }
 
     /// Returns the cache groups in table order.
@@ -1934,6 +1978,7 @@ impl PrefixCacheCoordinator {
         prompt: &[u32],
         hashes: &[Vec<u64>],
         source: &WorkerEndpoint,
+        resume: Option<proto::request::CacheResume>,
     ) -> PrefixSelection {
         let step = self.max_block_size();
         let limit = prompt.len().saturating_sub(1) / step * step;
@@ -1950,7 +1995,7 @@ impl PrefixCacheCoordinator {
                     .map(|page| {
                         let start = page * shape.block_size;
                         let span = &prompt[start..start + shape.key_tokens()];
-                        pool.lookup(hashes[group][page], group as u32, span, source)
+                        pool.lookup(hashes[group][page], group as u32, span, source, resume)
                     })
                     .collect::<Vec<_>>()
             })
@@ -2026,7 +2071,7 @@ impl PrefixCacheCoordinator {
             return PrefixHit::default();
         }
         let hashes = self.prefix_hashes(prompt, scope);
-        let selection = self.select_prefix(pool, prompt, &hashes, source);
+        let selection = self.select_prefix(pool, prompt, &hashes, source, scope.resume);
         let cached_free_units = selection
             .pages
             .iter()
@@ -2089,7 +2134,7 @@ impl PrefixCacheCoordinator {
             return Some(result);
         }
 
-        let selection = self.select_prefix(pool, prompt, &result.page_hashes, source);
+        let selection = self.select_prefix(pool, prompt, &result.page_hashes, source, scope.resume);
         let acquire = |group: usize, start: usize, pages: &[(UnitId, bool)]| {
             let shape = self.groups[group];
             pages
@@ -2106,6 +2151,7 @@ impl PrefixCacheCoordinator {
                         group as u32,
                         span,
                         source,
+                        scope.resume,
                     )
                 })
                 .collect::<Option<Vec<_>>>()
@@ -2210,7 +2256,7 @@ impl PrefixCacheCoordinator {
                 };
                 let first = page * block_size;
                 let span = tokens.span(first..first + table.shape.key_tokens());
-                pool.publish(reference, group as u32, *hash, &span, source);
+                pool.publish(reference, group as u32, *hash, &span, source, None);
             }
             published[group] = published[group].max(complete);
         }
@@ -2279,6 +2325,59 @@ mod tests {
 
     fn endpoint() -> Arc<WorkerEndpoint> {
         Arc::new(ipc::WorkerInfo::default().endpoint)
+    }
+
+    #[test]
+    fn private_recovery_pages_are_held_and_reused_only_by_their_continuation() {
+        let pool = BlockPool::new(8, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let tokens = vec![1, 2, 3, 4, 5];
+        let resume = proto::request::CacheResume {
+            world: 3,
+            request_id: 7,
+        };
+        let scope = PrefixScope {
+            resume: Some(resume),
+            ..Default::default()
+        };
+        let hashes = coordinator.prefix_hashes(&tokens, scope);
+        let page = pool.allocate(1, 1).unwrap().remove(0);
+        pool.activate([&page]);
+        let lease = page.clone();
+        drop(page);
+        assert_eq!(pool.free_units(), 6);
+        pool.publish(&lease, 0, hashes[0][0], &tokens[..4], &source, Some(resume));
+        assert_eq!(
+            coordinator
+                .probe_prefix(&pool, &tokens, true, false, PrefixScope::default(), &source)
+                .cached_tokens,
+            0
+        );
+        let other = PrefixScope {
+            resume: Some(proto::request::CacheResume {
+                world: 3,
+                request_id: 8,
+            }),
+            ..scope
+        };
+        assert_eq!(
+            coordinator
+                .probe_prefix(&pool, &tokens, true, false, other, &source)
+                .cached_tokens,
+            0
+        );
+        let mut allocation = coordinator.empty();
+        let hit = coordinator
+            .acquire_prefix(&pool, &mut allocation, &tokens, true, false, scope, &source)
+            .unwrap();
+        assert_eq!(hit.cached_tokens, 4);
+        drop(lease);
+        assert_eq!(pool.free_units(), 6);
+        drop(allocation);
+        assert_eq!(pool.free_units(), 7);
+        assert!(pool.export().is_empty());
+        assert!(pool.acquire_idle_from(1).is_empty());
     }
 
     fn full(block_size: usize, units_per_page: usize) -> GroupShape {
@@ -2362,6 +2461,7 @@ mod tests {
                     hashes[group][*page],
                     tokens,
                     source,
+                    None,
                 );
                 reference
             })
@@ -2383,6 +2483,7 @@ mod tests {
             PrefixScope {
                 isolation_key: Some(7),
                 state_seed: None,
+                resume: None,
             },
         );
         coordinator.extend_hashes(
@@ -2391,6 +2492,7 @@ mod tests {
             PrefixScope {
                 isolation_key: Some(7),
                 state_seed: None,
+                resume: None,
             },
         );
         assert_eq!(
@@ -2399,7 +2501,8 @@ mod tests {
                 &migrated,
                 PrefixScope {
                     isolation_key: Some(7),
-                    state_seed: None
+                    state_seed: None,
+                    resume: None,
                 }
             )
         );
@@ -2413,7 +2516,8 @@ mod tests {
                 &migrated,
                 PrefixScope {
                     isolation_key: Some(8),
-                    state_seed: None
+                    state_seed: None,
+                    resume: None,
                 }
             )
         );
@@ -3030,6 +3134,7 @@ mod tests {
         let kept = PrefixScope {
             isolation_key: None,
             state_seed: Some(prefix_seed("previous")),
+            resume: None,
         };
         let continued = serving.probe_prefix(&pool, &prompt, true, false, kept, &source);
         assert_eq!(continued.cached_tokens, 8);

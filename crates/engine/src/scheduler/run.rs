@@ -240,6 +240,7 @@ impl Scheduler {
             resizing: None,
             asleep: false,
             parking: None,
+            warming: super::warming::Warming::default(),
             parked: false,
             trial: false,
             failure: Arc::default(),
@@ -850,7 +851,7 @@ impl Scheduler {
 
     /// Completes the batches in flight, scheduling nothing new while the
     /// caller set `closing`.
-    fn drain_batches(&mut self) -> Result<(), String> {
+    pub(super) fn drain_batches(&mut self) -> Result<(), String> {
         while !(self.inflight.pending_batches.is_empty()
             && self.inflight.pending_submissions.is_empty())
         {

@@ -69,6 +69,7 @@ mod placement;
 mod preemption;
 mod run;
 mod speculation;
+mod warming;
 mod world;
 
 pub(crate) use crate::executor::{
@@ -493,6 +494,7 @@ pub struct Scheduler {
     /// A park waiting for the scheduler's requests to end
     /// (`Scheduler::park`).
     parking: Option<world::Parking>,
+    warming: warming::Warming,
     /// The scheduler parked: it admits and executes nothing until it
     /// resumes, and keeps its memory and prefix cache index.
     parked: bool,

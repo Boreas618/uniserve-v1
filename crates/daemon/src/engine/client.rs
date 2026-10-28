@@ -570,6 +570,21 @@ impl EngineClient {
         }
     }
 
+    /// Pin source pages, reserve target pages, or publish a completed cache
+    /// transfer. A snapshot retains its pages until a matching release.
+    pub async fn cache_warm(
+        &self,
+        operation: storage::manifest::cache::Operation,
+    ) -> Result<Vec<storage::manifest::cache::Snapshot>, String> {
+        let operation = serde_json::to_vec(&operation).map_err(|error| error.to_string())?;
+        self.ask(|id| wire::engine_command::Kind::CacheWarm(wire::CacheWarm { id, operation }))
+            .await?
+            .results()
+            .into_iter()
+            .map(|snapshot| serde_json::from_str(&snapshot).map_err(|error| error.to_string()))
+            .collect()
+    }
+
     /// Grows the engine's KV cache as [`Self::resize_cache`] does, once the
     /// worlds of `keep_weights` (a previous world kept as its weights, whose
     /// processes exited) released every storage but their weights on every
@@ -1128,6 +1143,13 @@ pub struct EventStream {
 }
 
 impl EventStream {
+    /// Provenance of private cache pages when this request resumes elsewhere.
+    pub fn cache_resume(&self) -> Option<proto::request::CacheResume> {
+        self.world().map(|world| proto::request::CacheResume {
+            world,
+            request_id: self.id.0,
+        })
+    }
     /// The world of the engine that feeds the stream; `None` for a stream no
     /// engine feeds.
     pub fn world(&self) -> Option<u64> {

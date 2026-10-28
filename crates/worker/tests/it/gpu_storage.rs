@@ -198,6 +198,7 @@ fn fp8_plan() -> CachePlan {
             compute_dtype: DType::BF16,
         }],
         states: Vec::new(),
+        checkpoints: Vec::new(),
         handle: Handle::none(),
     }
 }

@@ -1613,6 +1613,13 @@ impl Scheduler {
         if let Err(invariant) = acquired {
             self.invariant_broken(invariant);
         }
+        if let Some(resume) = self
+            .running
+            .get(&id)
+            .and_then(|state| state.req.cache.resume)
+        {
+            self.warming.claimed(resume);
+        }
     }
 }
 

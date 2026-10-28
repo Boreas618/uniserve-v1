@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use super::wire;
 use super::{
-    ArtifactEvent, ArtifactMedia, CachePolicy, CfgRenorm, ConditionExtent, DiffusionRequest,
-    DiffusionSamplingParams, EncoderInputs, Event, FeedbackImage, FeedbackNextToken,
-    FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint, GenerationFeatures,
-    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageGenerationConfig,
-    ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind, MigrationCause,
-    MultimodalInputs, PixelRange, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
-    Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
+    ArtifactEvent, ArtifactMedia, CachePolicy, CacheResume, CfgRenorm, ConditionExtent,
+    DiffusionRequest, DiffusionSamplingParams, EncoderInputs, Event, FeedbackImage,
+    FeedbackNextToken, FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint,
+    GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput,
+    ImageGenerationConfig, ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind,
+    MigrationCause, MultimodalInputs, PixelRange, PositionLogprobs, ReadoutRow, ReadoutSlot,
+    RejectionKind, Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
 };
 
 /// A message that states no valid value.
@@ -113,6 +113,10 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                 write: request.cache.write,
                 isolation_key: request.cache.isolation_key,
                 state_seed: request.cache.state_seed,
+                resume: request.cache.resume.map(|resume| wire::CacheResume {
+                    world: resume.world,
+                    request_id: resume.request_id,
+                }),
             }),
             include_stop_token: request.include_stop_token,
             image_generation: Some((&request.image_generation).into()),
@@ -215,6 +219,10 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                 write: cache.write,
                 isolation_key: cache.isolation_key,
                 state_seed: cache.state_seed,
+                resume: cache.resume.map(|resume| CacheResume {
+                    world: resume.world,
+                    request_id: resume.request_id,
+                }),
             },
             include_stop_token: request.include_stop_token,
             image_generation: present(request.image_generation, "image generation")?.try_into()?,

@@ -42,6 +42,10 @@ pub(crate) struct Claims {
 }
 
 impl Claims {
+    /// Storage Server TCP endpoints of the deployment's nodes, by host.
+    pub(crate) fn endpoints(&self) -> &BTreeMap<String, String> {
+        &self.endpoints
+    }
     /// Claims `arguments`' deployment at the server of every node of the
     /// deployment, keeping exactly the scopes their groups run there.
     ///

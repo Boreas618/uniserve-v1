@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -370,6 +370,49 @@ class CachePlan:
                 for field, (shape, dtype) in slots.fields(layout).items()
             ]
         )
+
+    def checkpoints(self) -> str:
+        """Packed checkpoint fields and their logical tensor regions.
+
+        Byte offsets are relative to the first plane of the layer's run;
+        the runtime binds those planes to the page's retained allocations.
+        """
+        checkpoints = []
+        for group in self.planes.groups:
+            if not group.states:
+                continue
+            for name, checkpoint in zip(
+                group.layers, group.checkpoints, strict=True
+            ):
+                logical = self.states[name].logical_tensors()
+                fields = []
+                for field, offset, shape, dtype in checkpoint.fields:
+                    stride = 1
+                    strides = []
+                    for extent in reversed(shape):
+                        strides.insert(0, stride)
+                        stride *= extent
+                    fields.append(
+                        {
+                            "tensor": f"{name}/{field}",
+                            "source": "",
+                            "dtype": _dtype_name(dtype),
+                            "element": dtype.itemsize,
+                            "offset": offset,
+                            "shape": shape,
+                            "strides": strides,
+                            "logical": asdict(logical[field]),
+                            "encoding": {"kind": "affine"},
+                        }
+                    )
+                checkpoints.append(
+                    {
+                        "first_plane": checkpoint.first_plane,
+                        "planes": checkpoint.planes,
+                        "fields": fields,
+                    }
+                )
+        return json.dumps(checkpoints)
 
 
 def cache_plan(

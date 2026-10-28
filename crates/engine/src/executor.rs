@@ -1521,6 +1521,12 @@ pub trait Executor: Send {
     fn ledgers(&mut self) -> Result<Vec<String>, ExecutorError> {
         Ok(Vec::new())
     }
+
+    /// Storage Server endpoints for the deployment nodes. Local numerical
+    /// executors retain no storage outside their process.
+    fn storage_nodes(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
+    }
     /// Runs the worker hook `name` with `payload` on every worker while
     /// none runs a batch, and returns each worker group's identity with its
     /// ranks' results, in rank order. The default refuses: the executor has

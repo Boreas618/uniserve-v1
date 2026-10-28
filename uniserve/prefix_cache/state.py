@@ -11,6 +11,7 @@ from typing import ClassVar, Literal
 import torch
 
 from uniserve import _slices
+from uniserve.distributed.logical import Logical
 from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve.tensors import BufferConfig
 
@@ -314,6 +315,21 @@ class StateConfig(ABC):
     def state_heads(self) -> tuple[int, ...]:
         """The logical heads of the state this rank keeps."""
         return (0,)
+
+    def logical_tensors(self) -> Mapping[str, Logical]:
+        """Logical slot fields of a replicated checkpoint.
+
+        Partitioned state types declare their own mathematical regions.
+        The block dimension belongs to the runtime and is excluded.
+        """
+        if self.heads != 1:
+            raise ValueError("partitioned state declares its logical tensors")
+        return {
+            name: Logical.whole(tuple(field.shape[1:]))
+            for name, field in self.buffers(
+                num_blocks=1, block_size=1, dtype=None, quantizer=None
+            ).items()
+        }
 
     @abstractmethod
     def buffers(

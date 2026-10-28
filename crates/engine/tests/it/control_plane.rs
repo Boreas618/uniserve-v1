@@ -2003,6 +2003,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
             write,
             isolation_key: Some(isolation_key),
             state_seed: None,
+            resume: None,
         };
         let mut events = handle.submit(request).expect("submit cache request");
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2058,12 +2059,14 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 /// Under FCFS with a 256-token step budget and prefill chunks capped at 64
 /// tokens, a 1000-token prompt is prefilled in many chunks; it and a
 /// concurrent short request must both finish and emit text. The test observes
-/// only completion, not how chunks and decodes share individual steps.
+/// completion and the executor's prefill token budget while warming caps it.
 #[test]
 fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
-    let executor = Box::new(SimExecutor::new(sim));
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let executor = Box::new(executor);
     let sched = support::scheduler_with(
         executor,
         special_tokens(),
@@ -2080,6 +2083,15 @@ fn chunked_prefill_progresses_with_decode() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
+
+    handle
+        .cache_warm(
+            storage::manifest::cache::Operation::Prefill { tokens: Some(16) },
+            engine::HookBarrier::new(1),
+        )
+        .recv()
+        .unwrap()
+        .unwrap();
 
     // A long prompt plus a short concurrent request.
     let long_prompt: Vec<u32> = (0..1000u32).map(|i| (i % 91) + 7).collect();
@@ -2120,6 +2132,47 @@ fn chunked_prefill_progresses_with_decode() {
     };
     let (t1, d1) = collect(&mut erx1);
     let (t2, d2) = collect(&mut erx2);
+    let prefill_tokens = || {
+        dispatched
+            .try_iter()
+            .filter_map(|event| match event {
+                BatchEvent::Submitted(batch) => Some(
+                    batch
+                        .requests
+                        .into_iter()
+                        .filter(|(call, _)| {
+                            call.kind == CallKind::Forward(ipc::ForwardMode::Prefill)
+                        })
+                        .map(|(call, _)| call.input_token_ids.len())
+                        .sum::<usize>(),
+                ),
+                _ => None,
+            })
+            .filter(|&tokens| tokens > 0)
+            .collect::<Vec<_>>()
+    };
+    let capped = prefill_tokens();
+    assert!(!capped.is_empty() && capped.iter().all(|&tokens| tokens <= 16));
+    handle
+        .cache_warm(
+            storage::manifest::cache::Operation::Prefill { tokens: None },
+            engine::HookBarrier::new(1),
+        )
+        .recv()
+        .unwrap()
+        .unwrap();
+    let mut restored = handle
+        .submit(generation_request(
+            RequestId(3),
+            text_input(vec![90; 128]),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            1,
+        ))
+        .unwrap();
+    assert!(collect(&mut restored).1);
+    assert!(prefill_tokens().into_iter().any(|tokens| tokens > 16));
     handle.shutdown();
     let _ = jh.join();
     assert!(d1 && d2, "both requests must finish (d1={d1} d2={d2})");

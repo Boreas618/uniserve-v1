@@ -87,6 +87,10 @@ fn generation() -> GenerationRequest {
             write: true,
             isolation_key: Some(99),
             state_seed: Some(7),
+            resume: Some(proto::request::CacheResume {
+                world: 3,
+                request_id: 5,
+            }),
         },
         include_stop_token: true,
         image_generation: ImageGenerationConfig {
