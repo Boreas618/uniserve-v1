@@ -217,9 +217,9 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 /// Serves the configuration `args` resolve until Ctrl-C or SIGTERM.
 async fn async_main(args: options::ServeArgs) -> Result<()> {
     let (config, stated) = args.resolve()?;
-    // Without a model the daemon serves its admin API alone, and its first
-    // `PUT /admin/config` brings a deployment up.
-    if config.model.is_none() {
+    // A model-less leader serves its admin API until a deployment is
+    // configured. Followers join the leader without loading a model.
+    if config.leads() && config.model.is_none() {
         info!(
             host = %config.server_config.host,
             port = config.server_config.port,
