@@ -814,6 +814,54 @@ impl SegmentedMapping {
         self.import_protected(index, descriptor, self.protection)
     }
 
+    /// Replace this range's backing at unchanged addresses.
+    ///
+    /// Each allocation is its byte extent and exported descriptor. Their
+    /// total must equal this range's size; segment boundaries may differ.
+    /// No device operation may address this range during the call. The caller
+    /// keeps any creating handles needed by remote fabric exports alive.
+    ///
+    /// # Errors
+    ///
+    /// Fails before unmapping for incompatible allocation extents.
+    /// A driver failure during remapping leaves the range unusable; the
+    /// caller must terminate its execution rather than replay its graphs.
+    pub fn remap(
+        &mut self,
+        allocations: &[(usize, &OwnedFd)],
+        protection: Protection,
+    ) -> Result<()> {
+        let granularity = HandleType::Descriptor.granularity(self.device)?;
+        let mut extent = 0_usize;
+        let mut segments = Vec::with_capacity(allocations.len());
+        for &(bytes, _) in allocations {
+            if bytes == 0 || !bytes.is_multiple_of(granularity) {
+                return Err(Error::invalid(
+                    "remapped allocations must be whole device granules",
+                ));
+            }
+            segments.push((extent, bytes, None, protection));
+            extent = extent
+                .checked_add(bytes)
+                .ok_or_else(|| Error::invalid("remapped extent overflows"))?;
+        }
+        if extent != self.bytes {
+            return Err(Error::invalid("remapping requires the same byte extent"));
+        }
+        let context = PrimaryContext::retain(self.device)?;
+        let _guard = context.enter()?;
+        for index in 0..self.segments.len() {
+            self.release(index)?;
+        }
+        self.segments = segments;
+        self.created = self.segments.iter().map(|_| None).collect();
+        self.protection = protection;
+        for (index, &(_, descriptor)) in allocations.iter().enumerate() {
+            self.import_protected(index, descriptor, protection)?;
+        }
+        Ok(())
+    }
+
     /// Maps segment `index` from the POSIX descriptor of a physical
     /// allocation of its length with `protection`, which the segment keeps
     /// through later changes of the mapping's protection until

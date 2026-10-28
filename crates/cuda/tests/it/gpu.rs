@@ -997,3 +997,70 @@ fn a_released_segment_is_mapped_again_at_its_address() {
     );
     assert!(bytes[2 * granularity..].iter().all(|byte| *byte == 9));
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
+    let _driver = exclusive_driver();
+    let (begin, end, destroy_graph) = capture_functions();
+    let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
+    let bytes = 2 * granularity;
+    let mut active = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
+    let original = active.create(0).unwrap();
+    let mut shared = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
+    shared.import(0, &original).unwrap();
+    let mut source = SegmentedMapping::reserve(DEVICE, &[granularity; 2], &[]).unwrap();
+    let descriptors: Vec<_> = (0..2).map(|index| source.create(index).unwrap()).collect();
+    let stream = Stream::new(DEVICE).unwrap();
+    let host = PinnedBuffer::new(DEVICE, bytes).unwrap();
+    // SAFETY: every fill lies in a live allocation; synchronization precedes
+    // capture and the change of access rights.
+    unsafe {
+        memset_d8(active.address(), 7, bytes, &stream).unwrap();
+        memset_d8(source.address(), 13, granularity, &stream).unwrap();
+        memset_d8(
+            source.address() + granularity as u64,
+            17,
+            granularity,
+            &stream,
+        )
+        .unwrap();
+    }
+    stream.synchronize().unwrap();
+    source.protect(Protection::ReadOnly).unwrap();
+    let mut graph = std::ptr::null_mut();
+    // SAFETY: captured copies borrow allocations that outlive the executable.
+    let read_back = unsafe {
+        assert_eq!(begin(stream.raw() as RawHandle, 2), 0);
+        memcpy_async(host.address(), active.address(), bytes, &stream).unwrap();
+        assert_eq!(end(stream.raw() as RawHandle, &mut graph), 0);
+        let executable = GraphExec::instantiate(DEVICE, graph as usize).unwrap();
+        let _context = DeviceGuard::new(DEVICE).unwrap();
+        assert_eq!(destroy_graph(graph), 0);
+        executable
+    };
+    read_back.launch(&stream).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![7; bytes]);
+
+    active
+        .remap(
+            &descriptors
+                .iter()
+                .map(|descriptor| (granularity, descriptor))
+                .collect::<Vec<_>>(),
+            Protection::ReadOnly,
+        )
+        .unwrap();
+    read_back.launch(&stream).unwrap();
+    stream.synchronize().unwrap();
+    let observed = read(&host);
+    assert_eq!(&observed[..granularity], vec![13; granularity]);
+    assert_eq!(&observed[granularity..], vec![17; granularity]);
+
+    // The predecessor's alias still reads the original immutable bytes.
+    // SAFETY: both copy ranges remain mapped through the synchronization.
+    unsafe { memcpy_async(host.address(), shared.address(), bytes, &stream).unwrap() };
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![7; bytes]);
+}
