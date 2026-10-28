@@ -31,9 +31,9 @@ const READ_INTERVAL: Duration = Duration::from_millis(200);
 pub struct Successor {
     /// It loads its weights from the model's files: their keys differ.
     pub loads_weights: bool,
-    /// It maps none of the engine's KV cache: the requests in flight
-    /// compute their state again in units of its own.
-    pub recomputes_cache: bool,
+    /// It maps none of the engine's KV cache, so copied or recomputed
+    /// in-flight state needs units of its own.
+    pub unmapped_cache: bool,
     /// Its graph policy captures graphs.
     pub captures_graphs: bool,
 }
@@ -795,7 +795,7 @@ impl EngineClient {
                 preempt_after_ms: preempt_after.map(|after| after.as_millis() as u64),
                 keep_weights: Vec::new(),
                 successor_loads_weights: successor.loads_weights,
-                successor_recomputes_cache: successor.recomputes_cache,
+                successor_unmapped_cache: successor.unmapped_cache,
                 successor_captures_graphs: successor.captures_graphs,
                 rank_budgets,
                 ..wire::ResizeCache::default()

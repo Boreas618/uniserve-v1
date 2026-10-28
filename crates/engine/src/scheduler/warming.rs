@@ -58,7 +58,7 @@ impl Scheduler {
 
     fn warm_pages(&mut self, operation: Operation) -> Result<Snapshot, String> {
         let prefixes = match operation {
-            Operation::Snapshot { world } => self.snapshot_pages(world)?,
+            Operation::Snapshot { world, after } => self.snapshot_pages(world, &after)?,
             Operation::Reserve { prefixes, keep } => self.reserve_pages(prefixes, keep)?,
             Operation::Coverage { prefixes, keep } => self.cache_coverage(prefixes, keep),
             Operation::Prefill { tokens } => {
@@ -66,6 +66,12 @@ impl Scheduler {
                     return Err("a warming prefill limit must be positive".into());
                 }
                 self.warming.prefill_tokens = tokens.map(|tokens| tokens as usize);
+                Vec::new()
+            }
+            Operation::Retain { requests } => {
+                self.warming
+                    .reserved
+                    .retain(|page| requests.contains(&(page.resume.world, page.resume.request_id)));
                 Vec::new()
             }
             Operation::Publish => {
@@ -96,6 +102,23 @@ impl Scheduler {
                         );
                         page.published = true;
                     }
+                    // Sliding attention and recurrent state need only their
+                    // newest window. Keep its predecessor until publication
+                    // has completed, then release superseded reservation pins.
+                    let mut ends = std::collections::HashMap::new();
+                    for page in &self.warming.reserved {
+                        let end = ends.entry((page.resume, page.page.group)).or_insert(0);
+                        *end = (*end).max(page.page.start + page.page.tokens);
+                    }
+                    self.warming.reserved.retain(|page| {
+                        cache.coordinator.groups()[page.page.group as usize]
+                            .window
+                            .is_none_or(|window| {
+                                let end = ends[&(page.resume, page.page.group)];
+                                page.page.start + page.page.tokens
+                                    > end.saturating_sub(window as u32)
+                            })
+                    });
                 }
                 Vec::new()
             }
@@ -131,13 +154,25 @@ impl Scheduler {
                 .collect()
         };
         Ok(Snapshot {
+            page_tokens: self
+                .storage
+                .cache()
+                .and_then(|cache| {
+                    cache
+                        .coordinator
+                        .groups()
+                        .iter()
+                        .map(|shape| shape.block_size as u32)
+                        .max()
+                })
+                .unwrap_or(1),
             prefixes,
             ranks,
             nodes: self.executor.storage_nodes(),
         })
     }
 
-    fn snapshot_pages(&mut self, world: u64) -> Result<Vec<Prefix>, String> {
+    fn snapshot_pages(&mut self, world: u64, after: &[(u64, u32)]) -> Result<Vec<Prefix>, String> {
         if !self.warming.leased.is_empty() {
             return Err("the previous cache snapshot still holds page leases".into());
         }
@@ -146,10 +181,7 @@ impl Scheduler {
         };
         let mut prefixes = Vec::new();
         for (&id, state) in &self.running {
-            if !state.req.is_migratable()
-                || state.terminal_intent.is_terminal()
-                || state.has_context_images()
-            {
+            if !state.req.is_migratable() || state.terminal_intent.is_terminal() {
                 continue;
             }
             let Some(allocation) = state.allocations.as_ref() else {
@@ -198,7 +230,12 @@ impl Scheduler {
                 if shape.draft {
                     continue;
                 }
-                for index in 0..prefix.computed as usize / shape.block_size {
+                let copied = after
+                    .iter()
+                    .find(|(request, _)| *request == id.0)
+                    .map_or(0, |(_, tokens)| *tokens as usize);
+                for index in copied / shape.block_size..prefix.computed as usize / shape.block_size
+                {
                     let Some(page) = table.page(index) else {
                         continue;
                     };
@@ -209,14 +246,15 @@ impl Scheduler {
                         start: (index * shape.block_size) as u32,
                         tokens: shape.block_size as u32,
                         total_tokens: prefix.tokens.len() as u32,
+                        state: shape.state,
                         units: page.units().iter().map(|unit| unit.0).collect(),
                     });
                     self.warming.leased.push(page.clone());
                 }
             }
-            if !prefix.pages.is_empty() {
-                prefixes.push(prefix);
-            }
+            // Even a request that wrote no new complete page participates
+            // in coverage and retains its existing target reservations.
+            prefixes.push(prefix);
         }
         Ok(prefixes)
     }
@@ -251,12 +289,26 @@ impl Scheduler {
                 CachedTokens::prompt(&prefix.tokens),
                 scope,
             );
-            prefix.pages.clear();
+            let source_pages = std::mem::take(&mut prefix.pages);
             for (group, shape) in cache.coordinator.groups().iter().enumerate() {
                 if shape.draft {
                     continue;
                 }
-                let complete = prefix.computed as usize / shape.block_size;
+                let complete = if shape.state {
+                    // A recurrent checkpoint describes the state at exactly
+                    // this boundary. Repartition its fields, never relabel an
+                    // earlier or later checkpoint as the desired state.
+                    source_pages
+                        .iter()
+                        .filter(|page| page.state)
+                        .map(|page| (page.start + page.tokens) as usize)
+                        .filter(|end| end % shape.block_size == 0)
+                        .max()
+                        .unwrap_or(0)
+                        / shape.block_size
+                } else {
+                    prefix.computed as usize / shape.block_size
+                };
                 let first = shape.window.map_or(0, |window| {
                     (complete * shape.block_size).saturating_sub(window) / shape.block_size
                 });
@@ -281,6 +333,7 @@ impl Scheduler {
                         start,
                         tokens: shape.block_size as u32,
                         total_tokens: prefix.tokens.len() as u32,
+                        state: shape.state,
                         units: reference.units().iter().map(|unit| unit.0).collect(),
                     };
                     reserved.push(Reserved {

@@ -354,19 +354,14 @@ impl PoolInner {
         source: &WorkerEndpoint,
         resume: Option<proto::request::CacheResume>,
     ) -> Option<u32> {
-        self.hash_to_pages
-            .get(&hash)?
-            .iter()
-            .copied()
-            .filter(|head| {
-                self.pages.get(head).is_some_and(|page| {
-                    page.group == group
-                        && page.source.as_ref() == source
-                        && page.tokens == tokens
-                        && (page.resume.is_none() || page.resume == resume)
-                })
+        self.hash_to_pages.get(&hash)?.iter().copied().find(|head| {
+            self.pages.get(head).is_some_and(|page| {
+                page.group == group
+                    && page.source.as_ref() == source
+                    && page.tokens == tokens
+                    && page.resume == resume
             })
-            .min_by_key(|head| self.pages[head].resume.is_none())
+        })
     }
 }
 
@@ -852,7 +847,7 @@ impl BlockPool {
             || page.group != group
             || page.tokens != tokens
             || page.source.as_ref() != source
-            || (page.resume.is_some() && page.resume != resume)
+            || page.resume != resume
         {
             return None;
         }
@@ -2065,9 +2060,10 @@ impl PrefixCacheCoordinator {
         scope: PrefixScope,
         source: &WorkerEndpoint,
     ) -> PrefixHit {
-        // Prefix hashes cover token ids only, not image content, so requests
-        // with images are excluded from prefix reuse.
-        if !self.prefix_enabled || !cache_read || has_images {
+        // Public keys cover tokens only. A private continuation reuses its
+        // own held state even when shared caching is disabled or the prompt
+        // contains images; its source request handle scopes every page.
+        if scope.resume.is_none() && (!self.prefix_enabled || !cache_read || has_images) {
             return PrefixHit::default();
         }
         let hashes = self.prefix_hashes(prompt, scope);
@@ -2121,7 +2117,7 @@ impl PrefixCacheCoordinator {
 
         // Empty hashes also prevent prefix-cache insertion for image requests; see
         // `probe_prefix` for why images are excluded.
-        if !self.prefix_enabled || has_images {
+        if scope.resume.is_none() && (!self.prefix_enabled || has_images) {
             return Some(PrefixLookup::default());
         }
         let hashes = self.prefix_hashes(prompt, scope);
@@ -2130,7 +2126,7 @@ impl PrefixCacheCoordinator {
             cached_tokens: 0,
             draft_tokens: 0,
         };
-        if !cache_read {
+        if !cache_read && scope.resume.is_none() {
             return Some(result);
         }
 
@@ -2368,8 +2364,14 @@ mod tests {
             0
         );
         let mut allocation = coordinator.empty();
+        assert_eq!(
+            coordinator
+                .probe_prefix(&pool, &tokens, false, true, scope, &source)
+                .cached_tokens,
+            4
+        );
         let hit = coordinator
-            .acquire_prefix(&pool, &mut allocation, &tokens, true, false, scope, &source)
+            .acquire_prefix(&pool, &mut allocation, &tokens, false, true, scope, &source)
             .unwrap();
         assert_eq!(hit.cached_tokens, 4);
         drop(lease);

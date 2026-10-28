@@ -381,10 +381,10 @@ message ResizeCache {
   repeated uint64 keep_weights = 4;
   // For a shrink or a plan, what the world that succeeds this one adds: it
   // loads its weights from the model's files (their keys differ), and it
-  // maps none of this world's KV cache, so the requests in flight compute
-  // their state in units of its own.
+  // maps none of this world's KV cache, so copied or recomputed in-flight
+  // state needs units of its own.
   bool successor_loads_weights = 5;
-  bool successor_recomputes_cache = 6;
+  bool successor_unmapped_cache = 6;
   // For a shrink or a plan: the successor's graph policy captures graphs,
   // so its warmup takes a graph share where its model can be captured.
   bool successor_captures_graphs = 8;

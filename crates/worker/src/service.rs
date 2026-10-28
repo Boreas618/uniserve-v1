@@ -689,6 +689,23 @@ impl Service<'_> {
             None => &mut local,
         };
         let result = match name {
+            "uniserve.cache_session" => {
+                let open: bool = serde_json::from_value(payload)
+                    .map_err(|error| Error::Invalid(format!("cache session: {error}")))?;
+                if let (Some(planes), Some(retained)) = (planes.as_ref(), retained.as_deref()) {
+                    if open {
+                        let device = planes
+                            .device()
+                            .ok_or(Error::State("cache transfers require a device pool"))?;
+                        self.maintenance
+                            .cache_copies
+                            .open(retained, device.uuid()?.0)?;
+                    } else {
+                        self.maintenance.cache_copies.close(retained)?;
+                    }
+                }
+                serde_json::Value::Null
+            }
             "uniserve.cache_transfer" => {
                 let copies = serde_json::from_value(payload)
                     .map_err(|error| Error::Invalid(format!("cache transfer: {error}")))?;

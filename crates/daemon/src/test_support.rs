@@ -164,6 +164,11 @@ pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerH
 /// this process over a socket pair, labelling their statistics with their
 /// model.
 pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
+    let state = if cores.iter().any(SchedulerHandle::starts_on_trial) {
+        crate::engine::client::EngineState::Standby
+    } else {
+        crate::engine::client::EngineState::Ready
+    };
     let first = &cores[0];
     let info = EngineInfo {
         limits: first.generation_limits(),
@@ -188,10 +193,14 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         .name("sim-engine".into())
         .spawn(move || engine::serve_requests(engine, cores))
         .expect("start the simulated engine");
-    EngineClient::over(
-        daemon,
+    EngineClient::new(
+        proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
+            .expect("a reader"),
+        proto::Connection::from_unix(daemon).expect("a writer"),
         info,
+        state,
         crate::leader::stats_sink(model_name, std::sync::Arc::default(), 0),
+        None,
     )
     .expect("a client")
 }

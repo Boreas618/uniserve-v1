@@ -63,6 +63,7 @@ use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
 
 pub(crate) mod group;
 mod redistribution;
+mod warming;
 use redistribution::Redistribution;
 
 /// An irrevocable operator decision, retained through partial publication,
@@ -761,11 +762,7 @@ fn steps(
     let tail = bytes(&gpu["serving_kv_cache"]).saturating_sub(kv_kept);
     // The previous world's segments the successor does not map: all it
     // keeps when the successor maps none of its cache.
-    let unmapped = if successor.recomputes_cache {
-        kv_kept
-    } else {
-        0
-    };
+    let unmapped = if successor.unmapped_cache { kv_kept } else { 0 };
     let parked = previous_world == PreviousWorld::Parked;
     serde_json::json!({
         "preparation": {
@@ -1306,7 +1303,7 @@ impl Replica {
         // their state again.
         let successor = Successor {
             loads_weights: !reloaded.is_empty() || (redistributes && redistribution.is_none()),
-            recomputes_cache: redistributes
+            unmapped_cache: redistributes
                 || kv_encoding_changes(&served, &target_spec)
                 || (!reloaded.is_empty() && request.in_flight == InFlight::Recompute),
             captures_graphs: target_spec
@@ -1325,8 +1322,12 @@ impl Replica {
         };
         let kv_cache = if !unmapped.is_empty() {
             "unmapped"
-        } else if successor.recomputes_cache {
-            "recomputed"
+        } else if successor.unmapped_cache {
+            if !reloaded.is_empty() && request.in_flight == InFlight::Recompute {
+                "recomputed"
+            } else {
+                "warming"
+            }
         } else {
             "mapped"
         };
@@ -1561,7 +1562,7 @@ impl Replica {
         // A successor of another parallel configuration lays its cache out
         // for the heads it holds, and one of another encoding cannot read the
         // serving world's: either maps none of its segments.
-        let segments = if adds.recomputes_cache {
+        let segments = if adds.unmapped_cache {
             Vec::new()
         } else {
             running.describe_cache().await.map_err(|error| {
@@ -1631,15 +1632,42 @@ impl Replica {
             (done, task)
         };
         let start_spec = spec.clone();
-        let prepared = tokio::task::spawn_blocking(move || control.start(start_spec, sink))
-            .await
-            .context("the successor's start did not complete")
-            .and_then(|started| started.context("the successor world did not start"));
+        let prepared = async {
+            let successor = Arc::new(
+                tokio::task::spawn_blocking(move || control.start(start_spec, sink))
+                    .await
+                    .context("the successor's start did not complete")?
+                    .context("the successor world did not start")?,
+            );
+            let changed = running.info().prefix_seed != successor.info().prefix_seed;
+            let warmed = if adds.unmapped_cache && !(changed && in_flight == InFlight::Recompute) {
+                self.progress("warm_cache", Some(successor.world()));
+                match warming::prepare(
+                    std::slice::from_ref(running),
+                    &successor,
+                    changed,
+                    update.cache_tail_tokens.map(std::num::NonZeroU32::get),
+                    update.cache_prefill_tokens.map(std::num::NonZeroU32::get),
+                )
+                .await
+                {
+                    Ok(report) => Some(report),
+                    Err(error) => {
+                        self.close(&successor).await;
+                        return Err(anyhow::anyhow!("cache warming failed: {error}"));
+                    }
+                }
+            } else {
+                None
+            };
+            Ok((successor, warmed))
+        }
+        .await;
         let (done, task) = interference;
         done.cancel();
         let throttled = task.await.unwrap_or_default();
-        let successor = match prepared {
-            Ok(successor) => Arc::new(successor),
+        let (successor, warmed) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.progress_done();
                 let restored = running.resize_cache(wire::CacheChange::Restore).await;
@@ -1677,9 +1705,9 @@ impl Replica {
         let trajectories_change = before.latent_seed != after.latent_seed;
         let numerics_change = pages_change || trajectories_change;
         let hold = Arc::clone(self.hold());
-        // A request keeps the state it reached only where the successor maps
-        // it: the old key counts as the new one for those requests alone.
-        if numerics_change && in_flight == InFlight::Keep && !adds.recomputes_cache {
+        // Only these continuations may reuse state computed with the prior
+        // numerics, whether its backing is mapped or copied.
+        if numerics_change && in_flight == InFlight::Keep {
             hold.keep(Some(Kept {
                 world: previous_world,
                 prefix_seed: pages_change.then_some(before.prefix_seed),
@@ -1702,19 +1730,35 @@ impl Replica {
                 self.close(&successor).await;
                 self.restore_tail(running).await;
                 replay_graphs(running, update.eager_prepare).await;
+                let _ = warming::resume_prefill(std::slice::from_ref(running)).await;
                 self.progress_done();
                 return Err(anyhow::anyhow!("the serving world did not park: {error}").into());
             }
         };
         let parked = paused.elapsed();
-        // The requests in flight compute their state again when the change
-        // asks it of other numerics, and where the successor maps none of it.
-        let recompute =
-            (numerics_change && in_flight == InFlight::Recompute) || adds.recomputes_cache;
+        // Recompute only when requested for changed numerics or when the
+        // encoding has no registered exact conversion.
+        let recompute = (numerics_change && in_flight == InFlight::Recompute)
+            || warmed
+                .as_ref()
+                .is_some_and(|report| report.recompute.is_some());
         // A previous world kept parked keeps its memory until the commit; one
         // kept as its weights frees the rest as the successor serves.
         let grows = update.previous_world != PreviousWorld::Parked;
-        if let Err(error) = successor.promote(index, recompute, grows).await {
+        let index = if adds.unmapped_cache {
+            Vec::new()
+        } else {
+            index
+        };
+        let promotion: anyhow::Result<()> = async {
+            warming::resume_prefill(std::slice::from_ref(running))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            successor.promote(index, recompute, grows).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = promotion {
             hold.keep(None);
             let _ = running.resume(vec![world]).await;
             hold.serve(Arc::clone(running));
@@ -1778,7 +1822,7 @@ impl Replica {
                 // cache, and the successor grows into them (step 5 of
                 // `specs/online-operations.md` §6.5). A rollback reads them
                 // back from there and computes the rest again.
-                if adds.recomputes_cache {
+                if adds.unmapped_cache {
                     match parked.resize_cache(wire::CacheChange::Evict).await {
                         Ok(results) => {
                             evicted = results
@@ -1861,7 +1905,8 @@ impl Replica {
             } else {
                 "mapped"
             },
-            "kv_cache": if adds.recomputes_cache { "recomputed" } else { "mapped" },
+            "kv_cache": if recompute { "recomputed" } else if warmed.is_some() { "warmed" } else { "mapped" },
+            "cache_warming": warmed,
             "memory": memory,
         });
         {
@@ -2408,7 +2453,7 @@ mod tests {
         });
         let reloading = Successor {
             loads_weights: true,
-            recomputes_cache: true,
+            unmapped_cache: true,
             captures_graphs: true,
         };
         let parked = steps(&gpu, PreviousWorld::Parked, reloading);

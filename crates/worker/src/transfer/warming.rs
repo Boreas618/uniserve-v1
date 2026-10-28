@@ -11,9 +11,36 @@ use crate::{Error, Result};
 #[derive(Default)]
 pub(crate) struct Copies {
     task: Option<u64>,
+    session: Option<u64>,
 }
 
 impl Copies {
+    pub(crate) fn open(&mut self, retained: &Retained, gpu: [u8; 16]) -> Result<()> {
+        if self.session.is_some() {
+            return Err(Error::State(
+                "cache warming already owns a transfer session",
+            ));
+        }
+        self.session = Some(retained.call("opening cache transfers", |client| {
+            client.open_transfer(vec![gpu])
+        })?);
+        Ok(())
+    }
+
+    /// Close only after every task has reached physical completion.
+    pub(crate) fn close(&mut self, retained: &Retained) -> Result<()> {
+        if self.task.is_some() {
+            return Err(Error::State("cache warming still has a transfer in flight"));
+        }
+        if let Some(session) = self.session {
+            retained.call("closing cache transfers", |client| {
+                client.close_transfer(session)
+            })?;
+            self.session = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn start(&mut self, retained: &Retained, copies: Vec<Copy>) -> Result<()> {
         if self.task.is_some() {
             return Err(Error::State("the previous cache transfer still runs"));

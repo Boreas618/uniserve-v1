@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,9 +88,8 @@ struct Routing {
     /// Each connected daemon's frame queue, by the order it connected; a
     /// closed connection's entry is `None`.
     fronts: Mutex<Vec<Option<crossbeam_channel::Sender<Frame>>>>,
-    /// Whether the engine parks or parked (`Park`): it admits nothing until
-    /// it resumes.
-    parked: AtomicBool,
+    /// The published lifecycle state; only Ready admits requests.
+    state: AtomicI32,
     /// Whether the engine failed, once reported.
     failed: AtomicBool,
     /// Whether the engine's world is on trial, until its commit: the
@@ -169,6 +168,8 @@ impl Routing {
             && !self.failed.swap(true, Ordering::AcqRel)
         {
             tracing::error!(%failure, "the engine failed; it serves nothing more");
+            self.state
+                .store(wire::EngineState::Failed as i32, Ordering::Release);
             self.broadcast(|| {
                 Frame::plain(from_engine::Kind::State(wire::State {
                     state: wire::EngineState::Failed as i32,
@@ -253,6 +254,7 @@ fn serve(
     schedulers: Vec<SchedulerHandle>,
     attachment: Option<Attachment>,
 ) -> anyhow::Result<()> {
+    let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
     let routing = Arc::new(Routing {
         slots: schedulers
             .into_iter()
@@ -265,7 +267,11 @@ fn serve(
         cache_routes: Mutex::default(),
         next: AtomicUsize::new(0),
         fronts: Mutex::default(),
-        parked: AtomicBool::new(false),
+        state: AtomicI32::new(if prepared {
+            wire::EngineState::Standby
+        } else {
+            wire::EngineState::Ready
+        } as i32),
         failed: AtomicBool::new(false),
         trial: AtomicBool::new(false),
     });
@@ -312,7 +318,13 @@ fn serve(
                     let attached = attachment
                         .as_ref()
                         .context("this engine takes no other daemon")
-                        .and_then(|attachment| connect_front(&address, attachment))
+                        .and_then(|attachment| {
+                            connect_front(
+                                &address,
+                                attachment,
+                                routing.state.load(Ordering::Acquire),
+                            )
+                        })
                         .and_then(|(reader, writer)| {
                             open_front(
                                 reader,
@@ -438,6 +450,7 @@ fn close_front(front: usize, routing: &Routing) {
 fn connect_front(
     address: &str,
     attachment: &Attachment,
+    state: i32,
 ) -> anyhow::Result<(Connection, Connection)> {
     let path = address
         .strip_prefix("unix:")
@@ -465,7 +478,7 @@ fn connect_front(
     );
     writer.send(&wire::FromEngine {
         kind: Some(from_engine::Kind::State(wire::State {
-            state: wire::EngineState::Ready as i32,
+            state,
             info: Some(attachment.info.clone()),
             error: String::new(),
         })),
@@ -501,8 +514,10 @@ fn read_requests(
             Err(error) => return Err(error).context("reading the daemon's requests"),
         };
         match message.kind {
-            Some(to_engine::Kind::Submit(submit)) if routing.parked.load(Ordering::Acquire) => {
-                refuse_parked(submit, front, routing);
+            Some(to_engine::Kind::Submit(submit))
+                if routing.state.load(Ordering::Acquire) != wire::EngineState::Ready as i32 =>
+            {
+                refuse_unready(submit, front, routing);
             }
             Some(to_engine::Kind::Submit(submit)) => submit_all(submit, front, routing, streams),
             Some(to_engine::Kind::Command(command)) => apply(command, routing),
@@ -615,7 +630,12 @@ fn read_requests(
                 Some(wire::engine_command::Kind::Attach(attach)) => {
                     let _ = control.send(Control::Attach(attach.requests));
                 }
-                // A serving engine was promoted, or succeeds none.
+                Some(wire::engine_command::Kind::Promote(promote))
+                    if routing.state.load(Ordering::Acquire)
+                        == wire::EngineState::Standby as i32 =>
+                {
+                    promote_schedulers(promote, routing);
+                }
                 Some(wire::engine_command::Kind::Promote(_)) | None => {}
             },
             None => {}
@@ -635,7 +655,7 @@ fn submit_all(
     let mut batches: HashMap<usize, Vec<(RequestId, Request, Credit)>> = HashMap::new();
     for message in submit.requests {
         let id = RequestId(message.id);
-        let request = match Request::from_wire(message) {
+        let mut request = match Request::from_wire(message) {
             Ok(request) => request,
             Err(error) => {
                 refuse(front, routing, id, error.to_string());
@@ -649,6 +669,11 @@ fn submit_all(
                 .and_then(|resume| crate::lock(&routing.cache_routes).remove(&resume)),
             Request::Diffusion(_) => None,
         };
+        if recovered.is_none()
+            && let Request::Generation(request) = &mut request
+        {
+            request.cache.resume = None;
+        }
         let Some(index) = recovered.or_else(|| routing.pick()) else {
             let (event, _) = Event::Error {
                 message: "the engine is unavailable after a worker failure".to_owned(),
@@ -793,6 +818,11 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
             crate::lock(&routing.cache_routes).clear();
             vec![Operation::Discard; routing.slots.len()]
         }
+        Operation::Retain { requests } => {
+            crate::lock(&routing.cache_routes)
+                .retain(|resume, _| requests.contains(&(resume.world, resume.request_id)));
+            vec![Operation::Retain { requests }; routing.slots.len()]
+        }
         operation => vec![operation; routing.slots.len()],
     };
     let together = crate::HookBarrier::new(routing.slots.len());
@@ -810,7 +840,7 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
 fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>) {
     let successor = crate::Successor {
         loads_weights: resize.successor_loads_weights,
-        recomputes_cache: resize.successor_recomputes_cache,
+        unmapped_cache: resize.successor_unmapped_cache,
         captures_graphs: resize.successor_captures_graphs,
         // A malformed UUID names no GPU of this deployment.
         rank_budgets: resize
@@ -1044,12 +1074,90 @@ fn configure_schedulers(configure: wire::Configure, front: usize, routing: &Arc<
     }
 }
 
+/// Adopts each predecessor index through the ordinary scheduler owners,
+/// then opens request admission on the same connection used to prepare.
+fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
+    let routing = Arc::clone(routing);
+    let spawned = std::thread::Builder::new()
+        .name("promote".into())
+        .spawn(move || {
+            let promoted = std::thread::scope(|scope| {
+                let promoting: Vec<_> = routing
+                    .slots
+                    .iter()
+                    .map(|slot| {
+                        let parked = slot
+                            .handle
+                            .cache_group()
+                            .and_then(|group| {
+                                promote
+                                    .index
+                                    .iter()
+                                    .find(|indexed| indexed.worker_group == group)
+                            })
+                            .map(|indexed| crate::scheduler::ParkedCache {
+                                pages: indexed
+                                    .pages
+                                    .iter()
+                                    .map(|page| crate::kv_cache::IndexedPage {
+                                        group: page.group,
+                                        hash: page.hash,
+                                        tokens: page.tokens.clone(),
+                                        units: page.units.clone(),
+                                    })
+                                    .collect(),
+                                held_units: indexed.held_units,
+                                requests: indexed.requests,
+                                reserved_units: indexed.reserved_units,
+                                reserving: indexed.reserving,
+                            })
+                            .unwrap_or_default();
+                        let (recompute, grows) = (promote.recompute, promote.grows);
+                        scope.spawn(move || slot.handle.promote(parked, recompute, grows))
+                    })
+                    .collect();
+                let mut result = Ok(());
+                for promotion in promoting {
+                    let completed = promotion.join().unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!("a scheduler's promotion panicked"))
+                    });
+                    if result.is_ok() {
+                        result = completed;
+                    }
+                }
+                result
+            });
+            let (state, error) = match promoted {
+                Ok(()) => (wire::EngineState::Ready, String::new()),
+                Err(error) => {
+                    routing.failed.store(true, Ordering::Release);
+                    (wire::EngineState::Failed, format!("{error:#}"))
+                }
+            };
+            routing.state.store(state as i32, Ordering::Release);
+            routing.broadcast(|| {
+                Frame::plain(from_engine::Kind::State(wire::State {
+                    state: state as i32,
+                    info: None,
+                    error: error.clone(),
+                }))
+            });
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "the promotion thread did not start");
+    }
+}
+
 /// Parks every scheduler at once, on a thread of its own, and answers the
 /// daemon `front` with `Parked` and every scheduler's prefix cache index,
 /// each by the worker group whose cache it indexes; every daemon reads the
 /// engine's new state.
 fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
-    if routing.parked.swap(true, Ordering::AcqRel) {
+    if routing
+        .state
+        .swap(wire::EngineState::Parked as i32, Ordering::AcqRel)
+        == wire::EngineState::Parked as i32
+    {
         tracing::info!("the engine parks already");
     }
     tracing::info!("the engine parks");
@@ -1149,7 +1257,9 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
                 }
             }
             if error.is_empty() {
-                routing.parked.store(false, Ordering::Release);
+                routing
+                    .state
+                    .store(wire::EngineState::Ready as i32, Ordering::Release);
                 routing.broadcast(|| {
                     Frame::plain(from_engine::Kind::State(wire::State {
                         state: wire::EngineState::Ready as i32,
@@ -1334,7 +1444,7 @@ fn wire_cache(group: crate::scheduler::GroupCache) -> wire::CacheSegments {
 /// Answers the requests a parked engine is submitted: a token request that
 /// resumes from its generated tokens, and a video request, leave at once as
 /// migratable, as the ones it held did, and any other is refused.
-fn refuse_parked(submit: wire::Submit, front: usize, routing: &Routing) {
+fn refuse_unready(submit: wire::Submit, front: usize, routing: &Routing) {
     for message in submit.requests {
         let id = RequestId(message.id);
         let event = match Request::from_wire(message) {
@@ -1350,7 +1460,7 @@ fn refuse_parked(submit: wire::Submit, front: usize, routing: &Routing) {
                 stored_layout: Vec::new(),
             },
             Ok(_) => Event::Error {
-                message: "the engine is parked and admits no request".to_owned(),
+                message: "the engine is not ready to admit requests".to_owned(),
             },
             Err(error) => {
                 refuse(front, routing, id, error.to_string());
@@ -1628,116 +1738,27 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
         ),
         latent_seed: first.latent_seed(),
     };
-    // A successor prepared beside its predecessor serves once the daemon
-    // promotes it, with the predecessor's prefix cache index.
-    if spec.predecessor.is_some() {
-        writer.send(&state(
-            wire::EngineState::Standby,
-            Some(info.clone()),
-            String::new(),
-        ))?;
-        tracing::info!(engine, world = spec.world, "the engine is prepared");
-        let Some(promote) = await_promotion(&mut reader)? else {
-            tracing::info!(engine, "the daemon shut the prepared engine down");
-            SchedulerHandle::shutdown_all(&schedulers);
-            return Ok(());
-        };
-        let (index, recompute, grows) = (&promote.index, promote.recompute, promote.grows);
-        // Every scheduler promotes at once, each with what the predecessor's
-        // scheduler over the same worker group parked with.
-        let promoted = std::thread::scope(|scope| {
-            let promoting: Vec<_> = schedulers
-                .iter()
-                .map(|scheduler| {
-                    let parked = scheduler
-                        .cache_group()
-                        .and_then(|group| {
-                            index.iter().find(|indexed| indexed.worker_group == group)
-                        })
-                        .map(|indexed| crate::scheduler::ParkedCache {
-                            pages: indexed
-                                .pages
-                                .iter()
-                                .map(|page| crate::kv_cache::IndexedPage {
-                                    group: page.group,
-                                    hash: page.hash,
-                                    tokens: page.tokens.clone(),
-                                    units: page.units.clone(),
-                                })
-                                .collect(),
-                            held_units: indexed.held_units,
-                            requests: indexed.requests,
-                            reserved_units: indexed.reserved_units,
-                            reserving: indexed.reserving,
-                        })
-                        .unwrap_or_default();
-                    scope.spawn(move || scheduler.promote(parked, recompute, grows))
-                })
-                .collect();
-            let mut outcome = Ok(());
-            for promotion in promoting {
-                let result = promotion
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a scheduler's promotion panicked")));
-                if outcome.is_ok() {
-                    outcome = result;
-                }
-            }
-            outcome
-        });
-        if let Err(error) = promoted {
-            let _ = writer.send(&state(
-                wire::EngineState::Failed,
-                None,
-                format!("{error:#}"),
-            ));
-            SchedulerHandle::shutdown_all(&schedulers);
-            return Err(error.context("promoting the prepared engine"));
-        }
-    }
-    writer.send(&state(
-        wire::EngineState::Ready,
-        Some(info.clone()),
-        String::new(),
-    ))?;
-    tracing::info!(engine, schedulers = schedulers.len(), "the engine serves");
+    // Standby and serving engines share one control channel. Standby
+    // refuses submissions until promotion, while cache transfers and other
+    // preparation commands use their ordinary owners and responses.
+    let initial = if spec.predecessor.is_some() {
+        wire::EngineState::Standby
+    } else {
+        wire::EngineState::Ready
+    };
+    writer.send(&state(initial, Some(info.clone()), String::new()))?;
+    tracing::info!(
+        engine,
+        schedulers = schedulers.len(),
+        ?initial,
+        "the engine control channel is ready"
+    );
     serve(
         reader,
         writer,
         schedulers,
         Some(Attachment { engine, info }),
     )
-}
-
-/// Waits on a prepared engine's connection for the daemon's word: the
-/// predecessor's prefix cache index once it promotes the engine, `None` once
-/// it shuts the engine down or closes the connection. A prepared engine is
-/// submitted nothing.
-fn await_promotion(reader: &mut Connection) -> anyhow::Result<Option<wire::Promote>> {
-    loop {
-        let message = match reader.try_recv::<wire::ToEngine>() {
-            Ok(Some(message)) => message,
-            Ok(None) => {
-                reader.wait(READ_INTERVAL)?;
-                continue;
-            }
-            Err(proto::Error::Closed) => return Ok(None),
-            Err(error) => return Err(error).context("reading the daemon's requests"),
-        };
-        match message.kind {
-            Some(to_engine::Kind::Engine(command)) => match command.kind {
-                Some(wire::engine_command::Kind::Promote(promote)) => {
-                    return Ok(Some(promote));
-                }
-                Some(wire::engine_command::Kind::Shutdown(_)) => return Ok(None),
-                // The daemon addresses a serving engine's other commands.
-                Some(_) | None => {}
-            },
-            Some(to_engine::Kind::Submit(_) | to_engine::Kind::Command(_)) | None => {
-                tracing::warn!("the daemon addressed a prepared engine's requests");
-            }
-        }
-    }
 }
 
 /// Every worker group's KV cache as the engine starts with it.

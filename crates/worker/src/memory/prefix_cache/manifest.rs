@@ -186,7 +186,7 @@ fn raw(tensor: String, chunk: Chunk) -> Storage {
         layout: StorageLayout {
             bytes,
             fields: vec![Field {
-                tensor,
+                tensor: tensor.clone(),
                 source: String::new(),
                 dtype: "uint8".into(),
                 element: 1,
@@ -194,7 +194,11 @@ fn raw(tensor: String, chunk: Chunk) -> Storage {
                 shape: vec![bytes],
                 strides: vec![1],
                 logical,
-                encoding: Encoding::Affine,
+                encoding: Encoding::Encoded {
+                    name: "unit-fp8-scale".into(),
+                    group: tensor.clone(),
+                    canonical: None,
+                },
             }],
         },
         chunks: vec![chunk],
