@@ -697,10 +697,9 @@ pub struct Successor {
     /// It loads its weights from the model's files (their keys differ), so
     /// it holds as many beside the serving world's.
     pub loads_weights: bool,
-    /// It maps none of the serving world's KV cache (another encoding, or
-    /// requests that compute their state again), so the requests in flight
-    /// take units of its own.
-    pub recomputes_cache: bool,
+    /// It maps none of the serving world's KV cache, so copied or
+    /// recomputed in-flight state needs units of its own.
+    pub unmapped_cache: bool,
     /// Its graph policy captures graphs (`cuda_graph_config.policy` is not
     /// `off`), so its warmup takes a graph share where its model can be
     /// captured.

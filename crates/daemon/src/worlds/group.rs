@@ -126,6 +126,10 @@ async fn restore(
         close(candidate).await;
     }
     for (replica, client) in previous.iter().zip(serving) {
+        replica.hold.keep(None);
+        if let Err(error) = warming::resume_prefill(std::slice::from_ref(client)).await {
+            warn!(%error, "the predecessor did not restore its prefill budget");
+        }
         let restored = if parked.contains(&client.world()) {
             client.resume(retiring.clone()).await
         } else {
@@ -255,7 +259,7 @@ pub(crate) async fn apply(
     }
     let adds = Successor {
         loads_weights: false,
-        recomputes_cache: true,
+        unmapped_cache: true,
         captures_graphs: specs.iter().any(|spec| {
             spec.cuda_graphs
                 .as_ref()
@@ -296,6 +300,7 @@ pub(crate) async fn apply(
     let mut observers = Vec::new();
     let mut parked = Vec::new();
     let mut interference = None;
+    let mut warmed = Vec::new();
     let result: anyhow::Result<()> = async {
         for (replica, client) in previous.iter().zip(&serving) {
             replica.progress("prepare", None);
@@ -379,6 +384,40 @@ pub(crate) async fn apply(
         if let Some(error) = failure {
             return Err(error);
         }
+        // Admission and migration use this same predecessor-to-successor
+        // assignment. Each source is leased by only one target owner.
+        let mut warming = Vec::new();
+        for (ordinal, candidate) in candidates.iter().enumerate() {
+            let sources: Vec<_> = serving
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % candidates.len() == ordinal)
+                .map(|(_, client)| Arc::clone(client))
+                .collect();
+            let changed = sources
+                .iter()
+                .any(|source| source.info().prefix_seed != candidate.info().prefix_seed);
+            warming.push(async move {
+                if changed && request.in_flight == InFlight::Recompute {
+                    Ok(warming::Report {
+                        recompute: Some("the update recomputes in-flight state".into()),
+                        ..warming::Report::default()
+                    })
+                } else {
+                    warming::prepare(
+                        &sources,
+                        candidate,
+                        changed,
+                        update.cache_tail_tokens.map(std::num::NonZeroU32::get),
+                        update.cache_prefill_tokens.map(std::num::NonZeroU32::get),
+                    )
+                    .await
+                }
+            });
+        }
+        for result in futures::future::join_all(warming).await {
+            warmed.push(result.map_err(anyhow::Error::msg)?);
+        }
         Ok(())
     }
     .await;
@@ -404,8 +443,19 @@ pub(crate) async fn apply(
     let promoted = Instant::now();
     let mut park_time = Duration::ZERO;
     let paused = previous.iter().all(|replica| replica.hold.is_paused());
-    for replica in &previous {
+    for (index, replica) in previous.iter().enumerate() {
         replica.progress("promote", None);
+        let before = serving[index].info();
+        let after = candidates[index % candidates.len()].info();
+        if request.in_flight == InFlight::Keep {
+            replica.hold.keep(Some(Kept {
+                world: serving[index].world(),
+                prefix_seed: (before.prefix_seed != after.prefix_seed)
+                    .then_some(before.prefix_seed),
+                latent_seed: (before.latent_seed != after.latent_seed)
+                    .then_some(before.latent_seed),
+            }));
+        }
         replica.hold.hold();
     }
     let result: anyhow::Result<()> = async {
@@ -415,11 +465,14 @@ pub(crate) async fn apply(
             parked.push(client.world());
         }
         park_time = promoted.elapsed();
-        for candidate in &candidates {
+        warming::resume_prefill(&serving)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        for (candidate, warmed) in candidates.iter().zip(&warmed) {
             candidate
                 .promote(
                     Vec::new(),
-                    true,
+                    warmed.recompute.is_some(),
                     update.previous_world != PreviousWorld::Parked,
                 )
                 .await?;
@@ -483,7 +536,6 @@ pub(crate) async fn apply(
         replica.monitor();
     }
     for (index, replica) in previous.iter().enumerate() {
-        replica.hold.keep(None);
         replica
             .hold
             .redirect(Arc::clone(&current[index % current.len()].hold));
@@ -558,6 +610,8 @@ pub(crate) async fn apply(
         "park_seconds": park_time.as_secs_f64(),
         "parallel": "changed",
         "redistribution": plans,
+        "cache_warming": warmed,
+        "kv_cache": if warmed.iter().any(|report| report.recompute.is_some()) { "recomputed" } else { "warmed" },
         "previous_world_kept": mode,
         "transfer_halvings": throttled.halvings,
         "transfer_restorations": throttled.restorations,

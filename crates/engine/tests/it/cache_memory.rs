@@ -509,7 +509,7 @@ fn a_redistributing_successor_leaves_a_configured_capacity_whole() {
         ..Workers::filling(0)
     });
     let redistributing = Successor {
-        recomputes_cache: true,
+        unmapped_cache: true,
         ..Successor::default()
     };
     let plans = resize(&handle, CacheChange::Plan(redistributing.clone())).unwrap();
@@ -728,7 +728,7 @@ fn recomputation_uses_the_target_window_and_page_storage() {
     assert_eq!(prefixes[0].request_id, 1);
     assert!(prefixes[0].tokens >= 4 * BLOCK);
     let target = Successor {
-        recomputes_cache: true,
+        unmapped_cache: true,
         rank_budgets: engine::RankBudgets::from([(
             [7; 16],
             storage::manifest::weights::RankBudget {
@@ -1200,7 +1200,7 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
     let recomputed = plan_of(Successor {
         loads_weights: true,
-        recomputes_cache: true,
+        unmapped_cache: true,
         ..Successor::default()
     });
     let in_flight = recomputed["successor"]["in_flight"].as_u64().unwrap();

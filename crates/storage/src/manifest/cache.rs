@@ -13,6 +13,8 @@ pub struct Page {
     pub start: u32,
     pub tokens: u32,
     pub total_tokens: u32,
+    /// A state page represents its endpoint, rather than a token interval.
+    pub state: bool,
     /// Physical units, in the cache group's page order.
     pub units: Vec<u32>,
 }
@@ -34,6 +36,7 @@ pub struct Prefix {
 /// The scheduler's frozen page references and their worker storage views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    pub page_tokens: u32,
     pub prefixes: Vec<Prefix>,
     pub ranks: Vec<Rank>,
     pub nodes: std::collections::BTreeMap<String, String>,
@@ -67,10 +70,11 @@ pub struct Copy {
 /// is legal only after all copies into reserved target pages have completed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Operation {
-    Snapshot { world: u64 },
+    Snapshot { world: u64, after: Vec<(u64, u32)> },
     Reserve { prefixes: Vec<Prefix>, keep: bool },
     Coverage { prefixes: Vec<Prefix>, keep: bool },
     Prefill { tokens: Option<u32> },
+    Retain { requests: Vec<(u64, u64)> },
     Publish,
     Release,
     Discard,

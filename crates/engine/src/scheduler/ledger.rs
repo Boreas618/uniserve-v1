@@ -215,8 +215,8 @@ pub(super) struct Additions {
     /// Its head segment.
     pub(super) head_segment: u64,
     /// What it prepares for the requests in flight: nothing when it maps
-    /// their KV cache read-only, the units they hold now when it computes
-    /// their state again in units of its own.
+    /// their KV cache read-only, target units for copied or recomputed state
+    /// otherwise.
     pub(super) in_flight: u64,
 }
 
@@ -234,8 +234,8 @@ impl Additions {
 /// The serving world's KV cache limit on the device of `report` in the
 /// preparing phase beside a successor that adds `adds`, and the segments it
 /// keeps within it, of which `floor` it cannot give back. The requests in
-/// flight hold `in_flight_units`, which a successor that computes their
-/// state again takes of its own. Fails for a worker that reports no ledger
+/// flight hold `in_flight_units`; an unmapped successor reserves their
+/// target representation. Fails for a worker that reports no ledger
 /// or no quota.
 pub(super) fn preparing(
     report: &CacheMemory,
@@ -303,7 +303,7 @@ pub(super) fn preparing(
         exclusive: target.map_or(serving.exclusive, |target| target.fixed),
         head_segment: target.map_or(report.head_bytes, |target| target.cache),
         in_flight: {
-            let requests = if adds.recomputes_cache {
+            let requests = if adds.unmapped_cache {
                 target.map_or(u64::from(in_flight_units) * report.unit_bytes, |target| {
                     target
                         .in_flight

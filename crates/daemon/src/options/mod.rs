@@ -973,6 +973,12 @@ pub struct UpdateOptions {
     /// captures: the serving world steps slower meanwhile, and replays its
     /// graphs again if it serves on or resumes.
     pub eager_prepare: bool,
+    /// Maximum accepted tokens not yet warmed per request before promotion;
+    /// unset uses the largest source or target cache page.
+    pub cache_tail_tokens: Option<std::num::NonZeroU32>,
+    /// Source prefill tokens per scheduling step after the first warming
+    /// round; unset uses the largest source or target cache page.
+    pub cache_prefill_tokens: Option<std::num::NonZeroU32>,
 }
 
 /// The default `update_config.transfer_slowdown`: on GB200, above the
@@ -989,6 +995,8 @@ impl Default for UpdateOptions {
             preempt_after: None,
             transfer_slowdown: TRANSFER_SLOWDOWN,
             eager_prepare: false,
+            cache_tail_tokens: None,
+            cache_prefill_tokens: None,
         }
     }
 }

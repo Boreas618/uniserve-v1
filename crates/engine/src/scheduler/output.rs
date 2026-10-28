@@ -1820,7 +1820,8 @@ impl Scheduler {
         let published_before = published.clone();
         let visible = state.cache_visible_len as usize;
         let draft_valid = state.draft.valid as usize;
-        let cache_write = state.req.cache.write;
+        let cache_write =
+            state.req.cache.write && !state.has_context_images() && !state.rebuilds_images();
         let isolation_key = state.req.cache.isolation_key;
         let scope = crate::kv_cache::PrefixScope::of(&state.req.cache);
         // Past its prompt, the cache of a request that generates text alone

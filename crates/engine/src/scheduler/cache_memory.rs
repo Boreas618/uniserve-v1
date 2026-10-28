@@ -520,10 +520,7 @@ impl Scheduler {
             // segments it inherits from this one and its head. A successor
             // that maps none of this cache inherits none, and its own
             // capacity sizes the cache it lays out.
-            if let Some(capacity) = report
-                .capacity_units
-                .filter(|_| !successor.recomputes_cache)
-            {
+            if let Some(capacity) = report.capacity_units.filter(|_| !successor.unmapped_cache) {
                 let head_units = report.head_bytes.div_ceil(report.unit_bytes.max(1));
                 while kept > floor && u64::from(report.first_unit(kept)) + head_units > capacity {
                     kept -= 1;

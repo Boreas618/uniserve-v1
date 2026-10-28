@@ -1753,6 +1753,17 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         )
         streaming = streams[-1]
         assert report["parallel"] == "changed", report
+        assert report["kv_cache"] == "warmed", report
+        warming = report["cache_warming"]
+        warming = warming if isinstance(warming, list) else [warming]
+        assert sum(round_["copied_bytes"] for round_ in warming) > 0
+        assert sum(round_["warmed_requests"] for round_ in warming) > 0
+        assert (
+            sum(round_["warmed_tokens"] for round_ in warming) >= EARLY_TOKENS
+        )
+        for round_ in warming:
+            assert round_["rounds"] > 0, round_
+            assert round_["tail_tokens"] <= round_["limit_tokens"], round_
         if change == "dp2-tp2-to-dep4":
             assert report["previous_worlds"] == previous_worlds, report
         else:
