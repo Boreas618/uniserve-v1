@@ -136,6 +136,7 @@ impl EngineConfig {
             },
             segments: None,
             world: spec.world,
+            retire: spec.retire.clone(),
             predecessor: None,
             model: spec.model.clone(),
             weights: stated(&workers.weights),
@@ -411,6 +412,7 @@ mod tests {
             world: 0,
             predecessor: None,
             segments: Vec::new(),
+            retire: Vec::new(),
         }
     }
 

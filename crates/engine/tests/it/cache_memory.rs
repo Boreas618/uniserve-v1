@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use engine::{
     BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
     ExecutorError, ExecutorInfo, ExecutorSubmitError, FinishReason, SchedulerConfig, SimEngine,
-    SimExecutor, WeightsInFlight, WorkerGroupId,
+    SimExecutor, Successor, WeightsInFlight, WorkerGroupId,
 };
 use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
@@ -53,6 +53,8 @@ struct Workers {
     transfer_context: u64,
     /// What another world's process books on the GPU.
     other_world_bytes: u64,
+    /// The serving world's weights on the GPU.
+    weights_bytes: u64,
     /// Free device bytes.
     free_bytes: u64,
     /// Segments the worker holds.
@@ -136,6 +138,13 @@ impl Workers {
             vec![WORLD + 1],
             None,
             self.other_world_bytes,
+        ));
+        entries.push(entry(
+            Item::Weights,
+            Some(&scope),
+            vec![WORLD],
+            None,
+            self.weights_bytes,
         ));
         entries.retain(|entry| entry.bytes > 0);
         GpuLedger {
@@ -388,6 +397,7 @@ fn a_shrink_lets_the_holders_of_the_tail_run_and_a_restore_returns_it() {
 
     let shrunk = handle.resize_cache(CacheChange::Shrink {
         preempt_after: None,
+        successor: Successor::default(),
     });
     assert!(
         matches!(terminal(&mut holder), Some(Event::Finished { .. })),
@@ -440,7 +450,8 @@ fn a_configured_capacity_withdraws_room_for_a_successors_head() {
         resize(
             &handle,
             CacheChange::Shrink {
-                preempt_after: None
+                preempt_after: None,
+                successor: Successor::default(),
             }
         )
         .is_ok()
@@ -455,7 +466,8 @@ fn a_configured_capacity_withdraws_room_for_a_successors_head() {
         resize(
             &handle,
             CacheChange::Shrink {
-                preempt_after: None
+                preempt_after: None,
+                successor: Successor::default(),
             }
         )
         .is_ok()
@@ -488,7 +500,8 @@ fn a_worker_without_a_cache_leaves_the_shrink_to_the_others() {
         resize(
             &handle,
             CacheChange::Shrink {
-                preempt_after: None
+                preempt_after: None,
+                successor: Successor::default(),
             }
         )
         .is_ok()
@@ -520,7 +533,7 @@ fn a_shrink_leaves_the_successor_what_the_device_has_free() {
         free_bytes: 1_500,
         ..Workers::filling(0)
     });
-    let plans = resize(&handle, CacheChange::Plan).unwrap();
+    let plans = resize(&handle, CacheChange::Plan(Successor::default())).unwrap();
     let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
     // 1500 free and the 8000 of the cache, less the 2000 of the head.
     assert_eq!(plan["kv_limit"], 7_500);
@@ -531,6 +544,7 @@ fn a_shrink_leaves_the_successor_what_the_device_has_free() {
         &handle,
         CacheChange::Shrink {
             preempt_after: None,
+            successor: Successor::default(),
         },
     );
     assert!(shrunk.is_ok(), "{shrunk:?}");
@@ -556,7 +570,7 @@ fn a_gpu_without_a_cache_must_hold_the_successor_beside_the_serving_world() {
         expert_process: Some(400),
         ..Workers::filling(0)
     });
-    let plans = resize(&handle, CacheChange::Plan).unwrap();
+    let plans = resize(&handle, CacheChange::Plan(Successor::default())).unwrap();
     assert_eq!(plans.len(), 2, "{plans:?}");
     let experts: serde_json::Value = serde_json::from_str(&plans[1]).unwrap();
     assert_eq!(
@@ -573,6 +587,7 @@ fn a_gpu_without_a_cache_must_hold_the_successor_beside_the_serving_world() {
         &handle,
         CacheChange::Shrink {
             preempt_after: None,
+            successor: Successor::default(),
         },
     )
     .unwrap_err();
@@ -607,6 +622,7 @@ fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
             &handle,
             CacheChange::Shrink {
                 preempt_after: Some(Duration::from_millis(50)),
+                successor: Successor::default(),
             },
         )
         .is_ok()
@@ -640,6 +656,7 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
             &handle,
             CacheChange::Shrink {
                 preempt_after: None,
+                successor: Successor::default(),
             },
         )
         .is_ok()
@@ -685,6 +702,7 @@ fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
         &handle,
         CacheChange::Shrink {
             preempt_after: None,
+            successor: Successor::default(),
         },
     )
     .unwrap_err();
@@ -728,7 +746,7 @@ fn a_plan_reports_each_devices_memory_and_withdraws_nothing() {
     fill.transfer_context = 1_500;
     fill.quota += 1_500;
     let (handle, workers, thread) = start(fill);
-    let plans = resize(&handle, CacheChange::Plan).unwrap();
+    let plans = resize(&handle, CacheChange::Plan(Successor::default())).unwrap();
     assert_eq!(
         workers.lock().unwrap().hooks,
         vec!["uniserve.cache_memory".to_owned()]
@@ -751,7 +769,8 @@ fn a_plan_reports_each_devices_memory_and_withdraws_nothing() {
         resize(
             &handle,
             CacheChange::Shrink {
-                preempt_after: None
+                preempt_after: None,
+                successor: Successor::default(),
             }
         )
         .is_ok()
@@ -775,7 +794,8 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
         resize(
             &handle,
             CacheChange::Shrink {
-                preempt_after: None
+                preempt_after: None,
+                successor: Successor::default(),
             }
         )
         .is_ok()
@@ -802,6 +822,53 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
             .recv_timeout(Duration::from_secs(10))
             .expect("the scheduler answers")
             .is_ok()
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A successor that loads its weights from the model's files adds as many
+/// beside the serving world's, and one that maps none of the cache takes of
+/// its own the units the requests in flight hold: the plan counts both, and
+/// the shrink gives back the more of the cache.
+#[test]
+fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
+    let (handle, _workers, thread) = start(Workers {
+        weights_bytes: 2_000,
+        quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 2_000,
+        ..Workers::filling(0)
+    });
+    let plan_of = |successor| -> serde_json::Value {
+        let plans = resize(&handle, CacheChange::Plan(successor)).unwrap();
+        serde_json::from_str(&plans[0]).unwrap()
+    };
+    // Mapping the weights and the cache, it needs nothing beside them.
+    assert_eq!(plan_of(Successor::default())["kv_limit"], 8_000);
+
+    let reloaded = plan_of(Successor {
+        loads_weights: true,
+        recomputes_cache: false,
+    });
+    assert_eq!(reloaded["successor"]["weights"], 2_000);
+    assert_eq!(reloaded["kv_limit"], 6_000);
+    assert_eq!(reloaded["segments_kept"], 6);
+
+    // A request in flight holds units the successor computes again.
+    let mut running = handle.submit(request(1, 8, 10_000)).unwrap();
+    assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+    let recomputed = plan_of(Successor {
+        loads_weights: true,
+        recomputes_cache: true,
+    });
+    let in_flight = recomputed["successor"]["in_flight"].as_u64().unwrap();
+    assert!(
+        in_flight >= 8 * UNIT_BYTES && in_flight.is_multiple_of(UNIT_BYTES),
+        "{recomputed}"
+    );
+    assert_eq!(
+        recomputed["kv_limit"].as_i64().unwrap(),
+        6_000 - in_flight as i64
     );
 
     handle.shutdown();

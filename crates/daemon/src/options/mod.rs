@@ -1273,6 +1273,7 @@ impl ServeConfig {
             world: 0,
             predecessor: None,
             segments: Vec::new(),
+            retire: Vec::new(),
         })
     }
 }

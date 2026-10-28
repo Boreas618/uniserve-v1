@@ -59,6 +59,7 @@ impl Default for WorkerProcessArgs {
             standby_memory: proto::request::StandbyMemory::Auto,
             segments: None,
             world: 0,
+            retire: Vec::new(),
             predecessor: None,
             daemon: String::new(),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,

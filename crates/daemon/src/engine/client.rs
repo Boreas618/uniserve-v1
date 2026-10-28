@@ -25,6 +25,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// the client closed.
 const READ_INTERVAL: Duration = Duration::from_millis(200);
 
+/// What a world succeeding an engine's on the same devices adds beside
+/// what it shares with it ([`EngineClient::make_room`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Successor {
+    /// It loads its weights from the model's files: their keys differ.
+    pub loads_weights: bool,
+    /// It maps none of the engine's KV cache: the requests in flight
+    /// compute their state again in units of its own.
+    pub recomputes_cache: bool,
+}
+
 /// What a ready engine reported it serves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineInfo {
@@ -547,6 +558,7 @@ impl EngineClient {
                 change: wire::CacheChange::Grow as i32,
                 preempt_after_ms: None,
                 keep_weights,
+                ..wire::ResizeCache::default()
             })
         })
         .await
@@ -625,19 +637,31 @@ impl EngineClient {
     /// Fails with the reason a scheduler could not make the change, or when
     /// the engine ends first.
     pub async fn resize_cache(&self, change: wire::CacheChange) -> Result<Vec<String>, String> {
-        self.resize_cache_within(change, None).await
+        self.ask(|id| {
+            wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+                id,
+                change: change as i32,
+                ..wire::ResizeCache::default()
+            })
+        })
+        .await
+        .map(Answered::results)
     }
 
-    /// Gives back the tail of the engine's KV cache as
-    /// [`Self::resize_cache`] does for a shrink, recomputing the requests
-    /// that still hold it once `preempt_after` passed, when given.
+    /// Plans (`Plan`) or makes (`Shrink`) the room a world succeeding the
+    /// engine's on the same devices needs beside what they share, by
+    /// `change`: what the successor adds is `successor`. A shrink recomputes
+    /// the requests that still hold the tail once `preempt_after` passed,
+    /// when given. Returns each device's plan.
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::resize_cache`] does.
-    pub async fn resize_cache_within(
+    /// Fails as [`Self::resize_cache`] does, and with every item of every
+    /// device and host when the successor does not fit.
+    pub async fn make_room(
         &self,
         change: wire::CacheChange,
+        successor: Successor,
         preempt_after: Option<Duration>,
     ) -> Result<Vec<String>, String> {
         self.ask(|id| {
@@ -646,6 +670,8 @@ impl EngineClient {
                 change: change as i32,
                 preempt_after_ms: preempt_after.map(|after| after.as_millis() as u64),
                 keep_weights: Vec::new(),
+                successor_loads_weights: successor.loads_weights,
+                successor_recomputes_cache: successor.recomputes_cache,
             })
         })
         .await

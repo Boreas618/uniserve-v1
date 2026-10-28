@@ -698,12 +698,17 @@ fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
 /// Gives back or restores every scheduler's KV cache memory, and answers
 /// the daemon `front` with `Hooked` as `run_hook` does.
 fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>) {
+    let successor = crate::Successor {
+        loads_weights: resize.successor_loads_weights,
+        recomputes_cache: resize.successor_recomputes_cache,
+    };
     let change = match wire::CacheChange::try_from(resize.change) {
         Ok(wire::CacheChange::Shrink) => crate::CacheChange::Shrink {
             preempt_after: resize.preempt_after_ms.map(Duration::from_millis),
+            successor,
         },
         Ok(wire::CacheChange::Grow) => crate::CacheChange::Grow,
-        Ok(wire::CacheChange::Plan) => crate::CacheChange::Plan,
+        Ok(wire::CacheChange::Plan) => crate::CacheChange::Plan(successor),
         Ok(wire::CacheChange::Restore) => crate::CacheChange::Restore,
         Ok(wire::CacheChange::Sleep) => crate::CacheChange::Sleep,
         Ok(wire::CacheChange::Wake) => crate::CacheChange::Wake,

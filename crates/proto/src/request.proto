@@ -333,6 +333,12 @@ message ResizeCache {
   // alone on every node (a previous world kept as its weights, whose
   // processes exited), so that a growth takes the rest of their memory.
   repeated uint64 keep_weights = 4;
+  // For a shrink or a plan, what the world that succeeds this one adds: it
+  // loads its weights from the model's files (their keys differ), and it
+  // maps none of this world's KV cache, so the requests in flight compute
+  // their state in units of its own.
+  bool successor_loads_weights = 5;
+  bool successor_recomputes_cache = 6;
 }
 
 enum CacheChange {
@@ -899,6 +905,10 @@ message EngineSpec {
   // engine that replaces a lost one of its world (or restarts it at a
   // rollback) takes as its own; empty to lay the planes out afresh.
   repeated CacheSegments segments = 18;
+  // Worlds of the deployment whose memory ends on every node before this
+  // engine's workers start: the world on trial a rollback discards, whose
+  // memory the previous world, started again on its kept weights, needs.
+  repeated uint64 retire = 19;
 }
 
 // What an engine that succeeds another maps of it.

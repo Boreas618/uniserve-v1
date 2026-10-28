@@ -661,6 +661,19 @@ pub enum WeightsInFlight {
     Abort,
 }
 
+/// What a world succeeding this one on the same devices adds beside what it
+/// shares with it, which a shrink makes room for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Successor {
+    /// It loads its weights from the model's files (their keys differ), so
+    /// it holds as many beside the serving world's.
+    pub loads_weights: bool,
+    /// It maps none of the serving world's KV cache (another encoding, or
+    /// requests that compute their state again), so the requests in flight
+    /// take units of its own.
+    pub recomputes_cache: bool,
+}
+
 /// A change to the device memory of a scheduler's KV cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheChange {
@@ -670,6 +683,7 @@ pub enum CacheChange {
     /// `preempt_after` passed, when given.
     Shrink {
         preempt_after: Option<std::time::Duration>,
+        successor: Successor,
     },
     /// Creates the given-back tail again.
     Restore,
@@ -685,7 +699,7 @@ pub enum CacheChange {
     /// Plans a shrink without withdrawing anything: answers with each
     /// device's memory beside a world succeeding this one, or fails with
     /// why such a world does not fit.
-    Plan,
+    Plan(Successor),
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the
