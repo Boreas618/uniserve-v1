@@ -153,7 +153,8 @@ pub(crate) struct BlockPoolStats {
     /// Pages removed from the prefix index, whether by allocation reuse,
     /// republication, or worker invalidation.
     pub(crate) evictions: u64,
-    /// Pages published to the prefix index.
+    /// Pages published to the prefix index for reuse across requests; a
+    /// request's private continuation alias does not count.
     pub(crate) pages_stored: u64,
 }
 
@@ -645,6 +646,9 @@ impl BlockPool {
             {
                 if !existing.aliases.contains(&page.resume) {
                     existing.aliases.push(page.resume);
+                    if page.resume.is_none() {
+                        inner.stats.pages_stored += 1;
+                    }
                 }
                 continue;
             }
@@ -674,7 +678,9 @@ impl BlockPool {
                 },
             );
             inner.hash_to_pages.entry(page.hash).or_default().push(head);
-            inner.stats.pages_stored += 1;
+            if page.resume.is_none() {
+                inner.stats.pages_stored += 1;
+            }
             imported += 1;
         }
         imported
@@ -848,6 +854,9 @@ impl BlockPool {
             && published.source == *source
         {
             published.aliases.push(resume);
+            if resume.is_none() {
+                inner.stats.pages_stored += 1;
+            }
             return;
         }
 
@@ -874,7 +883,9 @@ impl BlockPool {
             },
         );
         inner.hash_to_pages.entry(hash).or_default().push(head);
-        inner.stats.pages_stored += 1;
+        if resume.is_none() {
+            inner.stats.pages_stored += 1;
+        }
     }
 
     /// Finds a prefix page of `group` retained by this exact loaded Worker.
