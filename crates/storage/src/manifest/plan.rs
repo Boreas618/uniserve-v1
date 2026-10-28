@@ -106,8 +106,8 @@ struct Context<'r> {
     request: &'r Request,
     /// Source fields by logical tensor.
     sources: HashMap<&'r str, Vec<FieldRef>>,
-    /// Source chunks by GPU and key.
-    chunks: HashMap<(Gpu, Key), SourceChunk>,
+    /// Source regions by GPU, retained allocation, byte offset and length.
+    chunks: HashMap<(Gpu, Key, u64, u64), SourceChunk>,
     /// Each measured link's bandwidth in bytes per second.
     bandwidth: HashMap<(Gpu, Gpu), f64>,
 }
@@ -130,11 +130,9 @@ impl<'r> Context<'r> {
                     });
                 }
                 for (chunk, value) in held.chunks.iter().enumerate() {
-                    chunks.entry((gpu, value.key)).or_insert((
-                        rank as u32,
-                        storage as u32,
-                        chunk as u32,
-                    ));
+                    chunks
+                        .entry((gpu, value.key, value.storage_offset, value.length))
+                        .or_insert((rank as u32, storage as u32, chunk as u32));
                 }
             }
         }
@@ -462,7 +460,12 @@ impl<'c, 'r> Draft<'c, 'r> {
                 storage
                     .chunks
                     .iter()
-                    .map(|chunk| context.chunks.get(&(gpu, chunk.key)).copied())
+                    .map(|chunk| {
+                        context
+                            .chunks
+                            .get(&(gpu, chunk.key, chunk.storage_offset, chunk.length))
+                            .copied()
+                    })
                     .collect()
             })
             .collect();

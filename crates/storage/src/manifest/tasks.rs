@@ -97,7 +97,7 @@ impl Manifest {
                     })?;
                 Ok((
                     Region::Tensor { key: chunk.key, at },
-                    offset - chunk.offset,
+                    chunk.storage_offset + offset - chunk.offset,
                     chunk.offset + chunk.length - offset,
                 ))
             }

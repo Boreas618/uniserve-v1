@@ -83,6 +83,9 @@ pub struct Chunk {
     pub offset: u64,
     pub length: u64,
     pub key: Key,
+    /// First byte within the retained allocation. Logical cache pages can
+    /// borrow several regions of the same retained plane segment.
+    pub storage_offset: u64,
 }
 
 /// One storage of a rank: its layout and its chunks.
@@ -111,6 +114,7 @@ impl Storage {
                     key: layout.chunk_key(&window, fingerprint)?,
                     offset: window.start,
                     length: window.end - window.start,
+                    storage_offset: 0,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -142,6 +146,7 @@ impl Storage {
             .map(|page| {
                 let window = page * page_bytes..(page + 1) * page_bytes;
                 Ok(Chunk {
+                    storage_offset: 0,
                     key: layout.chunk_key(&window, fingerprint)?,
                     offset: window.start,
                     length: page_bytes,
