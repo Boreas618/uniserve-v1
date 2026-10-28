@@ -877,7 +877,7 @@ impl TransferConfig {
     /// where both hold a CUDA device, which reaches another host where both
     /// devices export a fabric handle; host products move over shared storage
     /// on one host and over the rank channel across hosts, because a
-    /// shared-storage segment is named in one host's namespace. Explicit
+    /// shared-memory segment is named in one host's namespace. Explicit
     /// bindings take precedence. `WorkerExecutor::try_new` validates each
     /// edge against the initialized endpoints and backends before the
     /// executor accepts work, and refuses by name an edge that would have to
@@ -929,7 +929,7 @@ impl TransferConfig {
                                 let device = (source.device.starts_with("cuda:")
                                     && destination.device.starts_with("cuda:"))
                                 .then_some(TransferBackend::CudaVmm);
-                                // A shared-storage segment is named in one host's
+                                // A shared-memory segment is named in one host's
                                 // namespace, so a host product that leaves its host
                                 // travels on the rank channel's data path.
                                 let host = if source.host == destination.host {
@@ -1985,7 +1985,7 @@ mod tests {
         };
 
         // A device product that did not fit its producer's pool is published
-        // in the producer's own address space and as shared-storage bytes; an
+        // in the producer's own address space and as shared-memory bytes; an
         // edge that carries only CUDA VMM takes neither to the decoder.
         let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
         let endpoint = |worker: &str| Endpoint {

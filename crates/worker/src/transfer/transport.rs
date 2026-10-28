@@ -6,7 +6,7 @@
 //! | Kind | Export | Read |
 //! | --- | --- | --- |
 //! | local | register the spans with a producer fence | borrow in place, or copy |
-//! | posix_shm | copy into a POSIX shared-storage segment | stage on the host, then copy |
+//! | posix_shm | copy into a POSIX shared-memory segment | stage on the host, then copy |
 //! | cuda_vmm | export in place or copy into a VMM pool chunk | map the handle, then copy |
 //! | channel | copy into the locator's payload bytes | stage on the host, then copy |
 //!

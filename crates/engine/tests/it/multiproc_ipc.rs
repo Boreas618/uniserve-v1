@@ -3012,7 +3012,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
 fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()> {
     use engine::{WorkerExecutor, WorkerGroupId};
 
-    // Once with an explicit shared-storage edge from rank 1 (the backbone) to
+    // Once with an explicit shared-memory edge from rank 1 (the backbone) to
     // rank 0 (the patch encoder), and once with only the edges
     // `TransferConfig::with_worker_defaults` derives for this worker.
     for transfer in [
@@ -3766,7 +3766,7 @@ fn a_cache_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Blocks a batch on an external shared-storage input that is not yet ready
+/// Blocks a batch on an external shared-memory input that is not yet ready
 /// and requires the group to hold it and the batch behind it, without
 /// resubmission, until the publisher marks the segment ready. Then copies
 /// the same external input into a device product through a tensor transfer.
@@ -5110,7 +5110,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 
     // The ranks are `media_worker` processes speaking the rank protocol. Each
     // answers Info with a real stub group's worker info, completes every
-    // call it receives and attaches a shared-storage media payload to a
+    // call it receives and attaches a shared-memory media payload to a
     // completion, selected by case: a valid payload from rank 0
     // ("retained"), a payload on a call identity the batch never carried
     // ("unknown-call"), a payload from rank 1 ("rank-output"), and a payload
@@ -5624,7 +5624,7 @@ fn product_transfer(
     call
 }
 
-/// An external shared-storage publisher the test controls.
+/// An external shared-memory publisher the test controls.
 ///
 /// The reader waits on a readiness word, written after the payload.
 struct SlowShmExport {
@@ -5634,7 +5634,7 @@ struct SlowShmExport {
     published: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Byte layout of a shared-storage export's header: a 512-byte header whose
+/// Byte layout of a shared-memory export's header: a 512-byte header whose
 /// first word is the readiness state.
 const SEGMENT_HEADER_BYTES: u64 = 512;
 const SEGMENT_STATE_OFFSET: u64 = 0;

@@ -190,7 +190,7 @@ pub(crate) enum Publication {
     Media,
 }
 
-/// Release borrowed shared-storage reads: their producer may reuse the rows.
+/// Release borrowed shared-memory reads: their producer may reuse the rows.
 pub(crate) fn release_borrowed(borrowed: &[Arc<Mutex<SharedRead>>]) {
     for read in borrowed {
         lock(read).release();

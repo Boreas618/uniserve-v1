@@ -357,7 +357,7 @@ impl WorkerProcess {
             }
             WorkerResponse::Result { result, .. } => {
                 // Receiving claims any media the result published, so the
-                // shared-storage objects are released rather than left named.
+                // shared-memory objects are released rather than left named.
                 drop(WorkerResult::receive(result));
                 bail!("unexpected startup result response");
             }

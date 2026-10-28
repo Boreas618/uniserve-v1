@@ -414,7 +414,7 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
                 headers |= {
                     "x-inference-time-s": "33.0",
                     "x-stage-durations": json.dumps(stages),
-                    "x-peak-storage-mb": "91000.5",
+                    "x-peak-memory-mb": "91000.5",
                 }
             return web.Response(body=b"mp4", headers=headers)
 

@@ -69,7 +69,7 @@ CREATE TABLE fill (start INTEGER NOT NULL, end INTEGER NOT NULL, device INTEGER 
     context INTEGER NOT NULL, stream INTEGER NOT NULL, correlation INTEGER NOT NULL,
     value INTEGER NOT NULL, bytes INTEGER NOT NULL, memory_kind INTEGER, graph INTEGER,
     graph_node INTEGER);
-CREATE TABLE storage (time INTEGER NOT NULL, operation INTEGER NOT NULL,
+CREATE TABLE memory (time INTEGER NOT NULL, operation INTEGER NOT NULL,
     memory_kind INTEGER NOT NULL, correlation INTEGER NOT NULL, address INTEGER NOT NULL,
     bytes INTEGER NOT NULL, process INTEGER, device INTEGER, context INTEGER, stream INTEGER,
     asynchronous INTEGER NOT NULL);
@@ -112,14 +112,14 @@ CREATE TABLE pc_take (take INTEGER PRIMARY KEY, time INTEGER NOT NULL,
 const DOCS: &[(&str, &str)] = &[
     (
         "doc.clocks",
-        "kernel, copy, fill, storage, marker, graph, api, pm_sample and steps use CUPTI's \
+        "kernel, copy, fill, memory, marker, graph, api, pm_sample and steps use CUPTI's \
          clock (clocks.cupti); fence uses the device's %globaltimer (clocks.gpu of its \
          device). Each clocks row is one \
          sample of the clocks it names at one instant, to within uncertainty nanoseconds.",
     ),
     (
         "doc.correlation",
-        "kernel, copy, fill, storage and graph rows carry the correlation id of the api row \
+        "kernel, copy, fill, memory and graph rows carry the correlation id of the api row \
          (CUPTI's runtime or driver call) that issued them; the nodes of a CUDA graph carry \
          its launch's. api rows of domain 2 (runtime) and 1 (driver) of one call share it.",
     ),
@@ -698,21 +698,21 @@ impl File {
                     (fill.graph_node as i64).into(),
                 ])],
             ),
-            Record::Memory(storage) => self.insert(
-                "storage",
-                "INSERT INTO storage VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            Record::Memory(memory) => self.insert(
+                "memory",
+                "INSERT INTO memory VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 [rusqlite::params_from_iter([
-                    rusqlite::types::Value::from(storage.timestamp as i64),
-                    i64::from(storage.operation).into(),
-                    i64::from(storage.memory_kind).into(),
-                    i64::from(storage.correlation).into(),
-                    (storage.address as i64).into(),
-                    (storage.bytes as i64).into(),
-                    i64::from(storage.process).into(),
-                    i64::from(storage.device).into(),
-                    i64::from(storage.context).into(),
-                    i64::from(storage.stream).into(),
-                    i64::from(storage.asynchronous).into(),
+                    rusqlite::types::Value::from(memory.timestamp as i64),
+                    i64::from(memory.operation).into(),
+                    i64::from(memory.memory_kind).into(),
+                    i64::from(memory.correlation).into(),
+                    (memory.address as i64).into(),
+                    (memory.bytes as i64).into(),
+                    i64::from(memory.process).into(),
+                    i64::from(memory.device).into(),
+                    i64::from(memory.context).into(),
+                    i64::from(memory.stream).into(),
+                    i64::from(memory.asynchronous).into(),
                 ])],
             ),
             Record::Marker(marker) => self.insert(

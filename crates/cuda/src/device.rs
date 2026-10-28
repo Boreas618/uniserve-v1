@@ -145,7 +145,7 @@ impl DeviceId {
     }
 
     /// Fails with the error that left the device's primary context
-    /// unusable, such as an illegal storage access or a device-side assert,
+    /// unusable, such as an illegal memory access or a device-side assert,
     /// which the driver returns from every call after it; passes while the
     /// context is usable. Waits for nothing on the device.
     pub fn context_error(self) -> Result<()> {

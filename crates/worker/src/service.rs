@@ -562,7 +562,7 @@ impl<'a> Service<'a> {
             return Ok(None);
         };
         let running = since.elapsed();
-        // A context that an illegal storage access or a device-side assert
+        // A context that an illegal memory access or a device-side assert
         // left unusable runs none of the work behind the failure, so the
         // completions of the jobs in flight never post: the rank fails with
         // the driver's error, which leaves its context unusable, at once

@@ -449,7 +449,7 @@ pub(crate) enum ReadCall {
         destination: Spans,
         producer: Option<Arc<Event>>,
     },
-    /// Copy a shared-storage export of this host into the destination.
+    /// Copy a shared-memory export of this host into the destination.
     Shared {
         locator: Arc<Locator>,
         slot: usize,

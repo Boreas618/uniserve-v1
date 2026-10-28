@@ -10,7 +10,7 @@
 //! orderly close removes its own as the last thing it does. Neither needs
 //! CUDA: they encode the libraries' naming.
 
-/// Where POSIX shared-storage objects live on Linux.
+/// Where POSIX shared-memory objects live on Linux.
 const SHARED_MEMORY: &str = "/dev/shm";
 
 /// Removes the shared memory the CUDA driver created for the interprocess
@@ -20,7 +20,7 @@ const SHARED_MEMORY: &str = "/dev/shm";
 /// across processes, users, threads and contexts.
 ///
 /// The driver backs each context's interprocess events with one POSIX
-/// shared-storage object, which it creates exclusively (`O_CREAT | O_EXCL`,
+/// shared-memory object, which it creates exclusively (`O_CREAT | O_EXCL`,
 /// mode 0600) with the context's first such event, and names
 /// `cuda.shm.<uid>.<pid>.<n>`: the creating process's user id and process id
 /// in lowercase hexadecimal (user 65534 is `fffe`), and the context's
@@ -77,10 +77,10 @@ pub fn remove_event_storage(uid: u32, pid: u32) -> std::io::Result<Vec<std::path
     failure.map_or(Ok(removed), Err)
 }
 
-/// Where NCCL creates its shared-storage objects: `/dev/shm/nccl-<random>`.
+/// Where NCCL creates its shared-memory objects: `/dev/shm/nccl-<random>`.
 const NCCL_PREFIX: &str = "/dev/shm/nccl-";
 
-/// NCCL's named shared-storage objects that a process maps, each by path and
+/// NCCL's named shared-memory objects that a process maps, each by path and
 /// inode.
 ///
 /// This encodes NCCL's naming, observed with NCCL 2.30.4 by tracing
@@ -177,7 +177,7 @@ impl NcclSegments {
 mod tests {
     use super::*;
 
-    /// A shared-storage object created under NCCL's prefix and mapped by
+    /// A shared-memory object created under NCCL's prefix and mapped by
     /// this process; unmapped when dropped.
     #[cfg(target_os = "linux")]
     struct Mapped {

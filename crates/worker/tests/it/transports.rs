@@ -395,7 +395,7 @@ fn observers_of_one_read_run_once_each() -> Result<()> {
     transports.close()
 }
 
-/// The child half of the two-process shared-storage test reads this
+/// The child half of the two-process shared-memory test reads this
 /// variable.
 const SHARED_LOCATOR: &str = "UNISERVE_TEST_SHM_LOCATOR";
 /// The line the consumer prints once it holds its claim on the export.
@@ -423,7 +423,7 @@ fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result
     let (_, locator) = locations
         .iter()
         .find(|(_, locator)| TransportKind::of(locator) == TransportKind::PosixShm)
-        .ok_or(Error::State("no shared-storage location was exported"))?;
+        .ok_or(Error::State("no shared-memory location was exported"))?;
 
     let locator = serde_json::to_string(locator)
         .map_err(|error| Error::Invalid(format!("unserializable locator: {error}")))?;
@@ -484,7 +484,7 @@ fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result
 /// `shared_exports_retire_once_another_process_acknowledged_its_reads`: copy
 /// the export, then borrow it in place until the producer answers.
 #[test]
-#[ignore = "runs as the consumer process of the shared-storage export test"]
+#[ignore = "runs as the consumer process of the shared-memory export test"]
 fn shared_export_consumer() -> Result<()> {
     let Ok(locator) = std::env::var(SHARED_LOCATOR) else {
         return Ok(());
@@ -495,7 +495,7 @@ fn shared_export_consumer() -> Result<()> {
         transports(&[TransportKind::PosixShm], "consumer", 1, 1 << 12, 1 << 20)?;
     let transport = transports
         .get(TransportKind::PosixShm)
-        .ok_or(Error::State("no shared-storage transport is bound"))?;
+        .ok_or(Error::State("no shared-memory transport is bound"))?;
 
     // A copy read acknowledges its claim when its task retires.
     let destination = zeros(&[2, 3])?;

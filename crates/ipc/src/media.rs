@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use proto::SharedMemory;
 
-/// Why a shared-storage media export could not be claimed.
+/// Why a shared-memory media export could not be claimed.
 ///
 /// Operating-system failures carry their `io::Error` as the source, shared so
 /// that the error can be cloned with the call result that holds it.
@@ -31,7 +31,7 @@ pub enum SharedMediaError {
     TooLarge(u64),
     /// The locator is empty, has a `/` or a NUL in its name, or publishes
     /// no bytes.
-    #[error("generated media has an invalid shared-storage locator")]
+    #[error("generated media has an invalid shared-memory locator")]
     Locator,
     /// The named object could not be opened.
     #[error("failed to open generated media shared storage")]
@@ -55,7 +55,7 @@ pub enum SharedMediaError {
     Map(#[source] Arc<io::Error>),
 }
 
-/// Read-only mapping of one claimed shared-storage media export.
+/// Read-only mapping of one claimed shared-memory media export.
 ///
 /// The mapping covers exactly the published byte count and is unmapped on
 /// drop. Share it with `Arc` rather than reopening: the name no longer exists
@@ -78,7 +78,7 @@ unsafe impl Send for SharedMedia {}
 unsafe impl Sync for SharedMedia {}
 
 impl SharedMedia {
-    /// Claims an immutable POSIX shared-storage object and maps its published extent.
+    /// Claims an immutable POSIX shared-memory object and maps its published extent.
     ///
     /// `name` is the object name without its leading `/`, and `num_bytes` is
     /// the published length; the object may be longer, and only the first
@@ -134,7 +134,7 @@ impl SharedMedia {
             });
         }
 
-        // SAFETY: descriptor names a readable shared-storage object of at least `bytes` bytes.
+        // SAFETY: descriptor names a readable shared-memory object of at least `bytes` bytes.
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

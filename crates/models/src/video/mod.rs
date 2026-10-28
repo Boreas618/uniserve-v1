@@ -8,7 +8,7 @@
 //! frame counts from them through the worker library.
 //!
 //! The server plans every condition before admission. A [`VideoCondition`]
-//! carries that plan to the workers: the shared-storage object holding the
+//! carries that plan to the workers: the shared-memory object holding the
 //! fetched bytes, the exact media the worker's media reader decodes them
 //! into, the conditioner's view, and the rows the latent encoders produce.
 //! A request's [`Conditioning`] (its task, presentation tags and conditions)
@@ -86,7 +86,7 @@ impl ConditionRole {
     }
 }
 
-/// Where a condition's fetched media bytes are: a POSIX shared-storage object
+/// Where a condition's fetched media bytes are: a POSIX shared-memory object
 /// on the host that runs the server and the media reader.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MediaLocator {

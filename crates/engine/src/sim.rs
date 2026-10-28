@@ -2039,7 +2039,7 @@ fn set_cache_lengths(lengths: &mut CallOutput, visible: u32) {
     lengths.cache_computed_len = visible;
 }
 
-/// Publishes bytes as an immutable POSIX shared-storage artifact.
+/// Publishes bytes as an immutable POSIX shared-memory artifact.
 ///
 /// The object is left in place under its generated name; the engine claims it
 /// by that name and unlinks it when it opens the result.
@@ -2054,7 +2054,7 @@ fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<ipc::MediaOutput>
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("shared-storage artifact has no printable name"))?
+        .ok_or_else(|| anyhow::anyhow!("shared-memory artifact has no printable name"))?
         .to_owned();
 
     Ok(ipc::MediaOutput {
