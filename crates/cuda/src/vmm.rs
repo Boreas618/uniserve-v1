@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::driver::{
     CU_MEM_ACCESS_FLAGS_PROT_READ, CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE,
@@ -599,15 +599,24 @@ pub struct SegmentedMapping {
     segments: Vec<(usize, usize, Option<u64>, Protection)>,
     /// Each segment's creating handle while this mapping created it and
     /// keeps it mapped, with the fabric handle it exports when it has one.
-    created: Vec<Option<Created>>,
+    created: Vec<Option<Arc<PhysicalAllocation>>>,
     // Declared last so that the fields above stay valid until teardown.
     range: VirtualRange,
 }
 
-/// A segment's creating handle, which its creator keeps.
-struct Created {
-    handle: u64,
+/// A creating handle independent of a virtual mapping. Keeping it alive
+/// preserves the allocation's fabric exports while addresses are remapped.
+pub struct PhysicalAllocation {
+    device: DeviceId,
+    bytes: usize,
     fabric: Option<[u8; 64]>,
+    _handle: VirtualRange,
+}
+
+impl Drop for PhysicalAllocation {
+    fn drop(&mut self) {
+        count_created(self.device, self.bytes, false);
+    }
 }
 
 /// The bytes of segments this process created and keeps the creating
@@ -785,10 +794,14 @@ impl SegmentedMapping {
             unsafe { (driver.mem_release)(handle) };
             return Err(error);
         }
-        self.created[index] = Some(Created {
-            handle,
+        let mut owner = VirtualRange::new(context.clone());
+        owner.adopt(handle);
+        self.created[index] = Some(Arc::new(PhysicalAllocation {
+            device: self.device,
+            bytes,
             fabric: fabric_handle,
-        });
+            _handle: owner,
+        }));
         count_created(self.device, bytes, true);
         Ok(descriptor)
     }
@@ -801,6 +814,12 @@ impl SegmentedMapping {
             .get(index)
             .and_then(|created| created.as_ref())
             .and_then(|created| created.fabric)
+    }
+
+    /// Borrow ownership of an allocation this mapping created. The owner can
+    /// outlive this mapping and keeps existing fabric exports importable.
+    pub fn allocation(&self, index: usize) -> Option<Arc<PhysicalAllocation>> {
+        self.created.get(index).and_then(Clone::clone)
     }
 
     /// Maps segment `index` from the POSIX descriptor of a physical
@@ -926,9 +945,6 @@ impl SegmentedMapping {
         let address = self.address + *offset as u64;
         let bytes = *bytes;
         let created = self.created[index].take();
-        if created.is_some() {
-            count_created(self.device, bytes, false);
-        }
         let context = PrimaryContext::retain(self.device)?;
         in_context(context.raw(), |driver| {
             // SAFETY: the segment was mapped by this mapping.
@@ -936,15 +952,8 @@ impl SegmentedMapping {
                 driver.check(unsafe { (driver.mem_unmap)(address, bytes) }, "cuMemUnmap");
             // SAFETY: the handle is this mapping's own reference.
             let released = driver.check(unsafe { (driver.mem_release)(handle) }, "cuMemRelease");
-            let released_creation = created.map_or(Ok(()), |created| {
-                driver.check(
-                    // SAFETY: the creating handle is this mapping's own
-                    // reference, which nothing maps.
-                    unsafe { (driver.mem_release)(created.handle) },
-                    "cuMemRelease",
-                )
-            });
-            unmapped.and(released).and(released_creation)
+            drop(created);
+            unmapped.and(released)
         })
     }
 
@@ -1039,11 +1048,8 @@ impl Drop for SegmentedMapping {
                     .push((self.address + *offset as u64, *bytes));
                 self.range.handles.push(handle);
             }
-            // The creating handle is released with the mapped one.
-            if let Some(created) = self.created[index].take() {
-                count_created(self.device, *bytes, false);
-                self.range.handles.push(created.handle);
-            }
+            // An allocation retained by another owner survives this mapping.
+            self.created[index].take();
         }
     }
 }

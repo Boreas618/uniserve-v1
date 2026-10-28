@@ -59,7 +59,8 @@ pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream};
 pub use vmm::{
-    HandleType, PeerMapping, Protection, SegmentedMapping, ShareableHandle, created_bytes,
+    HandleType, PeerMapping, PhysicalAllocation, Protection, SegmentedMapping, ShareableHandle,
+    created_bytes,
 };
 
 /// Lock `mutex`, keeping the state a panicking holder left.

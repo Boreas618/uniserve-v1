@@ -13,8 +13,8 @@ use cuda::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
     Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, PrimaryContext,
-    Protection, SegmentedMapping, SourceOrder, Stream, Strided, StridedCopy, VirtualPool,
-    memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
+    Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
+    VirtualPool, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -1007,6 +1007,8 @@ fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
     let bytes = 2 * granularity;
     let mut active = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
     let original = active.create(0).unwrap();
+    let creator = active.allocation(0).unwrap();
+    let fabric = active.fabric_handle(0);
     let mut shared = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
     shared.import(0, &original).unwrap();
     let mut source = SegmentedMapping::reserve(DEVICE, &[granularity; 2], &[]).unwrap();
@@ -1063,4 +1065,16 @@ fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
     unsafe { memcpy_async(host.address(), shared.address(), bytes, &stream).unwrap() };
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![7; bytes]);
+
+    // A retained creating handle keeps a remote fabric export usable even
+    // after its original virtual reservation points at different weights.
+    if let Some(handle) = fabric {
+        let imported =
+            PeerMapping::import(DEVICE, &ShareableHandle::Fabric(handle), bytes).unwrap();
+        // SAFETY: both allocations stay alive until the copy completes.
+        unsafe { memcpy_async(host.address(), imported.address(), bytes, &stream).unwrap() };
+        stream.synchronize().unwrap();
+        assert_eq!(read(&host), vec![7; bytes]);
+    }
+    drop(creator);
 }
