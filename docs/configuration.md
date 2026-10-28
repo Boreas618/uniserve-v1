@@ -250,6 +250,7 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `fence_probes` | `true` | Whether the probes record; a change switches every worker's probes in place, at the engine's next step boundary |
+| `graph_pc_sampling` | `false` | Whether every worker enables CUPTI's PC sampling, stopped, before it captures its CUDA graphs and keeps it enabled for its life, so that `pc_sampling` sessions attribute the samples of the graphs' kernels. CUPTI cannot run PM sampling, the range profiler or whole-graph activity records beside it, so sessions of `pm_sampling`, `range_metrics` and timelines that trace graphs whole are then refused. Each worker holds CUPTI's sampling buffer and working storage as process host storage: about 129 MiB at the default period (131,584 KiB measured on GB200), and up to 512 MiB more while a session samples at a short period (`docs/profiling.md`). The graphs are captured at a world's start, so a change takes a new world |
 | `fence_components` | `["*.Transformer"]` (each model's decoder stack, within the always-on budget `docs/profiling.md` states) | Name patterns (`*` matches any run) of the components whose module instances carry probes, a component being the `<component>` of the function its module class declares (`uniserve/numerics.py`); the probes are captured into a world's CUDA graphs, so a change takes a new world. Empty for no probe |
 
 ### `logging_config`

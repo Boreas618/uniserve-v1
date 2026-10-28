@@ -967,6 +967,11 @@ message Profiling {
   // The components whose module instances carry fence probes in the graphs
   // the workers capture, as name patterns (`*` matches any run).
   repeated string fence_components = 2;
+  // Whether every worker enables CUPTI's PC sampling, stopped, before it
+  // captures its CUDA graphs and keeps it enabled for its life, so that a
+  // session's PC samples of graph kernels are attributed; sessions of PM
+  // sampling, range metrics and whole-graph timelines are then refused.
+  bool graph_pc_sampling = 3;
 }
 
 // What an engine that succeeds another maps of it.

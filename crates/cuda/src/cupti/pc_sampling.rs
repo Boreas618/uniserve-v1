@@ -23,6 +23,7 @@ const STALL_NAME: usize = 128;
 /// `CUpti_PCSamplingConfigurationAttributeType`s.
 const SAMPLING_PERIOD: u32 = 1;
 const STALL_REASON: u32 = 2;
+const HARDWARE_BUFFER_SIZE: u32 = 4;
 const COLLECTION_MODE: u32 = 5;
 const START_STOP_CONTROL: u32 = 6;
 const OUTPUT_DATA_FORMAT: u32 = 7;
@@ -166,13 +167,20 @@ unsafe impl Send for PcSampler {}
 
 impl PcSampler {
     /// Enable continuous PC sampling on `context` (a `CUcontext`), each SM
-    /// sampling a warp every `2^period` cycles (`period` from 5 to 31), each
-    /// take holding up to `max_pcs` program counters.
+    /// sampling a warp every `2^period` cycles (`period` from 5 to 31), into
+    /// a hardware buffer of `hardware_buffer` bytes of device storage
+    /// (CUPTI's default, 512 MiB, when `None`), each take holding up to
+    /// `max_pcs` program counters.
     ///
     /// # Errors
     ///
     /// Fails when CUPTI lacks PC sampling or refuses the configuration.
-    pub fn enable(context: usize, period: u32, max_pcs: usize) -> Result<Self> {
+    pub fn enable(
+        context: usize,
+        period: u32,
+        max_pcs: usize,
+        hardware_buffer: Option<usize>,
+    ) -> Result<Self> {
         let cupti = cupti()?;
         let context = context as *mut c_void;
         let mut enable = ContextParams {
@@ -285,7 +293,7 @@ impl PcSampler {
         sampler.data.pcs = sampler.pcs.as_mut_ptr();
 
         let mut all = indices.clone();
-        let mut info = [
+        let mut info = vec![
             ConfigurationInfo {
                 kind: COLLECTION_MODE,
                 status: 0,
@@ -317,6 +325,13 @@ impl PcSampler {
                 data: [(&raw mut *sampler.data) as u64, 0, 0],
             },
         ];
+        if let Some(bytes) = hardware_buffer {
+            info.push(ConfigurationInfo {
+                kind: HARDWARE_BUFFER_SIZE,
+                status: 0,
+                data: [bytes as u64, 0, 0],
+            });
+        }
         let mut configure = ConfigurationParams {
             size: size_of::<ConfigurationParams>(),
             private: std::ptr::null_mut(),
@@ -340,6 +355,59 @@ impl PcSampler {
             });
         }
         Ok(sampler)
+    }
+
+    /// Sample every `2^period` cycles from the next start on; the sampler
+    /// is stopped.
+    ///
+    /// # Errors
+    ///
+    /// Fails when CUPTI refuses the period.
+    pub fn set_period(&mut self, period: u32) -> Result<()> {
+        self.configure(SAMPLING_PERIOD, u64::from(period))
+    }
+
+    /// Use a hardware buffer of `bytes` from the next start on; the sampler
+    /// is stopped.
+    ///
+    /// # Errors
+    ///
+    /// Fails when CUPTI refuses the size.
+    pub fn set_hardware_buffer(&mut self, bytes: usize) -> Result<()> {
+        self.configure(HARDWARE_BUFFER_SIZE, bytes as u64)
+    }
+
+    /// Set one configuration attribute of the enabled sampler.
+    fn configure(&mut self, kind: u32, value: u64) -> Result<()> {
+        let cupti = cupti()?;
+        let mut info = [ConfigurationInfo {
+            kind,
+            status: 0,
+            data: [value, 0, 0],
+        }];
+        let mut configure = ConfigurationParams {
+            size: size_of::<ConfigurationParams>(),
+            private: std::ptr::null_mut(),
+            context: self.context,
+            count: info.len(),
+            info: info.as_mut_ptr(),
+        };
+        // SAFETY: the struct is CUPTI's parameter struct; PC sampling is
+        // enabled on the context by this value.
+        unsafe {
+            call(
+                &cupti.pc_configure,
+                "cuptiPCSamplingSetConfigurationAttribute",
+                &mut configure,
+            )?;
+        }
+        match info[0].status {
+            0 => Ok(()),
+            code => Err(Error::Cupti {
+                call: "cuptiPCSamplingSetConfigurationAttribute",
+                code,
+            }),
+        }
     }
 
     /// The stall reasons the samples name: index and name.
@@ -492,7 +560,7 @@ mod tests {
         let context = PrimaryContext::retain(device)?;
         let stream = Stream::new(device)?;
         let spin = Spin::load(&stream)?;
-        let mut sampler = PcSampler::enable(context.raw() as usize, 10, 1000)?;
+        let mut sampler = PcSampler::enable(context.raw() as usize, 10, 1000, None)?;
         assert!(!sampler.stall_reasons().is_empty());
         sampler.start()?;
         for _ in 0..4 {

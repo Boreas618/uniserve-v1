@@ -210,6 +210,10 @@ pub struct LaunchDescriptor {
     /// patterns; none when empty.
     #[serde(default)]
     pub fence_components: Vec<String>,
+    /// Whether the worker enables PC sampling before it captures its CUDA
+    /// graphs and keeps it enabled for its life.
+    #[serde(default)]
+    pub graph_pc_sampling: bool,
 }
 
 /// One rank's place in the deployment's expert-parallel union.

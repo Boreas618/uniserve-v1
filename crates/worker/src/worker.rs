@@ -192,6 +192,13 @@ impl Worker {
         if context.is_some() {
             crate::profiling::counters::subscribe();
         }
+        // PC sampling for the rank's CUDA graphs, enabled before it
+        // captures any (`crate::profiling::pc_sampling`).
+        if launch.graph_pc_sampling
+            && let Some(context) = context.as_ref()
+        {
+            crate::profiling::pc_sampling::enable(context).map_err(phase("device"))?;
+        }
         // The worker's memory that outlives it is kept at the host's
         // Storage Server, which first shoots down a predecessor still
         // holding it.

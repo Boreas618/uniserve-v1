@@ -905,6 +905,13 @@ pub struct ProfilingOptions {
     /// instances carry probes in the CUDA graphs a world captures; a change
     /// takes a new world. Empty for no probe.
     pub fence_components: Vec<String>,
+    /// Whether every worker enables CUPTI's PC sampling before it captures
+    /// its CUDA graphs and keeps it enabled, stopped between sessions, so
+    /// that sessions attribute the samples of graph kernels. CUPTI then
+    /// refuses PM sampling, the range profiler and whole-graph activity
+    /// records, so sessions of those are refused. The graphs are captured
+    /// at a world's start, so a change takes a new world.
+    pub graph_pc_sampling: bool,
 }
 
 impl Default for ProfilingOptions {
@@ -915,6 +922,7 @@ impl Default for ProfilingOptions {
                 .iter()
                 .map(|&pattern| pattern.to_owned())
                 .collect(),
+            graph_pc_sampling: false,
         }
     }
 }
@@ -1380,6 +1388,7 @@ impl ServeConfig {
             profiling: Some(wire::Profiling {
                 fence_probes: self.profiling_config.fence_probes,
                 fence_components: self.profiling_config.fence_components.clone(),
+                graph_pc_sampling: self.profiling_config.graph_pc_sampling,
             }),
         })
     }

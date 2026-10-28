@@ -140,9 +140,18 @@ impl Default for RangeMetricsOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PcSamplingOptions {
-    /// Each SM samples a warp every `2^period` cycles, `period` from 5 to
-    /// 31 (CUPTI's `CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`).
+    /// Each SM samples a warp every `2^period` cycles
+    /// (`CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD`), from
+    /// [`PcSamplingOptions::MIN_PERIOD`] to 31.
     pub period: u32,
+}
+
+impl PcSamplingOptions {
+    /// The shortest period a session samples at: below it, no hardware
+    /// buffer of up to CUPTI's 512 MiB holds the samples of a busy GB200
+    /// between CUPTI's reads of it, and the samples are lost
+    /// (`docs/profiling.md`).
+    pub const MIN_PERIOD: u32 = 12;
 }
 
 impl Default for PcSamplingOptions {
@@ -187,6 +196,34 @@ pub struct SessionRequest {
 }
 
 impl SessionRequest {
+    /// Why a deployment whose ranks keep PC sampling enabled
+    /// (`profiling_config.graph_pc_sampling`) refuses this request, if it
+    /// does: CUPTI then refuses PM sampling (the device's performance
+    /// monitors are held), the range profiler and the whole-graph activity
+    /// record a timeline that traces graphs whole enables.
+    pub fn refused_beside_graph_pc_sampling(&self) -> Option<String> {
+        let mut refused: Vec<&str> = self
+            .collectors
+            .iter()
+            .filter(|collector| {
+                matches!(collector, Collector::PmSampling | Collector::RangeMetrics)
+            })
+            .map(|collector| collector.as_str())
+            .collect();
+        if self.collectors.contains(&Collector::Timeline)
+            && self.timeline.graphs == GraphTrace::Whole
+        {
+            refused.push("a timeline that traces graphs whole (use \"graphs\": \"nodes\")");
+        }
+        (!refused.is_empty()).then(|| {
+            format!(
+                "{} cannot run while profiling_config.graph_pc_sampling keeps CUPTI's PC sampling \
+                 enabled on every rank",
+                refused.join(" and ")
+            )
+        })
+    }
+
     /// The request's own faults: no collector, a collector named twice, a
     /// window of no step or no time, a negative slowdown, no output
     /// directory, an option table of a collector not run.
@@ -264,8 +301,13 @@ impl SessionRequest {
         if self.pm_sampling.metrics.is_empty() || self.range_metrics.metrics.is_empty() {
             return Err("a metric collector names at least one metric".to_owned());
         }
-        if !(5..=31).contains(&self.pc_sampling.period) {
-            return Err("pc_sampling.period is from 5 to 31".to_owned());
+        if !(PcSamplingOptions::MIN_PERIOD..=31).contains(&self.pc_sampling.period) {
+            return Err(format!(
+                "pc_sampling.period is from {} to 31: below {}, no hardware buffer of up to \
+                 512 MiB holds the samples of a busy device",
+                PcSamplingOptions::MIN_PERIOD,
+                PcSamplingOptions::MIN_PERIOD
+            ));
         }
         if self.pm_sampling.interval_ns == 0 {
             return Err("pm_sampling.interval_ns is positive".to_owned());
@@ -324,6 +366,49 @@ mod tests {
     }
 
     #[test]
+    fn graph_pc_sampling_refuses_the_collectors_cupti_cannot_run_beside_it() {
+        let session = |collectors: Vec<Collector>, graphs: GraphTrace| SessionRequest {
+            collectors,
+            timeline: TimelineOptions { graphs },
+            ..request()
+        };
+        for refused in [
+            session(vec![Collector::PmSampling], GraphTrace::Whole),
+            session(vec![Collector::RangeMetrics], GraphTrace::Whole),
+            session(vec![Collector::Timeline], GraphTrace::Whole),
+            session(
+                vec![Collector::Timeline, Collector::PcSampling],
+                GraphTrace::Whole,
+            ),
+        ] {
+            let reason = refused.refused_beside_graph_pc_sampling();
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("profiling_config.graph_pc_sampling")),
+                "{refused:?}: {reason:?}"
+            );
+        }
+        for accepted in [
+            session(
+                vec![
+                    Collector::Timeline,
+                    Collector::FenceTimeline,
+                    Collector::PcSampling,
+                ],
+                GraphTrace::Nodes,
+            ),
+            session(vec![Collector::PcSampling], GraphTrace::Whole),
+        ] {
+            assert_eq!(
+                accepted.refused_beside_graph_pc_sampling(),
+                None,
+                "{accepted:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_request_names_its_own_faults() {
         assert!(request().validate().is_ok());
         let faults = [
@@ -365,7 +450,7 @@ mod tests {
             },
             SessionRequest {
                 collectors: vec![Collector::PcSampling],
-                pc_sampling: PcSamplingOptions { period: 4 },
+                pc_sampling: PcSamplingOptions { period: 11 },
                 ..request()
             },
         ];

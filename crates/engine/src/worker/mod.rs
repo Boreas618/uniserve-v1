@@ -230,6 +230,9 @@ pub struct WorkerProcessArgs {
     /// The components whose module instances carry fence probes, as name
     /// patterns (`profiling_config.fence_components`).
     pub fence_components: Vec<String>,
+    /// Whether the workers keep PC sampling enabled for their life
+    /// (`profiling_config.graph_pc_sampling`).
+    pub graph_pc_sampling: bool,
     /// Maximum model context length in tokens.
     pub max_model_len: u32,
     /// Maximum accepted video duration in seconds. The frontend states it
