@@ -25,7 +25,10 @@
 //! representation, and each storage's fields, their logical parts and
 //! encodings, and its chunks. A worker of that position binds the tensors
 //! whose storages' chunks are all retained on its GPUs instead of reading
-//! the checkpoint.
+//! the checkpoint. Every checkpoint of one structure shares the position's
+//! manifest, so the worker looks each chunk up under the key its own
+//! checkpoint's values give it, never under the key the manifest records:
+//! the bytes of another checkpoint are never bound.
 //!
 //! Loading is collective, so every worker that loads with this one (its
 //! worker group, or its expert union) agrees on what to read from the
@@ -382,7 +385,8 @@ impl WeightKeys {
     }
 
     /// The manifest this worker reads, `None` without one or for one of
-    /// another version.
+    /// another version, its storages keyed under this worker's
+    /// fingerprints ([`WeightKeys::own_storages`]).
     fn manifest(&self, retained: &Retained) -> Result<Option<(String, WeightManifest)>> {
         let Some(text) = self.read_manifest(retained)? else {
             return Ok(None);
@@ -394,12 +398,44 @@ impl WeightKeys {
             tracing::info!("the retained weight manifest is of another version; loading");
             return Ok(None);
         }
-        let manifest = serde_json::from_str(&text).map_err(|error| {
+        let mut manifest: WeightManifest = serde_json::from_str(&text).map_err(|error| {
             Error::Interface(format!(
                 "the retained weight manifest is malformed: {error}"
             ))
         })?;
+        manifest.storages = self.own_storages(manifest.storages)?;
         Ok(Some((text, manifest)))
+    }
+
+    /// `storages`, as a manifest of this worker's position names them,
+    /// keyed under this worker's fingerprints. The manifest is keyed by the
+    /// structure and the position, which every checkpoint of one structure
+    /// shares, and records the chunk keys of the checkpoint that wrote it;
+    /// a chunk is found only under its full key, the regions it holds and
+    /// the fingerprint of the checkpoint source whose values they are, so
+    /// each chunk is looked up under the key this worker's own values give
+    /// it, and another checkpoint's bytes are never bound. A storage
+    /// holding a source this worker's model lacks is left out: its tensors
+    /// are missing and load.
+    fn own_storages(&self, storages: Vec<RetainedStorage>) -> Result<Vec<RetainedStorage>> {
+        let mut own = Vec::with_capacity(storages.len());
+        for mut storage in storages {
+            let known = storage
+                .storage
+                .layout
+                .fields
+                .iter()
+                .all(|field| self.fingerprint(&field.source).is_some());
+            if !known {
+                continue;
+            }
+            let keys = rekeyed(&storage.storage, &|source| self.fingerprint(source))?;
+            for (chunk, key) in storage.storage.chunks.iter_mut().zip(keys) {
+                chunk.key = key;
+            }
+            own.push(storage);
+        }
+        Ok(own)
     }
 
     /// The moves that rename this worker's retained weights to their keys
@@ -1398,4 +1434,103 @@ fn manifest_tensors(text: &str) -> Result<Vec<ManifestTensor>> {
         )));
     }
     Ok(described.tensors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::manifest::{Encoding, Logical, Segment, Span};
+
+    /// The keys of a worker of a model with one checkpoint source, `model`,
+    /// whose files fingerprint as `values`; the structure is the same for
+    /// every value.
+    fn keys(values: &str) -> WeightKeys {
+        let fingerprints = Fingerprints {
+            structure: "qwen3 structure".into(),
+            sources: BTreeMap::from([("model".to_owned(), values.to_owned())]),
+            values: values.into(),
+        };
+        WeightKeys::keyed(&fingerprints, b"rank 0".to_vec(), Vec::new(), vec![1, 2])
+    }
+
+    /// One retained storage of a 4 MiB matrix loaded from `model`, chunked
+    /// and keyed as `writer` retains it.
+    fn written_by(writer: &WeightKeys) -> RetainedStorage {
+        let field = Field {
+            tensor: "p:weight/data".into(),
+            source: "model".into(),
+            dtype: "uint8".into(),
+            element: 1,
+            offset: 0,
+            shape: vec![2, 2 << 20],
+            strides: vec![2 << 20, 1],
+            logical: Logical {
+                shape: vec![2, 2 << 20],
+                dims: vec!["output".into(), "input".into()],
+                units: vec![1, 1],
+                segments: vec![
+                    vec![Segment {
+                        span: Span::range(0, 2),
+                        local: 0,
+                    }],
+                    vec![Segment {
+                        span: Span::range(0, 2 << 20),
+                        local: 0,
+                    }],
+                ],
+            },
+            encoding: Encoding::Affine,
+        };
+        let (mut storages, _) = retained_storages(
+            &[0],
+            &[4 << 20],
+            vec![(0, field)],
+            &[2 << 20],
+            &writer.degrees,
+            &|source| writer.fingerprint(source),
+        )
+        .unwrap();
+        storages.remove(0)
+    }
+
+    fn chunk_keys(storage: &RetainedStorage) -> Vec<Key> {
+        storage
+            .storage
+            .chunks
+            .iter()
+            .map(|chunk| chunk.key)
+            .collect()
+    }
+
+    /// Two checkpoints of one structure share their position's manifest:
+    /// a worker of the second looks the first's chunks up under its own
+    /// values' keys, none of which the first retained, so it binds none of
+    /// the first's bytes; a worker of the first finds its chunks as written.
+    #[test]
+    fn a_manifest_of_another_checkpoint_names_none_of_its_chunks() {
+        let original = keys("original files");
+        let renormed = keys("renormalized files");
+        assert_eq!(original.manifest, renormed.manifest);
+
+        let written = written_by(&original);
+        let recorded = chunk_keys(&written);
+        let found = renormed.own_storages(vec![written.clone()]).unwrap();
+        let looked_up = chunk_keys(&found[0]);
+        assert_eq!(looked_up.len(), recorded.len());
+        assert!(looked_up.iter().all(|key| !recorded.contains(key)));
+        assert_eq!(looked_up, chunk_keys(&written_by(&renormed)));
+
+        let again = original.own_storages(vec![written]).unwrap();
+        assert_eq!(chunk_keys(&again[0]), recorded);
+    }
+
+    /// A storage of a checkpoint source the reading worker's model does not
+    /// load is left out: its tensors are missing and load.
+    #[test]
+    fn a_storage_of_an_unknown_source_is_left_out() {
+        let original = keys("original files");
+        let mut written = written_by(&original);
+        written.storage.layout.fields[0].source = "draft".into();
+        assert!(original.own_storages(vec![written]).unwrap().is_empty());
+    }
 }
