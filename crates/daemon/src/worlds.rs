@@ -706,7 +706,7 @@ fn memory_report(
             .as_u64()
             .unwrap_or(0)
             .saturating_sub(memory["reserve"].as_u64().unwrap_or(0))
-            .saturating_sub(memory["pools_unallocated"].as_u64().unwrap_or(0));
+            .saturating_sub(memory["unallocated"].as_u64().unwrap_or(0));
         let required: u64 = if weights_to_host {
             weights
                 .iter()
@@ -721,7 +721,7 @@ fn memory_report(
                 "host": host,
                 "available": memory["available"],
                 "reserve": memory["reserve"],
-                "pools_unallocated": memory["pools_unallocated"],
+                "unallocated": memory["unallocated"],
                 "admits": room,
                 "required": required,
                 "previous_world_weights": weights_to_host.then_some(required),

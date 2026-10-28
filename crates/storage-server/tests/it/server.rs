@@ -1679,6 +1679,34 @@ fn a_host_sizes_the_host_kv_cache_of_a_world_in_tokens() {
     assert_eq!(ask(4096, None), 4096);
 }
 
+#[test]
+fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
+    for refused in [true, false] {
+        let server = Running::reserving(if refused { u64::MAX } else { 0 });
+        let mut head = head(&server.socket);
+        let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+        let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+        let result = worker.allocate_host(key(42), "staged cache".into(), 4096);
+        if refused {
+            assert_eq!(server_error(result), ErrorKind::Resource);
+            assert!(worker.list().unwrap().tensors.is_empty());
+            continue;
+        }
+        let got = result.unwrap();
+        assert_eq!(got.tensors[0].shape, [4096]);
+        let (_, descriptor) = got.storages.into_iter().next().unwrap();
+        let mut file = std::fs::File::from(descriptor);
+        file.write_all(b"cache bytes").unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut bytes = [0; 11];
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"cache bytes");
+        assert_eq!(worker.list().unwrap().tensors.len(), 1);
+        worker.retain(Vec::new(), Vec::new()).unwrap();
+        assert!(worker.list().unwrap().tensors.is_empty());
+    }
+}
+
 /// A host that admits no page pool, its whole memory reserved, holds no
 /// token of a world's host KV cache and refuses its pools. Once a KV
 /// storage keeps what the pools commit (a connector connected), it holds
