@@ -30,8 +30,13 @@ const PM_HARDWARE_BUFFER: usize = 64 << 20;
 /// The samples one PM decode takes at most.
 const PM_MAX_SAMPLES: u32 = 65_536;
 
-/// The ranges one range profiler pass holds.
-const MAX_RANGES: usize = 65_536;
+/// The ranges one range profiler pass holds. Starting a pass takes about
+/// 1.42 MB of device storage per range (with one metric); on a GB200 rank
+/// that has warmed up, a pass of 1024 ranges starts and one of 2048 fails
+/// (`cuptiRangeProfilerStart` answers `CUPTI_ERROR_UNKNOWN` with 128 GB
+/// free, for a reason not established), so a pass holds 512, about 728 MB,
+/// and the session reads it every [`super::RANGE_CYCLE`] steps.
+const MAX_RANGES: usize = 512;
 
 /// The program counters one PC sampling take holds.
 const MAX_PCS: usize = 10_000;

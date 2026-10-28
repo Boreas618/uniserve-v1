@@ -50,8 +50,10 @@ use collectors::Collectors;
 /// How often the sampler thread drains the armed samplers.
 const DRAIN_PERIOD: Duration = Duration::from_millis(500);
 
-/// Every how many recorded steps the range profiler's ranges are read.
-const RANGE_CYCLE: u64 = 256;
+/// Every how many recorded steps the range profiler's ranges are read:
+/// a pass holds `collectors::MAX_RANGES` ranges, enough for 32 kernel and
+/// graph launches per step.
+pub(super) const RANGE_CYCLE: u64 = 16;
 
 /// A change of the collectors a step's forward waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
