@@ -529,7 +529,12 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         assert memory["feasible"] is True, memory
         assert memory["gpus"] and memory["hosts"], memory
         for gpu in memory["gpus"]:
-            assert gpu["kv_limit"] >= gpu["kv_floor"] > 0, gpu
+            # A GPU holding a KV cache keeps at least its first segment; a
+            # dedicated expert GPU holds none, so its floor is zero.
+            if gpu["segments_held"]:
+                assert gpu["kv_limit"] >= gpu["kv_floor"] > 0, gpu
+            else:
+                assert gpu["kv_floor"] == 0 and gpu["kv_limit"] >= 0, gpu
             assert gpu["successor"]["graph_pool"] > 0, gpu
             print(
                 f"GPU {gpu['gpu']}: quota {gpu['quota']}, serving KV cache "
