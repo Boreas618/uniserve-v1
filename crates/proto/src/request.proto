@@ -1003,6 +1003,10 @@ message Placement {
   // Hosts after the leader the shorthand spreads ranks across.
   repeated string worker_hosts = 6;
   double mem_fraction_static = 7;
+  // Deployment TOML read by the leader when it resolved the configuration.
+  // The engine launches these contents even if the file changes afterwards.
+  // Empty for the shorthand.
+  string worker_groups_content = 8;
 }
 
 message Scheduling {

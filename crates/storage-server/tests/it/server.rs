@@ -181,6 +181,7 @@ pub(crate) fn host(bytes: u64) -> StorageRecord {
         placement: Placement::Host { numa_node: None },
         bytes,
         segment: None,
+        fabric: None,
     }
 }
 
@@ -1722,6 +1723,7 @@ fn one_key_keeps_a_copy_at_each_location() {
         placement: location,
         bytes: 4,
         segment: None,
+        fabric: None,
     };
 
     // Two ranks publish what one key names, each at its own location.
@@ -1812,6 +1814,7 @@ pub(crate) fn device(bytes: u64, segment: Option<storage::Segment>) -> StorageRe
         placement: Placement::Device { gpu: GPU },
         bytes,
         segment,
+        fabric: None,
     }
 }
 

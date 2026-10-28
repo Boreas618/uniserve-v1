@@ -55,8 +55,9 @@ pub struct DaemonOptions {
     pub node_rank: u32,
     /// This node's host identity, as placements name it.
     pub host: String,
-    /// The leader's `host:port` the members join at; the leader binds it.
-    /// Required with several nodes.
+    /// The leader's `host:port` the members join at; the leader binds it
+    /// for as long as it serves, so nodes may also join the running
+    /// deployment. Required with several nodes.
     pub dist_init_addr: Option<String>,
     /// The leader's process socket, which engines connect to.
     pub socket: PathBuf,
@@ -87,8 +88,8 @@ type Served = anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>>;
 
 impl Daemon {
     /// Starts this node's daemon. The leader binds its process socket and
-    /// its members' address and waits until every member joined; a member
-    /// joins the leader. Returns once the service runs.
+    /// its members' address and waits until every member below `nnodes`
+    /// joined; a member joins the leader. Returns once the service runs.
     ///
     /// # Errors
     ///
@@ -125,16 +126,15 @@ impl Daemon {
             let _ = std::fs::remove_file(&options.socket);
             let listener = Listener::bind(&address)
                 .with_context(|| format!("binding the process socket {address}"))?;
-            let members = join_members(&options)?;
-            // The leader is reached at the address its members connected to.
-            let leader_address = members
-                .first()
-                .and_then(|member| member.connection.local_ip());
-            let local = local(&options, leader_address, false)?;
+            let (joins, members) = join_members(&options)?;
+            let leader_address = leader_address(&options, &members);
+            // While nodes may join, their processes reach this node's
+            // Storage Server too: their Transfer Servers read its memory.
+            let local = local(&options, leader_address, joins.is_some())?;
             let host = options.host.clone();
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
-                .spawn(move || service::serve_leader(&host, local, listener, members, &stop))
+                .spawn(move || service::serve_leader(&host, local, listener, joins, members, &stop))
                 .context("starting the daemon's service")?;
             (Some((address, options.socket.clone())), thread)
         } else {
@@ -274,8 +274,10 @@ impl Drop for Daemon {
 }
 
 /// This node's supervisor and claims. `remote_pages` says whether another
-/// node's processes send this node's Storage Server page requests: a member
-/// node's server serves the engine on the leader.
+/// node's processes reach this node's Storage Server: a member node's
+/// server serves the engine on the leader's page requests, and every node's
+/// server of a deployment that other nodes may join exposes its memory to
+/// their Transfer Servers' reads.
 fn local(
     options: &DaemonOptions,
     address: Option<IpAddr>,
@@ -289,16 +291,17 @@ fn local(
     })
 }
 
-/// The leader's wait for every member: each connects to `dist_init_addr`
-/// and says hello.
-fn join_members(options: &DaemonOptions) -> anyhow::Result<Vec<service::Membership>> {
-    if options.nnodes == 1 {
-        return Ok(Vec::new());
-    }
-    let address = options
-        .dist_init_addr
-        .as_deref()
-        .context("a leader of several nodes needs its address")?;
+/// The leader's address its members join at, bound when the deployment
+/// names one (`dist_init_addr`), and the members that joined before the
+/// leader serves: every node rank below `nnodes` (other than the leader's)
+/// within the join timeout. The address stays bound while the leader
+/// serves, so a node may join the running deployment later (`Joins`).
+fn join_members(
+    options: &DaemonOptions,
+) -> anyhow::Result<(Option<service::Joins>, Vec<service::Membership>)> {
+    let Some(address) = options.dist_init_addr.as_deref() else {
+        return Ok((None, Vec::new()));
+    };
     let bind = format!(
         "0.0.0.0:{}",
         address
@@ -310,73 +313,47 @@ fn join_members(options: &DaemonOptions) -> anyhow::Result<Vec<service::Membersh
         Listener::bind(&bind).with_context(|| format!("binding the leader's address {bind}"))?;
     tracing::info!(address = %listener.address(), nodes = options.nnodes, "awaiting the deployment's other nodes");
 
+    let mut joins = service::Joins::new(listener);
     let deadline = Instant::now() + options.join_timeout;
-    let mut connecting: Vec<Connection> = Vec::new();
     let mut members: Vec<service::Membership> = Vec::new();
-    while members.len() + 1 < options.nnodes as usize {
+    let awaited = |members: &[service::Membership]| {
+        (1..options.nnodes)
+            .filter(|rank| !members.iter().any(|member| member.node_rank == *rank))
+            .count()
+    };
+    while awaited(&members) > 0 {
         anyhow::ensure!(
             Instant::now() < deadline,
             "{} of {} nodes joined within {:?}",
-            members.len() + 1,
+            options.nnodes as usize - awaited(&members),
             options.nnodes,
             options.join_timeout
         );
-        while let Some(connection) = listener.try_accept()? {
-            connecting.push(connection);
-        }
-        let mut index = 0;
-        while index < connecting.len() {
-            let hello = match connecting[index].try_recv::<Hello>() {
-                Ok(Some(hello)) => hello,
-                Ok(None) => {
-                    index += 1;
-                    continue;
-                }
-                Err(_) => {
-                    connecting.swap_remove(index);
-                    continue;
-                }
-            };
-            let mut connection = connecting.swap_remove(index);
-            let joined = match &hello.peer {
-                Some(hello::Peer::Join(join)) => Some(join.clone()),
-                _ => None,
-            };
-            let refusal = service::refusal(&hello, |peer| matches!(peer, hello::Peer::Join(_)))
-                .or_else(|| {
-                    let member = joined.as_ref()?;
-                    (member.node_rank == 0
-                        || member.node_rank >= options.nnodes
-                        || members
-                            .iter()
-                            .any(|known| known.node_rank == member.node_rank))
-                    .then(|| {
-                        format!(
-                            "node rank {} is not one this deployment awaits",
-                            member.node_rank
-                        )
-                    })
-                });
-            let welcome = Welcome {
-                major: proto::PROTOCOL_MAJOR,
-                minor: proto::PROTOCOL_MINOR,
-                build: proto::BUILD.to_owned(),
-                refusal: refusal.clone().unwrap_or_default(),
-                nodes: Vec::new(),
-            };
-            let sent = connection.send(&welcome).is_ok();
-            if let (None, Some(member), true) = (refusal, joined, sent) {
-                tracing::info!(node_rank = member.node_rank, host = %member.host, "a node joined");
-                members.push(service::Membership {
-                    node_rank: member.node_rank,
-                    host: member.host,
-                    connection,
-                });
-            }
-        }
+        let admitted = joins.admit(&members)?;
+        members.extend(admitted);
         std::thread::sleep(Duration::from_millis(20));
     }
-    Ok(members)
+    Ok((Some(joins), members))
+}
+
+/// The address the leader's members reach it at: the address a member
+/// connected to, or the host `dist_init_addr` names when no member joined
+/// yet.
+fn leader_address(options: &DaemonOptions, members: &[service::Membership]) -> Option<IpAddr> {
+    use std::net::ToSocketAddrs as _;
+
+    members
+        .first()
+        .and_then(|member| member.connection.local_ip())
+        .or_else(|| {
+            options
+                .dist_init_addr
+                .as_deref()?
+                .to_socket_addrs()
+                .ok()?
+                .map(|address| address.ip())
+                .find(|address| !address.is_unspecified())
+        })
 }
 
 /// A member's join: connects to the leader, retrying until the deadline,

@@ -1,0 +1,135 @@
+UCX (65e342a, 1.23 development): register memory for remote reads alone
+when its protection grants no write.
+
+UCP's `ucp_mem_map` ignores the requested protection
+(UCP_MEM_MAP_PARAM_FIELD_PROT): `ucp_mem_map_params2uct_flags` derives the
+UCT access from the context's features alone, and the InfiniBand memory
+domain registers every region with LOCAL_WRITE | REMOTE_WRITE |
+REMOTE_READ | REMOTE_ATOMIC. The verbs registration of a read-only mapping
+refuses write access, so read-only host memory cannot be registered for
+RDMA at all.
+
+With this patch a protection without local or remote write maps to UCT
+local-read and remote-get access alone, and the InfiniBand memory domain
+(verbs and mlx5 DEVX registrations share `uct_ib_memh_access_flags`)
+registers such a region with IBV_ACCESS_REMOTE_READ only: the read-only
+mapping registers, and peers can read it but never write it. Such a
+registration stays out of UCP's registration cache, so a region registered
+for writing is never handed to it, nor it to a request for writing. Every
+other registration keeps UCX's behavior.
+
+NIXL's UCX backend passes the protection with the NIXL read-only
+registration patch (nixl-read-only.patch).
+
+diff -ruN a/src/ucp/core/ucp_mm.c b/src/ucp/core/ucp_mm.c
+--- a/src/ucp/core/ucp_mm.c	2026-10-28 06:32:40.987130062 +0000
++++ b/src/ucp/core/ucp_mm.c	2026-10-28 06:32:40.988130064 +0000
+@@ -313,18 +313,38 @@
+     return status;
+ }
+ 
++/* Whether the protection `params` asks for grants no write, local or
++ * remote: the memory is then registered for reads alone, which a read-only
++ * mapping of it accepts and which no peer can write through. */
++static int ucp_mem_map_params_read_only(const ucp_mem_map_params_t *params)
++{
++    return (params->field_mask & UCP_MEM_MAP_PARAM_FIELD_PROT) &&
++           !(params->prot &
++             (UCP_MEM_MAP_PROT_LOCAL_WRITE | UCP_MEM_MAP_PROT_REMOTE_WRITE));
++}
++
+ static unsigned
+ ucp_mem_map_params2uct_flags(const ucp_context_h context,
+                              const ucp_mem_map_params_t *params)
+ {
+     unsigned flags = 0;
+ 
+-    if (context->config.features & UCP_FEATURE_RMA) {
+-        flags |= UCT_MD_MEM_ACCESS_RMA;
+-    }
++    if (ucp_mem_map_params_read_only(params)) {
++        /* Local reads, and remote gets when the protection grants remote
++         * reads: no put, no atomic, no local write. */
++        flags |= UCT_MD_MEM_ACCESS_LOCAL_READ;
++        if ((context->config.features & UCP_FEATURE_RMA) &&
++            (params->prot & UCP_MEM_MAP_PROT_REMOTE_READ)) {
++            flags |= UCT_MD_MEM_ACCESS_REMOTE_GET;
++        }
++    } else {
++        if (context->config.features & UCP_FEATURE_RMA) {
++            flags |= UCT_MD_MEM_ACCESS_RMA;
++        }
+ 
+-    if (context->config.features & UCP_FEATURE_AMO) {
+-        flags |= UCT_MD_MEM_ACCESS_REMOTE_ATOMIC;
++        if (context->config.features & UCP_FEATURE_AMO) {
++            flags |= UCT_MD_MEM_ACCESS_REMOTE_ATOMIC;
++        }
+     }
+ 
+     if (params->field_mask & UCP_MEM_MAP_PARAM_FIELD_FLAGS) {
+@@ -1246,8 +1266,14 @@
+                                 UCS_SYS_DEVICE_ID_UNKNOWN, 0, uct_flags, 1,
+                                 alloc_name, &memh);
+     } else {
++        /* A registration for reads alone stays out of the registration
++         * cache, which would otherwise hand it a region registered for
++         * writing too, or hand it out to a request for writing. */
+         status = ucp_memh_create(context, address, length, mem_type,
+-                                 UCT_ALLOC_METHOD_LAST, 0, uct_flags, &memh);
++                                 UCT_ALLOC_METHOD_LAST,
++                                 ucp_mem_map_params_read_only(params) ?
++                                         UCP_MEMH_FLAG_NO_RCACHE : 0,
++                                 uct_flags, &memh);
+         if (status != UCS_OK) {
+             goto out;
+         }
+diff -ruN a/src/uct/ib/base/ib_md.c b/src/uct/ib/base/ib_md.c
+--- a/src/uct/ib/base/ib_md.c	2026-10-28 06:32:40.990130066 +0000
++++ b/src/uct/ib/base/ib_md.c	2026-10-28 06:32:40.991130068 +0000
+@@ -652,6 +652,16 @@
+         memh->flags |= UCT_IB_MEM_ACCESS_REMOTE_RMA;
+     }
+ 
++    /* Remote gets without any write, local or remote (UCP maps a protection
++     * without write so): the region is registered for remote reads only,
++     * which a read-only mapping accepts. */
++    if ((mem_flags & UCT_MD_MEM_ACCESS_REMOTE_GET) &&
++        !(mem_flags & (UCT_MD_MEM_ACCESS_REMOTE_PUT |
++                       UCT_MD_MEM_ACCESS_REMOTE_ATOMIC |
++                       UCT_MD_MEM_ACCESS_LOCAL_WRITE))) {
++        memh->flags |= UCT_IB_MEM_ACCESS_READ_ONLY;
++    }
++
+     if (mem_flags & UCT_MD_MEM_GVA) {
+         memh->flags |= UCT_IB_MEM_FLAG_GVA;
+     }
+@@ -667,6 +677,13 @@
+ uint64_t uct_ib_memh_access_flags(uct_ib_mem_t *memh, int relaxed_order,
+                                   uint64_t access_flags)
+ {
++    if (memh->flags & UCT_IB_MEM_ACCESS_READ_ONLY) {
++        /* Remote reads alone: no local or remote write, no atomic */
++        access_flags &= ~(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
++                          IBV_ACCESS_REMOTE_ATOMIC);
++        access_flags |= IBV_ACCESS_REMOTE_READ;
++    }
++
+     if (memh->flags & UCT_IB_MEM_FLAG_ODP) {
+         access_flags |= IBV_ACCESS_ON_DEMAND;
+     }
+diff -ruN a/src/uct/ib/base/ib_md.h b/src/uct/ib/base/ib_md.h
+--- a/src/uct/ib/base/ib_md.h	2026-10-28 06:32:40.989130065 +0000
++++ b/src/uct/ib/base/ib_md.h	2026-10-28 06:32:40.990130066 +0000
+@@ -80,6 +80,11 @@
+     UCT_IB_MEM_STRICT_ORDER_MR       = UCS_BIT(7), /**< A strict-order MR is
+                                                         allocated alongside the
+                                                         relaxed-order default MR */
++    UCT_IB_MEM_ACCESS_READ_ONLY      = UCS_BIT(8), /**< Remote gets and local
++                                                        reads alone were
++                                                        requested: the region is
++                                                        registered for remote
++                                                        reads only */
+ };
+ 
+ enum {

@@ -808,6 +808,7 @@ pub(crate) mod device {
             },
             bytes: bytes as u64,
             segment: None,
+            fabric: None,
         }
     }
 

@@ -1454,7 +1454,7 @@ fn receive_weights(
         meshes,
         experts,
     } = *receiving;
-    let sources = keys.sources(retained)?;
+    let sources = keys.sources(retained, &launch.storage.peers)?;
     let votes =
         agreement.all_gather_bytes(&[u8::from(found.is_none()), u8::from(sources.is_some())])?;
     let needed = votes.iter().any(|vote| vote.first() == Some(&1));

@@ -82,6 +82,7 @@ message Request {
     LedgerQuery ledger = 6;
     KeepWeights keep_weights = 7;
     ThrottleTransfers throttle_transfers = 8;
+    NodesQuery nodes = 9;
   }
 }
 
@@ -98,7 +99,16 @@ message Reply {
     LedgerReport ledger = 7;
     WeightsKept weights_kept = 8;
     TransfersThrottled transfers_throttled = 9;
+    NodesKnown nodes = 10;
   }
+}
+
+// The deployment's nodes as the leader knows them now, a node that joined
+// the running deployment included (minor 1). The leader answers it itself.
+message NodesQuery {}
+
+message NodesKnown {
+  repeated Node nodes = 1;
 }
 
 // Start one process of a worker group on a node, as a child of its daemon.

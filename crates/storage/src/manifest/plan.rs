@@ -151,19 +151,26 @@ impl<'r> Context<'r> {
             )));
         }
         // Links between GPUs, as the Transfer Server measured them; a copy
-        // within one GPU takes the link from it to itself.
-        let bandwidth = request
-            .links
-            .iter()
-            .filter_map(
-                |measured| match (&measured.link.source, &measured.link.destination) {
-                    (Memory::Device { gpu: source }, Memory::Device { gpu: destination }) => {
-                        Some(((*source, *destination), measured.bytes_per_second as f64))
-                    }
-                    _ => None,
-                },
-            )
-            .collect();
+        // within one GPU takes the link from it to itself. A GPU of another
+        // host reaches this host's over the NVLink fabric (a link between
+        // the two GPUs) or by READ (a link from that host's GPU): the
+        // Transfer Server copies over the fabric whenever it can, and a
+        // pair measured both ways takes the faster.
+        let mut bandwidth: HashMap<(Gpu, Gpu), f64> = HashMap::new();
+        for measured in &request.links {
+            let pair = match (&measured.link.source, &measured.link.destination) {
+                (
+                    Memory::Device { gpu: source }
+                    | Memory::Remote {
+                        gpu: Some(source), ..
+                    },
+                    Memory::Device { gpu: destination },
+                ) => (*source, *destination),
+                _ => continue,
+            };
+            let entry = bandwidth.entry(pair).or_default();
+            *entry = entry.max(measured.bytes_per_second as f64);
+        }
         Ok(Self {
             request,
             sources,

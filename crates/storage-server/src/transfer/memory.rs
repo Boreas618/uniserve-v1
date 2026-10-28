@@ -171,11 +171,20 @@ impl Mapped {
                 len: self.length()?,
                 key: nixl_key(),
             };
+            // A read-only allocation is mapped read-only, and registered for
+            // reads alone: other hosts READ it, and nothing can write it
+            // through the registration.
+            let access = if self.writable {
+                nixl::Access::ReadWrite
+            } else {
+                nixl::Access::Read
+            };
             // SAFETY: the host mapping is a field declared after `nixl`, so
-            // it stays mapped until the registration dropped; the Transfer
-            // Server holds no Rust reference to the bytes, which its copies
-            // reach through raw addresses only.
-            unsafe { agent.register(region) }
+            // it stays mapped (writable for `ReadWrite`) until the
+            // registration dropped; the Transfer Server holds no Rust
+            // reference to the bytes, which its copies reach through raw
+            // addresses only.
+            unsafe { agent.register(region, access) }
                 .map_err(|error| format!("registering memory with NIXL: {error}"))
         });
         registration

@@ -53,9 +53,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use storage::protocol::{
-    Access, Allocation, ContextBytes, ErrorKind, Event, Link, LinkBandwidth, ListedTask,
-    ListedTransfer, Memory, Move, Placement, Priority, Region, Registered, Reply, Role, Span,
-    Throttle, TransferEnd,
+    Access, Allocation, ContextBytes, ErrorKind, Event, FabricExport, FabricHandle, Link,
+    LinkBandwidth, ListedTask, ListedTransfer, Memory, Move, Placement, Priority, Region,
+    Registered, Reply, Role, Span, Throttle, TransferEnd,
 };
 
 use crate::child::{Launch, Supervised};
@@ -128,6 +128,9 @@ impl Transfers {
 pub(super) struct Exposing {
     allocations: Vec<Allocation>,
     regions: Vec<(usize, u64)>,
+    /// Each allocation's fabric handle and length, when its creator
+    /// recorded one.
+    fabric: Vec<Option<(FabricHandle, u64)>>,
 }
 
 /// A peer's exposure the server answers once its Transfer Server reported
@@ -136,6 +139,21 @@ struct Exposure {
     client: ClientId,
     request: u64,
     regions: Vec<(usize, u64)>,
+    fabric: Vec<Option<(FabricHandle, u64)>>,
+}
+
+impl Exposure {
+    /// The fabric handle of a region at `base` in allocation `index`, as
+    /// the reader imports it: the whole allocation, and the region's
+    /// offset in it.
+    fn fabric_at(&self, index: usize, base: u64) -> Option<FabricExport> {
+        let (handle, bytes) = self.fabric.get(index).copied().flatten()?;
+        Some(FabricExport {
+            handle,
+            bytes,
+            offset: base,
+        })
+    }
 }
 
 /// A region resolved to one of the server's allocations: the allocation,
@@ -315,9 +333,24 @@ impl Server {
         for (allocation, resolved) in needed {
             self.give(transfer_server, allocation, &resolved);
         }
+        // A storage's creator may have recorded its fabric handle, which a
+        // reader of the same fabric prefers to a READ.
+        let fabric = allocations
+            .iter()
+            .map(|allocation| match allocation {
+                Allocation::Storage { storage } => self.storages.get(storage).and_then(|entry| {
+                    entry
+                        .record
+                        .fabric
+                        .map(|handle| (handle, entry.record.bytes))
+                }),
+                _ => None,
+            })
+            .collect();
         Ok(Outcome::Exposing(Exposing {
             allocations,
             regions: placed,
+            fabric,
         }))
     }
 
@@ -334,6 +367,11 @@ impl Server {
         }
         let number = self.transfers.next_registration;
         self.transfers.next_registration += 1;
+        tracing::debug!(
+            exposure = number,
+            allocations = exposing.allocations.len(),
+            "registering allocations for another host"
+        );
         self.events.push((
             transfer_server,
             Event::Register {
@@ -348,6 +386,7 @@ impl Server {
                 client,
                 request,
                 regions: exposing.regions,
+                fabric: exposing.fabric,
             },
         );
     }
@@ -362,6 +401,11 @@ impl Server {
         ranges: &[Registered],
         failure: Option<&str>,
     ) {
+        tracing::debug!(
+            exposure = number,
+            failure,
+            "the Transfer Server registered an exposure"
+        );
         let Some(exposure) = self.transfers.exposures.remove(&number) else {
             // The peer disconnected meanwhile: nobody reads what was
             // registered for it.
@@ -385,6 +429,7 @@ impl Server {
                             key: range.key,
                             address: range.address + base,
                             bytes: range.bytes - base,
+                            fabric: exposure.fabric_at(index, base),
                         })
                     })
                     .collect::<Option<Vec<_>>>();
@@ -498,11 +543,6 @@ impl Server {
                 Region::Remote { endpoint, region } => {
                     if matches!(destination.allocation, Allocation::Fabric { .. }) {
                         return Err(crossing);
-                    }
-                    if span.rows > 1 {
-                        return Err(invalid(
-                            "a span of several rows reads no storage of another host",
-                        ));
                     }
                     (remote(deployment, endpoint, region)?, span.source_offset)
                 }

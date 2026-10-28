@@ -31,6 +31,8 @@ source .venv/bin/activate
 
 The sync builds the `uniserve` executable (its `serve`, `worker` and `storage` commands), the worker runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
+For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
+
 ## Quickstart
 
 Download the checkpoint and serve it on four GPUs:

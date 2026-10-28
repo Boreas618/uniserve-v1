@@ -398,6 +398,7 @@ mod tests {
             claim: [7; 16],
             host_kv_cache: true,
             tcp: Some("10.0.0.2:4100".into()),
+            peers: vec!["10.0.0.1:4100".into()],
             world: 3,
             standby: false,
             standby_memory: proto::request::StandbyMemory::Suspended,

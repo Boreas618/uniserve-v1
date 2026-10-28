@@ -741,6 +741,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
         placement: Placement::Device { gpu },
         bytes: allocation.len() as u64,
         segment: None,
+        fabric: None,
     };
     let source_a_fd = descriptor(&source_a)?;
     let destination_a_fd = descriptor(&destination_a)?;
@@ -762,6 +763,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
                     placement: Placement::Host { numa_node },
                     bytes: task_bytes,
                     segment: None,
+                    fabric: None,
                 },
                 host.as_fd(),
             ),

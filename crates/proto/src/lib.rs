@@ -40,8 +40,9 @@ pub mod process {
 /// takes a planned restart of every daemon.
 pub const PROTOCOL_MAJOR: u32 = 1;
 
-/// The interfaces' minor version: the additions this build knows.
-pub const PROTOCOL_MINOR: u32 = 0;
+/// The interfaces' minor version: the additions this build knows. Minor 1
+/// adds the leader's answer of the nodes it knows now (`NodesQuery`).
+pub const PROTOCOL_MINOR: u32 = 1;
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled

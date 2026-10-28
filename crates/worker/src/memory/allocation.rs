@@ -307,6 +307,19 @@ impl Storage {
         Ok(lock(&self.segments()?.mapping).create(index)?)
     }
 
+    /// The fabric handle of segment `index`, which this process created and
+    /// keeps the creating handle of, when its device makes fabric-exportable
+    /// memory: what a chunk's record states for other hosts of the NVLink
+    /// fabric, which import it while this process holds the segment.
+    pub(crate) fn segment_fabric(
+        &self,
+        index: usize,
+    ) -> Result<Option<storage::protocol::FabricHandle>> {
+        Ok(lock(&self.segments()?.mapping)
+            .fabric_handle(index)
+            .map(storage::protocol::FabricHandle))
+    }
+
     /// Maps segment `index` from the descriptor of memory another process
     /// created and the Storage Server retains.
     pub(crate) fn import_segment(&self, index: usize, descriptor: &OwnedFd) -> Result<()> {

@@ -2,3 +2,6 @@
 uniserve_kernels/src/uniserve_kernels/deepep/csrc/** linguist-vendored
 uniserve_kernels/src/uniserve_kernels/deepgemm/csrc/** linguist-vendored
 uniserve_kernels/src/uniserve_kernels/megamoe/** linguist-vendored
+
+# Unified patches use a single space to mark empty context lines.
+*.patch whitespace=-blank-at-eol

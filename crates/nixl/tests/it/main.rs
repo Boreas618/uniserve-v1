@@ -2,4 +2,5 @@
 
 #![cfg(test)]
 
+mod library;
 mod read;

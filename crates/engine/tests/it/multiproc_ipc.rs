@@ -2752,6 +2752,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 claim: claim.0,
                 host_kv_cache: false,
                 tcp: None,
+                peers: Vec::new(),
                 world: 0,
                 standby: false,
                 standby_memory: proto::request::StandbyMemory::Auto,

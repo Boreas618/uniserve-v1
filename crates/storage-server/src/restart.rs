@@ -755,6 +755,7 @@ mod tests {
                         placement: Placement::Host { numa_node: None },
                         bytes: 4,
                         segment: None,
+                        fabric: None,
                     },
                     memory.as_fd(),
                 )],

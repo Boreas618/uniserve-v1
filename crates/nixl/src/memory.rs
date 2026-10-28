@@ -1,6 +1,9 @@
 //! Byte ranges an agent registers and transfers move between.
 
-use nixl_sys::{MemType, MemoryRegion, NixlDescriptor, RegistrationHandle};
+use std::sync::Arc;
+
+use crate::agent::Shared;
+use crate::capi::{MEM_DRAM, MEM_VRAM, MemType};
 
 /// The memory a region lies in, as NIXL distinguishes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -15,8 +18,35 @@ pub enum Memory {
 impl Memory {
     pub(crate) fn kind(self) -> MemType {
         match self {
-            Self::Host => MemType::Dram,
-            Self::Device => MemType::Vram,
+            Self::Host => MEM_DRAM,
+            Self::Device => MEM_VRAM,
+        }
+    }
+}
+
+/// What a registration lets this agent's READs and its peers' READs do with
+/// its region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Access {
+    /// Reads and writes: a READ's destination, or a source the process may
+    /// also write. The mapping of the region must be writable.
+    ReadWrite,
+    /// Reads alone, local and remote: a source mapped read-only, which
+    /// peers can READ but never write. NIXL's UCX backend registers it so
+    /// with the read-only registration patch of UniServe's NIXL build
+    /// (`artifacts/native/patches`); without it the registration asks for
+    /// write access, which a read-only mapping of host memory refuses.
+    Read,
+}
+
+impl Access {
+    /// The registration descriptor's metadata that asks the UCX backend for
+    /// this access: `access=read` for reads alone, none for UCX's default of
+    /// reads and writes.
+    pub(crate) fn metadata(self) -> &'static [u8] {
+        match self {
+            Self::ReadWrite => b"",
+            Self::Read => b"access=read",
         }
     }
 }
@@ -52,49 +82,36 @@ pub struct Span {
     pub destination: Region,
 }
 
-/// A region registered with an agent's backends. Dropping it deregisters
-/// the region; the agent lives at least as long.
-#[derive(Debug)]
+/// A region registered with an agent's backend. Dropping it deregisters
+/// the region; it keeps the agent alive until then.
 pub struct Registration {
-    region: Region,
-    _handle: RegistrationHandle,
+    pub(crate) agent: Arc<Shared>,
+    pub(crate) region: Region,
+    pub(crate) access: Access,
 }
 
 impl Registration {
-    pub(crate) fn new(region: Region, handle: RegistrationHandle) -> Self {
-        Self {
-            region,
-            _handle: handle,
-        }
-    }
-
     pub fn region(&self) -> Region {
         self.region
     }
-}
 
-/// A region as `nixl-sys` describes memory to register.
-#[derive(Debug)]
-pub(crate) struct Described(pub(crate) Region);
-
-impl MemoryRegion for Described {
-    unsafe fn as_ptr(&self) -> *const u8 {
-        // A device address is a unified address: NIXL and UCX take it as a
-        // pointer value and never dereference it on the host.
-        self.0.address as usize as *const u8
-    }
-
-    fn size(&self) -> usize {
-        self.0.len
+    pub fn access(&self) -> Access {
+        self.access
     }
 }
 
-impl NixlDescriptor for Described {
-    fn mem_type(&self) -> MemType {
-        self.0.memory.kind()
+impl std::fmt::Debug for Registration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Registration")
+            .field("region", &self.region)
+            .field("access", &self.access)
+            .finish()
     }
+}
 
-    fn device_id(&self) -> u64 {
-        self.0.key
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.agent.deregister(self.region);
     }
 }
