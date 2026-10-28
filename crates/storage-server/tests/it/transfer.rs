@@ -301,6 +301,51 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
 }
 
 #[test]
+fn concurrent_transfers_can_be_collected_in_reverse_order() {
+    let server = serving(Gpus::Hidden);
+    let mut head = head(&server.socket);
+    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+    let source_bytes = pattern(64, 13);
+    let source = memfd(&source_bytes);
+    let destination = memfd(&[0; 64]);
+    worker
+        .put(
+            vec![
+                tensor(key(1), "source", 0, 0, Access::ReadOnly),
+                tensor(key(2), "destination", 1, 0, Access::Exclusive),
+            ],
+            &[(host(64), source.as_fd()), (host(64), destination.as_fd())],
+        )
+        .unwrap();
+    let tasks: Vec<_> = [0, 32]
+        .into_iter()
+        .map(|offset| {
+            worker
+                .transfer(
+                    vec![span(tensor_region(1), offset, tensor_region(2), offset, 32)],
+                    Priority::Warming,
+                    1,
+                )
+                .unwrap()
+        })
+        .collect();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for task in tasks.into_iter().rev() {
+        let completed = loop {
+            if let Some(completed) = worker.poll_transfer(task).unwrap() {
+                break completed;
+            }
+            assert!(Instant::now() < deadline, "a transfer did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(completed, (32, TransferEnd::Complete));
+    }
+    assert_eq!(read(&destination, 0, 64), source_bytes);
+}
+
+#[test]
 fn a_span_of_rows_copies_each_row_at_its_pitches() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);

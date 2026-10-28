@@ -224,6 +224,30 @@ impl Client {
         self.events.pop_front()
     }
 
+    /// Consume one task's completion without waiting, discarding its progress
+    /// notifications. Other tasks' events stay queued for their owners.
+    /// Returns `None` while the transfer is pending or after it was consumed.
+    pub fn poll_transfer(
+        &mut self,
+        task: u64,
+    ) -> Result<Option<(u64, crate::protocol::TransferEnd)>> {
+        self.pump()?;
+        let mut completion = None;
+        self.events.retain(|(event, _)| match event {
+            Event::TransferProgress { task: found, .. } if *found == task => false,
+            Event::Transferred {
+                task: found,
+                bytes,
+                end,
+            } if *found == task => {
+                completion = Some((*bytes, end.clone()));
+                false
+            }
+            _ => true,
+        });
+        Ok(completion)
+    }
+
     /// Block until request `id` is answered.
     pub fn wait(&mut self, id: u64) -> Result<Answer> {
         loop {

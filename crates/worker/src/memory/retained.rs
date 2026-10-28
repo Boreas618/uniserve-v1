@@ -313,14 +313,14 @@ impl Retained {
     /// The key of an exclusive storage of the worker's world: the digest of
     /// its scope, world, name, layout and GPU. It covers its shape only, so
     /// a restart of the world reuses the memory whatever else changed.
-    fn exclusive_key(&self, spec: &ExclusiveSpec<'_>, gpu: &[u8; 16]) -> Key {
+    pub(crate) fn exclusive_key(&self, spec: &ExclusiveSpec<'_>, gpu: &[u8; 16]) -> Key {
         self.storage_key(spec.name, spec.bytes, gpu, self.world)
     }
 
     /// The key of one part of a segmented storage, as the exclusive storage
     /// `{name}#{column}/{ordinal}` of the part's length that the segment's
     /// world created.
-    fn segment_key(&self, name: &str, part: &SegmentPart, gpu: &[u8; 16]) -> Key {
+    pub(crate) fn segment_key(&self, name: &str, part: &SegmentPart, gpu: &[u8; 16]) -> Key {
         self.storage_key(
             &segment_name(name, part),
             part.length,
@@ -420,46 +420,40 @@ impl Retained {
         })
     }
 
-    /// Block until transfer `task` ends: `Ok` once every span was copied,
-    /// an error naming how it ended otherwise. Other events the connection
-    /// receives meanwhile are for no one else: a worker submits the only
-    /// transfers whose events reach it.
-    pub(crate) fn transferred(&self, task: u64) -> Result<()> {
-        use storage::protocol::{Event, TransferEnd};
-        loop {
-            {
-                let mut state = lock(&self.state);
-                state
-                    .client
-                    .pump()
-                    .map_err(|error| storage_error("awaiting a transfer", error))?;
-                while let Some((event, _)) = state.client.next_event() {
-                    if let Event::Transferred {
-                        task: ended,
-                        bytes,
-                        end,
-                    } = event
-                        && ended == task
-                    {
-                        return match end {
-                            TransferEnd::Complete => {
-                                tracing::info!(task, bytes, "the transfer copied every span");
-                                Ok(())
-                            }
-                            TransferEnd::Cancelled => Err(Error::Interface(format!(
-                                "transfer {task} was cancelled after {bytes} bytes"
-                            ))),
-                            TransferEnd::Failed { message } => Err(Error::Interface(format!(
-                                "transfer {task} failed after {bytes} bytes: {message}"
-                            ))),
-                        };
-                    }
-                }
+    /// Consume the completion of one transfer without waiting. Other tasks'
+    /// completions remain queued for their owners. Returns false while copying.
+    pub(crate) fn poll_transfer(&self, task: u64) -> Result<bool> {
+        use storage::protocol::TransferEnd;
+
+        let completion = lock(&self.state)
+            .client
+            .poll_transfer(task)
+            .map_err(|error| storage_error("reading transfer completions", error))?;
+        let Some((bytes, end)) = completion else {
+            return Ok(false);
+        };
+        match end {
+            TransferEnd::Complete => {
+                tracing::info!(task, bytes, "the transfer copied every span");
+                Ok(true)
             }
-            // Events arrive on the connection while the copies run; the
-            // lock is free for other calls in between.
+            TransferEnd::Cancelled => Err(Error::Interface(format!(
+                "transfer {task} was cancelled after {bytes} bytes"
+            ))),
+            TransferEnd::Failed { message } => Err(Error::Interface(format!(
+                "transfer {task} failed after {bytes} bytes: {message}"
+            ))),
+        }
+    }
+
+    /// Wait until every span of transfer `task` has copied, preserving other
+    /// transfers' completions for their owners.
+    pub(crate) fn transferred(&self, task: u64) -> Result<()> {
+        while !self.poll_transfer(task)? {
+            // Leave the connection available for other calls between polls.
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        Ok(())
     }
 
     /// Note tensors the worker uses, which its startup retains.
