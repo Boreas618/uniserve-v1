@@ -33,6 +33,7 @@ mod posix_shm;
 mod read;
 mod registry;
 mod spans;
+pub(crate) mod staging;
 mod ticket;
 mod transport;
 pub(crate) mod vmm;

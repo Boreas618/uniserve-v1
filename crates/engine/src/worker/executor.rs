@@ -1537,11 +1537,16 @@ impl Executor for WorkerExecutor {
         }
     }
 
-    /// Keeps the weights alone of `worlds` through the deployment's claims,
-    /// which every group shares.
-    fn keep_weights(&mut self, worlds: &[u64], to_host: bool) -> anyhow::Result<Vec<String>> {
+    /// Retains weights and completed rollback cache through the deployment's
+    /// claims, which every group shares.
+    fn keep_weights(
+        &mut self,
+        worlds: &[u64],
+        to_host: bool,
+        cache_keys: &[Vec<u8>],
+    ) -> anyhow::Result<Vec<String>> {
         match self.workers.first() {
-            Some((_, group)) => group.claims().keep_weights(worlds, to_host),
+            Some((_, group)) => group.claims().keep_weights(worlds, to_host, cache_keys),
             None => Ok(Vec::new()),
         }
     }

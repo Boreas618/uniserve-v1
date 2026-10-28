@@ -219,6 +219,7 @@ impl Claims {
         &self,
         worlds: &[u64],
         to_host: bool,
+        cache_keys: &[Vec<u8>],
     ) -> anyhow::Result<Vec<String>> {
         if worlds.is_empty() {
             return Ok(Vec::new());
@@ -230,6 +231,7 @@ impl Claims {
                 &self.deployment,
                 worlds,
                 to_host,
+                cache_keys,
             )?;
             if !kept.refused.is_empty() {
                 tracing::warn!(

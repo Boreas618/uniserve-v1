@@ -211,6 +211,10 @@ impl Worker {
             launch.generation,
         )
         .map_err(phase("storage"))?;
+        // Rollback copies belong to this startup even though no numerical
+        // owner maps them. Protect them before the first new allocation
+        // releases exclusive storages left untaken by the prior process.
+        retained.use_keys(launch.execution.cache_keys.iter().copied());
 
         let describing = range(c"uniserve.worker.describe", None);
         let description = Description::describe(&launch).map_err(phase("describe"))?;
@@ -757,9 +761,7 @@ impl Worker {
         .map_err(|error| error.with_phase("executor"))?;
 
         // Every owner took its memory: retained storages of the scope that
-        // none took any more are released. Rollback keeps its named Host
-        // cache storages without mapping them into this worker.
-        retained.use_keys(config.cache_keys.iter().copied());
+        // none took any more are released.
         retained.retain_used().map_err(phase("storage"))?;
         tracing::info!("loaded numerical model");
         Ok(Self {
@@ -943,6 +945,7 @@ impl Worker {
             .collect::<Result<Vec<_>>>()?;
         let maintenance = crate::service::Maintenance {
             cache_copies: crate::transfer::warming::Copies::default(),
+            cache_staging: crate::transfer::staging::Staging::default(),
             retained: Some(Arc::clone(&self.retained)),
             weights: Some(update::WeightUpdate {
                 launch: self.launch.clone(),

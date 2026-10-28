@@ -352,6 +352,7 @@ impl CachePlanes {
         column: u32,
         unit: u32,
         suffix: &str,
+        resident: bool,
     ) -> Result<storage::manifest::Chunk> {
         let device = self
             .device
@@ -378,7 +379,7 @@ impl CachePlanes {
                     (unit < first).then_some((index, start))
                 })
                 .ok_or_else(|| Error::Invalid(format!("cache unit {unit} is outside its pool")))?;
-            if segment.0 as u32 >= segmented.released_from.load(Ordering::Acquire) {
+            if resident && segment.0 as u32 >= segmented.released_from.load(Ordering::Acquire) {
                 return Err(Error::Invalid(format!(
                     "cache unit {unit} has no retained storage"
                 )));

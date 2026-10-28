@@ -551,7 +551,7 @@ pub(crate) struct GroupArguments {
     /// The model groups', scheduler by scheduler, then the expert groups'.
     pub(crate) arguments: Vec<WorkerProcessArgs>,
     /// The model groups each scheduler holds.
-    per_core: usize,
+    pub(crate) per_core: usize,
     /// Each scheduler's resolved transfer edges.
     transfers: Vec<TransferConfig>,
     max_running_requests: usize,
@@ -1238,8 +1238,9 @@ impl SchedulerHandle {
         &self,
         worlds: Vec<u64>,
         to_host: bool,
+        cache_keys: Vec<Vec<u8>>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        self.commands.keep_weights(worlds, to_host)
+        self.commands.keep_weights(worlds, to_host, cache_keys)
     }
 
     /// Reads the memory ledgers of the nodes of the scheduler's workers,

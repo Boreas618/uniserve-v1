@@ -340,6 +340,50 @@ impl EngineControl {
         Ok(devices)
     }
 
+    /// Reads host admission from the deployment's existing Storage Server
+    /// claims, including target nodes with no serving worker yet.
+    pub(crate) fn host_memory(
+        &self,
+        hosts: &[String],
+    ) -> anyhow::Result<BTreeMap<String, storage::protocol::HostMemory>> {
+        let (mut connection, _) = self.connect()?;
+        let mut memory = BTreeMap::new();
+        for (index, host) in hosts.iter().enumerate() {
+            connection.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::Ledger(process::LedgerQuery {
+                        host: host.clone(),
+                        deployment: self.deployment.clone(),
+                    })),
+                })),
+            })?;
+            let answer: process::Downstream = connection
+                .recv(DAEMON_TIMEOUT)?
+                .context("the daemon did not report its host memory")?;
+            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
+                anyhow::bail!("the daemon did not answer its ledger query");
+            };
+            anyhow::ensure!(
+                answer.error.is_empty(),
+                "host memory for {host}: {}",
+                answer.error
+            );
+            let Some(reply::Kind::Ledger(report)) = answer.kind else {
+                anyhow::bail!("the daemon returned no memory ledger");
+            };
+            #[derive(serde::Deserialize)]
+            struct Ledger {
+                host_memory: storage::protocol::HostMemory,
+            }
+            memory.insert(
+                host.clone(),
+                serde_json::from_str::<Ledger>(&report.ledgers)?.host_memory,
+            );
+        }
+        Ok(memory)
+    }
+
     /// Publishes one commit decision at every deployment node. Publication
     /// is atomic within each Storage Server and idempotent across retries;
     /// the daemon retains its commit decision until every node has answered.

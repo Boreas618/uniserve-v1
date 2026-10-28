@@ -140,11 +140,12 @@ impl Scheduler {
             Command::KeepWeights {
                 worlds,
                 to_host,
+                cache_keys,
                 answer,
             } => {
                 let kept = self
                     .executor
-                    .keep_weights(&worlds, to_host)
+                    .keep_weights(&worlds, to_host, &cache_keys)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(kept);
             }

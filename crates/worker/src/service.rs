@@ -84,6 +84,7 @@ pub(crate) struct ParkedExperts {
 /// through, and the graph pools a sleeping worker suspends.
 pub(crate) struct Maintenance {
     pub(crate) cache_copies: crate::transfer::warming::Copies,
+    pub(crate) cache_staging: crate::transfer::staging::Staging,
     /// `None` for a rank whose planes this process allocated for itself
     /// (`LocalMemory`).
     pub(crate) retained: Option<Arc<Retained>>,
@@ -754,8 +755,12 @@ impl Service<'_> {
                         retained,
                         &sources,
                         device,
-                        storage::protocol::Placement::Device {
-                            gpu: device.uuid()?.0,
+                        if source.host_destination {
+                            storage::protocol::Placement::Host { numa_node: None }
+                        } else {
+                            storage::protocol::Placement::Device {
+                                gpu: device.uuid()?.0,
+                            }
                         },
                     )?
                 } else {
@@ -789,15 +794,50 @@ impl Service<'_> {
                 serde_json::Value::Null
             }
             "uniserve.cache_manifest" => {
-                let pages: Vec<storage::manifest::cache::Page> = serde_json::from_value(payload)
+                let pages: storage::manifest::cache::Pages = serde_json::from_value(payload)
                     .map_err(|error| Error::Invalid(format!("cache pages: {error}")))?;
                 match (planes.as_ref(), retained.as_deref()) {
                     (Some(planes), Some(retained)) => {
+                        let mut allocations = Vec::new();
+                        let storage =
+                            if pages.host {
+                                let device = planes
+                                    .device()
+                                    .ok_or(Error::State("cache staging requires a device pool"))?;
+                                let mut storages = Vec::new();
+                                for page in pages
+                                    .pages
+                                    .into_iter()
+                                    .filter(|page| page.worker_group == retained.scope().group)
+                                {
+                                    let rank = planes.manifest(
+                                        std::slice::from_ref(&page),
+                                        retained,
+                                        false,
+                                    )?;
+                                    let Some((rank, key)) = self
+                                        .maintenance
+                                        .cache_staging
+                                        .reserve(retained, device, page.clone(), rank)?
+                                    else {
+                                        continue;
+                                    };
+                                    allocations.push((key, page));
+                                    storages.extend(rank.storages);
+                                }
+                                storage::manifest::Rank {
+                                    gpu: Some(device.uuid()?.0),
+                                    storages,
+                                }
+                            } else {
+                                planes.manifest(&pages.pages, retained, true)?
+                            };
                         serde_json::to_value(storage::manifest::cache::Rank {
                             worker_group: retained.scope().group.clone(),
                             rank: retained.scope().rank,
                             host: self.info.endpoint.host.clone(),
-                            storage: planes.manifest(&pages, retained)?,
+                            storage,
+                            allocations,
                         })
                         .map_err(|error| Error::Invalid(format!("cache manifest: {error}")))?
                     }
@@ -837,6 +877,38 @@ impl Service<'_> {
                         serde_json::Value::Null
                     }
                 }
+            }
+            "uniserve.cache_staged" => match (planes.as_ref(), retained.as_deref()) {
+                (Some(planes), Some(retained)) => {
+                    let device = planes
+                        .device()
+                        .ok_or(Error::State("cache staging requires a device pool"))?;
+                    serde_json::to_value(storage::manifest::cache::Rank {
+                        worker_group: retained.scope().group.clone(),
+                        rank: retained.scope().rank,
+                        host: self.info.endpoint.host.clone(),
+                        storage: self.maintenance.cache_staging.source(device.uuid()?.0),
+                        allocations: self.maintenance.cache_staging.allocations(),
+                    })
+                    .map_err(|error| Error::Invalid(error.to_string()))?
+                }
+                _ => serde_json::Value::Null,
+            },
+            "uniserve.cache_unstage" => {
+                let keys = serde_json::from_value::<Vec<storage::Key>>(payload)
+                    .map_err(|error| Error::Invalid(format!("cache staging release: {error}")))?;
+                if let Some(retained) = retained.as_deref() {
+                    self.maintenance.cache_staging.release(retained, keys)?;
+                }
+                serde_json::Value::Null
+            }
+            "uniserve.cache_retain_staged" => {
+                let requests = serde_json::from_value::<Vec<(u64, u64)>>(payload)
+                    .map_err(|error| Error::Invalid(format!("cache staging retention: {error}")))?;
+                if let Some(retained) = retained.as_deref() {
+                    self.maintenance.cache_staging.retain(retained, &requests)?;
+                }
+                serde_json::Value::Null
             }
             "uniserve.cache_memory" => {
                 // The cache's device; a rank without a cache (an expert
@@ -1539,6 +1611,7 @@ mod tests {
             None,
             super::Maintenance {
                 cache_copies: crate::transfer::warming::Copies::default(),
+                cache_staging: crate::transfer::staging::Staging::default(),
                 retained: None,
                 weights: None,
                 pools: Vec::new(),

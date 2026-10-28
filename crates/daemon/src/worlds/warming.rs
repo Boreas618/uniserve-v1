@@ -11,6 +11,14 @@ use storage::protocol::{LinkBandwidth, Placement, Region};
 
 use crate::engine::client::EngineClient;
 
+/// How the successor consumes the predecessor's numerical state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reuse {
+    Exact,
+    Keep,
+    Recompute,
+}
+
 /// Observed completed copies and the accepted prefix still to compute.
 #[derive(Debug, Default, Serialize)]
 pub(super) struct Report {
@@ -21,6 +29,9 @@ pub(super) struct Report {
     pub warmed_requests: u32,
     pub warmed_tokens: u64,
     pub recompute: Option<String>,
+    pub staged: bool,
+    #[serde(skip)]
+    pub backup: Vec<Snapshot>,
 }
 
 /// Warm every predecessor assigned to this successor. A successful result
@@ -29,51 +40,91 @@ pub(super) struct Report {
 pub(super) async fn prepare(
     sources: &[Arc<EngineClient>],
     target: &Arc<EngineClient>,
-    keep: bool,
+    reuse: Reuse,
     tail_tokens: Option<u32>,
     prefill_tokens: Option<u32>,
+    host: bool,
 ) -> Result<Report, String> {
-    let result = rounds(sources, target, keep, tail_tokens, prefill_tokens).await;
+    let result = rounds(sources, target, reuse, tail_tokens, prefill_tokens, host).await;
+    let owners: Vec<_> = sources.iter().chain(std::iter::once(target)).collect();
+    let mut errors = Vec::new();
     if result
         .as_ref()
-        .map_or(true, |report| report.recompute.is_some())
+        .map_or(true, |report| report.recompute.is_some() && !report.staged)
     {
         // Cancellation completes physical work before either scheduler may
         // reuse a borrowed unit. Failed cancellation leaves those leases held.
-        target.hook("uniserve.cache_cancel", "null").await?;
-        target.cache_warm(Operation::Discard).await?;
-        for source in sources {
-            source.cache_warm(Operation::Release).await?;
+        for owner in &owners {
+            if let Err(error) = owner.hook("uniserve.cache_cancel", "null").await {
+                errors.push(error);
+            }
         }
-        resume_prefill(sources).await?;
+        if errors.is_empty() {
+            if let Err(error) = target.cache_warm(Operation::Discard).await {
+                errors.push(error);
+            }
+            for source in sources {
+                if let Err(error) = source.cache_warm(Operation::Release).await {
+                    errors.push(error);
+                }
+            }
+            for owner in &owners {
+                if let Err(error) = owner.hook("uniserve.cache_unstage", "[]").await {
+                    errors.push(error);
+                }
+            }
+        }
+        if let Err(error) = resume_prefill(sources).await {
+            errors.push(error);
+        }
     }
-    for owner in sources.iter().chain(std::iter::once(target)) {
+    for owner in owners {
         if let Err(error) = owner.hook("uniserve.cache_session", "false").await {
-            resume_prefill(sources).await?;
-            return Err(error);
+            errors.push(error);
         }
+    }
+    if !errors.is_empty() {
+        if let Err(error) = resume_prefill(sources).await {
+            errors.push(error);
+        }
+        if let Err(error) = result {
+            errors.insert(0, error);
+        }
+        return Err(errors.join("; "));
     }
     result
 }
 
 /// Restore the configured prefill budget after promotion or preparation failure.
 pub(super) async fn resume_prefill(sources: &[Arc<EngineClient>]) -> Result<(), String> {
+    let mut errors = Vec::new();
     for source in sources {
-        source
-            .cache_warm(Operation::Prefill { tokens: None })
-            .await?;
+        if let Err(error) = source.cache_warm(Operation::Prefill { tokens: None }).await {
+            errors.push(error);
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 async fn rounds(
     sources: &[Arc<EngineClient>],
     target: &Arc<EngineClient>,
-    keep: bool,
+    mut reuse: Reuse,
     tail_tokens: Option<u32>,
     prefill_tokens: Option<u32>,
+    host: bool,
 ) -> Result<Report, String> {
-    let mut report = Report::default();
+    let mut report = Report {
+        staged: host,
+        recompute: (reuse == Reuse::Recompute)
+            .then(|| "the update recomputes in-flight state".into()),
+        ..Report::default()
+    };
+    let keep = reuse == Reuse::Keep;
     let mut copied: HashMap<(u64, u64), u32> = HashMap::new();
     // A warming operation owns the transfer contexts across its rounds.
     // Individual task completion must not tear down and recreate them.
@@ -82,9 +133,11 @@ async fn rounds(
     }
     // Admission reserved room for live prefixes. Map any deferred writable
     // tail segments before leasing destination units from their pool.
-    target
-        .resize_cache(proto::request::wire::CacheChange::Grow)
-        .await?;
+    if !host {
+        target
+            .resize_cache(proto::request::wire::CacheChange::Grow)
+            .await?;
+    }
     loop {
         let mut snapshots = Vec::new();
         for source in sources {
@@ -105,12 +158,17 @@ async fn rounds(
             .iter()
             .flat_map(|snapshot| snapshot.prefixes.clone())
             .collect();
-        let targets = target
-            .cache_warm(Operation::Reserve {
-                prefixes: prefixes.clone(),
-                keep,
-            })
-            .await?;
+        let targets = if reuse == Reuse::Recompute {
+            Vec::new()
+        } else {
+            target
+                .cache_warm(Operation::Reserve {
+                    prefixes: prefixes.clone(),
+                    keep,
+                    host,
+                })
+                .await?
+        };
         let page_tokens = snapshots
             .iter()
             .chain(&targets)
@@ -118,25 +176,70 @@ async fn rounds(
             .max()
             .unwrap_or(1);
         report.limit_tokens = tail_tokens.unwrap_or(page_tokens);
+        if host {
+            // Retain the source layout as well as the successor layout.
+            // Only these completed copies permit eviction before promotion.
+            for source in sources {
+                let prefixes = prefixes
+                    .iter()
+                    .filter(|prefix| prefix.world == source.world())
+                    .cloned()
+                    .collect();
+                let backup = source.cache_warm(Operation::Stage { prefixes }).await?;
+                match copy(source, &snapshots, &backup).await? {
+                    CopyResult::Complete(bytes) => report.copied_bytes += bytes,
+                    CopyResult::Recompute(reason) => return Err(reason),
+                }
+            }
+        }
         match copy(target, &snapshots, &targets).await? {
             CopyResult::Complete(bytes) => report.copied_bytes += bytes,
             CopyResult::Recompute(reason) if !keep => {
                 report.recompute = Some(reason);
-                return Ok(report);
+                if !host {
+                    return Ok(report);
+                }
+                // No copy was submitted for an unsupported encoding. Keep
+                // the completed source backup, release the unused target
+                // views, and reserve GPU capacity for ordinary recomputation.
+                target.cache_warm(Operation::Discard).await?;
+                target.hook("uniserve.cache_unstage", "[]").await?;
+                reuse = Reuse::Recompute;
             }
             CopyResult::Recompute(reason) => {
                 return Err(format!("in-flight state cannot be kept: {reason}"));
             }
         }
-        target.cache_warm(Operation::Publish).await?;
+        target.cache_warm(Operation::Publish { host }).await?;
         for source in sources {
             source.cache_warm(Operation::Release).await?;
         }
         report.rounds += 1;
 
-        let coverage = target
-            .cache_warm(Operation::Coverage { prefixes, keep })
-            .await?;
+        let coverage = if reuse == Reuse::Recompute {
+            // The successor computes fresh state. Its predecessor still
+            // needs complete rollback copies before releasing device pages.
+            let mut coverage = Vec::new();
+            for source in sources {
+                coverage.extend(
+                    source
+                        .cache_warm(Operation::Coverage {
+                            prefixes: prefixes
+                                .iter()
+                                .filter(|prefix| prefix.world == source.world())
+                                .cloned()
+                                .collect(),
+                            keep: true,
+                        })
+                        .await?,
+                );
+            }
+            coverage
+        } else {
+            target
+                .cache_warm(Operation::Coverage { prefixes, keep })
+                .await?
+        };
         let cached: HashMap<_, _> = coverage
             .iter()
             .flat_map(|snapshot| &snapshot.prefixes)
@@ -148,18 +251,22 @@ async fn rounds(
             .map(|prefix| ((prefix.world, prefix.request), prefix.resume))
             .collect();
         let mut live = Vec::new();
+        let mut live_sources = Vec::new();
         report.tail_tokens = 0;
         report.warmed_requests = 0;
         report.warmed_tokens = 0;
         for source in sources {
             for request in source.describe_requests().await? {
                 let identity = (source.world(), request.request_id);
+                live_sources.push(identity);
                 if let Some(&resume) = resumes.get(&identity) {
                     live.push(resume);
                 }
                 let warmed = (*cached.get(&identity).unwrap_or(&0)).min(request.tokens);
-                report.warmed_tokens += u64::from(warmed);
-                report.warmed_requests += u32::from(warmed > 0);
+                if reuse != Reuse::Recompute {
+                    report.warmed_tokens += u64::from(warmed);
+                    report.warmed_requests += u32::from(warmed > 0);
+                }
                 report.tail_tokens = report.tail_tokens.max(
                     request
                         .tokens
@@ -170,6 +277,43 @@ async fn rounds(
         target
             .cache_warm(Operation::Retain { requests: live })
             .await?;
+        if host {
+            let payload =
+                serde_json::to_string(&live_sources).map_err(|error| error.to_string())?;
+            for owner in sources.iter().chain(std::iter::once(target)) {
+                owner.hook("uniserve.cache_retain_staged", &payload).await?;
+            }
+            report.backup.clear();
+            for source in sources {
+                let ranks = staged(source).await?;
+                let mut prefixes: Vec<_> = snapshots
+                    .iter()
+                    .flat_map(|snapshot| &snapshot.prefixes)
+                    .filter(|prefix| {
+                        prefix.world == source.world()
+                            && live_sources.contains(&(prefix.world, prefix.request))
+                    })
+                    .cloned()
+                    .collect();
+                for prefix in &mut prefixes {
+                    prefix.pages = ranks
+                        .iter()
+                        .flat_map(|rank| &rank.allocations)
+                        .filter(|(_, page)| page.request == (prefix.world, prefix.request))
+                        .map(|(_, page)| page.clone())
+                        .collect();
+                }
+                report.backup.push(Snapshot {
+                    prefixes,
+                    ranks,
+                    page_tokens,
+                    nodes: snapshots
+                        .iter()
+                        .flat_map(|snapshot| snapshot.nodes.clone())
+                        .collect(),
+                });
+            }
+        }
         copied = cached;
         tracing::info!(
             world = target.world(),
@@ -193,6 +337,98 @@ async fn rounds(
             }
         }
     }
+}
+
+/// Retained host keys kept across process retirement and a rollback restart.
+pub(super) fn keys(snapshots: &[Snapshot]) -> Vec<Vec<u8>> {
+    snapshots
+        .iter()
+        .flat_map(|snapshot| &snapshot.ranks)
+        .flat_map(|rank| &rank.storage.storages)
+        .flat_map(|storage| &storage.chunks)
+        .map(|chunk| chunk.key)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|key| key.0.to_vec())
+        .collect()
+}
+
+/// Load the successor's staged layout after the predecessors evicted their
+/// copied tails. Publication follows physical copy completion on every rank.
+pub(super) async fn materialize(target: &Arc<EngineClient>) -> Result<(), String> {
+    target
+        .resize_cache(proto::request::wire::CacheChange::Grow)
+        .await?;
+    let destinations = target.cache_warm(Operation::Materialize).await?;
+    let ranks = staged(target).await?;
+    let source = Snapshot {
+        ranks,
+        nodes: destinations
+            .iter()
+            .flat_map(|snapshot| snapshot.nodes.clone())
+            .collect(),
+        prefixes: Vec::new(),
+        page_tokens: 1,
+    };
+    match copy(target, &[source], &destinations).await? {
+        CopyResult::Complete(_) => {}
+        CopyResult::Recompute(reason) => return Err(reason),
+    }
+    target
+        .cache_warm(Operation::Publish { host: false })
+        .await?;
+    target.hook("uniserve.cache_unstage", "[]").await?;
+    Ok(())
+}
+
+async fn staged(target: &Arc<EngineClient>) -> Result<Vec<cache::Rank>, String> {
+    Ok(target
+        .hook("uniserve.cache_staged", "null")
+        .await?
+        .into_iter()
+        .map(|value| {
+            serde_json::from_str::<Option<cache::Rank>>(&value).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// Restore complete source pages before releasing its held continuations.
+/// The caller has retired the successor and restored the source's capacity.
+pub(super) async fn restore(target: &Arc<EngineClient>, backup: &[Snapshot]) -> Result<(), String> {
+    let mut prefixes = BTreeMap::new();
+    for prefix in backup
+        .iter()
+        .flat_map(|snapshot| &snapshot.prefixes)
+        .filter(|prefix| prefix.world == target.world())
+    {
+        prefixes.insert((prefix.world, prefix.request), prefix.clone());
+    }
+    if prefixes.is_empty() {
+        return Ok(());
+    }
+    target
+        .resize_cache(proto::request::wire::CacheChange::Grow)
+        .await?;
+    let destinations = target
+        .cache_warm(Operation::Reserve {
+            prefixes: prefixes.into_values().collect(),
+            keep: true,
+            host: false,
+        })
+        .await?;
+    match copy(target, backup, &destinations).await? {
+        CopyResult::Complete(_) => {}
+        CopyResult::Recompute(reason) => return Err(reason),
+    }
+    target
+        .cache_warm(Operation::Publish { host: false })
+        .await?;
+    let payload = serde_json::to_string(&keys(backup)).map_err(|error| error.to_string())?;
+    target.hook("uniserve.cache_unstage", &payload).await?;
+    Ok(())
 }
 
 enum CopyResult {
@@ -248,6 +484,18 @@ async fn copy(
                 .collect::<Result<Vec<_>, String>>()?;
             Ok(cache::Sources {
                 host: (*host).to_owned(),
+                host_destination: hosts[host]
+                    .iter()
+                    .flat_map(|rank| &rank.storage.storages)
+                    .flat_map(|storage| &storage.chunks)
+                    .any(|chunk| {
+                        matches!(
+                            chunk.binding,
+                            Binding::Local {
+                                at: Placement::Host { .. }
+                            }
+                        )
+                    }),
                 sources: storage::manifest::weights::Sources {
                     world: World { ranks },
                     links: Vec::new(),
@@ -393,6 +641,7 @@ mod tests {
             client.cache_warm(Operation::Reserve {
                 prefixes: Vec::new(),
                 keep: false,
+                host: false,
             }),
         )
         .await

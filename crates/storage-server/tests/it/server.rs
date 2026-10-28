@@ -1702,8 +1702,20 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         file.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"cache bytes");
         assert_eq!(worker.list().unwrap().tensors.len(), 1);
-        worker.retain(Vec::new(), Vec::new()).unwrap();
-        assert!(worker.list().unwrap().tensors.is_empty());
+        drop(worker);
+        assert_eq!(head.keep_weights(vec![1], vec![key(42)]).unwrap(), 0);
+        let mut resumed = world_worker(&server.socket, scope("text", 0), 1, claim);
+        let got = resumed
+            .get(vec![key(42)], Mode::Standby, Vec::new())
+            .unwrap();
+        let (_, descriptor) = got.storages.into_iter().next().unwrap();
+        let mut restored = std::fs::File::from(descriptor);
+        restored.seek(std::io::SeekFrom::Start(0)).unwrap();
+        restored.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"cache bytes");
+        drop(resumed);
+        assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
+        assert!(head.list().unwrap().tensors.is_empty());
     }
 }
 
@@ -2107,7 +2119,7 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     // The previous world's processes exit; the head keeps its weights.
     drop(first);
     await_used(&mut head, 270);
-    assert_eq!(head.keep_weights(vec![1]).unwrap(), 1);
+    assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
     let book = ledger(&mut head);
     assert_eq!(book.used(), 250);
     assert_eq!(booked(&book, Item::Weights, &[1, 2]), 200);
@@ -2116,7 +2128,10 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     // A worker is no head.
     let refused = second
         .call(
-            &storage::protocol::Request::KeepWeights { worlds: vec![1] },
+            &storage::protocol::Request::KeepWeights {
+                worlds: vec![1],
+                cache_keys: Vec::new(),
+            },
             &[],
         )
         .unwrap();

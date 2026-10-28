@@ -767,8 +767,8 @@ impl Server {
             (Request::PublishWorlds { worlds }, Role::Head { deployment, .. }) => {
                 self.publish_worlds(id, &deployment, worlds)
             }
-            (Request::KeepWeights { worlds }, Role::Head { deployment, .. }) => {
-                self.keep_weights(id, &deployment, worlds)
+            (Request::KeepWeights { worlds, cache_keys }, Role::Head { deployment, .. }) => {
+                self.keep_weights(id, &deployment, worlds, cache_keys)
             }
             (Request::DiscardPages { except }, Role::Head { deployment, .. }) => {
                 self.discard_pages(id, &deployment, *except)
@@ -1292,6 +1292,7 @@ impl Server {
         id: ClientId,
         deployment: &str,
         worlds: &[u64],
+        cache_keys: &[Key],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if !self
             .deployments
@@ -1305,7 +1306,9 @@ impl Server {
         let released: Vec<(Key, Placement)> = self
             .tensors
             .iter_mut()
-            .filter(|(_, tensor)| tensor.access == Access::Exclusive)
+            .filter(|((key, _), tensor)| {
+                tensor.access == Access::Exclusive && !cache_keys.contains(key)
+            })
             .filter_map(|(key, tensor)| {
                 tensor.retainers.retain(|retainer| {
                     retainer.scope.deployment != deployment || !worlds.contains(&retainer.world)
@@ -1321,7 +1324,7 @@ impl Server {
             deployment,
             ?worlds,
             released = count,
-            "worlds keep their weights alone"
+            "worlds retain their weights and rollback cache"
         );
         Ok(Outcome::Reply(
             Reply::Retained { released: count },

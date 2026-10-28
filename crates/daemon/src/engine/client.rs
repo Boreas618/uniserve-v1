@@ -34,6 +34,9 @@ pub struct Successor {
     /// It maps none of the engine's KV cache, so copied or recomputed
     /// in-flight state needs units of its own.
     pub unmapped_cache: bool,
+    pub host_cache: bool,
+    /// The predecessor releases its graph pool during preparation.
+    pub eager_source: bool,
     /// Its graph policy captures graphs.
     pub captures_graphs: bool,
 }
@@ -587,7 +590,8 @@ impl EngineClient {
 
     /// Grows the engine's KV cache as [`Self::resize_cache`] does, once the
     /// worlds of `keep_weights` (a previous world kept as its weights, whose
-    /// processes exited) released every storage but their weights on every
+    /// processes exited) released every storage but their weights and the
+    /// completed rollback copies named by `cache_keys` on every
     /// node, and with `to_host` moved those weights to host memory, so that
     /// each GPU's ledger leaves the cache the rest. Returns each node's
     /// report of the weights kept (JSON `{"host", "released", "moved_bytes",
@@ -601,6 +605,7 @@ impl EngineClient {
         &self,
         keep_weights: Vec<u64>,
         to_host: bool,
+        cache_keys: Vec<Vec<u8>>,
     ) -> Result<Vec<serde_json::Value>, String> {
         let results = self
             .ask(|id| {
@@ -610,6 +615,7 @@ impl EngineClient {
                     preempt_after_ms: None,
                     keep_weights,
                     keep_in_host_memory: to_host,
+                    cache_keys,
                     ..wire::ResizeCache::default()
                 })
             })
@@ -775,7 +781,10 @@ impl EngineClient {
                 cache: budget.cache,
                 cache_capacity: budget.cache_capacity,
                 cache_segment: budget.cache_segment,
-                in_flight: budget.in_flight,
+                in_flight: budget.in_flight.map(|cache| wire::CacheReservation {
+                    bytes: cache.bytes,
+                    mapped: cache.mapped,
+                }),
                 pages: budget
                     .pages
                     .iter()
@@ -796,6 +805,8 @@ impl EngineClient {
                 keep_weights: Vec::new(),
                 successor_loads_weights: successor.loads_weights,
                 successor_unmapped_cache: successor.unmapped_cache,
+                successor_host_cache: successor.host_cache,
+                eager_source: successor.eager_source,
                 successor_captures_graphs: successor.captures_graphs,
                 rank_budgets,
                 ..wire::ResizeCache::default()

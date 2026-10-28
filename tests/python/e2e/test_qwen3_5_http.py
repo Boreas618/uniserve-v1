@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -140,10 +141,13 @@ def _stop_storage_server(socket: Path) -> None:
 
 @contextmanager
 def _serve(
-    tmp_path: Path, name: str, options: tuple[str, ...] = ()
+    tmp_path: Path,
+    name: str,
+    options: tuple[str, ...] = (),
+    devices: str | None = None,
 ) -> Iterator[tuple[str, Path]]:
-    """A deployment serving `name` on one GPU with `options` beside the
-    common ones, its URL and its log.
+    """A deployment serving `name` on its reserved GPUs with `options`
+    beside the common ones, its URL and its log.
     """  # noqa: D205
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
@@ -165,7 +169,7 @@ def _serve(
         command += ["--set", option]
     log = tmp_path / f"{name}.log"
     environment = {
-        "CUDA_VISIBLE_DEVICES": _device(),
+        "CUDA_VISIBLE_DEVICES": devices or _device(),
         "XDG_RUNTIME_DIR": str(runtime),
     }
     try:
@@ -432,10 +436,82 @@ class _Streaming:
         )
         assert len(self.tokens) >= count, "the stream ended early"
 
+    @property
+    def finished(self) -> bool:
+        return not self._thread.is_alive()
+
     def join(self) -> None:
         self._thread.join(timeout=1800)
         assert not self._thread.is_alive(), "the request did not end"
         assert self.error is None, f"the stream failed: {self.error!r}"
+
+
+@pytest.mark.parametrize(
+    ("retention", "finish"), [("parked", "commit"), ("weights", "rollback")]
+)
+def test_repartitioned_recurrent_pages_resume_a_streaming_request(
+    tmp_path: Path,
+    retention: str,
+    finish: str,
+):
+    """TP1 to TP2 copies actual recurrent checkpoints and resumes their
+    private continuation while fixed-size requests keep arriving.
+    """  # noqa: D205
+    devices = os.environ["UNISERVE_WORLD_DEVICES"]
+    assert len(devices.split(",")) == 2
+    name = "qwen3_5-repartition"
+    with _serve(tmp_path, name, devices=devices) as (base_url, log):
+        streams = [_Streaming(base_url, name)]
+        streams[-1].wait_for(EARLY_TOKENS)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            change = executor.submit(
+                httpx.put,
+                f"{base_url}/admin/config",
+                json={
+                    "set": [
+                        "tensor_parallel_size=2",
+                        f"update_config.previous_world={retention}",
+                    ]
+                },
+                timeout=1800,
+            )
+            while not change.done():
+                if streams[-1].finished:
+                    streams[-1].join()
+                    streams.append(_Streaming(base_url, name))
+                time.sleep(0.01)
+            response = change.result()
+        assert response.status_code == 200, response.text
+        report = response.json()["result"]["world"]
+        assert report["kv_cache"] == "warmed", report
+        warming = report["cache_warming"]
+        assert warming["staged"], report
+        assert warming["warmed_requests"] > 0, warming
+        assert warming["warmed_tokens"] >= 256, warming
+        assert warming["tail_tokens"] <= warming["limit_tokens"], warming
+        print(
+            f"recurrent warming: {warming}, pause {report['pause_seconds']} s",
+            flush=True,
+        )
+        moved = len(streams[-1].tokens)
+        streams[-1].wait_for(moved + 1)
+        hits = _prefix_hits(base_url)
+        assert hits >= warming["warmed_tokens"]
+        finished = httpx.post(
+            f"{base_url}/admin/config/{finish}", json={}, timeout=1800
+        )
+        assert finished.status_code == 200, finished.text
+        streams[-1].join()
+        if finish == "rollback":
+            assert _prefix_hits(base_url) - hits >= warming["warmed_tokens"]
+        alone = _generate(base_url, name, COUNT_PROMPT, COUNT_TOKENS)
+
+    assert any("a request migrated" in line for line in _log_lines(log))
+    for stream in streams:
+        _close(
+            {"tokens": stream.tokens, "top": stream.top}, alone, COUNT_PROMPT
+        )
+        assert stream.usage == alone["usage"]
 
 
 def test_a_world_change_resumes_a_request_from_its_checkpoint(

@@ -57,9 +57,35 @@ impl Scheduler {
     }
 
     fn warm_pages(&mut self, operation: Operation) -> Result<Snapshot, String> {
+        let mut host = false;
+        let mut materialized = None;
         let prefixes = match operation {
             Operation::Snapshot { world, after } => self.snapshot_pages(world, &after)?,
-            Operation::Reserve { prefixes, keep } => self.reserve_pages(prefixes, keep)?,
+            Operation::Reserve {
+                prefixes,
+                keep,
+                host: staged,
+            } => {
+                host = staged;
+                self.reserve_pages(prefixes, keep, host)?
+            }
+            Operation::Stage { prefixes } => {
+                host = true;
+                prefixes
+            }
+            Operation::Materialize => {
+                materialized = Some(
+                    self.warming
+                        .reserved
+                        .iter_mut()
+                        .map(|page| {
+                            page.published = false;
+                            page.page.clone()
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                Vec::new()
+            }
             Operation::Coverage { prefixes, keep } => self.cache_coverage(prefixes, keep),
             Operation::Prefill { tokens } => {
                 if tokens == Some(0) {
@@ -74,7 +100,7 @@ impl Scheduler {
                     .retain(|page| requests.contains(&(page.resume.world, page.resume.request_id)));
                 Vec::new()
             }
-            Operation::Publish => {
+            Operation::Publish { host } => {
                 let pages: Vec<_> = self
                     .warming
                     .reserved
@@ -83,15 +109,19 @@ impl Scheduler {
                     .map(|page| page.page.clone())
                     .collect();
                 let payload = serde_json::to_string(&pages).map_err(|error| error.to_string())?;
-                self.executor
-                    .hook("uniserve.cache_publish", &payload)
-                    .map_err(|error| format!("{error:#}"))?;
+                if !host {
+                    self.executor
+                        .hook("uniserve.cache_publish", &payload)
+                        .map_err(|error| format!("{error:#}"))?;
+                }
                 if let Some(cache) = self.storage.cache() {
                     for page in &mut self.warming.reserved {
                         if page.published {
                             continue;
                         }
-                        cache.block_pool.activate([&page.reference]);
+                        if !host {
+                            cache.block_pool.activate([&page.reference]);
+                        }
                         cache.block_pool.publish(
                             &page.reference,
                             page.page.group,
@@ -131,14 +161,17 @@ impl Scheduler {
                 Vec::new()
             }
         };
-        let pages: Vec<_> = prefixes
-            .iter()
-            .flat_map(|prefix| prefix.pages.iter().cloned())
-            .collect();
+        let pages: Vec<_> = materialized.unwrap_or_else(|| {
+            prefixes
+                .iter()
+                .flat_map(|prefix| prefix.pages.iter().cloned())
+                .collect()
+        });
         let ranks = if pages.is_empty() {
             Vec::new()
         } else {
-            let payload = serde_json::to_string(&pages).map_err(|error| error.to_string())?;
+            let payload = serde_json::to_string(&storage::manifest::cache::Pages { pages, host })
+                .map_err(|error| error.to_string())?;
             self.executor
                 .hook("uniserve.cache_manifest", &payload)
                 .map_err(|error| format!("{error:#}"))?
@@ -246,13 +279,14 @@ impl Scheduler {
                         continue;
                     };
                     prefix.pages.push(Page {
-                        tensor: format!("{world}/{}", id.0),
+                        request: (world, id.0),
                         worker_group: worker.to_string(),
                         group: group as u32,
                         start: (index * shape.block_size) as u32,
                         tokens: shape.block_size as u32,
                         total_tokens: prefix.capacity_tokens,
                         state: shape.state,
+                        window: shape.window.map(|window| window as u32),
                         units: page.units().iter().map(|unit| unit.0).collect(),
                     });
                     self.warming.leased.push(page.clone());
@@ -265,7 +299,12 @@ impl Scheduler {
         Ok(prefixes)
     }
 
-    fn reserve_pages(&mut self, prefixes: Vec<Prefix>, keep: bool) -> Result<Vec<Prefix>, String> {
+    fn reserve_pages(
+        &mut self,
+        prefixes: Vec<Prefix>,
+        keep: bool,
+        host: bool,
+    ) -> Result<Vec<Prefix>, String> {
         let Some(cache) = self.storage.cache() else {
             return Ok(Vec::new());
         };
@@ -327,19 +366,24 @@ impl Scheduler {
                     }) {
                         continue;
                     }
-                    let reference = cache
-                        .block_pool
-                        .allocate(1, shape.units_per_page)
-                        .ok_or("the target cache has no room for the warming pages")?
-                        .remove(0);
+                    let reference = if host {
+                        cache.block_pool.reserve_future(shape.units_per_page)
+                    } else {
+                        cache
+                            .block_pool
+                            .allocate(1, shape.units_per_page)
+                            .map(|mut pages| pages.remove(0))
+                    }
+                    .ok_or("the target cache has no room for the warming pages")?;
                     let page = Page {
-                        tensor: format!("{}/{}", prefix.world, prefix.request),
+                        request: (prefix.world, prefix.request),
                         worker_group: group_name.to_string(),
                         group: group as u32,
                         start,
                         tokens: shape.block_size as u32,
                         total_tokens: prefix.capacity_tokens,
                         state: shape.state,
+                        window: shape.window.map(|window| window as u32),
                         units: reference.units().iter().map(|unit| unit.0).collect(),
                     };
                     reserved.push(Reserved {

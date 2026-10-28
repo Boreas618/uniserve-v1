@@ -153,6 +153,8 @@ pub(crate) struct Trial {
     pub(crate) previous_spec: wire::EngineSpec,
     pub(crate) previous_config: ServeConfig,
     pub(crate) previous: Previous,
+    /// Completed Host copies of the predecessor's in-flight cache pages.
+    pub(crate) cache_backup: Vec<storage::manifest::cache::Snapshot>,
     /// The previous world's retention mode, as the status reports it: the
     /// mode the update asked for, or `weights` when its weights could not
     /// move to host memory.
@@ -404,6 +406,8 @@ fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
         retire: Vec::new(),
         received_weights: Vec::new(),
         expert_order: Default::default(),
+        stage_cache: false,
+        cache_keys: Vec::new(),
         ..spec.clone()
     };
     // The file path is diagnostic; the resolved contents define the ranks.
@@ -649,21 +653,81 @@ fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 /// every item of every GPU and host, when a limit cannot hold the segments
 /// the serving world keeps in any case.
 async fn memory_plan(
-    running: &EngineClient,
-    successor: Successor,
+    running: &[Arc<EngineClient>],
+    successor: &mut Successor,
     budgets: &BTreeMap<storage::manifest::Gpu, storage::manifest::weights::RankBudget>,
+    target_hosts: &BTreeMap<storage::manifest::Gpu, String>,
+    control: &Arc<crate::engine::control::EngineControl>,
     previous_world: PreviousWorld,
 ) -> (serde_json::Value, Option<String>) {
-    match running
-        .make_room(wire::CacheChange::Plan, successor, None, budgets)
-        .await
-    {
-        Ok(results) => (memory_report(&results, previous_world, successor), None),
-        Err(refusal) => (
-            serde_json::json!({ "feasible": false, "refusal": refusal }),
-            Some(refusal),
-        ),
+    // Each policy spends only resources whose owner can release them while
+    // serving continues: tail eviction, host staging, then graph retirement.
+    let ordinary = *successor;
+    let staged = Successor {
+        host_cache: ordinary.unmapped_cache,
+        ..ordinary
+    };
+    let mut policies = vec![ordinary];
+    if staged != ordinary {
+        policies.push(staged);
     }
+    if !ordinary.eager_source {
+        policies.push(Successor {
+            eager_source: true,
+            ..staged
+        });
+        if staged != ordinary {
+            // A host refusal can still admit a wholly device-resident
+            // successor after its predecessor releases the graph pool.
+            policies.push(Successor {
+                eager_source: true,
+                ..ordinary
+            });
+        }
+    }
+    let mut refused = Vec::new();
+    for policy in policies {
+        let plans = futures::future::join_all(
+            running
+                .iter()
+                .map(|client| client.make_room(wire::CacheChange::Plan, policy, None, budgets)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|plans| plans.into_iter().flatten().collect::<Vec<_>>());
+        match plans {
+            Ok(results) => {
+                let report = match memory_report(
+                    &results,
+                    previous_world,
+                    policy,
+                    budgets,
+                    target_hosts,
+                    control,
+                )
+                .await
+                {
+                    Ok(report) => report,
+                    Err(error) => {
+                        refused.push(error);
+                        continue;
+                    }
+                };
+                if report["feasible"] == true {
+                    *successor = policy;
+                    return (report, None);
+                }
+                refused.push(report.to_string());
+            }
+            Err(error) => refused.push(error),
+        }
+    }
+    let refusal = refused.join("; ");
+    (
+        serde_json::json!({ "feasible": false, "refusal": refusal }),
+        Some(refusal),
+    )
 }
 
 /// The memory report of the engine's per-device plans (`ledger::Preparing`
@@ -674,12 +738,17 @@ async fn memory_plan(
 /// serving world's page pools needs none; a previous world kept in host
 /// memory moves there the weights a successor that loads its own does not
 /// map (all of the serving world's on each GPU, at most), which each host's
-/// admission must hold, or they stay on the GPUs.
-fn memory_report(
+/// admission must hold, or they stay on the GPUs. Host staging accounts for
+/// source rollback copies and assigned target rank reservations separately;
+/// target-only hosts are queried through their existing process ledger.
+async fn memory_report(
     plans: &[String],
     previous_world: PreviousWorld,
     successor: Successor,
-) -> serde_json::Value {
+    budgets: &BTreeMap<storage::manifest::Gpu, storage::manifest::weights::RankBudget>,
+    target_hosts: &BTreeMap<storage::manifest::Gpu, String>,
+    control: &Arc<crate::engine::control::EngineControl>,
+) -> Result<serde_json::Value, String> {
     let weights_to_host = previous_world == PreviousWorld::Host && successor.loads_weights;
     let mut gpus: Vec<serde_json::Value> = plans
         .iter()
@@ -697,43 +766,88 @@ fn memory_report(
             weights.insert((host.to_owned(), device.to_owned()), bytes);
         }
     }
-    let mut hosts: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut memory = BTreeMap::<String, storage::protocol::HostMemory>::new();
+    let mut staging = BTreeMap::<String, u64>::new();
     for gpu in &gpus {
-        let (Some(host), Some(memory)) = (gpu["host"].as_str(), gpu.get("host_memory")) else {
+        let (Some(host), Some(available)) = (gpu["host"].as_str(), gpu.get("host_memory")) else {
             continue;
         };
-        let room = memory["available"]
-            .as_u64()
-            .unwrap_or(0)
-            .saturating_sub(memory["reserve"].as_u64().unwrap_or(0))
-            .saturating_sub(memory["unallocated"].as_u64().unwrap_or(0));
-        let required: u64 = if weights_to_host {
-            weights
-                .iter()
-                .filter(|((on, _), _)| on == host)
-                .map(|(_, bytes)| bytes)
-                .sum()
-        } else {
-            0
-        };
-        hosts.entry(host.to_owned()).or_insert_with(|| {
-            serde_json::json!({
-                "host": host,
-                "available": memory["available"],
-                "reserve": memory["reserve"],
-                "unallocated": memory["unallocated"],
-                "admits": room,
-                "required": required,
-                "previous_world_weights": weights_to_host.then_some(required),
-                "feasible": required <= room,
-            })
-        });
+        memory.entry(host.to_owned()).or_insert(
+            serde_json::from_value(available.clone()).map_err(|error| error.to_string())?,
+        );
+        if successor.host_cache {
+            // With a rank plan, the source contributes only its rollback
+            // copy. Target layouts are charged at their own hosts below.
+            let key = if target_hosts.is_empty() {
+                "host_staging"
+            } else {
+                "in_flight_kv"
+            };
+            *staging.entry(host.to_owned()).or_default() += gpu[key].as_u64().unwrap_or(0);
+        }
     }
-    serde_json::json!({
-        "feasible": gpus.iter().all(|gpu| gpu["feasible"] == true),
+    if successor.host_cache {
+        for (gpu, host) in target_hosts {
+            let reservation = budgets
+                .get(gpu)
+                .and_then(|budget| budget.in_flight)
+                .ok_or_else(|| {
+                    format!(
+                        "target GPU {} has no continuation reservation",
+                        storage::protocol::gpu_name(gpu)
+                    )
+                })?;
+            *staging.entry(host.clone()).or_default() += reservation.bytes;
+        }
+        let missing: Vec<_> = staging
+            .keys()
+            .filter(|host| !memory.contains_key(*host))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let control = Arc::clone(control);
+            memory.extend(
+                tokio::task::spawn_blocking(move || control.host_memory(&missing))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    let mut hosts = Vec::new();
+    for (host, memory) in memory {
+        let room = memory.room();
+        let staged = staging.get(&host).copied().unwrap_or(0);
+        let required: u64 = staged
+            + if weights_to_host {
+                weights
+                    .iter()
+                    .filter(|((on, _), _)| on == &host)
+                    .map(|(_, bytes)| bytes)
+                    .sum()
+            } else {
+                0
+            };
+        hosts.push(serde_json::json!({
+            "host": host,
+            "available": memory.available,
+            "reserve": memory.reserve,
+            "unallocated": memory.unallocated,
+            "admits": room,
+            "required": required,
+            "cache_staging": staged,
+            "previous_world_weights": weights_to_host.then_some(required - staged),
+            "feasible": required <= room,
+        }));
+    }
+    Ok(serde_json::json!({
+        "feasible": gpus.iter().all(|gpu| gpu["feasible"] == true)
+            && hosts.iter().all(|host| host["feasible"] == true),
+        "host_staging": successor.host_cache,
+        "eager": successor.eager_source,
         "gpus": gpus,
-        "hosts": hosts.into_values().collect::<Vec<_>>(),
-    })
+        "hosts": hosts,
+    }))
 }
 
 /// What each step of `specs/online-operations.md` §6.5 frees on the GPU of
@@ -768,7 +882,7 @@ fn steps(
         "preparation": {
             "idle_prefix_pages": idle,
             "kv_tail": tail.saturating_sub(idle),
-            "warm_copies": bytes(&gpu["successor"]["in_flight"]),
+            "warm_copies": bytes(&gpu["trial_cache"]),
             "graph_pool": bytes(&serving["graph_pool"]),
         },
         "trial": {
@@ -1011,6 +1125,8 @@ fn begin_commit(
     for replica in current {
         if let Some(spec) = locked(&replica.served).as_mut() {
             spec.predecessor = None;
+            spec.stage_cache = false;
+            spec.cache_keys.clear();
             spec.retire = retire.clone();
         }
         replica.hold.keep(None);
@@ -1180,7 +1296,7 @@ impl Replica {
             ));
         }
         let current = locked(&self.config).clone();
-        let (mut target, stated, update) = resolve(&current, &request)?;
+        let (mut target, stated, mut update) = resolve(&current, &request)?;
         let mut target_digest = self.available(&target, request.force)?;
         if target == current && target.worker_groups.is_none() {
             return Ok(Applied::Unchanged);
@@ -1252,6 +1368,10 @@ impl Replica {
         // the update states it, the ranks' device order (§4.7). The order
         // the daemon chose is the target configuration's.
         let redistribution = if world_changes && redistributes && unmapped.is_empty() {
+            let requests = running
+                .describe_requests()
+                .await
+                .map_err(UpdateError::Refused)?;
             let planned = redistribution::plan(
                 &self.manifests,
                 self.control
@@ -1265,6 +1385,7 @@ impl Replica {
                 &[running.world()],
                 &target_spec,
                 !stated.contains("placement_config.devices"),
+                &requests,
             )
             .await
             .map_err(|error| {
@@ -1297,15 +1418,21 @@ impl Replica {
             .as_ref()
             .map(|planned| planned.budgets.clone())
             .unwrap_or_default();
+        let target_hosts = redistribution
+            .as_ref()
+            .map(|planned| planned.hosts.clone())
+            .unwrap_or_default();
         // A successor of another parallel configuration or another KV cache
         // encoding maps none of the serving world's cache, and one that
         // loads other weights does so when the requests in flight compute
         // their state again.
-        let successor = Successor {
+        let mut successor = Successor {
             loads_weights: !reloaded.is_empty() || (redistributes && redistribution.is_none()),
             unmapped_cache: redistributes
                 || kv_encoding_changes(&served, &target_spec)
                 || (!reloaded.is_empty() && request.in_flight == InFlight::Recompute),
+            host_cache: false,
+            eager_source: update.eager_prepare,
             captures_graphs: target_spec
                 .cuda_graphs
                 .as_ref()
@@ -1357,10 +1484,21 @@ impl Replica {
         // successor, with the weights it creates, per GPU and host
         // (`specs/online-operations.md` §6.6).
         let memory = if world_changes && !in_place && unmapped.is_empty() && shared_devices {
-            Some(memory_plan(&running, successor, &budgets, update.previous_world).await)
+            Some(
+                memory_plan(
+                    std::slice::from_ref(&running),
+                    &mut successor,
+                    &budgets,
+                    &target_hosts,
+                    self.control.get().ok_or(UpdateError::NoEngine)?,
+                    update.previous_world,
+                )
+                .await,
+            )
         } else {
             None
         };
+        update.eager_prepare = successor.eager_source;
         let plan = serde_json::json!({
             "from": locked(&self.worlds).executing,
             "replica": self.ordinal,
@@ -1477,6 +1615,7 @@ impl Replica {
                 successor,
                 redistributes,
                 &budgets,
+                &target_hosts,
                 redistribution,
             )
             .await?;
@@ -1497,7 +1636,7 @@ impl Replica {
     async fn change_world(
         self: &Arc<Self>,
         running: &Arc<EngineClient>,
-        served: wire::EngineSpec,
+        mut served: wire::EngineSpec,
         current: ServeConfig,
         target: ServeConfig,
         mut spec: wire::EngineSpec,
@@ -1507,6 +1646,7 @@ impl Replica {
         adds: Successor,
         redistributes: bool,
         budgets: &BTreeMap<storage::manifest::Gpu, storage::manifest::weights::RankBudget>,
+        target_hosts: &BTreeMap<storage::manifest::Gpu, String>,
         redistribution: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
@@ -1558,7 +1698,32 @@ impl Replica {
                 return Err(error.into());
             }
         };
-        let memory = memory_report(&shrunk, update.previous_world, adds);
+        let control = self.control.get().ok_or(UpdateError::NoEngine)?;
+        let memory = memory_report(
+            &shrunk,
+            update.previous_world,
+            adds,
+            budgets,
+            target_hosts,
+            control,
+        )
+        .await
+        .and_then(|report| {
+            if report["feasible"] == true {
+                Ok(report)
+            } else {
+                Err(report.to_string())
+            }
+        });
+        let memory = match memory {
+            Ok(report) => report,
+            Err(error) => {
+                self.restore_tail(running).await;
+                self.progress_done();
+                replay_graphs(running, update.eager_prepare).await;
+                return Err(UpdateError::Refused(error));
+            }
+        };
         // A successor of another parallel configuration lays its cache out
         // for the heads it holds, and one of another encoding cannot read the
         // serving world's: either maps none of its segments.
@@ -1571,6 +1736,7 @@ impl Replica {
             })?
         };
         spec.world = 0;
+        spec.stage_cache = adds.host_cache;
         spec.predecessor = Some(wire::Predecessor {
             world: previous_world,
             segments,
@@ -1640,14 +1806,22 @@ impl Replica {
                     .context("the successor world did not start")?,
             );
             let changed = running.info().prefix_seed != successor.info().prefix_seed;
-            let warmed = if adds.unmapped_cache && !(changed && in_flight == InFlight::Recompute) {
+            let recompute = changed && in_flight == InFlight::Recompute;
+            let warmed = if adds.unmapped_cache && (!recompute || adds.host_cache) {
                 self.progress("warm_cache", Some(successor.world()));
                 match warming::prepare(
                     std::slice::from_ref(running),
                     &successor,
-                    changed,
+                    if recompute {
+                        warming::Reuse::Recompute
+                    } else if changed {
+                        warming::Reuse::Keep
+                    } else {
+                        warming::Reuse::Exact
+                    },
                     update.cache_tail_tokens.map(std::num::NonZeroU32::get),
                     update.cache_prefill_tokens.map(std::num::NonZeroU32::get),
+                    adds.host_cache,
                 )
                 .await
                 {
@@ -1750,19 +1924,38 @@ impl Replica {
         } else {
             index
         };
+        let mut evicted: Option<serde_json::Value> = None;
         let promotion: anyhow::Result<()> = async {
             warming::resume_prefill(std::slice::from_ref(running))
                 .await
                 .map_err(anyhow::Error::msg)?;
+            if adds.host_cache {
+                let results = running
+                    .resize_cache(wire::CacheChange::Evict)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                evicted = results
+                    .iter()
+                    .find_map(|result| serde_json::from_str(result).ok());
+                warming::materialize(&successor)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
             successor.promote(index, recompute, grows).await?;
             Ok(())
         }
         .await;
         if let Err(error) = promotion {
             hold.keep(None);
-            let _ = running.resume(vec![world]).await;
-            hold.serve(Arc::clone(running));
+            let _ = successor.hook("uniserve.cache_cancel", "null").await;
             self.close(&successor).await;
+            let _ = running.resume(vec![world]).await;
+            if let Some(warmed) = &warmed {
+                warming::restore(running, &warmed.backup)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
+            hold.serve(Arc::clone(running));
             self.restore_tail(running).await;
             replay_graphs(running, update.eager_prepare).await;
             self.progress_done();
@@ -1813,32 +2006,25 @@ impl Replica {
         let mut mode = update.previous_world;
         let mut host_refused = None;
         let mut moved_bytes = 0;
-        let mut evicted: Option<serde_json::Value> = None;
         match &previous {
-            Previous::Parked(parked) => {
-                // A parked previous world whose cache the successor maps none
-                // of keeps it for a rollback alone: it evicts every segment
-                // past its first once their idle pages reached the host KV
-                // cache, and the successor grows into them (step 5 of
-                // `specs/online-operations.md` §6.5). A rollback reads them
-                // back from there and computes the rest again.
-                if adds.unmapped_cache {
-                    match parked.resize_cache(wire::CacheChange::Evict).await {
-                        Ok(results) => {
-                            evicted = results
-                                .iter()
-                                .find_map(|result| serde_json::from_str(result).ok());
-                        }
-                        Err(error) => warn!("the parked world did not evict its KV cache: {error}"),
-                    }
-                }
-                if let Err(error) = successor.resize_cache(wire::CacheChange::Grow).await {
-                    warn!("the successor's KV cache did not grow: {error}");
+            // Host staging already released the copied tail at promotion.
+            // Otherwise these device pages remain the rollback backing.
+            Previous::Parked(_) => {
+                if !adds.unmapped_cache
+                    && let Err(error) = successor.resize_cache(wire::CacheChange::Grow).await
+                {
+                    warn!("the successor's writable cache did not grow: {error}");
                 }
             }
             Previous::Weights => {
                 match successor
-                    .grow_keeping_weights(vec![previous_world], to_host)
+                    .grow_keeping_weights(
+                        vec![previous_world],
+                        to_host,
+                        warmed
+                            .as_ref()
+                            .map_or_else(Vec::new, |report| warming::keys(&report.backup)),
+                    )
                     .await
                 {
                     Ok(nodes) => {
@@ -1879,6 +2065,8 @@ impl Replica {
         let mut served_spec = spec;
         served_spec.world = world;
         served_spec.received_weights.clear();
+        served_spec.stage_cache = false;
+        served_spec.cache_keys.clear();
         *locked(&self.served) = Some(served_spec);
         *locked(&self.config) = target;
         let report = serde_json::json!({
@@ -1910,10 +2098,16 @@ impl Replica {
             "memory": memory,
         });
         {
+            served.cache_keys = warmed
+                .as_ref()
+                .map_or_else(Vec::new, |report| warming::keys(&report.backup));
             let mut worlds = locked(&self.worlds);
             worlds.executing = world;
             worlds.progress = None;
             worlds.trial = Some(Trial {
+                cache_backup: warmed
+                    .as_ref()
+                    .map_or_else(Vec::new, |report| report.backup.clone()),
                 world,
                 digest: target_digest,
                 previous_world,
@@ -2193,13 +2387,19 @@ pub(crate) async fn rollback(
             started
         }
     };
+    warming::restore(&previous, &trial.cache_backup)
+        .await
+        .map_err(anyhow::Error::msg)?;
     hold.serve(Arc::clone(&previous));
     crate::leader::reload_adapters(replica, &previous).await;
     if let Err(error) = previous.resize_cache(wire::CacheChange::Restore).await {
         warn!("the previous world's KV cache was not restored: {error}");
     }
     let pause = paused.elapsed();
-    *locked(&replica.served) = Some(trial.previous_spec);
+    let mut previous_spec = trial.previous_spec;
+    previous_spec.stage_cache = false;
+    previous_spec.cache_keys.clear();
+    *locked(&replica.served) = Some(previous_spec);
     *locked(&replica.config) = trial.previous_config;
     let report = serde_json::json!({
         "rolled_back": trial.world,
@@ -2334,6 +2534,100 @@ fn trial_fault(replica: &crate::leader::Replica, trial: &Trial) -> Option<String
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn host_admission_includes_new_target_nodes_once_per_rank() {
+        use proto::process::{self, downstream, reply, upstream};
+        use storage::manifest::weights::{CacheReservation, RankBudget};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("process.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // This protocol peer is the target node's existing storage ledger.
+        let node = std::thread::spawn(move || {
+            let mut connection =
+                proto::Connection::from_unix(listener.accept().unwrap().0).unwrap();
+            let _: process::Hello = connection.recv(Duration::from_secs(5)).unwrap().unwrap();
+            connection.send(&process::Welcome::default()).unwrap();
+            let message: process::Upstream =
+                connection.recv(Duration::from_secs(5)).unwrap().unwrap();
+            let Some(upstream::Kind::Request(request)) = message.kind else {
+                panic!("expected a process request");
+            };
+            connection.send(&process::Downstream {
+                kind: Some(downstream::Kind::Reply(process::Reply {
+                    id: request.id,
+                    error: String::new(),
+                    kind: Some(reply::Kind::Ledger(process::LedgerReport {
+                        ledgers: serde_json::json!({
+                            "ledgers": [],
+                            "host_memory": {"available": 800, "reserve": 100, "unallocated": 100},
+                        }).to_string(),
+                    })),
+                })),
+            }).unwrap();
+        });
+        let control = Arc::new(
+            crate::engine::control::EngineControl::new(
+                &directory.path().join("requests.sock"),
+                format!("unix:{}", socket.display()),
+                "source".into(),
+                "model".into(),
+            )
+            .unwrap(),
+        );
+        let budgets = [(1, 100), (2, 300), (3, 400)]
+            .into_iter()
+            .map(|(gpu, bytes)| {
+                (
+                    [gpu; 16],
+                    RankBudget {
+                        in_flight: Some(CacheReservation {
+                            bytes,
+                            mapped: bytes * 2,
+                        }),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let hosts = BTreeMap::from([
+            ([1; 16], "source".into()),
+            ([2; 16], "target".into()),
+            ([3; 16], "target".into()),
+        ]);
+        let plans = [serde_json::json!({
+            "host": "source", "gpu": "GPU-source", "feasible": true,
+            "in_flight_kv": 200,
+            "host_staging": 900,
+            "host_memory": {"available": 1000, "reserve": 100, "unallocated": 0},
+        })
+        .to_string()];
+        let report = memory_report(
+            &plans,
+            PreviousWorld::Parked,
+            Successor {
+                host_cache: true,
+                unmapped_cache: true,
+                ..Default::default()
+            },
+            &budgets,
+            &hosts,
+            &control,
+        )
+        .await
+        .unwrap();
+        node.join().unwrap();
+        let hosts = report["hosts"].as_array().unwrap();
+        let source = hosts.iter().find(|host| host["host"] == "source").unwrap();
+        let target = hosts.iter().find(|host| host["host"] == "target").unwrap();
+        assert_eq!(source["required"], 300);
+        assert_eq!(source["feasible"], true);
+        assert_eq!(target["required"], 700);
+        assert_eq!(target["admits"], 600);
+        assert_eq!(target["feasible"], false);
+        assert_eq!(report["feasible"], false);
+    }
+
     fn stats(batch_us: u64, batches: u64, tokens: u64, faults: u64) -> SchedulerStats {
         SchedulerStats {
             batch_roundtrip_us: batch_us,
@@ -2432,70 +2726,6 @@ mod tests {
             &comparable(&target),
             Some(&capacity)
         ));
-    }
-
-    /// Each step of a world change frees what its retention mode and the
-    /// successor leave to it: the tail's idle pages and the rest of the tail
-    /// in the preparation; in the trial, a parked previous world's segments
-    /// the successor does not map, past its first, or, kept as its weights
-    /// or in host memory, its processes with those segments, and in host
-    /// memory its weights the successor does not map.
-    #[test]
-    fn each_step_frees_what_the_mode_and_the_successor_leave_it() {
-        let gpu = serde_json::json!({
-            "serving": {"weights": 600, "graph_pool": 50, "process": 30, "exclusive": 5},
-            "serving_kv_cache": 800,
-            "kv_kept": 500,
-            "kv_floor": 100,
-            "idle_cached_tail": 120,
-            "successor": {"in_flight": 70},
-            "promotion_stall_ms": 9,
-        });
-        let reloading = Successor {
-            loads_weights: true,
-            unmapped_cache: true,
-            captures_graphs: true,
-        };
-        let parked = steps(&gpu, PreviousWorld::Parked, reloading);
-        assert_eq!(
-            parked["preparation"],
-            serde_json::json!({
-                "idle_prefix_pages": 120,
-                "kv_tail": 180,
-                "warm_copies": 70,
-                "graph_pool": 50,
-            })
-        );
-        assert_eq!(
-            parked["trial"],
-            serde_json::json!({
-                "unmapped_kv_segments": 400,
-                "weights_to_host": 0,
-                "processes": 0,
-            })
-        );
-        assert_eq!(parked["promotion_stall_ms"], 9);
-
-        let host = steps(&gpu, PreviousWorld::Host, reloading);
-        assert_eq!(
-            host["trial"],
-            serde_json::json!({
-                "unmapped_kv_segments": 0,
-                "weights_to_host": 600,
-                "processes": 585,
-            })
-        );
-        // A successor that maps the weights and the cache leaves the trial
-        // the previous world's processes alone.
-        let weights = steps(&gpu, PreviousWorld::Weights, Successor::default());
-        assert_eq!(
-            weights["trial"],
-            serde_json::json!({
-                "unmapped_kv_segments": 0,
-                "weights_to_host": 0,
-                "processes": 85,
-            })
-        );
     }
 
     /// A world change carries over a change of the build, and one of the

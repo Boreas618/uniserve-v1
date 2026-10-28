@@ -174,6 +174,10 @@ pub(super) struct Preparing {
     /// promotion that moves it to the successor through host memory copies
     /// back over the host link (step 3).
     pub(super) in_flight_kv: u64,
+    /// Old and successor layouts copied to host memory for promotion and rollback.
+    pub(super) host_staging: u64,
+    /// Target cache storage that must fit after the parked source evicts its tail.
+    pub(super) trial_cache: u64,
     /// How long such a promotion waits for that copy at the host link's
     /// measured bandwidth, in milliseconds; `None` before the Transfer
     /// Server measured the link.
@@ -302,12 +306,15 @@ pub(super) fn preparing(
         }),
         exclusive: target.map_or(serving.exclusive, |target| target.fixed),
         head_segment: target.map_or(report.head_bytes, |target| target.cache),
-        in_flight: {
+        in_flight: if adds.host_cache {
+            0
+        } else {
             let requests = if adds.unmapped_cache {
                 target.map_or(u64::from(in_flight_units) * report.unit_bytes, |target| {
-                    target
-                        .in_flight
-                        .unwrap_or_else(|| target.request_bytes(in_flight_tokens))
+                    target.in_flight.map_or_else(
+                        || target.request_bytes(in_flight_tokens),
+                        |cache| cache.mapped,
+                    )
                 })
             } else {
                 0
@@ -318,17 +325,52 @@ pub(super) fn preparing(
         },
     };
     let in_flight_kv = u64::from(in_flight_units) * report.unit_bytes;
+    let reservation = target.map_or(
+        storage::manifest::weights::CacheReservation {
+            bytes: in_flight_kv,
+            mapped: in_flight_kv,
+        },
+        |target| {
+            target
+                .in_flight
+                .unwrap_or_else(|| target.reserve_requests(in_flight_tokens))
+        },
+    );
+    let trial_cache = if adds.host_cache {
+        reservation.mapped
+    } else {
+        0
+    };
+    let host_staging = if adds.host_cache {
+        in_flight_kv + reservation.bytes
+    } else {
+        0
+    };
     let promotion_stall_ms = ledger
         .host_link_bytes_per_second
         .filter(|&bandwidth| bandwidth > 0)
-        .map(|bandwidth| in_flight_kv.saturating_mul(1000).div_ceil(bandwidth));
-    let beside = ledger.used() + unbooked_context - serving_kv_cache + successor.total();
+        .map(|bandwidth| {
+            if adds.host_cache {
+                reservation.bytes.saturating_mul(1000).div_ceil(bandwidth)
+            } else {
+                0
+            }
+        });
+    // Planning accounts for the graph pool that the owner will release.
+    // After the eager switch, the live ledger already reports zero here.
+    let released_graphs = if adds.eager_source {
+        serving.graph_pool
+    } else {
+        0
+    };
+    let beside =
+        ledger.used() + unbooked_context - serving_kv_cache - released_graphs + successor.total();
     // The successor's grant is never more than the device has free, so its
     // additions and the Transfer Server's context not created yet must fit
     // in the free storage and the tail the serving world gives back: a
     // process outside the deployment may hold more of the device than the
     // quota leaves it.
-    let within_free = report.free_bytes as i64 + serving_kv_cache as i64
+    let within_free = report.free_bytes as i64 + serving_kv_cache as i64 + released_graphs as i64
         - (successor.total() + unbooked_context) as i64;
     let kv_limit = (quota as i64 - beside as i64).min(within_free);
 
@@ -368,8 +410,10 @@ pub(super) fn preparing(
         // The caller counts the idle cached pages past the kept segments.
         idle_cached_tail: 0,
         in_flight_kv,
+        host_staging,
+        trial_cache,
         promotion_stall_ms,
-        feasible: kv_floor as i64 <= kv_limit,
+        feasible: (kv_floor + trial_cache) as i64 <= kv_limit,
         entries: ledger.entries.iter().map(LedgerEntry::describe).collect(),
         host_memory: report.host_memory,
     })

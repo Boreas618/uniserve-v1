@@ -762,6 +762,32 @@ impl BlockPool {
         Some(pages)
     }
 
+    /// Reserve logical units in the unmapped tail for host-staged pages.
+    /// Only a standby cache uses these references. The caller maps their
+    /// segments and copies the bytes before admitting any request to them.
+    pub(crate) fn reserve_future(&self, units_per_page: usize) -> Option<PageRef> {
+        let mut inner = lock(&self.inner);
+        let units: Vec<_> = (inner.withdrawn.max(inner.scratch + 1)..inner.meta.len() as u32)
+            .filter(|unit| {
+                !inner.inherited.contains(unit) && inner.meta[*unit as usize].ref_cnt == 0
+            })
+            .take(units_per_page)
+            .map(UnitId)
+            .collect();
+        if units.is_empty() || units.len() != units_per_page {
+            return None;
+        }
+        for unit in &units {
+            let meta = &mut inner.meta[unit.0 as usize];
+            meta.state = UnitState::Reserved;
+            meta.ref_cnt = 1;
+        }
+        Some(PageRef {
+            units: units.into_boxed_slice(),
+            pool: Arc::downgrade(&self.inner),
+        })
+    }
+
     /// Marks this pool's `Reserved` units of `pages` as `Active`.
     ///
     /// Units in any other state, or pages from another pool, are unchanged.

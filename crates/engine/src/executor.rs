@@ -1533,8 +1533,9 @@ pub trait Executor: Send {
         &mut self,
         worlds: &[u64],
         to_host: bool,
+        cache_keys: &[Vec<u8>],
     ) -> Result<Vec<String>, ExecutorError> {
-        let _ = (worlds, to_host);
+        let _ = (worlds, to_host, cache_keys);
         Ok(Vec::new())
     }
     /// Halves, or restores when not `halve`, the byte budgets of the links

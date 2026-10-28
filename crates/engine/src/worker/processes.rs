@@ -300,12 +300,14 @@ impl ProcessClient {
         deployment: &str,
         worlds: &[u64],
         to_host: bool,
+        cache_keys: &[Vec<u8>],
     ) -> anyhow::Result<WeightsKept> {
         let kind = request::Kind::KeepWeights(KeepWeights {
             host: host.to_owned(),
             deployment: deployment.to_owned(),
             worlds: worlds.to_vec(),
             to_host,
+            cache_keys: cache_keys.to_vec(),
         });
         let timeout = if to_host {
             MOVE_TIMEOUT
