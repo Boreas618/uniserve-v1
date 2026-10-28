@@ -363,6 +363,26 @@ def tensor_entry(identity: str, tensor: torch.Tensor) -> _Entry:
     return _Entry(identity, {"kind": "dense"}, {_DATA: tensor})
 
 
+def restore_tensor(
+    representation: Mapping[str, Any], fields: Mapping[str, torch.Tensor]
+) -> torch.Tensor:
+    """Reconstruct a numerical tensor as borrowed views of retained fields."""
+    if representation["kind"] == "dense":
+        return fields[_DATA]
+    quantizer = Quantizer(
+        representation["format"],
+        axis=representation["axis"],
+        calibrated_scale=representation["calibrated_scale"],
+    )
+    return quantizer.from_tensors(
+        fields,
+        shape=tuple(representation["shape"]),
+        dtype=_dtype(representation["dtype"]),
+        scale_layout=ScaleLayout(representation["scale_layout"]),
+        row_order=RowOrder(representation["row_order"]),
+    )
+
+
 def to_canonical(tensor: QuantizedTensor) -> QuantizedTensor:
     """``tensor`` in the canonical encoding of its format: block scales in
     linear order and every matrix's rows in logical order, each field an
@@ -615,6 +635,54 @@ class Layout:
     _cached: int = 0
     # The entries of host-streamed matrices, by parameter identity.
     _host: dict[int, _Entry] = field(default_factory=dict)
+
+    def replace_fields(self, fields: Mapping[str, torch.Tensor]) -> Layout:
+        """Describe the same numerical tensors over borrowed field storage.
+
+        Keys are manifest field names (``p:path/field``). Shapes, encodings,
+        and logical coordinates stay unchanged; only backing storage changes.
+        This lets streaming owners publish resident weights without describing
+        the temporary device slots their computations borrow.
+        """
+        entries = [
+            dataclasses.replace(
+                entry,
+                fields={
+                    name: fields.get(f"{entry.id}/{name}", value)
+                    for name, value in entry.fields.items()
+                },
+            )
+            for entry in self.entries
+        ]
+        return self._indexed(entries)
+
+    def merge(self, other: Layout) -> Layout:
+        """Replace the tensors described by ``other``, keeping other entries."""
+        replaced = {entry.id for entry in other.entries}
+        return self._indexed(
+            [
+                *(entry for entry in self.entries if entry.id not in replaced),
+                *other.entries,
+            ]
+        )
+
+    @classmethod
+    def _indexed(cls, entries: list[_Entry]) -> Layout:
+        layout = cls(entries)
+        index: dict[tuple[str, int], int] = {}
+        for entry in entries:
+            if entry.host:
+                continue
+            for name, value in entry.fields.items():
+                storage = value.untyped_storage()
+                key = (str(value.device), storage.data_ptr())
+                if key not in index:
+                    index[key] = len(layout._storages)
+                    layout._storages.append(storage)
+                    layout._views.append([])
+                offset = value.storage_offset() * value.element_size()
+                layout._views[index[key]].append((entry, name, value, offset))
+        return layout
 
     @classmethod
     def describe(
@@ -980,22 +1048,7 @@ class Retained:
                 raise ValueError(f"retained fields {missing} have no record")
             parts = {name: fields[f"{identity}/{name}"] for name in names}
             representation = entry["representation"]
-            if representation["kind"] == "quantized":
-                quantizer = Quantizer(
-                    representation["format"],
-                    axis=representation["axis"],
-                    calibrated_scale=representation["calibrated_scale"],
-                )
-                value: torch.Tensor = quantizer.from_tensors(
-                    parts,
-                    shape=tuple(representation["shape"]),
-                    dtype=_dtype(representation["dtype"]),
-                    scale_layout=ScaleLayout(representation["scale_layout"]),
-                    row_order=RowOrder(representation["row_order"]),
-                )
-            else:
-                value = parts[_DATA]
-            tensors[identity] = value
+            tensors[identity] = restore_tensor(representation, parts)
         return cls(tensors)
 
     def install(

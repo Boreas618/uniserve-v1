@@ -8,4 +8,6 @@ pub(crate) mod topology;
 mod weight_prefetch;
 pub(crate) mod world;
 
-pub(crate) use weight_prefetch::{DwdpManager, HostRetention, HostWeights};
+pub(crate) use weight_prefetch::{
+    DwdpManager, DwdpUpdate, ExpertWeights, HostRetention, HostWeights, ShardField,
+};

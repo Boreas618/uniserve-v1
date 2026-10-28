@@ -262,6 +262,33 @@ struct FieldRecord {
 }
 
 impl WeightKeys {
+    /// Republish a bound rank when a streaming owner replaces its resident
+    /// fields. Existing ordinary and host storages stay in the same manifest.
+    pub(crate) fn borrowed(
+        &self,
+        model: &Handle,
+        host: &[String],
+        found: &Found,
+    ) -> Result<Published> {
+        let layout = self.plan(model, host, None)?.layout;
+        Ok(Published {
+            keys: self.clone(),
+            layout,
+            manifest: WeightManifest {
+                version: MANIFEST_VERSION,
+                fingerprints: self.fingerprint_digests(),
+                tensors: manifest_tensors(&found.manifest)?,
+                storages: found.kept.clone(),
+            },
+            storages: found.storages.clone(),
+            created: Vec::new(),
+            shared: found
+                .kept
+                .iter()
+                .flat_map(|storage| storage.storage.chunks.iter().map(|chunk| chunk.key))
+                .collect(),
+        })
+    }
     /// The keys of weights of a model with `fingerprints` at `position` in
     /// its parallel configuration ([`position`]), on `devices` (the primary
     /// device first), chunked for the parallel `degrees`.
@@ -1166,6 +1193,162 @@ impl FieldColumns {
 }
 
 impl Published {
+    /// Replace numerical fields with the allocations their streaming owner
+    /// actually keeps resident. Fields in ordinary or host storage remain
+    /// retained; superseded shard allocations are released with this owner.
+    /// Returns keys the caller can release after publishing the replacement.
+    pub(crate) fn replace_resident(
+        &mut self,
+        layout: Handle,
+        live: &[Arc<Storage>],
+    ) -> Result<Vec<Key>> {
+        let method = |name: &str| Interpreter::import(&format!("{RETAINED}.Layout.{name}"));
+        let numbers = |name: &str| -> Result<Vec<i64>> {
+            integers(method(name)?.call_values(&[layout.to_any()])?)
+                .map_err(|error| Error::numerical(name, &error))
+        };
+        let names = |name: &str| -> Result<Vec<String>> {
+            texts(method(name)?.call_values(&[layout.to_any()])?)
+                .map_err(|error| Error::numerical(name, &error))
+        };
+        let tensors: tvm_ffi::String = method("manifest")?.call_as(&[layout.view()])?;
+        let tensors = manifest_tensors(tensors.as_str())?;
+        let replaced: BTreeSet<_> = tensors.iter().map(|tensor| tensor.id.clone()).collect();
+        let fields = FieldColumns {
+            ids: names("field_ids")?,
+            sources: names("field_sources")?,
+            storages: numbers("field_storages")?,
+            offsets: numbers("field_offsets")?,
+            dtypes: names("field_dtypes")?,
+            ranks: numbers("field_ranks")?,
+            shapes: numbers("field_shapes")?,
+            strides: numbers("field_strides")?,
+            parts: names("field_parts")?,
+        }
+        .fields()?;
+        let addresses = numbers("storage_addresses")?;
+        let mut incoming = Vec::new();
+        let mut replaced_fields = BTreeSet::new();
+        for (index, address) in addresses.into_iter().enumerate() {
+            let Some(owner) = live.iter().find(|owner| owner.address() == address as u64) else {
+                // Scalar quantization constants retain their existing owner;
+                // only fields transferred into distributed pages are replaced.
+                continue;
+            };
+            let allocation = owner.allocation().ok_or(Error::State(
+                "distributed resident fields use exportable allocations",
+            ))?;
+            let device = self.keys.device_index(allocation.device().0 as i64)?;
+            let (_, gpu) = self.keys.device(device)?;
+            let location = Placement::Device { gpu };
+            let storage_layout = StorageLayout {
+                bytes: owner.bytes() as u64,
+                fields: fields
+                    .iter()
+                    .filter(|(storage, _)| *storage == index)
+                    .map(|(_, field)| field.clone())
+                    .collect(),
+            };
+            replaced_fields.extend(
+                storage_layout
+                    .fields
+                    .iter()
+                    .map(|field| field.tensor.clone()),
+            );
+            let length = storage_layout.bytes;
+            let key = storage_layout
+                .chunk_key(&(0..length), &|source| self.keys.fingerprint(source))
+                .map_err(|error| Error::Interface(error.to_string()))?;
+            let descriptor = allocation.export_descriptor()?.ok_or(Error::State(
+                "resident weights export a retained descriptor",
+            ))?;
+            let fabric = match allocation.export()? {
+                Some(cuda::ShareableHandle::Fabric(bytes)) => {
+                    Some(storage::protocol::FabricHandle(bytes))
+                }
+                _ => None,
+            };
+            self.created.push((
+                TensorRecord {
+                    key,
+                    name: "resident expert weights".into(),
+                    storage: 0,
+                    offset: 0,
+                    dtype: "uint8".into(),
+                    shape: vec![length],
+                    strides: vec![1],
+                    access: Access::ReadOnly,
+                },
+                StorageRecord {
+                    placement: location,
+                    bytes: length,
+                    segment: None,
+                    fabric,
+                },
+                descriptor,
+            ));
+            incoming.push((
+                Arc::clone(owner),
+                RetainedStorage {
+                    device: Some(device),
+                    storage: manifest::Storage {
+                        layout: storage_layout,
+                        chunks: vec![manifest::Chunk {
+                            offset: 0,
+                            length,
+                            key,
+                            storage_offset: 0,
+                            binding: manifest::Binding::Local { at: location },
+                        }],
+                    },
+                },
+            ));
+        }
+        let previous: BTreeSet<_> = self
+            .manifest
+            .storages
+            .iter()
+            .flat_map(|storage| storage.storage.chunks.iter().map(|chunk| chunk.key))
+            .collect();
+        let mut kept = Vec::new();
+        let mut kept_owners = Vec::new();
+        for (owner, mut storage) in self
+            .storages
+            .drain(..)
+            .zip(self.manifest.storages.drain(..))
+        {
+            storage
+                .storage
+                .layout
+                .fields
+                .retain(|field| !replaced_fields.contains(&field.tensor));
+            if !storage.storage.layout.fields.is_empty() {
+                kept.push(storage);
+                kept_owners.push(owner);
+            }
+        }
+        for (owner, storage) in incoming {
+            kept_owners.push(owner);
+            kept.push(storage);
+        }
+        self.storages = kept_owners;
+        self.manifest.storages = kept;
+        self.manifest
+            .tensors
+            .retain(|tensor| !replaced.contains(&tensor.id));
+        self.manifest.tensors.extend(tensors);
+        let current: BTreeSet<_> = self
+            .manifest
+            .storages
+            .iter()
+            .flat_map(|storage| storage.storage.chunks.iter().map(|chunk| chunk.key))
+            .collect();
+        self.created
+            .retain(|(tensor, _, _)| current.contains(&tensor.key));
+        self.shared.retain(|key| current.contains(key));
+        Ok(previous.difference(&current).copied().collect())
+    }
+
     /// Keep in the manifest the storages the worker bound from `found`,
     /// beside those it publishes: a later worker binds them too. A bound
     /// storage holding a tensor of `load`, which the worker read again, is
@@ -1185,6 +1368,14 @@ impl Published {
                 .iter()
                 .filter(|storage| !reread(storage))
                 .cloned(),
+        );
+        self.storages.extend(
+            found
+                .kept
+                .iter()
+                .zip(&found.storages)
+                .filter(|(storage, _)| !reread(storage))
+                .map(|(_, owner)| Arc::clone(owner)),
         );
     }
 

@@ -50,7 +50,7 @@ enum Kind {
     /// this process; for memory the Storage Server retains, with the
     /// descriptor that maps it, which this process exports it by.
     Mapped {
-        mapping: PeerMapping,
+        mapping: Mutex<PeerMapping>,
         descriptor: Option<OwnedFd>,
     },
     /// Host memory the Storage Server retains: a memfd mapped into this
@@ -228,6 +228,18 @@ impl Storage {
         Ok(memory)
     }
 
+    /// Device storage whose owner keeps fabric exports live while a Storage
+    /// Server can retain the same allocation through its POSIX descriptor.
+    pub(crate) fn retained_device(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
+        let allocation = DeviceAllocation::retainable(device, bytes, &[])?;
+        let address = allocation.address();
+        let memory = Arc::new(Self {
+            kind: Kind::Device(allocation),
+        });
+        lock(&EXPORTABLE).insert(address, (Arc::downgrade(&memory), Residency::Resident));
+        Ok(memory)
+    }
+
     /// Every other visible device that can address `device`'s memory: the
     /// devices an exportable allocation grants access to, so in-process
     /// readers on those devices can copy from it.
@@ -261,7 +273,7 @@ impl Storage {
     pub(crate) fn mapped(mapping: PeerMapping) -> Arc<Self> {
         Arc::new(Self {
             kind: Kind::Mapped {
-                mapping,
+                mapping: Mutex::new(mapping),
                 descriptor: None,
             },
         })
@@ -378,7 +390,7 @@ impl Storage {
         let address = mapping.address();
         let storage = Arc::new(Self {
             kind: Kind::Mapped {
-                mapping,
+                mapping: Mutex::new(mapping),
                 descriptor: Some(descriptor),
             },
         });
@@ -489,7 +501,7 @@ impl Storage {
     pub(crate) fn protect(&self, protection: Protection) -> Result<()> {
         match &self.kind {
             Kind::Device(allocation) => Ok(allocation.protect(protection)?),
-            Kind::Mapped { mapping, .. } => Ok(mapping.protect(protection)?),
+            Kind::Mapped { mapping, .. } => Ok(lock(mapping).protect(protection)?),
             Kind::Segmented(segments) => Ok(lock(&segments.mapping).protect(protection)?),
             Kind::Retained(mapping) if protection == Protection::ReadOnly => mapping.seal(),
             Kind::Retained(_) | Kind::Pinned(_) | Kind::Host(_) => Err(Error::Invariant(
@@ -506,6 +518,28 @@ impl Storage {
             Kind::Device(allocation) => Some(allocation),
             _ => None,
         }
+    }
+
+    /// Replace a drained composite alias while preserving every tensor address.
+    /// Both storages must be unretained aliases; retained manifests own their
+    /// descriptors and use segmented remapping instead.
+    pub(crate) fn remap_alias(&self, source: &Self) -> Result<()> {
+        let (
+            Kind::Mapped {
+                mapping: target,
+                descriptor: None,
+            },
+            Kind::Mapped {
+                mapping: source,
+                descriptor: None,
+            },
+        ) = (&self.kind, &source.kind)
+        else {
+            return Err(Error::State(
+                "alias replacement requires composite mappings",
+            ));
+        };
+        Ok(lock(target).remap_from(&lock(source))?)
     }
 
     /// The live exportable allocation containing `address`, with the
@@ -550,7 +584,7 @@ impl Drop for Storage {
             Kind::Mapped {
                 mapping,
                 descriptor: Some(_),
-            } => Some(mapping.address()),
+            } => Some(lock(mapping).address()),
             _ => None,
         };
         if let Some(address) = registered {
@@ -571,7 +605,7 @@ impl Backing for Storage {
     fn device(&self) -> MemoryKind {
         match &self.kind {
             Kind::Device(allocation) => MemoryKind::Cuda(allocation.device()),
-            Kind::Mapped { mapping, .. } => MemoryKind::Cuda(mapping.device()),
+            Kind::Mapped { mapping, .. } => MemoryKind::Cuda(lock(mapping).device()),
             Kind::Segmented(segments) => MemoryKind::Cuda(segments.device),
             Kind::Pinned(_) | Kind::Retained(_) => MemoryKind::PinnedHost,
             Kind::Host(_) => MemoryKind::Host,
@@ -581,7 +615,7 @@ impl Backing for Storage {
     fn address(&self) -> u64 {
         match &self.kind {
             Kind::Device(allocation) => allocation.address(),
-            Kind::Mapped { mapping, .. } => mapping.address(),
+            Kind::Mapped { mapping, .. } => lock(mapping).address(),
             Kind::Segmented(segments) => segments.address,
             Kind::Pinned(buffer) => buffer.address(),
             Kind::Host(bytes) => bytes.as_ptr() as u64,
@@ -592,7 +626,7 @@ impl Backing for Storage {
     fn bytes(&self) -> usize {
         match &self.kind {
             Kind::Device(allocation) => allocation.len(),
-            Kind::Mapped { mapping, .. } => mapping.len(),
+            Kind::Mapped { mapping, .. } => lock(mapping).len(),
             Kind::Segmented(segments) => segments.bytes,
             Kind::Pinned(buffer) => buffer.len(),
             Kind::Host(bytes) => bytes.len(),

@@ -319,13 +319,23 @@ impl Worker {
             .collect();
         // A rank publishes what it read: everything, or the tensors it
         // read beside those it bound.
-        let (mut published, (bound, receipt)) = match (found, &keys) {
+        let distributed_weights = launch
+            .expert_parallel
+            .as_ref()
+            .is_some_and(|union| union.prefetches_weights());
+        let (mut published, (bound, mut receipt)) = match (found, &keys) {
             (Some(found), Some(keys)) if !load.is_empty() => {
                 let mut published = keys
                     .publish(&retained, model.handle(), &host_paths, Some(&load))
                     .map_err(phase("load"))?;
                 // The manifest names what the rank bound as well.
                 published.keep(&found, &load);
+                (Some(published), found.into_storages())
+            }
+            (Some(found), Some(keys)) if distributed_weights => {
+                let published = keys
+                    .borrowed(model.handle(), &host_paths, &found)
+                    .map_err(phase("load"))?;
                 (Some(published), found.into_storages())
             }
             (Some(found), _) => (None, found.into_storages()),
@@ -338,6 +348,11 @@ impl Worker {
             ),
             (None, None) => (None, (Vec::new(), None)),
         };
+        if distributed_weights && let Some(mut receiving) = receipt.take() {
+            // DWDP transforms local shards into peer-visible resident pages;
+            // their source bytes must arrive before this startup copy.
+            receiving.retain(&retained, true).map_err(phase("load"))?;
+        }
         let Prepared {
             mut config,
             capturable,
@@ -378,6 +393,15 @@ impl Worker {
         };
         let host_weights =
             HostWeights::start(&model, &components, &mut retention).map_err(phase("load"))?;
+        let retired = match (&weights, &mut published) {
+            (Some(weights), Some(published)) => {
+                let update = weights.update();
+                published
+                    .replace_resident(update.layout("{}")?, &update.storages()?)
+                    .map_err(phase("load"))?
+            }
+            _ => Vec::new(),
+        };
         // Weights received from other worlds arrive while the model binds
         // them, the executor and the expert exchange are built, capacity is
         // planned and the graphs are captured at the storages' fixed
@@ -386,12 +410,12 @@ impl Worker {
         let received = receipt.map(|receipt| (receipt, published.is_some()));
         let weight_storages = match published {
             Some(published) => {
-                let mut storages = published.put(&retained).map_err(phase("load"))?;
-                storages.extend(bound);
-                storages
+                drop(bound);
+                published.put(&retained).map_err(phase("load"))?
             }
             None => bound,
         };
+        retained.forget(&retired).map_err(phase("load"))?;
         // Plugins allocate the memory their kernels communicate through
         // before capacity planning measures free memory.
         let (plugin_buffers, unattributed) =
