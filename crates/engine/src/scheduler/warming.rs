@@ -210,6 +210,12 @@ impl Scheduler {
             let mut prefix = Prefix {
                 world,
                 request: id.0,
+                resume: state
+                    .req
+                    .cache
+                    .resume
+                    .map_or((world, id.0), |resume| (resume.world, resume.request_id)),
+                capacity_tokens: state.max_reserved_cache_tokens as u32,
                 tokens,
                 computed: state.cache_visible_len,
                 cached: 0,
@@ -245,7 +251,7 @@ impl Scheduler {
                         group: group as u32,
                         start: (index * shape.block_size) as u32,
                         tokens: shape.block_size as u32,
-                        total_tokens: prefix.tokens.len() as u32,
+                        total_tokens: prefix.capacity_tokens,
                         state: shape.state,
                         units: page.units().iter().map(|unit| unit.0).collect(),
                     });
@@ -275,8 +281,8 @@ impl Scheduler {
         let mut reserved = Vec::new();
         for mut prefix in prefixes {
             let resume = proto::request::CacheResume {
-                world: prefix.world,
-                request_id: prefix.request,
+                world: prefix.resume.0,
+                request_id: prefix.resume.1,
             };
             let scope = PrefixScope {
                 isolation_key: prefix.isolation_key,
@@ -332,7 +338,7 @@ impl Scheduler {
                         group: group as u32,
                         start,
                         tokens: shape.block_size as u32,
-                        total_tokens: prefix.tokens.len() as u32,
+                        total_tokens: prefix.capacity_tokens,
                         state: shape.state,
                         units: reference.units().iter().map(|unit| unit.0).collect(),
                     };
@@ -360,8 +366,8 @@ impl Scheduler {
         if let Some(cache) = self.storage.cache() {
             for prefix in &mut prefixes {
                 let resume = proto::request::CacheResume {
-                    world: prefix.world,
-                    request_id: prefix.request,
+                    world: prefix.resume.0,
+                    request_id: prefix.resume.1,
                 };
                 let scope = PrefixScope {
                     isolation_key: prefix.isolation_key,
