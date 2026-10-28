@@ -110,7 +110,7 @@ impl Scheduler {
                     allocations
                         .block_tables()
                         .iter()
-                        .map(|table| table.unit_ids().len() as u32)
+                        .map(|table| table.held_units() as u32)
                         .sum()
                 });
                 (units, state.reserve_worstcase)
@@ -150,7 +150,7 @@ impl Scheduler {
                 allocations
                     .block_tables()
                     .iter()
-                    .map(|table| table.unit_ids().len() as u32)
+                    .map(|table| table.held_units() as u32)
                     .sum::<u32>()
             });
             tokens.push(proto::request::wire::RequestPrefix {

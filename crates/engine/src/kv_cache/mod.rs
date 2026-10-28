@@ -1242,6 +1242,15 @@ impl BlockTable {
         self.end_page() * self.shape.block_size
     }
 
+    /// Physical units held by this table, excluding sparse checkpoint holes.
+    pub(crate) fn held_units(&self) -> usize {
+        self.pages
+            .iter()
+            .filter_map(|entry| entry.page.as_ref())
+            .map(|page| page.units().len())
+            .sum()
+    }
+
     /// Returns the held pages' units, page-major from `start_page`; a page
     /// without units names the padding sentinel, unit 0, in each position.
     pub(crate) fn unit_ids(&self) -> Vec<UnitId> {
@@ -3173,6 +3182,14 @@ mod tests {
             .ensure_capacity(&pool, &mut allocation, 0, 10, Checkpoint::Boundary)
             .unwrap();
         assert_eq!(free - pool.free_units(), 3 + 3);
+        assert_eq!(
+            allocation
+                .tables
+                .iter()
+                .map(BlockTable::held_units)
+                .sum::<usize>(),
+            free - pool.free_units(),
+        );
         let units = allocation.tables[1].unit_ids();
         assert_eq!(units.len(), 9);
         assert!(
