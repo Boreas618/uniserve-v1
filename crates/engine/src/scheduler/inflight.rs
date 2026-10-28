@@ -77,6 +77,8 @@ pub(super) struct PendingBatch {
     /// Whether the batch carries a `BatchKind::Prefill` call; such batches
     /// count against `PREFILL_WINDOW_CREDITS`.
     pub(super) prefill: bool,
+    /// The kind of step the batch's worker time measures, if any.
+    pub(super) measured: Option<speculation::MeasuredStep>,
 }
 
 /// Owns submitted identities and their lifetime through ordered reconciliation.
@@ -145,6 +147,9 @@ impl Inflight {
                     .requests
                     .iter()
                     .any(|(call, _)| batch_kind(call.kind) == BatchKind::Prefill),
+                measured: speculation::MeasuredStep::of(
+                    batch.requests.iter().map(|(call, _)| call),
+                ),
             },
         );
     }

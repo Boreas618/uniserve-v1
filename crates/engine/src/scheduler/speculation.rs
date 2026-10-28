@@ -24,10 +24,126 @@
 //! policy finds it worth its cost ([`crate::scheduler::RefillPolicy`]).
 //! Once the refill reaches the entries the request wrote itself, its draft
 //! cache is complete and it speculates.
+//!
+//! The refill policy weighs what the world measures ([`SpeculationMeter`]):
+//! the tokens a verification carrying drafts commits, the worker's time of
+//! a decoding step with and without drafts, and its time per prompt token.
 
 use super::*;
 use crate::kv_cache::Checkpoint;
 use ipc::{CallOutput, ForwardMode};
+
+/// The weight of each new observation in the meter's averages: an average
+/// of about the last sixteen.
+const METER_WEIGHT: f64 = 1.0 / 16.0;
+
+/// The kind of step a completed batch measures, by its calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeasuredStep {
+    /// A decoding step: decodes and verifications only; `drafted` when one
+    /// of its verifications carries drafts.
+    Decoding { drafted: bool },
+    /// A prompt step: prompt chunks and draft cache refills of `tokens`
+    /// tokens in all.
+    Prompt { tokens: u64 },
+}
+
+impl MeasuredStep {
+    /// The step `calls` make, `None` for one that mixes decoding with prompt
+    /// work or holds other calls, whose time measures neither.
+    pub(crate) fn of<'a>(calls: impl Iterator<Item = &'a Call> + Clone) -> Option<Self> {
+        let mut forwards = calls.clone().peekable();
+        forwards.peek()?;
+        if calls.clone().all(|call| {
+            matches!(
+                call.kind,
+                CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
+            )
+        }) {
+            let drafted = calls.clone().any(|call| {
+                call.kind == CallKind::Forward(ForwardMode::Verify)
+                    && !generation::verify_drafts(call).is_empty()
+            });
+            return Some(Self::Decoding { drafted });
+        }
+        let prompt = calls.clone().all(|call| {
+            call.kind == CallKind::Forward(ForwardMode::Prefill)
+                && call.vision_inputs.is_empty()
+                && call.latent_feature_input.is_none()
+                && call.readout.is_none()
+        });
+        let tokens: u64 = calls.map(|call| call.input_token_ids.len() as u64).sum();
+        (prompt && tokens > 0).then_some(Self::Prompt { tokens })
+    }
+}
+
+/// What the world measures of speculation, as moving averages over recent
+/// observations: the speedup a speculating request gets and the cost of a
+/// refilled token, in decode steps, which the refill policy weighs
+/// ([`crate::scheduler::RefillPolicy`]).
+///
+/// A verification carrying drafts commits `s` tokens on average; the
+/// worker's step takes `v` with drafts and `d` without, and `p` per prompt
+/// token. Speculating, a request takes `v / s` per token in place of `d`:
+/// its speedup is `g = s * d / v`, and a refilled token costs `k = p / d`
+/// decode steps. Until the world has measured a step without drafts
+/// (every one of its steps carried some), `d` is `v`: the request's
+/// speculation adds nothing to steps that carry drafts anyway.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpeculationMeter {
+    /// `s`: tokens a verification carrying drafts commits.
+    tokens_per_step: Option<f64>,
+    /// `v`: worker time of a decoding step with drafts, in microseconds.
+    drafted_step_us: Option<f64>,
+    /// `d`: worker time of a decoding step without drafts, in microseconds.
+    plain_step_us: Option<f64>,
+    /// `p`: worker time of a prompt step per token, in microseconds.
+    prompt_token_us: Option<f64>,
+}
+
+/// Moves `average` toward `value`, or starts it there.
+fn observe(average: &mut Option<f64>, value: f64) {
+    *average = Some(average.map_or(value, |current| current + METER_WEIGHT * (value - current)));
+}
+
+impl SpeculationMeter {
+    /// Observes a verification carrying drafts that committed `committed`
+    /// tokens.
+    pub(crate) fn observe_verification(&mut self, committed: usize) {
+        observe(&mut self.tokens_per_step, committed as f64);
+    }
+
+    /// Observes a completed step of `step`'s kind that took the worker
+    /// `worker_us` microseconds.
+    pub(crate) fn observe_step(&mut self, step: MeasuredStep, worker_us: u64) {
+        let time = worker_us as f64;
+        match step {
+            MeasuredStep::Decoding { drafted: true } => observe(&mut self.drafted_step_us, time),
+            MeasuredStep::Decoding { drafted: false } => observe(&mut self.plain_step_us, time),
+            MeasuredStep::Prompt { tokens } => {
+                observe(&mut self.prompt_token_us, time / tokens as f64)
+            }
+        }
+    }
+
+    /// The decode step time `d`, standing in `v` until a step without
+    /// drafts is measured.
+    fn decode_step_us(&self) -> Option<f64> {
+        self.plain_step_us.or(self.drafted_step_us)
+    }
+
+    /// The speedup `g` of a speculating request, once measured.
+    pub(crate) fn speedup(&self) -> Option<f64> {
+        let drafted = self.drafted_step_us.filter(|time| *time > 0.0)?;
+        Some(self.tokens_per_step? * self.decode_step_us()? / drafted)
+    }
+
+    /// The cost `k` of a refilled token, in decode steps, once measured.
+    pub(crate) fn token_cost(&self) -> Option<f64> {
+        let decode = self.decode_step_us().filter(|time| *time > 0.0)?;
+        Some(self.prompt_token_us? / decode)
+    }
+}
 
 /// A running request's draft cache, in a deployment that speculates.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -185,6 +301,10 @@ impl Scheduler {
         };
         if call.kind == CallKind::Forward(ForwardMode::Verify) {
             self.count_verification(id, call, record);
+            if !generation::verify_drafts(call).is_empty() {
+                self.speculation_meter
+                    .observe_verification(record.committed_tokens.len());
+            }
         }
         let held = self.holds_draft(id, start, end);
         let Some(state) = self.running.get_mut(&id) else {
@@ -281,7 +401,13 @@ impl Scheduler {
             .req
             .max_und_tokens
             .saturating_sub(state.num_generated_tokens);
-        tokens > 0 && self.config.refill.worth(remaining, tokens as usize)
+        tokens > 0
+            && self.config.refill.worth(
+                self.speculation_meter.speedup(),
+                self.speculation_meter.token_cost(),
+                remaining,
+                tokens as usize,
+            )
     }
 
     /// Plans the next chunk of `id`'s refill within `budget` tokens.

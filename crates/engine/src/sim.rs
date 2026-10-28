@@ -777,6 +777,56 @@ fn select_token(
 }
 
 /// Deterministic local model engine that implements the worker lifecycle protocol.
+/// How the simulated worker speculates: what its drafter proposes and the
+/// worker time each step reports.
+#[derive(Clone, Copy, Debug)]
+pub struct SimSpeculation {
+    /// The leading drafts of each proposal that are the request's next
+    /// tokens; the drafts after them are wrong.
+    pub accepted: usize,
+    /// Worker time of a decoding step none of whose verifications carries
+    /// drafts, in microseconds.
+    pub decode_us: u64,
+    /// Worker time of a decoding step one of whose verifications carries
+    /// drafts, in microseconds.
+    pub verify_us: u64,
+    /// Worker time of a prompt step per token it evaluates, in
+    /// microseconds.
+    pub prompt_token_us: u64,
+}
+
+impl SimSpeculation {
+    /// The worker time of a step of `calls`: its prompt tokens' and, with
+    /// decodes or verifications among them, one decoding step's.
+    fn step_us<'a>(&self, calls: impl Iterator<Item = &'a Call>) -> u64 {
+        let mut prompt_tokens = 0;
+        let mut decoding = None;
+        for call in calls {
+            match call.kind {
+                CallKind::Forward(ForwardMode::Prefill) => {
+                    prompt_tokens += call.input_token_ids.len() as u64;
+                }
+                CallKind::Forward(ForwardMode::Decode) => {
+                    decoding.get_or_insert(false);
+                }
+                CallKind::Forward(ForwardMode::Verify) => {
+                    let drafted = call.input_token_ids.len() > 1;
+                    *decoding.get_or_insert(false) |= drafted;
+                }
+                _ => {}
+            }
+        }
+        let step = decoding.map_or(0, |drafted| {
+            if drafted {
+                self.verify_us
+            } else {
+                self.decode_us
+            }
+        });
+        prompt_tokens * self.prompt_token_us + step
+    }
+}
+
 pub struct SimEngine {
     info: WorkerInfo,
     /// What the simulated pool is launched with: its queue depth and its
@@ -796,6 +846,8 @@ pub struct SimEngine {
     /// Block-diffusion sampling the simulated worker is launched with, as a
     /// rank's launch configuration states it.
     canvas_sampling: Option<ipc::CanvasSampling>,
+    /// How the simulated worker speculates, when it runs a drafter.
+    speculation: Option<SimSpeculation>,
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
@@ -877,6 +929,7 @@ impl SimEngine {
             results_on_wait: false,
             non_finite_candidate: None,
             canvas_sampling: None,
+            speculation: None,
             predicated_release: None,
             requests: HashMap::new(),
             refused: HashMap::new(),
@@ -1005,20 +1058,26 @@ impl SimEngine {
     /// than the request's own, or when synthetic media encoding or export
     /// fails. A sampling pipeline with no valid distribution yields an
     /// `Error` record with `InvalidDescriptor` instead.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the simulated model's settings, which the batch's calls borrow beside the engine's request map"
+    )]
     fn execute_call(
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
         non_finite_candidate: Option<u32>,
         canvas_sampling: Option<ipc::CanvasSampling>,
+        speculation: Option<SimSpeculation>,
         call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<CallOutput> {
         // A call states the coordinates it executes at. The simulator holds the
         // same request state a rank does, so a disagreement is a scheduling
         // failure and not a condition it can execute through. A media branch
-        // call around the chain carries no coordinates.
-        if request.chained(call) {
+        // call around the chain carries no coordinates, and a draft cache
+        // refill states the earlier positions it evaluates again.
+        if request.chained(call) && call.draft.refill.is_none() {
             let stated = call.coordinates;
             if request.positions_from_model {
                 request.logical_position = stated.logical_position;
@@ -1056,6 +1115,9 @@ impl SimEngine {
         set_cache_lengths(&mut record, request.cache_visible_len);
 
         match call.kind {
+            // A draft cache refill evaluates positions the cache holds again
+            // for the drafter alone: the request's progress stays.
+            CallKind::Forward(ForwardMode::Prefill) if call.draft.refill.is_some() => {}
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
@@ -1089,8 +1151,38 @@ impl SimEngine {
                     }
                     set_cache_lengths(&mut record, request.cache_visible_len);
                 } else if samples_token {
-                    let index = request.emitted;
                     let sampling_state = call.sampling_state.as_ref();
+                    // A verification accepts its drafts while each is the
+                    // token the model selects at its position, short of EOS
+                    // and of a finish token; the token after them is
+                    // sampled as a decode's.
+                    let mut verified = Vec::new();
+                    if work == CallKind::Forward(ForwardMode::Verify) {
+                        for &draft in call.input_token_ids.get(1..).unwrap_or_default() {
+                            let Some(output) = Self::sample(
+                                vocab,
+                                text_len,
+                                fake_eos,
+                                call,
+                                request,
+                                request.emitted + verified.len(),
+                                sampling_state,
+                            )?
+                            else {
+                                break;
+                            };
+                            let finishes = output.token == fake_eos
+                                || sampling_state.is_some_and(|state| {
+                                    state.finish_token_ids.binary_search(&output.token).is_ok()
+                                });
+                            if output.token != draft || finishes {
+                                break;
+                            }
+                            request.fold_penalty_token(output.token);
+                            verified.push(output);
+                        }
+                    }
+                    let index = request.emitted + verified.len();
                     let Some(output) = Self::sample(
                         vocab,
                         text_len,
@@ -1142,12 +1234,14 @@ impl SimEngine {
                             .insert(completion.clone(), transition);
                     }
                     // Positions and cache advance by the query length: the whole
-                    // bound for a prefill, one token for decode and verify.
+                    // bound for a prefill, one token for decode, and a
+                    // verification's committed tokens.
+                    let committed = verified.len() + 1;
                     if !visual_state {
                         let query_tokens = match work {
                             CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
-                            CallKind::Forward(ForwardMode::Decode)
-                            | CallKind::Forward(ForwardMode::Verify) => 1,
+                            CallKind::Forward(ForwardMode::Decode) => 1,
+                            CallKind::Forward(ForwardMode::Verify) => committed as u32,
                             _ => unreachable!(),
                         };
                         request.logical_position =
@@ -1162,30 +1256,67 @@ impl SimEngine {
                         }
                         CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify) => {
-                            request.emitted = request.emitted.saturating_add(1)
+                            request.emitted = request.emitted.saturating_add(committed)
                         }
                         _ => unreachable!(),
                     }
-                    record.committed_tokens = vec![output.token];
+                    record.committed_tokens = verified
+                        .iter()
+                        .map(|verified| verified.token)
+                        .chain([output.token])
+                        .collect();
                     // Fold the generated token into the device-resident penalty
                     // base so the next call's penalties see it before this
                     // one is host-observed. A false-predicate no-op never reaches
                     // this branch, so a retracted point is never folded.
                     request.fold_penalty_token(output.token);
-                    // The token's own entry leads its candidates when the
-                    // request asks for its generated tokens' logprobs.
+                    // Each committed token's own entry leads its candidates
+                    // when the request asks for its generated tokens'
+                    // logprobs.
                     if !output.top.is_empty() {
-                        record.token_logprobs = vec![
-                            output
-                                .top
-                                .iter()
-                                .map(|(token_id, logprob, rank)| TokenLogprob {
-                                    token_id: *token_id,
-                                    logprob: *logprob,
-                                    rank: *rank,
-                                })
-                                .collect(),
-                        ];
+                        record.token_logprobs = verified
+                            .iter()
+                            .chain([&output])
+                            .map(|sampled| {
+                                sampled
+                                    .top
+                                    .iter()
+                                    .map(|(token_id, logprob, rank)| TokenLogprob {
+                                        token_id: *token_id,
+                                        logprob: *logprob,
+                                        rank: *rank,
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                    }
+                    // The drafter proposes after the committed tokens: the
+                    // model's next tokens for its accepted count, then
+                    // wrong ones.
+                    if let Some(speculation) = speculation {
+                        for draft in 0..call.draft.proposals as usize {
+                            let Some(next) = Self::sample(
+                                vocab,
+                                text_len,
+                                fake_eos,
+                                call,
+                                request,
+                                request.emitted + draft,
+                                sampling_state,
+                            )?
+                            else {
+                                break;
+                            };
+                            record
+                                .draft_token_ids
+                                .push(if draft < speculation.accepted {
+                                    next.token
+                                } else if next.token == 1_000 {
+                                    1_001
+                                } else {
+                                    1_000
+                                });
+                        }
                     }
                 }
             }
@@ -1486,6 +1617,45 @@ impl SimEngine {
         }
     }
 
+    /// Speculates as `speculation` states: the simulated drafter proposes
+    /// for the calls that ask for drafts, verifications accept the drafts
+    /// that are the model's tokens, and every step reports its worker time.
+    pub fn set_speculation(&mut self, speculation: SimSpeculation) {
+        self.speculation = Some(speculation);
+    }
+
+    /// Reports a draft group after the other groups: the draft cache, whose
+    /// page holds `span` of the first group's pages' tokens in one unit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the simulated worker does not expose a prefix cache.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test setter whose missing prefix cache is documented under Panics"
+    )]
+    pub fn add_draft_group(&mut self, span: u32) {
+        let cache = self
+            .info
+            .prefix_cache
+            .as_mut()
+            .expect("sim AR worker has a prefix cache");
+        let first = cache.groups[0].clone();
+        let layer = cache
+            .groups
+            .iter()
+            .flat_map(|group| group.layer_ids.iter().copied())
+            .max()
+            .map_or(0, |layer| layer + 1);
+        cache.groups.push(ipc::CacheGroup {
+            kind: ipc::CacheGroupKind::Draft,
+            block_size: first.block_size * span,
+            units_per_page: 1,
+            layer_ids: vec![layer],
+            ..first
+        });
+    }
+
     /// Launches the simulated worker with block-diffusion sampling: a canvas
     /// step stops its block no later than the sampling's step limit.
     pub fn set_canvas_sampling(&mut self, sampling: ipc::CanvasSampling) {
@@ -1669,6 +1839,9 @@ impl SimEngine {
         let fake_eos = self.fake_eos;
         let non_finite_candidate = self.non_finite_candidate;
         let canvas_sampling = self.canvas_sampling;
+        let speculation = self.speculation;
+        let worker_exec_us = speculation
+            .map(|speculation| speculation.step_us(batch.requests.iter().map(|(call, _)| call)));
         let refused = &self.refused;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
@@ -1731,6 +1904,7 @@ impl SimEngine {
                 fake_eos,
                 non_finite_candidate,
                 canvas_sampling,
+                speculation,
                 &call,
                 request,
             )?;
@@ -1762,7 +1936,7 @@ impl SimEngine {
             completions,
             products: Vec::new(),
 
-            worker_exec_us: None,
+            worker_exec_us,
             forward_stats: None,
         };
         // A `Finish` for a stale request epoch leaves a readmitted request

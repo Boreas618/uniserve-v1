@@ -14,46 +14,50 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
-/// Default tokens a verification step of a request is expected to emit.
-const DEFAULT_EXPECTED_SPEEDUP: f64 = 2.0;
-/// Default time of evaluating one context token in a draft cache refill,
-/// in steps of decoding.
-const DEFAULT_REFILL_TOKEN_COST: f64 = 0.01;
-
 /// When a request whose draft cache is missing has it refilled.
 ///
 /// A refill evaluates the target model again over the request's context
 /// before the first position whose draft cache entry is missing, the cost
-/// of a prefill of those tokens; once refilled, the request speculates. It
-/// is worth its cost when the decode steps speculation saves over the
-/// tokens the request may still generate exceed it:
-/// `remaining * (1 - 1 / expected_speedup) > tokens * token_cost`, both
-/// sides in decode steps.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// of a prefill of those tokens; once refilled, the request speculates.
+/// With `g` the speedup speculation gives a request (the decode steps' time
+/// one of its verification steps takes the place of) and `k` the time of
+/// evaluating one context token, in decode steps, a refill of `tokens`
+/// tokens of a request that may still generate `remaining` tokens is worth
+/// it when `remaining * (1 - 1 / g) > tokens * k`.
+///
+/// The scheduler measures both from what its world executes
+/// (`SpeculationMeter`); a value stated here takes the place of the
+/// measured one. Until the world has measured a value it needs and none is
+/// stated, a request is refilled: its refill and its speculation measure
+/// it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RefillPolicy {
-    /// Tokens a verification step of a request is expected to emit; at
-    /// least one.
-    pub expected_speedup: f64,
-    /// The time of evaluating one context token in a refill, in decode
-    /// steps; not negative.
-    pub token_cost: f64,
+    /// The speedup `g` stated in place of the measured one; at least one.
+    pub expected_speedup: Option<f64>,
+    /// The cost `k` of one refilled token, in decode steps, stated in place
+    /// of the measured one; not negative.
+    pub token_cost: Option<f64>,
 }
 
 impl RefillPolicy {
     /// Whether refilling `tokens` context tokens of a request that may
-    /// still generate `remaining` tokens is worth its cost.
-    pub fn worth(&self, remaining: usize, tokens: usize) -> bool {
-        let saved = remaining as f64 * (1.0 - 1.0 / self.expected_speedup.max(1.0));
-        saved > tokens as f64 * self.token_cost.max(0.0)
-    }
-}
-
-impl Default for RefillPolicy {
-    fn default() -> Self {
-        Self {
-            expected_speedup: DEFAULT_EXPECTED_SPEEDUP,
-            token_cost: DEFAULT_REFILL_TOKEN_COST,
-        }
+    /// still generate `remaining` tokens is worth its cost, with the world's
+    /// measured speedup and token cost where none is stated.
+    pub fn worth(
+        &self,
+        measured_speedup: Option<f64>,
+        measured_token_cost: Option<f64>,
+        remaining: usize,
+        tokens: usize,
+    ) -> bool {
+        let (Some(speedup), Some(cost)) = (
+            self.expected_speedup.or(measured_speedup),
+            self.token_cost.or(measured_token_cost),
+        ) else {
+            return true;
+        };
+        let saved = remaining as f64 * (1.0 - 1.0 / speedup.max(1.0));
+        saved > tokens as f64 * cost.max(0.0)
     }
 }
 
