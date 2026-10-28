@@ -1471,7 +1471,7 @@ pub trait Executor: Send {
     /// Halves, or restores when not `halve`, the byte budgets of the links
     /// the deployment's transfers use on the nodes of the executor's
     /// workers (`Claims::throttle`), and returns those nodes' hosts. The
-    /// default suits an executor that retains no memory and runs no
+    /// default suits an executor that retains no storage and runs no
     /// transfer, which throttles no host.
     fn throttle(&mut self, halve: bool) -> Result<Vec<String>, ExecutorError> {
         let _ = halve;
