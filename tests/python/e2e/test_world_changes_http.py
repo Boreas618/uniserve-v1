@@ -426,22 +426,27 @@ class Streaming:
     usage, and how many tokens it read once `mark` was called.
     """  # noqa: D205
 
-    def __init__(self, base_url: str, name: str):
+    def __init__(self, base_url: str, name: str, *, body: dict | None = None):
         self.tokens: list[str] = []
         self.usage: dict | None = None
         self.marked: int | None = None
         self.error: BaseException | None = None
         self._thread = threading.Thread(
-            target=self._read, args=(base_url, name), daemon=True
+            target=self._read,
+            args=(
+                base_url,
+                body if body is not None else _body(name, stream=True),
+            ),
+            daemon=True,
         )
         self._thread.start()
 
-    def _read(self, base_url: str, name: str) -> None:
+    def _read(self, base_url: str, body: dict) -> None:
         try:
             with httpx.stream(
                 "POST",
                 f"{base_url}/v1/chat/completions",
-                json=_body(name, stream=True),
+                json=body,
                 timeout=1800,
             ) as response:
                 response.raise_for_status()
