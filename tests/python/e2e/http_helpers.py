@@ -4,10 +4,12 @@ import base64
 import io
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -140,6 +142,24 @@ def stop_server(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=30)
 
 
+def stop_storage_server(runtime: Path) -> None:
+    """Stop the Storage Server a server started under the runtime directory
+    `runtime` (its ``XDG_RUNTIME_DIR``), found by its socket on its command
+    line: it outlives the server, and holds the deployment's host and
+    device storage until it stops.
+    """  # noqa: D205
+    socket = str(runtime / "uniserve" / "storage.sock").encode()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if b"serve" in command and socket in command:
+            os.kill(int(entry.name), signal.SIGTERM)
+
+
 @contextmanager
 def server_process(
     args: list[str],
@@ -148,12 +168,31 @@ def server_process(
     timeout_s: float,
     env: dict[str, str] | None = None,
 ) -> Iterator[subprocess.Popen[str]]:
+    """Serve `args` until the block ends, once its health answers.
+
+    Unless `env` names them, the server runs on the GPUs the GPU locks
+    granted (``UNISERVE_WORLD_DEVICES``) and under a runtime directory of
+    its own (``XDG_RUNTIME_DIR``), whose Storage Server, which outlives the
+    server with the deployment's host and device storage, is stopped at the
+    end. A caller that names its runtime directory owns that Storage Server.
+    """
+    env = dict(env or {})
+    runtime = None
+    if "XDG_RUNTIME_DIR" not in env:
+        runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
+        env["XDG_RUNTIME_DIR"] = str(runtime)
+    granted = os.environ.get("UNISERVE_WORLD_DEVICES")
+    if granted and "CUDA_VISIBLE_DEVICES" not in env:
+        env["CUDA_VISIBLE_DEVICES"] = granted
     process = start_server(args, log_path, env)
     try:
         wait_health(base_url, process, timeout_s)
         yield process
     finally:
         stop_server(process)
+        if runtime is not None:
+            stop_storage_server(runtime)
+            shutil.rmtree(runtime, ignore_errors=True)
 
 
 def post_sse(
