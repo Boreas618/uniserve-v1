@@ -764,6 +764,7 @@ impl WeightKeys {
                         placement: location,
                         bytes: chunk.length,
                         segment: None,
+                        fabric: storage.segment_fabric(segment)?,
                     },
                     descriptor,
                 ));
@@ -1194,6 +1195,7 @@ impl Published {
                 placement: location,
                 bytes: layout.bytes,
                 segment: None,
+                fabric: None,
             },
             descriptor,
         ));
@@ -1254,6 +1256,7 @@ impl Published {
                 placement: Placement::Host { numa_node: None },
                 bytes: text.len() as u64,
                 segment: None,
+                fabric: None,
             },
             manifest_memory.as_fd(),
         ));

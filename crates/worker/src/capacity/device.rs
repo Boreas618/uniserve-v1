@@ -95,7 +95,9 @@ impl DeviceBudget {
 
     /// Device memory this process holds on `device` after PyTorch returns
     /// its unused cached blocks: NVML's figure with the plugins' buffers it
-    /// attributes to no process, without the storages the server retains.
+    /// attributes to no process, without the storages the server retains,
+    /// among them the segments this process created and keeps the creating
+    /// handles of, which NVML attributes to it ([`cuda::created_bytes`]).
     ///
     /// Fails when NVML attributes no usage on the device to this process, as
     /// inside a PID namespace NVML does not report.
@@ -112,7 +114,8 @@ impl DeviceBudget {
                 )),
                 error => Error::Cuda(error),
             })?;
-        Ok(process + self.unattributed.get(&device).copied().unwrap_or(0))
+        let created = cuda::created_bytes(device);
+        Ok(process.saturating_sub(created) + self.unattributed.get(&device).copied().unwrap_or(0))
     }
 
     /// Device memory this process holds on `device`, with the storages its

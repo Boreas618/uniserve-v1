@@ -370,6 +370,7 @@ impl Retained {
                 world: part.segment.world,
                 ordinal: part.segment.ordinal,
             }),
+            fabric: None,
         };
         let tensor = storage::TensorRecord {
             key,
@@ -831,6 +832,7 @@ impl ExclusiveMemory for &Retained {
                         placement: Placement::Device { gpu: *gpu },
                         segment: None,
                         bytes,
+                        fabric: None,
                     };
                     let tensor = storage::TensorRecord {
                         key: *key,

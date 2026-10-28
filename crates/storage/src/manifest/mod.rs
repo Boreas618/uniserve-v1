@@ -191,9 +191,11 @@ pub struct Request {
     /// The GPUs the target world's ranks may take, at least one per rank.
     pub gpus: Vec<Gpu>,
     /// The bandwidth of every link between them, as the host's Transfer
-    /// Server measured it when it started (the listing's
-    /// `transfer.links`): a copy within one GPU takes the link from it to
-    /// itself, and every link a block may take must be measured.
+    /// Server measured it (the listing's `transfer.links`): when it started
+    /// for the links within its host, at their first use for the links from
+    /// another host's GPUs (over the NVLink fabric, or READ). A copy within
+    /// one GPU takes the link from it to itself, and every link a block may
+    /// take must be measured.
     pub links: Vec<LinkBandwidth>,
 }
 

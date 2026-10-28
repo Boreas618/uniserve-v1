@@ -95,9 +95,9 @@ pub struct Options {
     /// copies, so a copy engine turns to that world's copies, and to
     /// higher-priority tasks, between chunks.
     pub chunk: Duration,
-    /// NIXL's C API library (`libnixl_capi.so`) of the release `nixl-sys`
-    /// pins, which the agent of the path between hosts loads; the loader's
-    /// search path finds it when `None`.
+    /// NIXL's C API library (`libnixl_capi.so`) of the release the `nixl`
+    /// crate binds, which the agent of the path between hosts loads; the
+    /// loader's search path finds it when `None`.
     pub nixl_library: Option<PathBuf>,
 }
 
@@ -208,12 +208,11 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         while let Ok(booking) = server.bookings.try_recv() {
             server.book(&mut client, booking)?;
         }
-        for (task, bytes, end) in server.lanes.reports() {
-            if end.is_some() {
-                server.ended(task);
-            }
-            server.send(&mut client, &Request::Copied { task, bytes, end })?;
-        }
+        // A lane reports a link it measured before the chunk that measured
+        // it completes, so the links taken after the reports include every
+        // link a reported task measured, and reach the server first: once
+        // a task's submitter learns it ended, the listing has its links.
+        let reports = server.lanes.reports();
         let links = server.lanes.measured();
         if !links.is_empty() {
             let measured = Request::Measured {
@@ -221,6 +220,12 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
                 contexts: Vec::new(),
             };
             server.send(&mut client, &measured)?;
+        }
+        for (task, bytes, end) in reports {
+            if end.is_some() {
+                server.ended(task);
+            }
+            server.send(&mut client, &Request::Copied { task, bytes, end })?;
         }
         server.collect(&mut client);
     }
@@ -520,6 +525,9 @@ impl Served {
                         hold,
                         destination_offset: copy.destination_offset,
                         bytes: copy.bytes,
+                        rows: copy.rows,
+                        source_pitch: copy.source_pitch,
+                        destination_pitch: copy.destination_pitch,
                     });
                     Ok(())
                 }),

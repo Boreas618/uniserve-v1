@@ -50,8 +50,9 @@ struct Held {
 pub(crate) struct ClaimHolder {
     /// The `uniserve` executable a Storage Server this daemon starts runs as.
     executable: std::path::PathBuf,
-    /// Whether processes on other nodes send this node's server page
-    /// requests: the server it starts then also listens on TCP.
+    /// Whether processes on other nodes reach this node's server (their
+    /// engine's page requests, their Transfer Servers' reads of its
+    /// memory): the server it starts then also listens on TCP.
     remote_pages: bool,
     /// This node's address other nodes reach, which names that listener.
     address: Option<std::net::IpAddr>,
@@ -262,10 +263,15 @@ impl ClaimHolder {
     pub(crate) fn throttle(&mut self, deployment: &str, halve: bool) -> anyhow::Result<()> {
         use anyhow::Context as _;
 
-        let held = self
-            .held
-            .get_mut(deployment)
-            .with_context(|| format!("this node holds no claim of deployment {deployment}"))?;
+        // A node that holds no claim of the deployment runs none of its
+        // transfers: no world of it has claimed the node yet.
+        let Some(held) = self.held.get_mut(deployment) else {
+            tracing::debug!(
+                deployment,
+                "no claim of the deployment: nothing to throttle"
+            );
+            return Ok(());
+        };
         let throttle = if halve {
             storage::protocol::Throttle::Halve
         } else {

@@ -1,0 +1,88 @@
+NIXL 1.5.1, UCX backend: register memory for reads alone on request.
+
+NIXL's UCX backend maps every registration with UCX's default protection,
+local and remote reads and writes (`ucp_mem_map` without
+UCP_MEM_MAP_PARAM_FIELD_PROT). The verbs registration of a read-only mapping
+refuses write access, so read-only host memory cannot be registered; with
+UCX's non-blocking registration of host memory (UCX_REG_NONBLOCK_MEM_TYPES
+includes `host` by default) the refusal is deferred to the first remote
+read, which then never completes and reports no error.
+
+With this patch a registration descriptor whose metadata (`metaInfo`, the
+C API's `nixl_capi_reg_dlist_add_desc` metadata) is exactly `access=read`
+is mapped with UCP_MEM_MAP_PROT_LOCAL_READ | UCP_MEM_MAP_PROT_REMOTE_READ:
+the read-only mapping registers, and peers can READ it but not write it.
+Every other registration keeps UCX's default. UniServe's Transfer Server
+registers the read-only host storage it exposes to other hosts this way.
+
+diff -ruN a/src/plugins/ucx/ucx_backend.cpp b/src/plugins/ucx/ucx_backend.cpp
+--- a/src/plugins/ucx/ucx_backend.cpp	2026-10-28 05:59:37.313079345 +0000
++++ b/src/plugins/ucx/ucx_backend.cpp	2026-10-28 05:59:37.314079346 +0000
+@@ -897,8 +897,14 @@
+ {
+     auto priv = std::make_unique<nixlUcxPrivateMetadata>();
+ 
++    // A descriptor whose metadata is "access=read" is registered for reads
++    // alone (local and remote): memory mapped read-only can be registered,
++    // and peers can only read it. Any other metadata keeps read and write
++    // access.
++    const bool read_only = mem.metaInfo == "access=read";
++
+     // TODO: Add nixl_mem check?
+-    const int ret = uc->memReg((void*) mem.addr, mem.len, priv->mem, nixl_mem);
++    const int ret = uc->memReg((void*) mem.addr, mem.len, priv->mem, nixl_mem, read_only);
+     if (ret) {
+         return NIXL_ERR_BACKEND;
+     }
+diff -ruN a/src/plugins/ucx/ucx_utils.cpp b/src/plugins/ucx/ucx_utils.cpp
+--- a/src/plugins/ucx/ucx_utils.cpp	2026-10-28 05:59:37.312079344 +0000
++++ b/src/plugins/ucx/ucx_utils.cpp	2026-10-28 05:59:37.313079345 +0000
+@@ -643,7 +643,11 @@
+ 
+ 
+ int
+-nixlUcxContext::memReg(void *addr, size_t size, nixlUcxMem &mem, nixl_mem_t nixl_mem_type) {
++nixlUcxContext::memReg(void *addr,
++                       size_t size,
++                       nixlUcxMem &mem,
++                       nixl_mem_t nixl_mem_type,
++                       bool read_only) {
+     mem.base = addr;
+     mem.size = size;
+ 
+@@ -653,6 +657,14 @@
+         .address = mem.base,
+         .length = mem.size,
+     };
++    /* Without a protection, UCX registers for local and remote reads and
++     * writes, which the verbs registration of a read-only mapping refuses
++     * (and a non-blocking registration then leaves every remote read of it
++     * unanswered). */
++    if (read_only) {
++        mem_params.field_mask |= UCP_MEM_MAP_PARAM_FIELD_PROT;
++        mem_params.prot = UCP_MEM_MAP_PROT_LOCAL_READ | UCP_MEM_MAP_PROT_REMOTE_READ;
++    }
+ 
+     ucs_status_t status = ucp_mem_map(ctx.get(), &mem_params, &mem.memh);
+     if (status != UCS_OK) {
+diff -ruN a/src/plugins/ucx/ucx_utils.h b/src/plugins/ucx/ucx_utils.h
+--- a/src/plugins/ucx/ucx_utils.h	2026-10-28 05:59:37.309079341 +0000
++++ b/src/plugins/ucx/ucx_utils.h	2026-10-28 05:59:37.311079343 +0000
+@@ -185,8 +185,16 @@
+     }
+ 
+     /* Memory management */
++    /* Registers `size` bytes at `addr`. With `read_only`, the memory is
++     * registered for local and remote reads alone, so a read-only mapping of
++     * it can be registered and remote peers can only read it; otherwise UCX's
++     * default of read and write access applies. */
+     int
+-    memReg(void *addr, size_t size, nixlUcxMem &mem, nixl_mem_t nixl_mem_type);
++    memReg(void *addr,
++           size_t size,
++           nixlUcxMem &mem,
++           nixl_mem_t nixl_mem_type,
++           bool read_only = false);
+     [[nodiscard]] std::string
+     packRkey(nixlUcxMem &mem);
+     void

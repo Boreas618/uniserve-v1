@@ -95,8 +95,15 @@ use serde::{Deserialize, Serialize};
 /// tensor regions select by their `at`, and a span copy rows at a pitch; 11
 /// moves a world's weights to host memory and back (`Offload`, `Restore`,
 /// and the Transfer Server's `Allocate`) and discards the pages a world of
-/// other numerics cannot hit (`DiscardPages`).
-pub const VERSION: u32 = 11;
+/// other numerics cannot hit (`DiscardPages`); 12 lets a process of another
+/// host read a small read-only tensor of bytes inline (`Read`).
+pub const VERSION: u32 = 12;
+
+/// The most bytes a [`Request::Read`] answers with: a weight manifest of the
+/// largest models the library serves fits many times over, and a reply of
+/// this size holds the server's loop for a few milliseconds on a host's
+/// network.
+pub const READ_BYTES: u64 = 64 << 20;
 
 /// The earliest client version the server serves: a client of version 4
 /// knows no worlds, and its requests act on world 0; a client of version 4
@@ -246,6 +253,46 @@ pub struct StorageRecord {
     /// storage, and for every storage of a client of protocol 5.
     #[serde(default)]
     pub segment: Option<Segment>,
+    /// The fabric handle the device allocation's creator exported, when it
+    /// holds the allocation and its GPU belongs to an NVLink fabric
+    /// (multi-node NVLink): another host of the fabric imports the handle
+    /// to copy the storage over NVLink while the creator holds it. `None`
+    /// for host memory, for an allocation without one, and for every
+    /// storage of a client that states none.
+    #[serde(default)]
+    pub fabric: Option<FabricHandle>,
+}
+
+/// A device allocation's 64-byte fabric handle (`CU_MEM_HANDLE_TYPE_FABRIC`),
+/// which only the process that created the allocation exports, and which
+/// imports only while that process holds the allocation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FabricHandle(pub [u8; 64]);
+
+impl std::fmt::Debug for FabricHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "FabricHandle(")?;
+        for byte in &self.0[..8] {
+            write!(formatter, "{byte:02x}")?;
+        }
+        write!(formatter, "..)")
+    }
+}
+
+impl Serialize for FabricHandle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // As a sequence of bytes, the encoding of `Region::Fabric`'s handle.
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FabricHandle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        let handle = <[u8; 64]>::try_from(bytes.as_slice())
+            .map_err(|_| serde::de::Error::invalid_length(bytes.len(), &"64 bytes"))?;
+        Ok(Self(handle))
+    }
 }
 
 /// One segment of a KV cache's value planes: the world that created its
@@ -796,6 +843,22 @@ pub struct Registered {
     pub address: u64,
     /// The range's length in bytes.
     pub bytes: u64,
+    /// The fabric handle of the device allocation the range lies in, when
+    /// its creator recorded one ([`StorageRecord::fabric`]): a reader whose
+    /// GPU imports it copies the range over the NVLink fabric rather than
+    /// READ it.
+    #[serde(default)]
+    pub fabric: Option<FabricExport>,
+}
+
+/// A device allocation's fabric handle, as an exposure names it: the
+/// allocation's length, which an import maps whole, and the offset of the
+/// exposed range's first byte in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FabricExport {
+    pub handle: FabricHandle,
+    pub bytes: u64,
+    pub offset: u64,
 }
 
 /// The device memory the Transfer Server's CUDA context takes on one GPU,
@@ -913,6 +976,13 @@ pub enum Request {
     },
     /// Every tensor, storage and claim the server holds.
     List,
+    /// From a process of another host ([`Role::Peer`]): the bytes of the
+    /// copy of `key` in host memory that a scope of `deployment` retains
+    /// read-only, a one-dimensional tensor of `uint8` elements (such as a
+    /// weight manifest) of at most [`READ_BYTES`] bytes. Answered with
+    /// [`Reply::Read`]; refused when the deployment retains no such tensor,
+    /// or a longer one.
+    Read { deployment: String, key: Key },
     /// Release every tensor and page pool of `deployment` and forget its
     /// claim: the deployment is no longer served. Refused while its head is
     /// connected.
@@ -1158,6 +1228,11 @@ pub enum Reply {
     Released,
     Rekeyed,
     Listing(Listing),
+    /// The bytes a [`Request::Read`] asked for.
+    Read {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
     Retired {
         released: u64,
     },

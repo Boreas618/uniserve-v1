@@ -38,6 +38,11 @@ pub struct StorageLaunch {
     /// page requests; `None` on the engine's host, or when the server accepts
     /// no other host.
     pub tcp: Option<String>,
+    /// Where processes of this host reach the deployment's Storage Servers
+    /// on its other nodes (`host:port`), each of which may hold the memory
+    /// of the deployment's other worlds: the weights a rank receives from
+    /// another host. Empty for a deployment of one node.
+    pub peers: Vec<String>,
     /// The world the worker belongs to: the exclusive storages it creates
     /// are its world's, and it retains what it uses in its world.
     pub world: u64,

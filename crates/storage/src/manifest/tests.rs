@@ -656,6 +656,102 @@ fn running_target_ranks_keep_their_gpus() {
 }
 
 #[test]
+fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
+    // Two expert-parallel ranks on GPUs 0 and 1 of one host grow to four
+    // ranks on GPUs 0..4, GPUs 2 and 3 on another host: that host's
+    // Transfer Server measured GPUs 0 and 1 by READ, and GPU 1 over the
+    // NVLink fabric too.
+    let source = world(vec![
+        (Some(gpu(0)), moe_rank(1, 0, 2, 0)),
+        (Some(gpu(1)), moe_rank(1, 0, 2, 1)),
+    ]);
+    let target = world(
+        (0..4)
+            .map(|rank| (None, moe_rank(4, rank, 4, rank)))
+            .collect(),
+    );
+    let read = |source: usize, destination: usize, bytes_per_second: u64| LinkBandwidth {
+        link: Link {
+            source: Memory::Remote {
+                endpoint: "10.0.0.1:4100".into(),
+                gpu: Some(gpu(source)),
+            },
+            destination: Memory::Device {
+                gpu: gpu(destination),
+            },
+        },
+        bytes_per_second,
+    };
+    let mut measured = links(4);
+    measured.retain(|measured| {
+        let host = |memory: &Memory| match memory {
+            Memory::Device { gpu: on } => (0..4)
+                .position(|index| gpu(index) == *on)
+                .map(|index| index / 2),
+            _ => None,
+        };
+        host(&measured.link.source) == host(&measured.link.destination)
+    });
+    for destination in [2, 3] {
+        measured.push(read(0, destination, 80_000_000_000));
+        measured.push(read(1, destination, 80_000_000_000));
+    }
+    let request = Request {
+        source,
+        target,
+        gpus: (0..4).map(gpu).collect(),
+        links: measured.clone(),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert!(manifest.missing.is_empty());
+    assert_fields_equal(&request, &apply(&request, &manifest));
+    // The ranks on the other host receive from both source GPUs.
+    let remote = [gpu(2), gpu(3)];
+    let received: BTreeSet<Gpu> = manifest
+        .links
+        .iter()
+        .filter(|load| remote.contains(&load.target) && load.bytes > 0)
+        .map(|load| load.source)
+        .collect();
+    assert_eq!(received, BTreeSet::from([gpu(0), gpu(1)]));
+
+    // The fabric's bandwidth stands for a pair also measured by READ.
+    let mut fabric = request.clone();
+    for destination in [2, 3] {
+        fabric.links.push(LinkBandwidth {
+            link: Link {
+                source: Memory::Device { gpu: gpu(1) },
+                destination: Memory::Device {
+                    gpu: gpu(destination),
+                },
+            },
+            bytes_per_second: 400_000_000_000,
+        });
+    }
+    let manifest = Manifest::plan(&fabric).unwrap();
+    let seconds = |source: usize| {
+        manifest
+            .links
+            .iter()
+            .filter(|load| load.source == gpu(source) && remote.contains(&load.target))
+            .map(|load| load.seconds * 400e9 / load.bytes as f64)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        seconds(1).iter().all(|scale| (scale - 1.0).abs() < 1e-9),
+        "{:?}",
+        seconds(1)
+    );
+
+    // Without a link from the other host's GPUs, no plan reaches them.
+    let mut unmeasured = request;
+    unmeasured
+        .links
+        .retain(|measured| !matches!(measured.link.source, Memory::Remote { .. }));
+    assert!(Manifest::plan(&unmeasured).is_err());
+}
+
+#[test]
 fn planning_is_cached_and_digests_cover_the_directions() {
     let source = world(vec![(Some(gpu(0)), moe_rank(1, 0, 1, 0))]);
     let target = world(vec![

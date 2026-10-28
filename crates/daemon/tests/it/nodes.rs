@@ -3,7 +3,7 @@
 //! leader routes what it asks for the member's node to the member.
 
 use daemon::{Daemon, DaemonOptions};
-use proto::process::{Exit, request};
+use proto::process::{Exit, NodesQuery, ThrottleTransfers, reply, request};
 
 use crate::support::{Engine, TIMEOUT, alive, eventually, launch, sleeper};
 
@@ -123,4 +123,71 @@ fn the_members_processes_end_with_the_leader() {
     // The member's service ends when the leader's connection closes.
     deployment.member.take().unwrap().wait().unwrap();
     assert!(!alive(pid), "a member's process outlived the leader");
+}
+
+#[test]
+fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() {
+    let directory = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let options = |nnodes: u32, node_rank: u32, host: &str| DaemonOptions {
+        nnodes,
+        node_rank,
+        host: host.to_owned(),
+        dist_init_addr: Some(format!("127.0.0.1:{port}")),
+        socket: directory.path().join(format!("{host}.sock")),
+        executable: "uniserve".into(),
+        join_timeout: TIMEOUT,
+    };
+
+    // A leader of one node that names its address serves at once.
+    let leader = Daemon::start(options(1, 0, "leader")).unwrap();
+    let address = leader.address().unwrap().to_owned();
+    let (mut serving, welcome) = Engine::hello(&address, proto::PROTOCOL_MAJOR);
+    assert_eq!(welcome.nodes.len(), 1);
+
+    // A node joins while an engine is served; a second node of the same
+    // rank is refused.
+    let member = Daemon::start(options(2, 1, "member")).unwrap();
+    let error = Daemon::start(options(2, 1, "again")).err().unwrap();
+    assert!(
+        format!("{error:#}").contains("node rank 1 is taken"),
+        "{error:#}"
+    );
+
+    // The engine served before learns the node by asking the leader, and
+    // throttles its transfers there, which a node that holds no claim of
+    // the deployment takes as nothing to do.
+    let known = serving.request(request::Kind::Nodes(NodesQuery {}));
+    let Some(reply::Kind::Nodes(known)) = known.kind else {
+        panic!("{known:?}");
+    };
+    let hosts: Vec<&str> = known.nodes.iter().map(|node| node.host.as_str()).collect();
+    assert_eq!(hosts, ["leader", "member"]);
+    let throttled = serving.request(request::Kind::ThrottleTransfers(ThrottleTransfers {
+        host: "member".into(),
+        deployment: "model".into(),
+        halve: true,
+    }));
+    assert_eq!(throttled.error, "");
+
+    // The next engine learns the node and runs a process there, whose exit
+    // comes back through the leader.
+    let (mut engine, welcome) = Engine::hello(&address, proto::PROTOCOL_MAJOR);
+    let nodes: Vec<(u32, &str)> = welcome
+        .nodes
+        .iter()
+        .map(|node| (node.node_rank, node.host.as_str()))
+        .collect();
+    assert_eq!(nodes, [(0, "leader"), (1, "member")]);
+    engine.spawn(launch("member", "group", 1, 0, "/bin/false", &[]));
+    assert_eq!(engine.exit().host, "member");
+
+    drop(engine);
+    drop(serving);
+    drop(member);
+    drop(leader);
 }

@@ -324,7 +324,7 @@ fn required<'a, T>(table: &'a Option<T>, name: &str) -> anyhow::Result<&'a T> {
 /// over `host` and the hosts after it.
 fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
     if !placement.worker_groups.is_empty() {
-        return Deployment::read(&placement.worker_groups)?
+        return Deployment::parse(&placement.worker_groups_content)?
             .worker_groups(host)
             .context("invalid `worker_groups` deployment");
     }

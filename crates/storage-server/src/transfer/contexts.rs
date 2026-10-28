@@ -462,7 +462,7 @@ impl Session {
                 // drops them in the same order); the Transfer Server holds
                 // no Rust reference to the bytes, which its copies reach
                 // through raw addresses only.
-                unsafe { agent.register(region) }
+                unsafe { agent.register(region, nixl::Access::ReadWrite) }
                     .map_err(|error| format!("registering memory with NIXL: {error}"))
             },
         )?;

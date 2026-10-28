@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node, Reply,
-    Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream, Welcome, downstream, event,
-    from_member, hello, reply, request, to_member, upstream,
+    Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node,
+    NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream, Welcome,
+    downstream, event, from_member, hello, reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
@@ -172,6 +172,9 @@ impl Local {
                     Err(error) => reply.error = format!("{error:#}"),
                 }
             }
+            Some(request::Kind::Nodes(_)) => {
+                reply.error = "the leader answers for the deployment's nodes".to_owned();
+            }
             None => reply.error = "an empty request".to_owned(),
         }
         reply
@@ -185,6 +188,102 @@ pub(crate) struct Membership {
     pub(crate) connection: Connection,
 }
 
+/// The leader's address members join at, and the connections that have not
+/// said hello yet.
+pub(crate) struct Joins {
+    listener: Listener,
+    connecting: Vec<Connection>,
+}
+
+impl Joins {
+    pub(crate) fn new(listener: Listener) -> Self {
+        Self {
+            listener,
+            connecting: Vec::new(),
+        }
+    }
+
+    /// Accepts the connections waiting and answers every hello that
+    /// arrived: a member of a node rank other than the leader's and every
+    /// member's in `members` joins, any other hello is refused. Returns the
+    /// members that joined.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the listener cannot accept.
+    pub(crate) fn admit(&mut self, members: &[Membership]) -> anyhow::Result<Vec<Membership>> {
+        while let Some(connection) = self.listener.try_accept()? {
+            self.connecting.push(connection);
+        }
+        let mut joined = Vec::new();
+        let mut index = 0;
+        while index < self.connecting.len() {
+            let hello = match self.connecting[index].try_recv::<Hello>() {
+                Ok(Some(hello)) => hello,
+                Ok(None) => {
+                    index += 1;
+                    continue;
+                }
+                Err(_) => {
+                    self.connecting.swap_remove(index);
+                    continue;
+                }
+            };
+            let mut connection = self.connecting.swap_remove(index);
+            let member = match &hello.peer {
+                Some(hello::Peer::Join(join)) => Some(join.clone()),
+                _ => None,
+            };
+            let refusal =
+                refusal(&hello, |peer| matches!(peer, hello::Peer::Join(_))).or_else(|| {
+                    let member = member.as_ref()?;
+                    (member.node_rank == 0
+                        || members
+                            .iter()
+                            .chain(&joined)
+                            .any(|known| known.node_rank == member.node_rank))
+                    .then(|| format!("node rank {} is taken", member.node_rank))
+                });
+            let welcome = Welcome {
+                major: proto::PROTOCOL_MAJOR,
+                minor: proto::PROTOCOL_MINOR,
+                build: proto::BUILD.to_owned(),
+                refusal: refusal.clone().unwrap_or_default(),
+                nodes: Vec::new(),
+            };
+            let sent = connection.send(&welcome).is_ok();
+            if let (None, Some(member), true) = (refusal, member, sent) {
+                tracing::info!(node_rank = member.node_rank, host = %member.host, "a node joined");
+                joined.push(Membership {
+                    node_rank: member.node_rank,
+                    host: member.host,
+                    connection,
+                });
+            }
+        }
+        Ok(joined)
+    }
+
+    /// The descriptors a wait for joins polls.
+    fn descriptors(&self) -> impl Iterator<Item = std::os::fd::RawFd> + '_ {
+        std::iter::once(self.listener.descriptor())
+            .chain(self.connecting.iter().map(Connection::descriptor))
+    }
+}
+
+/// The deployment's node of `member`, as engines learn it.
+fn member_node(member: &Membership) -> Node {
+    Node {
+        node_rank: member.node_rank,
+        host: member.host.clone(),
+        address: member
+            .connection
+            .peer_ip()
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
+    }
+}
+
 /// An engine connection to the leader.
 struct EngineConnection {
     connection: Connection,
@@ -193,12 +292,14 @@ struct EngineConnection {
 }
 
 /// Runs the leader's service until `stop`: engines connect on `listener`,
-/// and `members` joined before. Returns what it served when `stop` asks
-/// for a hot restart's handoff, and `None` once it stopped.
+/// `members` joined before, and other nodes may join at `joins`. Returns
+/// what it served when `stop` asks for a hot restart's handoff, and `None`
+/// once it stopped.
 pub(crate) fn serve_leader(
     host: &str,
     local: Local,
     listener: Listener,
+    joins: Option<Joins>,
     members: Vec<Membership>,
     stop: &Stop,
 ) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
@@ -210,23 +311,14 @@ pub(crate) fn serve_leader(
             .map(|address| address.to_string())
             .unwrap_or_default(),
     }];
-    for member in &members {
-        nodes.push(Node {
-            node_rank: member.node_rank,
-            host: member.host.clone(),
-            address: member
-                .connection
-                .peer_ip()
-                .map(|address| address.to_string())
-                .unwrap_or_default(),
-        });
-    }
+    nodes.extend(members.iter().map(member_node));
     nodes.sort_by_key(|node| node.node_rank);
     run_leader(
         LeaderService {
             host: host.to_owned(),
             local,
             listener,
+            joins,
             members,
             nodes,
             engines: HashMap::new(),
@@ -242,6 +334,9 @@ pub(crate) struct LeaderService {
     host: String,
     local: Local,
     listener: Listener,
+    /// Where other nodes join the running deployment, when it names the
+    /// leader's address.
+    joins: Option<Joins>,
     members: Vec<Membership>,
     nodes: Vec<Node>,
     engines: HashMap<u64, EngineConnection>,
@@ -260,6 +355,7 @@ pub(crate) fn run_leader(
         host,
         mut local,
         listener,
+        mut joins,
         mut members,
         mut nodes,
         mut engines,
@@ -273,6 +369,7 @@ pub(crate) fn run_leader(
                 host: host.to_owned(),
                 local,
                 listener,
+                joins,
                 members,
                 nodes,
                 engines,
@@ -294,6 +391,16 @@ pub(crate) fn run_leader(
                 },
             );
             next_engine += 1;
+        }
+
+        // Nodes joining the running deployment: an engine that connects
+        // from now on learns them, so the next world may run ranks there.
+        if let Some(joins) = &mut joins {
+            for member in joins.admit(&members)? {
+                nodes.push(member_node(&member));
+                nodes.sort_by_key(|node| node.node_rank);
+                members.push(member);
+            }
         }
 
         // Engines: their hellos and requests; a closed engine takes its
@@ -332,9 +439,15 @@ pub(crate) fn run_leader(
                     Ok(Some(Upstream {
                         kind: Some(upstream::Kind::Request(request)),
                     })) => {
-                        if let Some(reply) =
-                            route(engine, &request, host, &mut local, &mut members, &mut stops)
-                            && peer.connection.send(&downstream_reply(reply)).is_err()
+                        if let Some(reply) = route(
+                            engine,
+                            &request,
+                            host,
+                            &mut local,
+                            &mut members,
+                            &nodes,
+                            &mut stops,
+                        ) && peer.connection.send(&downstream_reply(reply)).is_err()
                         {
                             closed.push(engine);
                             break;
@@ -440,6 +553,7 @@ pub(crate) fn run_leader(
         }
 
         let mut descriptors = vec![listener.descriptor(), stop.wake.as_raw_fd()];
+        descriptors.extend(joins.iter().flat_map(Joins::descriptors));
         descriptors.extend(engines.values().map(|peer| peer.connection.descriptor()));
         descriptors.extend(members.iter().map(|member| member.connection.descriptor()));
         wait(&descriptors, EXIT_POLL_INTERVAL);
@@ -465,8 +579,18 @@ fn route(
     host: &str,
     local: &mut Local,
     members: &mut [Membership],
+    nodes: &[Node],
     stops: &mut HashMap<(u64, u64), PendingStop>,
 ) -> Option<Reply> {
+    if let Some(request::Kind::Nodes(_)) = &request.kind {
+        return Some(Reply {
+            id: request.id,
+            kind: Some(reply::Kind::Nodes(NodesKnown {
+                nodes: nodes.to_vec(),
+            })),
+            ..Reply::default()
+        });
+    }
     let target = match &request.kind {
         Some(request::Kind::Spawn(spawn)) => Some(spawn.host.as_str()),
         Some(request::Kind::Reserve(reserve)) => Some(reserve.host.as_str()),
@@ -474,7 +598,7 @@ fn route(
         Some(request::Kind::Ledger(query)) => Some(query.host.as_str()),
         Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
         Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
-        Some(request::Kind::Stop(_)) | None => None,
+        Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
     };
     let forward = |member: &mut Membership| {
         member
@@ -602,6 +726,12 @@ pub(crate) enum HandedService {
         /// The process socket: its address and whether it is a Unix
         /// socket; its descriptor comes first.
         listener: (String, bool),
+        /// The members' address, when the deployment names one: its
+        /// address and whether it is a Unix socket; its descriptor follows
+        /// the process socket's. A node whose hello is still awaited joins
+        /// again.
+        #[serde(default)]
+        joins: Option<(String, bool)>,
         /// Each engine connection, by its identity, after the listener.
         engines: Vec<(u64, bool, HandedConnection)>,
         next_engine: u64,
@@ -663,6 +793,7 @@ impl LeaderService {
             host,
             mut local,
             listener,
+            joins,
             members,
             nodes,
             engines,
@@ -671,6 +802,11 @@ impl LeaderService {
         } = self;
         let (listener_descriptor, unix, address) = listener.hand_over();
         let mut descriptors = vec![listener_descriptor];
+        let joins = joins.map(|joins| {
+            let (descriptor, unix, address) = joins.listener.hand_over();
+            descriptors.push(descriptor);
+            (address, unix)
+        });
         let mut handed_engines = Vec::with_capacity(engines.len());
         for (id, engine) in engines {
             let handed = engine.connection.hand_over();
@@ -688,6 +824,7 @@ impl LeaderService {
             HandedService::Leader {
                 host,
                 listener: (address, unix),
+                joins,
                 engines: handed_engines,
                 next_engine,
                 members: handed_members,
@@ -728,6 +865,7 @@ pub(crate) fn resume(
         HandedService::Leader {
             host: leader_host,
             listener: (address, unix),
+            joins,
             engines,
             next_engine,
             members,
@@ -736,6 +874,11 @@ pub(crate) fn resume(
             local,
         } => {
             let listener = Listener::resume(next()?, unix, address)?;
+            let joins = joins
+                .map(|(address, unix)| {
+                    anyhow::Ok(Joins::new(Listener::resume(next()?, unix, address)?))
+                })
+                .transpose()?;
             let mut adopted_engines = HashMap::new();
             for (id, welcomed, connection) in engines {
                 adopted_engines.insert(
@@ -782,6 +925,7 @@ pub(crate) fn resume(
                     host: leader_host,
                     local,
                     listener,
+                    joins,
                     members: adopted_members,
                     nodes,
                     engines: adopted_engines,

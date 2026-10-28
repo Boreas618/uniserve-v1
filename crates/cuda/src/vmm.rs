@@ -579,8 +579,13 @@ impl PeerMapping {
 ///
 /// Each segment a mapping creates exports a POSIX descriptor, which a
 /// Storage Server retains, and another process maps the same segment from
-/// it. Dropping the mapping queues the teardown of its mapped segments and
-/// of the range to the reclaimer.
+/// it. The mapping keeps the creating handle while the segment stays
+/// mapped, so that the segment's fabric handle, which only its creator
+/// exports, imports on another host of the NVLink fabric
+/// ([`Self::fabric_handle`]); NVML attributes the segment to this process
+/// meanwhile ([`created_bytes`]). Dropping the mapping queues the teardown
+/// of its mapped segments, its creating handles and the range to the
+/// reclaimer.
 pub struct SegmentedMapping {
     device: DeviceId,
     address: u64,
@@ -592,8 +597,42 @@ pub struct SegmentedMapping {
     /// Each segment's offset and length, its handle while mapped, and the
     /// protection it is mapped with.
     segments: Vec<(usize, usize, Option<u64>, Protection)>,
+    /// Each segment's creating handle while this mapping created it and
+    /// keeps it mapped, with the fabric handle it exports when it has one.
+    created: Vec<Option<Created>>,
     // Declared last so that the fields above stay valid until teardown.
     range: VirtualRange,
+}
+
+/// A segment's creating handle, which its creator keeps.
+struct Created {
+    handle: u64,
+    fabric: Option<[u8; 64]>,
+}
+
+/// The bytes of segments this process created and keeps the creating
+/// handles of, by device ordinal: NVML attributes them to this process
+/// although a Storage Server retains them.
+static CREATED: Mutex<BTreeMap<i32, u64>> = Mutex::new(BTreeMap::new());
+
+/// The bytes of segments this process created on `device` and keeps the
+/// creating handles of ([`SegmentedMapping::create`]), which NVML counts
+/// among the process's device memory although a Storage Server retains
+/// them: what this process holds of its own is NVML's figure less these.
+pub fn created_bytes(device: DeviceId) -> u64 {
+    lock(&CREATED).get(&device.0).copied().unwrap_or(0)
+}
+
+/// Counts `bytes` more (or, with `held` false, fewer) created bytes on
+/// `device`.
+fn count_created(device: DeviceId, bytes: usize, held: bool) {
+    let mut created = lock(&CREATED);
+    let entry = created.entry(device.0).or_default();
+    *entry = if held {
+        entry.saturating_add(bytes as u64)
+    } else {
+        entry.saturating_sub(bytes as u64)
+    };
 }
 
 impl SegmentedMapping {
@@ -637,6 +676,7 @@ impl SegmentedMapping {
             bytes: total,
             access: devices,
             protection: Protection::ReadWrite,
+            created: segments.iter().map(|_| None).collect(),
             segments,
             range,
         })
@@ -681,9 +721,12 @@ impl SegmentedMapping {
     /// Creates the physical memory of segment `index`, maps it with the
     /// mapping's protection, and returns its POSIX descriptor for a Storage
     /// Server to retain. The segment is mapped from the descriptor, as
-    /// another process maps it, and the creating handle is released: NVML
-    /// then attributes the memory to no process, as it does the other
-    /// memory a Storage Server retains.
+    /// another process maps it. The creating handle stays with the mapping
+    /// until the segment is released ([`Self::release`]): where the device
+    /// creates fabric-exportable memory of the segment's length, the
+    /// segment exports a fabric handle ([`Self::fabric_handle`]), which
+    /// imports only while its creator holds it. NVML attributes the memory
+    /// to this process meanwhile, and [`created_bytes`] counts it.
     ///
     /// # Errors
     ///
@@ -692,10 +735,15 @@ impl SegmentedMapping {
         let (_, bytes) = self.unmapped(index)?;
         let context = PrimaryContext::retain(self.device)?;
         let _guard = context.enter()?;
-        let properties = MemAllocationProp::device(
-            self.device.handle()?,
-            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-        );
+        // Fabric-exportable too where the device makes such memory and the
+        // segment is a multiple of its granularity.
+        let fabric = HandleType::probe(self.device)? == HandleType::Fabric
+            && bytes.is_multiple_of(HandleType::Fabric.granularity(self.device)?);
+        let mut handle_types = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        if fabric {
+            handle_types |= CU_MEM_HANDLE_TYPE_FABRIC;
+        }
+        let properties = MemAllocationProp::device(self.device.handle()?, handle_types);
         let driver = driver()?;
         let mut handle = 0;
         driver.check(
@@ -719,12 +767,40 @@ impl SegmentedMapping {
                 "a descriptor export returned a fabric handle",
             ));
         };
-        let mapped = self.import(index, &descriptor);
-        // SAFETY: the handle is this function's own reference; the mapping,
-        // when made, holds the memory through its imported handle.
-        driver.check(unsafe { (driver.mem_release)(handle) }, "cuMemRelease")?;
-        mapped?;
+        let fabric_handle = if fabric {
+            match ShareableHandle::export(handle, HandleType::Fabric) {
+                Ok(ShareableHandle::Fabric(exported)) => Some(exported),
+                Ok(ShareableHandle::Descriptor(_)) => None,
+                Err(error) => {
+                    // SAFETY: the handle is this function's own reference.
+                    unsafe { (driver.mem_release)(handle) };
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = self.import(index, &descriptor) {
+            // SAFETY: the handle is this function's own reference.
+            unsafe { (driver.mem_release)(handle) };
+            return Err(error);
+        }
+        self.created[index] = Some(Created {
+            handle,
+            fabric: fabric_handle,
+        });
+        count_created(self.device, bytes, true);
         Ok(descriptor)
+    }
+
+    /// The fabric handle of segment `index`, when this mapping created it,
+    /// keeps it mapped and the device made it fabric-exportable: another
+    /// host of the NVLink fabric imports it while this process holds it.
+    pub fn fabric_handle(&self, index: usize) -> Option<[u8; 64]> {
+        self.created
+            .get(index)
+            .and_then(|created| created.as_ref())
+            .and_then(|created| created.fabric)
     }
 
     /// Maps segment `index` from the POSIX descriptor of a physical
@@ -801,6 +877,10 @@ impl SegmentedMapping {
         };
         let address = self.address + *offset as u64;
         let bytes = *bytes;
+        let created = self.created[index].take();
+        if created.is_some() {
+            count_created(self.device, bytes, false);
+        }
         let context = PrimaryContext::retain(self.device)?;
         in_context(context.raw(), |driver| {
             // SAFETY: the segment was mapped by this mapping.
@@ -808,7 +888,15 @@ impl SegmentedMapping {
                 driver.check(unsafe { (driver.mem_unmap)(address, bytes) }, "cuMemUnmap");
             // SAFETY: the handle is this mapping's own reference.
             let released = driver.check(unsafe { (driver.mem_release)(handle) }, "cuMemRelease");
-            unmapped.and(released)
+            let released_creation = created.map_or(Ok(()), |created| {
+                driver.check(
+                    // SAFETY: the creating handle is this mapping's own
+                    // reference, which nothing maps.
+                    unsafe { (driver.mem_release)(created.handle) },
+                    "cuMemRelease",
+                )
+            });
+            unmapped.and(released).and(released_creation)
         })
     }
 
@@ -896,12 +984,17 @@ impl Drop for SegmentedMapping {
     fn drop(&mut self) {
         // The range's teardown unmaps and releases what is still mapped,
         // before it frees the addresses.
-        for (offset, bytes, handle, _) in &mut self.segments {
+        for (index, (offset, bytes, handle, _)) in self.segments.iter_mut().enumerate() {
             if let Some(handle) = handle.take() {
                 self.range
                     .mapped
                     .push((self.address + *offset as u64, *bytes));
                 self.range.handles.push(handle);
+            }
+            // The creating handle is released with the mapped one.
+            if let Some(created) = self.created[index].take() {
+                count_created(self.device, *bytes, false);
+                self.range.handles.push(created.handle);
             }
         }
     }

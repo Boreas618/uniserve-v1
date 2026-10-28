@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use proto::Connection;
 use proto::process::{
-    Claim, Downstream, Exit, Hello, KeepWeights, LedgerQuery, Node, Request, Reserve, Scope, Spawn,
-    Stop, ThrottleTransfers, Upstream, WeightsKept, Welcome, downstream, event, hello, reply,
-    request, upstream,
+    Claim, Downstream, Exit, Hello, KeepWeights, LedgerQuery, Node, NodesQuery, Request, Reserve,
+    Scope, Spawn, Stop, ThrottleTransfers, Upstream, WeightsKept, Welcome, downstream, event,
+    hello, reply, request, upstream,
 };
 
 /// Longest the leader takes to answer a request the engine sends: a claim
@@ -143,6 +143,8 @@ pub(crate) struct ProcessClient {
     connection: Connection,
     /// Every node of the deployment, as the leader knows it.
     nodes: Vec<Node>,
+    /// The leader's minor version: which additions it answers.
+    minor: u32,
     next_request: u64,
     exits: ExitReports,
 }
@@ -177,9 +179,34 @@ impl ProcessClient {
         Ok(Arc::new(Mutex::new(Self {
             connection,
             nodes: welcome.nodes,
+            minor: welcome.minor,
             next_request: 1,
             exits: ExitReports::default(),
         })))
+    }
+
+    /// The hosts of the deployment's nodes as the leader knows them now,
+    /// the leader's first: a node that joined since the engine connected
+    /// included, when the leader answers for its nodes (minor 1).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the leader does not answer.
+    pub(crate) fn current_hosts(&mut self) -> anyhow::Result<Vec<String>> {
+        if self.minor >= 1 {
+            match self.request(request::Kind::Nodes(NodesQuery {}))? {
+                reply::Kind::Nodes(known) => self.nodes = known.nodes,
+                other => anyhow::bail!("the daemon answered a query of its nodes with {other:?}"),
+            }
+        }
+        Ok(self.hosts())
+    }
+
+    /// The hosts of the deployment's nodes, the leader's first.
+    pub(crate) fn hosts(&self) -> Vec<String> {
+        let mut nodes: Vec<&Node> = self.nodes.iter().collect();
+        nodes.sort_by_key(|node| node.node_rank);
+        nodes.into_iter().map(|node| node.host.clone()).collect()
     }
 
     /// The address other nodes reach node `host` at; `None` for a
@@ -368,6 +395,8 @@ impl ProcessClient {
             // The engine states whether its workers use the host KV cache.
             host_kv_cache: false,
             tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
+            // The engine names the other nodes' servers (`Claims::launch`).
+            peers: Vec::new(),
             world,
             // The engine states whether a group stands by, and how.
             standby: false,

@@ -1,29 +1,41 @@
-//! Weights a worker receives from the other worlds on its host.
+//! Weights a worker receives from the deployment's other worlds.
 //!
 //! A worker whose position has no manifest of its own, such as a rank of a
 //! world that changes the deployment's parallel configuration, finds the
-//! weights the deployment's other worlds retain on the host's GPUs: every
-//! manifest the Storage Server retains, of this version and of the same
-//! fingerprints, names storages whose chunks lie on the GPUs that hold
-//! them ([`WeightKeys::sources`]). The worker plans the storages its own
-//! weights take without reading the checkpoint ([`WeightKeys::plan`] over
-//! an unread model), and the ranks that load together compute one copy
-//! manifest from those sources to all of their storages
-//! (`storage::manifest`), each verifying that every rank computed the same
-//! digest before any byte moves ([`WeightKeys::receive`]).
+//! weights the deployment's other worlds retain on the host's GPUs and on
+//! the GPUs of the deployment's other nodes: every manifest a Storage
+//! Server retains, of this version and of the same fingerprints, names
+//! storages whose chunks lie on the GPUs that hold them
+//! ([`WeightKeys::sources`]). The host's server is listed and read through
+//! the worker's own connection; another node's over TCP as a peer, whose
+//! manifests the worker reads inline (`Request::Read`). The worker plans
+//! the storages its own weights take without reading the checkpoint
+//! ([`WeightKeys::plan`] over an unread model), and the ranks that load
+//! together compute one copy manifest from those sources to all of their
+//! storages (`storage::manifest`), each verifying that every rank computed
+//! the same digest before any byte moves ([`WeightKeys::receive`]).
+//!
+//! A manifest's plan weighs every block by the bandwidth of its link, so
+//! each rank first has its host's Transfer Server measure the link from
+//! every source GPU of another node into its GPU that it has not measured
+//! (two READs, or copies over the NVLink fabric, of 64 MiB of a chunk that
+//! GPU holds into a scratch storage of the rank's), and the ranks plan from
+//! the links all of them measured, gathered across their hosts.
 //!
 //! Each rank then allocates its storages at fixed addresses: a chunk whose
 //! key a source holds on its GPU is mapped read-only, every other chunk is
 //! created and retained exclusive under a receiving key, which the Transfer
 //! Server writes the manifest's copies into as one task at the
-//! `Background` priority, across the links it measured. Padding the
-//! manifest names is zeroed on the rank's GPU, and the tensors of the
-//! regions no source holds are read from the checkpoint as a load of only
-//! those tensors. The rank binds its model to the storages while the bytes
-//! arrive; once the transfer ended ([`Receipt::retain`]), the received
-//! chunks are retained read-only under their keys, like chunks a load
-//! writes, the receiving keys are released and the storages become
-//! read-only.
+//! `Background` priority, across the links it measured; a copy from a GPU
+//! of another node names that node's region (`Region::Remote`), which the
+//! Transfer Server copies over the NVLink fabric when the source chunk's
+//! fabric handle imports, and READs otherwise. Padding the manifest names
+//! is zeroed on the rank's GPU, and the tensors of the regions no source
+//! holds are read from the checkpoint as a load of only those tensors. The
+//! rank binds its model to the storages while the bytes arrive; once the
+//! transfer ended ([`Receipt::retain`]), the received chunks are retained
+//! read-only under their keys, like chunks a load writes, the receiving
+//! keys are released and the storages become read-only.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::fd::{AsFd, OwnedFd};
@@ -32,8 +44,10 @@ use std::sync::Arc;
 use cuda::{Protection, Stream};
 use sha2::{Digest, Sha256};
 use storage::manifest::{self, Gpu, Manifest, Space};
-use storage::protocol::{Access, LinkBandwidth, ListedTensor, Priority, Region, Span};
-use storage::{Key, Mode, Placement, StorageRecord, TensorRecord};
+use storage::protocol::{
+    Access, LinkBandwidth, ListedTensor, Listing, Memory, Priority, Region, Span,
+};
+use storage::{Client, Key, Mode, Placement, StorageRecord, TensorRecord};
 
 use super::{
     Found, MANIFEST_NAME, MANIFEST_VERSION, Planned, WeightKeys, WeightManifest, field_record,
@@ -45,13 +59,29 @@ use crate::memory::retained::Retained;
 use crate::parallel::host::HostGroup;
 use crate::{Error, Result};
 
-/// The weights the deployment's worlds retain on the host: their ranks'
-/// storages, each on a GPU that holds all of its chunks, and the links the
-/// Transfer Server measured between the GPUs.
+/// The weights the deployment's worlds retain on the host and on its other
+/// nodes: their ranks' storages, each on a GPU that holds all of its
+/// chunks, the links the host's Transfer Server measured, and the server
+/// of each source GPU of another node.
 pub(crate) struct Sources {
     world: manifest::World,
     links: Vec<LinkBandwidth>,
+    remote: BTreeMap<Gpu, String>,
 }
+
+/// How long another node's Storage Server may take to accept the worker's
+/// connection and answer one request: a listing and a manifest are small.
+const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The bytes of one timed copy of a link measurement: the Transfer Server
+/// measures a link from another host by its contiguous chunks of 64 MiB,
+/// the faster of the first two giving its bandwidth (its lanes'
+/// `MEASURE_BYTES`).
+const LINK_SAMPLE: u64 = 64 << 20;
+
+/// Every source storage a listing's manifests name, by GPU, once per GPU
+/// however many manifests name it.
+type ByGpu = BTreeMap<Gpu, BTreeMap<Vec<u8>, manifest::Storage>>;
 
 /// Weights a worker receives into chunks it created, until the transfer
 /// ends and they are retained read-only ([`Receipt::retain`]).
@@ -75,9 +105,11 @@ pub(crate) struct Receipt {
 
 impl WeightKeys {
     /// The weights the other worlds of the worker's deployment retain on
-    /// the host of the same model, which this worker may receive: `None`
-    /// when they retain none, or no Transfer Server runs to copy them.
-    pub(crate) fn sources(&self, retained: &Retained) -> Result<Option<Sources>> {
+    /// the host and on the deployment's other nodes (their Storage Servers
+    /// at `peers`), of the same model, which this worker may receive:
+    /// `None` when they retain none, or no Transfer Server runs to copy
+    /// them. Failure to reach a peer is reported to the caller.
+    pub(crate) fn sources(&self, retained: &Retained, peers: &[String]) -> Result<Option<Sources>> {
         // A rank whose weights span devices (a generation tower on a device
         // of its own) loads them.
         if self.devices.len() != 1 {
@@ -86,12 +118,70 @@ impl WeightKeys {
         let listing = retained.call("listing the storage server", |client| client.list())?;
         let Some(links) = listing
             .transfer
-            .map(|transfer| transfer.links)
+            .as_ref()
+            .map(|transfer| transfer.links.clone())
             .filter(|links| !links.is_empty())
         else {
             return Ok(None);
         };
-        let deployment = retained.scope().deployment.as_str();
+        let deployment = retained.scope().deployment.clone();
+        let mut by_gpu = ByGpu::new();
+        self.collect(
+            &listing,
+            &deployment,
+            |key| read_text(retained, key),
+            &mut by_gpu,
+        )?;
+        let mut remote = BTreeMap::new();
+        for endpoint in peers {
+            let mut peer = Client::connect_peer(endpoint, PEER_TIMEOUT)
+                .map_err(|error| storage_error_at(endpoint, "connecting", &error))?;
+            let listing = peer
+                .list()
+                .map_err(|error| storage_error_at(endpoint, "listing", &error))?;
+            let read = |key: Key| {
+                let bytes = peer.read(deployment.clone(), key).map_err(|error| {
+                    storage_error_at(endpoint, "reading a weight manifest", &error)
+                })?;
+                String::from_utf8(bytes).map(Some).map_err(|_| {
+                    Error::Interface(format!("a weight manifest at {endpoint} is not text"))
+                })
+            };
+            for gpu in self.collect(&listing, &deployment, read, &mut by_gpu)? {
+                remote.entry(gpu).or_insert_with(|| endpoint.clone());
+            }
+        }
+        // One source rank per GPU, its storages in a fixed order, so that
+        // every worker that lists the same servers plans the same manifest.
+        let ranks: Vec<manifest::Rank> = by_gpu
+            .into_iter()
+            .map(|(gpu, storages)| manifest::Rank {
+                gpu: Some(gpu),
+                storages: storages.into_values().collect(),
+            })
+            .collect();
+        if ranks.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Sources {
+            world: manifest::World { ranks },
+            links,
+            remote,
+        }))
+    }
+
+    /// Adds every source storage that `listing`'s manifests name to
+    /// `by_gpu`, reading each manifest with `read`: the storages of the
+    /// fields of this worker's fingerprints whose chunks all lie on one GPU
+    /// of the listing, read-only and retained by the deployment. Returns
+    /// the GPUs it added storages of.
+    fn collect(
+        &self,
+        listing: &Listing,
+        deployment: &str,
+        mut read: impl FnMut(Key) -> Result<Option<String>>,
+        by_gpu: &mut ByGpu,
+    ) -> Result<BTreeSet<Gpu>> {
         let ours = |tensor: &ListedTensor| {
             tensor.access == Access::ReadOnly
                 && tensor
@@ -115,10 +205,9 @@ impl WeightKeys {
         }
 
         let digests = self.fingerprint_digests();
-        // Each source storage once per GPU, whatever manifests name it.
-        let mut by_gpu: BTreeMap<Gpu, BTreeMap<Vec<u8>, manifest::Storage>> = BTreeMap::new();
+        let mut added = BTreeSet::new();
         for key in manifests {
-            let Some(text) = read_text(retained, key)? else {
+            let Some(text) = read(key)? else {
                 continue;
             };
             // A manifest of another version or format names no source.
@@ -150,6 +239,7 @@ impl WeightKeys {
                     Error::Invalid(format!("encoding a source storage: {error}"))
                 })?;
                 for gpu in gpus.unwrap_or_default() {
+                    added.insert(gpu);
                     by_gpu
                         .entry(gpu)
                         .or_default()
@@ -157,22 +247,7 @@ impl WeightKeys {
                 }
             }
         }
-        // One source rank per GPU, its storages in a fixed order, so that
-        // every worker that lists the same server plans the same manifest.
-        let ranks: Vec<manifest::Rank> = by_gpu
-            .into_iter()
-            .map(|(gpu, storages)| manifest::Rank {
-                gpu: Some(gpu),
-                storages: storages.into_values().collect(),
-            })
-            .collect();
-        if ranks.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(Sources {
-            world: manifest::World { ranks },
-            links,
-        }))
+        Ok(added)
     }
 
     /// Receive this rank's `planned` storages from `sources`, together
@@ -224,6 +299,11 @@ impl WeightKeys {
         let encoded = serde_json::to_vec(&own)
             .map_err(|error| Error::Invalid(format!("encoding a target rank: {error}")))?;
         let freed = started.elapsed();
+        // Every rank plans from the links all of them measured: a rank of
+        // another host measured other links.
+        let links = measure_links(retained, sources, device, gpu)?;
+        let links = gather_links(agreement, &links)?;
+        let measured = started.elapsed();
         let targets = agreement
             .all_gather_bytes(&encoded)?
             .iter()
@@ -237,7 +317,7 @@ impl WeightKeys {
             source: sources.world.clone(),
             gpus: targets.iter().filter_map(|target| target.gpu).collect(),
             target: manifest::World { ranks: targets },
-            links: sources.links.clone(),
+            links,
         };
         let gathered = started.elapsed();
         let manifest =
@@ -338,6 +418,7 @@ impl WeightKeys {
                     placement: location,
                     bytes: chunk.length,
                     segment: None,
+                    fabric: storage.segment_fabric(segment)?,
                 };
                 let tensor = TensorRecord {
                     key: chunk.key,
@@ -409,6 +490,19 @@ impl WeightKeys {
             .spans(&request)
             .map(|span| {
                 let mut span = span.map_err(|error| Error::Interface(error.to_string()))?;
+                // A source chunk on a GPU of another node is that node's
+                // region.
+                if let Region::Tensor {
+                    at: Some(Placement::Device { gpu }),
+                    ..
+                } = &span.source
+                    && let Some(endpoint) = sources.remote.get(gpu)
+                {
+                    span.source = Region::Remote {
+                        endpoint: endpoint.clone(),
+                        region: Box::new(span.source),
+                    };
+                }
                 if let Region::Tensor { key, .. } = &mut span.destination {
                     *key = *receiving.get(key).ok_or_else(|| {
                         Error::Invariant("a copy writes a chunk the rank did not create".into())
@@ -455,12 +549,15 @@ impl WeightKeys {
             spans = spans_count,
             missing = missing.len(),
             digest = %super::hex(&manifest.digest),
+            remote_sources = sources.remote.len(),
             // Each phase's end, from the start: the unread model freed,
-            // the ranks' storages gathered, the manifest planned and
+            // the links from other nodes measured and gathered, the ranks'
+            // storages gathered, the manifest planned and
             // verified, the chunks mapped and created, the receiving keys
             // retained, the padding zeroed, the spans listed and the
             // transfer submitted.
             freed_ms = freed.as_millis() as u64,
+            measured_ms = measured.as_millis() as u64,
             gathered_ms = gathered.as_millis() as u64,
             planned_ms = planned.as_millis() as u64,
             verified_ms = verified.as_millis() as u64,
@@ -469,7 +566,7 @@ impl WeightKeys {
             zeroed_ms = zeroed.as_millis() as u64,
             listed_ms = listed.as_millis() as u64,
             submitted_ms = submitted.as_millis() as u64,
-            "receiving the rank's weights from the host's other worlds"
+            "receiving the rank's weights from the deployment's other worlds"
         );
         Ok(Found {
             manifest: manifest_text.clone(),
@@ -527,6 +624,7 @@ impl Receipt {
                     placement: Placement::Host { numa_node: None },
                     bytes: self.manifest.1.len() as u64,
                     segment: None,
+                    fabric: None,
                 },
                 manifest_memory.as_fd(),
             ));
@@ -557,6 +655,177 @@ impl Receipt {
         );
         Ok(())
     }
+}
+
+/// The links of `sources` into `gpu`, this rank's GPU on `device`, as the
+/// host's Transfer Server measured them, after it measured the link from
+/// every source GPU of another node it had not: for each, two copies of
+/// [`LINK_SAMPLE`] bytes from the longest chunk that GPU holds into a
+/// scratch storage the rank creates and releases, one task per GPU since
+/// the copies write the same scratch. A GPU that holds no chunk that long
+/// stays unmeasured, so a plan whose blocks only it holds fails.
+fn measure_links(
+    retained: &Retained,
+    sources: &Sources,
+    device: cuda::DeviceId,
+    gpu: Gpu,
+) -> Result<Vec<LinkBandwidth>> {
+    let into = Memory::Device { gpu };
+    let reaches = |links: &[LinkBandwidth], source: &Gpu| {
+        links.iter().any(|measured| {
+            measured.link.destination == into
+                && match &measured.link.source {
+                    Memory::Device { gpu: from }
+                    | Memory::Remote {
+                        gpu: Some(from), ..
+                    } => from == source,
+                    _ => false,
+                }
+        })
+    };
+    let mut unmeasured: Vec<(Gpu, String, Key)> = Vec::new();
+    for (source, endpoint) in &sources.remote {
+        if reaches(&sources.links, source) {
+            continue;
+        }
+        let longest = sources
+            .world
+            .ranks
+            .iter()
+            .filter(|rank| rank.gpu == Some(*source))
+            .flat_map(|rank| rank.storages.iter().flat_map(|storage| &storage.chunks))
+            .filter(|chunk| chunk.length >= LINK_SAMPLE)
+            .max_by_key(|chunk| (chunk.length, chunk.key));
+        match longest {
+            Some(chunk) => unmeasured.push((*source, endpoint.clone(), chunk.key)),
+            None => tracing::warn!(
+                gpu = %cuda::DeviceUuid(*source),
+                endpoint,
+                "another node's GPU holds no chunk long enough to measure its link"
+            ),
+        }
+    }
+    if unmeasured.is_empty() {
+        return Ok(sources.links.clone());
+    }
+
+    let started = std::time::Instant::now();
+    let bytes = 2 * LINK_SAMPLE;
+    let scratch = Storage::segmented(device, &[bytes as usize], &[])?;
+    let descriptor = scratch.create_segment(0)?;
+    let key = measuring_key(retained.world(), &gpu);
+    retained.call("retaining a link measurement's scratch", |client| {
+        client.put(
+            vec![TensorRecord {
+                key,
+                name: "link measurement scratch".into(),
+                storage: 0,
+                offset: 0,
+                dtype: "uint8".into(),
+                shape: vec![bytes],
+                strides: vec![1],
+                access: Access::Exclusive,
+            }],
+            &[(
+                StorageRecord {
+                    placement: Placement::Device { gpu },
+                    bytes,
+                    segment: None,
+                    fabric: None,
+                },
+                descriptor.as_fd(),
+            )],
+        )
+    })?;
+    retained.use_keys([key]);
+    let copied = unmeasured.iter().try_for_each(|(source, endpoint, chunk)| {
+        let spans = (0..2)
+            .map(|half| Span {
+                source: Region::Remote {
+                    endpoint: endpoint.clone(),
+                    region: Box::new(Region::Tensor {
+                        key: *chunk,
+                        at: Some(Placement::Device { gpu: *source }),
+                    }),
+                },
+                source_offset: 0,
+                destination: Region::Tensor { key, at: None },
+                destination_offset: half * LINK_SAMPLE,
+                bytes: LINK_SAMPLE,
+                rows: 1,
+                source_pitch: 0,
+                destination_pitch: 0,
+            })
+            .collect();
+        let task = retained.transfer(spans, Priority::Background, retained.world())?;
+        retained.transferred(task)
+    });
+    retained.forget(&[key])?;
+    drop(scratch);
+    copied?;
+
+    // The Transfer Server reports a link it measured before the end of the
+    // task that measured it.
+    let listing = retained.call("listing the storage server", |client| client.list())?;
+    let links = listing
+        .transfer
+        .map(|transfer| transfer.links)
+        .unwrap_or_default();
+    let missing: Vec<String> = unmeasured
+        .iter()
+        .filter(|(source, ..)| !reaches(&links, source))
+        .map(|(source, ..)| cuda::DeviceUuid(*source).to_string())
+        .collect();
+    if !missing.is_empty() {
+        tracing::warn!(
+            ?missing,
+            "the links from these GPUs of another node stay unmeasured"
+        );
+    }
+    tracing::info!(
+        gpus = unmeasured.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "measured the links from another node's GPUs"
+    );
+    Ok(links)
+}
+
+/// Every link the ranks of `agreement` measured, each rank giving `links`,
+/// in one order on every rank: a link measured by several (each rank of a
+/// host lists the same) takes the highest bandwidth.
+fn gather_links(agreement: &HostGroup, links: &[LinkBandwidth]) -> Result<Vec<LinkBandwidth>> {
+    let encoded = serde_json::to_vec(links)
+        .map_err(|error| Error::Invalid(format!("encoding measured links: {error}")))?;
+    let mut merged: BTreeMap<Vec<u8>, LinkBandwidth> = BTreeMap::new();
+    for bytes in agreement.all_gather_bytes(&encoded)? {
+        let links: Vec<LinkBandwidth> = serde_json::from_slice(&bytes)
+            .map_err(|error| Error::Interface(format!("a rank's measured links: {error}")))?;
+        for measured in links {
+            let identity = serde_json::to_vec(&measured.link)
+                .map_err(|error| Error::Invalid(format!("encoding a link: {error}")))?;
+            let entry = merged.entry(identity).or_insert_with(|| measured.clone());
+            entry.bytes_per_second = entry.bytes_per_second.max(measured.bytes_per_second);
+        }
+    }
+    Ok(merged.into_values().collect())
+}
+
+/// The key a rank's link measurement scratch on `gpu` is retained under in
+/// world `world`.
+fn measuring_key(world: u64, gpu: &Gpu) -> Key {
+    // Scratch is named by its owner, not by the bytes the transfer writes.
+    let mut key = [0; 32];
+    key[..8].copy_from_slice(b"linkbw\0\0");
+    key[8..16].copy_from_slice(&world.to_le_bytes());
+    key[16..].copy_from_slice(gpu);
+    Key(key)
+}
+
+/// A failure of a request to another node's Storage Server at `endpoint`.
+fn storage_error_at(endpoint: &str, what: &str, error: &storage::Error) -> Error {
+    Error::Interface(format!(
+        "{what} at another node's storage server {endpoint}: {error}"
+    ))
 }
 
 /// The tensor a field identity (`<tensor id>/<field>`) belongs to.

@@ -76,10 +76,6 @@ minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 # Mooncake Store's C API, loaded at run time (`libmooncake_store.so`, built
 # with `WITH_STORE_C_SHARED`), so nothing links Mooncake.
 mooncake_store = { git = "https://github.com/kvcache-ai/Mooncake", tag = "v0.3.13.post1", default-features = false, features = ["dlopen"] }
-# NIXL's C API, resolved in `libnixl_capi.so` at run time (`stub-api`), so
-# nothing links NIXL. The library comes from the NIXL release of this exact
-# version, whose `wrapper.h` declares the same functions.
-nixl-sys = { version = "=1.5.1", features = ["stub-api"] }
 prometheus-client = "0.24.0"
 png = "0.18.1"
 # The cross-build interfaces' Protobuf messages and their compiler, which needs

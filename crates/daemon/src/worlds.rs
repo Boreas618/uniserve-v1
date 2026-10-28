@@ -375,17 +375,23 @@ fn switches_probes_only(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 /// the layout of its cache and the worlds it retires as it starts, which
 /// the world's history sets.
 fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
-    wire::EngineSpec {
+    let mut comparable = wire::EngineSpec {
         world: 0,
         predecessor: None,
         segments: Vec::new(),
         retire: Vec::new(),
         ..spec.clone()
+    };
+    // The file path is diagnostic; the resolved contents define the ranks.
+    if let Some(ranks) = comparable.placement.as_mut() {
+        ranks.worker_groups.clear();
     }
+    comparable
 }
 
 /// Whether `target` states another parallel configuration than `served`:
-/// other ranks, devices or hosts, another device of a generation tower
+/// other ranks, devices or hosts (a deployment file by its content), another
+/// device of a generation tower
 /// (the worker mesh), another division of the routed experts, or another
 /// page size of the KV cache. Each GPU of the successor then holds other
 /// regions of the logical tensors: its weights are keyed by those regions,
@@ -397,7 +403,7 @@ fn parallel_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool
     let ranks = |spec: &wire::EngineSpec| {
         spec.placement.as_ref().map(|placement| {
             (
-                placement.worker_groups.clone(),
+                placement.worker_groups_content.clone(),
                 placement.tensor_parallel_size,
                 placement.data_parallel_size,
                 placement.device.clone(),
@@ -732,7 +738,7 @@ impl Leader {
                 unavailable.world, unavailable.reason
             )));
         }
-        if target == current {
+        if target == current && target.worker_groups.is_none() {
             return Ok(Applied::Unchanged);
         }
         // A configuration of another served name or model processes requests
@@ -760,6 +766,9 @@ impl Leader {
         };
         let world_changes = comparable(&served) != comparable(&target_spec);
         let daemon_changes = crate::options::daemon_options_differ(&current, &target);
+        if target == current && !world_changes {
+            return Ok(Applied::Unchanged);
+        }
 
         // A world change: what each derived state of the serving world
         // becomes in its successor. Weights of other keys are loaded from the
@@ -2041,5 +2050,41 @@ mod tests {
         }
         assert!(!parallel_change(&served, &sized));
         assert_eq!(differing(&served, &sized), vec!["the placement"]);
+    }
+
+    /// The resolved deployment carries the ranks it read even when the
+    /// file is changed in place before the engine starts.
+    #[test]
+    fn a_resolved_deployment_keeps_its_ranks_when_the_file_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deployment.toml");
+        let spec = |ranks: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "[[worker_groups]]\nid = \"model\"\nranks = {ranks}\nqueue_depth = 2\n\n\
+                     [worker_groups.components.model]\ntensor_parallel_size = 2\n"
+                ),
+            )
+            .unwrap();
+            let config = crate::options::ServeConfig {
+                worker_groups: Some(path.clone()),
+                ..Default::default()
+            };
+            let mut resolved = config.engine_spec().unwrap();
+            resolved.model_facts = Some(wire::ModelFacts::default());
+            resolved
+        };
+        let served = spec(r#"["rank-0/cuda:0", "rank-0/cuda:1"]"#);
+        let moved = spec(r#"["rank-1/cuda:0", "rank-1/cuda:1"]"#);
+        std::fs::remove_file(path).unwrap();
+        for (resolved, host) in [(served, "rank-0"), (moved, "rank-1")] {
+            let engine = engine::EngineConfig::from_spec(&resolved).unwrap();
+            let ranks = &engine.worker_groups[0].ranks;
+            assert_eq!(ranks.len(), 2);
+            assert!(ranks.iter().all(|rank| rank.host == host));
+            assert_eq!(ranks[0].device, "cuda:0");
+            assert_eq!(ranks[1].device, "cuda:1");
+        }
     }
 }

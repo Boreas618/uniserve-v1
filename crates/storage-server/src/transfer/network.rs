@@ -23,6 +23,14 @@
 //!   ([`Network::unexpose`]), so that the other host releases what it holds
 //!   for them, GPU contexts among them.
 //!
+//! A source whose creator recorded its device allocation's fabric handle
+//! ([`Registered::fabric`]) is copied over the NVLink fabric instead,
+//! whenever the handle imports on the destination's GPU: the destination's
+//! copy engines read it as they read another host's region a task names by
+//! fabric handle. A handle that does not import (the GPUs share no fabric,
+//! or the handle names no allocation) leaves the source to its READ, from
+//! the registration the exposure made.
+//!
 //! An agent's name is unique to its process, so a peer whose Transfer
 //! Server restarted answers with another agent: its metadata is loaded and
 //! the previous agent's forgotten, and the new one registers the regions
@@ -40,12 +48,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cuda::DeviceId;
 use storage::Client;
-use storage::protocol::{Link, Memory, Region, Registered};
+use storage::protocol::{FabricExport, Link, Memory, Region, Registered};
 
 use super::contexts::Hold;
 use super::lanes::{End, LaneKey, Piece, Runner};
-use super::memory::Mapped;
+use super::memory::{Fabric, Mapped};
 
 /// How long another host's Storage Server may take to accept the connection
 /// and to answer an exposure: far longer than registering the largest
@@ -87,6 +96,9 @@ pub(super) struct Source {
     /// The range from the region's first byte to the end of its
     /// allocation, as that agent registered it.
     pub(super) region: nixl::Region,
+    /// The device allocation's fabric handle, when its creator recorded
+    /// one.
+    pub(super) fabric: Option<FabricExport>,
 }
 
 /// A task's move from another host's memory into an allocation of this
@@ -100,7 +112,12 @@ pub(super) struct Inbound {
     pub(super) destination: Arc<Mapped>,
     pub(super) hold: Option<Hold>,
     pub(super) destination_offset: u64,
+    /// The bytes of each row, the rows, and their pitches on each side, as
+    /// the span states them.
     pub(super) bytes: u64,
+    pub(super) rows: u64,
+    pub(super) source_pitch: u64,
+    pub(super) destination_pitch: u64,
 }
 
 /// An exposure of another host a task READs, which it ends when it ends.
@@ -210,6 +227,7 @@ impl Network {
                     region: source_region(&range)?,
                     endpoint: endpoint.clone(),
                     peer: peer.clone(),
+                    fabric: range.fabric,
                 };
                 sources.insert(
                     (endpoint.clone(), deployment.clone(), region),
@@ -220,52 +238,87 @@ impl Network {
 
         let agent = self.agent()?;
         let mut pieces = Vec::with_capacity(moves.len());
+        // Each fabric handle is imported once per task and GPU.
+        let mut imports: HashMap<([u8; 64], DeviceId), Arc<Fabric>> = HashMap::new();
         for copy in moves {
             let Some(source) = sources.get(&(copy.endpoint, copy.deployment, copy.region)) else {
                 return Err("a region was not exposed".into());
             };
             // Another host checked the region; the span is checked here,
-            // against the range it registered from the region's first byte.
-            let within = copy
-                .source_offset
-                .checked_add(copy.bytes)
+            // against the range it registered from the region's first byte:
+            // from its first row's start to its last row's end.
+            let within = (copy.rows - 1)
+                .checked_mul(copy.source_pitch)
+                .and_then(|start| start.checked_add(copy.source_offset))
+                .and_then(|start| start.checked_add(copy.bytes))
                 .is_some_and(|end| end <= source.region.len as u64);
             if !within {
                 return Err(format!(
-                    "a span's source of {} bytes at offset {} reaches past the {} bytes of its \
-                     region at {}",
-                    copy.bytes, copy.source_offset, source.region.len, source.endpoint
+                    "a span's source of {} rows of {} bytes at offset {} and pitch {} reaches \
+                     past the {} bytes of its region at {}",
+                    copy.rows,
+                    copy.bytes,
+                    copy.source_offset,
+                    copy.source_pitch,
+                    source.region.len,
+                    source.endpoint
                 ));
             }
-            match &copy.hold {
-                Some(hold) => hold.session()?.nixl_region(agent, &copy.destination)?,
-                None => copy.destination.nixl_host_region(agent)?,
+            let read = Piece {
+                task,
+                source: End::Remote(Arc::clone(source)),
+                source_offset: copy.source_offset,
+                destination: End::Given {
+                    mapped: copy.destination,
+                    hold: copy.hold,
+                },
+                destination_offset: copy.destination_offset,
+                bytes: copy.bytes,
+                rows: copy.rows,
+                source_pitch: copy.source_pitch,
+                destination_pitch: copy.destination_pitch,
+            };
+            let End::Given { mapped, hold } = &read.destination else {
+                unreachable!("a READ's destination is this host's allocation");
+            };
+            if let (Some(fabric), Some(hold)) = (source.fabric, hold) {
+                match over_fabric(source, fabric, mapped, hold, &mut imports) {
+                    Ok((lane, import)) => {
+                        let source_offset = fabric
+                            .offset
+                            .checked_add(read.source_offset)
+                            .ok_or("a span's source offset overflows")?;
+                        pieces.push((
+                            lane,
+                            Piece {
+                                source: import,
+                                source_offset,
+                                ..read
+                            },
+                        ));
+                        continue;
+                    }
+                    Err(message) => tracing::debug!(
+                        message,
+                        endpoint = source.endpoint,
+                        "a source's fabric handle did not import: READ it"
+                    ),
+                }
+            }
+            match hold {
+                Some(hold) => hold.session()?.nixl_region(agent, mapped)?,
+                None => mapped.nixl_host_region(agent)?,
             };
             let link = Link {
                 source: source.memory.clone(),
-                destination: copy.destination.memory.clone(),
+                destination: mapped.memory.clone(),
             };
             pieces.push((
                 LaneKey {
                     link,
                     runner: Runner::Network,
                 },
-                Piece {
-                    task,
-                    source: End::Remote(Arc::clone(source)),
-                    source_offset: copy.source_offset,
-                    destination: End::Given {
-                        mapped: copy.destination,
-                        hold: copy.hold,
-                    },
-                    destination_offset: copy.destination_offset,
-                    bytes: copy.bytes,
-                    // The server refuses rows at a pitch from another host:
-                    // a READ copies one contiguous run.
-                    rows: 1,
-                    source_pitch: 0,
-                    destination_pitch: 0,
-                },
+                read,
             ));
         }
         Ok(pieces)
@@ -311,6 +364,12 @@ impl Network {
     ) -> Result<(String, u64, Vec<Registered>), String> {
         let host = self.host(endpoint);
         let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
+        tracing::debug!(
+            endpoint,
+            deployment,
+            regions = regions.len(),
+            "asking another host to expose regions"
+        );
         let (exposure, metadata, ranges) =
             host.expose(endpoint, deployment, regions)
                 .map_err(|error| {
@@ -330,6 +389,13 @@ impl Network {
                 tracing::warn!(%error, peer = previous, "forgetting an ended NIXL agent failed");
             }
         }
+        tracing::debug!(
+            endpoint,
+            exposure,
+            peer,
+            regions = ranges.len(),
+            "another host exposed regions"
+        );
         Ok((peer, exposure, ranges))
     }
 }
@@ -368,6 +434,48 @@ impl Host {
     }
 }
 
+/// The lane and the source end of a move from `source`, which its host
+/// exposed with the fabric handle `fabric`, into `destination`, copied over
+/// the NVLink fabric by the copy engines of the destination's GPU, which
+/// `hold` holds; the move's source offset counts from the exposed range's
+/// first byte, `fabric.offset` bytes into the imported allocation. The
+/// handle is imported there now (once per task and GPU, through
+/// `imports`), so that a handle that does not import fails here and leaves
+/// the move to its READ.
+fn over_fabric(
+    source: &Source,
+    fabric: FabricExport,
+    destination: &Mapped,
+    hold: &Hold,
+    imports: &mut HashMap<([u8; 64], DeviceId), Arc<Fabric>>,
+) -> Result<(LaneKey, End), String> {
+    let Memory::Remote { gpu: Some(gpu), .. } = &source.memory else {
+        return Err("a fabric handle names device memory".into());
+    };
+    let device = destination.device()?;
+    // The destination's GPU context, which the import lives in.
+    hold.session()?;
+    let import = Arc::clone(
+        imports
+            .entry((fabric.handle.0, device))
+            .or_insert_with(|| Arc::new(Fabric::new(fabric.handle.0, fabric.bytes, device))),
+    );
+    import.address()?;
+    Ok((
+        LaneKey {
+            link: Link {
+                source: Memory::Device { gpu: *gpu },
+                destination: destination.memory.clone(),
+            },
+            runner: Runner::Device(device),
+        },
+        End::Fabric {
+            import,
+            _hold: hold.clone(),
+        },
+    ))
+}
+
 /// Register `allocations` with `network`'s agent for other hosts' READs,
 /// each with the hold on its GPU for device memory: each one's range, in
 /// order, and the agent's metadata taken after the registrations, which
@@ -389,6 +497,8 @@ pub(super) fn register(
                 key: region.key,
                 address: region.address,
                 bytes: region.len as u64,
+                // The server states the fabric handles its records know.
+                fabric: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

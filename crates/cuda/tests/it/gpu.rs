@@ -843,12 +843,13 @@ fn a_pitched_copy_across_a_released_segment_is_refused() {
 }
 
 /// A segment a mapping creates is mapped from its descriptor, as another
-/// process maps it: NVML attributes its memory to no process, as it does
-/// the memory a Storage Server retains, which capacity planning counts
-/// apart from the process's own.
+/// process maps it, and its creating handle stays with the mapping until
+/// the segment is released: NVML attributes the memory to this process
+/// meanwhile, as `created_bytes` counts it for capacity planning, which
+/// books it apart from the process's own, and to no process once released.
 #[test]
 #[ignore = "requires a CUDA device and NVML"]
-fn a_created_segment_is_attributed_to_no_process() {
+fn a_created_segment_is_counted_as_created_until_it_is_released() {
     let _driver = exclusive_driver();
     let nvml = Nvml::init().unwrap();
     let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
@@ -861,11 +862,23 @@ fn a_created_segment_is_attributed_to_no_process() {
         Err(Error::ProcessNotFound { .. }) => return,
         Err(error) => panic!("{error}"),
     };
+    let created_before = cuda::created_bytes(DEVICE);
     let _descriptor = segmented.create(0).unwrap();
-    let after = nvml.process_memory(DEVICE).unwrap();
+    assert_eq!(cuda::created_bytes(DEVICE), created_before + bytes as u64);
+    let held = nvml.process_memory(DEVICE).unwrap();
     assert!(
-        after < before + bytes as u64 / 2,
-        "NVML attributes the created segment to this process: {before} -> {after} bytes"
+        held >= before + bytes as u64 / 2,
+        "NVML attributes the held creation to no process: {before} -> {held} bytes"
+    );
+    // What the process holds of its own leaves the created segment out.
+    assert!(held - cuda::created_bytes(DEVICE) < before + bytes as u64 / 2);
+
+    segmented.release(0).unwrap();
+    assert_eq!(cuda::created_bytes(DEVICE), created_before);
+    let released = nvml.process_memory(DEVICE).unwrap();
+    assert!(
+        released < before + bytes as u64 / 2,
+        "NVML attributes the released segment to this process: {before} -> {released} bytes"
     );
 }
 

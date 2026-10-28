@@ -1228,7 +1228,7 @@ impl ServeConfig {
     ///
     /// Fails, naming the option, when a capture list is not strictly
     /// increasing or repeats a shape, or a batch bound exceeds the worker's
-    /// `u32` fields.
+    /// `u32` fields; and when the deployment file cannot be read.
     pub fn engine_spec(&self) -> anyhow::Result<wire::EngineSpec> {
         let graphs = &self.cuda_graph_config;
         let flashinfer = &self.flashinfer_config;
@@ -1273,6 +1273,16 @@ impl ServeConfig {
             host: self.host_identity.clone(),
             placement: Some(wire::Placement {
                 worker_groups: text(&self.worker_groups),
+                worker_groups_content: self
+                    .worker_groups
+                    .as_deref()
+                    .map(|path| {
+                        std::fs::read_to_string(path).with_context(|| {
+                            format!("reading the deployment file {}", path.display())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
                 tensor_parallel_size: bounded(
                     self.tensor_parallel_size.get(),
                     "tensor_parallel_size",

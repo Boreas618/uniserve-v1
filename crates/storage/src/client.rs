@@ -456,6 +456,15 @@ impl Client {
         }
     }
 
+    /// See [`Request::Read`]: the bytes of `deployment`'s read-only host
+    /// tensor `key`.
+    pub fn read(&mut self, deployment: String, key: Key) -> Result<Vec<u8>> {
+        match Self::expect(self.call(&Request::Read { deployment, key }, &[])?)?.reply {
+            Reply::Read { bytes } => Ok(bytes),
+            other => Err(unexpected("read", &other)),
+        }
+    }
+
     /// See [`Request::Offload`] (`to_host`) and [`Request::Restore`].
     /// Returns how many storages moved and their bytes, once every copy
     /// ended.

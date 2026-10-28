@@ -37,8 +37,12 @@
 //!   leader restores them, which the Transfer Servers do gradually, and it
 //!   restores them when the preparation ends.
 //!
-//! The control acts through the serving engine, whose claims cover every
-//! node of the deployment ([`EngineClient::throttle_transfers`]).
+//! The control acts through the serving engine, which throttles every node
+//! of the deployment as the leader knows it at each decision
+//! ([`EngineClient::throttle_transfers`]): the copies of a world change run
+//! on the Transfer Servers of the successor's nodes, a node that joined the
+//! deployment after the serving engine started among them, and a node that
+//! holds no claim of the deployment has none to throttle.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

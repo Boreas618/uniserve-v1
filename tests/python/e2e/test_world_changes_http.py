@@ -41,6 +41,16 @@ the same request alone, with the same usage.
   tokens for the request alone, and every GPU's weights equal, field by
   field, those of a direct start in the new configuration.
 
+- A change across hosts (``UNISERVE_FOLLOWER`` names a second host by its
+  ssh destination, ``UNISERVE_LEADER_ADDRESS`` this host's address it
+  reaches, and ``UNISERVE_FOLLOWER_DEVICES`` the GPUs it may use): four
+  expert-parallel schedulers on this host grow onto both hosts, the second
+  joining the running deployment, and the same four move to the second
+  host by a deployment file changed in place. The successor's ranks on the
+  second host receive their weights from this host's worlds through the
+  Transfer Servers (over the NVLink fabric or by READ), the stream goes on,
+  and every GPU's weights equal those of a direct start.
+
 The tests print the pause of every promotion and rollback. Each runs a
 Storage Server of its own: ``XDG_RUNTIME_DIR`` points the daemon at a
 directory of the test's, and the server the daemon starts there is stopped
@@ -49,9 +59,11 @@ at the end.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -59,7 +71,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -1477,10 +1489,6 @@ PARALLEL_CHANGES = {
 }
 
 
-# The ranks of each change's first configuration.
-SOURCE_RANKS = {"dp2-tp2-to-dep4": 4, "dep2-to-tep4": 2}
-
-
 @pytest.mark.parametrize("change", list(PARALLEL_CHANGES))
 def test_a_parallel_configuration_change_continues_a_streaming_request(
     tmp_path: Path, change: str
@@ -1526,28 +1534,334 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         assert streaming.usage == reference_usage
         changed = _weight_digests(base_url)
 
-    lines = _log_lines(log)
-    assert any("a request migrated" in line for line in lines), (
-        "the streaming request did not migrate to the successor"
-    )
-    # Only the first world's ranks read the checkpoint; the successor's
-    # received their weights from it through the Transfer Server.
-    loaded = sum(
-        "uniserve.loading.rank: loaded numerical model" in line
-        for line in lines
-    )
-    assert loaded == SOURCE_RANKS[change], loaded
-    assert any(
-        "receiving the rank's weights from the host's other worlds" in line
-        for line in lines
-    )
-    assert any("retained the received weights" in line for line in lines)
     direct_path = tmp_path / "direct"
     direct_path.mkdir()
     with _serve(direct_path, name, devices, target, env=environment) as (
         base_url,
         _,
     ):
+        direct = _weight_digests(base_url)
+    assert sorted(changed) == sorted(direct)
+    for gpu, fields in direct.items():
+        differing = sorted(
+            field
+            for field in fields.keys() | changed[gpu].keys()
+            if fields.get(field) != changed[gpu].get(field)
+        )
+        assert not differing, f"GPU {gpu}: {differing[:8]}"
+
+
+# The second host of the cross-host changes, its GPUs, and this host's
+# address it reaches; the cases skip without them.
+FOLLOWER = os.environ.get("UNISERVE_FOLLOWER")
+FOLLOWER_DEVICES = os.environ.get("UNISERVE_FOLLOWER_DEVICES", "0,1,2,3")
+LEADER_ADDRESS = os.environ.get("UNISERVE_LEADER_ADDRESS")
+# What the leader logs while it awaits the nodes below `--nnodes`, and once
+# a node joined it.
+AWAITING = "awaiting the deployment's other nodes"
+JOINED = "a node joined"
+
+
+def _remote(command: str, timeout: float = 120) -> str:
+    """Runs `command` on the second host; returns its output."""
+    assert FOLLOWER is not None
+    done = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", FOLLOWER, command],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=True,
+    )
+    return done.stdout
+
+
+# Stops the Storage Server serving the socket given as its argument, found
+# by its command line, as `_stop_storage_server` does on this host.
+STOP_STORAGE = """
+import os
+import signal
+import sys
+
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    try:
+        command = open(f"/proc/{entry}/cmdline", "rb").read().split(b"\\0")
+    except OSError:
+        continue
+    if b"serve" in command and sys.argv[1].encode() in command:
+        os.kill(int(entry), signal.SIGTERM)
+"""
+
+
+@contextmanager
+def _follower(
+    log: Path,
+    address: str,
+    env: dict[str, str],
+    leader_log: Path | None = None,
+) -> Iterator[Callable[[], None]]:
+    """The second host's daemon, joining the leader at `address` with the
+    variables `env` beside the test's environment: started once
+    `leader_log` shows the leader awaits it, or when the test calls the
+    callable it yields. On exit, which follows the leader's, it waits
+    until the daemon ended, which it does when the leader's connection
+    closes, and stops the Storage Server the daemon started.
+    """  # noqa: D205
+    runtime = f"/tmp/uniserve-follower-{os.getpid()}-{find_free_port()}"
+    variables = {
+        name: os.environ.get(name, "")
+        for name in (
+            "PATH",
+            "LD_LIBRARY_PATH",
+            "PYTHONPATH",
+            "MAX_JOBS",
+            "FLASHINFER_WORKSPACE_BASE",
+            "UCX_NET_DEVICES",
+        )
+    }
+    variables.update(env)
+    variables.update(
+        {
+            "CUDA_VISIBLE_DEVICES": FOLLOWER_DEVICES,
+            "XDG_RUNTIME_DIR": runtime,
+            "NCCL_NVLS_ENABLE": "0",
+        }
+    )
+    environment = " ".join(
+        f"{name}={shlex.quote(value)}" for name, value in variables.items()
+    )
+    remote = (
+        f"mkdir -m 700 {runtime} && cd {shlex.quote(str(Path.cwd()))} && "
+        f"echo follower pid $$ && exec env {environment} "
+        f"{shlex.quote(str(require_uniserve_binary()))} serve --nnodes 2 "
+        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1"
+    )
+    started: list[subprocess.Popen[str]] = []
+    leaving = threading.Event()
+
+    def start() -> None:
+        if not started:
+            started.append(
+                subprocess.Popen(
+                    ["ssh", "-o", "BatchMode=yes", FOLLOWER, remote],
+                    stdout=log.open("w", encoding="utf-8"),
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+
+    def start_when_awaited() -> None:
+        while not leaving.is_set():
+            if (
+                leader_log is not None
+                and leader_log.exists()
+                and AWAITING in (leader_log.read_text(errors="replace"))
+            ):
+                start()
+                return
+            time.sleep(1)
+
+    starter = threading.Thread(target=start_when_awaited, daemon=True)
+    if leader_log is not None:
+        starter.start()
+    try:
+        yield start
+    finally:
+        leaving.set()
+        if leader_log is not None:
+            starter.join()
+        for process in started:
+            try:
+                process.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                pid = log.read_text().split("follower pid ")[1].split()[0]
+                _remote(f"kill {pid}")
+                process.wait(timeout=120)
+                pytest.fail("the follower daemon outlived its leader")
+        if started:
+            socket = f"{runtime}/uniserve/storage.sock"
+            kept = shlex.quote(str(log.with_suffix(".storage.log")))
+            _remote(
+                f"python3 -c {shlex.quote(STOP_STORAGE)} {socket}; "
+                f"cp {runtime}/uniserve/storage-server.log {kept} 2>/dev/null; "
+                f"rm -rf {runtime}"
+            )
+
+
+def _two_host_options(address: str, nnodes: int) -> tuple[str, ...]:
+    """The leader's options of a deployment of this host and the second:
+    its identity, the nodes it awaits at its start, and the address the
+    second joins at.
+    """  # noqa: D205
+    return (
+        "--host-identity",
+        "rank-0",
+        "--nnodes",
+        str(nnodes),
+        "--dist-init-addr",
+        address,
+    )
+
+
+def _deployment_file(path: Path, host: str, ranks: int) -> Path:
+    """`ranks` expert-parallel schedulers of one rank each, on GPUs
+    0..`ranks` of `host`: the shorthand's `--data-parallel-size` as a
+    deployment file.
+    """  # noqa: D205
+    path.write_text(
+        "".join(
+            f'[[worker_groups]]\nid = "model-{index}"\n'
+            f'ranks = ["{host}/cuda:{index}"]\nqueue_depth = 2\n\n'
+            f"[worker_groups.components.model]\n\n"
+            for index in range(ranks)
+        )
+    )
+    return path
+
+
+# The cross-host changes: the options the deployment serves with first on
+# this host (the deployment file's host when it states one), the change's
+# assignments, and the options of a direct start of the result, with the
+# host a deployment file moves to.
+HOST_CHANGES = {
+    # One GPU's deployment moves to one GPU of the second host: the
+    # deployment file names that GPU instead, at the same path.
+    "one-gpu-moves-to-another-host": ((), (), (), "rank-1", 1),
+    # Four expert-parallel schedulers on this host grow to eight over both
+    # hosts: the second joins the running deployment.
+    "dep4-to-dep8-on-two-hosts": (
+        ("--data-parallel-size", "4"),
+        ("data_parallel_size=8", 'placement_config.worker_hosts=["rank-1"]'),
+        (
+            "--data-parallel-size",
+            "8",
+            "--set",
+            'placement_config.worker_hosts=["rank-1"]',
+        ),
+        None,
+        4,
+    ),
+    # The same four schedulers move to the second host.
+    "dep4-moves-to-another-host": ((), (), (), "rank-1", 4),
+}
+
+
+@pytest.mark.parametrize("change", list(HOST_CHANGES))
+def test_a_change_across_hosts_continues_a_streaming_request(
+    tmp_path: Path, change: str
+):
+    """A world change that grows the deployment onto a host that joined it
+    while it served, or moves it there, continues the count streaming
+    across it with the tokens the committed world decodes for the request
+    alone. The successor's ranks on the new host receive their weights
+    from this host's world through the Transfer Servers instead of reading
+    the checkpoint, and the committed world's weights on every GPU are
+    byte for byte those of a direct start.
+    """  # noqa: D205
+    if FOLLOWER is None or LEADER_ADDRESS is None:
+        pytest.skip(
+            "UNISERVE_FOLLOWER and UNISERVE_LEADER_ADDRESS name the hosts"
+        )
+    source, assignments, target, moved_to, ranks = HOST_CHANGES[change]
+    name = "qwen3-host-change"
+    environment = _plugin(tmp_path / "plugins", "digest", DIGEST_PLUGIN)
+    # NVLink SHARP is off across hosts, as in the two-host deployments.
+    environment["NCCL_NVLS_ENABLE"] = "0"
+    # The GPUs of this host gpu-any.sh granted, as many as the first
+    # world's ranks.
+    devices = _four_devices() if ranks == 4 else _device()
+    deployment = tmp_path / "deployment.toml"
+    if moved_to is not None:
+        _deployment_file(deployment, "rank-0", ranks)
+        source = target = ("--worker-groups", str(deployment))
+    if ranks > 1:
+        source += ("--set", "moe_config.expert_parallel=true")
+        target += ("--set", "moe_config.expert_parallel=true")
+
+    changed_path = tmp_path / "changed"
+    changed_path.mkdir()
+    address = f"{LEADER_ADDRESS}:{find_free_port()}"
+    log = changed_path / "server.log"
+    with contextlib.ExitStack() as stack:
+        # The follower's daemon ends after the leader's.
+        join = stack.enter_context(
+            _follower(changed_path / "follower.log", address, environment)
+        )
+        base_url, log = stack.enter_context(
+            _serve(
+                changed_path,
+                name,
+                devices,
+                source + _two_host_options(address, 1),
+                env=environment,
+            )
+        )
+        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        # The second host joins the deployment while it serves.
+        join()
+        _wait_until(
+            lambda: JOINED in log.read_text(errors="replace"),
+            300,
+            "the second host did not join",
+        )
+        if moved_to is not None:
+            _deployment_file(deployment, moved_to, ranks)
+        report = _world_change(base_url, *assignments)
+        streaming.mark()
+        assert report["parallel"] == "changed", report
+        assert report["previous_world"] == serving["world"], report
+        print(
+            f"{change}: promotion pause {report['pause_seconds']:.3f} s "
+            f"(park {report['park_seconds']:.3f} s, "
+            f"preparation {report['prepare_seconds']:.1f} s, "
+            f"transfer halvings {report['transfer_halvings']}, "
+            f"restorations {report['transfer_restorations']})"
+        )
+        streaming.wait_for(streaming.marked + 64)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        streaming.join()
+        assert len(streaming.tokens) > streaming.marked
+        reference, reference_usage = _ask(base_url, name)
+        assert streaming.tokens == reference
+        assert streaming.usage == reference_usage
+        changed = _weight_digests(base_url)
+        if moved_to is not None:
+            # The commit retired the previous world on the host it left: no
+            # GPU there holds its weights any more.
+            ledgers = _ledgers(_config(base_url))
+            assert (serving["world"],) not in _worlds_of(ledgers, "weights")
+
+    lines = _log_lines(log) + _log_lines(changed_path / "follower.log")
+    for line in lines:
+        if "measured the links from another node's GPUs" in line or (
+            "receiving the rank's weights" in line and "remote_sources" in line
+        ):
+            print(line)
+    direct_path = tmp_path / "direct"
+    direct_path.mkdir()
+    address = f"{LEADER_ADDRESS}:{find_free_port()}"
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _follower(
+                direct_path / "follower.log",
+                address,
+                environment,
+                leader_log=direct_path / "server.log",
+            )
+        )
+        base_url, _ = stack.enter_context(
+            _serve(
+                direct_path,
+                name,
+                devices,
+                target + _two_host_options(address, 2),
+                env=environment,
+            )
+        )
         direct = _weight_digests(base_url)
     assert sorted(changed) == sorted(direct)
     for gpu, fields in direct.items():

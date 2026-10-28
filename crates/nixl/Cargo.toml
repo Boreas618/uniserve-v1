@@ -6,12 +6,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# Every NIXL call resolves in `libnixl_capi.so` at run time (`nixl-sys`'s
-# `stub-api` build), so building needs no NIXL installation and no binary
-# links NIXL; a process that never creates an agent never loads it.
+# The crate binds NIXL's C API itself: every NIXL call resolves in
+# `libnixl_capi.so` when the library loads at run time, so building needs
+# no NIXL installation and no binary links NIXL; a process that never
+# creates an agent never loads it.
 [dependencies]
 libloading.workspace = true
-nixl-sys.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -28,11 +28,12 @@
 //!   queued pieces leave at once, and it ends once its submitted chunks
 //!   completed, since only then are its regions free of copies.
 //! - **Links from other hosts.** Nobody measured them when the process
-//!   started: a network lane times its chunks of [`MEASURE_BYTES`], one at
-//!   a time, until [`MEASURE_SAMPLES`] of them took the link's bandwidth,
-//!   and reports it; until then its chunks are of that size and wait for
-//!   no budget. A bandwidth a lane learns is kept for the lane's next
-//!   thread.
+//!   started: a network lane (a READ's link) or a GPU lane (a link from
+//!   another host's GPU of the NVLink fabric) times its contiguous chunks
+//!   of [`MEASURE_BYTES`], one at a time, until [`MEASURE_SAMPLES`] of them
+//!   took the link's bandwidth, and reports it; until then its chunks are
+//!   of that size and wait for no budget. A bandwidth a lane measures is
+//!   kept for the lane's next thread.
 //! - **Threads and contexts.** A lane's thread runs while the lane has
 //!   chunks queued or in flight, and ends when it has none; the next piece
 //!   queued on the lane starts another. A GPU lane's thread holds its GPU
@@ -68,20 +69,20 @@ const MIN_CHUNK: u64 = 256 << 10;
 /// Chunks are whole multiples of this.
 const CHUNK_ALIGN: u64 = 64 << 10;
 
-/// The chunk a GPU lane times to learn the bandwidth of a link nobody
-/// measured (one from another host's GPU of the NVLink fabric).
-const PROBE_CHUNK: u64 = 4 << 20;
-
-/// The chunk a network lane times to learn the bandwidth of a link from
-/// another host: as long as a measured copy when the process starts
-/// (`devices::SAMPLE_BYTES`), so that the fixed cost of posting a READ and
-/// seeing it complete is a few percent of its time at the line rate of the
-/// host's network adapters.
+/// The chunk a lane times to learn the bandwidth of a link from another
+/// host: as long as a measured copy when the process starts
+/// (`devices::SAMPLE_BYTES`), so that the fixed cost of submitting a copy
+/// or posting a READ and seeing it complete is a few percent of its time
+/// at the line rate of the NVLink fabric or the host's network adapters.
+/// The pace of the link's later chunks is its measured bandwidth, so a
+/// shorter chunk, whose fixed cost would understate the link, would hold
+/// the link below its rate.
 const MEASURE_BYTES: u64 = 64 << 20;
 
 /// The timed chunks of [`MEASURE_BYTES`] whose fastest gives a link from
 /// another host its bandwidth: the first READ over a new connection also
-/// sets the connection up.
+/// sets the connection up, and the first copy from an imported allocation
+/// maps its pages on the GPU.
 const MEASURE_SAMPLES: usize = 2;
 
 /// The chunks a GPU or network lane keeps in flight: one copying while the host
@@ -288,7 +289,7 @@ struct State {
     running: HashSet<LaneKey>,
     budgets: HashMap<Link, Budget>,
     /// Each link's bandwidth in bytes per second: measured when the process
-    /// started, or learned by a lane since.
+    /// started, or by a lane since.
     bandwidths: HashMap<Link, f64>,
     /// Each report: the task, the bytes it copied, and its end once it
     /// ended.
@@ -484,12 +485,6 @@ impl Shared {
         }
     }
 
-    /// A lane learned `link`'s bandwidth, in bytes per second, which its
-    /// next threads use.
-    fn learned(&self, link: &Link, bandwidth: f64) {
-        self.lock().bandwidths.insert(link.clone(), bandwidth);
-    }
-
     /// A lane measured `link`, from another host, at `bandwidth` bytes per
     /// second: it is kept, and reported to the server.
     fn measured(&self, link: &Link, bandwidth: f64) {
@@ -675,13 +670,27 @@ impl Lanes {
     }
 }
 
-/// The bytes of a chunk that lasts `chunk` at `bandwidth` bytes per second.
+/// The bytes of a chunk that lasts `chunk` at `bandwidth` bytes per
+/// second; [`MEASURE_BYTES`] on a link nobody measured.
 fn chunk_bytes(bandwidth: Option<f64>, chunk: Duration) -> u64 {
     let Some(bandwidth) = bandwidth else {
-        return PROBE_CHUNK;
+        return MEASURE_BYTES;
     };
     let bytes = (bandwidth * chunk.as_secs_f64()) as u64;
     (bytes / CHUNK_ALIGN * CHUNK_ALIGN).max(MIN_CHUNK)
+}
+
+/// The timing of a link nobody measured: `piece`, a chunk of it, completed
+/// `seconds` after its submission. A contiguous chunk of [`MEASURE_BYTES`]
+/// is a sample (a shorter one, the tail of a piece, or a strided one, whose
+/// rows each cost a copy or a READ descriptor, would understate the link);
+/// returns the link's bandwidth, the fastest sample, once
+/// [`MEASURE_SAMPLES`] were taken.
+fn sample(samples: &mut Vec<f64>, piece: &Piece, seconds: f64) -> Option<f64> {
+    if piece.rows == 1 && piece.bytes == MEASURE_BYTES {
+        samples.push(piece.bytes as f64 / seconds.max(1e-6));
+    }
+    (samples.len() >= MEASURE_SAMPLES).then(|| samples.iter().copied().fold(0.0, f64::max))
 }
 
 /// Run `lane`'s chunks on the copy engines of `device`, until nothing is
@@ -716,6 +725,7 @@ fn device_lane(
         }
     };
     let mut flight: VecDeque<(Piece, Event)> = VecDeque::with_capacity(DEPTH);
+    let mut samples = Vec::with_capacity(MEASURE_SAMPLES);
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
         let piece = match shared.next(lane, bytes, !flight.is_empty()) {
@@ -790,12 +800,12 @@ fn device_lane(
             fatal("recording a copy's completion", &error);
         }
         if bandwidth.is_none() {
-            // A link nobody measured: its first chunk alone times it.
+            // A link nobody measured: its chunks run one at a time, timed.
             wait(&event);
-            let seconds = started.elapsed().as_secs_f64().max(1e-6);
-            let learned = piece.copied() as f64 / seconds;
-            bandwidth = Some(learned);
-            shared.learned(&lane.link, learned);
+            if let Some(measured) = sample(&mut samples, &piece, started.elapsed().as_secs_f64()) {
+                bandwidth = Some(measured);
+                shared.measured(&lane.link, measured);
+            }
             shared.complete(&piece, None);
             continue;
         }
@@ -871,10 +881,7 @@ fn network_lane(
     let mut flight: VecDeque<(Piece, nixl::Transfer)> = VecDeque::with_capacity(DEPTH);
     let mut samples = Vec::with_capacity(MEASURE_SAMPLES);
     loop {
-        let bytes = match bandwidth {
-            Some(_) => chunk_bytes(bandwidth, chunk),
-            None => MEASURE_BYTES,
-        };
+        let bytes = chunk_bytes(bandwidth, chunk);
         let piece = match shared.next(lane, bytes, !flight.is_empty()) {
             Next::Chunk(piece) => piece,
             Next::Busy => {
@@ -906,14 +913,12 @@ fn network_lane(
         };
         if bandwidth.is_none() {
             let failure = finish(transfer);
-            if failure.is_none() && piece.bytes == MEASURE_BYTES {
-                let seconds = started.elapsed().as_secs_f64().max(1e-6);
-                samples.push(piece.bytes as f64 / seconds);
-                if samples.len() == MEASURE_SAMPLES {
-                    let fastest = samples.iter().copied().fold(0.0, f64::max);
-                    bandwidth = Some(fastest);
-                    shared.measured(&lane.link, fastest);
-                }
+            if failure.is_none()
+                && let Some(measured) =
+                    sample(&mut samples, &piece, started.elapsed().as_secs_f64())
+            {
+                bandwidth = Some(measured);
+                shared.measured(&lane.link, measured);
             }
             shared.complete(&piece, failure);
             continue;
@@ -946,21 +951,31 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
         usize::try_from(piece.bytes).map_err(|_| "a chunk exceeds the address space".to_owned())?;
     // The server checked the destination span against its allocation, and
     // the exposure resolution the source span against its region's range.
-    let span = nixl::Span {
-        source: nixl::Region {
-            address: source.region.address + piece.source_offset,
-            len,
-            ..source.region
-        },
-        destination: nixl::Region {
-            address: local.address + piece.destination_offset,
-            len,
-            ..local
-        },
-    };
-    agent
-        .read(&source.peer, &[span])
-        .map_err(|error| format!("posting a READ from {}: {error}", source.endpoint))
+    // One READ moves the chunk's rows, a descriptor each.
+    let spans: Vec<nixl::Span> = (0..piece.rows)
+        .map(|row| nixl::Span {
+            source: nixl::Region {
+                address: source.region.address + piece.source_offset + row * piece.source_pitch,
+                len,
+                ..source.region
+            },
+            destination: nixl::Region {
+                address: local.address + piece.destination_offset + row * piece.destination_pitch,
+                len,
+                ..local
+            },
+        })
+        .collect();
+    let transfer = agent
+        .read(&source.peer, &spans)
+        .map_err(|error| format!("posting a READ from {}: {error}", source.endpoint))?;
+    tracing::debug!(
+        task = piece.task,
+        bytes = piece.bytes,
+        endpoint = source.endpoint,
+        "posted a READ"
+    );
+    Ok(transfer)
 }
 
 /// Poll `transfer` until it completed, as the host observes it; returns
@@ -968,13 +983,15 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
 /// network failed) fails its task, not the process: no CUDA context took
 /// part in it.
 fn finish(mut transfer: nixl::Transfer) -> Option<String> {
-    loop {
+    let failure = loop {
         match transfer.poll() {
-            Ok(true) => return None,
+            Ok(true) => break None,
             Ok(false) => std::thread::sleep(POLL),
-            Err(error) => return Some(format!("a READ from another host failed: {error}")),
+            Err(error) => break Some(format!("a READ from another host failed: {error}")),
         }
-    }
+    };
+    tracing::debug!(failure, "a READ ended");
+    failure
 }
 
 /// Wait until `event` completed, as the host observes it.
