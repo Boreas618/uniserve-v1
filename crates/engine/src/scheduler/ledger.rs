@@ -65,6 +65,11 @@ pub(super) struct CacheMemory {
     /// and activations: the graph pool a successor's warmup captures in.
     #[serde(default)]
     pub(super) graph_share_bytes: u64,
+    /// Whether a rank of the worker's model captures graphs under a policy
+    /// that captures; a successor of a model that serves every call eagerly
+    /// takes no graph share.
+    #[serde(default)]
+    pub(super) capturable: bool,
     /// The worker's host.
     #[serde(default)]
     pub(super) host: String,
@@ -276,7 +281,13 @@ pub(super) fn preparing(
         } else {
             0
         },
-        graph_pool: report.graph_share_bytes,
+        // A successor captures graphs only when its policy captures and its
+        // model can be captured.
+        graph_pool: if adds.captures_graphs && report.capturable {
+            report.graph_share_bytes
+        } else {
+            0
+        },
         process: serving.process,
         exclusive: serving.exclusive,
         head_segment: report.head_bytes,

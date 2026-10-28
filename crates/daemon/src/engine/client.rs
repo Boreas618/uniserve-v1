@@ -34,6 +34,8 @@ pub struct Successor {
     /// It maps none of the engine's KV cache: the requests in flight
     /// compute their state again in units of its own.
     pub recomputes_cache: bool,
+    /// Its graph policy captures graphs.
+    pub captures_graphs: bool,
 }
 
 /// What a ready engine reported it serves.
@@ -696,6 +698,7 @@ impl EngineClient {
                 keep_weights: Vec::new(),
                 successor_loads_weights: successor.loads_weights,
                 successor_recomputes_cache: successor.recomputes_cache,
+                successor_captures_graphs: successor.captures_graphs,
                 ..wire::ResizeCache::default()
             })
         })

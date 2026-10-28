@@ -675,6 +675,10 @@ pub struct Successor {
     /// requests that compute their state again), so the requests in flight
     /// take units of its own.
     pub recomputes_cache: bool,
+    /// Its graph policy captures graphs (`cuda_graph_config.policy` is not
+    /// `off`), so its warmup takes a graph share where its model can be
+    /// captured.
+    pub captures_graphs: bool,
 }
 
 /// A change to the device memory of a scheduler's KV cache.

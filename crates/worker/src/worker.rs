@@ -128,6 +128,10 @@ pub(crate) struct Worker {
     scratches: Scratches,
     /// How the worker, parked as a standby, keeps its graph memory.
     standby_memory: ipc::StandbyMemory,
+    /// Whether a rank of the loaded model captures graphs under a policy
+    /// that captures (`auto`): its model's and components' calls can be
+    /// captured, and no component streams its weights from host memory.
+    capturable: bool,
     executor: Executor,
     /// The executor runs warmup phases: the rank has executor computations or
     /// an expert union member.
@@ -335,6 +339,8 @@ impl Worker {
             .find(|placed| placed.config.weights == ComponentWeights::Host)
             .map(|placed| placed.name.as_str());
         plugin_graph_policy(&mut launch.execution).map_err(phase("load"))?;
+        let capturable =
+            graph_policy("auto", &model, host_component).is_ok_and(|policy| policy != "off");
         launch.execution.graph_policy =
             graph_policy(&launch.execution.graph_policy, &model, host_component)
                 .map_err(phase("load"))?;
@@ -747,6 +753,7 @@ impl Worker {
             graphs,
             scratches,
             standby_memory: launch.storage.standby_memory,
+            capturable,
             executor,
             computation_warmup,
             context,
@@ -932,6 +939,7 @@ impl Worker {
             bookings: self.bookings.clone(),
             host_cache: self.host_cache.take(),
             graph_pools: self.graphs.pools(),
+            capturable: self.capturable,
         };
         // The rank serves with CUPTI attached (`crate::profiling::cupti`),
         // unless a profiler holds it; the control thread's (this one's)

@@ -113,6 +113,10 @@ pub(crate) struct Maintenance {
     /// The rank's CUDA devices, whose contexts the rank probes while jobs
     /// are in flight (`Service::watch_jobs`).
     pub(crate) devices: Vec<cuda::DeviceId>,
+    /// Whether a rank of the loaded model captures graphs under a policy
+    /// that captures: a world succeeding this one that configures graphs
+    /// takes a graph share for its warmup's captures only then.
+    pub(crate) capturable: bool,
     /// What the warm rank books in each device's ledger: a promoted standby
     /// books it, a sleep books its graph pools released and a wake books
     /// them again.
@@ -747,6 +751,7 @@ impl Service<'_> {
                     "scratch_units": scratch,
                     "free_bytes": free,
                     "graph_share_bytes": graph_share,
+                    "capturable": self.maintenance.capturable,
                     "host": self.info.endpoint.host,
                     "scope": retained.as_deref().map(|retained| retained.scope().clone()),
                     "world": retained.as_deref().map(crate::memory::retained::Retained::world),
@@ -1263,6 +1268,7 @@ mod tests {
                 bookings: Vec::new(),
                 host_cache: None,
                 graph_pools: Vec::new(),
+                capturable: false,
             },
         )
         .run()

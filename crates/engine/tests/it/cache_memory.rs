@@ -73,6 +73,10 @@ struct Workers {
     expert_process: Option<u64>,
     /// Each hook run, with its payload.
     hooks: Vec<String>,
+    /// The graph share a successor's warmup takes on the GPU, and whether
+    /// the worker's model can be captured at all.
+    graph_share_bytes: u64,
+    capturable: bool,
     /// The bandwidth from host memory to the GPU the Transfer Server
     /// measured, in bytes per second.
     host_link: Option<u64>,
@@ -222,7 +226,8 @@ impl Executor for Segmented {
                 "capacity_units": workers.capacity_units,
                 "scratch_units": 0,
                 "free_bytes": workers.free_bytes,
-                "graph_share_bytes": 0,
+                "graph_share_bytes": workers.graph_share_bytes,
+                "capturable": workers.capturable,
                 "host": "node0",
                 "scope": {"deployment": "model", "group": "model", "rank": 0},
                 "world": WORLD,
@@ -864,7 +869,7 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
 
     let reloaded = plan_of(Successor {
         loads_weights: true,
-        recomputes_cache: false,
+        ..Successor::default()
     });
     assert_eq!(reloaded["successor"]["weights"], 2_000);
     assert_eq!(reloaded["kv_limit"], 6_000);
@@ -876,6 +881,7 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
     let recomputed = plan_of(Successor {
         loads_weights: true,
         recomputes_cache: true,
+        ..Successor::default()
     });
     let in_flight = recomputed["successor"]["in_flight"].as_u64().unwrap();
     assert!(
@@ -937,6 +943,57 @@ fn a_parked_world_evicts_its_cache_past_its_first_segment() {
         terminal(&mut request),
         Some(Event::Finished { .. })
     ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A successor's warmup takes a graph share only when its graph policy
+/// captures and its model can be captured: the plan of one that serves
+/// every call eagerly, or of a model that cannot be captured, leaves the
+/// serving world's cache that share.
+#[test]
+fn a_successor_that_captures_no_graphs_takes_no_graph_share() {
+    let (handle, _workers, thread) = start(Workers {
+        quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 2_000,
+        graph_share_bytes: 2_000,
+        capturable: true,
+        ..Workers::filling(0)
+    });
+    let plan_of = |successor| -> serde_json::Value {
+        let plans = resize(&handle, CacheChange::Plan(successor)).unwrap();
+        serde_json::from_str(&plans[0]).unwrap()
+    };
+    let capturing = plan_of(Successor {
+        captures_graphs: true,
+        ..Successor::default()
+    });
+    assert_eq!(capturing["successor"]["graph_pool"], 2_000);
+    assert_eq!(capturing["kv_limit"], 8_000);
+    let eager = plan_of(Successor::default());
+    assert_eq!(eager["successor"]["graph_pool"], 0);
+    assert_eq!(eager["kv_limit"], 10_000);
+
+    handle.shutdown();
+    thread.join().unwrap();
+
+    // A model that cannot be captured serves eagerly whatever the policy.
+    let (handle, _workers, thread) = start(Workers {
+        quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 2_000,
+        graph_share_bytes: 2_000,
+        capturable: false,
+        ..Workers::filling(0)
+    });
+    let plans = resize(
+        &handle,
+        CacheChange::Plan(Successor {
+            captures_graphs: true,
+            ..Successor::default()
+        }),
+    )
+    .unwrap();
+    let uncaptured: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
+    assert_eq!(uncaptured["successor"]["graph_pool"], 0);
 
     handle.shutdown();
     thread.join().unwrap();

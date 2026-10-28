@@ -701,6 +701,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
     let successor = crate::Successor {
         loads_weights: resize.successor_loads_weights,
         recomputes_cache: resize.successor_recomputes_cache,
+        captures_graphs: resize.successor_captures_graphs,
     };
     let change = match wire::CacheChange::try_from(resize.change) {
         Ok(wire::CacheChange::Shrink) => crate::CacheChange::Shrink {
