@@ -12,10 +12,11 @@ use std::sync::Arc;
 use super::wire;
 use super::{
     ArtifactEvent, ArtifactMedia, CachePolicy, CfgRenorm, ConditionExtent, DiffusionRequest,
-    DiffusionSamplingParams, Event, FeedbackNextToken, FeedbackSource, FinishReason,
-    GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder,
-    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaKind,
-    MigrationCause, MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
+    DiffusionSamplingParams, EncoderInputs, Event, FeedbackImage, FeedbackNextToken,
+    FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint, GenerationFeatures,
+    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageGenerationConfig,
+    ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind, MigrationCause,
+    MultimodalInputs, PixelRange, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
     Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
 };
 
@@ -132,7 +133,52 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                 .collect(),
             generated_token_ids: request.generated_token_ids.clone(),
             adapter: request.adapter,
+            generated_images: request
+                .generated_images
+                .iter()
+                .map(|image| wire::GeneratedImage {
+                    tokens: image.tokens,
+                    image: Some(match &image.image {
+                        FeedbackImage::Pixels(pixels) => {
+                            wire::generated_image::Image::Pixels(pixels.as_ref().into())
+                        }
+                        FeedbackImage::Png(png) => {
+                            wire::generated_image::Image::PngB64(png.to_string())
+                        }
+                    }),
+                })
+                .collect(),
         }
+    }
+}
+
+impl From<&ImagePixels> for wire::ImagePixels {
+    fn from(pixels: &ImagePixels) -> Self {
+        Self {
+            height: pixels.height,
+            width: pixels.width,
+            range: match pixels.range {
+                PixelRange::Unit => wire::PixelRange::Unit,
+                PixelRange::SignedUnit => wire::PixelRange::SignedUnit,
+            } as i32,
+            values: pixels.values.clone(),
+        }
+    }
+}
+
+impl TryFrom<wire::ImagePixels> for ImagePixels {
+    type Error = WireError;
+
+    fn try_from(pixels: wire::ImagePixels) -> Result<Self, WireError> {
+        Ok(Self {
+            height: pixels.height,
+            width: pixels.width,
+            range: match known::<wire::PixelRange>(pixels.range, "pixel range")? {
+                wire::PixelRange::Unit => PixelRange::Unit,
+                wire::PixelRange::SignedUnit => PixelRange::SignedUnit,
+            },
+            values: pixels.values,
+        })
     }
 }
 
@@ -189,6 +235,23 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                 .collect(),
             generated_token_ids: request.generated_token_ids,
             adapter: request.adapter,
+            generated_images: request
+                .generated_images
+                .into_iter()
+                .map(|image| {
+                    Ok(GeneratedImage {
+                        tokens: image.tokens,
+                        image: match present(image.image, "generated image")? {
+                            wire::generated_image::Image::Pixels(pixels) => {
+                                FeedbackImage::Pixels(Arc::new(pixels.try_into()?))
+                            }
+                            wire::generated_image::Image::PngB64(png) => {
+                                FeedbackImage::Png(Arc::from(png))
+                            }
+                        },
+                    })
+                })
+                .collect::<Result<_, WireError>>()?,
         })
     }
 }
@@ -216,7 +279,7 @@ impl From<wire::GenerationConstraint> for GenerationConstraint {
 impl From<&ImageInput> for wire::ImageInput {
     fn from(image: &ImageInput) -> Self {
         Self {
-            hash: image.hash,
+            digest: image.digest.to_vec(),
             b64: image.b64.clone(),
             position: image.position,
             num_positions: image.num_positions,
@@ -230,7 +293,7 @@ impl TryFrom<wire::ImageInput> for ImageInput {
 
     fn try_from(image: wire::ImageInput) -> Result<Self, WireError> {
         Ok(Self {
-            hash: image.hash,
+            digest: digest(&image.digest, "an input image's digest")?,
             b64: image.b64,
             position: image.position,
             num_positions: image.num_positions,
@@ -530,8 +593,29 @@ impl From<&DiffusionRequest> for wire::DiffusionRequest {
             trajectory: request.trajectory.id,
             denoised_steps: request.trajectory.denoised_steps,
             state_seed: request.trajectory.state_seed,
+            stored_layout: request.trajectory.stored_layout.clone(),
+            encoder_inputs: request
+                .encoder_inputs
+                .as_ref()
+                .map(|inputs| wire::EncoderInputs {
+                    text: inputs.text.to_vec(),
+                    vision: inputs.vision.map(|digest| digest.to_vec()),
+                    video_units: inputs
+                        .video_units
+                        .iter()
+                        .map(|digest| digest.to_vec())
+                        .collect(),
+                    audio: inputs.audio.map(|digest| digest.to_vec()),
+                }),
         }
     }
+}
+
+/// A SHA-256 digest from its wire bytes.
+fn digest(bytes: &[u8], field: &str) -> Result<[u8; 32], WireError> {
+    bytes
+        .try_into()
+        .map_err(|_| WireError::new(format!("{field} is not a SHA-256 digest")))
 }
 
 impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
@@ -570,7 +654,29 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
                 id: request.trajectory,
                 denoised_steps: request.denoised_steps,
                 state_seed: request.state_seed,
+                stored_layout: request.stored_layout,
             },
+            encoder_inputs: request
+                .encoder_inputs
+                .map(|inputs| -> Result<Box<EncoderInputs>, WireError> {
+                    Ok(Box::new(EncoderInputs {
+                        text: digest(&inputs.text, "the text encoding's inputs")?,
+                        vision: inputs
+                            .vision
+                            .map(|bytes| digest(&bytes, "the vision encoding's inputs"))
+                            .transpose()?,
+                        video_units: inputs
+                            .video_units
+                            .iter()
+                            .map(|bytes| digest(bytes, "a condition unit's inputs"))
+                            .collect::<Result<_, _>>()?,
+                        audio: inputs
+                            .audio
+                            .map(|bytes| digest(&bytes, "the audio encoding's inputs"))
+                            .transpose()?,
+                    }))
+                })
+                .transpose()?,
         })
     }
 }
@@ -636,13 +742,16 @@ impl Event {
                 width,
                 bytes,
                 pixels_png_b64,
+                feedback,
             } => Kind::ImageDone(wire::ImageDone {
                 image_id: *image_id,
                 height: *height,
                 width: *width,
                 bytes: *bytes,
                 png_b64: pixels_png_b64.clone(),
+                feedback: feedback.as_deref().map(Into::into),
             }),
+            Self::ControlToken { id } => Kind::ControlToken(wire::ControlToken { id: *id }),
             Self::MediaProgress {
                 phase,
                 completed_steps,
@@ -699,12 +808,14 @@ impl Event {
             Self::Migratable {
                 cause,
                 denoised_steps,
+                stored_layout,
             } => Kind::Migratable(wire::Migratable {
                 cause: match cause {
                     MigrationCause::Drain => wire::MigrationCause::Drain,
                     MigrationCause::Loss => wire::MigrationCause::Loss,
                 } as i32,
                 denoised_steps: *denoised_steps,
+                stored_layout: stored_layout.clone(),
             }),
         };
         let event = wire::Event {
@@ -776,7 +887,12 @@ impl Event {
                 width: done.width,
                 bytes: done.bytes,
                 pixels_png_b64: done.png_b64,
+                feedback: done
+                    .feedback
+                    .map(|pixels| ImagePixels::try_from(pixels).map(Arc::new))
+                    .transpose()?,
             },
+            Kind::ControlToken(token) => Self::ControlToken { id: token.id },
             Kind::MediaProgress(progress) => Self::MediaProgress {
                 phase: progress.phase,
                 completed_steps: progress.completed_steps,
@@ -826,6 +942,7 @@ impl Event {
                     wire::MigrationCause::Loss => MigrationCause::Loss,
                 },
                 denoised_steps: migratable.denoised_steps,
+                stored_layout: migratable.stored_layout,
             },
         };
         Ok((request, event))

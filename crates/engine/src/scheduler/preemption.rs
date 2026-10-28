@@ -14,15 +14,19 @@
 //!    short of its last, on a denoiser whose ranks map host latent pools,
 //!    is written to them (`crate::trajectories`); a lost worker's is not.
 //! 3. **Leave.** The request ends as migratable with the steps stored
-//!    (zero for none), and the daemon submits it again with them, or with
-//!    the stored steps it named before when it stored none: a trajectory's
-//!    state at a step is the same whenever it is read.
-//! 4. **Resume.** An admitted request that names stored steps has its
-//!    pages pinned before its latent preparation, which restores them and
-//!    opens the trajectory at that step when every page is pinned, and
-//!    starts from noise otherwise. Every other call of the request (the
-//!    reading, encoding and refining of its conditions) runs as for a new
-//!    request: they are recomputed, and compute what they computed before.
+//!    (zero for none) and the record of where their pages lie and how each
+//!    stored rank laid its part out, and the daemon submits it again with
+//!    them, or with the stored steps it named before when it stored none: a
+//!    trajectory's state at a step is the same whenever it is read.
+//! 4. **Resume.** An admitted request that names stored steps has the
+//!    pages its record names pinned before its latent preparation, which
+//!    lays them out in its own ranks' pages, whatever parallel
+//!    configuration stored them, and opens the trajectory at that step when
+//!    every page is pinned, and starts from noise otherwise. Every other
+//!    call of the request runs as for a new request: its encoders read the
+//!    outputs the host encoder pools hold (`crate::encoder_outputs`) and
+//!    compute the others, and the reading and refining of its conditions
+//!    are recomputed, which compute what they computed before.
 
 use super::*;
 use crate::trajectories::{Offloaded, Restored};
@@ -48,6 +52,7 @@ impl Scheduler {
             let _ = pending.event_tx.send(Event::Migratable {
                 cause,
                 denoised_steps: 0,
+                stored_layout: Vec::new(),
             });
         }
         let running: Vec<RequestId> = self
@@ -86,13 +91,13 @@ impl Scheduler {
                 .as_mut()
                 .and_then(|store| store.offloaded(id));
             return match outcome {
-                Some(Offloaded::Stored(steps)) => {
+                Some(Offloaded::Stored(steps, record)) => {
                     tracing::info!(request = id.0, steps, "stored a preempted video trajectory");
-                    self.finish_media(id, DiffusionTerminal::Migrated(cause, steps));
+                    self.finish_media(id, DiffusionTerminal::Migrated(cause, steps, record));
                     true
                 }
                 Some(Offloaded::Failed) => {
-                    self.finish_media(id, DiffusionTerminal::Migrated(cause, 0));
+                    self.finish_media(id, DiffusionTerminal::Migrated(cause, 0, Vec::new()));
                     true
                 }
                 None => false,
@@ -117,9 +122,10 @@ impl Scheduler {
                     .get(&(request_key, component.clone()))
                     .cloned()
             });
+        let layouts = state.latent_layouts.clone();
         let offloading = match (stores, denoiser, self.trajectories.as_mut()) {
             (true, Some(worker), Some(store)) => {
-                store.offload(id, request_key, &worker, trajectory, steps)
+                store.offload(id, request_key, &worker, trajectory, steps, &layouts)
             }
             _ => false,
         };
@@ -129,7 +135,7 @@ impl Scheduler {
             }
             return false;
         }
-        self.finish_media(id, DiffusionTerminal::Migrated(cause, 0));
+        self.finish_media(id, DiffusionTerminal::Migrated(cause, 0, Vec::new()));
         true
     }
 
@@ -217,7 +223,7 @@ impl Scheduler {
         let Some(state) = self.media_state(id) else {
             return Restoring::Ready(None);
         };
-        let trajectory = state.request.trajectory;
+        let trajectory = state.request.trajectory.clone();
         if trajectory.denoised_steps == 0 || trajectory.denoised_steps >= state.denoising.steps() {
             return Restoring::Ready(None);
         }
@@ -242,6 +248,7 @@ impl Scheduler {
                 trajectory.id,
                 trajectory.denoised_steps,
                 trajectory.state_seed,
+                &trajectory.stored_layout,
             )
         });
         if pinning {

@@ -1,5 +1,6 @@
 //! A Storage Server on a socket of its own, in the test's process, and the
-//! host latent pool a simulated video denoising rank maps there.
+//! host page pools simulated video ranks map there: a denoising rank's
+//! latent pool and an encoder rank's encoder pool.
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -24,9 +25,9 @@ pub(crate) struct StorageServer {
     stop: Arc<AtomicBool>,
     wake: OwnedFd,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The worker connection that created the pools: the server keeps a
+    /// The worker connections that created the pools: the server keeps a
     /// pool's pages for its deployment while a worker of it is connected.
-    _worker: Option<Client>,
+    _workers: Vec<Client>,
     _directory: tempfile::TempDir,
 }
 
@@ -58,7 +59,7 @@ impl StorageServer {
             stop,
             wake: writer,
             thread: Some(thread),
-            _worker: None,
+            _workers: Vec::new(),
             _directory: directory,
         }
     }
@@ -70,6 +71,18 @@ impl StorageServer {
     /// A page pool of pages of `page_bytes` bytes, as rank 0 of worker group
     /// `group` maps it for its latent pages, holding `slots` pages.
     pub(crate) fn latent_pool(&mut self, group: &str, page_bytes: u64, slots: u64) -> u64 {
+        self.page_pool(group, Key([7; 32]), page_bytes, slots)
+    }
+
+    /// A page pool of pages of `page_bytes` bytes, as rank 0 of worker group
+    /// `group` maps it for its encoder outputs, holding `slots` pages.
+    pub(crate) fn encoder_pool(&mut self, group: &str, page_bytes: u64, slots: u64) -> u64 {
+        self.page_pool(group, Key([8; 32]), page_bytes, slots)
+    }
+
+    /// A page pool of pages laid out as `layout` says, which rank 0 of
+    /// worker group `group` maps.
+    fn page_pool(&mut self, group: &str, layout: Key, page_bytes: u64, slots: u64) -> u64 {
         let mut worker = Client::connect(
             &self.socket,
             Role::Worker {
@@ -85,7 +98,7 @@ impl StorageServer {
         )
         .unwrap();
         let shape = PageShape {
-            layout: Key([7; 32]),
+            layout,
             kv_head_offset: 0,
             kv_head_count: 0,
             page_bytes,
@@ -98,7 +111,7 @@ impl StorageServer {
         let Reply::PagePool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
             panic!("the latent pool was refused");
         };
-        self._worker = Some(worker);
+        self._workers.push(worker);
         pool
     }
 }

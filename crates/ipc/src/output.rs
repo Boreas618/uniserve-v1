@@ -185,6 +185,24 @@ pub struct CallOutput {
     /// token, in order, for the request's next verification: as many as
     /// the call's `DraftWork::proposals` asked for, none otherwise.
     pub draft_token_ids: Vec<u32>,
+    /// A successful video latent preparation's report of how each
+    /// denoising rank's request slot pages hold the request's samples:
+    /// every rank reports its own, and joining the ranks' completions
+    /// gathers them. The engine keys and records the trajectory's pages by
+    /// them when it stores the trajectory.
+    pub latent_layouts: Vec<RankLatentLayout>,
+}
+
+/// How one denoising rank's request slot pages hold a video request's
+/// latent samples.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankLatentLayout {
+    /// The rank's index in its worker group.
+    pub rank: u32,
+    /// The slot's pages as one storage (`storage::manifest::StorageLayout`,
+    /// JSON): the logical sample tensors, the part of each the rank holds
+    /// and where its values lie in the pages.
+    pub layout: String,
 }
 
 impl CallOutput {
@@ -231,6 +249,10 @@ impl CallOutput {
         ensure_valid!(
             self.candidate_logprobs.is_empty() || self.status == CallStatus::Ok,
             "candidate log-probabilities belong to a successful completion"
+        );
+        ensure_valid!(
+            self.latent_layouts.is_empty() || self.status == CallStatus::Ok,
+            "latent layouts belong to a successful completion"
         );
         if self.status == CallStatus::Predicated {
             ensure_valid!(

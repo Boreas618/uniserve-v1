@@ -80,6 +80,9 @@ fn ar_decode_call() -> Call {
         predicate: None,
         image_index: (kind == CallKind::Media(MediaCall::LatentPreparation)).then_some(4),
         latent_restore: None,
+        host_output: None,
+        latent_draw: (kind == CallKind::Media(MediaCall::LatentEncoding)).then_some(2),
+        carried_image: None,
     }
 }
 
@@ -151,11 +154,15 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         predicate: None,
         image_index: None,
         latent_restore: None,
+        host_output: None,
+        latent_draw: None,
+        carried_image: None,
     }
 }
 
 fn completion_record() -> CallOutput {
     CallOutput {
+        latent_layouts: Vec::new(),
         token_logprobs: vec![vec![
             TokenLogprob {
                 token_id: 271,
@@ -675,6 +682,9 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             predicate: None,
             image_index: None,
             latent_restore: None,
+            host_output: None,
+            latent_draw: None,
+            carried_image: None,
         };
         // A video decode range may start past the first unit, while an audio
         // decode range must start at it. Neither call may omit its range.
@@ -1804,6 +1814,9 @@ fn comprehensive_batches() -> Vec<Batch> {
             image_index: (kind == CallKind::Media(MediaCall::LatentPreparation))
                 .then_some(4 + index as u32),
             latent_restore: None,
+            host_output: None,
+            latent_draw: None,
+            carried_image: None,
         });
         // The admissions ride on the first batch of the pass, as a scheduler
         // places them ahead of the calls that use them.
@@ -1942,6 +1955,7 @@ fn full_forward_stats() -> ForwardStats {
 
 fn full_run_result() -> BatchOutput {
     let mut ok_record = CallOutput {
+        latent_layouts: Vec::new(),
         token_logprobs: Vec::new(),
         prompt_logprobs: Vec::new(),
         request_key: key_for_request(100),

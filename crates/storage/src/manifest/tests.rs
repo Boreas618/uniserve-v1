@@ -1084,3 +1084,52 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
             .is_none()
     );
 }
+
+/// A storage holding rows `start..start + count` of two `u32` tensors of
+/// 64 rows by 16 columns, the first at byte 0 and the second at byte
+/// `second`, in pages of 1 KiB: 64 bytes a row, 16 rows a page.
+fn paged_rows(start: u64, count: u64, second: u64, content: [u8; 32]) -> Storage {
+    let rows = |tensor: &str, offset: u64| {
+        field(
+            tensor,
+            offset,
+            &[64, 16],
+            vec![part(start, count), whole(16)],
+            vec![1, 0],
+        )
+    };
+    let fields = vec![rows("first", 0), rows("second", second)];
+    let layout = StorageLayout {
+        bytes: fields.iter().map(|field| field.bytes().end).max().unwrap(),
+        fields,
+    };
+    Storage::paged(layout, 1024, &|_| Some(content)).unwrap()
+}
+
+#[test]
+fn a_page_is_keyed_by_what_it_holds_and_where() {
+    // Rows 0..32 of both tensors on one rank of two, or all 64 rows on one
+    // rank: the first pages hold the same rows of the first tensor at the
+    // same positions under both, and the pages past them hold other rows.
+    let content = [5; 32];
+    let half = paged_rows(0, 32, 2048, content);
+    let whole_rows = paged_rows(0, 64, 4096, content);
+    let keys =
+        |storage: &Storage| -> Vec<Key> { storage.chunks.iter().map(|chunk| chunk.key).collect() };
+    let (half, whole_rows) = (keys(&half), keys(&whole_rows));
+    assert_eq!((half.len(), whole_rows.len()), (4, 8));
+    assert_eq!(half[..2], whole_rows[..2]);
+    assert_ne!(half[2], whole_rows[2]);
+    // Pages of distinct contents never share a key, nor do the pages of
+    // one storage.
+    let other = keys(&paged_rows(0, 32, 2048, [6; 32]));
+    assert!(half.iter().zip(&other).all(|(one, two)| one != two));
+    let distinct: BTreeSet<Key> = half.iter().copied().collect();
+    assert_eq!(distinct.len(), 4);
+    // Pages of no bytes are refused.
+    let empty = StorageLayout {
+        bytes: 0,
+        fields: Vec::new(),
+    };
+    assert!(Storage::paged(empty, 0, &|_| Some(content)).is_err());
+}

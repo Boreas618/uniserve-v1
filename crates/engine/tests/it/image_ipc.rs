@@ -181,6 +181,7 @@ fn request(
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
+        generated_images: Vec::new(),
     }
 }
 
@@ -192,6 +193,13 @@ struct Outcome {
     prompt_scores: usize,
     images: Vec<String>,
     reason: Option<FinishReason>,
+    /// Every token the engine counted, in order: text and control tokens.
+    generated: Vec<u32>,
+    /// Each image's identity, its feedback product's values and the number
+    /// of counted tokens before it.
+    fed_back: Vec<(u32, std::sync::Arc<engine::ImagePixels>, usize)>,
+    completion_tokens: usize,
+    image_count: usize,
 }
 
 /// Submit `request` and collect its events until it finishes.
@@ -208,19 +216,43 @@ fn run(engine: &SchedulerHandle, request: GenerationRequest) -> anyhow::Result<O
             .with_context(|| format!("request {id:?} timed out"))?
             .with_context(|| format!("request {id:?} event stream closed"))?;
         match event {
-            Event::TextToken { id, .. } => outcome.tokens.push(id),
-            Event::TextTokens { ids } => outcome.tokens.extend(ids),
+            Event::TextToken { id, .. } => {
+                outcome.tokens.push(id);
+                outcome.generated.push(id);
+            }
+            Event::TextTokens { ids } => {
+                outcome.tokens.extend(&ids);
+                outcome.generated.extend(ids);
+            }
+            Event::ControlToken { id } => outcome.generated.push(id),
             Event::PromptLogprobs { positions } => {
                 outcome.prompt_scores += positions.len();
             }
-            Event::ImageDone { pixels_png_b64, .. } => {
+            Event::ImageDone {
+                image_id,
+                pixels_png_b64,
+                feedback,
+                ..
+            } => {
                 outcome.images.push(pixels_png_b64);
+                if let Some(feedback) = feedback {
+                    outcome
+                        .fed_back
+                        .push((image_id, feedback, outcome.generated.len()));
+                }
             }
             Event::Rejected { message, .. } => {
                 anyhow::bail!("request {id:?} was rejected: {message}")
             }
-            Event::Finished { reason, .. } => {
+            Event::Finished {
+                reason,
+                completion_tokens,
+                images,
+                ..
+            } => {
                 outcome.reason = Some(reason);
+                outcome.completion_tokens = completion_tokens;
+                outcome.image_count = images;
                 return Ok(outcome);
             }
             _ => {}
@@ -328,7 +360,7 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
         // temporal position.
         let prompt = |color| MultimodalInputs {
             images: vec![ImageInput {
-                hash: u64::from(color),
+                digest: crate::support::image_digest(u64::from(color)),
                 b64: png(32, [color, 40, 200]),
                 position: 2,
                 num_positions: 1,
@@ -396,5 +428,73 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
     engine.shutdown();
     result?;
     assert!(!engine.is_dead(), "image understanding killed the engine");
+    Ok(())
+}
+
+/// A request that generated an image and left its engine continues on
+/// another from its facts, through the worker's own feedback computation:
+/// the engine writes the carried image's decoded values into its context
+/// by the request's feedback encoder, which the worker prepares as it
+/// prepares the decoded product, and the request generates the images and
+/// text the uninterrupted request generates after it, numbered after the
+/// carried image, with a usage that counts every token and image.
+#[test]
+fn a_continuation_feeds_its_carried_image_back_through_the_worker() -> anyhow::Result<()> {
+    let interleaved = |id: u64| {
+        let mut request = request(
+            id,
+            vec![5, 6, 7],
+            MultimodalInputs::default(),
+            GenerationConstraint::Default,
+            image(7, 2, 1.0),
+            true,
+        );
+        // Every sample opens an image while the request may open one.
+        request.max_images = 2;
+        request.max_und_tokens = 6;
+        request.sampling.seed = Some(3);
+        request.sampling.logit_bias = vec![(START_OF_IMAGE, 100.0)];
+        request
+    };
+    let whole = engine()?;
+    let uninterrupted = run(&whole, interleaved(21));
+    whole.shutdown();
+    let uninterrupted = uninterrupted?;
+    assert_eq!(uninterrupted.fed_back.len(), 2, "two images fed back");
+    assert!(
+        !matches!(uninterrupted.reason, Some(FinishReason::Error)),
+        "the uninterrupted request failed"
+    );
+
+    // The facts a migration carries once the first image is out: the tokens
+    // counted before it and the image, with its feedback values.
+    let (first, values, tokens) = uninterrupted.fed_back[0].clone();
+    assert_eq!(first, 1);
+    let mut continuation = interleaved(21);
+    continuation.generated_token_ids = uninterrupted.generated[..tokens].to_vec();
+    continuation.generated_images = vec![engine::GeneratedImage {
+        tokens: tokens as u32,
+        image: engine::FeedbackImage::Pixels(values),
+    }];
+    let resumed = engine()?;
+    let continued = run(&resumed, continuation);
+    resumed.shutdown();
+    let continued = continued?;
+
+    assert_eq!(continued.reason, uninterrupted.reason);
+    let ids: Vec<u32> = continued.fed_back.iter().map(|(id, _, _)| *id).collect();
+    assert_eq!(
+        ids,
+        [2],
+        "the continuation numbers its image after the carried one"
+    );
+    assert_eq!(continued.images, uninterrupted.images[1..]);
+    assert_eq!(
+        uninterrupted.generated[tokens..],
+        continued.generated[..],
+        "the continuation generates what the uninterrupted request did after the image"
+    );
+    assert_eq!(continued.completion_tokens, uninterrupted.completion_tokens);
+    assert_eq!(continued.image_count, uninterrupted.image_count);
     Ok(())
 }

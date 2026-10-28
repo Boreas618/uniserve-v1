@@ -28,6 +28,7 @@ use crate::executor::latents::LatentLedger;
 use crate::executor::reports::Publication;
 use crate::ffi::{Backing, DType, MemoryKind};
 use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::encoders::{self, EncoderHostPool};
 use crate::memory::{
     LatentUpdate, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore,
 };
@@ -308,6 +309,12 @@ struct Prepared {
     /// fields and trajectory (`crate::executor::image`).
     #[serde(default)]
     image: Option<serde_json::Value>,
+    /// A video latent preparation on a denoising rank: how the rank's
+    /// request slot pages hold the request's samples
+    /// (`storage::manifest::StorageLayout`), which its completion reports
+    /// and a restore lays the stored values out in.
+    #[serde(default)]
+    latent_layout: Option<serde_json::Value>,
 }
 
 /// The name of a call's output product.
@@ -345,12 +352,18 @@ pub(crate) fn prepared_step(
             .iter()
             .map(|output| product_name(info, call, output).map(str::to_owned))
             .collect::<Result<Vec<_>>>()?;
+        // The executor reads an encoding's image as the host prepared it
+        // (`image::describe`), not its payload: an inline image's encoded
+        // bytes and a carried image's values stay out of the step.
+        let mut described = call.clone();
+        described.input_image = None;
+        described.carried_image = None;
         entries.push(serde_json::json!({
             "index": index,
             "slot": state.slot,
             "active": state.active,
             "refused": state.refused(),
-            "call": serde_json::to_value(call).map_err(encode)?,
+            "call": serde_json::to_value(&described).map_err(encode)?,
             "range": serde_json::to_value(range).map_err(encode)?,
             "output_names": names,
             "latent": serde_json::Value::Null,
@@ -373,6 +386,8 @@ pub(crate) struct PreparedOwners<'a> {
     /// The trajectory ledger of a computation that names the `latents`
     /// resource.
     pub(crate) ledger: Option<&'a LatentLedger>,
+    /// The host encoder pool of a rank that maps one.
+    pub(crate) encoders: Option<&'a EncoderHostPool>,
     /// The stream device products host tasks wrote are fenced on.
     pub(crate) host_stream: Option<Arc<CUDAStream>>,
     /// The inputs host codecs read in place from their shared-memory
@@ -390,10 +405,13 @@ pub(crate) struct Published {
 /// each trajectory's banks from the ledger, as the executor prepared them
 /// (`step["prepared"]`, one entry per call), noting the banks in `step`.
 /// Returns the tensors the executor's execution reads and writes, in call
-/// order, and the writes [`publish`] publishes behind it. A latent
-/// preparation that restores a stored trajectory reads the stored pages
-/// besides: their views follow the call's writes, in the order of the page
-/// indices `step["calls"][i]["latent"]["restore"]` lists.
+/// order, and the writes [`publish`] publishes behind it. A video encoder
+/// call whose output lies in the host encoder pool (`Call::host_output`)
+/// reads or writes the pool pages its rows fall on besides: their views
+/// follow the call's writes, one per copy `step["calls"][i]["host"]` lists.
+/// A latent preparation that restores a stored trajectory reads the stored
+/// pages besides: their views follow the call's writes, in the order of the
+/// page indices `step["calls"][i]["latent"]["restore"]` lists.
 pub(crate) fn bind_prepared(
     owners: &PreparedOwners<'_>,
     plan: &BatchPlan,
@@ -504,6 +522,16 @@ pub(crate) fn bind_prepared(
                 published.push((index, product.clone(), bound, write.host_export));
             }
         }
+        // A video encoder call's output in the host encoder pool, on a rank
+        // that writes some of it.
+        if let Some(output) = &call.host_output
+            && batch.calls[index].active
+            && let Some((views, host)) = host_copies(owners.encoders, output, prepared)?
+        {
+            tensors.extend(views);
+            step["calls"][index]["host"] = host;
+        }
+
         let forward = &mut batch.calls[index].forward.products;
         forward.reports = prepared.reports;
         forward.publication = publication(prepared, deferred, owners.host_stream.as_ref())?;
@@ -524,16 +552,37 @@ pub(crate) fn bind_prepared(
             let ledger = owners
                 .ledger
                 .ok_or_else(|| Error::Invalid("this rank keeps no latent trajectories".into()))?;
-            // A resumed request's preparation copies the stored pages into
-            // the bank it initializes, and commits the stored step.
-            let (banks, update, restored) = match &call.latent_restore {
-                Some(restore) if kind == MediaCall::LatentPreparation => {
-                    let bound = ledger.bind_restore(slot, call, restore, owners.rank)?;
-                    (bound.banks, bound.update, bound.pages)
+            // A video latent preparation reports how the rank's pages hold
+            // the request's samples, which key and record the trajectory
+            // when a preemption stores it.
+            let layout = match (&prepared.latent_layout, kind) {
+                (Some(layout), MediaCall::LatentPreparation) => Some(layout),
+                (None, MediaCall::LatentPreparation) if call.latent_restore.is_some() => {
+                    return Err(Error::Interface(
+                        "a restoring latent preparation declares no latent layout".into(),
+                    ));
+                }
+                _ => None,
+            };
+            if let Some(layout) = layout {
+                batch.calls[index]
+                    .output
+                    .set_latent_layout(owners.rank, layout.to_string());
+            }
+            // A resumed request's preparation copies the stored values into
+            // the bank it initializes, laid out in the rank's pages, and
+            // commits the stored step.
+            let (banks, update, restored) = match (&call.latent_restore, layout) {
+                (Some(restore), Some(layout)) => {
+                    let layout = serde_json::from_value(layout.clone()).map_err(|error| {
+                        Error::Interface(format!("a request's latent layout: {error}"))
+                    })?;
+                    let bound = ledger.bind_restore(slot, call, restore, owners.rank, layout)?;
+                    (bound.banks, bound.update, Some((bound.pages, bound.copies)))
                 }
                 _ => {
                     let (banks, update) = ledger.bind(slot, call, kind)?;
-                    (banks, update, Vec::new())
+                    (banks, update, None)
                 }
             };
             let mut latent = serde_json::json!({
@@ -541,15 +590,96 @@ pub(crate) fn bind_prepared(
                 "write": banks.write,
                 "step": banks.step,
             });
-            if !restored.is_empty() {
-                latent["restore"] = restored.iter().map(|(page, _)| *page).collect();
-                tensors.extend(restored.into_iter().map(|(_, view)| view));
+            if let Some((pages, copies)) = restored {
+                // The stored pages follow the call's other tensors.
+                latent["restore"] = serde_json::json!({
+                    "pages": pages.len(),
+                    "copies": copies,
+                });
+                tensors.extend(pages);
             }
             step["calls"][index]["latent"] = latent;
             batch.calls[index].forward.products.latent = Some(update);
         }
     }
     Ok((tensors, Published { writes: published }))
+}
+
+/// The pool pages a video encoder call's output reads or writes and the
+/// copies between them (`Call::host_output`), as `bind_prepared` hands them
+/// to the executor: the views, and `{"import": bool, "copies": [[output,
+/// page offset, bytes], ...]}` with one copy per view, the byte offset in
+/// the call's output, the byte offset in the page and the bytes copied.
+///
+/// An import reads every row of the call's output from the pages; an export
+/// writes the rows the rank wrote (the region the executor prepared its
+/// write in, or all of them) to the pages the pool does not hold already.
+/// Ranks that write the same rows write the same bytes. `None` for a rank
+/// that writes none of the output, as a latent encoding's audio call on a
+/// rank other than its first.
+fn host_copies(
+    pool: Option<&EncoderHostPool>,
+    output: &ipc::HostOutput,
+    prepared: &Prepared,
+) -> Result<Option<(Vec<StorageView>, serde_json::Value)>> {
+    if prepared.writes.is_empty() {
+        return Ok(None);
+    }
+    let pool = pool.ok_or_else(|| {
+        Error::Invalid("this rank maps no host encoder pool for the call's output".into())
+    })?;
+    if output.pool != pool.pool() {
+        return Err(Error::Invalid(format!(
+            "the call's output lies in encoder pool {}, not in this rank's pool {}",
+            output.pool,
+            pool.pool()
+        )));
+    }
+    output
+        .validate(Some(pool.page_bytes()))
+        .map_err(|error| Error::Invalid(format!("the call's host output: {error}")))?;
+    let [write] = prepared.writes.as_slice() else {
+        return Err(Error::Interface(
+            "a video encoder call with a host output prepares one write".into(),
+        ));
+    };
+    let rows = *write
+        .shape
+        .first()
+        .ok_or_else(|| Error::Interface("an encoder output has no rows".into()))?;
+    if u64::from(output.rows[1] - output.rows[0]) != rows {
+        return Err(Error::Interface(format!(
+            "the executor prepared {rows} rows of an encoder output the engine names {:?} of",
+            output.rows
+        )));
+    }
+    // The rows this rank's copies cover.
+    let copied = match (&write.region, output.import) {
+        (Some(region), false) => {
+            let rows = region
+                .first()
+                .ok_or_else(|| Error::Interface("an encoder write's region has no rows".into()))?;
+            rows[0]..rows[1]
+        }
+        _ => 0..rows,
+    };
+    let mut views = Vec::new();
+    let mut copies = Vec::new();
+    for copy in encoders::page_copies(output.rows[0], copied, output.row_bytes, pool.page_bytes()) {
+        let slot = output.slots.get(copy.page).ok_or_else(|| {
+            Error::Invalid("an encoder output's rows lie beyond its pages".into())
+        })?;
+        // A page the pool held already is left as it is.
+        let Some(slot) = slot else {
+            continue;
+        };
+        views.push(pool.view(*slot)?);
+        copies.push([copy.output, copy.offset, copy.bytes]);
+    }
+    Ok(Some((
+        views,
+        serde_json::json!({ "import": output.import, "copies": copies }),
+    )))
 }
 
 /// How a call publishes what its host tasks write into `deferred`, its

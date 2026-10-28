@@ -27,8 +27,10 @@
 //! ([`LatentHostPool`]) writes a preempted request's committed trajectory
 //! there, on a copy stream behind every batch that used the banks
 //! ([`LatentLedger::offload`]), and a resumed request's latent preparation
-//! copies the stored pages into the bank it initializes and commits the
-//! trajectory at the stored step ([`LatentLedger::bind_restore`]).
+//! copies the stored values into the bank it initializes, laid out in the
+//! rank's own pages by the copy manifest from the stored ranks' pages
+//! (`crate::memory::latent::restore`), and commits the trajectory at the
+//! stored step ([`LatentLedger::bind_restore`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,11 +40,13 @@ use ipc::{
     BufferId, Call, CallKind, ImageParams, LatentOffload, LatentParams, LatentRestore, MediaCall,
     RequestKey,
 };
+use storage::manifest::StorageLayout;
 
 use crate::Error;
 use crate::executor::batch::StreamOrder;
 use crate::job::Job;
 use crate::memory::allocation::StorageView;
+use crate::memory::latent::restore;
 use crate::memory::{LatentHostPool, TrajectoryVersion};
 use crate::stream::Issue;
 use crate::{LatentPool, LatentStorage, LatentUpdate, Result};
@@ -84,13 +88,17 @@ struct HostCopies {
 }
 
 /// What [`LatentLedger::bind_restore`] binds of a resumed request's latent
-/// preparation: its banks and commit, and the stored pages it copies.
+/// preparation: its banks and commit, and the stored pages it copies from.
 pub(crate) struct Restored {
     pub(crate) banks: Banks,
     pub(crate) update: LatentUpdate,
-    /// The index of each restored page among the slot's pages, with its
-    /// `[page_units]` float32 view in the host latent pool.
-    pub(crate) pages: Vec<(u32, StorageView)>,
+    /// The `uint8 [page_bytes]` view of every stored page the copies read,
+    /// in a host latent pool.
+    pub(crate) pages: Vec<StorageView>,
+    /// The copies, each `[page, offset, target, bytes]`: `bytes` bytes from
+    /// byte `offset` of stored page `pages[page]` to byte `target` of the
+    /// request slot's pages, which lie back to back in the bank.
+    pub(crate) copies: Vec<[u64; 4]>,
 }
 
 /// What [`LatentLedger::bind`] binds of one call.
@@ -248,18 +256,23 @@ impl LatentLedger {
 
     /// The banks a resumed video request's latent preparation reads and
     /// writes in `slot`, its commit at the stored step of `restore`, and the
-    /// views of the stored pages `rank` copies into the bank it initializes:
-    /// one for every page of the slot.
+    /// copies that lay the stored values `rank` reads out in `layout`, the
+    /// rank's own slot pages of the request as its executor declares them
+    /// (`storage::manifest::StorageLayout`): the copy manifest from the
+    /// stored ranks' pages to the rank's ([`restore::copies`]), which copies
+    /// a page laid out as a stored one was whole.
     ///
     /// Fails for a rank that maps no latent pool, an image model's ledger,
-    /// or a restore that does not name every page of the slot on `rank`
-    /// exactly once.
+    /// a layout past the slot's pages, a source whose pages its layout does
+    /// not name one by one, or sources that do not hold every value of the
+    /// rank's pages.
     pub(crate) fn bind_restore(
         &self,
         slot: usize,
         call: &Call,
         restore: &LatentRestore,
         rank: u32,
+        layout: StorageLayout,
     ) -> Result<Restored> {
         let host = self.host.as_ref().ok_or_else(|| {
             Error::Invalid("a call restores a trajectory but the rank maps no latent pool".into())
@@ -274,22 +287,66 @@ impl LatentLedger {
             .get(&slot)
             .ok_or_else(|| Error::Invalid("a denoising request has no canvas".into()))?;
         let params = self.slot_params(slot, call, canvas, pages);
-        let mut restored: Vec<(u32, StorageView)> = restore
-            .pages
-            .iter()
-            .filter(|copy| copy.rank == rank)
-            .map(|copy| Ok((copy.page, host.pool.view(copy)?)))
-            .collect::<Result<_>>()?;
-        restored.sort_by_key(|(page, _)| *page);
-        if !restored
-            .iter()
-            .map(|(page, _)| u64::from(*page))
-            .eq(0..pages)
-        {
+
+        // The rank's own pages and the stored pages on its host.
+        let target = restore::Stored {
+            layout,
+            page_bytes: host.pool.page_bytes(),
+        };
+        if target.pages() > pages {
             return Err(Error::Invalid(
-                "a latent restore does not name every page of the slot on this rank".into(),
+                "a request's latent layout lies past its slot's pages".into(),
             ));
         }
+        let read: Vec<&ipc::LatentSource> = restore
+            .sources
+            .iter()
+            .filter(|source| source.readers.contains(&rank))
+            .collect();
+        let sources = read
+            .iter()
+            .map(|source| {
+                let layout = serde_json::from_str(&source.layout)
+                    .map_err(|error| Error::Invalid(format!("a stored latent layout: {error}")))?;
+                let stored = restore::Stored {
+                    layout,
+                    page_bytes: source.pool.page_bytes,
+                };
+                if stored.pages() != source.slots.len() as u64 {
+                    return Err(Error::Invalid(
+                        "a stored latent layout names other pages than its source holds".into(),
+                    ));
+                }
+                Ok(stored)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let gpu = host.device.uuid()?.0;
+        let planned = restore::copies(&sources, &target, restore.content, gpu)?;
+
+        // One view of every stored page a copy reads.
+        let mut views: Vec<StorageView> = Vec::new();
+        let mut viewed: HashMap<(usize, u64), u64> = HashMap::new();
+        let mut copies = Vec::with_capacity(planned.len());
+        for copy in planned {
+            let index = match viewed.get(&(copy.source, copy.page)) {
+                Some(index) => *index,
+                None => {
+                    let source = read[copy.source];
+                    let slot = source.slots[copy.page as usize];
+                    views.push(host.pool.source(&source.pool, slot)?);
+                    let index = views.len() as u64 - 1;
+                    viewed.insert((copy.source, copy.page), index);
+                    index
+                }
+            };
+            copies.push([index, copy.offset, copy.target, copy.bytes]);
+        }
+        tracing::debug!(
+            sources = read.len(),
+            pages = views.len(),
+            copies = copies.len(),
+            "restoring a stored trajectory into the rank's pages"
+        );
         let bound = self.initial(slot, call, params)?;
         let update = LatentUpdate::restored(bound.update, i64::from(restore.steps))?;
         Ok(Restored {
@@ -298,7 +355,8 @@ impl LatentLedger {
                 ..bound.banks
             },
             update,
-            pages: restored,
+            pages: views,
+            copies,
         })
     }
 

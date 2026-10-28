@@ -243,6 +243,7 @@ fn warmup_request(
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
+        generated_images: Vec::new(),
     }
 }
 

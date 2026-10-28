@@ -331,6 +331,7 @@ mod tests {
                 height: 768,
             },
             trajectory: Default::default(),
+            encoder_inputs: None,
         }
     }
 

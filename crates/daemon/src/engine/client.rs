@@ -1046,6 +1046,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
         let _ = request.events.send(Event::Migratable {
             cause: proto::request::MigrationCause::Loss,
             denoised_steps: 0,
+            stored_layout: Vec::new(),
         });
     }
 }

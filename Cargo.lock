@@ -2789,12 +2789,12 @@ name = "proto"
 version = "2.0.0"
 dependencies = [
  "bitflags",
- "fnv",
  "libc",
  "prost",
  "prost-build",
  "protox",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "thiserror",

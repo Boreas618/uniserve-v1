@@ -279,5 +279,63 @@ fn merge_completion_record(
         (None, None) => {}
         _ => anyhow::bail!("rank cache export presence diverged"),
     }
+    // Each denoising rank reports how its own pages hold a video request's
+    // samples: the joined completion holds every rank's.
+    canonical
+        .output
+        .latent_layouts
+        .extend(rank_completion.output.latent_layouts.iter().cloned());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ipc::{CallId, CallStatus, RankLatentLayout, RequestId, RequestKey};
+
+    use super::*;
+
+    fn completion(rank: u32) -> CallResult {
+        CallResult {
+            output: ipc::CallOutput {
+                request_key: RequestKey::new(1, RequestId(3), 1),
+                call_id: CallId::new(5, 0),
+                status: CallStatus::Ok,
+                error_code: None,
+                error_message: None,
+                timing_counters: Default::default(),
+                cache_visible_len: 0,
+                cache_computed_len: 0,
+                step_index: 0,
+                committed_tokens: Vec::new(),
+                token_logprobs: Vec::new(),
+                prompt_logprobs: Vec::new(),
+                candidate_logprobs: Vec::new(),
+                finish_flags: Default::default(),
+                media_output: None,
+                cache_output: None,
+                draft_token_ids: Vec::new(),
+                latent_layouts: vec![RankLatentLayout {
+                    rank,
+                    layout: format!("rank {rank}"),
+                }],
+            },
+            media: Ok(None),
+        }
+    }
+
+    /// The joined completion of a video latent preparation states how
+    /// every denoising rank holds the request's samples, each rank's as it
+    /// reported it.
+    #[test]
+    fn a_joined_completion_holds_every_ranks_latent_layout() {
+        let mut joined = completion(0);
+        merge_completion_record(&mut joined, &completion(1)).unwrap();
+        let ranks: Vec<(u32, &str)> = joined
+            .output
+            .latent_layouts
+            .iter()
+            .map(|layout| (layout.rank, layout.layout.as_str()))
+            .collect();
+        assert_eq!(ranks, [(0, "rank 0"), (1, "rank 1")]);
+    }
 }

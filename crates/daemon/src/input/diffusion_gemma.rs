@@ -48,7 +48,7 @@ pub(crate) fn engine_images(
 
         let image = &images[placement.source];
         inputs.push(ImageInput {
-            hash: image.hash(),
+            digest: image.digest(),
             b64: base64::engine::general_purpose::STANDARD.encode(image.bytes()),
             position: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
             num_positions: placement.soft_tokens,

@@ -90,6 +90,7 @@ fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> Genera
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
+        generated_images: Vec::new(),
     }
 }
 

@@ -605,6 +605,10 @@ impl Scheduler {
             return None;
         }
         let state = self.running.get(&id)?;
+        // A context rebuild plans its calls one at a time.
+        if state.replay.is_some() {
+            return None;
+        }
         if self.num_scheduled_prompt_tokens(id)? < state.req.prompt_token_ids.len() as u32
             || self.num_scheduled_images(id)? < state.req.multimodal_inputs.images.len()
         {

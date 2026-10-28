@@ -18,7 +18,7 @@ use crate::protocol::{Placement, Region, Span};
 impl Manifest {
     /// The key a staging space of the manifest is retained under.
     pub fn staging_key(&self, staging: u32) -> Key {
-        let mut digest = super::Digest::new(b"uniserve-manifest-staging");
+        let mut digest = crate::key::Digest::new(b"uniserve-manifest-staging");
         digest.bytes(&self.digest);
         digest.number(u64::from(staging));
         Key(digest.finish())

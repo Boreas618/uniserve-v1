@@ -235,6 +235,7 @@ impl Scheduler {
             kv_offload: None,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             trajectories: None,
+            encoder_outputs: None,
             closing: false,
             resizing: None,
             asleep: false,
@@ -489,7 +490,7 @@ impl Scheduler {
                     Some((
                         rank as u32,
                         crate::trajectories::RankLatents {
-                            local: rank_host == host,
+                            host: rank_host,
                             pool: pool.as_ref()?,
                         },
                     ))
@@ -504,7 +505,7 @@ impl Scheduler {
             return;
         }
         let mut store = match crate::trajectories::TrajectoryStore::connect(
-            socket, deployment, world,
+            socket, deployment, world, host,
         ) {
             Ok(store) => store,
             Err(error) => {
@@ -526,6 +527,68 @@ impl Scheduler {
                 identities.iter().map(String::as_str),
             ));
             self.trajectories = Some(store);
+        }
+    }
+
+    /// Stores the outputs of the video encoders in the host encoder pools of
+    /// their worker groups, reached through the Storage Server at `socket`
+    /// for the ranks on `host` (the engine's) and over the TCP address
+    /// another host's rank reports, for each group whose ranks executing an
+    /// encoder report the same pool (`ExecutorInfo::rank_encoders`), as a
+    /// head of `deployment` in `world`. Without them every request's
+    /// encoders compute its outputs.
+    pub fn enable_encoder_store(
+        &mut self,
+        socket: &std::path::Path,
+        deployment: &str,
+        world: u64,
+        host: &str,
+    ) {
+        let info = self.executor.info();
+        let groups: Vec<(
+            crate::WorkerGroupId,
+            Vec<(u32, crate::encoder_outputs::RankEncoders<'_>)>,
+        )> = info
+            .rank_encoders
+            .iter()
+            .map(|(worker, ranks)| {
+                let reports = ranks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(rank, (rank_host, pool))| {
+                        Some((
+                            rank as u32,
+                            crate::encoder_outputs::RankEncoders {
+                                local: rank_host == host,
+                                pool: pool.as_ref()?,
+                            },
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                (worker.clone(), reports)
+            })
+            .filter(|(_, reports)| !reports.is_empty())
+            .collect();
+        if groups.is_empty() {
+            return;
+        }
+        let mut store =
+            match crate::encoder_outputs::EncoderStore::connect(socket, deployment, world) {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "video encoder outputs are not stored: the storage server is unreachable"
+                    );
+                    return;
+                }
+            };
+        let mut served = false;
+        for (worker, reports) in &groups {
+            served |= store.add_worker(worker, reports);
+        }
+        if served {
+            self.encoder_outputs = Some(store);
         }
     }
 
@@ -821,9 +884,9 @@ impl Scheduler {
     /// liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        // Answers of the host KV cache and of the host latent pools arrive on
-        // connections the executor does not wait on: while some are awaited,
-        // the park is short.
+        // Answers of the host KV cache and of the host latent and encoder
+        // pools arrive on connections the executor does not wait on: while
+        // some are awaited, the park is short.
         // So is the park of a closing scheduler, which awaits its last
         // page commits.
         let timeout = if self.closing
@@ -835,6 +898,10 @@ impl Scheduler {
                 .trajectories
                 .as_ref()
                 .is_some_and(crate::trajectories::TrajectoryStore::waiting)
+            || self
+                .encoder_outputs
+                .as_ref()
+                .is_some_and(crate::encoder_outputs::EncoderStore::waiting)
         {
             KV_OFFLOAD_POLL
         } else {

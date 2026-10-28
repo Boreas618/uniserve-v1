@@ -18,6 +18,8 @@
 //! Token semantics (stop conditions, image-branch triggers, public events)
 //! are resolved afterwards in `output`.
 
+pub(crate) mod continuation;
+
 use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv_cache::{BlockTable, CacheAllocation};
 
@@ -321,7 +323,30 @@ impl RequestState {
                 // Logical positions advance by the image's position count once,
                 // after its last encoder.
                 self.cache_visible_len = record.cache_visible_len;
-                if is_feedback_call(call) {
+                if is_feedback_call(call) && self.replay.is_some() {
+                    // A generated image the context rebuild writes: the
+                    // request's context continues with the next one, or the
+                    // prompt tokens after it.
+                    self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
+                    self.feedback_features = None;
+                    let encoders = self.req.image_generation.feedback_encoders.len();
+                    let written = self.feedback_encoder_index == encoders;
+                    if written {
+                        self.logical_position = self
+                            .logical_position
+                            .saturating_add(self.req.image_generation.num_feedback_positions);
+                        self.feedback_encoder_index = 0;
+                    }
+                    let next = self.feedback_encoder_index;
+                    if let Some(replay) = self.replay.as_mut() {
+                        if written {
+                            replay.images.pop_front();
+                        } else if let Some(image) = replay.images.front_mut() {
+                            image.stage = continuation::ReplayStage::Encode(next);
+                        }
+                    }
+                    self.replayable = false;
+                } else if is_feedback_call(call) {
                     self.feedback_encoder_index = self.feedback_encoder_index.saturating_add(1);
                     self.feedback_features = None;
                     if self.feedback_encoder_index
@@ -354,10 +379,22 @@ impl RequestState {
                 }
             }
             // A prefill that neither extends the prompt nor reads a feature is
-            // the `CloseCache` write, after which the prefix cache is published.
+            // the `CloseCache` write, after which the prefix cache is
+            // published, or, for an image the context rebuild writes, its
+            // feedback encoders read the image.
             CallKind::Forward(ForwardMode::Prefill) => {
                 self.cache_visible_len = record.cache_visible_len;
-                self.phase = GenerationPhase::PublishCache;
+                match self
+                    .replay
+                    .as_mut()
+                    .and_then(|replay| replay.images.front_mut())
+                {
+                    Some(image) => {
+                        image.stage = continuation::ReplayStage::Encode(0);
+                        self.feedback_encoder_index = 0;
+                    }
+                    None => self.phase = GenerationPhase::PublishCache,
+                }
                 self.replayable = false;
             }
             CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
@@ -442,7 +479,15 @@ impl RequestState {
                 if is_feedback_call(call) =>
             {
                 self.feedback_features = call.encoder_output.clone();
-                self.phase = GenerationPhase::FeedbackState;
+                let index = self.feedback_encoder_index;
+                match self
+                    .replay
+                    .as_mut()
+                    .and_then(|replay| replay.images.front_mut())
+                {
+                    Some(image) => image.stage = continuation::ReplayStage::Write(index),
+                    None => self.phase = GenerationPhase::FeedbackState,
+                }
                 self.replayable = false;
             }
             _ => {}
@@ -498,9 +543,11 @@ fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
 
 /// Plans a context prefill: prompt tokens `start..end` and the vision
 /// `blocks` of the input images between them, which write `block_tokens` cache
-/// tokens together, with a sampled-token output unless the request is a
-/// readout or the deployment generates canvases (`generates_canvases`), or
-/// the context ends with a block of this call.
+/// tokens together, with a sampled-token output when the request `samples`
+/// from its prompt, unless it is a readout or the context ends with a block
+/// of this call. A request samples nothing from its prompt on a deployment
+/// that generates canvases, or while it rebuilds a migrated context, until
+/// it resumes.
 ///
 /// The prompt of a readout or of a canvas-generating request only conditions
 /// its canvases, so its prefill samples nothing. A context that ends with an
@@ -515,7 +562,7 @@ pub(super) fn plan_prompt(
     blocks: Vec<VisionInput>,
     block_tokens: u32,
     sampling_state: Option<SamplingState>,
-    generates_canvases: bool,
+    samples: bool,
 ) -> Result<Call, PlanningError> {
     if start > end
         || (start == end && blocks.is_empty())
@@ -536,7 +583,7 @@ pub(super) fn plan_prompt(
         .is_some_and(|block| block.offset == end.saturating_sub(start))
         && end as usize == request.prompt_token_ids.len();
     call.vision_inputs = blocks;
-    if request.is_readout() || generates_canvases || ends_with_block {
+    if request.is_readout() || !samples || ends_with_block {
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
@@ -771,37 +818,107 @@ pub(super) fn plan_image_extend(
     finish_plan(request, call, 0)
 }
 
-/// Encodes host image bytes or an existing device image into a feature tensor.
+/// The image an encoding call reads.
+#[derive(Debug, Clone)]
+pub(super) enum EncodeSource {
+    /// An encoded image in base64: an input image, or a generated image's
+    /// PNG that feedback reads as an artifact.
+    Payload(String),
+    /// A resident image product: the decoded image feedback reads on the
+    /// device.
+    Resident(TensorRef),
+    /// The values of the decoded image product a migrated request generated
+    /// before, which its feedback reads as it read that product.
+    Carried(std::sync::Arc<crate::ImagePixels>),
+}
+
+/// Encodes an image (`source`) into a feature tensor with encoder `step`;
+/// a latent encoding samples its posterior at `draw` (`Call::latent_draw`).
 ///
-/// A device `source` takes precedence over `image_base64`. Fails with
-/// `FeedbackDisabled` for a feedback encode on a request without image
-/// feedback or a feedback source, and with `MissingImageInput` for an
-/// input-image encode that has neither bytes nor a source.
+/// Fails with `FeedbackDisabled` for a feedback encode on a request without
+/// image feedback or a feedback source, and with `MissingImageInput` for an
+/// empty payload.
 pub(super) fn plan_encode(
     limits: &crate::GenerationLimits,
     request: &GenerationRequest,
     step: MediaCall,
-    image_base64: String,
-    source: Option<TensorRef>,
+    source: EncodeSource,
     feedback: bool,
+    draw: Option<u32>,
 ) -> Result<Call, PlanningError> {
-    if feedback {
-        if !request.feeds_back_images() || request.image_generation.feedback_source.is_none() {
-            return Err(PlanningError::FeedbackDisabled);
-        }
-    } else if source.is_none() && image_base64.is_empty() {
-        return Err(PlanningError::MissingImageInput);
+    if feedback
+        && (!request.feeds_back_images() || request.image_generation.feedback_source.is_none())
+    {
+        return Err(PlanningError::FeedbackDisabled);
     }
     let mut call = new_call(request, CallKind::Media(step));
-    if source.is_none() && !image_base64.is_empty() {
-        call.input_image = Some(image_base64.into());
+    match source {
+        EncodeSource::Payload(image_base64) if image_base64.is_empty() => {
+            return Err(PlanningError::MissingImageInput);
+        }
+        EncodeSource::Payload(image_base64) => call.input_image = Some(image_base64.into()),
+        EncodeSource::Resident(product) => call.image_input = Some(product),
+        EncodeSource::Carried(pixels) => call.carried_image = Some(pixels),
     }
-    call.image_input = source;
     call.encoder_output = Some(encoder_output(step, limits)?);
+    call.latent_draw = (step == MediaCall::LatentEncoding)
+        .then_some(draw)
+        .flatten();
     if feedback {
         call.completion_output = Some(output_tensor(1, DType::U8));
     }
     finish_plan(request, call, 0)
+}
+
+/// The posterior draw of a request's latent encoding (`Call::latent_draw`):
+/// its ordinal among the request's latent encodings, which count its input
+/// images' latent encoders in context order, then the feedback latent
+/// encoders of each image it generates, in image order.
+///
+/// `encoding` names the encoding: an input image's block, or the feedback
+/// encoder of index `encoder` of generated image `image_index` (from one).
+pub(super) fn latent_draw(request: &GenerationRequest, encoding: LatentEncoding) -> u32 {
+    let latent = |inputs: &[ImageEncoderInput]| {
+        inputs
+            .iter()
+            .filter(|input| input.encoder == crate::ImageEncoder::Latent)
+            .count()
+    };
+    let images = &request.multimodal_inputs.images;
+    let draw = match encoding {
+        LatentEncoding::Input(block) => {
+            images[..block.image.min(images.len())]
+                .iter()
+                .map(|image| latent(&image.encoders))
+                .sum::<usize>()
+                + images.get(block.image).map_or(0, |image| {
+                    latent(&image.encoders[..block.encoder.min(image.encoders.len())])
+                })
+        }
+        LatentEncoding::Feedback {
+            image_index,
+            encoder,
+        } => {
+            let feedback = &request.image_generation.feedback_encoders;
+            images
+                .iter()
+                .map(|image| latent(&image.encoders))
+                .sum::<usize>()
+                + (image_index.saturating_sub(1) as usize) * latent(feedback)
+                + latent(&feedback[..encoder.min(feedback.len())])
+        }
+    };
+    u32::try_from(draw).unwrap_or(u32::MAX)
+}
+
+/// A request's latent encoding, by what it encodes (`latent_draw`).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum LatentEncoding {
+    /// An input image's block.
+    Input(BlockCursor),
+    /// Feedback encoder `encoder` of the request's generated image
+    /// `image_index`, from one.
+    Feedback { image_index: u32, encoder: usize },
 }
 
 /// Writes the closing token into the prefix cache before export, without sampling another token.
@@ -936,15 +1053,25 @@ pub(super) fn plan_diffusion_finalize(
 /// Derives storage bounds directly from the call's actual inputs and outputs.
 ///
 /// `max_completion_bytes` covers the logprob payload of a token-producing call
-/// plus, for image decoding, the base64 PNG. `max_cache_units` starts at zero;
+/// plus, for image decoding, the base64 PNG and the feedback image product's
+/// values it publishes after it. `max_cache_units` starts at zero;
 /// `Scheduler::plan_call` sets it for forward calls.
 fn finish_plan(
     request: &GenerationRequest,
     mut call: Call,
     prompt_positions: u32,
 ) -> Result<Call, PlanningError> {
+    // A decoding that writes the request's feedback image product also
+    // publishes the product's values and their range after the PNG
+    // (`ipc::append_feedback`).
     let image_completion_bytes = if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
-        png_base64_bound(request.image.width, request.image.height)?
+        let feedback = if call.image_output.is_some() {
+            crate::ImagePixels::value_bytes(request.image.height, request.image.width)
+                .saturating_add(1)
+        } else {
+            0
+        };
+        png_base64_bound(request.image.width, request.image.height)?.saturating_add(feedback)
     } else {
         0
     };
@@ -1570,11 +1697,22 @@ pub(crate) struct RequestState {
     pub(super) round_token_ids: Vec<u32>,
     /// Host image bytes retained only while artifact-based feedback needs them.
     pub(super) feedback_image_b64: Option<String>,
+    /// The digest of the last image whose decoding the request accepted,
+    /// with the image's identity: what its feedback encoders read, which keys
+    /// their outputs in the host encoder pools
+    /// (`encodings::generated_image`). A feedback encoding queued behind its
+    /// image's decoding, before the decoding's values reach the engine, finds
+    /// the digest of an earlier image here or none, and is keyed by neither.
+    pub(super) feedback_digest: Option<(u32, [u8; 32])>,
     /// False after a completed call creates state unavailable from the input.
     pub(super) replayable: bool,
     /// Encoder-cache entries this request holds; released when the request
     /// finishes.
     pub(super) encoder_cache_pins: Vec<EncoderCachePin>,
+    /// The image encoding the request looked up in the host encoder pools
+    /// and plans next (`Scheduler::encoding_ready`), until its call is
+    /// registered with the output it reads or writes.
+    pub(super) host_encoding: Option<super::encodings::Encoding>,
     /// Request-local encoder outputs and feedback sources outside the encoder
     /// cache, freed by `Scheduler::free_transient_products` or when the
     /// request finishes.
@@ -1598,6 +1736,24 @@ pub(crate) struct RequestState {
     /// `Scheduler::fail_after_inflight` reports as the request's terminal
     /// error and its error finish logs.
     pub(super) failure: Option<String>,
+    /// The prompt tokens the request's usage charges: its own prompt, without
+    /// the tokens a migrated request extends it with.
+    pub(super) prompt_tokens: usize,
+    /// A migrated image-generating request's context rebuild, until it
+    /// resumes (`continuation`): the images still to write and what it does
+    /// once they are written.
+    pub(super) replay: Option<Replay>,
+}
+
+/// The rebuild of a migrated image-generating request's context
+/// (`continuation`). Its calls are planned one at a time, each once the
+/// previous one's result is accepted.
+pub(crate) struct Replay {
+    /// The images still to write, in order; the first is in progress once
+    /// the prompt tokens before it are written.
+    pub(super) images: std::collections::VecDeque<continuation::ReplayImage>,
+    /// What the request does once its context is rebuilt.
+    pub(super) resume: continuation::Resume,
 }
 
 impl RequestState {
@@ -1605,7 +1761,32 @@ impl RequestState {
     /// tokens it generated before it migrated, which its prompt continues
     /// with (`Scheduler::request_state`) and its usage counts as generated.
     pub(crate) fn charged_prompt_tokens(&self) -> usize {
-        self.req.prompt_token_ids.len() - self.req.generated_token_ids.len()
+        self.prompt_tokens
+    }
+
+    /// The image the request's context rebuild writes next, when the prompt
+    /// tokens before it are written: the rebuild's next call is one of the
+    /// image's (`continuation::ReplayStage`).
+    pub(super) fn replay_image_due(
+        &self,
+        scheduled_prompt_tokens: u32,
+    ) -> Option<&continuation::ReplayImage> {
+        self.replay
+            .as_ref()?
+            .images
+            .front()
+            .filter(|image| image.offset <= scheduled_prompt_tokens)
+    }
+
+    /// The prompt tokens the request's next context prefill may write: up to
+    /// the next image its context rebuild writes, or its whole prompt.
+    pub(super) fn context_prompt_end(&self) -> usize {
+        self.replay
+            .as_ref()
+            .and_then(|replay| replay.images.front())
+            .map_or(self.req.prompt_token_ids.len(), |image| {
+                image.offset as usize
+            })
     }
 
     /// Returns the request allocations, which admission installs.
@@ -1639,12 +1820,22 @@ impl RequestState {
         !self.req.multimodal_inputs.images.is_empty()
     }
 
+    /// Returns whether the request's context rebuild writes generated
+    /// images: its context past them is no run of prompt tokens, so, as
+    /// for context images, no page of its prompt is shared through the
+    /// prefix cache.
+    pub(super) fn rebuilds_images(&self) -> bool {
+        self.replay
+            .as_ref()
+            .is_some_and(|replay| !replay.images.is_empty())
+    }
+
     /// Returns whether the request's cache holds its prompt and then the
     /// tokens it generates, in order: a request that generates text alone
     /// from a prompt without context images, whose migration resumes from
     /// its generated tokens and finds their pages as its prompt's.
     pub(super) fn caches_generated_text(&self) -> bool {
-        self.req.is_migratable() && !self.has_context_images() && self.replayable
+        self.req.generates_text_alone() && !self.has_context_images() && self.replayable
     }
 
     /// Returns whether execution continues after committing generation output.

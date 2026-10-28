@@ -395,11 +395,12 @@ impl WorkerGroup {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
 
-        // Rank 0's report becomes the group's. A rank's host latent pool is
-        // its own, which the executor keeps rank by rank
-        // (`ExecutorInfo::rank_latents`).
+        // Rank 0's report becomes the group's. A rank's host latent and
+        // encoder pools are its own reports, which the executor keeps rank
+        // by rank (`ExecutorInfo::rank_latents`, `rank_encoders`).
         let mut info = workers[0].info().clone();
         info.latent_pool = None;
+        info.encoder_pool = None;
 
         // A rank's product storage follows the components it holds, which an
         // asymmetric placement makes rank-specific: a rank that executes or
@@ -435,8 +436,18 @@ impl WorkerGroup {
         let mut image_capacity = None;
         let mut diffusion_lm_step_rows = 0;
         let mut image_unconditional = None;
+        let mut image_encoders = std::collections::BTreeMap::new();
         for (rank, worker) in workers.iter().enumerate() {
             let stated = worker.info();
+            // Each image encoder's output, as the ranks holding it state it.
+            for (name, output) in stated.image_encoders.iter() {
+                anyhow::ensure!(
+                    image_encoders
+                        .insert(name.clone(), *output)
+                        .is_none_or(|known| known == *output),
+                    "physical rank {rank} states another {name} encoder output than another rank"
+                );
+            }
             if let Some(tokens) = &stated.image_unconditional_token_ids {
                 anyhow::ensure!(
                     image_unconditional
@@ -490,6 +501,7 @@ impl WorkerGroup {
         info.image_capacity = image_capacity;
         info.diffusion_lm_step_rows = diffusion_lm_step_rows;
         info.image_unconditional_token_ids = image_unconditional;
+        info.image_encoders = Box::new(image_encoders);
 
         refuse_shared_storage_off_engine_host(
             &process_args.host,

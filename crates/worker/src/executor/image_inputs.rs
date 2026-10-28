@@ -318,7 +318,11 @@ pub(crate) fn prepare_inputs(
     let Some(tower) = plan.calls.first().and_then(|call| Tower::of(call.kind)) else {
         return Ok(true);
     };
-    if plan.calls.iter().all(|call| call.input_image.is_none()) {
+    if plan
+        .calls
+        .iter()
+        .all(|call| call.input_image.is_none() && call.carried_image.is_none())
+    {
         return Ok(true);
     }
     let Some(images) = backend
@@ -331,23 +335,30 @@ pub(crate) fn prepare_inputs(
     let mut tasks = Vec::new();
     let reserved = (|| -> Result<()> {
         for (index, call) in plan.calls.iter().enumerate() {
-            let Some(payload) = &call.input_image else {
-                continue;
+            let work = match (&call.input_image, &call.carried_image) {
+                (Some(payload), _) => ImageWork::Prepare {
+                    preparation: images.preparation.clone(),
+                    tower,
+                    payload: Arc::clone(payload),
+                    input_images: requests
+                        .get(call.request_key.request_id.0)?
+                        .admission()
+                        .input_images,
+                    pool: Arc::clone(&images.pinned),
+                    dtype: images.dtype,
+                },
+                // A carried image is the decoded product's values: its
+                // encoder prepares them on the device, as it prepares that
+                // product, so the host only stages them.
+                (None, Some(image)) => ImageWork::Carry {
+                    image: Arc::clone(image),
+                    pool: Arc::clone(&images.pinned),
+                },
+                (None, None) => continue,
             };
-            let input_images = requests
-                .get(call.request_key.request_id.0)?
-                .admission()
-                .input_images;
             let task = images.host.reserve()?;
             tasks.push((index, Arc::clone(&task)));
-            task.configure(ImageTask::new(ImageWork::Prepare {
-                preparation: images.preparation.clone(),
-                tower,
-                payload: Arc::clone(payload),
-                input_images,
-                pool: Arc::clone(&images.pinned),
-                dtype: images.dtype,
-            }))?;
+            task.configure(ImageTask::new(work))?;
             let weak: Weak<Submission> = Arc::downgrade(submission);
             let notify: Box<dyn FnOnce() + Send> = Box::new(move || {
                 if let Some(submission) = weak.upgrade() {

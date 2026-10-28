@@ -111,7 +111,7 @@ pub use call::*;
 pub use command::*;
 pub use identity::*;
 pub use info::*;
-pub use media::{SharedMedia, SharedMediaError};
+pub use media::{ImageMedia, SharedMedia, SharedMediaError, append_feedback, parse_image_media};
 pub use proto::{MediaLocator, MediaSource, SharedMemory};
 // The request values the engine carries on to its ranks are the request
 // vocabulary's own.
@@ -123,8 +123,8 @@ pub use parallel::{
 pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
     CanvasSampling, CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams,
-    ImageParamsError, PrefixCacheDtype, PrefixCacheDtypeParseError, RequestId, SamplingParams,
-    SamplingParamsError, StandbyMemory, TokenLogprob,
+    ImageParamsError, ImagePixels, PixelRange, PrefixCacheDtype, PrefixCacheDtypeParseError,
+    RequestId, SamplingParams, SamplingParamsError, StandbyMemory, TokenLogprob,
 };
 pub use request::*;
 pub use tensor::*;

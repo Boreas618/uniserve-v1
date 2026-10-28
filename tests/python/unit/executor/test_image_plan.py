@@ -84,7 +84,8 @@ def test_an_image_decoding_stages_its_bytes_and_reads_its_latent():
         trajectory=True,
     )
     planned = entry.to_json()["image"]
-    assert planned["bytes"] == 3 * 32 * 48
+    # The RGB bytes, then the published product's BF16 values.
+    assert planned["bytes"] == 3 * 32 * 48 + 2 * 3 * 32 * 48
     assert planned["latent"] is True
     assert planned["writes"] == [
         {
@@ -101,17 +102,15 @@ def test_an_image_decoding_stages_its_bytes_and_reads_its_latent():
     ]
     # Its pixel product, then its staged bytes.
     assert entry.tensors == 2
-    # Without a pixel product only the staged bytes leave the call.
-    assert (
-        decoding_entry(
-            height=32,
-            width=48,
-            value_range="unit",
-            publishes=False,
-            trajectory=True,
-        ).writes
-        == ()
+    # Without a pixel product only the RGB bytes leave the call.
+    unpublished = decoding_entry(
+        height=32,
+        width=48,
+        value_range="unit",
+        publishes=False,
+        trajectory=True,
     )
+    assert (unpublished.writes, unpublished.staging) == ((), 3 * 32 * 48)
     # A resident image is read and quantized, not decoded.
     resident = decoding_entry(
         height=32,

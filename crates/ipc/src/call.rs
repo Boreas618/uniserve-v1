@@ -455,6 +455,83 @@ pub struct Call {
     /// The stored trajectory a resumed video request's latent preparation
     /// opens at, instead of step zero; absent for every other call.
     pub latent_restore: Option<LatentRestore>,
+    /// The host encoder pool pages an encoder call (a video request's, or
+    /// an image encoding) reads its output from instead of computing it, or
+    /// writes the output it computed to; absent for every other call.
+    pub host_output: Option<HostOutput>,
+    /// The posterior draw an image latent encoding samples its latent with:
+    /// the encoding's ordinal among its request's latent encodings, its
+    /// input images' latent encoders in context order, then the feedback
+    /// latent encoders of each image it generates, in image order. The
+    /// engine derives it from the request alone, so the rank keys the draw on
+    /// the admitted image seed and this ordinal, whichever encodings an
+    /// encoder cache spared and whichever engine the request resumed on.
+    /// Absent on every other call.
+    pub latent_draw: Option<u32>,
+    /// The image a migrated request generated before, which its feedback
+    /// encoding reads in place of a resident image product: the values of the
+    /// decoded image product the image was generated as, which the rank
+    /// prepares for its encoder as it prepares that product. Absent on every
+    /// other call.
+    pub carried_image: Option<std::sync::Arc<proto::request::ImagePixels>>,
+}
+
+/// Where an encoder call's output lies in the host encoder pool
+/// (`Call::host_output`).
+///
+/// The pool stores an encoder's whole output, its rows in order, in pages
+/// of their own: the `i`-th page holds its bytes `i * page_bytes` up to
+/// `(i + 1) * page_bytes`, the last one their remainder. A video encoder
+/// call's output holds the stored output's rows `rows[0]` up to `rows[1]` (a
+/// latent encoding round's units, or all of them), its row `r` being the
+/// stored row `rows[0] + r`, so the call reads or writes the bytes of those
+/// rows in the pages they fall on. An image encoding's output is the whole
+/// stored output, whose rows the worker prepares from the image: at most
+/// `rows[1]`, the cache tokens of the block the features write, which the
+/// pages are sized by, from `rows[0] = 0` on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostOutput {
+    /// The pool at the call's ranks' host's Storage Server
+    /// (`EncoderPoolInfo::pool`).
+    pub pool: u64,
+    /// Whether every rank of the call reads its output's rows from the
+    /// pages instead of computing them; otherwise the call computes its
+    /// output and the rank that wrote rows writes them to the pages.
+    pub import: bool,
+    /// The bytes of one row.
+    pub row_bytes: u64,
+    /// The stored output's rows the call's output holds: its first and its
+    /// end row; for an image encoding, its first row and a bound of its
+    /// end.
+    pub rows: [u32; 2],
+    /// The pool slot of each page of the stored output; `None` for a page
+    /// an export leaves unwritten, as the pool holds it already. An import
+    /// names every page.
+    pub slots: Vec<Option<u64>>,
+}
+
+impl HostOutput {
+    /// Validates that the rows are nonempty, that every page is named for
+    /// an import, and, given the pool's `page_bytes`, that the pages hold
+    /// the stored output's rows up to the call's last one.
+    pub fn validate(&self, page_bytes: Option<u64>) -> ValidationResult<()> {
+        let [first, end] = self.rows;
+        ensure_valid!(
+            first < end && self.row_bytes > 0 && !self.slots.is_empty(),
+            "a host output names no rows or no pages"
+        );
+        ensure_valid!(
+            !self.import || self.slots.iter().all(Option::is_some),
+            "an imported host output names every page"
+        );
+        if let Some(page_bytes) = page_bytes {
+            ensure_valid!(
+                u64::from(end) * self.row_bytes <= self.slots.len() as u64 * page_bytes,
+                "a host output's pages do not hold its rows"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Call {
@@ -511,6 +588,9 @@ impl Call {
             cache_output: None,
             draft: DraftWork::default(),
             latent_restore: None,
+            host_output: None,
+            latent_draw: None,
+            carried_image: None,
         }
     }
 
@@ -664,10 +744,26 @@ impl Call {
                         self.kind,
                         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
                     )
-                    && self.image_input.is_none(),
+                    && self.image_input.is_none()
+                    && self.carried_image.is_none(),
                 "encoded image requires an image encoder without another image source"
             );
         }
+        if let Some(image) = &self.carried_image {
+            ensure_valid!(
+                image.is_complete()
+                    && matches!(
+                        self.kind,
+                        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
+                    )
+                    && self.image_input.is_none(),
+                "a carried image requires an image encoder without another image source"
+            );
+        }
+        ensure_valid!(
+            self.latent_draw.is_none() || self.kind == CallKind::Media(MediaCall::LatentEncoding),
+            "only a latent encoding names a posterior draw"
+        );
 
         // A token-denoising call either reads candidate log-probabilities at
         // slots of the canvas rows it carries, or runs one step of its
@@ -821,6 +917,29 @@ impl Call {
             ensure_valid!(
                 self.kind == CallKind::Media(MediaCall::LatentPreparation) && !prepares_image,
                 "only a video latent preparation restores a stored trajectory"
+            );
+        }
+        // Only an encoder call that writes one output has its output in the
+        // host encoder pool: a video encoder call's one output, or an image
+        // encoding's features.
+        if let Some(output) = &self.host_output {
+            output.validate(None)?;
+            let one_output = match self.encoder_output {
+                Some(_) => {
+                    self.outputs.is_empty() && self.kind != CallKind::Media(MediaCall::TextEncoding)
+                }
+                None => self.outputs.len() == 1,
+            };
+            ensure_valid!(
+                matches!(
+                    self.kind,
+                    CallKind::Media(
+                        MediaCall::VisionEncoding
+                            | MediaCall::TextEncoding
+                            | MediaCall::LatentEncoding
+                    )
+                ) && one_output,
+                "only an encoder call of one output has a host output"
             );
         }
         Ok(())

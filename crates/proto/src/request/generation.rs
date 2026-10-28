@@ -108,13 +108,16 @@ pub struct ReadoutSlot {
 /// An encoded image and the model's requirements for adding it to context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageInput {
-    /// Stable content hash used for encoder-cache identity; see
-    /// [`encoder_cache_key`]. The engine derives encoder-cache keys from this
-    /// value and the encoder's index and kind only, so omni preprocessing in
-    /// the server folds `CachePolicy::isolation_key` into it to keep isolated
-    /// requests from sharing entries, and folds in any request-dependent
-    /// preprocessing parameter that changes the encoder product.
-    pub hash: u64,
+    /// The SHA-256 digest of what the image's encoders read of the request:
+    /// the image's bytes, any request-dependent preprocessing parameter that
+    /// changes what they compute (a pixel budget the request's input images
+    /// share), and the request's cache partition
+    /// (`CachePolicy::isolation_key`), which the server folds in so that
+    /// requests of other partitions share no encoder output. The engine keys
+    /// the image's encoder outputs, in its encoder cache and in the host
+    /// encoder pools, by this digest, the encoder and, for an encoder that
+    /// samples, the request's draw.
+    pub digest: [u8; 32],
     /// Base64-encoded input image.
     pub b64: String,
     /// Exclusive prompt-token position at the end of this image's marker gap.
@@ -164,27 +167,85 @@ pub struct ImageEncoderInput {
     pub width: Option<u32>,
 }
 
-/// Derives the cache identity of one ordered image encoder.
-///
-/// `encoder_index` is the encoder's index in `ImageInput::encoders`. The engine
-/// derives the key when it looks up a cached product before encoding and
-/// again when it stores the encoder's product, so both must use the same
-/// index for a stored product to be found.
-pub fn encoder_cache_key(image_hash: u64, encoder_index: usize, encoder: ImageEncoder) -> u64 {
-    use std::hash::Hasher as _;
+/// The interval a decoded image product's values lie in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PixelRange {
+    /// `[0, 1]`.
+    Unit,
+    /// `[-1, 1]`.
+    SignedUnit,
+}
 
-    // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
-    // the encoder index distinguishes repeated encoder kinds within one image
-    // input.
-    let tag: u8 = match encoder {
-        ImageEncoder::Vision => 1,
-        ImageEncoder::Latent => 2,
-    };
-    let mut hasher = fnv::FnvHasher::default();
-    hasher.write(&image_hash.to_le_bytes());
-    hasher.write(&(encoder_index as u64).to_le_bytes());
-    hasher.write(&[tag]);
-    hasher.finish()
+/// The values of a decoded image product, exported to the host: the image an
+/// image decoding wrote for its request's feedback encoders, which read it on
+/// the device (`FeedbackSource::DeviceProduct`).
+///
+/// They are the exact input of the feedback encoders, unlike the published
+/// PNG, whose pixels are quantized to eight bits; a migrated request carries
+/// them so that the engine continuing it encodes the image as the request
+/// that generated it did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePixels {
+    /// Image height in pixels.
+    pub height: u32,
+    /// Image width in pixels.
+    pub width: u32,
+    /// The interval the values lie in, which the feedback encoders' image
+    /// transform reads.
+    pub range: PixelRange,
+    /// BF16 values of shape `[3, height, width]`, row-major, little-endian:
+    /// [`ImagePixels::value_bytes`] bytes.
+    #[serde(with = "serde_bytes")]
+    pub values: Vec<u8>,
+}
+
+impl ImagePixels {
+    /// Bytes of the BF16 values of a `height` x `width` image: two per value
+    /// of each of its three channels.
+    pub fn value_bytes(height: u32, width: u32) -> u64 {
+        u64::from(height)
+            .saturating_mul(u64::from(width))
+            .saturating_mul(6)
+    }
+
+    /// Whether the values fill the image's `[3, height, width]` raster.
+    pub fn is_complete(&self) -> bool {
+        self.values.len() as u64 == Self::value_bytes(self.height, self.width)
+            && self.height > 0
+            && self.width > 0
+    }
+}
+
+/// What a generated image's feedback encoders read, which a migrated request
+/// carries for each image it generated before (`GeneratedImage`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackImage {
+    /// The decoded image product's values, for feedback that reads the
+    /// device product (`FeedbackSource::DeviceProduct`).
+    Pixels(std::sync::Arc<ImagePixels>),
+    /// The image's base64 PNG, for feedback that reads the materialized
+    /// artifact (`FeedbackSource::ArtifactProduct`).
+    Png(std::sync::Arc<str>),
+}
+
+/// An image a migrated request generated on the engines that served it
+/// before (`GenerationRequest::generated_images`).
+///
+/// The image is a fact of the request, as its tokens are: its client
+/// received it. The engine that continues the request writes it into the
+/// request's context by the computation the request fed it back with: its
+/// feedback encoders over [`GeneratedImage::image`], then the feature
+/// writes, at its place among the generated tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedImage {
+    /// The request's generated tokens that precede the image: it opened once
+    /// the request had generated this many tokens, the one that opened it
+    /// included.
+    pub tokens: u32,
+    /// What the image's feedback encoders read.
+    pub image: FeedbackImage,
 }
 
 /// Product channel through which a materialized image reaches feedback encode.
@@ -879,10 +940,13 @@ pub struct GenerationRequest {
     #[serde(default)]
     pub readout: Vec<ReadoutRow>,
     /// The tokens a migrated request generated on the engines that served it
-    /// before, in order; empty for a new request. They continue its prompt:
-    /// the engine computes their cache and generates after them, and counts
-    /// them as generated against `max_und_tokens` and `min_tokens`, in the
-    /// penalties and bad words of its sampling, and in its usage.
+    /// before, in order, every one it counted as generated: the text it
+    /// published and the control tokens it did not (`Event::ControlToken`),
+    /// such as the tokens that opened its images; empty for a new request.
+    /// They continue its prompt: the engine computes their cache and
+    /// generates after them, and counts them as generated against
+    /// `max_und_tokens` and `min_tokens`, in the penalties and bad words of
+    /// its sampling, and in its usage.
     #[serde(default)]
     pub generated_token_ids: Vec<u32>,
     /// The LoRA adapter the request computes with: the slot of the
@@ -890,19 +954,35 @@ pub struct GenerationRequest {
     /// model alone (`uniserve.adapters`).
     #[serde(default)]
     pub adapter: u32,
+    /// The images a migrated request generated on the engines that served it
+    /// before, in order, each at its place among `generated_token_ids`;
+    /// empty for a new request. The engine writes each into the request's
+    /// context as the request fed it back, and counts it as generated:
+    /// against `max_images`, in its image numbering and in its usage.
+    #[serde(default)]
+    pub generated_images: Vec<GeneratedImage>,
 }
 
 impl GenerationRequest {
     /// Returns whether the request resumes generation it began on another
     /// engine.
     pub fn is_migrated(&self) -> bool {
-        !self.generated_token_ids.is_empty()
+        !self.generated_token_ids.is_empty() || !self.generated_images.is_empty()
     }
 
-    /// Returns whether the request can resume on another engine from the
-    /// tokens it generated: whether it generates text alone. An image's
-    /// trajectory and a readout's answers are not tokens.
+    /// Returns whether the request can resume on another engine from what it
+    /// generated: its tokens and images, which its client received, and from
+    /// which the engine that continues it computes everything else. A
+    /// readout generates nothing to resume from: its answers come whole.
     pub fn is_migratable(&self) -> bool {
+        !self.is_readout()
+    }
+
+    /// Returns whether the request's context holds its prompt and then the
+    /// tokens it generates, in order: whether it generates text alone. An
+    /// image-generating request's context also holds its images and the
+    /// tokens that frame them.
+    pub fn generates_text_alone(&self) -> bool {
         !self.is_readout() && !self.generates_images()
     }
 
@@ -988,18 +1068,13 @@ impl GenerationRequest {
         }
         if self.is_migrated() {
             if !self.is_migratable() {
-                return Err(GenerationRequestError::MigratedMedia);
+                return Err(GenerationRequestError::MigratedReadout);
             }
             // Its prompt's log-probabilities were reported where it began.
             if self.sampling.return_prompt_logprobs {
                 return Err(GenerationRequestError::MigratedPromptLogprobs);
             }
-            if self.generated_token_ids.len() >= self.max_und_tokens {
-                return Err(GenerationRequestError::MigratedPastLimit {
-                    generated: self.generated_token_ids.len(),
-                    max_und_tokens: self.max_und_tokens,
-                });
-            }
+            self.validate_generated()?;
         }
 
         // Trigger patterns must be nonempty. Text that continues after an image
@@ -1071,6 +1146,66 @@ impl GenerationRequest {
         // a meaningful termination boundary.
         if self.stop_strings.iter().any(String::is_empty) {
             return Err(GenerationRequestError::EmptyStopString);
+        }
+        Ok(())
+    }
+}
+
+impl GenerationRequest {
+    /// Validates what a migrated request generated before: a request still
+    /// running when it left, and images it could have generated.
+    ///
+    /// Text alone stops at its token limit, so a running text request
+    /// generated fewer. A direct image trigger opens an image before the
+    /// limit is checked, so an image-generating request may have reached it
+    /// with the token that opened an image still in progress. Each image
+    /// follows the tokens before it in order, within `max_images`, and is
+    /// what its request's feedback reads, of its image size.
+    fn validate_generated(&self) -> Result<(), GenerationRequestError> {
+        let generated = self.generated_token_ids.len();
+        let past_limit = if self.generates_images() {
+            generated > self.max_und_tokens
+        } else {
+            generated >= self.max_und_tokens
+        };
+        if self.decodes_text() && past_limit {
+            return Err(GenerationRequestError::MigratedPastLimit {
+                generated,
+                max_und_tokens: self.max_und_tokens,
+            });
+        }
+        if self.generated_images.is_empty() {
+            return Ok(());
+        }
+        if !self.continues_after_image() {
+            return Err(GenerationRequestError::MigratedImageWithoutFeedback);
+        }
+        if self.generated_images.len() > usize::from(self.max_images) {
+            return Err(GenerationRequestError::MigratedPastImageLimit {
+                images: self.generated_images.len(),
+                max_images: self.max_images,
+            });
+        }
+        let mut previous = 0;
+        for (index, image) in self.generated_images.iter().enumerate() {
+            // An image opens on a token, and a later one on a later token.
+            let tokens = image.tokens as usize;
+            if tokens > generated || tokens == 0 || (index > 0 && tokens <= previous) {
+                return Err(GenerationRequestError::MigratedImageOutOfOrder { image: index });
+            }
+            previous = tokens;
+            let reads = match (&image.image, &self.image_generation.feedback_source) {
+                (FeedbackImage::Pixels(pixels), Some(FeedbackSource::DeviceProduct)) => {
+                    pixels.is_complete()
+                        && pixels.height == self.image.height
+                        && pixels.width == self.image.width
+                }
+                (FeedbackImage::Png(png), Some(FeedbackSource::ArtifactProduct)) => !png.is_empty(),
+                _ => false,
+            };
+            if !reads {
+                return Err(GenerationRequestError::MigratedImageMismatch { image: index });
+            }
         }
         Ok(())
     }
@@ -1193,10 +1328,10 @@ pub enum GenerationRequestError {
     /// A readout request also asks to generate tokens or images.
     #[error("a readout request generates no tokens or images")]
     GeneratingReadout,
-    /// A migrated request reads canvas slots or generates images, whose
-    /// state its tokens do not restore.
-    #[error("only a text generation request resumes from its generated tokens")]
-    MigratedMedia,
+    /// A migrated request reads canvas slots: a readout generates nothing to
+    /// resume from.
+    #[error("a readout does not resume from generated tokens")]
+    MigratedReadout,
     /// A migrated request asks for its prompt's log-probabilities again.
     #[error("a migrated request does not report prompt log-probabilities again")]
     MigratedPromptLogprobs,
@@ -1208,6 +1343,32 @@ pub enum GenerationRequestError {
         generated: usize,
         /// The request's token limit.
         max_und_tokens: usize,
+    },
+    /// A migrated request carries images, but it does not feed images back
+    /// into a context that continues after them.
+    #[error("a migrated request carries images its context does not continue after")]
+    MigratedImageWithoutFeedback,
+    /// A migrated request carries more images than its limit allows.
+    #[error("a migrated request carries {images} images of its {max_images}-image limit")]
+    MigratedPastImageLimit {
+        /// Images the request generated before it migrated.
+        images: usize,
+        /// The request's image limit.
+        max_images: u16,
+    },
+    /// A migrated request's image does not follow a token it generated
+    /// after the previous image's.
+    #[error("migrated image {image} does not follow its own generated token")]
+    MigratedImageOutOfOrder {
+        /// Index of the image among the carried images.
+        image: usize,
+    },
+    /// A migrated request's image is not what its feedback reads: the
+    /// decoded product's values of its image size, or its PNG.
+    #[error("migrated image {image} is not what the request's feedback reads")]
+    MigratedImageMismatch {
+        /// Index of the image among the carried images.
+        image: usize,
     },
     /// A readout row has no tokens or reads no slot.
     #[error("every readout row must hold tokens and read at least one slot")]
@@ -1328,7 +1489,7 @@ mod tests {
             negative_prompt_token_ids: vec![9],
             multimodal_inputs: MultimodalInputs {
                 images: vec![ImageInput {
-                    hash: 17,
+                    digest: [17; 32],
                     b64: "aW1hZ2U=".into(),
                     position: 2,
                     num_positions: 1,
@@ -1369,6 +1530,7 @@ mod tests {
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
             adapter: 4,
+            generated_images: Vec::new(),
         }
     }
 
@@ -1383,15 +1545,6 @@ mod tests {
             assert_eq!(name.parse::<GenerationConstraint>().unwrap(), constraint);
         }
         assert!("text".parse::<GenerationConstraint>().is_err());
-    }
-
-    #[test]
-    fn encoder_cache_keys_are_stable_and_step_scoped() {
-        let first = encoder_cache_key(17, 0, ImageEncoder::Latent);
-        assert_eq!(first, encoder_cache_key(17, 0, ImageEncoder::Latent));
-        assert_ne!(first, encoder_cache_key(18, 0, ImageEncoder::Latent));
-        assert_ne!(first, encoder_cache_key(17, 1, ImageEncoder::Latent));
-        assert_ne!(first, encoder_cache_key(17, 0, ImageEncoder::Vision));
     }
 
     #[test]
@@ -1454,7 +1607,7 @@ mod tests {
         let mut request = complete_request();
         request.prompt_token_ids = vec![1; 35];
         request.multimodal_inputs.images = vec![ImageInput {
-            hash: 17,
+            digest: [17; 32],
             b64: "aW1hZ2U=".into(),
             position: 35,
             num_positions: 1,

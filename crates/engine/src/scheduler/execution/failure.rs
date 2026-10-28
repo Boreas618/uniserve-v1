@@ -116,7 +116,7 @@ impl Scheduler {
                     _ => None,
                 };
                 let terminal = match cause {
-                    Some(cause) => DiffusionTerminal::Migrated(cause, 0),
+                    Some(cause) => DiffusionTerminal::Migrated(cause, 0, Vec::new()),
                     None => DiffusionTerminal::Failed(msg.to_string()),
                 };
                 self.finish_media(id, terminal);
@@ -167,6 +167,7 @@ impl Scheduler {
                 let _ = st.output.events.event_tx.send(Event::Migratable {
                     cause: MigrationCause::Loss,
                     denoised_steps: 0,
+                    stored_layout: Vec::new(),
                 });
             }
         }
@@ -177,6 +178,7 @@ impl Scheduler {
             let _ = pending.event_tx.send(Event::Migratable {
                 cause: MigrationCause::Loss,
                 denoised_steps: 0,
+                stored_layout: Vec::new(),
             });
         }
         for id in self.media_ids() {
@@ -185,7 +187,7 @@ impl Scheduler {
                 Some(TerminalIntent::None) => MigrationCause::Loss,
                 _ => continue,
             };
-            self.finish_media(id, DiffusionTerminal::Migrated(cause, 0));
+            self.finish_media(id, DiffusionTerminal::Migrated(cause, 0, Vec::new()));
         }
 
         let running: Vec<(RequestId, MigrationCause)> = self
@@ -235,8 +237,12 @@ impl Scheduler {
         if let Some(kv_offload) = self.kv_offload.as_mut() {
             kv_offload.worker_failed(&loss.worker_id);
         }
-        // So are the trajectory offloads its batches carried.
+        // So are the trajectory offloads its batches carried, and the
+        // encoder outputs its calls read or wrote.
         if let Some(store) = self.trajectories.as_mut() {
+            store.worker_failed(&loss.worker_id);
+        }
+        if let Some(store) = self.encoder_outputs.as_mut() {
             store.worker_failed(&loss.worker_id);
         }
 
@@ -447,7 +453,9 @@ impl Scheduler {
                 if !self.inflight.has_pending_calls(id) {
                     let terminal = match refusal {
                         Some(reason) => DiffusionTerminal::Rejected(reason.clone()),
-                        None if migrating => DiffusionTerminal::Migrated(MigrationCause::Loss, 0),
+                        None if migrating => {
+                            DiffusionTerminal::Migrated(MigrationCause::Loss, 0, Vec::new())
+                        }
                         None => DiffusionTerminal::Failed(loss.message.clone()),
                     };
                     self.finish_media(id, terminal);

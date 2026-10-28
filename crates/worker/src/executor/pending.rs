@@ -1,8 +1,8 @@
 //! Resolve numerical completion into accepted request progress and wire output.
 
 use ipc::{
-    ArtifactHandle, BatchOutput, Call, CallOutput, CallStatus, ErrorCode, MediaOutput, RequestKey,
-    TensorExport, TensorRef, TimingCounters,
+    ArtifactHandle, BatchOutput, Call, CallOutput, CallStatus, ErrorCode, MediaOutput,
+    RankLatentLayout, RequestKey, TensorExport, TensorRef, TimingCounters,
 };
 use ipc::{CallId, MediaSource};
 
@@ -169,6 +169,12 @@ impl PendingOutput {
         self.progress.cache_computed_len = length;
     }
 
+    /// Report how this rank's request slot pages hold the request's latent
+    /// samples (`CallOutput::latent_layouts`), on a successful completion.
+    pub(crate) fn set_latent_layout(&mut self, rank: u32, layout: String) {
+        self.output.latent_layouts = vec![RankLatentLayout { rank, layout }];
+    }
+
     /// Record the step a validated trajectory commit publishes, which the
     /// call's completion reports. Releasing the trajectory publishes none.
     pub(crate) fn apply_latent_update(&mut self, update: &LatentUpdate) -> Result<()> {
@@ -251,6 +257,12 @@ impl PendingOutput {
             self.output.token_logprobs.clear();
             self.output.prompt_logprobs.clear();
             self.output.candidate_logprobs.clear();
+        }
+        // Every denoising rank reports how its own pages hold the request's
+        // samples, the output owner or not; a call that did not succeed
+        // laid nothing out.
+        if self.output.status != CallStatus::Ok {
+            self.output.latent_layouts.clear();
         }
 
         set_progress(&mut self.output, self.progress)?;
@@ -461,6 +473,7 @@ pub(crate) fn request_output(
         media_output: None,
         cache_output: None,
         draft_token_ids: Vec::new(),
+        latent_layouts: Vec::new(),
     };
     set_progress(&mut output, progress)?;
     Ok(output)
@@ -525,6 +538,9 @@ mod tests {
             cache_input: None,
             cache_output: None,
             latent_restore: None,
+            host_output: None,
+            latent_draw: None,
+            carried_image: None,
         }
     }
 
@@ -694,6 +710,35 @@ mod tests {
         output.resolve(RequestProgress::default(), &mut written(&[0])?)?;
         assert_eq!(output.result()?.status, CallStatus::Predicated);
         assert!(output.products().is_empty());
+        Ok(())
+    }
+
+    /// A denoising rank that does not report its call's public output still
+    /// reports how its own pages hold the request's samples, which the
+    /// engine joins from every rank; a predicated call reports none.
+    #[test]
+    fn every_rank_reports_its_latent_layout_of_a_successful_call() -> Result<()> {
+        for (reports_output, predicate, reported) in
+            [(false, 1, true), (true, 1, true), (false, 0, false)]
+        {
+            let mut output = pending()?;
+            output.reports_output = reports_output;
+            output.set_latent_layout(1, "layout".into());
+            output.predicate_word = Some(0);
+            output.resolve(RequestProgress::default(), &mut written(&[predicate])?)?;
+            let layouts = &output.result()?.latent_layouts;
+            assert_eq!(
+                layouts
+                    .iter()
+                    .map(|layout| (layout.rank, layout.layout.as_str()))
+                    .collect::<Vec<_>>(),
+                if reported {
+                    vec![(1, "layout")]
+                } else {
+                    Vec::new()
+                }
+            );
+        }
         Ok(())
     }
 

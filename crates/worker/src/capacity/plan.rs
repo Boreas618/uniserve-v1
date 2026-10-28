@@ -234,6 +234,10 @@ fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
         // A video denoising rank maps its host latent pool once its ledger
         // is bound.
         latent_pool: None,
+        encoder_pool: None,
+        // An image encoding rank states its encoders once its executor
+        // stated them.
+        image_encoders: Box::default(),
         buffer_pool_bytes: 0,
         encoder_cache_entries: 0,
         encoder_entry_bytes: 0,

@@ -1951,6 +1951,7 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
             adapter: 0,
+            generated_images: Vec::new(),
         }))?;
         std::fs::write(directory.path().join("release"), "")?;
         runtime.block_on(async {
@@ -2031,6 +2032,7 @@ fn greedy_text(id: u64, generated: Vec<u32>, max_und_tokens: usize) -> Request {
         readout: Vec::new(),
         generated_token_ids: generated,
         adapter: 0,
+        generated_images: Vec::new(),
     })
 }
 
@@ -2096,6 +2098,7 @@ fn a_cache_layer_kept_per_request_resumes_from_its_checkpoints() -> anyhow::Resu
                 readout: Vec::new(),
                 generated_token_ids: Vec::new(),
                 adapter: 0,
+                generated_images: Vec::new(),
             }))?;
             let (tokens, terminal) = tokens_until_terminal(&mut events)?;
             anyhow::ensure!(
@@ -2161,6 +2164,7 @@ fn a_prefill_group_hands_its_requests_to_a_decode_group() -> anyhow::Result<()> 
                     readout: Vec::new(),
                     generated_token_ids: Vec::new(),
                     adapter: 0,
+                    generated_images: Vec::new(),
                 }))?);
             }
             let mut generated = Vec::new();
@@ -2500,6 +2504,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                     height: 768,
                 },
                 trajectory: Default::default(),
+                encoder_inputs: None,
             }))?;
             requests.push((request_id, events));
         }
@@ -5312,6 +5317,7 @@ fn media_worker() -> anyhow::Result<()> {
                             media_output: None,
                             cache_output: None,
                             draft_token_ids: Vec::new(),
+                            latent_layouts: Vec::new(),
                         }
                     })
                     .collect();

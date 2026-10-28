@@ -90,6 +90,7 @@ use crate::executor::reports::{HostCall, HostTasks, Reports, release_borrowed};
 use crate::job::{Completion, Job};
 use crate::memory::OutputPool;
 use crate::memory::allocation::StorageView;
+use crate::memory::encoders::EncoderHostPool;
 use crate::request::RequestPool;
 use crate::stream::{CUDAStream, Issue as _};
 use crate::worker::WorkerMemory;
@@ -151,6 +152,9 @@ pub(crate) struct Computations {
     /// products host tasks wrote are fenced on: the tasks waited for their
     /// copies, so the fences complete at once.
     host_stream: Option<Arc<CUDAStream>>,
+    /// The host encoder pool its video encoder calls read their outputs
+    /// from or write them to (`Call::host_output`), on a rank that maps one.
+    encoders: Option<EncoderHostPool>,
     /// Started requests the executor has not admitted yet, as JSON.
     started: Vec<serde_json::Value>,
 }
@@ -178,8 +182,14 @@ impl Computations {
             reports: resources.reports,
             images: resources.images,
             host_stream: resources.host_stream,
+            encoders: None,
             started: Vec::new(),
         }
+    }
+
+    /// Read and write video encoder outputs in `pool` from now on.
+    pub(crate) fn attach_encoders(&mut self, pool: EncoderHostPool) {
+        self.encoders = Some(pool);
     }
 
     /// The rank's image host resource, when a computation names it.
@@ -829,6 +839,7 @@ fn record_last(
             info: parts.info,
             rank: parts.rank as u32,
             ledger: computations.ledger.as_ref(),
+            encoders: computations.encoders.as_ref(),
             host_stream: computations.host_stream.clone(),
             borrowed: &inputs.imports.borrowed(),
         };
@@ -847,6 +858,7 @@ fn record_last(
             pages: computations.pages.as_mut(),
             ledger: computations.ledger.as_mut(),
             images: computations.images.as_ref(),
+            encoders: computations.encoders.as_ref(),
         };
         if images {
             let tensors = image::bind(

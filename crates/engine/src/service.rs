@@ -972,6 +972,8 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
                                     .collect(),
                                 held_units: parked.held_units,
                                 requests: parked.requests,
+                                reserved_units: parked.reserved_units,
+                                reserving: parked.reserving,
                             });
                         }
                     }
@@ -1185,11 +1187,13 @@ fn refuse_parked(submit: wire::Submit, front: usize, routing: &Routing) {
             Ok(Request::Generation(request)) if request.is_migratable() => Event::Migratable {
                 cause: MigrationCause::Drain,
                 denoised_steps: 0,
+                stored_layout: Vec::new(),
             },
             // A video request leaves naming the trajectory it named.
             Ok(Request::Diffusion(_)) => Event::Migratable {
                 cause: MigrationCause::Drain,
                 denoised_steps: 0,
+                stored_layout: Vec::new(),
             },
             Ok(_) => Event::Error {
                 message: "the engine is parked and admits no request".to_owned(),
@@ -1509,6 +1513,8 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
                                 .collect(),
                             held_units: indexed.held_units,
                             requests: indexed.requests,
+                            reserved_units: indexed.reserved_units,
+                            reserving: indexed.reserving,
                         })
                         .unwrap_or_default();
                     scope.spawn(move || scheduler.promote(parked, recompute, grows))

@@ -17,6 +17,12 @@ use ipc::MediaCall;
 /// that many steps, rather than after every step of its schedule.
 pub(in crate::scheduler) const DENOISING_LOOKAHEAD: usize = 2;
 
+/// A video request's encoder output `name` in the host encoder pools: a
+/// video request has one output of each name.
+fn video_output(name: &'static str) -> crate::encoder_outputs::OutputId {
+    crate::encoder_outputs::OutputId { name, ordinal: 0 }
+}
+
 /// What one media call occupies while it is in flight.
 ///
 /// On a component whose capacity is measured in media units the call
@@ -175,11 +181,22 @@ impl Scheduler {
                 return Vec::new();
             }
         }
+        // An encoder is offered once its output's lookup in the host encoder
+        // pool resolved, so that every call of the output reads it or every
+        // call computes it.
+        let resolved = |name: &'static str| {
+            self.encoder_outputs
+                .as_ref()
+                .is_none_or(|store| store.resolved(state.admission.request_key, video_output(name)))
+        };
         let mut ready = Vec::new();
         if graph.encodes_vision() && !state.vision_encoding_scheduled {
-            ready.push(MediaCall::VisionEncoding);
+            if resolved(product::VISION_FEATURES) {
+                ready.push(MediaCall::VisionEncoding);
+            }
         } else if !state.text_encoding_scheduled
             && state.vision_features.as_ref().is_none_or(produced)
+            && resolved(product::CONDITIONING)
         {
             ready.push(MediaCall::TextEncoding);
         }
@@ -192,7 +209,12 @@ impl Scheduler {
         let visual_units = graph.condition_units().len() as u32;
         let encoding_remains = state.scheduled_condition_units < visual_units
             || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none());
-        if encoding_remains && self.latent_round(state).is_some() {
+        let latents = if state.scheduled_condition_units < visual_units {
+            product::CONDITION_VIDEO_LATENTS
+        } else {
+            product::CONDITION_AUDIO_LATENTS
+        };
+        if encoding_remains && self.latent_round(state).is_some() && resolved(latents) {
             ready.push(MediaCall::LatentEncoding);
         }
         // Latent preparation reads the text features and every condition
@@ -260,6 +282,102 @@ impl Scheduler {
             }
         }
         ready
+    }
+
+    /// Looks up admitted video request `id`'s encoder outputs in the host
+    /// encoder pools (`crate::encoder_outputs`): each output its graph
+    /// computes, keyed by the digest of what its encoder reads, which the
+    /// request names (`DiffusionRequest::encoder_inputs`), and its rows of
+    /// static width as the request reserved them. A request that names no
+    /// digests, or an output the pools do not serve, computes them.
+    pub(in crate::scheduler) fn look_up_encoder_outputs(&mut self, id: RequestId) {
+        let Some(state) = self.media_state(id) else {
+            return;
+        };
+        let Some(inputs) = state.request.encoder_inputs.as_ref() else {
+            return;
+        };
+        let request_key = state.admission.request_key;
+        // The visual condition latents are one output, of every unit.
+        let units = (!inputs.video_units.is_empty()).then(|| {
+            let mut digest = storage::key::Digest::new(b"encoder-units");
+            for unit in &inputs.video_units {
+                digest.bytes(unit);
+            }
+            digest.finish()
+        });
+        let outputs = [
+            (
+                MediaCall::VisionEncoding,
+                product::VISION_FEATURES,
+                inputs.vision,
+            ),
+            (
+                MediaCall::TextEncoding,
+                product::CONDITIONING,
+                Some(inputs.text),
+            ),
+            (
+                MediaCall::LatentEncoding,
+                product::CONDITION_VIDEO_LATENTS,
+                units,
+            ),
+            (
+                MediaCall::LatentEncoding,
+                product::CONDITION_AUDIO_LATENTS,
+                inputs.audio,
+            ),
+        ];
+        let mut lookups = Vec::new();
+        for (media_call, name, digest) in outputs {
+            let Some(digest) = digest else {
+                continue;
+            };
+            let Some(rows) = state.graph.product(name).and_then(|product| product.extent) else {
+                continue;
+            };
+            let Some(reservation) = state.reservations.get(name) else {
+                continue;
+            };
+            let reserved = &state.allocations.tensors[reservation];
+            // A row's bytes, when every extent but the rows' is static.
+            let Some(row_bytes) = reserved.shape_bound.dims[1..].iter().try_fold(
+                reserved.dtype.element_bytes(),
+                |bytes, dim| match dim {
+                    DimBound::Static(extent) => Some(bytes * u64::from(*extent)),
+                    DimBound::Device { .. } => None,
+                },
+            ) else {
+                continue;
+            };
+            let Some(worker) = self
+                .info
+                .media_components
+                .get(&media_call)
+                .and_then(|component| {
+                    self.placement
+                        .affinity
+                        .get(&(request_key, component.clone()))
+                })
+            else {
+                continue;
+            };
+            lookups.push((worker.clone(), name, digest, rows, row_bytes));
+        }
+        let Some(store) = self.encoder_outputs.as_mut() else {
+            return;
+        };
+        for (worker, name, digest, rows, row_bytes) in lookups {
+            store.lookup(
+                request_key,
+                &worker,
+                video_output(name),
+                &digest,
+                rows,
+                row_bytes,
+                crate::encoder_outputs::Access::FULL,
+            );
+        }
     }
 
     /// Returns the steps of a request's trajectory covered once its submitted
@@ -586,7 +704,7 @@ impl Scheduler {
                 let CallKind::Media(media_call) = inflight.call.kind else {
                     continue;
                 };
-                if inflight.call.input_image.is_some() {
+                if inflight.call.input_image.is_some() || inflight.call.carried_image.is_some() {
                     occupancy.occupy(
                         &self.image_demand(inflight.call.request_key, media_call),
                         *id,
@@ -923,6 +1041,34 @@ impl Scheduler {
             }
             _ => None,
         };
+        // An encoder call's output in the host encoder pool: the output, the
+        // rows of it the call's output holds, and whether no other call of
+        // it follows. A visual latent round holds its own units' rows.
+        let encoded = |name: &'static str| {
+            state
+                .graph
+                .product(name)
+                .and_then(|product| product.extent)
+                .map(|rows| (name, [0, rows], true))
+        };
+        let host_plan = match media_call {
+            MediaCall::VisionEncoding => encoded(product::VISION_FEATURES),
+            MediaCall::TextEncoding => encoded(product::CONDITIONING),
+            MediaCall::LatentEncoding if visual_round => decode.as_ref().map(|range| {
+                let cursor = range.cursor as usize;
+                let end = cursor + range.max_units as usize;
+                let first: u32 = units[..cursor].iter().sum();
+                let rows: u32 = units[cursor..end].iter().sum();
+                (
+                    product::CONDITION_VIDEO_LATENTS,
+                    [first, first + rows],
+                    end == units.len(),
+                )
+            }),
+            MediaCall::LatentEncoding => encoded(product::CONDITION_AUDIO_LATENTS),
+            _ => None,
+        };
+
         let completion_output = if outputs.is_empty() && stateful {
             Some(self.media_completion_product(request_key, call_id)?)
         } else {
@@ -936,6 +1082,12 @@ impl Scheduler {
         call.completion_output = completion_output;
         call.predicate = predicate;
         call.latent_restore = latent_restore;
+        call.host_output = match (host_plan, self.encoder_outputs.as_mut()) {
+            (Some((name, rows, last)), Some(store)) => {
+                store.plan_call(request_key, video_output(name), call_id, rows, last)
+            }
+            _ => None,
+        };
 
         // Record what this call schedules: the admission it carries, the
         // reservation slice each product binds to, and the cursors that

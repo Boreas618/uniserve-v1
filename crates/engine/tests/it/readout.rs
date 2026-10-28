@@ -89,6 +89,7 @@ fn readout_request(
         readout,
         generated_token_ids: Vec::new(),
         adapter: 0,
+        generated_images: Vec::new(),
     }
 }
 
@@ -433,7 +434,7 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
     let running = Running::start(readout_worker(), SchedulerConfig::default());
     let mut request = readout_request(6, prompt(16, 1000), vec![row(16, &[(1, &[50, 51, 52])])]);
     request.multimodal_inputs.images.push(ImageInput {
-        hash: 99,
+        digest: crate::support::image_digest(99),
         b64: "aW1hZ2U=".into(),
         position: 10,
         num_positions: 9,
@@ -466,9 +467,9 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
 
 /// A vision input image of `tokens` cache tokens and as many positions at
 /// prompt position `position`.
-fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
+fn vision_image(id: u64, position: u32, tokens: u32) -> ImageInput {
     ImageInput {
-        hash,
+        digest: crate::support::image_digest(id),
         b64: "aW1hZ2U=".into(),
         position,
         num_positions: tokens,
@@ -714,7 +715,7 @@ fn an_image_encode_waits_for_a_free_host_task() {
                 vec![row(16, &[(1, &[50, 51])])],
             );
             request.multimodal_inputs.images.push(ImageInput {
-                hash: 200 + index,
+                digest: crate::support::image_digest(200 + index),
                 b64: "aW1hZ2U=".into(),
                 position: 0,
                 num_positions: 9,

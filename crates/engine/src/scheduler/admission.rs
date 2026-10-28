@@ -101,6 +101,22 @@ impl Scheduler {
                 return;
             }
         };
+        // A migrated image-generating request rebuilds its context from its
+        // facts, which must describe a request this engine serves.
+        let continuation = if req.is_migrated() && req.generates_images() {
+            match generation::continuation::plan(&req, &self.special_tokens) {
+                Ok(continuation) => Some(continuation),
+                Err(error) => {
+                    let _ = event_tx.send(Event::Rejected {
+                        kind: RejectionKind::Invalid,
+                        message: format!("invalid generation request: {error}"),
+                    });
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // Backpressure: under overload the new submission is rejected rather
         // than letting queued requests grow without bound and exhaust process
         // memory. The bound covers both waiting queues and retired requests
@@ -118,7 +134,7 @@ impl Scheduler {
             });
             return;
         }
-        let st = self.request_state(req, event_tx, max_cache_tokens);
+        let st = self.request_state(req, event_tx, max_cache_tokens, continuation);
 
         // Admission examines only the queue head, so the insertion position
         // fixes the admission order. Under `Priority` a request goes after
@@ -231,23 +247,63 @@ impl Scheduler {
 
     /// The state of a validated request, at the next request epoch, which
     /// publishes through `event_tx`. `max_cache_tokens` is its worst-case
-    /// cache token count (`validate_submission`).
+    /// cache token count (`validate_submission`), and `continuation` the
+    /// context rebuild of a migrated image-generating request
+    /// (`generation::continuation`).
     pub(super) fn request_state(
         &mut self,
         mut req: GenerationRequest,
         event_tx: EventTx,
         max_cache_tokens: usize,
+        continuation: Option<generation::continuation::Continuation>,
     ) -> RequestState {
+        let prompt_tokens = req.prompt_token_ids.len();
+        let generated = req.generated_token_ids.len();
         // A migrated request's generated tokens continue its prompt: the
         // engine computes their cache as it computes the prompt's and samples
         // after the last of them, at the position the request had reached.
         // They count as generated from the start, so the token limit,
         // `min_tokens`, the penalties and the bad words continue where they
         // were; its usage charges only its own prompt as prompt
-        // (`RequestState::charged_prompt_tokens`).
-        req.prompt_token_ids
-            .extend_from_slice(&req.generated_token_ids);
-        let generated_token_ids = req.generated_token_ids.clone();
+        // (`RequestState::charged_prompt_tokens`). A migrated request that
+        // generates images extends its prompt by the tokens its decodes
+        // wrote instead, writes its images between them, and resumes in the
+        // state it left (`generation::continuation`).
+        let (generated_token_ids, round_token_ids, next_token, replay) = match continuation {
+            Some(continuation) => {
+                req.prompt_token_ids
+                    .extend_from_slice(&continuation.written);
+                let (token, round_closing) = match continuation.resume {
+                    generation::continuation::Resume::Decode {
+                        token,
+                        round_closing,
+                    } => (token, round_closing),
+                    generation::continuation::Resume::Open { token } => (token, false),
+                    generation::continuation::Resume::FeedbackSample => (0, false),
+                };
+                let replay = generation::Replay {
+                    images: continuation.images,
+                    resume: continuation.resume,
+                };
+                (
+                    continuation.history,
+                    continuation.round,
+                    (token, round_closing),
+                    Some(replay),
+                )
+            }
+            None => {
+                req.prompt_token_ids
+                    .extend_from_slice(&req.generated_token_ids);
+                (
+                    req.generated_token_ids.clone(),
+                    Vec::new(),
+                    (0, false),
+                    None,
+                )
+            }
+        };
+        let images = req.generated_images.len();
         // Multimodal requests reserve their configured bounded cache envelope at
         // admission so excess concurrency queues instead of exhausting the prefix cache.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
@@ -271,14 +327,14 @@ impl Scheduler {
             image_encoder_index: 0,
             input_image_features: None,
             context_features: Vec::new(),
-            round_closing: false,
+            round_closing: next_token.1,
             logical_position: 0,
             cache_visible_len: 0,
             cache_computed_len: 0,
-            next_token: 0,
-            num_generated_tokens: generated_token_ids.len(),
-            image_id: 0,
-            num_generated_images: 0,
+            next_token: next_token.0,
+            num_generated_tokens: generated,
+            image_id: u32::try_from(images).unwrap_or(u32::MAX),
+            num_generated_images: images,
             image_reservation_pending: false,
             denoising: Denoising::new(u32::from(req.image.steps)),
             image_conditioning: None,
@@ -297,10 +353,12 @@ impl Scheduler {
             page_keys: Vec::new(),
             offload_boundary: 0,
             generated_token_ids,
-            round_token_ids: Vec::new(),
+            round_token_ids,
             feedback_image_b64: None,
+            feedback_digest: None,
             replayable: true,
             encoder_cache_pins: Vec::new(),
+            host_encoding: None,
             transient_encoder_products: Vec::new(),
             readout_rows: 0,
             readout_logprobs: Vec::with_capacity(req.readout_candidates()),
@@ -311,6 +369,8 @@ impl Scheduler {
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,
             failure: None,
+            prompt_tokens,
+            replay,
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);
@@ -536,7 +596,8 @@ impl Scheduler {
     /// startup. The two resident request slots a video decoder needs are the
     /// rank's to require: it refuses to start with fewer. Rejects with
     /// `RejectionKind::Overloaded` when the waiting bound is reached. A
-    /// rejection's send result is ignored.
+    /// rejection's send result is ignored. A queued request waits behind
+    /// the others in the order [`Self::queue_media`] keeps.
     pub(super) fn enqueue_media(
         &mut self,
         request: DiffusionRequest,
@@ -611,12 +672,33 @@ impl Scheduler {
             );
             return;
         }
-        self.waiting_media.push_back(PendingMedia {
+        self.queue_media(PendingMedia {
             request,
             graph,
             event_tx,
             queued_at,
         });
+    }
+
+    /// Queues `pending` for admission: a request that resumes a stored
+    /// trajectory behind the others that resume one and ahead of every
+    /// request that starts one, and any other request last.
+    ///
+    /// A stored trajectory stays needed until its request's latent
+    /// preparation restores it, so taking the resumed requests first keeps
+    /// the trajectories a world still has to restore to those of its latest
+    /// preemption, at most its request slots, which the host latent pools
+    /// are sized by; the resumed requests also arrived first.
+    fn queue_media(&mut self, pending: PendingMedia) {
+        let position = if pending.request.trajectory.denoised_steps > 0 {
+            self.waiting_media
+                .iter()
+                .position(|queued| queued.request.trajectory.denoised_steps == 0)
+                .unwrap_or(self.waiting_media.len())
+        } else {
+            self.waiting_media.len()
+        };
+        self.waiting_media.insert(position, pending);
     }
 
     /// Reserves a media request's row and output buffers on every routed worker.
@@ -822,6 +904,7 @@ impl Scheduler {
                 artifact: None,
                 restoring: Restoring::Ready(None),
                 offloading: false,
+                latent_layouts: BTreeMap::new(),
             };
 
             // The interval from receipt to admission is the queue wait. The
@@ -838,11 +921,13 @@ impl Scheduler {
             self.running_media.insert(id, state);
             self.running_order.push(id);
             // A resumed request's stored trajectory is pinned while its
-            // conditions are prepared.
+            // conditions are prepared, and every request's encoder outputs
+            // are looked up before its encoders are offered.
             let restoring = self.start_restore(id);
             if let Some(state) = self.media_state_mut(id) {
                 state.restoring = restoring;
             }
+            self.look_up_encoder_outputs(id);
         }
     }
 
@@ -1544,7 +1629,7 @@ impl Scheduler {
         let Some(state) = self.running.get_mut(&id) else {
             return;
         };
-        if !state.req.cache.read || state.has_context_images() {
+        if !state.req.cache.read || state.has_context_images() || state.rebuilds_images() {
             return;
         }
         state.page_keys = kv_offload.page_keys(
@@ -1632,7 +1717,7 @@ fn acquire_cached_prefix(
     source: &ipc::WorkerEndpoint,
 ) -> Result<(), &'static str> {
     let prompt = state.req.prompt_token_ids.clone();
-    let has_context_images = state.has_context_images();
+    let has_context_images = state.has_context_images() || state.rebuilds_images();
     let cache_read = state.req.cache.read;
     let scope = PrefixScope::of(&state.req.cache);
     let allocation = state
