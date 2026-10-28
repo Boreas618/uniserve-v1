@@ -90,7 +90,7 @@ use serde::{Deserialize, Serialize};
 /// a storage's KV cache `segment`, the listing's `ledgers`) and a world kept
 /// as its weights (`KeepWeights`); 10 lets one key have a copy at each
 /// location memory lies at, which `get`, `retain`, `rekey` and a transfer's
-/// tensor regions select by their `at`.
+/// tensor regions select by their `at`, and a span copy rows at a pitch.
 pub const VERSION: u32 = 10;
 
 /// The earliest client version the server serves: a client of version 4
@@ -604,10 +604,14 @@ pub enum Region {
     },
 }
 
-/// One copy of a transfer: `bytes` bytes from `source_offset` of `source`
-/// to `destination_offset` of `destination`. The spans of a task run in no
-/// fixed order, so no span writes bytes another span of the task reads or
-/// writes.
+/// One copy of a transfer: `rows` rows of `bytes` bytes, row `r` from
+/// `source_offset + r * source_pitch` of `source` to `destination_offset +
+/// r * destination_pitch` of `destination`. One row copies `bytes` bytes
+/// and its pitches are unused; rows at a pitch, each at least `bytes`, copy
+/// a strided region as one span (a column of a row-major matrix, a part of
+/// every expert's rows), which the Transfer Server runs as pitched copies.
+/// The spans of a task run in no fixed order, so no span writes bytes
+/// another span of the task reads or writes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     pub source: Region,
@@ -615,6 +619,16 @@ pub struct Span {
     pub destination: Region,
     pub destination_offset: u64,
     pub bytes: u64,
+    pub rows: u64,
+    pub source_pitch: u64,
+    pub destination_pitch: u64,
+}
+
+impl Span {
+    /// The bytes the span copies: its rows' bytes.
+    pub fn copied(&self) -> u64 {
+        self.bytes.saturating_mul(self.rows)
+    }
 }
 
 /// The order in which the tasks on one link take their turns, highest
@@ -731,7 +745,8 @@ pub enum Allocation {
 
 /// One copy the server gives its Transfer Server: a [`Span`] with its
 /// regions resolved to allocations, and offsets from their first byte (from
-/// the region's first byte, for another host's region).
+/// the region's first byte, for another host's region), with the span's
+/// rows and pitches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Move {
     pub source: Allocation,
@@ -739,6 +754,9 @@ pub struct Move {
     pub destination: Allocation,
     pub destination_offset: u64,
     pub bytes: u64,
+    pub rows: u64,
+    pub source_pitch: u64,
+    pub destination_pitch: u64,
 }
 
 /// A link's bandwidth as the Transfer Server measured it: when it started,
