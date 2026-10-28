@@ -32,6 +32,10 @@ pub(super) struct Report {
     pub staged: bool,
     #[serde(skip)]
     pub backup: Vec<Snapshot>,
+    /// Whether the warming opened copy sessions on its owners' ranks, which
+    /// its end closes.
+    #[serde(skip)]
+    pub sessions: bool,
 }
 
 /// Warm every predecessor assigned to this successor. A successful result
@@ -48,10 +52,9 @@ pub(super) async fn prepare(
     let result = rounds(sources, target, reuse, tail_tokens, prefill_tokens, host).await;
     let owners: Vec<_> = sources.iter().chain(std::iter::once(target)).collect();
     let mut errors = Vec::new();
-    if result
-        .as_ref()
-        .map_or(true, |report| report.recompute.is_some() && !report.staged)
-    {
+    if result.as_ref().map_or(true, |report| {
+        report.sessions && report.recompute.is_some() && !report.staged
+    }) {
         // Cancellation completes physical work before either scheduler may
         // reuse a borrowed unit. Failed cancellation leaves those leases held.
         for owner in &owners {
@@ -78,9 +81,12 @@ pub(super) async fn prepare(
             errors.push(error);
         }
     }
-    for owner in owners {
-        if let Err(error) = owner.hook("uniserve.cache_session", "false").await {
-            errors.push(error);
+    // A warming that found no request in flight opened no session.
+    if result.as_ref().map_or(true, |report| report.sessions) {
+        for owner in owners {
+            if let Err(error) = owner.hook("uniserve.cache_session", "false").await {
+                errors.push(error);
+            }
         }
     }
     if !errors.is_empty() {
@@ -126,8 +132,21 @@ async fn rounds(
     };
     let keep = reuse == Reuse::Keep;
     let mut copied: HashMap<(u64, u64), u32> = HashMap::new();
+    // Sources whose requests hold no prefix have no state to warm or back
+    // up: the change then involves none of their ranks, which may be busy
+    // in a long step, and the requests continue on the successor as any
+    // request admitted after this snapshot does.
+    let mut first = Some(snapshots(sources, &copied).await?);
+    if first
+        .iter()
+        .flatten()
+        .all(|snapshot| snapshot.prefixes.is_empty())
+    {
+        return Ok(report);
+    }
     // A warming operation owns the transfer contexts across its rounds.
     // Individual task completion must not tear down and recreate them.
+    report.sessions = true;
     for owner in sources.iter().chain(std::iter::once(target)) {
         owner.hook("uniserve.cache_session", "true").await?;
     }
@@ -139,21 +158,10 @@ async fn rounds(
             .await?;
     }
     loop {
-        let mut snapshots = Vec::new();
-        for source in sources {
-            snapshots.extend(
-                source
-                    .cache_warm(Operation::Snapshot {
-                        world: source.world(),
-                        after: copied
-                            .iter()
-                            .filter(|((world, _), _)| *world == source.world())
-                            .map(|((_, request), &tokens)| (*request, tokens))
-                            .collect(),
-                    })
-                    .await?,
-            );
-        }
+        let snapshots = match first.take() {
+            Some(snapshots) => snapshots,
+            None => snapshots(sources, &copied).await?,
+        };
         let prefixes: Vec<_> = snapshots
             .iter()
             .flat_map(|snapshot| snapshot.prefixes.clone())
@@ -337,6 +345,30 @@ async fn rounds(
             }
         }
     }
+}
+
+/// Every source's in-flight prefixes past the tokens `copied` already holds
+/// of each request.
+async fn snapshots(
+    sources: &[Arc<EngineClient>],
+    copied: &HashMap<(u64, u64), u32>,
+) -> Result<Vec<Snapshot>, String> {
+    let mut snapshots = Vec::new();
+    for source in sources {
+        snapshots.extend(
+            source
+                .cache_warm(Operation::Snapshot {
+                    world: source.world(),
+                    after: copied
+                        .iter()
+                        .filter(|((world, _), _)| *world == source.world())
+                        .map(|((_, request), &tokens)| (*request, tokens))
+                        .collect(),
+                })
+                .await?,
+        );
+    }
+    Ok(snapshots)
 }
 
 /// Retained host keys kept across process retirement and a rollback restart.
