@@ -1769,13 +1769,16 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
             return;
         }
         // A world on trial is not relaunched: the deployment rolls back to
-        // the previous world.
+        // the previous world, with the reason naming the world as the
+        // trial's own watch names it, whichever notices the loss first.
+        let world = lost_client.world();
         let on_trial = locked(&replica.worlds)
             .trial
             .as_ref()
-            .is_some_and(|trial| trial.world == lost_client.world());
+            .is_some_and(|trial| trial.world == world);
         drop(lost_client);
         if on_trial {
+            let reason = format!("world {world} lost its engine: {reason}");
             if let Err(error) = crate::worlds::rollback(&replica, reason).await {
                 tracing::error!("the rollback failed: {error:#}");
             }
