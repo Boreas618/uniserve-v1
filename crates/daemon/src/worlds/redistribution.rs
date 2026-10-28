@@ -63,6 +63,7 @@ pub(crate) async fn plan(
     // The daemon orders only the shorthand's ranks, on CUDA devices.
     let open = open
         && shorthand.worker_groups.is_empty()
+        && shorthand.worker_groups_content.is_empty()
         && matches!(shorthand.device.as_str(), "cuda" | "gpu");
     // Preserve the declared device set. Assignment may permute its ranks,
     // but may not introduce GPUs outside the deployment's device set. The

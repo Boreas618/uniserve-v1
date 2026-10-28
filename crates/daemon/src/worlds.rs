@@ -58,11 +58,23 @@ use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState, Successor};
 use crate::engine::hold::Kept;
-use crate::leader::{Leader, UpdateError, locked, stats_sink};
+use crate::leader::{Leader, Replica, UpdateError, locked, stats_sink};
 use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
 
+pub(crate) mod group;
 mod redistribution;
 use redistribution::Redistribution;
+
+/// An irrevocable operator decision, retained through partial publication,
+/// worker recovery and daemon handoff until every successor commits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Commit {
+    worlds: Vec<u64>,
+    retire: Vec<u64>,
+    discard_pages: bool,
+    nodes: Option<Vec<String>>,
+    pub(crate) pending: Vec<u64>,
+}
 
 /// How the requests in flight at a promotion continue when the new world
 /// computes other numerics than the one they ran on.
@@ -80,6 +92,9 @@ pub enum InFlight {
 /// A change of the deployment's configuration (`PUT /admin/config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApplyRequest {
+    /// Update this independent replica. Without an index, a deployment
+    /// update advances through replicas as each trial is committed.
+    pub replica: Option<usize>,
     /// The whole target configuration as TOML, as `--config` reads it;
     /// `None` takes the current one.
     pub config: Option<String>,
@@ -396,6 +411,96 @@ fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
     comparable
 }
 
+fn devices(
+    spec: &wire::EngineSpec,
+) -> anyhow::Result<std::collections::BTreeSet<(String, String)>> {
+    Ok(engine::EngineConfig::from_spec(spec)?
+        .worker_groups
+        .into_iter()
+        .flat_map(|group| group.ranks.into_iter().map(|rank| (rank.host, rank.device)))
+        .collect())
+}
+
+/// Keeps an existing replica's assigned devices when an update changes its
+/// execution options without requesting a different set of ranks.
+#[expect(
+    clippy::unwrap_used,
+    reason = "EngineConfig::from_spec requires the ranks before this mutation"
+)]
+fn retain_devices(served: &wire::EngineSpec, target: &mut wire::EngineSpec) -> anyhow::Result<()> {
+    if served
+        .placement
+        .as_ref()
+        .is_some_and(|ranks| ranks.worker_groups_content.is_empty())
+    {
+        return Ok(());
+    }
+    let source = engine::EngineConfig::from_spec(served)?;
+    let mut destination = engine::EngineConfig::from_spec(target)?;
+    for group in &mut destination.worker_groups {
+        if let Some(before) = source
+            .worker_groups
+            .iter()
+            .find(|before| before.id == group.id)
+            && before.ranks.len() == group.ranks.len()
+        {
+            group.ranks.clone_from(&before.ranks);
+        }
+    }
+    target.placement.as_mut().unwrap().worker_groups_content =
+        engine::Deployment::snapshot(&destination.worker_groups)?;
+    Ok(())
+}
+
+/// Assigns each distinct requested GPU once. Several numerical worker
+/// groups sharing a GPU keep that relationship in the successor.
+#[expect(
+    clippy::unwrap_used,
+    reason = "EngineConfig::from_spec requires the ranks before this mutation"
+)]
+fn assign_devices(
+    target: &mut wire::EngineSpec,
+    mut available: BTreeMap<String, Vec<u32>>,
+    explicit: bool,
+) -> anyhow::Result<()> {
+    let mut config = engine::EngineConfig::from_spec(target)?;
+    let mut assigned = BTreeMap::<(String, String), String>::new();
+    for group in &mut config.worker_groups {
+        for rank in &mut group.ranks {
+            let key = (rank.host.clone(), rank.device.clone());
+            if let Some(device) = assigned.get(&key) {
+                rank.device.clone_from(device);
+                continue;
+            }
+            let free = available
+                .get_mut(&rank.host)
+                .with_context(|| format!("no GPU inventory for host {}", rank.host))?;
+            let index = if explicit {
+                let device = rank
+                    .device
+                    .strip_prefix("cuda:")
+                    .context("a replica rank must name a CUDA device")?
+                    .parse::<u32>()?;
+                free.iter().position(|candidate| *candidate == device)
+                    .with_context(|| format!("host {} device {} is occupied; the replica successor needs disjoint GPUs", rank.host, rank.device))?
+            } else {
+                anyhow::ensure!(
+                    !free.is_empty(),
+                    "host {} has insufficient free GPUs for the replica successor",
+                    rank.host
+                );
+                0
+            };
+            let device = format!("cuda:{}", free.remove(index));
+            assigned.insert(key, device.clone());
+            rank.device = device;
+        }
+    }
+    target.placement.as_mut().unwrap().worker_groups_content =
+        engine::Deployment::snapshot(&config.worker_groups)?;
+    Ok(())
+}
+
 /// Whether `target` states another parallel configuration than `served`:
 /// other ranks, devices or hosts (a deployment file by its content), another
 /// device of a generation tower
@@ -693,14 +798,351 @@ fn steps(
 }
 
 impl Leader {
+    /// Applies a configuration through the replica that owns its worlds.
+    pub async fn apply(&self, request: ApplyRequest) -> Result<Applied, UpdateError> {
+        let _replacing = self
+            .replicas
+            .replacing
+            .try_lock()
+            .map_err(|_| UpdateError::InProgress)?;
+        let replicas = self.replicas();
+        if locked(&self.replicas.commit).is_some() {
+            return Err(UpdateError::InProgress);
+        }
+        if let Some(trial) = locked(&self.replicas.group).as_ref() {
+            return Err(UpdateError::OnTrial(trial.world()));
+        }
+        if let Some(world) = replicas.iter().find_map(|replica| {
+            locked(&replica.worlds)
+                .trial
+                .as_ref()
+                .map(|trial| trial.world)
+        }) {
+            return Err(UpdateError::OnTrial(world));
+        }
+        let current = locked(&replicas[0].config).clone();
+        let (target, stated, update) = resolve(&current, &request)?;
+        let count = if target.moe_config.expert_parallel {
+            1
+        } else {
+            target.data_parallel_size.get()
+        };
+        if count != replicas.len() {
+            if request.replica.is_some() {
+                return Err(UpdateError::Refused(
+                    "a change across replica boundaries applies to the whole deployment".into(),
+                ));
+            }
+            return group::apply(self, &request, target, stated, update).await;
+        }
+        let indices: Vec<_> = match request.replica {
+            Some(index) => vec![index],
+            None => (0..replicas.len()).collect(),
+        };
+        if !request.dry_run {
+            locked(&self.replicas.pending).clear();
+        }
+        let mut reports = Vec::new();
+        for (position, index) in indices.iter().copied().enumerate() {
+            let replica = replicas
+                .get(index)
+                .ok_or_else(|| UpdateError::Refused(format!("no replica {index}")))?;
+            match Box::pin(replica.apply(request.clone())).await? {
+                Applied::World(report) => {
+                    *locked(&self.replicas.pending) = indices[position + 1..]
+                        .iter()
+                        .map(|index| (*index, request.clone()))
+                        .collect();
+                    return Ok(Applied::World(report));
+                }
+                applied @ Applied::Daemon { .. } => {
+                    if request.replica.is_some() {
+                        return Err(UpdateError::Refused(
+                            "daemon options apply to the deployment, not one replica".to_owned(),
+                        ));
+                    }
+                    return Ok(applied);
+                }
+                Applied::Planned(report) | Applied::InPlace(report) => reports.push(report),
+                Applied::Unchanged => {}
+            }
+        }
+        if reports.is_empty() {
+            return Ok(Applied::Unchanged);
+        }
+        let report = if reports.len() == 1 {
+            reports.remove(0)
+        } else {
+            serde_json::json!({ "replicas": reports })
+        };
+        Ok(if request.dry_run {
+            Applied::Planned(report)
+        } else {
+            Applied::InPlace(report)
+        })
+    }
+
+    /// Commits the executing trial and releases its previous world.
+    pub async fn commit(&self) -> Result<serde_json::Value, UpdateError> {
+        let _replacing = self.replicas.replacing.lock().await;
+        if locked(&self.replicas.commit).is_none() {
+            if locked(&self.replicas.group).is_some() {
+                group::decide_commit(&self.replicas).await?;
+            } else {
+                self.trial()?.decide_commit(&self.replicas).await?;
+            }
+        }
+        complete_commit(&self.replicas).await
+    }
+
+    /// Restores the previous world of the executing trial.
+    pub async fn rollback(&self, reason: String) -> Result<serde_json::Value, UpdateError> {
+        let _replacing = self.replicas.replacing.lock().await;
+        if locked(&self.replicas.commit).is_some() {
+            return Err(UpdateError::Refused(
+                "commit is decided; finish the pending commit".into(),
+            ));
+        }
+        if locked(&self.replicas.group).is_some() {
+            return group::rollback(&self.replicas, reason).await;
+        }
+        let replica = self.trial()?;
+        locked(&self.replicas.pending).clear();
+        replica.rollback(reason).await
+    }
+
+    /// Reports the configuration and resource ownership of the replicas.
+    pub async fn config_status(&self) -> serde_json::Value {
+        let replicas = self.replicas();
+        let client = replicas
+            .iter()
+            .filter_map(|replica| replica.hold().client())
+            .find(|client| matches!(client.state(), EngineState::Ready | EngineState::Parked));
+        let ledgers = match client {
+            Some(client) => {
+                match tokio::time::timeout(LEDGER_READ, client.describe_memory()).await {
+                    Ok(Ok(nodes)) => serde_json::Value::Array(
+                        nodes
+                            .iter()
+                            .filter_map(|node| serde_json::from_str(node).ok())
+                            .collect(),
+                    ),
+                    Ok(Err(error)) => serde_json::json!({ "error": error }),
+                    Err(_) => serde_json::json!({
+                        "error": format!("the ledgers were not read within {LEDGER_READ:?}")
+                    }),
+                }
+            }
+            None => serde_json::Value::Null,
+        };
+        let mut statuses = Vec::new();
+        for replica in replicas {
+            statuses.push(replica.config_status());
+        }
+        let mut status = statuses
+            .iter()
+            .find(|status| !status["trial"].is_null() || !status["update"].is_null())
+            .unwrap_or(&statuses[0])
+            .clone();
+        status["replicas"] = statuses.into();
+        status["ledgers"] = ledgers;
+        if let Some(trial) = locked(&self.replicas.group).as_ref() {
+            status["trial"] = trial.status();
+        }
+        status["commit"] = serde_json::json!(&*locked(&self.replicas.commit));
+        status["pending_replicas"] = locked(&self.replicas.pending)
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>()
+            .into();
+        status
+    }
+
+    fn trial(&self) -> Result<Arc<Replica>, UpdateError> {
+        self.replicas()
+            .into_iter()
+            .find(|replica| locked(&replica.worlds).trial.is_some())
+            .ok_or_else(|| UpdateError::Refused("no world is on trial".to_owned()))
+    }
+}
+
+fn resolve(
+    current: &ServeConfig,
+    request: &ApplyRequest,
+) -> Result<
+    (
+        ServeConfig,
+        crate::options::Stated,
+        crate::options::UpdateOptions,
+    ),
+    UpdateError,
+> {
+    let (mut target, stated) = match &request.config {
+        Some(text) => crate::options::resolve_text(text, &request.set),
+        None => crate::options::overridden(current, &request.set)
+            .map(|(config, paths)| (config, crate::options::Stated::from_paths(paths))),
+    }
+    .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+    target
+        .validate(&stated)
+        .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+    let update = target.update_config.clone();
+    if request.config.is_none() {
+        target.update_config = current.update_config.clone();
+    }
+    if target.served_model_name() != current.served_model_name() {
+        return Err(UpdateError::Refused(
+            "the served model name names the deployment: deploy another one instead".into(),
+        ));
+    }
+    Ok((target, stated, update))
+}
+
+/// Records the operator's decision before publication or retirement. A
+/// subsequent error can leave work pending, but cannot make rollback legal.
+fn begin_commit(
+    registry: &crate::leader::Replicas,
+    current: &[Arc<Replica>],
+    retire: Vec<u64>,
+    discard_pages: bool,
+) {
+    let worlds: Vec<_> = current
+        .iter()
+        .map(|replica| locked(&replica.worlds).executing)
+        .collect();
+    for replica in current {
+        if let Some(spec) = locked(&replica.served).as_mut() {
+            spec.predecessor = None;
+            spec.retire = retire.clone();
+        }
+        replica.hold.keep(None);
+    }
+    *locked(&registry.commit) = Some(Commit {
+        pending: worlds.clone(),
+        worlds,
+        retire,
+        discard_pages,
+        nodes: None,
+    });
+}
+
+/// Completes a recorded decision. Publication progress survives both an
+/// error response and daemon handoff; node and engine operations are
+/// idempotent when a response was lost after the operation took effect.
+#[expect(
+    clippy::unwrap_used,
+    reason = "the deployment replacement lock retains the decision until its final take"
+)]
+pub(crate) async fn complete_commit(
+    registry: &Arc<crate::leader::Replicas>,
+) -> Result<serde_json::Value, UpdateError> {
+    let decision = locked(&registry.commit)
+        .clone()
+        .context("no commit is pending")?;
+    let replicas = registry.serving.borrow().clone();
+    if !decision.nodes.as_ref().is_some_and(Vec::is_empty) {
+        let control = Arc::clone(replicas[0].control.get().ok_or(UpdateError::NoEngine)?);
+        let worlds = decision.worlds.clone();
+        let mut nodes = decision.nodes;
+        let (result, nodes) = tokio::task::spawn_blocking(move || {
+            let result = control.publish_worlds(&worlds, &mut nodes);
+            (result, nodes)
+        })
+        .await
+        .context("the publication task did not complete")?;
+        locked(&registry.commit).as_mut().unwrap().nodes = nodes;
+        result.context("commit is decided; publication remains pending")?;
+    }
+    for world in decision.pending {
+        let replica = replicas
+            .iter()
+            .find(|replica| locked(&replica.worlds).executing == world)
+            .context("a committed world has no replica owner")?;
+        let _owner = replica.replacing.lock().await;
+        let client = match replica.hold.client() {
+            Some(client)
+                if !matches!(client.state(), EngineState::Failed(_) | EngineState::Closed) =>
+            {
+                client
+            }
+            _ => {
+                // Publication of the entire decision completed above. Only
+                // now may recovery start a spec that retires predecessors.
+                let client = replica.recover().await?;
+                replica.monitor();
+                client
+            }
+        };
+        client
+            .commit(decision.retire.clone(), decision.discard_pages)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("commit is decided; world {world} remains pending: {error}")
+            })?;
+        let segments = client.describe_cache().await.map_err(|error| {
+            anyhow::anyhow!(
+                "commit is decided; reading world {world}'s cache remains pending: {error}"
+            )
+        })?;
+        if let Some(spec) = locked(&replica.served).as_mut() {
+            spec.segments = segments;
+            spec.retire.clear();
+        }
+        if let Err(error) = client.resize_cache(wire::CacheChange::Grow).await {
+            warn!(%error, world, "the committed world's cache did not grow");
+        }
+        locked(&registry.commit)
+            .as_mut()
+            .unwrap()
+            .pending
+            .retain(|pending| *pending != world);
+    }
+    let completed = locked(&registry.commit).take().unwrap();
+    let mut committed = serde_json::json!({
+        "world": (completed.worlds.len() == 1).then(|| completed.worlds[0]),
+        "previous_world": (completed.retire.len() == 1).then(|| completed.retire[0]),
+        "worlds": completed.worlds,
+        "previous_worlds": completed.retire,
+    });
+    for replica in &replicas {
+        let mut state = locked(&replica.worlds);
+        if completed.worlds.contains(&state.executing) {
+            state.last = Some(committed.clone());
+        }
+    }
+    loop {
+        let Some((index, request)) = locked(&registry.pending).pop_front() else {
+            break;
+        };
+        let replica = Arc::clone(&registry.serving.borrow()[index]);
+        match Box::pin(replica.apply(request)).await {
+            Ok(Applied::World(report)) => {
+                committed["next_trial"] = report;
+                break;
+            }
+            Ok(Applied::InPlace(_) | Applied::Unchanged) => {}
+            Ok(Applied::Daemon { .. } | Applied::Planned(_)) => {
+                locked(&registry.pending).clear();
+                committed["rollout_error"] = "the next replica requires a deployment update".into();
+                break;
+            }
+            Err(error) => {
+                locked(&registry.pending).clear();
+                committed["rollout_error"] = error.to_string().into();
+                break;
+            }
+        }
+    }
+    Ok(committed)
+}
+
+impl Replica {
     /// The digest of `target`, which names it, unless a rollback marked it
     /// unavailable and the update does not `force` it.
     fn available(&self, target: &ServeConfig, force: bool) -> Result<String, UpdateError> {
         let target_digest =
             digest(target).map_err(|error| UpdateError::Failed(error.context("digest")))?;
-        if !force
-            && let Some(unavailable) = locked(&self.engines.worlds).unavailable.get(&target_digest)
-        {
+        if !force && let Some(unavailable) = locked(&self.worlds).unavailable.get(&target_digest) {
             return Err(UpdateError::Refused(format!(
                 "the configuration {target_digest} was rolled back from world {} ({}); \
                  apply it again with force",
@@ -723,63 +1165,75 @@ impl Leader {
     /// unavailable unless `force`, and a change the successor cannot map;
     /// fails when the successor does not start (the serving world serves
     /// on) or its promotion fails (the serving world resumes).
-    pub async fn apply(&self, request: ApplyRequest) -> Result<Applied, UpdateError> {
+    pub(crate) async fn apply(
+        self: &Arc<Self>,
+        request: ApplyRequest,
+    ) -> Result<Applied, UpdateError> {
         let _replacing = self
-            .engines
             .replacing
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
-        if let Some(trial) = &locked(&self.engines.worlds).trial {
+        if let Some(trial) = &locked(&self.worlds).trial {
             return Err(UpdateError::OnTrial(trial.world));
         }
-        if self.engines.asleep.load(Ordering::Acquire) {
+        if self.asleep.load(Ordering::Acquire) {
             return Err(UpdateError::Refused(
                 "the engine sleeps: wake it (/admin/wake_up) before updating it".to_owned(),
             ));
         }
-        let current = locked(&self.engines.config).clone();
-        let (mut target, stated) = match &request.config {
-            Some(text) => crate::options::resolve_text(text, &request.set),
-            None => crate::options::overridden(&current, &request.set)
-                .map(|(config, paths)| (config, crate::options::Stated::from_paths(paths))),
-        }
-        .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-        target
-            .validate(&stated)
-            .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-        // The update options an update's assignments state govern that
-        // update alone; the configuration keeps its own.
-        let update = target.update_config.clone();
-        if request.config.is_none() {
-            target.update_config = current.update_config.clone();
-        }
+        let current = locked(&self.config).clone();
+        let (mut target, stated, update) = resolve(&current, &request)?;
         let mut target_digest = self.available(&target, request.force)?;
         if target == current && target.worker_groups.is_none() {
             return Ok(Applied::Unchanged);
         }
-        // A configuration of another served name or model processes requests
-        // otherwise: it is another deployment.
-        if target.served_model_name() != current.served_model_name() {
-            return Err(UpdateError::Refused(
-                "the served model name names the deployment: deploy another one instead".to_owned(),
-            ));
-        }
-
-        let served = locked(&self.engines.served)
-            .clone()
-            .ok_or(UpdateError::NoEngine)?;
+        let served = locked(&self.served).clone().ok_or(UpdateError::NoEngine)?;
         // The target's engine spec is resolved as a deployment's start
         // resolves it: from the options, completed by what the model's files
         // determine.
         let prepared = Leader::prepare(&target, &stated)
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+        let prepared_specs = engine::EngineConfig::replica_specs(&prepared.spec)
+            .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+        let prepared_spec = prepared_specs.get(self.ordinal).cloned().ok_or_else(|| {
+            UpdateError::Refused("the target changes the replica group".to_owned())
+        })?;
         let mut target_spec = wire::EngineSpec {
             world: 0,
             predecessor: None,
             segments: Vec::new(),
-            ..prepared.spec
+            ..prepared_spec
         };
+        let explicit_devices = target.worker_groups.is_some()
+            || (stated.contains("placement_config.device")
+                && target.placement_config.device != "cuda")
+            || !target.placement_config.devices.is_empty();
+        if !explicit_devices
+            && target.tensor_parallel_size == current.tensor_parallel_size
+            && target.data_parallel_size == current.data_parallel_size
+            && target.placement_config.worker_hosts == current.placement_config.worker_hosts
+        {
+            retain_devices(&served, &mut target_spec)
+                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+        }
+        let running = self.hold().client().ok_or(UpdateError::NoEngine)?;
+        let needs_world = comparable(&served) != comparable(&target_spec)
+            && !crate::leader::configurable(
+                &comparable(&served),
+                &comparable(&target_spec),
+                running.info().capacity.as_ref(),
+            )
+            && !switches_probes_only(&served, &target_spec);
+        if prepared_specs.len() > 1 && needs_world {
+            let control = Arc::clone(self.control.get().ok_or(UpdateError::NoEngine)?);
+            let available = tokio::task::spawn_blocking(move || control.available_devices())
+                .await
+                .context("the device inventory task did not complete")??;
+            assign_devices(&mut target_spec, available, explicit_devices)
+                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+        }
+        let shared_devices = !devices(&served)?.is_disjoint(&devices(&target_spec)?);
         let mut world_changes = comparable(&served) != comparable(&target_spec);
         let daemon_changes = crate::options::daemon_options_differ(&current, &target);
         if target == current && !world_changes {
@@ -795,21 +1249,18 @@ impl Leader {
         let unmapped = differing(&served, &target_spec);
         let reloaded = reloads(&served, &target_spec);
         let mut redistributes = parallel_change(&served, &target_spec);
-        let running = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
         // A change of the parallel configuration plans what each GPU of the
         // successor maps, receives and creates of the weights, and, unless
         // the update states it, the ranks' device order (§4.7). The order
         // the daemon chose is the target configuration's.
         let redistribution = if world_changes && redistributes && unmapped.is_empty() {
             let planned = redistribution::plan(
-                &self.engines.manifests,
-                self.engines
-                    .control
+                &self.manifests,
+                self.control
                     .get()
                     .ok_or(UpdateError::NoEngine)?
                     .process_address(),
-                self.engines
-                    .control
+                self.control
                     .get()
                     .ok_or(UpdateError::NoEngine)?
                     .next_engine(),
@@ -903,13 +1354,16 @@ impl Leader {
         // memory ledger first: the serving world's KV cache limit beside a
         // successor, with the weights it creates, per GPU and host
         // (`specs/online-operations.md` §6.6).
-        let memory = if world_changes && !in_place && unmapped.is_empty() {
+        let memory = if world_changes && !in_place && unmapped.is_empty() && shared_devices {
             Some(memory_plan(&running, successor, &budgets, update.previous_world).await)
         } else {
             None
         };
         let plan = serde_json::json!({
-            "from": locked(&self.engines.worlds).executing,
+            "from": locked(&self.worlds).executing,
+            "replica": self.ordinal,
+            "shared_devices": shared_devices,
+            "devices": devices(&target_spec)?,
             "digest": target_digest,
             "world": world_changes,
             "daemon": daemon_changes,
@@ -934,7 +1388,7 @@ impl Leader {
                     then: None,
                 });
             }
-            *locked(&self.engines.config) = target;
+            *locked(&self.config) = target;
             return Ok(Applied::InPlace(plan));
         }
         // The daemon orchestrates what changes in its world, its scheduling
@@ -968,8 +1422,8 @@ impl Leader {
             info!(enabled, "the workers switched the fence probes in place");
             let mut spec = served;
             spec.profiling = target_spec.profiling;
-            *locked(&self.engines.served) = Some(spec);
-            *locked(&self.engines.config) = target;
+            *locked(&self.served) = Some(spec);
+            *locked(&self.config) = target;
             return Ok(Applied::InPlace(plan));
         }
         // Scheduling alone, within the batch the serving world's workers
@@ -983,8 +1437,8 @@ impl Leader {
             info!("the engine took the new scheduling limits in place");
             let mut spec = served;
             spec.scheduling = target_spec.scheduling;
-            *locked(&self.engines.served) = Some(spec);
-            *locked(&self.engines.config) = target;
+            *locked(&self.served) = Some(spec);
+            *locked(&self.config) = target;
             return Ok(Applied::InPlace(plan));
         }
         if !unmapped.is_empty() {
@@ -1039,7 +1493,7 @@ impl Leader {
         reason = "one world change: both worlds' specs and configurations and its options"
     )]
     async fn change_world(
-        &self,
+        self: &Arc<Self>,
         running: &Arc<EngineClient>,
         served: wire::EngineSpec,
         current: ServeConfig,
@@ -1055,6 +1509,7 @@ impl Leader {
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
         let previous_world = running.world();
+        let shared_devices = !devices(&served)?.is_disjoint(&devices(&spec)?);
         // The serving world gives its graph memory to the successor's
         // captures first, so the shrink that follows leaves it to the
         // successor.
@@ -1077,21 +1532,21 @@ impl Leader {
         self.progress("shrink", None);
         // The serving world's cache gives back the tail past the limit each
         // GPU's ledger leaves it beside the successor; its requests run on.
-        let shrunk = running
-            .make_room(
-                wire::CacheChange::Shrink,
-                adds,
-                update.preempt_after,
-                budgets,
-            )
-            .await
-            .map_err(|error| {
-                self.progress_done();
-                anyhow::anyhow!(
-                    "the KV cache did not make room for a successor world; the serving world \
+        let shrunk =
+            if shared_devices {
+                running
+                .make_room(wire::CacheChange::Shrink, adds, update.preempt_after, budgets)
+                .await
+                .map_err(|error| {
+                    self.progress_done();
+                    anyhow::anyhow!(
+                        "the KV cache did not make room for a successor world; the serving world \
                      serves on: {error}"
-                )
-            });
+                    )
+                })
+            } else {
+                Ok(Vec::new())
+            };
         // A shrink refused or failed leaves the serving world serving: it
         // replays its graphs again when it ran eagerly for the successor.
         let shrunk = match shrunk {
@@ -1128,7 +1583,7 @@ impl Leader {
                 self.progress("baseline", None);
                 let waiting = Instant::now();
                 let idle = crate::interference::eager_baseline(
-                    &self.engines.observer,
+                    &self.observer,
                     previous_world,
                     running.info().schedulers,
                     since,
@@ -1148,10 +1603,11 @@ impl Leader {
         };
 
         self.progress("prepare", None);
-        let control = Arc::clone(self.engines.control.get().ok_or(UpdateError::NoEngine)?);
+        let control = Arc::clone(self.control.get().ok_or(UpdateError::NoEngine)?);
         let sink = stats_sink(
-            self.engines.model_name.clone(),
-            Arc::clone(&self.engines.observer),
+            self.model_name.clone(),
+            Arc::clone(&self.observer),
+            self.ordinal,
         );
         info!(previous_world, "preparing a successor world");
         // While the successor prepares, its transfers yield to the serving
@@ -1159,7 +1615,7 @@ impl Leader {
         let interference = {
             let done = tokio_util::sync::CancellationToken::new();
             let throttling = crate::interference::Throttling::new(
-                &self.engines.observer,
+                &self.observer,
                 previous_world,
                 update.transfer_slowdown,
                 Instant::now(),
@@ -1167,8 +1623,7 @@ impl Leader {
             );
             let task = tokio::spawn(crate::interference::control(
                 Arc::clone(running),
-                Arc::clone(&self.engines.observer),
-                throttling,
+                vec![(Arc::clone(&self.observer), throttling)],
                 crate::interference::INTERVAL,
                 done.clone(),
             ));
@@ -1205,7 +1660,7 @@ impl Leader {
         // The promotion: the serving world's step boundary, its index, the
         // successor's import.
         let baseline = update.rollback.window.and_then(|window| {
-            self.engines.observer.rates(
+            self.observer.rates(
                 previous_world,
                 started.checked_sub(window).unwrap_or(started),
                 window,
@@ -1220,7 +1675,7 @@ impl Leader {
         let pages_change = before.prefix_seed != after.prefix_seed;
         let trajectories_change = before.latent_seed != after.latent_seed;
         let numerics_change = pages_change || trajectories_change;
-        let hold = Arc::clone(self.migrator.hold());
+        let hold = Arc::clone(self.hold());
         // A request keeps the state it reached only where the successor maps
         // it: the old key counts as the new one for those requests alone.
         if numerics_change && in_flight == InFlight::Keep && !adds.recomputes_cache {
@@ -1232,7 +1687,7 @@ impl Leader {
         }
         // A profiling session belongs to the serving world: it ends, its
         // files written, before the world parks.
-        crate::profiling::end_for_world(&self.engines, Some(running), "world change").await;
+        crate::profiling::end_for_world(self, Some(running), "world change").await;
         let paused = Instant::now();
         hold.hold();
         let index = match running.park().await {
@@ -1280,7 +1735,7 @@ impl Leader {
             park_ms = parked.as_millis() as u64,
             "the successor world serves on trial"
         );
-        crate::leader::reload_adapters(&self.engines, &successor).await;
+        crate::leader::reload_adapters(self, &successor).await;
 
         // The previous world as the trial keeps it.
         let previous = match update.previous_world {
@@ -1379,8 +1834,8 @@ impl Leader {
         let mut served_spec = spec;
         served_spec.world = world;
         served_spec.received_weights.clear();
-        *locked(&self.engines.served) = Some(served_spec);
-        *locked(&self.engines.config) = target;
+        *locked(&self.served) = Some(served_spec);
+        *locked(&self.config) = target;
         let report = serde_json::json!({
             "world": world,
             "previous_world": previous_world,
@@ -1409,7 +1864,7 @@ impl Leader {
             "memory": memory,
         });
         {
-            let mut worlds = locked(&self.engines.worlds);
+            let mut worlds = locked(&self.worlds);
             worlds.executing = world;
             worlds.progress = None;
             worlds.trial = Some(Trial {
@@ -1432,82 +1887,32 @@ impl Leader {
             });
             worlds.last = Some(report.clone());
         }
-        tokio::spawn(watch_trial(Arc::clone(&self.engines), world));
+        watch(Arc::clone(self), Arc::downgrade(&successor));
+        tokio::spawn(watch_trial(Arc::clone(self), world));
         Ok(report)
     }
 
-    /// Commits the world on trial: the previous world's processes exit and
-    /// its memory is retired, the successor takes the segments it mapped
-    /// read-only and grows its cache into the memory freed, and relaunches
-    /// its worker groups on a loss from then on.
-    ///
-    /// # Errors
-    ///
-    /// Refuses when no world is on trial; fails when the successor does not
-    /// commit, which leaves it serving on trial.
-    pub async fn commit(&self) -> Result<serde_json::Value, UpdateError> {
-        let _replacing = self.engines.replacing.lock().await;
-        let trial = locked(&self.engines.worlds)
+    /// Decides the current trial and closes its predecessor. Publication
+    /// and retirement complete through the deployment's durable decision.
+    async fn decide_commit(
+        self: &Arc<Self>,
+        registry: &Arc<crate::leader::Replicas>,
+    ) -> Result<(), UpdateError> {
+        let _replacing = self.replacing.lock().await;
+        let trial = locked(&self.worlds)
             .trial
             .take()
-            .ok_or_else(|| UpdateError::Refused("no world is on trial".to_owned()))?;
-        let client = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
-        if let Previous::Parked(previous) = &trial.previous {
-            let previous = Arc::clone(previous);
-            let exit = tokio::task::spawn_blocking(move || {
-                previous.shutdown();
-                previous.await_exit(CLOSED_EXIT)
-            })
-            .await
-            .context("the previous world's shutdown did not complete")?;
-            if let Err(error) = exit {
-                warn!("the previous world's engine process: {error:#}");
-            }
-        }
-        let results = match client
-            .commit(vec![trial.previous_world], trial.pages_change)
-            .await
-        {
-            Ok(results) => results,
-            Err(error) => {
-                let world = trial.world;
-                locked(&self.engines.worlds).trial = Some(Trial {
-                    previous: Previous::Weights,
-                    ..trial
-                });
-                return Err(anyhow::anyhow!(
-                    "world {world} did not commit and stays on trial, its previous world's \
-                     processes closed: {error}"
-                )
-                .into());
-            }
-        };
-        if let Err(error) = client.resize_cache(wire::CacheChange::Grow).await {
-            warn!("the committed world's KV cache did not grow: {error}");
-        }
-        // A relaunch of the committed world lays its planes out as they are:
-        // the previous world's segments are its own.
-        let segments = client.describe_cache().await.unwrap_or_default();
-        if let Some(spec) = locked(&self.engines.served).as_mut() {
-            spec.predecessor = None;
-            spec.segments = segments;
-        }
-        // The requests that migrate from now on continue as any request
-        // does.
-        self.migrator.hold().keep(None);
-        let report = serde_json::json!({
-            "world": trial.world,
-            "previous_world": trial.previous_world,
-            "trial_seconds": trial.promoted.elapsed().as_secs_f64(),
-            "workers": results.len(),
-        });
-        info!(
-            world = trial.world,
-            previous_world = trial.previous_world,
-            "the world is committed"
+            .ok_or_else(|| UpdateError::Refused("no world is on trial".into()))?;
+        begin_commit(
+            registry,
+            &[Arc::clone(self)],
+            vec![trial.previous_world],
+            trial.pages_change,
         );
-        locked(&self.engines.worlds).last = Some(report.clone());
-        Ok(report)
+        if let Previous::Parked(previous) = trial.previous {
+            close(&previous).await;
+        }
+        Ok(())
     }
 
     /// Rolls the world on trial back to the previous world, for `reason`.
@@ -1516,38 +1921,21 @@ impl Leader {
     ///
     /// Refuses when no world is on trial; fails when the previous world
     /// does not serve again, which leaves no world serving.
-    pub async fn rollback(&self, reason: String) -> Result<serde_json::Value, UpdateError> {
-        let _replacing = self.engines.replacing.lock().await;
-        rollback(&self.engines, reason).await
+    pub(crate) async fn rollback(
+        self: &Arc<Self>,
+        reason: String,
+    ) -> Result<serde_json::Value, UpdateError> {
+        let _replacing = self.replacing.lock().await;
+        rollback(self, reason).await
     }
 
-    /// The deployment's configuration and worlds, as `GET /admin/config`
-    /// reports them, with every item of the memory ledgers of the GPUs its
-    /// worlds use, per host: the executing engine has each node's daemon
-    /// read its Storage Server's ledgers, asking no worker.
-    pub async fn config_status(&self) -> serde_json::Value {
-        let ledgers = match self.migrator.hold().client() {
-            Some(client) => {
-                match tokio::time::timeout(LEDGER_READ, client.describe_memory()).await {
-                    Ok(Ok(nodes)) => serde_json::Value::Array(
-                        nodes
-                            .iter()
-                            .filter_map(|node| serde_json::from_str(node).ok())
-                            .collect(),
-                    ),
-                    Ok(Err(error)) => serde_json::json!({ "error": error }),
-                    Err(_) => serde_json::json!({
-                        "error": format!("the ledgers were not read within {LEDGER_READ:?}")
-                    }),
-                }
-            }
-            None => serde_json::Value::Null,
-        };
-        let config = locked(&self.engines.config).clone();
+    /// This replica's configuration, executing world, trial and update history.
+    pub(crate) fn config_status(&self) -> serde_json::Value {
+        let config = locked(&self.config).clone();
         let printed = crate::options::printed(&config).unwrap_or_default();
         let digest = digest(&config).unwrap_or_default();
-        let worlds = locked(&self.engines.worlds);
-        let hold = self.migrator.hold();
+        let worlds = locked(&self.worlds);
+        let hold = self.hold();
         let executing = hold.client().map(|client| {
             serde_json::json!({
                 "world": client.world(),
@@ -1578,11 +1966,10 @@ impl Leader {
             })
         });
         let trial = worlds.trial.as_ref().map(|trial| {
-            let rates = trial.thresholds.window.and_then(|window| {
-                self.engines
-                    .observer
-                    .rates(trial.world, trial.promoted, window)
-            });
+            let rates = trial
+                .thresholds
+                .window
+                .and_then(|window| self.observer.rates(trial.world, trial.promoted, window));
             serde_json::json!({
                 "world": trial.world,
                 "previous_world": trial.previous_world,
@@ -1608,12 +1995,11 @@ impl Leader {
             "trial": trial,
             "unavailable": worlds.unavailable.values().collect::<Vec<_>>(),
             "last": worlds.last,
-            "ledgers": ledgers,
         })
     }
 
     fn progress(&self, phase: &str, world: Option<u64>) {
-        let mut worlds = locked(&self.engines.worlds);
+        let mut worlds = locked(&self.worlds);
         let started = worlds
             .progress
             .as_ref()
@@ -1629,13 +2015,13 @@ impl Leader {
 
     /// Notes `note` on the change in progress, for its later phases too.
     fn progress_note(&self, note: String) {
-        if let Some(progress) = locked(&self.engines.worlds).progress.as_mut() {
+        if let Some(progress) = locked(&self.worlds).progress.as_mut() {
             progress.note = Some(note);
         }
     }
 
     fn progress_done(&self) {
-        locked(&self.engines.worlds).progress = None;
+        locked(&self.worlds).progress = None;
     }
 
     /// Shuts the engine `client` serves down and waits for its process.
@@ -1681,15 +2067,18 @@ async fn close(client: &Arc<EngineClient>) {
 /// Rolls the world on trial back to the previous world (see the module);
 /// the caller holds the replacement lock.
 pub(crate) async fn rollback(
-    engines: &Arc<crate::leader::Engines>,
+    replica: &Arc<crate::leader::Replica>,
     reason: String,
 ) -> Result<serde_json::Value, UpdateError> {
-    let trial = locked(&engines.worlds)
+    if let Some(registry) = replica.registry.upgrade() {
+        locked(&registry.pending).clear();
+    }
+    let trial = locked(&replica.worlds)
         .trial
         .take()
         .ok_or_else(|| UpdateError::Refused("no world is on trial".to_owned()))?;
     warn!(world = trial.world, previous_world = trial.previous_world, %reason, "rolling back");
-    let hold = Arc::clone(&engines.hold);
+    let hold = Arc::clone(&replica.hold);
     // The requests returning to the previous world recompute what the world
     // on trial computed for them.
     hold.keep(None);
@@ -1698,7 +2087,7 @@ pub(crate) async fn rollback(
     // first.
     let failing = hold.client();
     // A profiling session of the world on trial ends with it.
-    crate::profiling::end_for_world(engines, failing.as_deref(), "rollback").await;
+    crate::profiling::end_for_world(replica, failing.as_deref(), "rollback").await;
     hold.hold();
     // The world on trial preempts its requests, which wait for the previous
     // world: its live schedulers park, and a scheduler that failed handed
@@ -1727,8 +2116,12 @@ pub(crate) async fn rollback(
             previous
         }
         Previous::Weights => {
-            let control = Arc::clone(engines.control.get().ok_or(UpdateError::NoEngine)?);
-            let sink = stats_sink(engines.model_name.clone(), Arc::clone(&engines.observer));
+            let control = Arc::clone(replica.control.get().ok_or(UpdateError::NoEngine)?);
+            let sink = stats_sink(
+                replica.model_name.clone(),
+                Arc::clone(&replica.observer),
+                replica.ordinal,
+            );
             // The world on trial, closed, is retired before the previous
             // world's workers start: they need its memory (weights of its
             // own included) within the deployment's quota.
@@ -1755,13 +2148,13 @@ pub(crate) async fn rollback(
         }
     };
     hold.serve(Arc::clone(&previous));
-    crate::leader::reload_adapters(engines, &previous).await;
+    crate::leader::reload_adapters(replica, &previous).await;
     if let Err(error) = previous.resize_cache(wire::CacheChange::Restore).await {
         warn!("the previous world's KV cache was not restored: {error}");
     }
     let pause = paused.elapsed();
-    *locked(&engines.served) = Some(trial.previous_spec);
-    *locked(&engines.config) = trial.previous_config;
+    *locked(&replica.served) = Some(trial.previous_spec);
+    *locked(&replica.config) = trial.previous_config;
     let report = serde_json::json!({
         "rolled_back": trial.world,
         "world": trial.previous_world,
@@ -1770,7 +2163,7 @@ pub(crate) async fn rollback(
         "trial_seconds": trial.promoted.elapsed().as_secs_f64(),
     });
     {
-        let mut worlds = locked(&engines.worlds);
+        let mut worlds = locked(&replica.worlds);
         worlds.executing = trial.previous_world;
         worlds.unavailable.insert(
             trial.digest.clone(),
@@ -1783,7 +2176,7 @@ pub(crate) async fn rollback(
         );
         worlds.last = Some(report.clone());
     }
-    watch(Arc::clone(engines), Arc::downgrade(&previous));
+    watch(Arc::clone(replica), Arc::downgrade(&previous));
     info!(
         world = trial.previous_world,
         "the previous world serves again"
@@ -1793,36 +2186,36 @@ pub(crate) async fn rollback(
 
 /// Watches the engine `client` serves for its loss (`watch_engine`), on a
 /// task of its own whose future the rollback it may run does not contain.
-fn watch(engines: Arc<crate::leader::Engines>, client: std::sync::Weak<EngineClient>) {
+fn watch(replica: Arc<crate::leader::Replica>, client: std::sync::Weak<EngineClient>) {
     let watching: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        Box::pin(crate::leader::watch_engine(engines, client));
+        Box::pin(crate::leader::watch_engine(replica, client));
     tokio::spawn(watching);
 }
 
 /// Watches world `world`'s trial and rolls it back on a fault or past a
 /// threshold; ends with the trial.
-async fn watch_trial(engines: Arc<crate::leader::Engines>, world: u64) {
+async fn watch_trial(replica: Arc<crate::leader::Replica>, world: u64) {
     loop {
         tokio::time::sleep(TRIAL_POLL).await;
         let reason = {
-            let worlds = locked(&engines.worlds);
+            let worlds = locked(&replica.worlds);
             let Some(trial) = worlds.trial.as_ref().filter(|trial| trial.world == world) else {
                 return;
             };
-            trial_fault(&engines, trial)
+            trial_fault(&replica, trial)
         };
         let Some(reason) = reason else {
             continue;
         };
-        let _replacing = engines.replacing.lock().await;
-        if !locked(&engines.worlds)
+        let _replacing = replica.replacing.lock().await;
+        if !locked(&replica.worlds)
             .trial
             .as_ref()
             .is_some_and(|trial| trial.world == world)
         {
             return;
         }
-        if let Err(error) = rollback(&engines, reason).await {
+        if let Err(error) = rollback(&replica, reason).await {
             tracing::error!("the rollback failed: {error:#}");
         }
         return;
@@ -1830,8 +2223,8 @@ async fn watch_trial(engines: Arc<crate::leader::Engines>, world: u64) {
 }
 
 /// Why `trial` rolls back now, if it does.
-fn trial_fault(engines: &crate::leader::Engines, trial: &Trial) -> Option<String> {
-    let client = engines.hold.client();
+fn trial_fault(replica: &crate::leader::Replica, trial: &Trial) -> Option<String> {
+    let client = replica.hold.client();
     match client.as_ref().map(|client| client.state()) {
         Some(EngineState::Failed(reason)) => {
             return Some(format!("world {} failed: {reason}", trial.world));
@@ -1841,7 +2234,7 @@ fn trial_fault(engines: &crate::leader::Engines, trial: &Trial) -> Option<String
         }
         _ => {}
     }
-    let faults = engines
+    let faults = replica
         .observer
         .numerical_faults(trial.world, trial.promoted);
     if faults > 0 {
@@ -1865,7 +2258,7 @@ fn trial_fault(engines: &crate::leader::Engines, trial: &Trial) -> Option<String
     }
     if let (Some(window), Some(baseline)) = (thresholds.window, trial.baseline)
         && trial.promoted.elapsed() >= window
-        && let Some(rates) = engines.observer.rates(trial.world, trial.promoted, window)
+        && let Some(rates) = replica.observer.rates(trial.world, trial.promoted, window)
     {
         if let Some(regression) = thresholds.step_time_regression
             && baseline.step_us > 0.0

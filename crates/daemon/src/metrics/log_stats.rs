@@ -12,6 +12,8 @@
 //! `logging_config.log_stats` is set.
 
 use std::fmt::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::metrics::{EngineLabels, F64Gauge, METRICS, U64Counter, U64Gauge};
@@ -63,7 +65,7 @@ impl StatsLogger {
     ///
     /// Must be called within a Tokio runtime, since it spawns onto the current
     /// one.
-    pub(crate) fn start(model_name: String, engine_count: usize) -> Self {
+    pub(crate) fn start(model_name: String, engine_count: Arc<AtomicUsize>) -> Self {
         let task = AbortOnDropHandle::new(tokio::spawn(async move {
             run_stats_logger(model_name, engine_count).await;
         }));
@@ -100,8 +102,8 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
 /// Samples cumulative engine metrics and periodically logs interval throughput and occupancy.
 ///
 /// Runs until its task is aborted.
-async fn run_stats_logger(model_name: String, engine_count: usize) {
-    let engines = resolve_engine_metrics(&model_name, engine_count);
+async fn run_stats_logger(model_name: String, engine_count: Arc<AtomicUsize>) {
+    let mut engines = resolve_engine_metrics(&model_name, engine_count.load(Ordering::Relaxed));
 
     let mut interval = tokio::time::interval(LOG_STATS_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -117,6 +119,11 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
     let mut msg = String::new();
     loop {
         interval.tick().await;
+
+        let active = engine_count.load(Ordering::Relaxed);
+        if active > engines.len() {
+            engines = resolve_engine_metrics(&model_name, active);
+        }
 
         let now = Instant::now();
         let elapsed = now.duration_since(last_log_time).as_secs_f64();
@@ -139,7 +146,10 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
             && last_generation_throughput == 0.0;
 
         // Read scheduler gauges (aggregate across engines).
-        let (num_running, num_waiting, prefix_cache_usage) = read_scheduler_gauges(&engines);
+        // Retired schedulers still own completed-request counters, while
+        // occupancy describes only the current serving group.
+        let (num_running, num_waiting, prefix_cache_usage) =
+            read_scheduler_gauges(&engines[..active]);
 
         // Compute prefix cache hit rate over this interval.
         let delta_queries = curr

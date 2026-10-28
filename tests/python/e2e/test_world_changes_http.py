@@ -566,6 +566,150 @@ def _worlds_of(ledgers: list[dict], item: str) -> set[tuple[int, ...]]:
     }
 
 
+def test_independent_replicas_roll_on_disjoint_devices(tmp_path: Path):
+    """One replica trials at a time while the shared service keeps serving."""
+    name = "qwen3-replicas"
+    devices = os.environ["UNISERVE_WORLD_DEVICES"]
+    assert len(devices.split(",")) >= 3
+    with _serve(tmp_path, name, devices, ("--data-parallel-size", "2")) as (
+        base_url,
+        _log,
+    ):
+        before = _config(base_url)["replicas"]
+        assert len(before) == 2
+        worlds = [replica["slots"][0]["world"] for replica in before]
+        assert len(set(worlds)) == 2
+        expected = _chat(base_url, name, CACHED_PROMPT)
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        report, streams = _change_under_traffic(
+            base_url, name, streaming, (CHANGE,)
+        )
+        assert report["previous_world"] == worlds[0]
+        status = _config(base_url)
+        assert status["pending_replicas"] == [1]
+        assert status["replicas"][1]["slots"][0]["world"] == worlds[1]
+        for ledger in _ledgers(status):
+            resident = {
+                world
+                for entry in ledger["entries"]
+                if entry["item"] == "process"
+                for world in entry["worlds"]
+            }
+            assert not {worlds[0], report["world"]} <= resident
+        assert _chat(base_url, name, CACHED_PROMPT) == expected
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        status = _config(base_url)
+        assert status["replicas"][0]["trial"] is None
+        assert status["replicas"][1]["trial"]["previous_world"] == worlds[1]
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        status = _config(base_url)
+        assert status["pending_replicas"] == []
+        assert all(replica["trial"] is None for replica in status["replicas"])
+        for stream in streams:
+            stream.join()
+        assert _chat(base_url, name, CACHED_PROMPT) == expected
+
+
+def test_replica_rollback_and_daemon_restart_preserve_serving(tmp_path: Path):
+    """A selected replica rolls back; a hot restart adopts both owners."""
+    name = "qwen3-replica-recovery"
+    devices = os.environ["UNISERVE_WORLD_DEVICES"]
+    assert len(devices.split(",")) >= 3
+    with _serve(tmp_path, name, devices, ("--data-parallel-size", "2")) as (
+        base_url,
+        log,
+    ):
+        successor = None
+        try:
+            before = _config(base_url)["replicas"]
+            worlds = [replica["slots"][0]["world"] for replica in before]
+            expected = _chat(base_url, name, CACHED_PROMPT)
+            applied = httpx.put(
+                f"{base_url}/admin/config",
+                json={"set": [CHANGE], "replica": 1},
+                timeout=1800,
+            )
+            assert applied.status_code == 200, applied.text
+            status = _config(base_url)
+            assert status["replicas"][0]["slots"][0]["world"] == worlds[0]
+            assert status["replicas"][1]["trial"]["previous_world"] == worlds[1]
+            streaming = Streaming(base_url, name)
+            streaming.wait_for(EARLY_TOKENS)
+            rolled = _admin(
+                base_url, "config/rollback", {"reason": "operator rollback"}
+            )
+            assert rolled.status_code == 200, rolled.text
+            restored = _config(base_url)
+            assert [
+                replica["slots"][0]["world"] for replica in restored["replicas"]
+            ] == worlds
+            assert restored["pending_replicas"] == []
+            assert _chat(base_url, name, CACHED_PROMPT) == expected
+            engines = _pids(log, "Engine")
+            restarted = _admin(base_url, "restart")
+            assert restarted.status_code == 200, restarted.text
+            successor = restarted.json()["result"]["pid"]
+            adopted = _config(base_url)
+            assert [
+                replica["slots"][0]["world"] for replica in adopted["replicas"]
+            ] == worlds
+            assert _pids(log, "Engine") == engines
+            assert _chat(base_url, name, CACHED_PROMPT) == expected
+            streaming.join()
+        finally:
+            if successor is not None and _runs(successor):
+                os.kill(successor, signal.SIGTERM)
+                _wait_until(
+                    lambda: not _runs(successor),
+                    120,
+                    "successor daemon did not stop",
+                )
+
+
+def test_splitting_an_expert_group_rolls_back_as_one_transaction(
+    tmp_path: Path,
+):
+    """A split trial restores its coupled predecessor as one transaction."""
+    name = "qwen3-group-rollback"
+    devices = os.environ["UNISERVE_WORLD_DEVICES"]
+    options = (
+        "--data-parallel-size",
+        "2",
+        "--set",
+        "moe_config.expert_parallel=true",
+    )
+    with _serve(tmp_path, name, devices, options) as (base_url, _log):
+        before = _config(base_url)
+        previous = before["replicas"][0]["slots"][0]["world"]
+        expected = _chat(base_url, name, CACHED_PROMPT)
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        report, streams = _change_under_traffic(
+            base_url, name, streaming, ("moe_config.expert_parallel=false",)
+        )
+        assert report["previous_worlds"] == [previous]
+        assert len(report["worlds"]) == 2
+        status = _config(base_url)
+        assert status["trial"]["worlds"] == report["worlds"]
+        assert len(status["replicas"]) == 2
+        assert _chat(base_url, name, CACHED_PROMPT) == expected
+        rolled = _admin(
+            base_url, "config/rollback", {"reason": "operator rollback"}
+        )
+        assert rolled.status_code == 200, rolled.text
+        assert rolled.json()["result"]["rolled_back"] == report["worlds"]
+        restored = _config(base_url)
+        assert restored["trial"] is None
+        assert len(restored["replicas"]) == 1
+        assert restored["replicas"][0]["slots"][0]["world"] == previous
+        for stream in streams:
+            stream.join()
+        assert _chat(base_url, name, CACHED_PROMPT) == expected
+
+
 @pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
 def test_a_world_change_continues_a_streaming_request_and_commits(
     tmp_path: Path, topology: str
@@ -1565,7 +1709,11 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         base_url,
         log,
     ):
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        before = _config(base_url)
+        serving = before["slots"][0]
+        previous_worlds = [
+            replica["slots"][0]["world"] for replica in before["replicas"]
+        ]
         if change == "tp1-to-tp2":
             # Physical free storage alone is insufficient: the new GPU
             # must also hold the target's weights and runtime within its
@@ -1600,7 +1748,10 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         )
         streaming = streams[-1]
         assert report["parallel"] == "changed", report
-        assert report["previous_world"] == serving["world"], report
+        if change == "dp2-tp2-to-dep4":
+            assert report["previous_worlds"] == previous_worlds, report
+        else:
+            assert report["previous_world"] == serving["world"], report
         print(
             f"{change}: promotion pause {report['pause_seconds']:.3f} s "
             f"(park {report['park_seconds']:.3f} s, "
@@ -1609,6 +1760,8 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
             f"restorations {report['transfer_restorations']})"
         )
         redistribution = report["redistribution"]
+        if change == "dp2-tp2-to-dep4":
+            (redistribution,) = redistribution
         assert redistribution is not None, report
         order = redistribution["devices"]
         print(f"{change}: ranks on devices {order} ({redistribution['order']})")

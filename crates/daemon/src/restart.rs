@@ -107,33 +107,31 @@ struct Prepare {
 #[derive(Debug, Serialize, Deserialize)]
 struct Takeover {
     listener: HandedListener,
-    /// The control connection's state, its descriptor travelling apart.
-    control: (bool, Vec<u8>),
+    replicas: Vec<ReplicaHandoff>,
+    adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
+    commit: Option<crate::worlds::Commit>,
+    pending: std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>,
     service: HandedService,
-    /// How many descriptors the service sends.
     service_descriptors: usize,
+    admin: HandedAdmin,
+    jobs: Vec<(VideoJob, Option<u64>)>,
+    then: Option<crate::worlds::ApplyRequest>,
+}
+
+/// One replica's control connection and executing world. Descriptors follow
+/// replica order after the HTTP listener and before the service descriptors.
+#[derive(Debug, Serialize, Deserialize)]
+struct ReplicaHandoff {
+    control: (bool, Vec<u8>),
     engine: u64,
     next_engine: u64,
-    /// The spec the engine serves (`wire::EngineSpec`, encoded).
     served: Vec<u8>,
-    /// The identity the successor's first request takes.
     first_request: u64,
-    admin: HandedAdmin,
-    /// Each job's record, and its artifact's length once it completed.
-    jobs: Vec<(VideoJob, Option<u64>)>,
-    /// New requests wait; the engine sleeps, and whether its sleep paused
-    /// them; the LoRA adapters the workers hold (`Leader::adopt_pause`).
+    config: String,
     paused: bool,
     asleep: bool,
     sleep_paused: bool,
-    adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
-    /// The configurations a rollback marked unavailable.
-    #[serde(default)]
     unavailable: Vec<crate::worlds::Unavailable>,
-    /// The change the successor applies once it serves: the rest of a change
-    /// whose daemon options this hot restart applies.
-    #[serde(default)]
-    then: Option<crate::worlds::ApplyRequest>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -210,11 +208,11 @@ impl Restarter {
 
         // The successor serves with the daemon's options the change
         // states, over the configuration the engine serves.
-        let options = config.unwrap_or_else(|| handoff.config.clone());
+        let options = config.unwrap_or_else(|| handoff[0].config.clone());
         let address = |server: &crate::options::ServerOptions| {
             (server.host.clone(), server.port, server.uds.clone())
         };
-        let rebind = address(&options.server_config) != address(&handoff.config.server_config);
+        let rebind = address(&options.server_config) != address(&handoff[0].config.server_config);
         let config = crate::options::printed(&options)?;
         let processes = self
             .daemon
@@ -258,14 +256,29 @@ impl Restarter {
             .map_err(|_| anyhow::anyhow!("the listener's lock is poisoned"))?
             .take()
             .context("the HTTP listener was handed over already")?;
-        let control = handoff
-            .client
-            .take_control()
-            .context("the engine's control connection is not this daemon's")?;
-        let control = control.hand_over();
-        let first_request = handoff.client.next_request_id() + (1 << 32);
+        let mut descriptors = vec![listener_descriptor];
+        let mut replicas = Vec::new();
+        for replica in &handoff {
+            let control = replica
+                .client
+                .take_control()
+                .context("the engine's control connection is not this daemon's")?
+                .hand_over();
+            descriptors.push(control.descriptor);
+            replicas.push(ReplicaHandoff {
+                control: (control.unix, control.received),
+                engine: replica.engine,
+                next_engine: replica.next_engine,
+                served: replica.served.encode_to_vec(),
+                first_request: replica.client.next_request_id() + (1 << 32),
+                config: crate::options::printed(&replica.config)?,
+                paused: replica.paused,
+                asleep: replica.asleep,
+                sleep_paused: replica.sleep_paused,
+                unavailable: replica.unavailable.clone(),
+            });
+        }
         let jobs_handed = jobs.hand_over(job_relay(channel.stream()));
-        let mut descriptors: Vec<OwnedFd> = vec![listener_descriptor, control.descriptor];
         let service_count = service_descriptors.len();
         descriptors.extend(service_descriptors);
         let mut job_records = Vec::with_capacity(jobs_handed.len());
@@ -284,27 +297,23 @@ impl Restarter {
             &mut channel,
             &Message::Takeover(Box::new(Takeover {
                 listener,
-                control: (control.unix, control.received),
+                replicas,
+                adapters: crate::leader::locked(&leader.replicas.adapters).clone(),
+                commit: crate::leader::locked(&leader.replicas.commit).clone(),
+                pending: crate::leader::locked(&leader.replicas.pending).clone(),
                 service,
                 service_descriptors: service_count,
-                engine: handoff.engine,
-                next_engine: handoff.next_engine,
-                served: handoff.served.encode_to_vec(),
-                first_request,
                 admin: admin.hand_over(),
                 jobs: job_records,
-                paused: handoff.paused,
-                asleep: handoff.asleep,
-                sleep_paused: handoff.sleep_paused,
-                adapters: handoff.adapters,
-                unavailable: handoff.unavailable,
                 then: then.map(|request| *request),
             })),
             &borrowed,
         )?;
         drop(descriptors);
         self.handed_over.store(true, Ordering::Release);
-        handoff.client.attach(&requests);
+        for replica in handoff {
+            replica.client.attach(&requests);
+        }
 
         let pid = match recv(&mut channel).await? {
             (Message::Serving { pid }, _) => pid,
@@ -520,20 +529,14 @@ async fn prepared_successor(
     };
     let Takeover {
         listener,
-        control: (control_unix, control_received),
+        replicas,
+        adapters,
+        commit,
+        pending,
         service,
         service_descriptors,
-        engine,
-        next_engine,
-        served,
-        first_request,
         admin,
         jobs,
-        paused,
-        asleep,
-        sleep_paused,
-        adapters,
-        unavailable,
         then,
     } = *takeover;
     let mut descriptors = descriptors.into_iter();
@@ -550,11 +553,17 @@ async fn prepared_successor(
         }
         None => handed,
     };
-    let control_connection = Connection::resume(Handed {
-        descriptor: next()?,
-        unix: control_unix,
-        received: control_received,
-    })?;
+    let replicas = replicas
+        .into_iter()
+        .map(|replica| {
+            let connection = Connection::resume(Handed {
+                descriptor: next()?,
+                unix: replica.control.0,
+                received: replica.control.1.clone(),
+            })?;
+            Ok((replica, connection))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let service_fds = (0..service_descriptors)
         .map(|_| next())
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -569,24 +578,79 @@ async fn prepared_successor(
         service,
         service_fds,
     )?;
-    let served = wire::EngineSpec::decode(served.as_slice())?;
-    let observer = Arc::new(crate::worlds::Observer::default());
-    let sink = stats_sink(config.model().to_owned(), Arc::clone(&observer));
-    let spec = served.clone();
-    let (client, control) = tokio::task::spawn_blocking(move || {
-        control
-            .adopt(engine, next_engine, spec, control_connection, sink)
-            .map(|client| (client, control))
+    let control = Arc::new(control);
+    let adopting = Arc::clone(&control);
+    let daemon_options = config.clone();
+    let adopted = tokio::task::spawn_blocking(move || {
+        replicas
+            .into_iter()
+            .enumerate()
+            .map(|(index, (replica, connection))| {
+                let (options, _) = crate::options::resolve_text(&replica.config, &[])?;
+                let options = crate::options::with_daemon_options(&options, &daemon_options);
+                let served = wire::EngineSpec::decode(replica.served.as_slice())?;
+                let observer = Arc::new(crate::worlds::Observer::default());
+                let sink = stats_sink(options.model().to_owned(), Arc::clone(&observer), index);
+                let client = adopting.adopt(
+                    replica.engine,
+                    replica.next_engine,
+                    served.clone(),
+                    connection,
+                    sink,
+                )?;
+                client.number_requests_from(replica.first_request);
+                Ok((replica, options, served, observer, client))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
     })
     .await
-    .context("the engine's adoption did not complete")??;
-    client.number_requests_from(first_request);
+    .context("the engines' adoption did not complete")??;
+    let mut adopted = adopted.into_iter();
+    let (handed, options, served, observer, client) =
+        adopted.next().context("the takeover names no replicas")?;
     let leader = Arc::new(Leader::finish(
-        &config, prepared, control, client, served, observer,
+        &config,
+        prepared,
+        Arc::clone(&control),
+        client,
+        served,
+        observer,
     )?);
-    leader.adopt_pause(paused, asleep, sleep_paused, adapters);
-    leader.adopt_unavailable(unavailable);
+    let first = Arc::clone(&leader.replicas()[0]);
+    *crate::leader::locked(&first.config) = options;
+    first.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
+    first.adopt_unavailable(handed.unavailable);
+    for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
+        let replica = crate::leader::Replica::new(
+            &options,
+            Arc::new(client),
+            observer,
+            index + 1,
+            Arc::downgrade(&leader.replicas),
+            Arc::clone(&leader.replicas.adapters),
+        );
+        let _ = replica.control.set(Arc::clone(&control));
+        *crate::leader::locked(&replica.served) = Some(served);
+        replica.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
+        replica.adopt_unavailable(handed.unavailable);
+        replica.monitor();
+        leader
+            .replicas
+            .serving
+            .send_modify(|replicas| replicas.push(replica));
+    }
 
+    *crate::leader::locked(&leader.replicas.adapters) = adapters;
+    *crate::leader::locked(&leader.replicas.commit) = commit;
+    *crate::leader::locked(&leader.replicas.pending) = pending;
+    if crate::leader::locked(&leader.replicas.commit).is_some() {
+        let committing = Arc::clone(&leader);
+        tokio::spawn(async move {
+            if let Err(error) = committing.commit().await {
+                tracing::error!(%error, "the handed-over commit remains pending");
+            }
+        });
+    }
     let retire = Arc::new(AtomicBool::new(false));
     let admin = Admin::resume(shutdown.clone(), Arc::clone(&retire), admin);
     admin.record(

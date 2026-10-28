@@ -83,6 +83,7 @@ message Request {
     KeepWeights keep_weights = 7;
     ThrottleTransfers throttle_transfers = 8;
     NodesQuery nodes = 9;
+    DeviceQuery devices = 10;
     PublishWorlds publish_worlds = 11;
   }
 }
@@ -101,6 +102,7 @@ message Reply {
     WeightsKept weights_kept = 8;
     TransfersThrottled transfers_throttled = 9;
     NodesKnown nodes = 10;
+    DeviceInventory devices = 11;
     WorldsPublished worlds_published = 12;
   }
 }
@@ -113,6 +115,14 @@ message NodesKnown {
   repeated Node nodes = 1;
 }
 
+// CUDA-visible devices available for an independent replica's successor.
+message DeviceQuery {
+  string host = 1;
+}
+
+message DeviceInventory {
+  repeated uint32 available = 1;
+}
 // Publish the immutable pages of a committed set of worlds at one node.
 // Every successor is published before any predecessor is retired.
 message PublishWorlds {

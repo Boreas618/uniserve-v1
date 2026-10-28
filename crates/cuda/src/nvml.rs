@@ -211,6 +211,19 @@ impl Nvml {
         Ok(false)
     }
 
+    /// Whether no compute or graphics process holds a context on `device`.
+    /// A replica update uses idle devices without interrupting another
+    /// serving process or taking its device allocations.
+    pub fn is_idle(&self, device: DeviceId) -> Result<bool> {
+        let handle = self.device(device)?;
+        for query in [self.api.compute_processes, self.api.graphics_processes] {
+            if !self.processes(query, handle)?.is_empty() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The processes one of NVML's `_v3` queries lists for `handle`.
     fn processes(&self, query: ProcessQuery, handle: NvmlDevice) -> Result<Vec<ProcessInfo>> {
         let call = "nvmlDevice*RunningProcesses_v3";

@@ -835,6 +835,38 @@ pub struct TransferConfig {
     pub worker_hosts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+impl std::fmt::Display for TransferConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, edge) in self.edges.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{}", edge.source_worker)?;
+            if let Some(rank) = edge.source_rank {
+                write!(formatter, ":{rank}")?;
+            }
+            write!(formatter, "->{}", edge.destination_worker)?;
+            if let Some(rank) = edge.destination_rank {
+                write!(formatter, ":{rank}")?;
+            }
+            formatter.write_str("=")?;
+            if edge.device == Some(TransferBackend::Local)
+                && edge.host == Some(TransferBackend::Local)
+            {
+                formatter.write_str("local")?;
+            } else {
+                for (index, mechanism) in edge.mechanisms().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("+")?;
+                    }
+                    write!(formatter, "{mechanism}")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl TransferConfig {
     /// Records the placement's rank counts and hosts, and binds a default edge
     /// for every ordered pair of ranks, within and across workers, that no

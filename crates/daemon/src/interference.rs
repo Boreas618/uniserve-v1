@@ -286,8 +286,7 @@ pub(crate) struct Throttled {
 /// at the budgets the Transfer Servers keep.
 pub(crate) async fn control(
     running: Arc<EngineClient>,
-    observer: Arc<Observer>,
-    mut throttling: Throttling,
+    mut observed: Vec<(Arc<Observer>, Throttling)>,
     interval: Duration,
     done: CancellationToken,
 ) -> Throttled {
@@ -301,7 +300,29 @@ pub(crate) async fn control(
             () = done.cancelled() => break,
             _ = ticks.tick() => {}
         }
-        if let Some((decision, ratio)) = throttling.decide(&observer) {
+        let decisions: Vec<_> = observed
+            .iter_mut()
+            .filter_map(|(observer, throttling)| throttling.decide(observer))
+            .collect();
+        let decision = if decisions
+            .iter()
+            .any(|(decision, _)| *decision == Decision::Halve)
+        {
+            Some(Decision::Halve)
+        } else if decisions
+            .iter()
+            .any(|(decision, _)| *decision == Decision::Restore)
+            && observed.iter().all(|(_, throttling)| !throttling.halved())
+        {
+            Some(Decision::Restore)
+        } else {
+            None
+        };
+        if let Some(decision) = decision {
+            let ratio = decisions
+                .iter()
+                .map(|(_, ratio)| *ratio)
+                .fold(0.0, f64::max);
             let halve = decision == Decision::Halve;
             match running.throttle_transfers(halve).await {
                 Ok(hosts) => {
@@ -322,7 +343,7 @@ pub(crate) async fn control(
             }
         }
     }
-    if throttling.halved() {
+    if observed.iter().any(|(_, throttling)| throttling.halved()) {
         match running.throttle_transfers(false).await {
             Ok(_) => throttled.restorations += 1,
             Err(error) => {
@@ -488,8 +509,7 @@ mod tests {
         let done = CancellationToken::new();
         let control = tokio::spawn(control(
             Arc::clone(&running),
-            Arc::clone(&observer),
-            throttling,
+            vec![(Arc::clone(&observer), throttling)],
             interval,
             done.clone(),
         ));

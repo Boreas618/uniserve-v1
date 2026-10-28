@@ -77,6 +77,59 @@ fn stated(text: &str) -> Option<String> {
 }
 
 impl EngineConfig {
+    /// Resolves independent data-parallel replicas into standalone engine
+    /// specs with explicit host and GPU assignments. Expert-parallel groups
+    /// communicate across schedulers and remain in one engine spec.
+    ///
+    /// Fails for invalid engine options, unequal scheduler groups, or a
+    /// transfer edge between otherwise independent replicas.
+    pub fn replica_specs(spec: &EngineSpec) -> anyhow::Result<Vec<EngineSpec>> {
+        let config = Self::from_spec(spec)?;
+        let count = config.data_parallel_size;
+        if count == 1 || config.expert_parallel.is_some() {
+            return Ok(vec![spec.clone()]);
+        }
+        anyhow::ensure!(
+            !config.worker_groups.is_empty() && config.worker_groups.len().is_multiple_of(count),
+            "worker groups must form {count} equal independent replicas"
+        );
+        let groups_per_replica = config.worker_groups.len() / count;
+        let transfers = TransferConfig::parse(&spec.transfer)?;
+        config
+            .worker_groups
+            .chunks(groups_per_replica)
+            .map(|groups| {
+                let contains = |id: &crate::executor::WorkerGroupId| {
+                    groups.iter().any(|group| &group.id == id)
+                };
+                let mut local = TransferConfig::default();
+                for edge in &transfers.edges {
+                    let source = contains(&edge.source_worker);
+                    let destination = contains(&edge.destination_worker);
+                    anyhow::ensure!(
+                        source == destination,
+                        "a transfer edge connects independent replicas: {} -> {}",
+                        edge.source_worker,
+                        edge.destination_worker
+                    );
+                    if source {
+                        local.edges.push(edge.clone());
+                    }
+                }
+                let mut replica = spec.clone();
+                let ranks = replica
+                    .placement
+                    .as_mut()
+                    .context("the engine spec states no ranks")?;
+                ranks.data_parallel_size = 1;
+                ranks.worker_groups.clear();
+                ranks.worker_groups_content = Deployment::snapshot(groups)?;
+                replica.transfer = local.to_string();
+                Ok(replica)
+            })
+            .collect()
+    }
+
     /// The configuration `spec` states.
     ///
     /// # Errors
@@ -337,7 +390,7 @@ fn required<'a, T>(table: &'a Option<T>, name: &str) -> anyhow::Result<&'a T> {
 /// the shorthand's groups of one component, with the ranks spread in blocks
 /// over `host` and the hosts after it.
 fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
-    if !placement.worker_groups.is_empty() {
+    if !placement.worker_groups_content.is_empty() {
         return Deployment::parse(&placement.worker_groups_content)?
             .worker_groups(host)
             .context("invalid `worker_groups` deployment");
@@ -601,5 +654,52 @@ mod tests {
         let mut cpu = tensor_experts(2, &[0, 1]);
         cpu.placement.as_mut().unwrap().device = "cpu".into();
         assert!(EngineConfig::from_spec(&cpu).is_err());
+    }
+
+    #[test]
+    fn independent_replicas_preserve_their_assigned_tensor_parallel_ranks() {
+        let mut deployment = spec();
+        let ranks = deployment.placement.as_mut().unwrap();
+        ranks.tensor_parallel_size = 2;
+        ranks.data_parallel_size = 2;
+        let replicas = EngineConfig::replica_specs(&deployment).unwrap();
+        let devices: Vec<Vec<String>> = replicas
+            .iter()
+            .map(|replica| {
+                EngineConfig::from_spec(replica)
+                    .unwrap()
+                    .worker_groups
+                    .into_iter()
+                    .flat_map(|group| group.ranks.into_iter().map(|rank| rank.device))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            devices,
+            vec![vec!["cuda:0", "cuda:1"], vec!["cuda:2", "cuda:3"]]
+        );
+        assert!(
+            replicas
+                .iter()
+                .all(|replica| replica.scheduling == deployment.scheduling)
+        );
+    }
+
+    #[test]
+    fn communicating_expert_ranks_stay_in_one_replica() {
+        let mut deployment = spec();
+        deployment.placement.as_mut().unwrap().data_parallel_size = 4;
+        deployment.experts.as_mut().unwrap().expert_parallel = true;
+        let replicas = EngineConfig::replica_specs(&deployment).unwrap();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(
+            EngineConfig::from_spec(&replicas[0])
+                .unwrap()
+                .worker_groups
+                .iter()
+                .map(|group| group.ranks.len())
+                .sum::<usize>(),
+            4
+        );
     }
 }
