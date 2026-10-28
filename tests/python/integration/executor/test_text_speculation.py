@@ -172,6 +172,7 @@ class Worker:
             TextBinding(
                 slots=SLOTS,
                 units=UNITS,
+                warmup_units=UNITS - 1,
                 unit_pool=self.pool,
                 tables={
                     "unit_tables": self.unit_tables,

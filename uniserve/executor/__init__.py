@@ -450,6 +450,7 @@ class _DiffusionLMComputations:
             TextBinding(
                 slots=binding.slots,
                 units=binding.units,
+                warmup_units=binding.warmup_units,
                 unit_pool=binding.unit_pool,
                 tables=binding.tables,
                 computations=_computation_bindings(binding, computations),
