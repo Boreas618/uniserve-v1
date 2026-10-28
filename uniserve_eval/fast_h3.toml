@@ -879,9 +879,9 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # The BF16 checkpoint on the same layout: each replica keeps its
-# transformer's layer projections in page-locked host memory and streams them
+# transformer's layer projections in page-locked host storage and streams them
 # through five layer buffers (the fewest of at least four that divide its 50
-# layers), which leaves the device memory they would hold to a 15-second step
+# layers), which leaves the device storage they would hold to a 15-second step
 # beside the text encoder's shard.
 [servers.rtx-pro-6000-8-dp8-bf16]
 host = "127.0.0.1"

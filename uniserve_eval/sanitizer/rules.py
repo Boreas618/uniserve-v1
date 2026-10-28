@@ -104,16 +104,16 @@ def inspect_events(events: list[Event]) -> list[Hint]:
                     )
                 )
 
-            if "Pageable" in (copy.source_memory, copy.destination_memory):
+            if "Pageable" in (copy.source_storage, copy.destination_storage):
                 hints.append(
                     Hint(
                         "pageable-copy",
                         f"{copy.direction}: {copy.bytes} bytes through "
-                        "pageable host memory. An Async API may block or "
+                        "pageable host storage. An Async API may block or "
                         "stage the copy.",
                         "Consider reusing pinned host buffers on the "
                         "execution path. One-time loading and host-only copies "
-                        "may not justify pinned memory.",
+                        "may not justify pinned storage.",
                         (event,),
                     )
                 )

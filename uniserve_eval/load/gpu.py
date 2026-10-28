@@ -2,10 +2,10 @@
 
 ``run_point`` runs a ``GpuStorageSampler`` around the warmup and measured
 load and persists its raw samples as ``gpu_samples.jsonl`` and its summary
-under the ``gpu_memory`` key. Readings come from ``nvidia-smi``, which
+under the ``gpu_storage`` key. Readings come from ``nvidia-smi``, which
 reports every GPU it can see, not only those the server uses, and
-device-wide memory use, so they include processes other than the server
-under test. Memory is in MiB and utilization in percent.
+device-wide storage use, so they include processes other than the server
+under test. Storage is in MiB and utilization in percent.
 """
 
 from __future__ import annotations

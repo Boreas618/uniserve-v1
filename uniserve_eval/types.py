@@ -614,10 +614,10 @@ class RequestRecord:
     video_shape: VideoShape | None = None
     # Timings a video server reported for this request, as it defines them:
     # its inference time, its named stage durations, and its peak device
-    # memory in MiB. Servers that report none leave them unset.
+    # storage in MiB. Servers that report none leave them unset.
     server_inference_s: float | None = None
     server_stage_s: dict[str, float] = field(default_factory=dict)
-    server_peak_memory_mib: float | None = None
+    server_peak_storage_mib: float | None = None
     media_checks: dict[str, bool] = field(default_factory=dict)
     original_output: dict[str, Any] | None = None
     example: dict[str, Any] | None = None
@@ -894,7 +894,7 @@ class RequestRecord:
             ),
             "server_inference_s": self.server_inference_s,
             "server_stage_s": dict(self.server_stage_s),
-            "server_peak_memory_mib": self.server_peak_memory_mib,
+            "server_peak_storage_mib": self.server_peak_storage_mib,
             "media_checks": self.media_checks,
             "original_output": self.original_output,
             "example": self.example,

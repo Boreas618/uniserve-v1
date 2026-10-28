@@ -154,7 +154,7 @@ async def run_point(
                 "cpu_affinity": sorted(os.sched_getaffinity(0)),
                 "connection_limits": None,
                 "keepalive_expiry_s": None,
-                "media_buffer": "host_memory",
+                "media_buffer": "host_storage",
                 "warmup_rows": selected_rows_identity(warmup_rows or []),
                 "priming_rows": selected_rows_identity(priming_rows or []),
             },
@@ -326,7 +326,7 @@ async def run_point(
             )
 
         if sampler.summary() is not None:
-            summary["gpu_memory"] = sampler.summary()
+            summary["gpu_storage"] = sampler.summary()
         summary["client"] = {
             "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             * 1024,
@@ -397,7 +397,7 @@ async def run_point(
         )
         failure["error"] = {"type": type(error).__name__, "message": str(error)}
         if sampler is not None and sampler.summary() is not None:
-            failure["gpu_memory"] = sampler.summary()
+            failure["gpu_storage"] = sampler.summary()
 
         # Persisting the streams fails again when the original error came
         # from persisting them, e.g. a media sample that cannot be written

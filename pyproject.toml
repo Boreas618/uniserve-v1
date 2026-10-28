@@ -69,7 +69,7 @@ gpu = [
     "flashinfer-python==0.6.18",
     "ninja>=1.13",
     "requests[socks]>=2",
-    "uniserve-kernels[host_memory,sparse_attention,flash_attn_4,megamoe]",
+    "uniserve-kernels[host_storage,sparse_attention,flash_attn_4,megamoe]",
 ]
 
 [tool.uv.sources]

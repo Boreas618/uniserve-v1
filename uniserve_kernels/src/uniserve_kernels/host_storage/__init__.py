@@ -19,8 +19,8 @@ def _extension():
     from uniserve_kernels import jit
 
     return jit.load(
-        "uniserve_host_memory",
-        [Path(__file__).parent / "csrc" / "host_memory.cpp"],
+        "uniserve_host_storage",
+        [Path(__file__).parent / "csrc" / "host_storage.cpp"],
         cxx_flags=["-O2", "-std=c++20"],
         with_cuda=True,
     )

@@ -2,7 +2,7 @@
 
 // Lifetime tracking of PyTorch pinned host storage that native code reads
 // with its own asynchronous DMA. The Python package
-// uniserve_kernels.host_memory compiles this file on first use.
+// uniserve_kernels.host_storage compiles this file on first use.
 
 #include <torch/extension.h>
 #include <ATen/core/CachingHostAllocator.h>

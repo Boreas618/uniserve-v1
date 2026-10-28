@@ -28,8 +28,8 @@ class Copy:
     stream: int
     bytes: int
     direction: str
-    source_memory: str
-    destination_memory: str
+    source_storage: str
+    destination_storage: str
 
 
 @dataclass(frozen=True)
