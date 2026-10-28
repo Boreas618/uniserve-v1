@@ -157,6 +157,10 @@ pub(crate) struct Worker {
     /// sizes them; `None` for a rank that copies no page through the host
     /// KV cache.
     host_cache: Option<HostCacheSetup>,
+    /// The weights the rank still receives from other worlds, and whether a
+    /// publication of tensors it read retains its manifest; warmup retains
+    /// them once they arrived, before the rank serves.
+    received: Option<(weights::Receipt, bool)>,
     warmed: bool,
 }
 
@@ -440,15 +444,12 @@ impl Worker {
         };
         let host_weights =
             HostWeights::start(&model, &components, &mut retention).map_err(phase("load"))?;
-        // Weights received from other worlds arrived while the model bound
-        // them and the executor and the expert exchange were built; their
-        // chunks are retained read-only before the published manifest names
-        // them.
-        if let Some(receipt) = receipt {
-            receipt
-                .retain(&retained, published.is_some())
-                .map_err(phase("load"))?;
-        }
+        // Weights received from other worlds arrive while the model binds
+        // them, the executor and the expert exchange are built, capacity is
+        // planned and the graphs are captured at the storages' fixed
+        // addresses; warmup retains them once they arrived
+        // ([`Worker::warmup`]).
+        let received = receipt.map(|receipt| (receipt, published.is_some()));
         let weight_storages = match published {
             Some(published) => {
                 let mut storages = published.put(&retained).map_err(phase("load"))?;
@@ -757,6 +758,7 @@ impl Worker {
             bookings: Vec::new(),
             _plugin_buffers: plugin_buffers,
             host_cache,
+            received,
             warmed: false,
         })
     }
@@ -793,7 +795,14 @@ impl Worker {
             let _capture = range(c"uniserve.worker.capture", None);
             warm_computations(executor.backend_mut())?;
         }
-        let backend = executor.backend();
+        // The graphs were captured while received weights arrived at their
+        // fixed addresses; the rank serves only once they all did.
+        if let Some((receipt, published)) = self.received.take() {
+            receipt
+                .retain(&self.retained, published)
+                .map_err(phase("warmup"))?;
+        }
+        let backend = self.executor.backend();
         if backend.components().holds_host() {
             self.require_codecs()?;
         }

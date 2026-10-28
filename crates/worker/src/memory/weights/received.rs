@@ -32,7 +32,7 @@ use std::sync::Arc;
 use cuda::{Protection, Stream};
 use sha2::{Digest, Sha256};
 use storage::manifest::{self, Gpu, Manifest, Space};
-use storage::protocol::{Access, LinkBandwidth, ListedTensor, Priority, Region};
+use storage::protocol::{Access, LinkBandwidth, ListedTensor, Priority, Region, Span};
 use storage::{Key, Mode, Placement, StorageRecord, TensorRecord};
 
 use super::{
@@ -223,6 +223,7 @@ impl WeightKeys {
         };
         let encoded = serde_json::to_vec(&own)
             .map_err(|error| Error::Invalid(format!("encoding a target rank: {error}")))?;
+        let freed = started.elapsed();
         let targets = agreement
             .all_gather_bytes(&encoded)?
             .iter()
@@ -238,10 +239,12 @@ impl WeightKeys {
             target: manifest::World { ranks: targets },
             links: sources.links.clone(),
         };
+        let gathered = started.elapsed();
         let manifest =
             Manifest::plan(&request).map_err(|error| Error::Interface(error.to_string()))?;
         // Every participating rank verifies the digest before any byte
         // moves: the ranks computed the same manifest from the same inputs.
+        let planned = started.elapsed();
         let digests = agreement.all_gather_bytes(&manifest.digest)?;
         if !manifest.verify(&manifest.digest)
             || digests
@@ -252,6 +255,7 @@ impl WeightKeys {
                 "the ranks receiving weights computed different copy manifests".into(),
             ));
         }
+        let verified = started.elapsed();
         let own_rank = rank as u32;
 
         // The tensors of regions no source holds, and of fields that move
@@ -364,6 +368,7 @@ impl WeightKeys {
             writable.push(ranges);
         }
 
+        let allocated = started.elapsed();
         // The created chunks receive under their receiving keys: the
         // Transfer Server writes only exclusive tensors.
         if !receiving_records.is_empty() {
@@ -385,8 +390,11 @@ impl WeightKeys {
         }
         drop(receiving_records);
 
-        // Padding the rank holds in the chunks it created is zeroed.
-        zero_padding(&manifest, own_rank, &mapped_storages, &writable, device)?;
+        // The chunks the rank created start zeroed, the padding the
+        // manifest names among them.
+        let registered = started.elapsed();
+        zero_created(&mapped_storages, &writable, device)?;
+        let zeroed = started.elapsed();
 
         // The copies into this rank's storages, as one transfer task;
         // copies through staging spaces move encoded fields, which the rank
@@ -409,7 +417,9 @@ impl WeightKeys {
                 Ok(span)
             })
             .collect::<Result<Vec<_>>>()?;
-        let bytes: u64 = spans.iter().map(|span| span.bytes).sum();
+        let bytes: u64 = spans.iter().map(Span::copied).sum();
+        let spans_count = spans.len();
+        let listed = started.elapsed();
         let task = if spans.is_empty() {
             None
         } else {
@@ -418,6 +428,7 @@ impl WeightKeys {
 
         // The manifest the rank retains for its position, and the fields
         // it binds: all but those of the tensors it reads.
+        let submitted = started.elapsed();
         let manifest_text = serde_json::to_string(&WeightManifest {
             version: MANIFEST_VERSION,
             fingerprints: self.fingerprint_digests(),
@@ -433,15 +444,31 @@ impl WeightKeys {
                 }
             }
         }
-        retained.use_keys(shared.iter().copied());
+        // The receiving keys stay retained, and booked, until the bytes
+        // arrived ([`Receipt::retain`]).
+        retained.use_keys(shared.iter().copied().chain(receiving.values().copied()));
         tracing::info!(
             rank,
             mapped = shared.len(),
             created = created.len(),
             copied_bytes = bytes,
+            spans = spans_count,
             missing = missing.len(),
             digest = %super::hex(&manifest.digest),
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            // Each phase's end, from the start: the unread model freed,
+            // the ranks' storages gathered, the manifest planned and
+            // verified, the chunks mapped and created, the receiving keys
+            // retained, the padding zeroed, the spans listed and the
+            // transfer submitted.
+            freed_ms = freed.as_millis() as u64,
+            gathered_ms = gathered.as_millis() as u64,
+            planned_ms = planned.as_millis() as u64,
+            verified_ms = verified.as_millis() as u64,
+            allocated_ms = allocated.as_millis() as u64,
+            registered_ms = registered.as_millis() as u64,
+            zeroed_ms = zeroed.as_millis() as u64,
+            listed_ms = listed.as_millis() as u64,
+            submitted_ms = submitted.as_millis() as u64,
             "receiving the rank's weights from the host's other worlds"
         );
         Ok(Found {
@@ -509,13 +536,17 @@ impl Receipt {
             .map(|tensor| tensor.key)
             .chain(self.shared.iter().copied())
             .collect();
+        // The receiving keys end before the same storage is retained under
+        // the chunks' keys: the GPU's ledger books each storage the server
+        // retains, and the receiving storages' booking gives way to the
+        // weights' rather than counting the storage twice.
+        retained.forget(&self.receiving)?;
         if !tensors.is_empty() {
             retained.call("retaining received weights", |client| {
                 client.put(tensors, &records)
             })?;
         }
         retained.use_keys(used);
-        retained.forget(&self.receiving)?;
         for storage in &self.storages {
             storage.protect(Protection::ReadOnly)?;
         }
@@ -543,39 +574,23 @@ fn receiving_key(world: u64, key: &Key) -> Key {
     Key(digest.finalize().into())
 }
 
-/// Zero the padding `manifest` names in `own_rank`'s storages where it
-/// lies in the chunks the rank created (`writable`, byte ranges per
-/// storage); a mapped chunk holds its source's zeros already.
-fn zero_padding(
-    manifest: &Manifest,
-    own_rank: u32,
+/// Zero every chunk the rank created (`created`, byte ranges per
+/// storage). The padding the manifest's fills name lies in them (a mapped
+/// chunk holds its source's zeros already), and until the transfer ends
+/// every byte of a weight is either its value or zero: the forwards that
+/// warm the rank up and capture its graphs meanwhile read finite numbers.
+fn zero_created(
     storages: &[Arc<Storage>],
-    writable: &[Vec<(u64, u64)>],
+    created: &[Vec<(u64, u64)>],
     device: cuda::DeviceId,
 ) -> Result<()> {
-    let fills: Vec<_> = manifest
-        .fills
-        .iter()
-        .filter(|fill| fill.rank == own_rank)
-        .collect();
-    if fills.is_empty() {
-        return Ok(());
-    }
     let stream = Stream::new(device)?;
-    for fill in fills {
-        let storage = &storages[fill.storage as usize];
+    for (storage, ranges) in storages.iter().zip(created) {
         let base = storage.address();
-        for row in 0..fill.rows {
-            let start = fill.offset + row * fill.pitch;
-            let end = start + fill.length;
-            for &(first, last) in &writable[fill.storage as usize] {
-                let (from, to) = (start.max(first), end.min(last));
-                if from < to {
-                    // SAFETY: the bytes lie in a chunk this rank created and
-                    // nothing reads yet; the stream is synchronized below.
-                    unsafe { cuda::memset_d8(base + from, 0, (to - from) as usize, &stream) }?;
-                }
-            }
+        for &(first, last) in ranges {
+            // SAFETY: the bytes lie in a chunk this rank created and nothing
+            // reads or writes them yet; the stream is synchronized below.
+            unsafe { cuda::memset_d8(base + first, 0, (last - first) as usize, &stream) }?;
         }
     }
     stream.synchronize()?;
