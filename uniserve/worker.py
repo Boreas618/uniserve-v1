@@ -40,7 +40,7 @@ def import_path(path: str) -> Callable[..., Any]:
     which the runtime holds as a handle and passes back as that same tensor.
     The runtime wraps each view of its storage this way once, by calling
     ``torch.from_dlpack`` through this function, so every call that takes
-    the view receives one torch tensor aliasing the runtime's memory, as a
+    the view receives one torch tensor aliasing the runtime's storage, as a
     Python caller would pass it. A failure of the callable crosses with the
     error kinds of :mod:`uniserve.errors`.
 

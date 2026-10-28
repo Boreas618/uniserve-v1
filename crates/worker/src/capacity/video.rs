@@ -16,7 +16,7 @@ use ipc::{MediaCall, OutputInfo, VideoDenoiserInfo, VideoTaskInfo};
 use serde::Deserialize;
 
 use super::plan::{MediaFacts, product_bytes};
-use crate::memory::LatentPlan;
+use crate::storage::LatentPlan;
 use crate::{Error, Result};
 
 /// A video denoiser's latent pages of one request slot.

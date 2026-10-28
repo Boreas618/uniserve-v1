@@ -54,7 +54,7 @@ pub use world::{GroupCache, ParkedCache};
 mod admission;
 mod allocation;
 mod batching;
-mod cache_memory;
+mod cache_storage;
 mod control;
 mod denoising;
 pub(crate) mod encodings;
@@ -488,8 +488,8 @@ pub struct Scheduler {
     closing: bool,
     /// A shrink or sleep of the KV cache waiting for its units to be let go
     /// (`Scheduler::resize_cache`).
-    resizing: Option<cache_memory::PendingResize>,
-    /// The workers gave back the cache and graph memory: the scheduler
+    resizing: Option<cache_storage::PendingResize>,
+    /// The workers gave back the cache and graph storage: the scheduler
     /// admits and runs nothing until it wakes.
     asleep: bool,
     /// A park waiting for the scheduler's requests to end
@@ -497,7 +497,7 @@ pub struct Scheduler {
     parking: Option<world::Parking>,
     warming: warming::Warming,
     /// The scheduler parked: it admits and executes nothing until it
-    /// resumes, and keeps its memory and prefix cache index.
+    /// resumes, and keeps its storage and prefix cache index.
     parked: bool,
     /// The scheduler's world is on trial until its commit
     /// (`Scheduler::commit`): any fault, non-finite logits included, fails

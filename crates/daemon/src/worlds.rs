@@ -3,7 +3,7 @@
 //!
 //! A world is the processes that execute one configuration of the
 //! deployment: an engine and its workers, their communicators, graphs and
-//! the memory they created. A deployment has two slots for worlds, and at
+//! the storage they created. A deployment has two slots for worlds, and at
 //! most one world executes. An update to a configuration that changes what
 //! a world executes takes four steps:
 //!
@@ -23,7 +23,7 @@
 //!    for its own heads.
 //! 2. **Promotion.** At a step boundary new requests wait, the serving world
 //!    parks (it ends every token request that resumes from its generated
-//!    tokens as migratable and executes nothing more, keeping its memory and
+//!    tokens as migratable and executes nothing more, keeping its storage and
 //!    its prefix cache index), and the successor imports that index into
 //!    the units it maps and serves: every migrated request is submitted
 //!    again with the tokens it generated and reuses the pages of every
@@ -32,16 +32,16 @@
 //!    again.
 //! 3. **Trial.** The successor executes; the previous world is kept as
 //!    `update_config.previous_world` states: parked, its weights alone, or
-//!    its weights in host memory. The trial ends only with the operator's
+//!    its weights in host storage. The trial ends only with the operator's
 //!    commit, and rolls back by itself on a fault of the successor (a fatal
 //!    worker error, its engine process's exit, a stalled job, non-finite
 //!    logits) or past a threshold of `update_config.rollback`.
 //! 4. **Commit** or **rollback.** A commit releases the previous world: its
 //!    processes exit, the successor takes the segments it mapped read-only
-//!    and retires the previous world's memory, and grows its cache into the
-//!    memory freed. A rollback parks and closes the successor, resumes the
+//!    and retires the previous world's storage, and grows its cache into the
+//!    storage freed. A rollback parks and closes the successor, resumes the
 //!    previous world (or starts it again on its kept weights), retires the
-//!    successor's memory, and marks the configuration unavailable: applying
+//!    successor's storage, and marks the configuration unavailable: applying
 //!    it again needs `force`.
 
 use std::collections::BTreeMap;
@@ -156,10 +156,10 @@ pub(crate) struct Trial {
     pub(crate) cache_backup: Vec<storage::manifest::cache::Snapshot>,
     /// The previous world's retention mode, as the status reports it: the
     /// mode the update asked for, or `weights` when its weights could not
-    /// move to host memory.
+    /// move to host storage.
     pub(crate) mode: PreviousWorld,
     /// Why the previous world's weights stayed on the GPUs when the update
-    /// asked to keep them in host memory: each node's refusal.
+    /// asked to keep them in host storage: each node's refusal.
     pub(crate) host_refused: Option<String>,
     pub(crate) promoted: Instant,
     pub(crate) promoted_at: f64,
@@ -372,7 +372,7 @@ const TRIAL_POLL: Duration = Duration::from_millis(500);
 /// How long the closed engine of a world takes to exit.
 const CLOSED_EXIT: Duration = Duration::from_secs(60);
 
-/// How long the status waits for the memory ledgers, which each node's
+/// How long the status waits for the storage ledgers, which each node's
 /// daemon reads from its Storage Server.
 const LEDGER_READ: Duration = Duration::from_secs(10);
 
@@ -548,7 +548,7 @@ fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'stat
     };
     differs("the deployment", served.deployment == target.deployment);
     differs("the host", served.host == target.host);
-    // The queue depth and memory fraction of the same ranks.
+    // The queue depth and storage fraction of the same ranks.
     let sizing = |spec: &wire::EngineSpec| {
         spec.placement.as_ref().map(|placement| {
             (
@@ -640,14 +640,14 @@ fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 
 /// Whether a world succeeding the one `running` executes, which adds
 /// `successor` beside what it shares with it, fits beside it on every
-/// device, from each GPU's memory ledger: the report `PUT
+/// device, from each GPU's storage ledger: the report `PUT
 /// /admin/config` plans with, and the refusal when it does not fit. The
 /// serving engine computes, for each worker that holds the KV cache, what
 /// the serving world, the successor and the Transfer Server hold on its GPU
 /// and the KV cache limit that leaves the serving world, and fails, with
 /// every item of every GPU and host, when a limit cannot hold the segments
 /// the serving world keeps in any case.
-async fn memory_plan(
+async fn storage_plan(
     running: &[Arc<EngineClient>],
     successor: &mut Successor,
     budgets: &BTreeMap<storage::manifest::Gpu, storage::manifest::weights::RankBudget>,
@@ -693,7 +693,7 @@ async fn memory_plan(
         .map(|plans| plans.into_iter().flatten().collect::<Vec<_>>());
         match plans {
             Ok(results) => {
-                let report = match memory_report(
+                let report = match storage_report(
                     &results,
                     previous_world,
                     policy,
@@ -725,18 +725,18 @@ async fn memory_plan(
     )
 }
 
-/// The memory report of the engine's per-device plans (`ledger::Preparing`
+/// The storage report of the engine's per-device plans (`ledger::Preparing`
 /// of the engine, as JSON) for a successor that adds `successor` and a
 /// previous world kept as `previous_world`: each GPU's, with what each
 /// step of `specs/online-operations.md` §6.5 frees there ([`steps`]), and
-/// each host's admission of new host memory. A successor sharing the
+/// each host's admission of new host storage. A successor sharing the
 /// serving world's page pools needs none; a previous world kept in host
-/// memory moves there the weights a successor that loads its own does not
+/// storage moves there the weights a successor that loads its own does not
 /// map (all of the serving world's on each GPU, at most), which each host's
 /// admission must hold, or they stay on the GPUs. Host staging accounts for
 /// source rollback copies and assigned target rank reservations separately;
 /// target-only hosts are queried through their existing process ledger.
-async fn memory_report(
+async fn storage_report(
     plans: &[String],
     previous_world: PreviousWorld,
     successor: Successor,
@@ -761,13 +761,13 @@ async fn memory_report(
             weights.insert((host.to_owned(), device.to_owned()), bytes);
         }
     }
-    let mut memory = BTreeMap::<String, storage::protocol::HostMemory>::new();
+    let mut storage = BTreeMap::<String, storage::protocol::HostStorage>::new();
     let mut staging = BTreeMap::<String, u64>::new();
     for gpu in &gpus {
-        let (Some(host), Some(available)) = (gpu["host"].as_str(), gpu.get("host_memory")) else {
+        let (Some(host), Some(available)) = (gpu["host"].as_str(), gpu.get("host_storage")) else {
             continue;
         };
-        memory.entry(host.to_owned()).or_insert(
+        storage.entry(host.to_owned()).or_insert(
             serde_json::from_value(available.clone()).map_err(|error| error.to_string())?,
         );
         if successor.host_cache {
@@ -796,13 +796,13 @@ async fn memory_report(
         }
         let missing: Vec<_> = staging
             .keys()
-            .filter(|host| !memory.contains_key(*host))
+            .filter(|host| !storage.contains_key(*host))
             .cloned()
             .collect();
         if !missing.is_empty() {
             let control = Arc::clone(control);
-            memory.extend(
-                tokio::task::spawn_blocking(move || control.host_memory(&missing))
+            storage.extend(
+                tokio::task::spawn_blocking(move || control.host_storage(&missing))
                     .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())?,
@@ -810,8 +810,8 @@ async fn memory_report(
         }
     }
     let mut hosts = Vec::new();
-    for (host, memory) in memory {
-        let room = memory.room();
+    for (host, storage) in storage {
+        let room = storage.room();
         let staged = staging.get(&host).copied().unwrap_or(0);
         let required: u64 = staged
             + if weights_to_host {
@@ -825,9 +825,9 @@ async fn memory_report(
             };
         hosts.push(serde_json::json!({
             "host": host,
-            "available": memory.available,
-            "reserve": memory.reserve,
-            "unallocated": memory.unallocated,
+            "available": storage.available,
+            "reserve": storage.reserve,
+            "unallocated": storage.unallocated,
             "admits": room,
             "required": required,
             "cache_staging": staged,
@@ -848,7 +848,7 @@ async fn memory_report(
 /// What each step of `specs/online-operations.md` §6.5 frees on the GPU of
 /// the plan `gpu` (`ledger::Preparing` of the engine), in bytes, and the
 /// promotion stall of moving the requests' KV cache in flight through host
-/// memory (step 3), for a successor that adds `successor` and a previous
+/// storage (step 3), for a successor that adds `successor` and a previous
 /// world kept as `previous_world`. In the preparing phase: the idle cached
 /// pages of the tail the serving world gives back (step 1), the rest of
 /// that tail (step 2), the warm copies a successor that recomputes the
@@ -856,9 +856,9 @@ async fn memory_report(
 /// world's graph pool (step 4). In the trial: the previous world's KV cache
 /// segments the successor does not map, past its first (step 5, a parked
 /// previous world), its weights the successor does not map (step 6, kept in
-/// host memory), and its processes' graph pool, process memory and
+/// host storage), and its processes' graph pool, process storage and
 /// exclusive storages with those segments (step 7, kept as its weights or
-/// in host memory).
+/// in host storage).
 fn steps(
     gpu: &serde_json::Value,
     previous_world: PreviousWorld,
@@ -1027,7 +1027,7 @@ impl Leader {
             .find(|client| matches!(client.state(), EngineState::Ready | EngineState::Parked));
         let ledgers = match client {
             Some(client) => {
-                match tokio::time::timeout(LEDGER_READ, client.describe_memory()).await {
+                match tokio::time::timeout(LEDGER_READ, client.describe_storage()).await {
                     Ok(Ok(nodes)) => serde_json::Value::Array(
                         nodes
                             .iter()
@@ -1469,12 +1469,12 @@ impl Replica {
             }
         }
         // A change a new world executes is checked against every device's
-        // memory ledger first: the serving world's KV cache limit beside a
+        // storage ledger first: the serving world's KV cache limit beside a
         // successor, with the weights it creates, per GPU and host
         // (`specs/online-operations.md` §6.6).
-        let memory = if world_changes && !in_place && unmapped.is_empty() && shared_devices {
+        let storage = if world_changes && !in_place && unmapped.is_empty() && shared_devices {
             Some(
-                memory_plan(
+                storage_plan(
                     std::slice::from_ref(&running),
                     &mut successor,
                     &budgets,
@@ -1503,7 +1503,7 @@ impl Replica {
             "reloads": reloaded,
             "differs": unmapped,
             "in_flight_requests": running.in_flight(),
-            "memory": memory.as_ref().map(|(plan, _)| plan),
+            "storage": storage.as_ref().map(|(plan, _)| plan),
             "redistribution": redistribution.as_ref().map(|planned| &planned.report),
         });
         if request.dry_run {
@@ -1580,7 +1580,7 @@ impl Replica {
         }
         // A successor that does not fit beside the serving world on some
         // GPU is refused before anything starts, naming each item there.
-        if let Some((_, Some(refusal))) = memory {
+        if let Some((_, Some(refusal))) = storage {
             return Err(UpdateError::Refused(refusal));
         }
         let redistribution = match redistribution {
@@ -1642,7 +1642,7 @@ impl Replica {
         let started = Instant::now();
         let previous_world = running.world();
         let shared_devices = !devices(&served)?.is_disjoint(&devices(&spec)?);
-        // The serving world gives its graph memory to the successor's
+        // The serving world gives its graph storage to the successor's
         // captures first, so the shrink that follows leaves it to the
         // successor.
         let eager_since = if update.eager_prepare {
@@ -1689,7 +1689,7 @@ impl Replica {
             }
         };
         let control = self.control.get().ok_or(UpdateError::NoEngine)?;
-        let memory = memory_report(
+        let storage = storage_report(
             &shrunk,
             update.previous_world,
             adds,
@@ -1705,7 +1705,7 @@ impl Replica {
                 Err(report.to_string())
             }
         });
-        let memory = match memory {
+        let storage = match storage {
             Ok(report) => report,
             Err(error) => {
                 self.restore_tail(running).await;
@@ -1887,7 +1887,7 @@ impl Replica {
             Ok(index) => index,
             Err(error) => {
                 // The serving world serves on: it resumes, and the successor
-                // closes with its memory.
+                // closes with its storage.
                 hold.keep(None);
                 let _ = running.resume(vec![world]).await;
                 hold.serve(Arc::clone(running));
@@ -1906,7 +1906,7 @@ impl Replica {
             || warmed
                 .as_ref()
                 .is_some_and(|report| report.recompute.is_some());
-        // A previous world kept parked keeps its memory until the commit; one
+        // A previous world kept parked keeps its storage until the commit; one
         // kept as its weights frees the rest as the successor serves.
         let grows = update.previous_world != PreviousWorld::Parked;
         let index = if adds.unmapped_cache {
@@ -1982,11 +1982,11 @@ impl Replica {
                 Previous::Weights
             }
         };
-        // The successor's cache grows into the memory the previous world
+        // The successor's cache grows into the storage the previous world
         // freed: a previous world kept as its weights released, with its
-        // processes, their graph pools and process memory, and keeps its
+        // processes, their graph pools and process storage, and keeps its
         // weights alone, so every other storage of it the successor does
-        // not map is released first; kept in host memory, its weights that
+        // not map is released first; kept in host storage, its weights that
         // the successor does not map move there too. Each GPU's ledger
         // leaves the successor all of it at once. A node that cannot move
         // the weights (no Transfer Server, or more than the host admits)
@@ -2085,7 +2085,7 @@ impl Replica {
             },
             "kv_cache": if recompute { "recomputed" } else if warmed.is_some() { "warmed" } else { "mapped" },
             "cache_warming": warmed,
-            "memory": memory,
+            "storage": storage,
         });
         {
             served.cache_keys = warmed
@@ -2347,7 +2347,7 @@ pub(crate) async fn rollback(
                 replica.ordinal,
             );
             // The world on trial, closed, is retired before the previous
-            // world's workers start: they need its memory (weights of its
+            // world's workers start: they need its storage (weights of its
             // own included) within the deployment's quota.
             let spec = wire::EngineSpec {
                 retire: vec![trial.world],
@@ -2544,7 +2544,7 @@ mod tests {
                     kind: Some(reply::Kind::Ledger(process::LedgerReport {
                         ledgers: serde_json::json!({
                             "ledgers": [],
-                            "host_memory": {"available": 800, "reserve": 100, "unallocated": 100},
+                            "host_storage": {"available": 800, "reserve": 100, "unallocated": 100},
                         }).to_string(),
                     })),
                 })),
@@ -2583,10 +2583,10 @@ mod tests {
             "host": "source", "gpu": "GPU-source", "feasible": true,
             "in_flight_kv": 200,
             "host_staging": 900,
-            "host_memory": {"available": 1000, "reserve": 100, "unallocated": 0},
+            "host_storage": {"available": 1000, "reserve": 100, "unallocated": 0},
         })
         .to_string()];
-        let report = memory_report(
+        let report = storage_report(
             &plans,
             PreviousWorld::Parked,
             Successor {

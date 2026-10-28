@@ -35,19 +35,19 @@ pub struct PrefixCacheInfo {
     /// serves, so the engine never allocates them.
     pub scratch_units: u32,
     /// The segments the rank's value planes are made of, in unit order, each
-    /// of whole units that give memory back and are created again whole;
+    /// of whole units that give storage back and are created again whole;
     /// empty for planes not split.
     #[serde(default)]
     pub segments: Vec<CacheSegment>,
     /// The segments the planes hold, `[0, held_segments)`: the engine
-    /// allocates no unit of the segments after, whose memory was given back.
+    /// allocates no unit of the segments after, whose storage was given back.
     #[serde(default)]
     pub held_segments: u32,
     /// The units the planes map read-only from the predecessor world's
     /// planes, `[inherited_start, inherited_start + inherited_units)`: they
     /// hold the predecessor's pages, which the engine reads once its index
     /// is imported and allocates only once the predecessor is gone and the
-    /// rank took its memory; zero for planes of their own.
+    /// rank took its storage; zero for planes of their own.
     #[serde(default)]
     pub inherited_start: u32,
     #[serde(default)]
@@ -97,7 +97,7 @@ impl PrefixCacheInfo {
 /// every plane, which a world created and the Storage Server retains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheSegment {
-    /// The world that created the segment's memory.
+    /// The world that created the segment's storage.
     pub world: u64,
     /// The segment's ordinal among those its world created.
     pub ordinal: u32,
@@ -372,7 +372,7 @@ impl PrefixCacheInfo {
                 identities.sort_unstable();
                 identities.join("+")
             },
-            // Stages whose planes split alike give memory back together;
+            // Stages whose planes split alike give storage back together;
             // planes split otherwise hold every unit and give back none.
             segments: if self.segments == other.segments {
                 self.segments.clone()

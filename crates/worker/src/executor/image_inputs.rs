@@ -23,8 +23,8 @@ use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::host::image::{ImageResult, ImageTask, ImageWork};
 use crate::host::{HostPool, HostTask};
-use crate::memory::PinnedPool;
-use crate::memory::allocation::StorageView;
+use crate::storage::PinnedPool;
+use crate::storage::allocation::StorageView;
 use crate::{Error, Outcome, Result};
 
 /// The Python class whose static methods prepare request images.

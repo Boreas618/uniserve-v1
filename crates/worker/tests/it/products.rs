@@ -1,4 +1,4 @@
-//! Product storage lifetimes, imports and exports on host memory.
+//! Product storage lifetimes, imports and exports on host storage.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -11,8 +11,8 @@ use ipc::{
 };
 use ipc::{CallId, RequestId};
 use worker::ffi::MemoryKind;
-use worker::memory::LocalMemory;
-use worker::memory::{BufferPool, OutputPlacement, ProductBuffer, ProductStore, StorageView};
+use worker::storage::LocalStorage;
+use worker::storage::{BufferPool, OutputPlacement, ProductBuffer, ProductStore, StorageView};
 use worker::transfer::exports;
 use worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
 use worker::{EventPool, Result};
@@ -54,7 +54,7 @@ fn store(pool_bytes: u64, request_capacity: usize, relay_depth: usize) -> Result
         vec![CPU],
         request_capacity,
         relay_depth,
-        BufferPool::allocate(pool_bytes, &[CPU], &mut LocalMemory)?,
+        BufferPool::allocate(pool_bytes, &[CPU], &mut LocalStorage)?,
         EventPool::new(),
     )
 }
@@ -417,7 +417,7 @@ fn a_released_import_leaves_its_product_importable() -> Result<()> {
         allocations: Some(&allocations),
         ..OutputPlacement::default()
     };
-    let import = |placement| -> Result<Arc<worker::memory::ProductRead>> {
+    let import = |placement| -> Result<Arc<worker::storage::ProductRead>> {
         let read =
             consumer.import_tensor(&product, tensor, CPU, &transports, placement, None, None)?;
         for transfer in read.reads() {

@@ -95,7 +95,7 @@ pub struct WorkerGroupConfig {
     /// Maximum number of physical runs in flight per rank, launched as
     /// `WorkerProcessArgs::queue_depth`.
     pub queue_depth: usize,
-    /// Per-rank share of device memory available to this worker process for
+    /// Per-rank share of device storage available to this worker process for
     /// static allocations (weights and KV cache).
     ///
     /// When set, `SchedulerHandle::start_all` launches the group's ranks with it as
@@ -134,7 +134,7 @@ impl WorkerGroupConfig {
         Ok(())
     }
 
-    /// Checks a per-process static memory fraction: a group's
+    /// Checks a per-process static storage fraction: a group's
     /// `mem_fraction_static` or the engine-wide
     /// `WorkerProcessArgs::mem_fraction_static` default.
     ///
@@ -409,7 +409,7 @@ pub struct EngineConfig {
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
     /// The world the engine executes (`EngineSpec::world`): its workers'
-    /// memory is keyed and retained under it.
+    /// storage is keyed and retained under it.
     pub world: u64,
     /// The KV cache of each worker group of the predecessor world, by group
     /// identity; `None` for an engine that succeeds none. The engine's
@@ -1069,7 +1069,7 @@ impl SchedulerHandle {
     ///
     /// # Errors
     ///
-    /// Fails when the world's own cache, grown into the predecessor's memory
+    /// Fails when the world's own cache, grown into the predecessor's storage
     /// freed at once when it `grows`, cannot hold the requests the
     /// predecessor hands over (which `recompute` from their tokens or not),
     /// a worker refuses or dies, or the scheduler has stopped.
@@ -1226,7 +1226,7 @@ impl SchedulerHandle {
     }
 
     /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
-    /// workers, which the deployment's claims cover, in host memory when
+    /// workers, which the deployment's claims cover, in host storage when
     /// `to_host`; the receiver gets each node's report.
     pub fn keep_weights(
         &self,
@@ -1237,7 +1237,7 @@ impl SchedulerHandle {
         self.commands.keep_weights(worlds, to_host, cache_keys)
     }
 
-    /// Reads the memory ledgers of the nodes of the scheduler's workers,
+    /// Reads the storage ledgers of the nodes of the scheduler's workers,
     /// which the deployment's claims cover; the receiver gets each node's
     /// as JSON.
     pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
@@ -1261,7 +1261,7 @@ impl SchedulerHandle {
     }
 
     /// Commits the scheduler's world, which succeeded another: its workers
-    /// take the predecessor's memory they mapped read-only, and its groups
+    /// take the predecessor's storage they mapped read-only, and its groups
     /// relaunch on a loss from then on. The receiver gets what each worker
     /// reported.
     pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
@@ -1315,7 +1315,7 @@ impl SchedulerHandle {
         self.commands.commit_experts(order, together)
     }
 
-    /// Gives back or restores KV cache memory; the receiver gets what each
+    /// Gives back or restores KV cache storage; the receiver gets what each
     /// worker reported, or why the change failed.
     pub fn resize_cache(
         &self,

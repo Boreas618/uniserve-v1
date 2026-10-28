@@ -4,7 +4,7 @@ One persistent kernel per expert layer and rank of an expert group
 dispatches each token to the ranks holding its experts, runs the W4A4 FC1
 GEMM, the gated activation on the dequantized FC1 products, the NVFP4
 encoding of the gated product, the FC2 GEMM, and returns the partial sums
-to the token's rank, over NVSHMEM symmetric memory. It is FlashInfer's
+to the token's rank, over NVSHMEM symmetric storage. It is FlashInfer's
 MegaMoE (``moe_ep/kernel_src/cutedsl_megamoe``), vendored in
 ``uniserve_kernels.megamoe`` with the gated activation extended to
 tanh-approximated GELU (``up * gate * sigmoid(sqrt(8/pi) * (gate +
@@ -68,7 +68,7 @@ def _initialize_nvshmem(
             raise RuntimeError("NVSHMEM already serves another expert group")
         return
 
-    # This provider exchanges through directly mapped NVLink peer memory.
+    # This provider exchanges through directly mapped NVLink peer storage.
     # NVSHMEM's default IBRC transport would initialize unused RDMA endpoints,
     # even on an NVLink-only deployment. Keep explicit operator settings.
     os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
@@ -289,7 +289,7 @@ class _MegaMoE(NVFP4Operator):
         if hidden.shape[0] > buffer.max_tokens:
             raise ValueError("routed tokens exceed the MegaMoE buffer")
 
-        # Copy values, linear block scales, and routes into symmetric memory.
+        # Copy values, linear block scales, and routes into symmetric storage.
         # Already-encoded rows retain their bytes; BF16 rows use the shared
         # NVFP4 encoder. The launch reads only this call's token extent.
         symmetric = buffer.symmetric

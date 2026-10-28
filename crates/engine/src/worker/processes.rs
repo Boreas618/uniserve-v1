@@ -35,9 +35,9 @@ use proto::process::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Longest the leader takes to answer a request that may move a world's
-/// weights between a node's GPUs and its host memory (a claim, which
-/// returns them, and keeping them in host memory): the node's Transfer
-/// Server registers host memory of every GPU's weights and copies them
+/// weights between a node's GPUs and its host storage (a claim, which
+/// returns them, and keeping them in host storage): the node's Transfer
+/// Server registers host storage of every GPU's weights and copies them
 /// over the node's host links.
 const MOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -284,7 +284,7 @@ impl ProcessClient {
     }
 
     /// Has node `host`'s daemon keep the weights alone of `worlds` of
-    /// `deployment` at its Storage Server, in host memory when `to_host`;
+    /// `deployment` at its Storage Server, in host storage when `to_host`;
     /// returns what it released and moved, and why it kept the weights on
     /// its GPUs when it could not move them.
     ///
@@ -346,7 +346,7 @@ impl ProcessClient {
         }
     }
 
-    /// The memory ledgers node `host`'s Storage Server keeps for
+    /// The storage ledgers node `host`'s Storage Server keeps for
     /// `deployment`, as its daemon reads them over its claim: JSON of the
     /// server's `Ledger` answer.
     ///
@@ -359,7 +359,7 @@ impl ProcessClient {
                 host: host.to_owned(),
                 deployment: deployment.to_owned(),
             }))
-            .with_context(|| format!("reading the memory ledgers of host {host}"))?
+            .with_context(|| format!("reading the storage ledgers of host {host}"))?
         {
             reply::Kind::Ledger(report) => Ok(report.ledgers),
             other => anyhow::bail!("the daemon answered a ledger query with {other:?}"),
@@ -367,7 +367,7 @@ impl ProcessClient {
     }
 
     /// Has node `host`'s daemon claim `deployment`'s `scopes` there for
-    /// `world`, ending the memory of the worlds `retirement` names, and
+    /// `world`, ending the storage of the worlds `retirement` names, and
     /// returns the claim's storage launch.
     ///
     /// # Errors
@@ -418,7 +418,7 @@ impl ProcessClient {
             world,
             // The engine states whether a group stands by, and how.
             standby: false,
-            standby_memory: proto::request::StandbyMemory::Auto,
+            standby_storage: proto::request::StandbyStorage::Auto,
         })
     }
 

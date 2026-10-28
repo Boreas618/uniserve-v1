@@ -12,8 +12,8 @@ use cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
 
 use super::grants::{DescriptorGrants, EXPORT_NAME_BYTES};
 use super::handle::AllocationHandle;
-use crate::memory::allocation::Storage;
 use crate::parallel::host::HostGroup;
+use crate::storage::allocation::Storage;
 use crate::{Error, Result};
 
 /// The export name under which a rank serves its peer allocation; a grant
@@ -93,7 +93,7 @@ impl PeerStorage {
         let local = Storage::retained_device(device, bytes)?;
         let allocation: &DeviceAllocation = local
             .allocation()
-            .ok_or_else(|| Error::Invariant("peer storage is device memory".into()))?;
+            .ok_or_else(|| Error::Invariant("peer storage is device storage".into()))?;
         let rounded = allocation.len();
         let handle = allocation
             .export()?

@@ -20,7 +20,7 @@ rotation, so steps and idle joins share one :class:`ExpertAgreement`.
 
 Construction is collective and happens at the same point of every member's
 startup, after loading and before capacity planning, so the exchanges'
-device workspaces are resident when the rank measures its free memory.
+device workspaces are resident when the rank measures its free storage.
 Warmup reaches the same collectives in the same order on every member: the
 runners capture their graphs (each capture's eager warmup an expert step the
 sources announce), then :meth:`ExpertUnion.finish_warmup` lets dedicated
@@ -100,7 +100,7 @@ class ExpertUnion:
         self._joins: JoinGraphs | None = None
         self._microbatch_joins: list[JoinGraphs] = []
         # The captured joins and microbatch joins an eager union set aside
-        # (:meth:`run_eager`); their pools' memory is given back meanwhile.
+        # (:meth:`run_eager`); their pools' storage is given back meanwhile.
         self._eager_joins: tuple[JoinGraphs, list[JoinGraphs]] | None = None
         self._warming = True
         self._closed = False
@@ -419,7 +419,7 @@ class ExpertUnion:
 
         With the joins set aside, this rank's forwards run eagerly too
         (:meth:`replays`), so every rank of the union submits in the same
-        rotation; the worker gives the joins' graph memory back meanwhile.
+        rotation; the worker gives the joins' graph storage back meanwhile.
         Every rank of the union switches between the same two steps.
         """  # noqa: D205
         # Both kinds of captured join live in the join pools the worker

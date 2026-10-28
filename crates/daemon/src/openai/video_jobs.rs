@@ -12,7 +12,7 @@
 //!
 //! - `max_bytes` of artifact bytes, counting artifacts retained by
 //!   a job and artifacts held by an unfinished download. Retained artifacts
-//!   are shared-memory mappings, so this is the memory the store may hold.
+//!   are shared-storage mappings, so this is the storage the store may hold.
 //! - `retention`, after which a completed or failed job's record is deleted.
 //!
 //! A hot restart hands the store's records and artifacts to the successor
@@ -195,7 +195,7 @@ pub(crate) struct RetainedMedia {
 }
 
 impl RetainedMedia {
-    /// The shared-memory object holding the bytes, when they have one.
+    /// The shared-storage object holding the bytes, when they have one.
     pub(crate) fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.media.descriptor()
     }

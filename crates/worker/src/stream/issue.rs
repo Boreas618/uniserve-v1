@@ -51,11 +51,11 @@ pub struct RowFill {
 
 /// What a function issues stream work to. See the module documentation.
 pub trait Issue: Copy {
-    /// What issues writes of host memory in this issuer's order.
+    /// What issues writes of host storage in this issuer's order.
     type Host: Issue;
 
     /// The stream the work is issued on; `None` for host storage, whose
-    /// work is plain memory writes.
+    /// work is plain storage writes.
     fn stream(&self) -> Option<&Stream>;
 
     /// The issuer of writes between host ranges, which no stream carries:
@@ -66,7 +66,7 @@ pub trait Issue: Copy {
     ///
     /// # Safety
     /// Every destination stays valid until the copies ran. A source of a
-    /// [`cuda::SourceOrder::DuringCall`] batch is host memory
+    /// [`cuda::SourceOrder::DuringCall`] batch is host storage
     /// readable during this call, and need not outlive it; a source of a
     /// [`cuda::SourceOrder::Stream`] batch stays valid until the
     /// copies ran.
@@ -87,8 +87,8 @@ pub trait Issue: Copy {
     /// `cuMemsetD2D32Async`).
     ///
     /// # Safety
-    /// Every row holds `fill.count` aligned elements in the memory of the
-    /// stream's device (host memory without a stream) and stays valid until
+    /// Every row holds `fill.count` aligned elements in the storage of the
+    /// stream's device (host storage without a stream) and stays valid until
     /// the fill ran.
     unsafe fn memset_2d(&self, fill: RowFill) -> Result<()>;
 
@@ -111,7 +111,7 @@ pub trait Issue: Copy {
     fn call(&self, call: DeferredCall) -> Result<()>;
 
     /// Run `function` once the work issued before it completed. It touches
-    /// host memory only: it neither calls CUDA nor blocks. Without a stream
+    /// host storage only: it neither calls CUDA nor blocks. Without a stream
     /// it runs in the order of this issuer's host writes.
     fn launch_host_fn(&self, function: HostFunction) -> Result<()>;
 
@@ -137,7 +137,7 @@ pub(crate) type HostFunction = Box<dyn FnOnce() + Send>;
 /// Copy the entries of `copies` between host ranges.
 ///
 /// # Safety
-/// Every range is valid host memory and no destination overlaps a source.
+/// Every range is valid host storage and no destination overlaps a source.
 unsafe fn copy_host(copies: &CopyBatch) {
     for (destination, source, bytes) in copies.iter() {
         // SAFETY: forwarded from the caller.
@@ -147,10 +147,10 @@ unsafe fn copy_host(copies: &CopyBatch) {
     }
 }
 
-/// Write `fill` into host memory.
+/// Write `fill` into host storage.
 ///
 /// # Safety
-/// The destination is valid host memory of `fill.count` elements.
+/// The destination is valid host storage of `fill.count` elements.
 unsafe fn fill_host(fill: Fill) {
     if fill.width == 1 {
         // SAFETY: forwarded from the caller.
@@ -198,10 +198,10 @@ unsafe fn fill_device(fill: Fill, stream: &Stream) -> Result<()> {
     Ok(())
 }
 
-/// Write the rows of `fill` into host memory.
+/// Write the rows of `fill` into host storage.
 ///
 /// # Safety
-/// Every row is valid host memory of `fill.count` elements.
+/// Every row is valid host storage of `fill.count` elements.
 unsafe fn fill_host_rows(fill: RowFill) {
     for row in 0..fill.height {
         // SAFETY: forwarded from the caller.
@@ -244,7 +244,7 @@ unsafe fn fill_device_rows(fill: RowFill, stream: &Stream) -> Result<()> {
     Ok(())
 }
 
-/// Issue at once: on the stream, or as host memory writes without one.
+/// Issue at once: on the stream, or as host storage writes without one.
 impl Issue for Option<&Stream> {
     type Host = Self;
 
@@ -261,7 +261,7 @@ impl Issue for Option<&Stream> {
             // SAFETY: forwarded from the caller.
             Some(stream) => unsafe { copies.submit(stream) }?,
             // SAFETY: forwarded from the caller; without a stream every
-            // range is host memory.
+            // range is host storage.
             None => unsafe { copy_host(copies) },
         }
         Ok(())

@@ -201,10 +201,10 @@ impl EngineConfig {
                 }),
             keep_standby: workers.standby,
             standby: false,
-            standby_memory: if workers.standby_memory.is_empty() {
-                proto::request::StandbyMemory::Auto
+            standby_storage: if workers.standby_storage.is_empty() {
+                proto::request::StandbyStorage::Auto
             } else {
-                named(&workers.standby_memory, "worker_config.standby_memory")?
+                named(&workers.standby_storage, "worker_config.standby_storage")?
             },
             segments: None,
             world: spec.world,

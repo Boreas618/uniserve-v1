@@ -8,8 +8,8 @@ ends the segment, begins the next and records the work, which every replay
 performs between the two segments.
 
 :func:`pool` creates the allocator pools graphs capture into: in a worker,
-a pool allocates from the device memory Rust reserved for it, through the
-worker library's allocator entry points for the pool's slot, so the memory
+a pool allocates from the device storage Rust reserved for it, through the
+worker library's allocator entry points for the pool's slot, so the storage
 keeps its addresses for as long as a graph captured in it lives. Importing
 this module does not initialize CUDA.
 """
@@ -112,16 +112,16 @@ _allocators: dict[tuple[str, int], Any] = {}
 def pool(device: int, slot: int | None = None, library: str = "") -> list[Any]:
     """Create one CUDA graph allocator pool on ``device``.
 
-    In a worker, Rust passes the ``slot`` of the device memory it reserved
+    In a worker, Rust passes the ``slot`` of the device storage it reserved
     for the pool and the path of the worker ``library``: the pool allocates
     its segments through the library's entry points of that slot
     (``uniserve_graph_malloc_<slot>`` and ``uniserve_graph_free_<slot>``).
-    Without a slot, the pool allocates from torch's own device memory.
+    Without a slot, the pool allocates from torch's own device storage.
 
     Returns:
         ``[pool, id_a, id_b, total_bytes]``: the pool (an opaque handle Rust
         passes to the executor's captures), its allocator id pair (which
-        names the pool in :func:`pool_bytes`) and the device's total memory,
+        names the pool in :func:`pool_bytes`) and the device's total storage,
         from which Rust derives the default graph budget.
     """
     device = int(device)

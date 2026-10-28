@@ -282,7 +282,7 @@ pub trait ArtifactMedia: std::fmt::Debug + Send + Sync {
     /// The artifact's bytes.
     fn bytes(&self) -> &[u8];
 
-    /// The shared-memory object holding the bytes, which another process
+    /// The shared-storage object holding the bytes, which another process
     /// maps; `None` for bytes held in this process alone.
     fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>>;
 }

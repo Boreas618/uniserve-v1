@@ -518,11 +518,11 @@ fn inherit_listener(command: &mut Command, listener: TcpListener) {
 ///
 /// A rank that ends in order destroys its CUDA contexts, which removes the
 /// shared memory the driver keeps for each context's interprocess events. A
-/// rank that is killed or crashes leaves that memory in `/dev/shm`, named
-/// for the rank's process id (`cuda::shm::remove_event_memory`), and the names of
-/// its NCCL communicators' proxy memory (`cuda::shm::NcclSegments`), which the
+/// rank that is killed or crashes leaves that storage in `/dev/shm`, named
+/// for the rank's process id (`cuda::shm::remove_event_storage`), and the names of
+/// its NCCL communicators' proxy storage (`cuda::shm::NcclSegments`), which the
 /// daemon notes while the rank lives. Every wait here therefore observes
-/// the exit first without reaping it, removes the memory named for the rank
+/// the exit first without reaping it, removes the storage named for the rank
 /// while its zombie still holds the process id, so that no live process can
 /// own those names, and the noted NCCL names, and then reaps it.
 ///
@@ -704,7 +704,7 @@ impl Child {
         // effort: the rank is reaped whatever it finds.
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let _ = cuda::shm::remove_event_memory(uid, self.id());
+        let _ = cuda::shm::remove_event_storage(uid, self.id());
         let _ = self.segments.remove();
         let exited = match &mut self.process {
             Process::Spawned(child) => Exited::Status(child.wait()?),
@@ -804,9 +804,9 @@ time.sleep(600)
         }
     }
 
-    /// The interprocess-event memory the driver created for process `pid`,
+    /// The interprocess-event storage the driver created for process `pid`,
     /// by its name in `/dev/shm` (`cuda.shm.<uid in hex>.<pid in hex>.<n>`).
-    fn event_memory(pid: u32) -> Vec<PathBuf> {
+    fn event_storage(pid: u32) -> Vec<PathBuf> {
         // SAFETY: getuid has no preconditions.
         let prefix = format!("cuda.shm.{:x}.{pid:x}.", unsafe { libc::getuid() });
         std::fs::read_dir("/dev/shm")
@@ -817,20 +817,20 @@ time.sleep(600)
             .collect()
     }
 
-    /// Starts an [`EVENT_HOLDER`] and waits until its event memory exists.
+    /// Starts an [`EVENT_HOLDER`] and waits until its event storage exists.
     fn hold_event() -> (Holder, Vec<PathBuf>) {
         let mut command = Command::new("python3");
         command.args(["-c", EVENT_HOLDER]);
         let holder = Holder(Child::spawn(&mut command).unwrap());
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let memory = event_memory(holder.0.id());
-            if !memory.is_empty() {
-                return (holder, memory);
+            let storage = event_storage(holder.0.id());
+            if !storage.is_empty() {
+                return (holder, storage);
             }
             assert!(
                 Instant::now() < deadline,
-                "the holder created no event memory"
+                "the holder created no event storage"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -874,22 +874,22 @@ time.sleep(600)
 
     /// A rank killed by someone else is reaped by polling, as the daemon
     /// polls its children, and one killed by its parent is reaped by
-    /// waiting: either way no memory named for the dead rank remains, while
+    /// waiting: either way no storage named for the dead rank remains, while
     /// a live rank's stays.
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn a_killed_rank_leaves_no_event_memory_once_reaped() {
-        let (mut killed, killed_memory) = hold_event();
-        let (mut live, live_memory) = hold_event();
+    fn a_killed_rank_leaves_no_event_storage_once_reaped() {
+        let (mut killed, killed_storage) = hold_event();
+        let (mut live, live_storage) = hold_event();
 
         assert_eq!(kill_and_poll(&mut killed).signal(), Some(libc::SIGKILL));
         assert!(
-            killed_memory.iter().all(|path| !path.exists()),
-            "{killed_memory:?} outlived its rank"
+            killed_storage.iter().all(|path| !path.exists()),
+            "{killed_storage:?} outlived its rank"
         );
         assert!(
-            live_memory.iter().all(|path| path.exists()),
-            "a live rank lost {live_memory:?}"
+            live_storage.iter().all(|path| path.exists()),
+            "a live rank lost {live_storage:?}"
         );
 
         live.0.kill().unwrap();
@@ -898,8 +898,8 @@ time.sleep(600)
             Some(libc::SIGKILL)
         );
         assert!(
-            live_memory.iter().all(|path| !path.exists()),
-            "{live_memory:?} outlived its rank"
+            live_storage.iter().all(|path| !path.exists()),
+            "{live_storage:?} outlived its rank"
         );
     }
 

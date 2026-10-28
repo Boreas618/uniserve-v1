@@ -381,7 +381,7 @@ impl VideoService {
     /// # Errors
     ///
     /// Returns `ServeError::Video` naming the field at fault, or failing
-    /// when processing's own resources or the shared-memory allocation fail,
+    /// when processing's own resources or the shared-storage allocation fail,
     /// and `ServeError::ContextLengthExceeded` for a presentation longer than
     /// the prompt capacity.
     pub async fn process(
@@ -468,7 +468,7 @@ fn condition_extent(condition: &models::video::VideoCondition) -> ConditionExten
 impl Presenter {
     /// Plans `fetched`, presents its prompt, which must fit
     /// `max_prompt_tokens`, and publishes each condition's media to shared
-    /// memory, which the request holds until the engine retires it.
+    /// storage, which the request holds until the engine retires it.
     fn present(
         &self,
         fetched: Fetched,

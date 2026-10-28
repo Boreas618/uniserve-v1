@@ -62,7 +62,7 @@ pub(crate) struct ExportTable {
     name: String,
     events: Arc<EventPool>,
     state: Mutex<Table>,
-    /// Shared-memory retirements that unregister CUDA host mappings run on this
+    /// Shared-storage retirements that unregister CUDA host mappings run on this
     /// host pool, created on first use.
     retirements: Mutex<Option<Arc<HostPool<SourceRetirement>>>>,
     wake: Mutex<Option<Wake>>,

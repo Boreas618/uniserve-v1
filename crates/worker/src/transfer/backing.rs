@@ -36,7 +36,7 @@ pub(crate) struct CudaSource {
 
 enum ExportBacking {
     /// Spans read in place by readers in this process, fenced by the
-    /// producer's event when they are device memory.
+    /// producer's event when they are device storage.
     Local {
         source: Spans,
         event: Option<Arc<Event>>,

@@ -124,7 +124,7 @@ pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
     CanvasSampling, CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams,
     ImageParamsError, ImagePixels, PixelRange, PrefixCacheDtype, PrefixCacheDtypeParseError,
-    RequestId, SamplingParams, SamplingParamsError, StandbyMemory, TokenLogprob,
+    RequestId, SamplingParams, SamplingParamsError, StandbyStorage, TokenLogprob,
 };
 pub use request::*;
 pub use tensor::*;

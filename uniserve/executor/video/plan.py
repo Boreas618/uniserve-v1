@@ -14,7 +14,7 @@ request's conditions take (its ``make_size``). A request whose size the
 denoiser or the plan does not serve is refused alone, for the reason the
 refusal states.
 
-A request's samples live in the latent pages the rank's memory owns
+A request's samples live in the latent pages the rank's storage owns
 (:class:`SamplePages`); its state tables and retained conditioning in slot
 rows sized for every layout the rank prepares (:class:`StateEnvelope`).
 """

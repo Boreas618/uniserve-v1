@@ -174,7 +174,7 @@ impl EngineControl {
                     }
                     Ok(wire::EngineState::Failed) => {
                         // The failed engine closes its workers and exits;
-                        // their memory is free once it has.
+                        // their storage is free once it has.
                         await_exit(&mut control, FAILED_EXIT);
                         anyhow::bail!("the engine failed to start: {}", state.error);
                     }
@@ -342,12 +342,12 @@ impl EngineControl {
 
     /// Reads host admission from the deployment's existing Storage Server
     /// claims, including target nodes with no serving worker yet.
-    pub(crate) fn host_memory(
+    pub(crate) fn host_storage(
         &self,
         hosts: &[String],
-    ) -> anyhow::Result<BTreeMap<String, storage::protocol::HostMemory>> {
+    ) -> anyhow::Result<BTreeMap<String, storage::protocol::HostStorage>> {
         let (mut connection, _) = self.connect()?;
-        let mut memory = BTreeMap::new();
+        let mut storage = BTreeMap::new();
         for (index, host) in hosts.iter().enumerate() {
             connection.send(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
@@ -360,28 +360,28 @@ impl EngineControl {
             })?;
             let answer: process::Downstream = connection
                 .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report its host memory")?;
+                .context("the daemon did not report its host storage")?;
             let Some(downstream::Kind::Reply(answer)) = answer.kind else {
                 anyhow::bail!("the daemon did not answer its ledger query");
             };
             anyhow::ensure!(
                 answer.error.is_empty(),
-                "host memory for {host}: {}",
+                "host storage for {host}: {}",
                 answer.error
             );
             let Some(reply::Kind::Ledger(report)) = answer.kind else {
-                anyhow::bail!("the daemon returned no memory ledger");
+                anyhow::bail!("the daemon returned no storage ledger");
             };
             #[derive(serde::Deserialize)]
             struct Ledger {
-                host_memory: storage::protocol::HostMemory,
+                host_storage: storage::protocol::HostStorage,
             }
-            memory.insert(
+            storage.insert(
                 host.clone(),
-                serde_json::from_str::<Ledger>(&report.ledgers)?.host_memory,
+                serde_json::from_str::<Ledger>(&report.ledgers)?.host_storage,
             );
         }
-        Ok(memory)
+        Ok(storage)
     }
 
     /// Publishes one commit decision at every deployment node. Publication

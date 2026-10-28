@@ -13,15 +13,15 @@
 //! | Event | [`Event`] | `cuEventDestroy` on drop |
 //! | Graph executable | [`GraphExec`] (borrowed) | by its owner |
 //! | Module loaded from PTX | [`Module`], [`Function`] | never: graphs keep calling its kernels |
-//! | Device memory | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
-//! | Host memory | [`PinnedBuffer`] (deferred), [`HostRegistration`] (synchronous) | on drop |
+//! | Device storage | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
+//! | Host storage | [`PinnedBuffer`] (deferred), [`HostRegistration`] (synchronous) | on drop |
 //! | NCCL | [`nccl::Communicator`] | explicit `destroy` |
 //! | NVML | [`Nvml`] | `nvmlShutdown` on drop |
 //!
 //! Device addresses are plain `u64` values (`CUdeviceptr`, unified with host
 //! pointers). Operations that read or write through an address are `unsafe`:
-//! the caller keeps the memory alive until the stream work completes.
-//! Releasing memory never synchronizes on the dropping thread; see
+//! the caller keeps the storage alive until the stream work completes.
+//! Releasing storage never synchronizes on the dropping thread; see
 //! [`reclaim`].
 
 mod context;

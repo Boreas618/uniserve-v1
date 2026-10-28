@@ -192,7 +192,7 @@ message Reserved {
 // Have a node's daemon hold the deployment's claim at its Storage Server,
 // starting the server when the node has none. The claim lasts as long as the
 // daemon: a later claim of the same scopes answers the claim held. The
-// world's weights that an earlier `KeepWeights` moved to host memory return
+// world's weights that an earlier `KeepWeights` moved to host storage return
 // to the GPUs they left before the claim is answered (the server's
 // `Restore`), so that a world starting again at a rollback finds them where
 // its workers map them.
@@ -208,7 +208,7 @@ message Claim {
   // The world whose scopes these are: the daemon's identity of the
   // processes that execute one configuration of the deployment.
   uint64 world = 5;
-  // Worlds of the deployment whose memory on the node ends: a world the
+  // Worlds of the deployment whose storage on the node ends: a world the
   // claiming one superseded at a commit, or one a rollback discarded.
   repeated uint64 retire = 6;
   reserved 7;
@@ -229,7 +229,7 @@ message Claimed {
   string tcp = 3;
 }
 
-// Read the memory ledgers the node's Storage Server keeps for the
+// Read the storage ledgers the node's Storage Server keeps for the
 // deployment: one per GPU of the node it uses, with every item booked
 // there. The daemon reads them over the claim it holds.
 message LedgerQuery {
@@ -243,7 +243,7 @@ message KeepWeights {
   string host = 1;
   string deployment = 2;
   repeated uint64 worlds = 3;
-  // The worlds keep their weights in host memory
+  // The worlds keep their weights in host storage
   // (`update_config.previous_world = "host"`): the weights each world alone
   // retains then move there through the server's Transfer Server (the
   // server's `Offload`). A node whose server cannot move them (it runs no
@@ -256,7 +256,7 @@ message KeepWeights {
 message WeightsKept {
   // The storages the server released.
   uint64 released = 1;
-  // With `to_host`: the bytes of weights moved to host memory, and why the
+  // With `to_host`: the bytes of weights moved to host storage, and why the
   // node kept them on its GPUs instead (empty when they moved).
   uint64 moved_bytes = 2;
   string refused = 3;
@@ -278,8 +278,8 @@ message TransfersThrottled {}
 
 message LedgerReport {
   // The Storage Server's `Ledger` answer as JSON: `{"ledgers": [...],
-  // "host_memory": {...}}` (the `storage` crate's `GpuLedger` and
-  // `HostMemory`).
+  // "host_storage": {...}}` (the `storage` crate's `GpuLedger` and
+  // `HostStorage`).
   string ledgers = 1;
 }
 

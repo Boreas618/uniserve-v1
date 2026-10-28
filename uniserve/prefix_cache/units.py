@@ -1,7 +1,7 @@
 """Unit-pool layout and borrowed views of paged K/V state with column planes.
 
 The pool is ``num_units`` equally sized allocation units. Every unit is
-ordinary memory; a serving owner reserves unit zero as the padding sentinel
+ordinary storage; a serving owner reserves unit zero as the padding sentinel
 that padding rows may read, and assigns the others. Each unit holds
 ``columns`` columns, and each column a key plane and a value plane of
 ``plane_bytes`` bytes. Every plane ``(column, field)`` is one contiguous

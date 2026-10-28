@@ -149,7 +149,7 @@ impl WorkerProcessArgs {
                 rank as u32,
                 StorageLaunch {
                     standby: self.standby,
-                    standby_memory: self.standby_memory,
+                    standby_storage: self.standby_storage,
                     world: self.world,
                     ..claims.launch(&self.ranks[rank].host)?
                 },
@@ -314,7 +314,7 @@ impl WorkerGroup {
             .any(|args| args.ranks.iter().any(|rank| rank.host != args.host));
         let registry = crate::worker::registry::WorkerRegistry::bind(remote)?;
         // Every node's Storage Server holds the deployment's claim before a
-        // worker starts there, so the workers find their retained memory
+        // worker starts there, so the workers find their retained storage
         // and the server shoots down processes of a previous claim first.
         let claims = Claims::claim(&arguments, &processes)?;
         let groups = launch_all(

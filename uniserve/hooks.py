@@ -10,7 +10,7 @@ JSON value. A hook no plugin implements fails, and the admin API answers so.
 
 These are extension points: UniServe implements none of them itself. Hooks
 named ``uniserve.*`` are the engine's own (sleep, wake, the KV cache's
-memory), which the worker runs without this module.
+storage), which the worker runs without this module.
 """
 
 from __future__ import annotations

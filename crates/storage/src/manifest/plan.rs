@@ -11,7 +11,7 @@ use super::{
     Request, Result, Side, Space, Staging,
 };
 use crate::Key;
-use crate::protocol::Memory;
+use crate::protocol::LinkEnd;
 
 /// The most tied GPU assignments whose transfers are planned to find the
 /// one whose busiest link finishes first: every assignment of up to five
@@ -106,9 +106,9 @@ struct Context<'r> {
     /// Source fields by logical tensor.
     sources: HashMap<&'r str, Vec<FieldRef>>,
     /// Source regions by GPU, retained allocation, byte offset and length.
-    chunks: HashMap<(Memory, Key, u64, u64), SourceChunk>,
+    chunks: HashMap<(LinkEnd, Key, u64, u64), SourceChunk>,
     /// Each measured link's bandwidth in bytes per second.
-    bandwidth: HashMap<(Memory, Memory), f64>,
+    bandwidth: HashMap<(LinkEnd, LinkEnd), f64>,
 }
 
 impl<'r> Context<'r> {
@@ -128,7 +128,7 @@ impl<'r> Context<'r> {
                 for (chunk, value) in held.chunks.iter().enumerate() {
                     chunks
                         .entry((
-                            value.binding.memory(source.gpu)?,
+                            value.binding.end(source.gpu)?,
                             value.key,
                             value.storage_offset,
                             value.length,
@@ -161,10 +161,10 @@ impl<'r> Context<'r> {
         // Host links retain their exact endpoint. GPU UUIDs name one
         // physical allocation across hosts, whether reached by fabric or
         // READ; the Transfer Server uses fabric when available.
-        let mut bandwidth: HashMap<(Memory, Memory), f64> = HashMap::new();
+        let mut bandwidth: HashMap<(LinkEnd, LinkEnd), f64> = HashMap::new();
         for measured in &request.links {
             let source = match &measured.link.source {
-                Memory::Remote { gpu: Some(gpu), .. } => Memory::Device { gpu: *gpu },
+                LinkEnd::Remote { gpu: Some(gpu), .. } => LinkEnd::Device { gpu: *gpu },
                 source => source.clone(),
             };
             let pair = (source, measured.link.destination.clone());
@@ -218,8 +218,8 @@ impl<'r> Context<'r> {
     }
 
     /// The available route follows the Transfer Server: a remote GPU can
-    /// use the fabric or READ, while remote host memory requires READ.
-    fn bandwidth(&self, pair: &(Memory, Memory)) -> Result<f64> {
+    /// use the fabric or READ, while remote host storage requires READ.
+    fn bandwidth(&self, pair: &(LinkEnd, LinkEnd)) -> Result<f64> {
         let bandwidth = self.bandwidth.get(pair).copied().unwrap_or(0.0);
         if bandwidth > 0.0 {
             Ok(bandwidth)
@@ -246,10 +246,10 @@ impl<'r> Context<'r> {
                         .chunks
                         .iter()
                         .all(|chunk| {
-                            chunk.binding.memory(rank.gpu).ok() == Some(Memory::Device { gpu })
+                            chunk.binding.end(rank.gpu).ok() == Some(LinkEnd::Device { gpu })
                         })
                         || !held.chunks.iter().all(|chunk| {
-                            chunk.binding.memory(Some(gpu)).ok() == Some(Memory::Device { gpu })
+                            chunk.binding.end(Some(gpu)).ok() == Some(LinkEnd::Device { gpu })
                         })
                     {
                         continue;
@@ -510,7 +510,7 @@ impl<'c, 'r> Draft<'c, 'r> {
                         context
                             .chunks
                             .get(&(
-                                chunk.binding.memory(Some(gpu)).ok()?,
+                                chunk.binding.end(Some(gpu)).ok()?,
                                 chunk.key,
                                 chunk.storage_offset,
                                 chunk.length,
@@ -1024,7 +1024,7 @@ impl<'c, 'r> Draft<'c, 'r> {
             .collect()
     }
 
-    /// Charge each retained chunk's actual memory link. A logical field
+    /// Charge each retained chunk's actual storage link. A logical field
     /// may span device pages, offloaded host pages, and remote pages; its
     /// rank's execution GPU does not determine where those bytes reside.
     fn traffic(
@@ -1032,7 +1032,7 @@ impl<'c, 'r> Draft<'c, 'r> {
         cell: &Cell,
         source: FieldRef,
         form: Form,
-    ) -> Result<BTreeMap<(Memory, Memory), u64>> {
+    ) -> Result<BTreeMap<(LinkEnd, LinkEnd), u64>> {
         let runs = match &cell.what {
             Block::Bytes(range) => vec![(
                 (
@@ -1054,9 +1054,9 @@ impl<'c, 'r> Draft<'c, 'r> {
             let mut row = 0;
             let mut done = 0;
             while row < rows {
-                let (source_memory, source_left) =
-                    self.memory_at(Side::Source, source, form, from + row * source_pitch + done)?;
-                let (target_memory, target_left) = self.memory_at(
+                let (source_storage, source_left) =
+                    self.storage_at(Side::Source, source, form, from + row * source_pitch + done)?;
+                let (target_storage, target_left) = self.storage_at(
                     Side::Target,
                     cell.target,
                     cell.form,
@@ -1075,7 +1075,7 @@ impl<'c, 'r> Draft<'c, 'r> {
                 } else {
                     ((length - done).min(source_left).min(target_left), 1)
                 };
-                *traffic.entry((source_memory, target_memory)).or_insert(0) += bytes * count;
+                *traffic.entry((source_storage, target_storage)).or_insert(0) += bytes * count;
                 if done == 0 && bytes == length {
                     row += count;
                 } else {
@@ -1090,13 +1090,13 @@ impl<'c, 'r> Draft<'c, 'r> {
         Ok(traffic)
     }
 
-    fn memory_at(
+    fn storage_at(
         &self,
         side: Side,
         field: FieldRef,
         form: Form,
         offset: u64,
-    ) -> Result<(Memory, u64)> {
+    ) -> Result<(LinkEnd, u64)> {
         let (world, gpu) = match side {
             Side::Source => (
                 &self.context.request.source,
@@ -1108,7 +1108,7 @@ impl<'c, 'r> Draft<'c, 'r> {
             ),
         };
         if form == Form::Canonical {
-            return Ok((Binding::Rank.memory(gpu)?, u64::MAX));
+            return Ok((Binding::Rank.end(gpu)?, u64::MAX));
         }
         let chunks = &world.ranks[field.rank as usize].storages[field.storage as usize].chunks;
         let index = chunks.partition_point(|chunk| chunk.offset + chunk.length <= offset);
@@ -1122,7 +1122,7 @@ impl<'c, 'r> Draft<'c, 'r> {
                 ))
             })?;
         Ok((
-            chunk.binding.memory(gpu)?,
+            chunk.binding.end(gpu)?,
             chunk.offset + chunk.length - offset,
         ))
     }

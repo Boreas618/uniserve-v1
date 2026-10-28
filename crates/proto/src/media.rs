@@ -1,5 +1,5 @@
 //! Media bytes between the processes of a node: published as named POSIX
-//! shared-memory objects ([`MediaSource`]), and passed by descriptor and
+//! shared-storage objects ([`MediaSource`]), and passed by descriptor and
 //! mapped read-only ([`MappedMedia`]).
 //!
 //! A video request's condition media travel from the daemon to the workers
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::request::ArtifactMedia;
 use crate::shared_memory::SharedMemory;
 
-/// Where published media lies: a POSIX shared-memory object, by its name
+/// Where published media lies: a POSIX shared-storage object, by its name
 /// without the leading `/`, and the byte count published in it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MediaLocator {
@@ -27,7 +27,7 @@ pub struct MediaLocator {
 }
 
 /// Media bytes this process published, under a fresh name, as a POSIX
-/// shared-memory object for other processes on this host to read.
+/// shared-storage object for other processes on this host to read.
 ///
 /// The daemon publishes each fetched condition this way; the worker's media
 /// reader opens the object by name, reads it and never unlinks it. The
@@ -40,7 +40,7 @@ pub struct MediaSource {
 }
 
 impl MediaSource {
-    /// Copies `bytes` into a new shared-memory object.
+    /// Copies `bytes` into a new shared-storage object.
     ///
     /// The object is created exclusively, readable and writable by its owner
     /// only, and physically reserved to exactly `bytes.len()` bytes.
@@ -89,7 +89,7 @@ impl PartialEq for MediaSource {
 
 impl Eq for MediaSource {}
 
-/// The first `bytes` bytes of a shared-memory object another process
+/// The first `bytes` bytes of a shared-storage object another process
 /// published and passed by descriptor, mapped read-only for as long as this
 /// value lives.
 #[derive(Debug)]

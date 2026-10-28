@@ -2,7 +2,7 @@
 
 The worker's storage harness (``crates/worker/examples/storage_harness.rs``,
 built with ``cargo build -p worker --example storage_harness``)
-allocates one cache in host memory, binds this package's cache interface to
+allocates one cache in host storage, binds this package's cache interface to
 it and drives it through installs, an export, an abandoned and an adopted
 import, a guidance prefix slot and the releases. After each step it reports
 whether another owner could reuse a slot's units and hands the test the

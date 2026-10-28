@@ -1,4 +1,4 @@
-//! Device ordinals, attributes, identity and memory information.
+//! Device ordinals, attributes, identity and storage information.
 
 use std::fmt;
 
@@ -26,7 +26,7 @@ pub enum DeviceAttribute {
     ComputeCapabilityMajor = 75,
     ComputeCapabilityMinor = 76,
     VirtualMemoryManagementSupported = 102,
-    /// Whether host memory registers for reads alone
+    /// Whether host storage registers for reads alone
     /// (`CU_MEMHOSTREGISTER_READ_ONLY`, [`crate::HostRegistration::read_only`]).
     ReadOnlyHostRegisterSupported = 113,
     HandleTypePosixFileDescriptorSupported = 103,
@@ -36,7 +36,7 @@ pub enum DeviceAttribute {
     HostNumaId = 134,
 }
 
-/// Device memory reported by `cuMemGetInfo`, in bytes.
+/// Device storage reported by `cuMemGetInfo`, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryInfo {
     pub free: u64,
@@ -130,7 +130,7 @@ impl DeviceId {
         Ok(DeviceUuid(bytes))
     }
 
-    /// Whether this device can directly address memory resident on `peer`.
+    /// Whether this device can directly address storage resident on `peer`.
     pub fn can_access_peer(self, peer: DeviceId) -> Result<bool> {
         let driver = driver()?;
         let (device, peer) = (self.handle()?, peer.handle()?);
@@ -145,14 +145,14 @@ impl DeviceId {
     }
 
     /// Fails with the error that left the device's primary context
-    /// unusable, such as an illegal memory access or a device-side assert,
+    /// unusable, such as an illegal storage access or a device-side assert,
     /// which the driver returns from every call after it; passes while the
     /// context is usable. Waits for nothing on the device.
     pub fn context_error(self) -> Result<()> {
         self.memory_info().map(drop)
     }
 
-    /// Free and total device memory, queried in the device's primary context.
+    /// Free and total device storage, queried in the device's primary context.
     pub fn memory_info(self) -> Result<MemoryInfo> {
         let _guard = DeviceGuard::new(self)?;
         let driver = driver()?;

@@ -15,9 +15,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::protocol::{
-    Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostMemory, Item, Key, Link, Listing,
-    Mode, Placement, Priority, Region, Registered, Reply, Request, Role, Scope, ServerMessage,
-    Span, StorageRecord, TensorRecord, Throttle, VERSION, Welcome,
+    Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage, Item, Key, Link,
+    Listing, Mode, Placement, Priority, Region, Registered, Reply, Request, Role, Scope,
+    ServerMessage, Span, StorageRecord, TensorRecord, Throttle, VERSION, Welcome,
 };
 use crate::transport::Connection;
 
@@ -83,7 +83,7 @@ impl Client {
 
     /// Connect to the server of another host at `address` (`host:port`,
     /// its `Endpoint`) as [`Role::Peer`], the Transfer Server of this host
-    /// that READs memory there. Connecting, and every blocking call after
+    /// that READs storage there. Connecting, and every blocking call after
     /// it ([`Client::call`]), fails once `timeout` passes without an
     /// answer, so a host that stopped answering fails the caller's task
     /// instead of holding it.
@@ -571,8 +571,8 @@ impl Client {
     }
 
     /// See [`Request::Ledger`]: the ledgers of `gpus` (every GPU when empty)
-    /// and what the host admits of new host memory.
-    pub fn ledger(&mut self, gpus: Vec<[u8; 16]>) -> Result<(Vec<GpuLedger>, HostMemory)> {
+    /// and what the host admits of new host storage.
+    pub fn ledger(&mut self, gpus: Vec<[u8; 16]>) -> Result<(Vec<GpuLedger>, HostStorage)> {
         match Self::expect(self.call(&Request::Ledger { gpus }, &[])?)?.reply {
             Reply::Ledger { ledgers, host } => Ok((ledgers, host)),
             other => Err(unexpected("ledger", &other)),

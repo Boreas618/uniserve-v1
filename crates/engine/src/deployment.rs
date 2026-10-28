@@ -66,7 +66,7 @@ struct GroupEntry {
     ranks: Vec<RankRange>,
     /// Physical runs in flight per rank (`WorkerProcessArgs::queue_depth`).
     queue_depth: usize,
-    /// Per-rank device-memory share; the server-wide `mem_fraction_static`
+    /// Per-rank device-storage share; the server-wide `mem_fraction_static`
     /// applies when absent.
     #[serde(default)]
     mem_fraction_static: Option<f64>,

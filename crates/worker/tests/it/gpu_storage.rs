@@ -1,6 +1,6 @@
 //! Storage owners against a real driver: block tables, output readback and
 //! cache planes. These tests need a CUDA device and use a few megabytes of
-//! memory; run them with
+//! storage; run them with
 //! `cargo test -p worker --test it gpu_storage -- --ignored`.
 
 use std::collections::HashMap;
@@ -10,8 +10,8 @@ use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d8};
 use ipc::BlockTable;
 use ipc::{PrefixCacheDtype, UnitId};
 use worker::ffi::{Backing, DType, Handle};
-use worker::memory::LocalMemory;
-use worker::memory::{
+use worker::storage::LocalStorage;
+use worker::storage::{
     BlockTableStorage, BlockTables, CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, GroupShape,
     OutputBuffer, OutputStorage, Storage, StorageView,
 };
@@ -210,8 +210,14 @@ fn cache_planes_start_reset_and_reset_their_leading_units() -> Result<()> {
     let stream = Stream::new(DEVICE)?;
     let plan = Arc::new(fp8_plan());
     assert_eq!(plan.unit_bytes, 276);
-    let planes =
-        CachePlanes::allocate(plan, Some(DEVICE), 6, None, Some(&stream), &mut LocalMemory)?;
+    let planes = CachePlanes::allocate(
+        plan,
+        Some(DEVICE),
+        6,
+        None,
+        Some(&stream),
+        &mut LocalStorage,
+    )?;
     let views: HashMap<_, _> = planes.views().into_iter().collect();
     assert_eq!(views["key.values"].shape(), &[2, 6, 64]);
     assert_eq!(views["key.scale"].shape(), &[2, 6]);

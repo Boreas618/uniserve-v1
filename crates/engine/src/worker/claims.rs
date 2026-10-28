@@ -8,11 +8,11 @@
 //! worker starts with its node's socket and claim token ([`StorageLaunch`]),
 //! by which the server tells it belongs to the deployment's current claim,
 //! and the other nodes' servers, from which it may receive another world's
-//! weights. The engine ends another world's memory on every node by
+//! weights. The engine ends another world's storage on every node by
 //! claiming its own scopes again with that world retired
 //! ([`Claims::retire`]): the predecessor its commit supersedes, or the
 //! successor a rollback discards, wherever they ran, so a world change that
-//! moves the deployment to other nodes ends the memory the previous world
+//! moves the deployment to other nodes ends the storage the previous world
 //! left on the nodes it leaves.
 
 use std::collections::BTreeMap;
@@ -104,7 +104,7 @@ impl Claims {
                     first.world,
                     scopes,
                     // A world started again at a rollback retires the world on
-                    // trial first, whose memory it needs.
+                    // trial first, whose storage it needs.
                     crate::worker::processes::Retirement {
                         worlds: first.retire.clone(),
                     },
@@ -156,7 +156,7 @@ impl Claims {
         Ok(())
     }
 
-    /// Ends the memory of every world of `worlds` on each node of the
+    /// Ends the storage of every world of `worlds` on each node of the
     /// deployment, claiming the engine's own scopes there again with them
     /// retired: a tensor no other world retains is released. Committed
     /// pages stay in the nodes' page pools for any world whose keys reach
@@ -200,8 +200,8 @@ impl Claims {
     /// Keeps the weights alone of every world of `worlds` on each node of
     /// the deployment: a previous world kept as its weights, whose processes
     /// exited, keeps nothing else, so each GPU's ledger leaves the rest to
-    /// this world. With `to_host` the weights then move to host memory,
-    /// which leaves this world their device memory too; a node that cannot
+    /// this world. With `to_host` the weights then move to host storage,
+    /// which leaves this world their device storage too; a node that cannot
     /// move them keeps them on its GPUs.
     ///
     /// Returns each node's report as JSON: `{"host", "released",
@@ -275,9 +275,9 @@ impl Claims {
         Ok(hosts)
     }
 
-    /// The memory ledgers of every node of the deployment: for each host, the
+    /// The storage ledgers of every node of the deployment: for each host, the
     /// JSON of its Storage Server's ledgers of the deployment and what it
-    /// admits of new host memory, read by the node's daemon over its claim
+    /// admits of new host storage, read by the node's daemon over its claim
     /// (no worker is asked, so serving goes on).
     ///
     /// # Errors

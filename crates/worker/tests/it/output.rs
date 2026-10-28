@@ -2,7 +2,7 @@
 //! words and the logprob scores packed among them.
 
 use ipc::TokenLogprob;
-use worker::memory::{LogprobLayout, OutputBuffer, OutputStorage};
+use worker::storage::{LogprobLayout, OutputBuffer, OutputStorage};
 use worker::{EventPool, Result};
 
 /// A host output buffer whose lent words hold `words`, as the executor

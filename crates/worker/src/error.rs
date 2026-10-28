@@ -11,7 +11,7 @@ use ipc::{ErrorCallIdentity, WorkerResponseError};
 /// Invalid submissions and operations on unavailable worker state.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A socket, thread, shared-memory object or peer exchange failed, or a
+    /// A socket, thread, shared-storage object or peer exchange failed, or a
     /// peer sent what its protocol does not allow. `source` is the error
     /// that caused it, when one did.
     #[error("{what}")]
@@ -58,7 +58,7 @@ pub enum Error {
     Shared(std::sync::Arc<Error>),
     /// Python returned a TVM-FFI tensor where the worker expects an opaque
     /// object. Handles cross threads; a TVM-FFI tensor, a DLPack import of
-    /// memory its producer owns, must not. A torch tensor returned through
+    /// storage its producer owns, must not. A torch tensor returned through
     /// the import path crosses as an opaque handle instead.
     #[error("a TVM-FFI tensor cannot be held as an opaque handle")]
     TensorHandle,
@@ -123,7 +123,7 @@ pub(crate) const fn traces(code: ErrorCode) -> bool {
 /// message: an exception the numerical library raised, or a worker error
 /// whose message embeds a lower-level failure.
 const FATAL_CUDA_MESSAGES: &[&str] = &[
-    "illegal memory access",
+    "illegal storage access",
     "cudaerrorillegaladdress",
     "device-side assert",
     "cudaerrorlaunchfailure",
@@ -187,7 +187,7 @@ impl WorkerError {
     ///
     /// A CUDA driver failure is classified by its result code. Any other
     /// failure is classified, in order, by a fatal CUDA text in its message,
-    /// an out-of-memory text in its message, then its own kind.
+    /// an out-of-storage text in its message, then its own kind.
     pub fn classify(error: Error, context: Option<&str>) -> Self {
         let mut message = error_message(&error);
         if let Some(context) = context.filter(|context| !context.is_empty()) {
@@ -399,7 +399,7 @@ mod tests {
         let error = WorkerError::classify(
             numerical(
                 "OutOfMemory",
-                "CUDA out of memory after an illegal memory access",
+                "CUDA out of memory after an illegal storage access",
             ),
             Some("decode"),
         );
@@ -407,7 +407,7 @@ mod tests {
         assert!(error.fatal);
         assert_eq!(
             error.response().message,
-            "decode: text.forward: CUDA out of memory after an illegal memory access"
+            "decode: text.forward: CUDA out of memory after an illegal storage access"
         );
         assert_eq!(error.traceback(), Some("Traceback"));
     }

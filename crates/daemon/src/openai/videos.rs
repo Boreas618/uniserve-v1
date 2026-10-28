@@ -14,7 +14,7 @@
 //! and the job-store settings.
 //!
 //! Completed video bytes arrive as `ArtifactEvent::media`, the read-only
-//! shared-memory mapping (`SharedMedia`) the engine claims from the worker.
+//! shared-storage mapping (`SharedMedia`) the engine claims from the worker.
 //! Responses and retained jobs hold that mapping by `Arc`, and `media_body`
 //! streams from it without gathering the video into one buffer.
 

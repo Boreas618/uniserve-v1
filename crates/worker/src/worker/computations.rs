@@ -40,9 +40,9 @@ use crate::executor::reports::Reports;
 use crate::ffi::Argument;
 use crate::ffi::{Handle, Interpreter};
 use crate::job::{BLOCK_ON_TIMEOUT, Job, JobQueue};
-use crate::memory::allocation::StorageView;
-use crate::memory::{CachePlan, LatentPlan, OutputPool, PrefixCache};
 use crate::parallel::world::CollectiveGroup;
+use crate::storage::allocation::StorageView;
+use crate::storage::{CachePlan, LatentPlan, OutputPool, PrefixCache};
 use crate::stream::Scratches;
 use crate::stream::{CUDAStream, Streams};
 use crate::worker::image::{ImageInfo, ImageManifest};
@@ -414,7 +414,7 @@ pub(crate) struct Binding<'a> {
     /// The distributed expert weights' prefetch object, with DWDP.
     pub(crate) prefetch: Option<&'a Handle>,
     /// Where a latent ledger's banks are taken.
-    pub(crate) memory: &'a mut dyn crate::memory::ExclusiveMemory,
+    pub(crate) storage: &'a mut dyn crate::storage::ExclusiveStorage,
 }
 
 /// What binding leaves: the computations, the most rows a token-denoising step
@@ -496,7 +496,7 @@ pub(crate) fn bind(start: Binding<'_>) -> Result<Bound> {
         graphs,
         collectives,
         prefetch,
-        memory,
+        storage,
     } = start;
     if manifest.computations.is_empty() && experts.is_none() {
         return Ok(Bound {
@@ -585,7 +585,7 @@ pub(crate) fn bind(start: Binding<'_>) -> Result<Bound> {
         values.extend(staging.views().into_iter().map(Argument::Tensor));
     }
 
-    let ledger = latent_ledger(&computations, video, latent, request_slots, memory)?;
+    let ledger = latent_ledger(&computations, video, latent, request_slots, storage)?;
     if let Some(ledger) = &ledger {
         values.extend(ledger.banks()?.into_iter().map(Argument::Tensor));
     }
@@ -624,7 +624,7 @@ pub(crate) fn bind(start: Binding<'_>) -> Result<Bound> {
         values.push(Argument::Handle(prefetch.clone()));
     }
 
-    let memory_json = serde_json::json!({
+    let storage_json = serde_json::json!({
         "slots": request_slots,
         "max_calls": max_calls,
         "streams": known
@@ -643,7 +643,7 @@ pub(crate) fn bind(start: Binding<'_>) -> Result<Bound> {
         "collectives": collectives_json,
         "prefetch": prefetch.is_some(),
     });
-    let bound = executor.bind(memory_json.to_string(), values)?;
+    let bound = executor.bind(storage_json.to_string(), values)?;
     let bound: Bind = serde_json::from_str(&bound)
         .map_err(|error| Error::Interface(format!("the executor's bound computations: {error}")))?;
     let computations = (!computations.is_empty()).then(|| {
@@ -838,7 +838,7 @@ fn latent_ledger(
     video: Option<&VideoCapacity>,
     latent: Option<LatentPlan>,
     request_slots: usize,
-    memory: &mut dyn crate::memory::ExclusiveMemory,
+    storage: &mut dyn crate::storage::ExclusiveStorage,
 ) -> Result<Option<LatentLedger>> {
     let Some(computation) = computations
         .iter()
@@ -862,14 +862,14 @@ fn latent_ledger(
             ));
         }
     };
-    // The banks live on the computation's device, or in host memory on a rank
+    // The banks live on the computation's device, or in host storage on a rank
     // without one.
     let storage = LatentStorage::allocate(
         &plan,
         computation.device,
         computation.stream.as_ref(),
         "computations.latent_banks",
-        memory,
+        storage,
     )?;
     let pool = LatentPool::new(plan.request_pool_size, plan.num_pages, plan.page_units)?;
     Ok(Some(match slot_pages {

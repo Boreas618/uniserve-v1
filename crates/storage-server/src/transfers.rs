@@ -1,15 +1,15 @@
 //! The server's side of its Transfer Server, which copies bytes between the
-//! memory the server holds.
+//! storage the server holds.
 //!
 //! The server runs the Transfer Server ([`crate::transfer`]) as a child
 //! process ([`Supervised`]) and starts it again when it ends. It connects
-//! as [`Role::Transfer`](storage::protocol::Role::Transfer), reports the
-//! bandwidth of every link and its CUDA contexts' device memory
-//! ([`Request::Measured`](storage::protocol::Request::Measured)), and runs
+//! as [`Role::Transfer`](::storage::protocol::Role::Transfer), reports the
+//! bandwidth of every link and its CUDA contexts' device storage
+//! ([`Request::Measured`](::storage::protocol::Request::Measured)), and runs
 //! the tasks heads and workers submit:
 //!
 //! 1. A client's [`Request::Transfer`] names its spans by [`Region`]. The
-//!    server checks that every region is memory of the client's deployment
+//!    server checks that every region is storage of the client's deployment
 //!    and every span lies within its region and writes no read-only tensor,
 //!    resolves each region to an [`Allocation`] and a byte offset, and
 //!    forwards the task as [`Event::Transfer`]. The first task that copies
@@ -24,21 +24,21 @@
 //!    report, since bytes may be in flight until then.
 //!
 //! The server submits tasks of its own too: a world's weights moving
-//! between its GPUs and host memory ([`crate::moves`]) copy whole storages,
+//! between its GPUs and host storage ([`crate::moves`]) copy whole storages,
 //! and each task's end goes to its move rather than to a client.
 //!
 //! A span's source on another host ([`Region::Remote`]) is forwarded as
 //! that host's region ([`Allocation::Remote`]), which this server cannot
 //! check: the Transfer Server has that host's server expose it and READs
 //! it. The other direction serves another host's Transfer Server, a
-//! [`Role::Peer`]: its [`Request::Expose`](storage::protocol::Request::Expose)
+//! [`Role::Peer`]: its [`Request::Expose`](::storage::protocol::Request::Expose)
 //! names regions of a deployment here, which the server checks as a
 //! task's sources, gives the Transfer Server, and has it register with its
 //! NIXL agent ([`Event::Register`]); the peer's request waits until the
 //! Transfer Server reports the ranges and its agent's metadata
-//! ([`Request::Registered`](storage::protocol::Request::Registered)), which
+//! ([`Request::Registered`](::storage::protocol::Request::Registered)), which
 //! answer it ([`Reply::Exposed`]). The exposure lives until the peer ends it
-//! ([`Request::Unexpose`](storage::protocol::Request::Unexpose)) or its
+//! ([`Request::Unexpose`](::storage::protocol::Request::Unexpose)) or its
 //! connection closes; the Transfer Server then lets its registrations go
 //! ([`Event::Deregister`]), and the GPU contexts they held with them.
 //!
@@ -52,9 +52,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use storage::protocol::{
+use ::storage::protocol::{
     Access, Allocation, ContextBytes, ErrorKind, Event, FabricExport, FabricHandle, Link,
-    LinkBandwidth, ListedTask, ListedTransfer, Memory, Move, Placement, Priority, Region,
+    LinkBandwidth, LinkEnd, ListedTask, ListedTransfer, Move, Placement, Priority, Region,
     Registered, Reply, Role, Span, Throttle, TransferEnd,
 };
 
@@ -161,11 +161,11 @@ impl Exposure {
 }
 
 /// A region resolved to one of the server's allocations: the allocation,
-/// the memory it lies in, the offset of the region's first byte and the
+/// the storage it lies in, the offset of the region's first byte and the
 /// allocation's size.
 struct Resolved {
     allocation: Allocation,
-    memory: Memory,
+    end: LinkEnd,
     base: u64,
     bytes: u64,
     /// The descriptor the Transfer Server needs, unless it is an
@@ -206,10 +206,10 @@ impl Server {
     pub(super) fn transfer_request(
         &mut self,
         id: ClientId,
-        request: &storage::protocol::Request,
+        request: &::storage::protocol::Request,
         role: &Role,
     ) -> Result<Outcome, (ErrorKind, String)> {
-        use storage::protocol::Request;
+        use ::storage::protocol::Request;
 
         let deployment = Self::deployment_of(role)
             .ok_or_else(|| invalid("a transfer request comes from a head or a worker"))?
@@ -285,9 +285,9 @@ impl Server {
     /// A report of the Transfer Server's.
     pub(super) fn transfer_report(
         &mut self,
-        request: &storage::protocol::Request,
+        request: &::storage::protocol::Request,
     ) -> Result<Outcome, (ErrorKind, String)> {
-        use storage::protocol::Request;
+        use ::storage::protocol::Request;
 
         match request {
             Request::Measured { links, contexts } => {
@@ -331,7 +331,7 @@ impl Server {
         }
     }
 
-    /// A peer's [`Request::Expose`](storage::protocol::Request::Expose) of
+    /// A peer's [`Request::Expose`](::storage::protocol::Request::Expose) of
     /// `regions` of `deployment`: each is a retained tensor or a page pool
     /// of the deployment, checked as a task's source is, and the Transfer
     /// Server is given each allocation it does not hold yet. The request
@@ -466,7 +466,7 @@ impl Server {
                     .map(|&(index, base)| {
                         let range = ranges.get(index).filter(|range| base <= range.bytes)?;
                         Some(Registered {
-                            memory: range.memory.clone(),
+                            end: range.end.clone(),
                             key: range.key,
                             address: range.address + base,
                             bytes: range.bytes - base,
@@ -496,7 +496,7 @@ impl Server {
         self.release_exposure(exposure, reply);
     }
 
-    /// A peer's [`Request::Unexpose`](storage::protocol::Request::Unexpose):
+    /// A peer's [`Request::Unexpose`](::storage::protocol::Request::Unexpose):
     /// its exposure `exposure` ends, unless it holds no such exposure.
     pub(super) fn unexpose(&mut self, peer: ClientId, exposure: u64) -> Outcome {
         if self.transfers.live.get(&exposure) == Some(&peer) {
@@ -575,8 +575,9 @@ impl Server {
                 extent(span.destination_pitch)?,
                 "destination",
             )?;
-            let crossing =
-                invalid("a span copies to or from this host's memory, not between two other hosts");
+            let crossing = invalid(
+                "a span copies to or from this host's storage, not between two other hosts",
+            );
             let (source, source_offset) = match &span.source {
                 // Another host's region: that host checks it, and the span
                 // against it, once the Transfer Server asks it to expose
@@ -677,9 +678,9 @@ impl Server {
         else {
             return Err(invalid("a moved storage was released"));
         };
-        let resolved = |storage: StorageId, record: &storage::protocol::StorageRecord| Resolved {
+        let resolved = |storage: StorageId, record: &::storage::protocol::StorageRecord| Resolved {
             allocation: Allocation::Storage { storage },
-            memory: crate::moves::memory_of(record),
+            end: crate::moves::storage_of(record),
             base: 0,
             bytes: record.bytes,
             attachment: Some(Attachment::Storage(storage)),
@@ -743,7 +744,7 @@ impl Server {
             transfer_server,
             Event::Allocation {
                 allocation,
-                memory: resolved.memory.clone(),
+                end: resolved.end.clone(),
                 bytes: resolved.bytes,
                 writable: resolved.writable,
             },
@@ -796,15 +797,15 @@ impl Server {
                     .storages
                     .get(&tensor.storage)
                     .ok_or_else(|| invalid(&format!("{} has no storage", tensor.name)))?;
-                let memory = match storage.record.placement {
-                    Placement::Device { gpu } => Memory::Device { gpu },
-                    Placement::Host { .. } => Memory::Host,
+                let end = match storage.record.placement {
+                    Placement::Device { gpu } => LinkEnd::Device { gpu },
+                    Placement::Host { .. } => LinkEnd::Host,
                 };
                 Ok(Resolved {
                     allocation: Allocation::Storage {
                         storage: tensor.storage,
                     },
-                    memory,
+                    end,
                     base: tensor.offset,
                     bytes: storage.record.bytes,
                     attachment: Some(Attachment::Storage(tensor.storage)),
@@ -823,7 +824,7 @@ impl Server {
                     })?;
                 Ok(Resolved {
                     allocation: Allocation::Pool { pool: *pool },
-                    memory: Memory::Host,
+                    end: LinkEnd::Host,
                     base: 0,
                     bytes: entry.slots() * entry.shape.page_bytes,
                     attachment: Some(Attachment::Pool(*pool)),
@@ -845,7 +846,7 @@ impl Server {
                         gpu: *gpu,
                         bytes: *bytes,
                     },
-                    memory: Memory::Device { gpu: *gpu },
+                    end: LinkEnd::Device { gpu: *gpu },
                     base: *offset,
                     bytes: *bytes,
                     attachment: None,
@@ -853,7 +854,7 @@ impl Server {
                 })
             }
             Region::Remote { .. } => Err(invalid(if destination {
-                "a span writes memory of this host: another host's region is a source, which \
+                "a span writes storage of this host: another host's region is a source, which \
                  this host READs"
             } else {
                 "another host exposes its own retained tensors and page pools"
@@ -888,7 +889,7 @@ impl Server {
         cancelled
     }
 
-    /// See [`Request::Throttle`](storage::protocol::Request::Throttle).
+    /// See [`Request::Throttle`](::storage::protocol::Request::Throttle).
     /// Without links, a halving names the tasks of `deployment`, whose links
     /// the Transfer Server knows.
     fn throttle(
@@ -1024,7 +1025,7 @@ impl Server {
                 Owner::Move { number, index } => self.moved(number, index, &failed),
             }
         }
-        // The device memory it was creating for a move is never reported.
+        // The device storage it was creating for a move is never reported.
         self.moves_lost_allocations();
         // Its agent ended with it: the exposures it held end, the regions it
         // was registering are refused, and the next one registers them when
@@ -1054,7 +1055,7 @@ impl Server {
         }
     }
 
-    /// The device memory the connected Transfer Server's CUDA context takes
+    /// The device storage the connected Transfer Server's CUDA context takes
     /// on each GPU while it holds one, as it measured it; it books the
     /// context itself while it holds it.
     pub(super) fn transfer_contexts(&self) -> Vec<([u8; 16], u64)> {
@@ -1065,12 +1066,12 @@ impl Server {
             .collect()
     }
 
-    /// The bandwidth of copies from host memory to `gpu` the connected
+    /// The bandwidth of copies from host storage to `gpu` the connected
     /// Transfer Server measured, in bytes per second.
     pub(super) fn host_link(&self, gpu: [u8; 16]) -> Option<u64> {
         let link = Link {
-            source: Memory::Host,
-            destination: Memory::Device { gpu },
+            source: LinkEnd::Host,
+            destination: LinkEnd::Device { gpu },
         };
         self.transfers
             .links

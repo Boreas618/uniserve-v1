@@ -14,7 +14,7 @@ use super::read::{NativeRead, ReadCall, payload};
 use super::transport::{ExportView, Staged, Transport, producer, read_destination};
 use super::{Spans, copy_planner};
 use crate::ffi::{Backing, MemoryKind};
-use crate::memory::allocation::{Storage, StorageView};
+use crate::storage::allocation::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -76,7 +76,7 @@ pub(super) fn locate(mut locator: Locator, staging: &Storage, bytes: usize) -> R
     // SAFETY: the export's copy and the wait behind it were performed, so
     // nothing writes the staging any more.
     let payload = unsafe { staging.host_bytes() }
-        .ok_or_else(|| Error::Invariant("channel staging is host memory".into()))?[..bytes]
+        .ok_or_else(|| Error::Invariant("channel staging is host storage".into()))?[..bytes]
         .to_vec();
     match &mut locator.transport {
         TransferTransport::Channel {
@@ -133,7 +133,7 @@ impl NativeRead {
     }
 }
 
-/// A rank-channel payload as host memory a copy can read in place. The
+/// A rank-channel payload as host storage a copy can read in place. The
 /// locator is immutable and retained by the read for the copy's duration.
 struct ChannelPayload(Arc<Locator>);
 

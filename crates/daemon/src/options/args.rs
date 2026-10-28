@@ -69,7 +69,7 @@ pub struct ServeArgs {
     /// Longest sequence a request may reach, in tokens (`max_model_len`).
     #[arg(long)]
     pub max_model_len: Option<NonZeroU32>,
-    /// Each rank's share of its device's memory, in (0, 1]
+    /// Each rank's share of its device's storage, in (0, 1]
     /// (`mem_fraction_static`).
     #[arg(long)]
     pub mem_fraction_static: Option<f64>,

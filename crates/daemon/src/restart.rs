@@ -162,7 +162,7 @@ pub(crate) struct Restarter {
     pub(crate) accepting: CancellationToken,
     /// Set once the deployment was handed over: this daemon detaches from
     /// the engine instead of shutting it down, and leaves the service and
-    /// the memory to the successor.
+    /// the storage to the successor.
     pub(crate) handed_over: Arc<AtomicBool>,
 }
 
@@ -458,7 +458,7 @@ fn artifact_descriptor(
     let (object, mut file) = proto::SharedMemory::create(media.len())
         .context("creating shared memory for a video artifact")?;
     std::io::Write::write_all(&mut file, media)?;
-    // The descriptor keeps the memory; the object's name is not needed.
+    // The descriptor keeps the storage; the object's name is not needed.
     drop(object);
     Ok(OwnedFd::from(file))
 }

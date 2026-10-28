@@ -87,9 +87,9 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
-    /// NVML attributes no device memory on the device to this process, for
+    /// NVML attributes no device storage on the device to this process, for
     /// example inside a PID namespace NVML does not report.
-    #[error("NVML reports no device memory for process {pid} on {device}")]
+    #[error("NVML reports no device storage for process {pid} on {device}")]
     ProcessNotFound { pid: u32, device: DeviceId },
 
     /// Deferred releases failed since the previous [`crate::reclaim::flush`].
@@ -102,7 +102,7 @@ pub enum Error {
     ExitHandler,
 }
 
-/// `CUDA_ERROR_OUT_OF_MEMORY`: the call could not allocate enough memory or
+/// `CUDA_ERROR_OUT_OF_MEMORY`: the call could not allocate enough storage or
 /// other resources.
 const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
 
@@ -111,7 +111,7 @@ const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
 /// The driver documents each as leaving the process in an inconsistent
 /// state in which further CUDA work returns the same error, or its context
 /// as unusable (`CUDA_ERROR_ASSERT`). An uncorrectable ECC error is included
-/// because the memory the process computes with can no longer be trusted.
+/// because the storage the process computes with can no longer be trusted.
 const UNRECOVERABLE_DRIVER_RESULTS: &[i32] = &[
     214, // CUDA_ERROR_ECC_UNCORRECTABLE
     226, // CUDA_ERROR_CONTAINED
@@ -134,7 +134,7 @@ impl Error {
         Self::InvalidArgument(message.into())
     }
 
-    /// The driver could not allocate memory or another resource for the
+    /// The driver could not allocate storage or another resource for the
     /// call; the process and its contexts remain usable.
     pub fn is_out_of_memory(&self) -> bool {
         match self {
@@ -222,7 +222,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "NVML reports no device memory for process 42 on cuda:3"
+            "NVML reports no device storage for process 42 on cuda:3"
         );
     }
 }

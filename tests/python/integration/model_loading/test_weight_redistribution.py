@@ -257,7 +257,7 @@ def _apply(
 ) -> list[torch.Tensor]:
     """Execute what ``manifest`` directs for target rank ``rank``, whose
     planned storages are ``storages``, from the source ranks' images (of
-    their planned storages ``source_storages``) into fresh memory: its
+    their planned storages ``source_storages``) into fresh storage: its
     mappings, copies and fills.
     """  # noqa: D205
     assert not manifest["stagings"], "dense weights convert nothing"
@@ -338,8 +338,8 @@ def _differing_fields(planned, applied, direct) -> list[str]:
             shape = (*field["shape"], element)
             strides = (*(stride * element for stride in field["strides"]), 1)
 
-            def elements(memory, shape=shape, strides=strides, field=field):
-                return memory.as_strided(shape, strides, field["offset"])
+            def elements(storage, shape=shape, strides=strides, field=field):
+                return storage.as_strided(shape, strides, field["offset"])
 
             if not torch.equal(elements(image), elements(loaded)):
                 differing.append(field["tensor"])
@@ -446,6 +446,6 @@ def test_an_update_holds_the_weights_a_direct_start_loads(scenario):
             flush=True,
         )
         assert not differing, differing[:10]
-        # The rank's memory returns before the next one is checked.
+        # The rank's storage returns before the next one is checked.
         target_ranks[index] = None
         del applied, direct

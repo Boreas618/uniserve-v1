@@ -237,10 +237,10 @@ mod tests {
         let watch = BlockingWatch::start()?;
         let recording = StreamActivity::start([("device", &stream)])?;
         let bytes = 256 << 20;
-        let memory = DeviceAllocation::linear(DeviceId(0), bytes)?;
+        let storage = DeviceAllocation::linear(DeviceId(0), bytes)?;
         // SAFETY: the allocation holds `bytes` and outlives the fill, which
         // the synchronization waits for.
-        unsafe { memset_d8(memory.address(), 0, bytes, &stream)? };
+        unsafe { memset_d8(storage.address(), 0, bytes, &stream)? };
         stream.synchronize()?;
         assert_eq!(scope.calls(), vec![("cuStreamSynchronize", 1)]);
         let taken = crate::cupti::activity::tests::taken_until("device", |taken| taken.busy_us > 0);

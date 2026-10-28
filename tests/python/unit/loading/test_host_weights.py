@@ -1,4 +1,4 @@
-"""A repeated layer stack moves its projections to host memory and slots.
+"""A repeated layer stack moves its projections to host storage and slots.
 
 The worker allocates the page-locked host region and the device slots; the
 library states which modules stream, how a layer's projection matrices lie

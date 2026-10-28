@@ -8,8 +8,8 @@ and the server the daemon starts there is stopped at the end).
   (``PUT /admin/config``) and down through its admin API without
   restarting: each deployment's page pools and weights
   belong to it, so bringing it down returns the host's shared memory and
-  the GPU's memory to what they were before it, and a deployment whose
-  page pools the host's available memory cannot hold is refused with the
+  the GPU's storage to what they were before it, and a deployment whose
+  page pools the host's available storage cannot hold is refused with the
   sizes that decided it.
 - A serving deployment answers its admin API: new requests wait while
   generation is paused and are served once it continues; a flush revokes
@@ -23,11 +23,11 @@ and the server the daemon starts there is stopped at the end).
   the next world and dropped by the one after its removal: the worker hook
   it registers answers from every worker in between, and fails before and
   after.
-- A world change while another process holds the device's free memory
+- A world change while another process holds the device's free storage
   gives back the tail of the serving world's KV cache for the successor,
-  and the committed successor grows its cache into the memory the
+  and the committed successor grows its cache into the storage the
   previous world freed.
-- A sleeping deployment gives back its KV cache and graph memory, holds
+- A sleeping deployment gives back its KV cache and graph storage, holds
   new requests and recomputes the ones it ran once it wakes, and answers
   as before.
 - A LoRA adapter loads into a slot the daemon assigns, through the plugin
@@ -124,7 +124,7 @@ def _checkpoint() -> str:
 
 def _pool_gib(runtime: Path) -> float:
     """The host page pools the test's Storage Server holds, in GiB: the
-    sizes of its ``uniserve-page-pool`` memfds, whose memory the host frees
+    sizes of its ``uniserve-page-pool`` memfds, whose storage the host frees
     once the server and the workers that map them let them go.
     """  # noqa: D205
     pid = _storage_pid(runtime)
@@ -146,7 +146,7 @@ def _available_gib() -> float:
 
 
 def _gpu_used_mib(device: str) -> int:
-    """The memory in use on GPU ``device``, as ``nvidia-smi`` reports it."""
+    """The storage in use on GPU ``device``, as ``nvidia-smi`` reports it."""
     output = subprocess.run(
         [
             "nvidia-smi",
@@ -189,7 +189,7 @@ def _held(runtime: Path) -> list[str]:
     """What the test's Storage Server holds, its page pools without their
     slot counters, which the deployment's offloads move as it serves. Its
     Transfer Server's process, contexts, link measurements and tasks are no
-    memory it holds: a restarted server's Transfer Server measures anew.
+    storage it holds: a restarted server's Transfer Server measures anew.
     """  # noqa: D205
     return sorted(
         line.split(": ", 1)[0] if line.startswith("page pool") else line
@@ -373,7 +373,7 @@ def _settle(base_url: str, timeout_s: float = 900) -> dict:
     return state
 
 
-def test_a_node_serves_deployments_one_after_another_and_releases_their_memory(
+def test_a_node_serves_deployments_one_after_another_and_releases_their_storage(
     tmp_path: Path, runtime: Path
 ):
     device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
@@ -417,7 +417,7 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_memory(
             assert after_pools == 0, after_pools
             assert after_gpu <= gpu + 1024, (after_gpu, gpu)
 
-        # A host KV cache the host's available memory cannot hold.
+        # A host KV cache the host's available storage cannot hold.
         too_large = int(_available_gib()) * 2
         _deploy(
             base_url,
@@ -921,7 +921,7 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         ), "the successor world did not map the retained weights"
 
 
-# The options of a deployment whose KV cache takes the device memory its
+# The options of a deployment whose KV cache takes the device storage its
 # share leaves, rather than a fixed token count.
 SIZED_OPTIONS = tuple(
     option
@@ -932,7 +932,7 @@ SIZED_OPTIONS = tuple(
 
 @contextmanager
 def _ballast(device: str, leave_gib: float) -> Iterator[int]:
-    """Hold GPU `device`'s free memory but `leave_gib` GiB in a process.
+    """Hold GPU `device`'s free storage but `leave_gib` GiB in a process.
 
     The process holds it until the context ends; yields the bytes it holds.
     """
@@ -957,13 +957,13 @@ def _ballast(device: str, leave_gib: float) -> Iterator[int]:
         assert line.strip().isdigit(), f"the ballast process answered {line!r}"
         yield int(line)
     finally:
-        # Closing its input ends the process, which frees the memory.
+        # Closing its input ends the process, which frees the storage.
         assert process.stdin is not None
         process.stdin.close()
         process.wait(timeout=120)
 
 
-def test_a_world_change_under_memory_pressure_shrinks_the_kv_cache(
+def test_a_world_change_under_storage_pressure_shrinks_the_kv_cache(
     tmp_path: Path, runtime: Path
 ):
     name = "qwen3-live-pressure"
@@ -1007,7 +1007,7 @@ def test_a_world_change_under_memory_pressure_shrinks_the_kv_cache(
         grew = [
             line
             for line in lines
-            if "growing the KV cache into the memory freed" in line
+            if "growing the KV cache into the storage freed" in line
         ]
         for line in withdrew + gave + grew:
             print(line)
@@ -1020,7 +1020,7 @@ def test_a_world_change_under_memory_pressure_shrinks_the_kv_cache(
         assert after == before
 
 
-def test_a_sleeping_deployment_gives_back_its_cache_and_graph_memory(
+def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
     tmp_path: Path, runtime: Path
 ):
     name = "qwen3-live-sleep"
@@ -1063,7 +1063,7 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_memory(
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
         after = _gpu_used_mib(device)
         print(
-            f"GPU memory: awake {awake} MiB, asleep {asleep} MiB, "
+            f"GPU storage: awake {awake} MiB, asleep {asleep} MiB, "
             f"woken {after} MiB"
         )
         assert awake - asleep >= 10 * 1024, (awake, asleep)
@@ -1393,7 +1393,7 @@ def test_a_lora_adapter_is_served_under_its_name_across_a_world_change(
         assert ask("tuned").status_code == 404
 
 
-# The communication buffer plugin a test installs: 4 GiB of device memory.
+# The communication buffer plugin a test installs: 4 GiB of device storage.
 BUFFER_PLUGIN = """
 import torch
 
@@ -1408,7 +1408,7 @@ def allocate(models, device):
 
 
 def _fitted_units(log: Path) -> tuple[int, int]:
-    """The cache units the worker's free memory fits, before it rounds them
+    """The cache units the worker's free storage fits, before it rounds them
     down to whole segments, and the bytes of each.
     """  # noqa: D205
     fitted = None

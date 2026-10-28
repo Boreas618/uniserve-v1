@@ -544,7 +544,7 @@ fn read_requests(
                 Some(wire::engine_command::Kind::CacheWarm(warm)) => {
                     warm_cache(warm, front, routing);
                 }
-                Some(wire::engine_command::Kind::DescribeMemory(describe)) => {
+                Some(wire::engine_command::Kind::DescribeStorage(describe)) => {
                     // The deployment's claims cover every node, so the first
                     // scheduler reads them all.
                     let answers: Vec<_> = routing
@@ -852,7 +852,7 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
     answer_hooked(warm.id, answers, front, routing);
 }
 
-/// Gives back or restores every scheduler's KV cache memory, and answers
+/// Gives back or restores every scheduler's KV cache storage, and answers
 /// the daemon `front` with `Hooked` as `run_hook` does.
 fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>) {
     let successor = crate::Successor {
@@ -937,7 +937,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
             return;
         }
     };
-    tracing::info!(?change, "changing the KV cache memory");
+    tracing::info!(?change, "changing the KV cache storage");
     if resize.keep_weights.is_empty() {
         let answers: Vec<_> = routing
             .slots
@@ -948,7 +948,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         return;
     }
     // The worlds that keep their weights alone release the rest of their
-    // memory on every node first, and move their weights to host memory when
+    // storage on every node first, and move their weights to host storage when
     // asked (the deployment's claims cover every node, so the first
     // scheduler asks), on a thread of its own: the change then finds it on
     // each GPU's ledger. The answer carries each node's report of the
@@ -956,7 +956,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
     let (id, worlds, to_host, cache_keys) = (
         resize.id,
         resize.keep_weights.clone(),
-        resize.keep_in_host_memory,
+        resize.keep_in_host_storage,
         resize.cache_keys.clone(),
     );
     let routing = Arc::clone(routing);

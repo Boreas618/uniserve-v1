@@ -1,8 +1,8 @@
 //! Stream-ordered copies and fills.
 //!
-//! Addresses are unified virtual addresses: device memory, pinned or
-//! registered host memory, and (for [`SourceOrder::DuringCall`] sources)
-//! ordinary host memory. Every submission is `unsafe` because the caller keeps
+//! Addresses are unified virtual addresses: device storage, pinned or
+//! registered host storage, and (for [`SourceOrder::DuringCall`] sources)
+//! ordinary host storage. Every submission is `unsafe` because the caller keeps
 //! each addressed range valid, and not concurrently written by other work,
 //! until the stream reaches the copy.
 
@@ -110,7 +110,7 @@ memset!(
 /// (`cuMemsetD2D8Async`).
 ///
 /// # Safety
-/// Every row lies in device memory valid until the fill completes.
+/// Every row lies in device storage valid until the fill completes.
 pub unsafe fn memset_2d_d8(
     destination: u64,
     pitch: usize,
@@ -134,7 +134,7 @@ pub unsafe fn memset_2d_d8(
 /// (`cuMemsetD2D32Async`).
 ///
 /// # Safety
-/// Every row lies in 4-byte aligned device memory valid until the fill
+/// Every row lies in 4-byte aligned device storage valid until the fill
 /// completes.
 pub unsafe fn memset_2d_d32(
     destination: u64,

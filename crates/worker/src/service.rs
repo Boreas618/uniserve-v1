@@ -17,7 +17,7 @@ use ipc::{Channel, IpcError, RequestKind, WorkerInfo, WorkerRequest, WorkerRespo
 
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBatch;
-use crate::memory::retained::Retained;
+use crate::storage::retained::Retained;
 use crate::{Batch, Error, Executor, Submission};
 
 const EXPERT_POLL: Duration = Duration::from_micros(200);
@@ -54,10 +54,10 @@ enum PendingResponse {
 /// All channel waits run on the caller's thread; completion wakes interrupt
 /// them without advancing execution on a callback thread.
 /// What a parked standby worker released, which its promotion restores;
-/// nothing for a standby that keeps its memory resident.
+/// nothing for a standby that keeps its storage resident.
 #[derive(Default)]
 pub(crate) struct Suspension {
-    /// The graph pools and scratch whose contents it moved to host memory.
+    /// The graph pools and scratch whose contents it moved to host storage.
     pub(crate) pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
     /// What the executor released of the expert transports' workspaces.
     pub(crate) experts: ParkedExperts,
@@ -86,7 +86,7 @@ pub(crate) struct Maintenance {
     pub(crate) cache_copies: crate::transfer::warming::Copies,
     pub(crate) cache_staging: crate::transfer::staging::Staging,
     /// `None` for a rank whose planes this process allocated for itself
-    /// (`LocalMemory`).
+    /// (`LocalStorage`).
     pub(crate) retained: Option<Arc<Retained>>,
     /// What an in-place weight update rewrites; `None` for a rank that
     /// loaded no model.
@@ -95,7 +95,7 @@ pub(crate) struct Maintenance {
     /// Those of `pools` that hold captured graphs alone: an eager rank gives
     /// them back, and keeps the streams' scratch its forwards use.
     pub(crate) graph_pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
-    /// Whether the worker sleeps: its graph memory suspended and its cache
+    /// Whether the worker sleeps: its graph storage suspended and its cache
     /// given back.
     pub(crate) asleep: bool,
     /// CUPTI's always-on counters of the rank, kept while it serves; `None`
@@ -109,7 +109,7 @@ pub(crate) struct Maintenance {
     pub(crate) predecessor: Option<ipc::PredecessorCache>,
     /// The token capacity the deployment configured for the KV cache
     /// (`kv_cache_config.max_tokens`), which bounds a successor world's
-    /// pool as it bounds this one's; `None` for a pool sized by memory.
+    /// pool as it bounds this one's; `None` for a pool sized by storage.
     pub(crate) max_total_tokens: Option<usize>,
     /// The request slots the rank was configured for, whose state
     /// checkpoints a token capacity also holds (`CachePlan::token_units`).
@@ -128,7 +128,7 @@ pub(crate) struct Maintenance {
     /// What mapping the rank's host page pools needs, which
     /// `uniserve.host_cache` takes; `None` for a rank that copies no page
     /// through the host KV cache, and once mapped.
-    pub(crate) host_cache: Option<crate::memory::prefix_cache::host::HostCacheSetup>,
+    pub(crate) host_cache: Option<crate::storage::prefix_cache::host::HostCacheSetup>,
 }
 
 /// A standby worker parked until its promotion: its retained storages,
@@ -163,7 +163,7 @@ impl Parked {
         }
         if !pools.is_empty() {
             renew_graphs()?;
-            tracing::info!("the promoted standby worker restored its graph memory");
+            tracing::info!("the promoted standby worker restored its graph storage");
         }
         if let Some(world) = &world {
             crate::ffi::Interpreter::import("uniserve.distributed.world.resume")?
@@ -405,11 +405,11 @@ impl<'a> Service<'a> {
             WorkerRequest::Promote { message_id } => {
                 let promoted = match self.standby.take() {
                     // The promoted standby replaces the rank it stood by
-                    // for: it books its memory in the ledgers now, which the
+                    // for: it books its storage in the ledgers now, which the
                     // larger of its scope's processes' bookings counts.
                     Some(parked) => parked
                         .promote(self.executor)
-                        .and_then(|()| self.book_memory(true).map_err(WorkerError::from)),
+                        .and_then(|()| self.book_storage(true).map_err(WorkerError::from)),
                     None => Err(WorkerError::from(Error::State(
                         "only a parked standby worker is promoted",
                     ))),
@@ -562,7 +562,7 @@ impl<'a> Service<'a> {
             return Ok(None);
         };
         let running = since.elapsed();
-        // A context that an illegal memory access or a device-side assert
+        // A context that an illegal storage access or a device-side assert
         // left unusable runs none of the work behind the failure, so the
         // completions of the jobs in flight never post: the rank fails with
         // the driver's error, which leaves its context unusable, at once
@@ -635,16 +635,16 @@ impl Service<'_> {
     /// Runs the built-in hook `name` with the JSON `payload`, while the rank
     /// runs no batch, and returns its JSON result:
     ///
-    /// - `uniserve.cache_memory`: the cache planes' segments (count, units
+    /// - `uniserve.cache_storage`: the cache planes' segments (count, units
     ///   and bytes of each, the first given back), the head segment and
     ///   graph share a successor world creates, the rank's scope, world and
     ///   host, the deployment's ledger of the cache's GPU, what the host
-    ///   admits of new host memory, and the device's free memory;
+    ///   admits of new host storage, and the device's free storage;
     /// - `uniserve.release_cache` (`{"from": segment}`): gives back the
     ///   planes' segments from `segment` on, whose units the engine
     ///   withdrew;
     /// - `uniserve.restore_cache`: creates them again;
-    /// - `uniserve.sleep`: suspends the graph memory and gives back every
+    /// - `uniserve.sleep`: suspends the graph storage and gives back every
     ///   segment; `uniserve.wake` restores both;
     /// - `uniserve.host_cache` (`{"tokens": count}`): maps the rank's host
     ///   page pools, each holding the pages of `count` tokens, the count
@@ -652,8 +652,8 @@ impl Service<'_> {
     ///   rank reports of each pool (`ipc::PagePoolInfo`); a rank that copies
     ///   no page through the host KV cache answers `null`;
     /// - `uniserve.eager` (`{"eager": bool}`): serves every forward and
-    ///   expert join eagerly and gives back the captured graphs' memory, or
-    ///   restores that memory at its addresses and serves by the graphs
+    ///   expert join eagerly and gives back the captured graphs' storage, or
+    ///   restores that storage at its addresses and serves by the graphs
     ///   again; a rank whose computations serve by their graphs alone
     ///   refuses;
     /// - `uniserve.update_weights` (`{"model_path": path}`): rewrites the
@@ -685,8 +685,8 @@ impl Service<'_> {
             .map(|cache| Arc::clone(cache.planes()));
         let retained = self.maintenance.retained.clone();
         let mut shared = retained.as_deref();
-        let mut local = crate::memory::retained::LocalMemory;
-        let memory: &mut dyn crate::memory::retained::ExclusiveMemory = match &mut shared {
+        let mut local = crate::storage::retained::LocalStorage;
+        let storage: &mut dyn crate::storage::retained::ExclusiveStorage = match &mut shared {
             Some(retained) => retained,
             None => &mut local,
         };
@@ -731,7 +731,7 @@ impl Service<'_> {
                 serde_json::Value::Null
             }
             "uniserve.cache_links" => {
-                let sources: Vec<storage::manifest::cache::Sources> =
+                let sources: Vec<::storage::manifest::cache::Sources> =
                     serde_json::from_value(payload)
                         .map_err(|error| Error::Invalid(format!("cache sources: {error}")))?;
                 let links = if let (Some(planes), Some(retained), Some(source)) = (
@@ -757,9 +757,9 @@ impl Service<'_> {
                         &sources,
                         device,
                         if source.host_destination {
-                            storage::protocol::Placement::Host { numa_node: None }
+                            ::storage::protocol::Placement::Host { numa_node: None }
                         } else {
-                            storage::protocol::Placement::Device {
+                            ::storage::protocol::Placement::Device {
                                 gpu: device.uuid()?.0,
                             }
                         },
@@ -770,7 +770,7 @@ impl Service<'_> {
                 serde_json::to_value(links).map_err(|error| Error::Invalid(error.to_string()))?
             }
             "uniserve.cache_publish" => {
-                let pages: Vec<storage::manifest::cache::Page> = serde_json::from_value(payload)
+                let pages: Vec<::storage::manifest::cache::Page> = serde_json::from_value(payload)
                     .map_err(|error| Error::Invalid(format!("cache pages: {error}")))?;
                 if let (Some(planes), Some(retained)) = (planes.as_ref(), retained.as_deref()) {
                     let mut units: Vec<_> = pages
@@ -784,7 +784,7 @@ impl Service<'_> {
                         let stream = cuda::Stream::new(planes.device().ok_or_else(|| {
                             Error::Invalid("cache publication requires a device pool".into())
                         })?)?;
-                        let column = crate::memory::prefix_cache::planes::UnitColumn::bind(
+                        let column = crate::storage::prefix_cache::planes::UnitColumn::bind(
                             planes,
                             Some(&stream),
                         )?;
@@ -795,7 +795,7 @@ impl Service<'_> {
                 serde_json::Value::Null
             }
             "uniserve.cache_manifest" => {
-                let pages: storage::manifest::cache::Pages = serde_json::from_value(payload)
+                let pages: ::storage::manifest::cache::Pages = serde_json::from_value(payload)
                     .map_err(|error| Error::Invalid(format!("cache pages: {error}")))?;
                 match (planes.as_ref(), retained.as_deref()) {
                     (Some(planes), Some(retained)) => {
@@ -826,14 +826,14 @@ impl Service<'_> {
                                     allocations.push((key, page));
                                     storages.extend(rank.storages);
                                 }
-                                storage::manifest::Rank {
+                                ::storage::manifest::Rank {
                                     gpu: Some(device.uuid()?.0),
                                     storages,
                                 }
                             } else {
                                 planes.manifest(&pages.pages, retained, true)?
                             };
-                        serde_json::to_value(storage::manifest::cache::Rank {
+                        serde_json::to_value(::storage::manifest::cache::Rank {
                             worker_group: retained.scope().group.clone(),
                             rank: retained.scope().rank,
                             host: self.info.endpoint.host.clone(),
@@ -887,7 +887,7 @@ impl Service<'_> {
                     let device = planes
                         .device()
                         .ok_or(Error::State("cache staging requires a device pool"))?;
-                    serde_json::to_value(storage::manifest::cache::Rank {
+                    serde_json::to_value(::storage::manifest::cache::Rank {
                         worker_group: retained.scope().group.clone(),
                         rank: retained.scope().rank,
                         host: self.info.endpoint.host.clone(),
@@ -899,7 +899,7 @@ impl Service<'_> {
                 _ => serde_json::Value::Null,
             },
             "uniserve.cache_unstage" => {
-                let keys = serde_json::from_value::<Vec<storage::Key>>(payload)
+                let keys = serde_json::from_value::<Vec<::storage::Key>>(payload)
                     .map_err(|error| Error::Invalid(format!("cache staging release: {error}")))?;
                 if let Some(retained) = retained.as_deref() {
                     self.maintenance.cache_staging.release(retained, keys)?;
@@ -914,30 +914,30 @@ impl Service<'_> {
                 }
                 serde_json::Value::Null
             }
-            "uniserve.cache_memory" => {
+            "uniserve.cache_storage" => {
                 // The cache's device; a rank without a cache (an expert
-                // worker) reports its primary device's memory.
+                // worker) reports its primary device's storage.
                 let device = planes
                     .as_ref()
                     .and_then(|planes| planes.device())
                     .or_else(|| self.maintenance.devices.first().copied());
-                // The device's free memory, which bounds what the cache
+                // The device's free storage, which bounds what the cache
                 // creates, and the graph share a successor's warmup captures
                 // in (the share a serving worker's capacity plan keeps).
                 let (free, graph_share) = match device {
                     Some(device) => {
-                        let memory = device.memory_info()?;
+                        let storage = device.memory_info()?;
                         (
-                            memory.free,
-                            crate::cuda_graph::graph_storage_budget_bytes(memory.total as i64),
+                            storage.free,
+                            crate::cuda_graph::graph_storage_budget_bytes(storage.total as i64),
                         )
                     }
                     None => (0, 0),
                 };
                 // The GPU's ledger, from which the engine computes what the
                 // cache may hold beside every world of the deployment, and
-                // what the host admits of new host memory.
-                let (ledger, host_memory) = match (retained.as_deref(), device) {
+                // what the host admits of new host storage.
+                let (ledger, host_storage) = match (retained.as_deref(), device) {
                     (Some(retained), Some(device)) => {
                         let (ledger, host) = retained.ledger(device)?;
                         (Some(ledger), Some(host))
@@ -949,7 +949,7 @@ impl Service<'_> {
                     .backend()
                     .worker_storage()
                     .and_then(|storage| storage.prefix_cache.as_ref())
-                    .map_or(0, crate::memory::PrefixCache::scratch_lent);
+                    .map_or(0, crate::storage::PrefixCache::scratch_lent);
                 // The head segment a successor creates beside its
                 // predecessor's: the sentinel, the scratch of a warmup like
                 // this rank's and the writable pages needed to advance a
@@ -958,7 +958,7 @@ impl Service<'_> {
                     (Some(planes), Some(device)) => {
                         let plan = planes.plan();
                         let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
-                        u64::from(crate::memory::PlaneLayout::whole_granules(
+                        u64::from(crate::storage::PlaneLayout::whole_granules(
                             1 + scratch + plan.progress_units(),
                             plan.plane_bytes,
                             granularity,
@@ -988,9 +988,9 @@ impl Service<'_> {
                     "capturable": self.maintenance.capturable,
                     "host": self.info.endpoint.host,
                     "scope": retained.as_deref().map(|retained| retained.scope().clone()),
-                    "world": retained.as_deref().map(crate::memory::retained::Retained::world),
+                    "world": retained.as_deref().map(crate::storage::retained::Retained::world),
                     "ledger": ledger,
-                    "host_memory": host_memory,
+                    "host_storage": host_storage,
                 })
             }
             "uniserve.host_cache" => {
@@ -1033,11 +1033,11 @@ impl Service<'_> {
                 // The executor switches its computations' forwards and its
                 // expert union's joins. An expert-only rank holds no
                 // computation, but its union replays captured joins from the
-                // pools given back below: a replay over unmapped pool memory
+                // pools given back below: a replay over unmapped pool storage
                 // faults on the device and leaves its peers waiting in the
                 // step's exchange.
                 let executor = self.executor.backend().executor();
-                // No forward or join replays a graph while its memory is given
+                // No forward or join replays a graph while its storage is given
                 // back: the executor switches before it goes and after it
                 // returns.
                 if eager {
@@ -1047,13 +1047,13 @@ impl Service<'_> {
                     for pool in &self.maintenance.graph_pools {
                         pool.suspend()?;
                     }
-                    // The ledgers no longer book the graph memory given back,
+                    // The ledgers no longer book the graph storage given back,
                     // which the successor's preparation may then use.
-                    self.book_memory(false)?;
+                    self.book_storage(false)?;
                 } else {
-                    // The graph memory is booked again before it is restored,
+                    // The graph storage is booked again before it is restored,
                     // refused past the quota.
-                    self.book_memory(true)?;
+                    self.book_storage(true)?;
                     for pool in &self.maintenance.graph_pools {
                         pool.restore()?;
                     }
@@ -1073,7 +1073,7 @@ impl Service<'_> {
                 // A rank that holds no cache, such as an expert worker, has
                 // none to give back.
                 if let Some(planes) = planes {
-                    planes.release_segments(first, memory)?;
+                    planes.release_segments(first, storage)?;
                     renew_graphs()?;
                 }
                 serde_json::Value::Null
@@ -1082,7 +1082,7 @@ impl Service<'_> {
                 let limit = payload["segments"]
                     .as_u64()
                     .and_then(|count| u32::try_from(count).ok());
-                restore(planes.as_ref(), memory, limit)?;
+                restore(planes.as_ref(), storage, limit)?;
                 renew_graphs()?;
                 serde_json::Value::Null
             }
@@ -1102,17 +1102,17 @@ impl Service<'_> {
                     .ok_or_else(|| Error::State("a host pool inherits no cache"))?;
                 let plan = planes.plan();
                 let cells = plan.columns as usize * predecessor.num_units as usize;
-                let peers = crate::memory::allocation::Storage::peers(device)?;
+                let peers = crate::storage::allocation::Storage::peers(device)?;
                 let mut names = Vec::new();
-                for field in crate::memory::prefix_cache::planes::FIELDS {
+                for field in crate::storage::prefix_cache::planes::FIELDS {
                     names.push((format!("prefix_cache.{field}.initialized"), cells));
                     if plan.quantized {
                         names.push((format!("prefix_cache.{field}.scale"), cells * 4));
                     }
                 }
-                let specs: Vec<crate::memory::retained::ExclusiveSpec<'_>> = names
+                let specs: Vec<crate::storage::retained::ExclusiveSpec<'_>> = names
                     .iter()
-                    .map(|(name, bytes)| crate::memory::retained::ExclusiveSpec {
+                    .map(|(name, bytes)| crate::storage::retained::ExclusiveSpec {
                         name,
                         device,
                         bytes: *bytes,
@@ -1160,25 +1160,25 @@ impl Service<'_> {
                 if let Some(planes) = &planes
                     && planes.segments().is_some()
                 {
-                    planes.release_segments(0, memory)?;
+                    planes.release_segments(0, storage)?;
                 }
-                // The ledgers no longer book the released graph memory.
-                self.book_memory(false)?;
-                tracing::info!("the worker sleeps: its graph memory and cache are released");
+                // The ledgers no longer book the released graph storage.
+                self.book_storage(false)?;
+                tracing::info!("the worker sleeps: its graph storage and cache are released");
                 serde_json::Value::Null
             }
             "uniserve.wake" => {
                 if self.maintenance.asleep {
-                    // The graph memory is booked again before it and the
+                    // The graph storage is booked again before it and the
                     // cache are restored, refused past the quota.
-                    self.book_memory(true)?;
+                    self.book_storage(true)?;
                     for pool in &self.maintenance.pools {
                         pool.restore()?;
                     }
-                    restore(planes.as_ref(), memory, None)?;
+                    restore(planes.as_ref(), storage, None)?;
                     renew_graphs()?;
                     self.maintenance.asleep = false;
-                    tracing::info!("the worker woke: its graph memory and cache are restored");
+                    tracing::info!("the worker woke: its graph storage and cache are restored");
                 }
                 serde_json::Value::Null
             }
@@ -1191,11 +1191,11 @@ impl Service<'_> {
                     .backend()
                     .worker_storage()
                     .and_then(|storage| storage.prefix_cache.as_ref())
-                    .is_some_and(crate::memory::PrefixCache::copies_pages);
+                    .is_some_and(crate::storage::PrefixCache::copies_pages);
                 let plan = planes.as_ref().map(|planes| Arc::clone(planes.plan()));
                 // The requests in flight keep their KV cache through the
                 // update: the checkpoint loads beside the cache, in the
-                // graph memory as well when the free memory alone does not
+                // graph storage as well when the free storage alone does not
                 // hold it.
                 let keep = payload["keep"].as_bool().unwrap_or(false) && !self.maintenance.asleep;
                 let suspended = keep && self.make_room_for_weights()?;
@@ -1206,7 +1206,7 @@ impl Service<'_> {
                     _ => Ok(serde_json::json!({ "group": null, "page_contents": [] })),
                 };
                 // The checkpoint copy is gone: its staging booking ends, and
-                // the graph memory given back for it returns and is booked
+                // the graph storage given back for it returns and is booked
                 // again.
                 if keep {
                     self.book_staging(&BTreeMap::new())?;
@@ -1216,7 +1216,7 @@ impl Service<'_> {
                         pool.restore()?;
                     }
                     renew_graphs()?;
-                    self.book_memory(true)?;
+                    self.book_storage(true)?;
                 }
                 updated?
             }
@@ -1307,10 +1307,10 @@ impl Service<'_> {
 }
 
 impl Service<'_> {
-    /// Books the warm rank's memory in each device's ledger, its graph
-    /// pools while `graphs` are resident; a rank whose memory the server
-    /// does not keep (`LocalMemory`) books none.
-    fn book_memory(&self, graphs: bool) -> crate::Result<()> {
+    /// Books the warm rank's storage in each device's ledger, its graph
+    /// pools while `graphs` are resident; a rank whose storage the server
+    /// does not keep (`LocalStorage`) books none.
+    fn book_storage(&self, graphs: bool) -> crate::Result<()> {
         let Some(retained) = self.maintenance.retained.as_deref() else {
             return Ok(());
         };
@@ -1324,7 +1324,7 @@ impl Service<'_> {
     /// hold on `device` with the rank's process in the device's ledger,
     /// replacing what an earlier session booked. Answers the ledger's
     /// refusal, with the booking unchanged, when it cannot fit them. A rank
-    /// that books nothing (`LocalMemory`, or a parked standby, which books
+    /// that books nothing (`LocalStorage`, or a parked standby, which books
     /// at its promotion) books none of them either.
     fn book_profiling(
         &mut self,
@@ -1376,20 +1376,20 @@ impl Service<'_> {
         tracing::warn!("unbooking the ended profiling session's device storage failed: {failure}");
     }
 
-    /// Makes the device memory beside the KV cache hold a checkpoint of the
+    /// Makes the device storage beside the KV cache hold a checkpoint of the
     /// rank's weights, which an update keeping the requests in flight loads
-    /// into new memory before it copies each tensor into place. The copy is
+    /// into new storage before it copies each tensor into place. The copy is
     /// booked in each device's ledger as the rank's staging, within the
-    /// deployment's quota, and must fit the device's free memory; the graph
-    /// memory is given back (and its booking ended) when the quota or the
-    /// free memory does not hold the copy beside it. Returns whether it was
+    /// deployment's quota, and must fit the device's free storage; the graph
+    /// storage is given back (and its booking ended) when the quota or the
+    /// free storage does not hold the copy beside it. Returns whether it was
     /// given back, for the caller to restore once the update ends.
     ///
     /// # Errors
     ///
-    /// Refuses, with the graph memory restored and booked and the staging
-    /// unbooked, when even without the graph memory the quota or the free
-    /// memory does not hold the checkpoint.
+    /// Refuses, with the graph storage restored and booked and the staging
+    /// unbooked, when even without the graph storage the quota or the free
+    /// storage does not hold the checkpoint.
     fn make_room_for_weights(&mut self) -> crate::Result<bool> {
         let Some(weights) = self.maintenance.weights.as_ref() else {
             return Ok(false);
@@ -1415,13 +1415,13 @@ impl Service<'_> {
         for pool in &self.maintenance.pools {
             pool.suspend()?;
         }
-        self.book_memory(false)?;
+        self.book_storage(false)?;
         let refusal = match self.book_staging(&needed) {
             Err(error) => Some(format!("{error}")),
             Ok(()) => short(&needed)?.map(|(device, bytes, free)| {
                 format!(
                     "the checkpoint's {bytes} bytes on {device} exceed the {free} bytes free with \
-                     the graph memory given back"
+                     the graph storage given back"
                 )
             }),
         };
@@ -1431,7 +1431,7 @@ impl Service<'_> {
                 pool.restore()?;
             }
             renew_graphs()?;
-            self.book_memory(true)?;
+            self.book_storage(true)?;
             return Err(Error::Unsupported(format!(
                 "keeping the requests in flight through the weight update loads the checkpoint \
                  beside their KV cache: {refusal}; update with the requests in flight \
@@ -1443,7 +1443,7 @@ impl Service<'_> {
 
     /// Books `bytes` of staging on each device of the rank's ledger
     /// bookings, those `bytes` does not name at 0: a transient copy the rank
-    /// holds beside its other memory. Refused, past the quota, with the
+    /// holds beside its other storage. Refused, past the quota, with the
     /// ledger's entries.
     fn book_staging(&self, bytes: &BTreeMap<cuda::DeviceId, u64>) -> crate::Result<()> {
         let Some(retained) = self.maintenance.retained.as_deref() else {
@@ -1455,7 +1455,7 @@ impl Service<'_> {
                 booking.device,
                 booking.total,
                 booking.quota,
-                vec![(storage::Item::Staging, staging)],
+                vec![(::storage::Item::Staging, staging)],
             )?;
         }
         Ok(())
@@ -1476,10 +1476,10 @@ fn renew_graphs() -> crate::Result<()> {
     Ok(())
 }
 
-/// Creates the segments `planes` gave back again, through `memory`.
+/// Creates the segments `planes` gave back again, through `storage`.
 fn restore(
-    planes: Option<&Arc<crate::memory::CachePlanes>>,
-    memory: &mut dyn crate::memory::retained::ExclusiveMemory,
+    planes: Option<&Arc<crate::storage::CachePlanes>>,
+    storage: &mut dyn crate::storage::retained::ExclusiveStorage,
     limit: Option<u32>,
 ) -> crate::Result<()> {
     let Some(planes) = planes else {
@@ -1492,7 +1492,7 @@ fn restore(
         return Ok(());
     }
     let stream = cuda::Stream::new(device)?;
-    planes.restore_segments(memory, &stream, limit)
+    planes.restore_segments(storage, &stream, limit)
 }
 
 /// Runs the worker hook `name` with `payload` (`uniserve.hooks.call`) and

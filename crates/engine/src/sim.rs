@@ -468,14 +468,14 @@ impl Executor for SimExecutor {
     }
 
     /// Answers the engine's own worker hooks as a worker without a device
-    /// does: its cache is not split into segments, it gives back no memory,
+    /// does: its cache is not split into segments, it gives back no storage,
     /// it has no fence probes, and a profiling session it takes part in runs
     /// no collector and writes no file. It loads and unloads LoRA adapters
     /// as a worker with a LoRA plugin does, answering the slot; other plugin
     /// hooks fail, as no plugin is loaded.
     fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
         let result = match name {
-            "uniserve.cache_memory" => serde_json::json!({
+            "uniserve.cache_storage" => serde_json::json!({
                 "segments": [],
                 "held": 0,
             }),

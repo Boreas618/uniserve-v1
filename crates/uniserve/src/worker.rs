@@ -116,7 +116,7 @@ fn raise_descriptor_limit() -> Result<(), String> {
 /// job per CPU plus two.
 const COMPILE_JOBS_VARIABLE: &str = "MAX_JOBS";
 
-/// The peak host memory of one compilation job: one `cicc` of FlashInfer's
+/// The peak host storage of one compilation job: one `cicc` of FlashInfer's
 /// fused-MoE build reaches 6.1 GiB.
 const COMPILE_JOB_BYTES: u64 = 61 * (1 << 30) / 10;
 
@@ -125,7 +125,7 @@ const COMPILE_JOB_BYTES: u64 = 61 * (1 << 30) / 10;
 ///
 /// The ranks of the worker's launch on its host (`LOCAL_WORLD_SIZE`, one
 /// when unset) start and compile together, so each takes an equal share of
-/// half of the host's available CPUs and of the memory available as it
+/// half of the host's available CPUs and of the storage available as it
 /// starts, at [`COMPILE_JOB_BYTES`] per job, and at least one job. The
 /// variable is set before the interpreter starts, so every build of the
 /// worker reads it.
@@ -146,11 +146,11 @@ fn bound_compile_jobs() -> Result<(), String> {
     let cpus = std::thread::available_parallelism()
         .map_err(|error| format!("counting the available CPUs: {error}"))?
         .get() as u64;
-    let available = available_memory()?;
+    let available = available_storage()?;
 
     let by_cpus = cpus / 2 / ranks;
-    let by_memory = available / (COMPILE_JOB_BYTES * ranks);
-    let jobs = by_cpus.min(by_memory).max(1);
+    let by_storage = available / (COMPILE_JOB_BYTES * ranks);
+    let jobs = by_cpus.min(by_storage).max(1);
     eprintln!(
         "uniserve worker: kernel compilations run up to {jobs} parallel jobs \
          ({cpus} CPUs and {} GiB available for {ranks} ranks of this host; \
@@ -163,9 +163,9 @@ fn bound_compile_jobs() -> Result<(), String> {
     Ok(())
 }
 
-/// The host memory available to new allocations without swapping, in bytes:
+/// The host storage available to new allocations without swapping, in bytes:
 /// `MemAvailable` of `/proc/meminfo`.
-fn available_memory() -> Result<u64, String> {
+fn available_storage() -> Result<u64, String> {
     let meminfo = std::fs::read_to_string("/proc/meminfo")
         .map_err(|error| format!("reading /proc/meminfo: {error}"))?;
     meminfo

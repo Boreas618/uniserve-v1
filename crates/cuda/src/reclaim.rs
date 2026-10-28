@@ -1,4 +1,4 @@
-//! Deferred release of device and pinned host memory.
+//! Deferred release of device and pinned host storage.
 //!
 //! Dropping a [`crate::DeviceAllocation`], [`crate::PeerMapping`] or
 //! [`crate::PinnedBuffer`] makes no CUDA call on the dropping thread. The
@@ -14,7 +14,7 @@
 //!   capture mode, so its calls never interact with other threads' captures.
 //!
 //! The reclaimer does not order releases after device work. Owners guarantee
-//! that no queued or replayable device work still addresses memory when they
+//! that no queued or replayable device work still addresses storage when they
 //! drop its last reference (the worker retires storage by events and drains
 //! its streams before shutdown).
 //!
@@ -103,7 +103,7 @@ pub(crate) fn defer(release: impl FnOnce() -> Result<()> + Send + 'static) {
 /// Waits until every release queued before this call has run.
 ///
 /// Returns [`Error::Reclaim`] if any deferred release failed since the
-/// previous flush; the failed memory remains allocated until process exit.
+/// previous flush; the failed storage remains allocated until process exit.
 pub fn flush() -> Result<()> {
     if let Some(sender) = reclaimer() {
         let (done, completed) = mpsc::sync_channel(1);

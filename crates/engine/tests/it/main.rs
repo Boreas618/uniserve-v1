@@ -3,7 +3,7 @@
 
 #![cfg(test)]
 
-mod cache_memory;
+mod cache_storage;
 mod canvas;
 mod control_plane;
 mod encoder_outputs;

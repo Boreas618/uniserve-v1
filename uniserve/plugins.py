@@ -11,8 +11,8 @@ first, with the :class:`Registry`, through which the function adds:
 - worker hooks (``uniserve.hooks``): the operations the admin API runs on
   every worker (``load_lora_adapter`` and ``unload_lora_adapter`` of a LoRA
   plugin, ``uniserve.adapters``, or a name of its own);
-- communication buffers: memory a plugin's kernels communicate through
-  (symmetric memory, multicast objects), which every GPU worker allocates
+- communication buffers: storage a plugin's kernels communicate through
+  (symmetric storage, multicast objects), which every GPU worker allocates
   before it sizes the KV cache (:func:`allocate_buffers`);
 - weight sources: the tensors of a checkpoint streamed from elsewhere than
   its files (a tensor stream, CUDA IPC handles), named by a URI of the
@@ -124,9 +124,9 @@ class Registry:
         """Allocate the communication buffer ``name`` on every GPU worker
         before it sizes the KV cache: ``factory`` is called with the
         worker's models (``uniserve.hooks.models``) and its CUDA device
-        ordinal, allocates the memory and returns an object that holds it,
-        which the worker keeps for its lifetime. The memory counts against
-        the KV cache, memory NVML attributes to no process (a VMM
+        ordinal, allocates the storage and returns an object that holds it,
+        which the worker keeps for its lifetime. The storage counts against
+        the KV cache, storage NVML attributes to no process (a VMM
         allocation's) included.
 
         Raises:

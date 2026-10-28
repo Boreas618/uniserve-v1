@@ -1,4 +1,4 @@
-"""Byte layout rules of the device memory the executors allocate.
+"""Byte layout rules of the device storage the executors allocate.
 
 An executor lays its columns out in one arena per runner, each column at a
 :data:`COLUMN_ALIGNMENT` boundary, and allocates request state as separate

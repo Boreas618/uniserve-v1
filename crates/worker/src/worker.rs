@@ -23,18 +23,18 @@
 //! [`Worker::run`] serves the channel, and [`Worker::close`] consumes the rank
 //! and releases its owners in dependency order: execution, the executor and its
 //! computations, streams, requests, the process world, then deferred device
-//! memory. The launch closes every rank that started, unless the rank abandoned
+//! storage. The launch closes every rank that started, unless the rank abandoned
 //! work its threads may wait in for good, which ends the process at once.
 
 mod computations;
 mod image;
 mod loading;
-mod memory;
 mod planning;
+mod storage;
 pub(crate) mod update;
 
 pub(crate) use loading::LoadedModel;
-pub(crate) use memory::WorkerMemory;
+pub(crate) use storage::WorkerStorage;
 
 use std::sync::Arc;
 
@@ -59,18 +59,18 @@ use crate::executor::experts::{ExpertMember, ExpertStart};
 use crate::executor::transfer::TransferRuntime;
 use crate::ffi::{Handle, Interpreter};
 use crate::job::{BLOCK_ON_TIMEOUT, JobQueue};
-use crate::memory::allocation::Storage;
-use crate::memory::encoders::{self, EncoderHostPool};
-use crate::memory::prefix_cache::host::{self, HostCacheSetup};
-use crate::memory::retained::Retained;
-use crate::memory::weights::{self, WeightKeys};
-use crate::memory::{LatentHostPool, SlotPages};
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{DwdpManager, HostRetention, HostWeights};
 use crate::profiling::kernels::{KernelRecords, KernelWatch};
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
 use crate::service::{Ending, Parked, ParkedExperts, Service, Suspension};
+use crate::storage::allocation::Storage;
+use crate::storage::encoders::{self, EncoderHostPool};
+use crate::storage::prefix_cache::host::{self, HostCacheSetup};
+use crate::storage::retained::Retained;
+use crate::storage::weights::{self, WeightKeys};
+use crate::storage::{LatentHostPool, SlotPages};
 use crate::stream::Scratches;
 use crate::stream::Streams;
 use crate::transfer::TransportKind;
@@ -79,8 +79,8 @@ use loading::{ComponentMesh, Description, ExpertPartition, head_projection, sequ
 
 use computations::Binding;
 pub(crate) use computations::warm as warm_computations;
-use memory::allocate_storage;
 use planning::{block_size, cache_plan, cache_width, log_capacity, plan};
+use storage::allocate_storage;
 
 /// One caching-allocator segment: device, graph pool id and bytes.
 type Segment = (DeviceId, (u64, u64), u64);
@@ -127,11 +127,11 @@ pub(crate) struct Worker {
     /// The shared work areas of the computations' streams, which the executor's
     /// execution contexts borrow.
     scratches: Scratches,
-    /// How the worker, parked as a standby, keeps its graph memory.
-    standby_memory: ipc::StandbyMemory,
+    /// How the worker, parked as a standby, keeps its graph storage.
+    standby_storage: ipc::StandbyStorage,
     /// Whether a rank of the loaded model captures graphs under a policy
     /// that captures (`auto`): its model's and components' calls can be
-    /// captured, and no component streams its weights from host memory.
+    /// captured, and no component streams its weights from host storage.
     capturable: bool,
     executor: Executor,
     /// The executor runs warmup phases: the rank has executor computations or
@@ -203,7 +203,7 @@ impl Worker {
         {
             crate::profiling::pc_sampling::enable(context).map_err(phase("device"))?;
         }
-        // The worker's memory that outlives it is kept at the host's
+        // The worker's storage that outlives it is kept at the host's
         // Storage Server, which first shoots down a predecessor still
         // holding it.
         let retained = Retained::connect(
@@ -256,7 +256,7 @@ impl Worker {
         let agreement = world.union.as_ref().unwrap_or(&world.host);
         // A rank whose position no world loaded before receives its weights
         // from the host's other worlds instead; layers streamed from host
-        // memory are retained whole and load.
+        // storage are retained whole and load.
         let streams_from_host = components
             .placed()
             .iter()
@@ -312,7 +312,7 @@ impl Worker {
         // is captured, so that warmup captures them into the graphs.
         attach_fences(&launch, &model).map_err(phase("load"))?;
         // A loading worker's weights are put once the host regions of the
-        // layers it streams from host memory joined them.
+        // layers it streams from host storage joined them.
         let host_paths: Vec<String> = components
             .placed()
             .iter()
@@ -370,7 +370,7 @@ impl Worker {
         let mut streams = Streams::create(&devices).map_err(phase("streams"))?;
         let host = launch.host.clone();
         // Expert transports map their device workspaces before capacity
-        // planning measures free memory.
+        // planning measures free storage.
         let experts = match &executor {
             Some(executor) => ExpertMember::start(ExpertStart {
                 launch: &launch,
@@ -386,7 +386,7 @@ impl Worker {
             .map_err(phase("experts"))?;
         let distributed_weights = weights.as_ref().map(DwdpManager::update);
         // Host-resident layer weights release their device storage before
-        // capacity planning measures free memory.
+        // capacity planning measures free storage.
         // A stack's host region is published with a whole load and bound
         // otherwise: a rank that misses any of it loads whole (`Load::of`).
         let mut retention = match &mut published {
@@ -419,8 +419,8 @@ impl Worker {
             }
             None => bound,
         };
-        // Plugins allocate the memory their kernels communicate through
-        // before capacity planning measures free memory.
+        // Plugins allocate the storage their kernels communicate through
+        // before capacity planning measures free storage.
         let (plugin_buffers, unattributed) =
             allocate_plugin_buffers(device).map_err(phase("capacity"))?;
         let budget = match device {
@@ -556,7 +556,7 @@ impl Worker {
                 graphs: &mut graphs,
                 collectives: &collectives,
                 prefetch: weights.as_ref().map(DwdpManager::prefetch),
-                memory: &mut &*retained,
+                storage: &mut &*retained,
             })
             .map_err(phase("bind"))?,
             None => computations::Bound {
@@ -787,7 +787,7 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
 
-        // Every owner took its memory: retained storages of the scope that
+        // Every owner took its storage: retained storages of the scope that
         // none took any more are released.
         retained.retain_used().map_err(phase("storage"))?;
         tracing::info!("loaded numerical model");
@@ -801,7 +801,7 @@ impl Worker {
             streams,
             graphs,
             scratches,
-            standby_memory: launch.storage.standby_memory,
+            standby_storage: launch.storage.standby_storage,
             capturable,
             executor,
             computation_warmup,
@@ -869,7 +869,7 @@ impl Worker {
 
         // The warm rank books what the Storage Server cannot see in each
         // device's ledger, which refuses it past the deployment's quota. A
-        // standby lives beside the quota, on the memory the fraction leaves,
+        // standby lives beside the quota, on the storage the fraction leaves,
         // until its promotion replaces the rank it stands by for: it books
         // then.
         self.bookings = self.measure_bookings().map_err(phase("warmup"))?;
@@ -910,9 +910,9 @@ impl Worker {
             .backend()
             .worker_storage()
             .and_then(|storage| storage.prefix_cache.as_ref());
-        let scratch = prefix_cache.map_or(0, crate::memory::PrefixCache::scratch_lent);
+        let scratch = prefix_cache.map_or(0, crate::storage::PrefixCache::scratch_lent);
         // The planes' segments, the ones they hold (a successor creates its
-        // tail as its memory frees) and the units they map from the
+        // tail as its storage frees) and the units they map from the
         // predecessor world, which the engine allocates only once the world
         // took them.
         let segments = prefix_cache.map(|cache| {
@@ -933,12 +933,12 @@ impl Worker {
             }
         }
         // A standby worker parks with its exclusive storages read-only until
-        // the engine promotes it, and with the memory its graphs address
+        // the engine promotes it, and with the storage its graphs address
         // released when keeping it would crowd the workers it stands by for.
         let standby = if self.retained.standing_by() {
             // A standby that cannot park fails its startup: the engine,
             // still awaiting its startup report, names the error.
-            let parked = self.park_memory().and_then(|suspension| {
+            let parked = self.park_storage().and_then(|suspension| {
                 self.retained.park().map_err(phase("standby"))?;
                 Ok(suspension)
             });
@@ -1019,16 +1019,16 @@ impl Worker {
         served
     }
 
-    /// How a parked standby keeps the device memory its graphs address, as
-    /// `worker_config.standby_memory` says: resident or suspended (its
-    /// device memory released, its addresses kept, restored at the
+    /// How a parked standby keeps the device storage its graphs address, as
+    /// `worker_config.standby_storage` says: resident or suspended (its
+    /// device storage released, its addresses kept, restored at the
     /// promotion); with `auto`, resident when
-    /// every device keeps, beside it, the share of its memory a serving
+    /// every device keeps, beside it, the share of its storage a serving
     /// worker's capacity plan leaves for graphs and activations
     /// ([`graph_storage_budget_bytes`]), and suspended otherwise. The ranks
     /// that park together (the expert union the rank belongs to, else its
     /// worker group) take one mode: one rank's crowded device suspends them
-    /// all. Suspending copies the graph pools and scratch to host memory,
+    /// all. Suspending copies the graph pools and scratch to host storage,
     /// has the executor release the expert transports' workspaces
     /// (`park_experts`: those that keep their addresses are suspended, the
     /// others freed and their graphs captured again at the promotion), and
@@ -1037,24 +1037,24 @@ impl Worker {
     ///
     /// # Errors
     ///
-    /// Fails when a device lacks that share even once the memory is
+    /// Fails when a device lacks that share even once the storage is
     /// suspended: the standby does not fit beside the workers it stands by
     /// for, and none is kept.
-    fn park_memory(&mut self) -> std::result::Result<Suspension, WorkerError> {
+    fn park_storage(&mut self) -> std::result::Result<Suspension, WorkerError> {
         let mut pools = self.graphs.pools();
         pools.extend(self.scratches.pools());
         let mut devices: Vec<DeviceId> = pools.iter().map(|pool| pool.device).collect();
         devices.sort_unstable();
         devices.dedup();
         let short = |device: DeviceId| -> Result<bool> {
-            let memory = device.memory_info()?;
-            Ok(memory.free < graph_storage_budget_bytes(memory.total as i64))
+            let storage = device.memory_info()?;
+            Ok(storage.free < graph_storage_budget_bytes(storage.total as i64))
         };
-        let bytes: usize = pools.iter().map(|pool| pool.memory.mapped_bytes()).sum();
-        let crowded = match self.standby_memory {
-            ipc::StandbyMemory::Resident => false,
-            ipc::StandbyMemory::Suspended => true,
-            ipc::StandbyMemory::Auto => {
+        let bytes: usize = pools.iter().map(|pool| pool.storage.mapped_bytes()).sum();
+        let crowded = match self.standby_storage {
+            ipc::StandbyStorage::Resident => false,
+            ipc::StandbyStorage::Suspended => true,
+            ipc::StandbyStorage::Auto => {
                 let mut crowded = false;
                 for &device in &devices {
                     crowded |= short(device).map_err(phase("standby"))?;
@@ -1069,7 +1069,7 @@ impl Worker {
             }
         };
         if !crowded {
-            tracing::info!(bytes, "the standby worker keeps its graph memory resident");
+            tracing::info!(bytes, "the standby worker keeps its graph storage resident");
             return Ok(Suspension::default());
         }
 
@@ -1080,7 +1080,7 @@ impl Worker {
         for pool in &pools {
             pool.suspend().map_err(phase("standby"))?;
         }
-        tracing::info!(bytes, "the standby worker suspended its graph memory");
+        tracing::info!(bytes, "the standby worker suspended its graph storage");
         // The expert transports release their workspaces: those that keep their
         // addresses are suspended, which the promotion maps back; the others
         // are freed, and the promotion rebuilds them and captures the
@@ -1116,15 +1116,15 @@ impl Worker {
         tracing::info!("the standby worker suspended its communicators");
         for &device in &devices {
             if short(device).map_err(phase("standby"))? {
-                let memory = device
+                let storage = device
                     .memory_info()
                     .map_err(|error| phase("standby")(error.into()))?;
                 return Err(phase("standby")(Error::Invalid(format!(
                     "the standby worker does not fit beside the workers it stands by for on \
-                     {device}: {} bytes are free once its graph memory is suspended, below \
-                     the {} bytes of graph memory its promotion maps",
-                    memory.free,
-                    graph_storage_budget_bytes(memory.total as i64)
+                     {device}: {} bytes are free once its graph storage is suspended, below \
+                     the {} bytes of graph storage its promotion maps",
+                    storage.free,
+                    graph_storage_budget_bytes(storage.total as i64)
                 ))));
             }
         }
@@ -1210,7 +1210,7 @@ impl Worker {
         failure.map_or(Ok(()), Err)
     }
 
-    /// What the warm rank books on each CUDA device it uses: the memory its
+    /// What the warm rank books on each CUDA device it uses: the storage its
     /// graph pools map there, and what its process holds beside them, with
     /// the product storage it has yet to make resident (on the primary
     /// device). None on a CPU rank.
@@ -1227,7 +1227,7 @@ impl Worker {
             let graph: u64 = pools
                 .iter()
                 .filter(|pool| pool.device == index)
-                .map(|pool| pool.memory.mapped_bytes() as u64)
+                .map(|pool| pool.storage.mapped_bytes() as u64)
                 .sum();
             let pending = if device == self.config.device {
                 self.plan.arena.deferred_device_bytes()
@@ -1297,7 +1297,7 @@ impl Worker {
             .map_err(phase("warmup"))
     }
 
-    /// Check graph residency, report memory and kernels, then seal.
+    /// Check graph residency, report storage and kernels, then seal.
     fn complete_startup(&mut self) -> std::result::Result<(), WorkerError> {
         let cuda_devices: Vec<DeviceId> = self.config.devices().filter_map(Device::cuda).collect();
         if let Some(budget) = &self.budget {
@@ -1402,7 +1402,7 @@ fn attach_fences(launch: &WorkerLaunch, model: &LoadedModel) -> Result<()> {
 
 /// Allocate every plugin's communication buffer on the rank's CUDA device
 /// (`uniserve.plugins.allocate_buffers`), and measure what NVML attributes
-/// to no process of what they took: the device's free memory falls by more
+/// to no process of what they took: the device's free storage falls by more
 /// than the process's grows. Returns the objects that hold the buffers,
 /// which the rank keeps, and those bytes by device; nothing for a CPU rank
 /// or without buffers.
@@ -1413,7 +1413,7 @@ fn allocate_plugin_buffers(device: Device) -> Result<(Option<Handle>, BTreeMap<D
     let nvml = cuda::Nvml::init()?;
     let free = || -> Result<u64> { Ok(index.memory_info()?.free) };
     let process = || -> Result<u64> {
-        nvml.process_memory(index).map_err(|error| match error {
+        nvml.process_storage(index).map_err(|error| match error {
             cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
                 "NVML reports no device storage for this process on {index}"
             )),
@@ -1477,7 +1477,7 @@ struct Prepared {
     config: WorkerConfig,
     capturable: bool,
     text_facts: image::TextFacts,
-    cache: Option<crate::memory::CachePlan>,
+    cache: Option<crate::storage::CachePlan>,
     executor: Option<Arc<crate::executor::python::PythonExecutor>>,
     manifest: computations::Manifest,
     video: Option<(String, crate::capacity::video::VideoManifest)>,
@@ -1587,7 +1587,7 @@ fn prepare_model(
 pub(crate) fn plan_rank(
     launch: &WorkerLaunch,
     source_worlds: &[u64],
-) -> Result<storage::manifest::weights::PlannedRank> {
+) -> Result<::storage::manifest::weights::PlannedRank> {
     let device = launch.device();
     let Device::Cuda(cuda) = device else {
         return Err(Error::Unsupported(
@@ -1638,7 +1638,7 @@ pub(crate) fn plan_rank(
         None => None,
     };
     let Some(keys) = keys else {
-        return Ok(storage::manifest::weights::PlannedRank {
+        return Ok(::storage::manifest::weights::PlannedRank {
             gpu,
             total_bytes: device_storage.total,
             free_bytes: device_storage.free,
@@ -1689,7 +1689,7 @@ pub(crate) fn plan_rank(
             .as_ref()
             .map(|(name, manifest)| (name.as_str(), manifest.clone())),
     )?;
-    let mut budget = storage::manifest::weights::RankBudget {
+    let mut budget = ::storage::manifest::weights::RankBudget {
         quota,
         graphs: if config.graph_policy == "off" {
             0
@@ -1726,12 +1726,12 @@ pub(crate) fn plan_rank(
     // Transfer context may not have been created yet on a new target GPU.
     let transfer = ledger
         .transfer_context
-        .saturating_sub(ledger.bytes(|entry| entry.item == storage::Item::TransferContext));
+        .saturating_sub(ledger.bytes(|entry| entry.item == ::storage::Item::TransferContext));
     let mut sources = keys.sources(&retained, &launch.storage.peers, Some(source_worlds))?;
     if let Some(sources) = sources.as_mut() {
         keys.measure_sources(&retained, sources)?;
     }
-    Ok(storage::manifest::weights::PlannedRank {
+    Ok(::storage::manifest::weights::PlannedRank {
         gpu,
         total_bytes: device_storage.total,
         free_bytes: device_storage.free,
@@ -1812,7 +1812,7 @@ fn receive_weights(
         .received
         .as_ref()
         .map(|received| {
-            serde_json::from_slice::<storage::manifest::weights::Transfer>(&received.manifest)
+            serde_json::from_slice::<::storage::manifest::weights::Transfer>(&received.manifest)
                 .map_err(|error| Error::Interface(format!("weight redistribution plan: {error}")))
         })
         .transpose()?;
@@ -1880,7 +1880,7 @@ fn weight_keys(
     )?))
 }
 
-/// The tensor- and expert-parallel degrees the rank's weight memory is
+/// The tensor- and expert-parallel degrees the rank's weight storage is
 /// chunked for: `load_config.parallel_degrees`, or every degree up to the
 /// number of GPUs the process sees.
 fn chunk_degrees(launch: &WorkerLaunch) -> Result<Vec<u64>> {
@@ -1918,7 +1918,7 @@ fn endpoint(host: &str) -> WorkerEndpoint {
 /// policy and captures the same shapes.
 ///
 /// A rank holding `host_component`, a component that keeps its weights in
-/// host memory, requires `off`: its layers' weight copies are scheduled by
+/// host storage, requires `off`: its layers' weight copies are scheduled by
 /// the host as each layer is reached, which a captured graph cannot repeat.
 fn graph_policy(
     configured: &str,
@@ -1929,7 +1929,7 @@ fn graph_policy(
         && configured != "off"
     {
         return Err(Error::Unsupported(format!(
-            "component {name} keeps its weights in host memory, which requires cuda_graph_config.policy=off"
+            "component {name} keeps its weights in host storage, which requires cuda_graph_config.policy=off"
         )));
     }
     if model.uncaptured.is_empty() || configured == "off" {

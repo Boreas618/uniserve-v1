@@ -9,7 +9,7 @@ use ffi::{Handle, RawUniqueId, api};
 use crate::{DeviceId, Error, PrimaryContext, Result, Stream};
 
 /// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
-/// memory.
+/// storage.
 const NCCL_SUSPEND_MEM: i32 = 0x01;
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
@@ -352,7 +352,7 @@ impl Communicator {
         api.check(unsafe { (api.comm_destroy)(self.raw) }, "ncclCommDestroy")
     }
 
-    /// Releases the communicator's dynamic device memory
+    /// Releases the communicator's dynamic device storage
     /// (`ncclCommSuspend(NCCL_SUSPEND_MEM)`) until [`Self::resume`]. No
     /// operation may run on it, nor a graph that captured one, in between.
     ///

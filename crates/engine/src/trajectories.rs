@@ -27,7 +27,7 @@
 //!   preparation is offered. When every page is pinned, every restoring
 //!   rank lays the stored values out in its own pages through the copy
 //!   manifest from the stored ranks' layouts to its own
-//!   (`worker::memory::latent::restore`), copying a page it lays out as a
+//!   (`worker::storage::latent::restore`), copying a page it lays out as a
 //!   stored rank did whole, and the preparation commits the trajectory at
 //!   the stored step (`Call::latent_restore`); when one is missing, it
 //!   starts from noise, which computes the same trajectory, and the pages

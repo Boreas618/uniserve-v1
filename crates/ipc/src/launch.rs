@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use crate::{CanvasSampling, ComponentConfig};
 use serde::{Deserialize, Serialize};
 
-/// The Storage Server a worker retains its memory at, and its deployment's
+/// The Storage Server a worker retains its storage at, and its deployment's
 /// claim there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,7 +39,7 @@ pub struct StorageLaunch {
     /// no other host.
     pub tcp: Option<String>,
     /// Where processes of this host reach the deployment's Storage Servers
-    /// on its other nodes (`host:port`), each of which may hold the memory
+    /// on its other nodes (`host:port`), each of which may hold the storage
     /// of the deployment's other worlds: the weights a rank receives from
     /// another host. Empty for a deployment of one node.
     pub peers: Vec<String>,
@@ -51,9 +51,9 @@ pub struct StorageLaunch {
     /// access, warms up on scratch units, parks with the storages read-only
     /// and serves once promoted (`WorkerRequest::Promote`).
     pub standby: bool,
-    /// How the worker, parked as a standby, keeps the device memory of its
-    /// graph pools and scratch (`worker_config.standby_memory`).
-    pub standby_memory: crate::StandbyMemory,
+    /// How the worker, parked as a standby, keeps the device storage of its
+    /// graph pools and scratch (`worker_config.standby_storage`).
+    pub standby_storage: crate::StandbyStorage,
 }
 
 /// Every value one rank process is launched with.
@@ -135,7 +135,7 @@ pub struct LaunchDescriptor {
     pub load_format: String,
     pub download_dir: Option<String>,
     pub load_threads: Option<u32>,
-    /// The tensor- and expert-parallel degrees retained weight memory is
+    /// The tensor- and expert-parallel degrees retained weight storage is
     /// chunked for; empty for every degree up to the GPUs the worker sees.
     pub parallel_degrees: Vec<u32>,
     /// Compute dtype name.
@@ -143,10 +143,10 @@ pub struct LaunchDescriptor {
     /// Precision selectors, a JSON object.
     pub quantization_config: serde_json::Value,
     pub prefix_cache_dtype: Option<String>,
-    /// Fraction of device memory this rank may hold for static allocations,
+    /// Fraction of device storage this rank may hold for static allocations,
     /// weights and prefix cache, in (0, 1].
     pub mem_fraction_static: f64,
-    /// Prefix cache capacity in tokens; `None` sizes it from memory.
+    /// Prefix cache capacity in tokens; `None` sizes it from storage.
     pub max_total_tokens: Option<u64>,
     /// The KV cache of the rank of the same scope in the world this one
     /// succeeds, whose segments the rank maps read-only behind a head

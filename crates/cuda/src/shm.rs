@@ -3,24 +3,24 @@
 //! removal.
 //!
 //! A process that is killed or crashes leaves the driver's interprocess-event
-//! memory, named for its process id ([`remove_event_memory`]), and its NCCL
-//! communicators' proxy memory, under random names its mappings show
+//! storage, named for its process id ([`remove_event_storage`]), and its NCCL
+//! communicators' proxy storage, under random names its mappings show
 //! ([`NcclSegments`]). The process that reaps it removes both while its
 //! zombie still holds the process id, and a worker that ends without its
 //! orderly close removes its own as the last thing it does. Neither needs
 //! CUDA: they encode the libraries' naming.
 
-/// Where POSIX shared-memory objects live on Linux.
+/// Where POSIX shared-storage objects live on Linux.
 const SHARED_MEMORY: &str = "/dev/shm";
 
 /// Removes the shared memory the CUDA driver created for the interprocess
 /// events of process `pid`, run by user `uid`, and returns the paths it
-/// removed. It needs no CUDA: it encodes the driver's naming of that memory,
+/// removed. It needs no CUDA: it encodes the driver's naming of that storage,
 /// observed with driver 580.82.07 by tracing `shm_open` and `shm_unlink`
 /// across processes, users, threads and contexts.
 ///
 /// The driver backs each context's interprocess events with one POSIX
-/// shared-memory object, which it creates exclusively (`O_CREAT | O_EXCL`,
+/// shared-storage object, which it creates exclusively (`O_CREAT | O_EXCL`,
 /// mode 0600) with the context's first such event, and names
 /// `cuda.shm.<uid>.<pid>.<n>`: the creating process's user id and process id
 /// in lowercase hexadecimal (user 65534 is `fffe`), and the context's
@@ -39,7 +39,7 @@ const SHARED_MEMORY: &str = "/dev/shm";
 /// name leaves every mapping of the object valid until its holder ends. Exactly the names of that form with this user and
 /// process id are removed. Every matching object is attempted; the first
 /// failure other than an object already gone is returned.
-pub fn remove_event_memory(uid: u32, pid: u32) -> std::io::Result<Vec<std::path::PathBuf>> {
+pub fn remove_event_storage(uid: u32, pid: u32) -> std::io::Result<Vec<std::path::PathBuf>> {
     let owned = |name: &str| {
         let mut fields = name.split('.');
         let (Some("cuda"), Some("shm"), Some(user), Some(process), Some(ordinal), None) = (
@@ -77,10 +77,10 @@ pub fn remove_event_memory(uid: u32, pid: u32) -> std::io::Result<Vec<std::path:
     failure.map_or(Ok(removed), Err)
 }
 
-/// Where NCCL creates its shared-memory objects: `/dev/shm/nccl-<random>`.
+/// Where NCCL creates its shared-storage objects: `/dev/shm/nccl-<random>`.
 const NCCL_PREFIX: &str = "/dev/shm/nccl-";
 
-/// NCCL's named shared-memory objects that a process maps, each by path and
+/// NCCL's named shared-storage objects that a process maps, each by path and
 /// inode.
 ///
 /// This encodes NCCL's naming, observed with NCCL 2.30.4 by tracing
@@ -177,7 +177,7 @@ impl NcclSegments {
 mod tests {
     use super::*;
 
-    /// A shared-memory object created under NCCL's prefix and mapped by
+    /// A shared-storage object created under NCCL's prefix and mapped by
     /// this process; unmapped when dropped.
     #[cfg(target_os = "linux")]
     struct Mapped {
@@ -254,7 +254,7 @@ mod tests {
     /// user's, ones with the ids in decimal, or a name of another form.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_dead_process_loses_exactly_its_event_memory() {
+    fn a_dead_process_loses_exactly_its_event_storage() {
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
         // Its exit is observed without reaping it, so its id stays taken.
@@ -289,7 +289,7 @@ mod tests {
                 .unwrap();
         }
 
-        let removed = remove_event_memory(uid, pid);
+        let removed = remove_event_storage(uid, pid);
         child.wait().unwrap();
         let survived: Vec<bool> = kept.iter().map(|file| file.exists()).collect();
         for file in dead.iter().chain(&kept) {

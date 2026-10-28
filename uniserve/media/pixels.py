@@ -72,7 +72,7 @@ class PreparedImage:
     The pixels are in the processor's output dtype. ``height`` and
     ``width`` are the canvas dimensions, not the tower's input size.
 
-    A host-prepared image keeps its pixels in page-locked memory when it is
+    A host-prepared image keeps its pixels in page-locked storage when it is
     prepared for a CUDA device, so the consumer's copy to the device is
     asynchronous; the caching host allocator keeps the block from reuse
     until that copy completes.
@@ -188,7 +188,7 @@ def prepare_host_image(
     ``input_images`` is the number of input images in the image's request;
     a patch tower whose images share a pixel budget bounds each by its share
     (see ``PatchTransform.pixel_bound``). With ``pin`` the pixels are copied
-    into page-locked memory, so a consumer can copy them to a CUDA device
+    into page-locked storage, so a consumer can copy them to a CUDA device
     without synchronizing the host with the device.
 
     Touches no device and holds no state, so any host thread may run it;
@@ -248,7 +248,7 @@ def _resample_bytes(image: Image.Image, size: tuple[int, int]) -> torch.Tensor:
     ``pil_to_tensor`` yields a channels-last view of the decoded bytes, and
     the antialiased bicubic filter runs on it only when the size changes,
     rounding back to 8 bits. torchvision picks its interpolation kernel by
-    host architecture and memory format, so the same calls on the host
+    host architecture and storage format, so the same calls on the host
     reproduce the reference pixels independently of the destination device.
     """
     pixels = tensor_vision.pil_to_tensor(image)

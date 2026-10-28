@@ -23,8 +23,8 @@ expert parallelism), or attention and expert workers exchanging through
 DeepEP, form one expert world, which keeps a standby world
 (``worker_config.standby``): once both serve, each worker group is launched
 a second time beside the first, at a rendezvous of its own, and parks with
-its graphs captured, its device memory kept resident or suspended
-(``worker_config.standby_memory``: suspended, it also releases its
+its graphs captured, its device storage kept resident or suspended
+(``worker_config.standby_storage``: suspended, it also releases its
 all-to-all workspaces and NCCL communicators, which its ranks restore
 together at the promotion, and frees DeepEP's windows, which cannot keep
 their addresses: the promotion rebuilds them and captures the graphs that
@@ -305,9 +305,9 @@ def _expert_world(topology: str, tmp_path: Path) -> tuple[str, ...]:
 
 
 @pytest.mark.parametrize("topology", ["replicas", "dedicated"])
-@pytest.mark.parametrize("standby_memory", ["resident", "suspended"])
+@pytest.mark.parametrize("standby_storage", ["resident", "suspended"])
 def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
-    tmp_path: Path, standby_memory: str, topology: str
+    tmp_path: Path, standby_storage: str, topology: str
 ):
     streamed, usage, reference, reference_usage, lines = _stream_through_a_kill(
         tmp_path,
@@ -319,7 +319,7 @@ def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
             "--set",
             "worker_config.standby=true",
             "--set",
-            f"worker_config.standby_memory={standby_memory}",
+            f"worker_config.standby_storage={standby_storage}",
         ),
         devices="0,1",
         parked="the standby world of the failure domain is parked",
@@ -331,8 +331,8 @@ def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
     assert logged("the failure domain's standby world was promoted")
     assert not logged("relaunching the failure domain's worker groups")
     assert logged("a request migrated"), "the streaming request did not migrate"
-    if standby_memory == "resident":
-        assert logged("the standby worker keeps its graph memory resident")
+    if standby_storage == "resident":
+        assert logged("the standby worker keeps its graph storage resident")
     elif topology == "replicas":
         for event in (
             "the standby worker suspended its expert transports",

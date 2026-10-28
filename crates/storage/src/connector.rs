@@ -25,7 +25,7 @@ pub struct Settings {
     /// The name other Mooncake clients reach this host's transfer engine
     /// by; the host's name when unset.
     pub hostname: Option<String>,
-    /// Host memory this connector contributes to Mooncake's pool, in bytes;
+    /// Host storage this connector contributes to Mooncake's pool, in bytes;
     /// zero makes it a client only.
     pub segment_bytes: u64,
     /// `libmooncake_store.so`, built with `WITH_STORE_C_SHARED`; the

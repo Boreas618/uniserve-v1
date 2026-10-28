@@ -33,23 +33,23 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::os::fd::OwnedFd;
 
+use ::storage::protocol::{Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, Scope};
 use serde::{Deserialize, Serialize};
-use storage::protocol::{Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, Scope};
 
 type ClientId = u64;
 
 /// The bytes of a page pool unless the server is started with another
 /// size. The workers that copy through a pool register it for device
-/// copies, which pins it: its memory is allocated whole when the first
+/// copies, which pins it: its storage is allocated whole when the first
 /// worker maps it.
 pub const DEFAULT_POOL_BYTES: u64 = 64 << 30;
 
-/// The host memory a rank's page pools take at most when the host's memory
+/// The host storage a rank's page pools take at most when the host's storage
 /// holds none of the pools a world asks for and a KV storage keeps every
 /// page the pools commit: staging pools, through which pages pass into the
 /// KV storage on their way out of the device (`specs/online-operations.md`
 /// §6.5). The server admits them from its reserve, never past the host's
-/// available memory.
+/// available storage.
 pub const STAGING_POOL_BYTES: u64 = 256 << 20;
 
 /// One slot's state.
@@ -282,7 +282,7 @@ impl Pools {
         if handed.pools.len() != descriptors.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "a handed-over page pool lacks its memory",
+                "a handed-over page pool lacks its storage",
             ));
         }
         let pools = handed

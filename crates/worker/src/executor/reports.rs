@@ -23,7 +23,7 @@ use ipc::{Batch as BatchPlan, Call, CallStatus, ErrorCode, MediaSource, TensorRe
 use crate::executor::PendingOutput;
 use crate::executor::batch::HostStage;
 use crate::executor::products::{ProductOwners, Publications, export};
-use crate::memory::ProductBuffer;
+use crate::storage::ProductBuffer;
 use crate::stream::CUDAStream;
 use crate::transfer::SharedRead;
 use crate::{Error, Result, lock};
@@ -190,7 +190,7 @@ pub(crate) enum Publication {
     Media,
 }
 
-/// Release borrowed shared-memory reads: their producer may reuse the rows.
+/// Release borrowed shared-storage reads: their producer may reuse the rows.
 pub(crate) fn release_borrowed(borrowed: &[Arc<Mutex<SharedRead>>]) {
     for read in borrowed {
         lock(read).release();

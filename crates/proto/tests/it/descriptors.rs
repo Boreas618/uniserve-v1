@@ -9,8 +9,8 @@ use std::time::Duration;
 use proto::request::{ArtifactMedia as _, wire};
 use proto::{Connection, MappedMedia};
 
-/// An anonymous shared-memory file holding `bytes`.
-fn memory(bytes: &[u8]) -> OwnedFd {
+/// An anonymous shared-storage file holding `bytes`.
+fn storage(bytes: &[u8]) -> OwnedFd {
     let name = c"artifact";
     // SAFETY: memfd_create takes a NUL-terminated name and flags.
     let descriptor = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
@@ -32,7 +32,7 @@ fn a_frame_carries_its_descriptor_and_the_receiver_maps_the_bytes() {
     // Two frames, the first with a descriptor and the second without: each
     // descriptor comes with its own frame, in order.
     let bytes = b"generated video bytes";
-    let shared = memory(bytes);
+    let shared = storage(bytes);
     let announce = |content_type: &str| wire::Artifact {
         media_kind: wire::MediaKind::Video as i32,
         content_type: content_type.to_owned(),
@@ -55,5 +55,5 @@ fn a_frame_carries_its_descriptor_and_the_receiver_maps_the_bytes() {
     assert!(receiver.take_descriptor().is_none());
 
     // A mapping is never longer than the object it maps.
-    assert!(MappedMedia::map(memory(b"short"), 64).is_err());
+    assert!(MappedMedia::map(storage(b"short"), 64).is_err());
 }

@@ -12,7 +12,7 @@
 //!   It answers with its cache index: every published page's public and
 //!   private continuation aliases with their units, which the successor
 //!   reads from the planes it maps read-only without duplicating the bytes.
-//!   Its memory and index stay as they were, so a rollback resumes it.
+//!   Its storage and index stay as they were, so a rollback resumes it.
 //! - **Promote** (the successor): its workers copy the predecessor's cache
 //!   flags and scales of the units they inherit (`uniserve.adopt_cache`),
 //!   and its pool imports the predecessor's pages into those units, from
@@ -45,7 +45,7 @@ pub struct GroupCache {
     pub scratch: u32,
 }
 
-/// What a worker reports of its KV cache (`uniserve.cache_memory`).
+/// What a worker reports of its KV cache (`uniserve.cache_storage`).
 #[derive(serde::Deserialize)]
 struct CacheReport {
     #[serde(default)]
@@ -187,7 +187,7 @@ impl Scheduler {
             return;
         };
         // The pages reserved for the host KV cache reach it, so the
-        // successor and a later eviction of the parked memory find them
+        // successor and a later eviction of the parked storage find them
         // there.
         self.flush_offloads();
         self.parked = true;
@@ -238,8 +238,8 @@ impl Scheduler {
     /// units it held when they `recompute` from their tokens, beside a page
     /// each, the last they continue. The limit is the
     /// units its own segments hold free, and those of the segments it has
-    /// yet to create that every device's memory ledger has room for: the
-    /// quota less everything booked, the predecessor's kept memory
+    /// yet to create that every device's storage ledger has room for: the
+    /// quota less everything booked, the predecessor's kept storage
     /// included, and, when the predecessor's processes exit at the
     /// promotion (it `grows`), with what they booked transferred to this
     /// world. The world has no more until its commit gives it the
@@ -271,7 +271,7 @@ impl Scheduler {
                 0
             };
         let own_free = cache.block_pool.free_units() as u32;
-        let growable = match self.cache_memory()? {
+        let growable = match self.cache_storage()? {
             Some(reports) => {
                 let fit = reports
                     .iter()
@@ -290,7 +290,7 @@ impl Scheduler {
         let free = own_free + growable;
         if needed > free {
             return Err(format!(
-                "the successor world's KV cache holds {free} free units within its memory \
+                "the successor world's KV cache holds {free} free units within its storage \
                  ledgers until its commit ({own_free} in its own segments, {growable} in the \
                  segments the ledgers have room for), and the {} requests in flight need \
                  {needed}{}{}",
@@ -406,7 +406,7 @@ impl Scheduler {
         self.closing = closing;
         let reports = self
             .executor
-            .hook_groups("uniserve.cache_memory", "")
+            .hook_groups("uniserve.cache_storage", "")
             .map_err(|error| format!("{error:#}"))?;
         let mut groups = Vec::new();
         for (group, results) in reports {

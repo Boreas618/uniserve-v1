@@ -16,7 +16,7 @@ Every scheduler keeps its own KV cache and attention, and its worker holds `1 / 
 
 | Exchange | Transport | Requirements |
 | --- | --- | --- |
-| `alltoall` (default) | FlashInfer's NVLink all-to-all around each rank's grouped experts | NVLink peers (MNNVL fabric or peer memory) |
+| `alltoall` (default) | FlashInfer's NVLink all-to-all around each rank's grouped experts | NVLink peers (MNNVL fabric or peer storage) |
 | `megamoe` | The fused MegaMoE kernel: one launch exchanges, runs the experts and combines | NVFP4 expert weights, Blackwell GPUs |
 | `deepep` | DeepEP elastic dispatch and combine | Dedicated expert workers |
 | `dwdp` | Weight prefetch instead of token exchange (see below) | CuTeDSL expert kernels, peer-accessible GPUs on one host |
@@ -70,4 +70,4 @@ Attention ranks hold no routed-expert weights; expert ranks hold every routed ex
   --set moe_config.exchange=dwdp
 ```
 
-Each scheduler's worker keeps its expert shard resident and, before each expert layer, copies the shards of the other workers from peer memory into two reusable buffers per weight, prefetching the next layer while the current one computes. Schedulers advance independently and never wait for each other during inference; only startup is collective. The workers need peer-accessible GPUs on one host, and the experts must run on the CuTeDSL kernels (BF16 with widths that are multiples of 64, or NVFP4, on SM100). The startup log reports the resident, buffer and per-invocation copy bytes.
+Each scheduler's worker keeps its expert shard resident and, before each expert layer, copies the shards of the other workers from peer storage into two reusable buffers per weight, prefetching the next layer while the current one computes. Schedulers advance independently and never wait for each other during inference; only startup is collective. The workers need peer-accessible GPUs on one host, and the experts must run on the CuTeDSL kernels (BF16 with widths that are multiples of 64, or NVFP4, on SM100). The startup log reports the resident, buffer and per-invocation copy bytes.

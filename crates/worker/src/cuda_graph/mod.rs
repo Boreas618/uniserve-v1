@@ -1,14 +1,14 @@
-//! The device memory of the CUDA graphs the executor captures and replays.
+//! The device storage of the CUDA graphs the executor captures and replays.
 //!
 //! The executor (Python) captures every graph it serves (`uniserve.cuda_graph`)
 //! into allocator pools the worker creates for it ([`reserve_pools`]): each
-//! pool allocates from device memory Rust owns ([`memory`]), which keeps its
+//! pool allocates from device storage Rust owns ([`storage`]), which keeps its
 //! addresses for as long as any graph captured in it lives, and is registered
 //! with [`GraphStorage`] for budget accounting ([`GraphPool`]). [`GraphMode`]
 //! names how a forward ran in the statistics the worker reports.
 
-mod memory;
 mod pool;
+mod storage;
 
 pub(crate) use pool::{GraphPool, GraphStorage, graph_storage_budget_bytes, reserve_pools};
 

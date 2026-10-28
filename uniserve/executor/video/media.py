@@ -9,7 +9,7 @@ codecs release the GIL while they encode. Every finished task reports to
 the worker as one message on the pipe the worker passes in
 (:class:`Reports`): the batch and call it belongs to, a row, a status, a
 value and a payload. The worker reads the pipe on a thread of its own, so a
-result's memory is ordered before the worker reads it by the pipe's write
+result's storage is ordered before the worker reads it by the pipe's write
 and read.
 
 **Condition reading.** The server publishes every condition's fetched bytes
@@ -463,7 +463,7 @@ class Conditions:
         )
         name = str(source["name"])
         try:
-            # The shared-memory object is a seekable file FFmpeg reads
+            # The shared-storage object is a seekable file FFmpeg reads
             # directly.
             input_file = open(f"/dev/shm/{name}", "rb")
         except OSError as error:

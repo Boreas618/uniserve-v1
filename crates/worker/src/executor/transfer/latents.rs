@@ -26,8 +26,8 @@ use ipc::{BufferId, Call, LatentParams, TensorExport, TensorRef, TensorTransfer,
 use crate::executor::PendingOutput;
 use crate::executor::products::Publications;
 use crate::ffi::DType;
-use crate::memory::LatentPool;
-use crate::memory::{LatentExport, LatentImport, LatentStorage};
+use crate::storage::LatentPool;
+use crate::storage::{LatentExport, LatentImport, LatentStorage};
 use crate::stream::Issue;
 use crate::transfer::exports;
 use crate::transfer::{Read, ReadRef, Transports, fetch};
@@ -329,9 +329,9 @@ mod tests {
     use crate::EventPool;
     use crate::executor::PendingOutput;
     use crate::ffi::DType;
-    use crate::memory::LatentPlan;
-    use crate::memory::{LatentUpdate, TrajectoryVersion};
     use crate::request::RequestProgress;
+    use crate::storage::LatentPlan;
+    use crate::storage::{LatentUpdate, TrajectoryVersion};
     use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
     const SLOT: usize = 1;
@@ -342,10 +342,10 @@ mod tests {
         RequestKey::new(1, RequestId(7), 1)
     }
 
-    /// A pool of two slots and three usable two-unit pages on host memory.
+    /// A pool of two slots and three usable two-unit pages on host storage.
     fn pool() -> Result<(LatentPool, LatentStorage)> {
         Ok((
-            crate::memory::LatentPool::new(2, 4, 2)?,
+            crate::storage::LatentPool::new(2, 4, 2)?,
             LatentStorage::allocate(
                 &LatentPlan {
                     request_pool_size: 2,
@@ -357,7 +357,7 @@ mod tests {
                 None,
                 None,
                 "latent_banks",
-                &mut crate::memory::LocalMemory,
+                &mut crate::storage::LocalStorage,
             )?,
         ))
     }

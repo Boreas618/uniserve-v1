@@ -281,7 +281,7 @@ pub(crate) async fn apply(
                 .is_none_or(|graphs| graphs.policy != "off")
         }),
     };
-    let (admission, refusal) = memory_plan(
+    let (admission, refusal) = storage_plan(
         &serving,
         &mut adds,
         &budgets,
@@ -301,7 +301,7 @@ pub(crate) async fn apply(
         "previous_worlds": source_worlds,
         "replicas": specs.len(),
         "redistribution": plans,
-        "memory": admission,
+        "storage": admission,
         "feasible": refusals.is_empty(),
         "refusals": refusals,
     });

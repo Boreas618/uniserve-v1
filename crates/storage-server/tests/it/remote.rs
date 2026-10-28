@@ -21,8 +21,8 @@
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use storage::protocol::{Priority, Reply, Request, TransferEnd};
-use storage::{Access, Client, Role, TensorRecord};
+use ::storage::protocol::{Priority, Reply, Request, TransferEnd};
+use ::storage::{Access, Client, Role, TensorRecord};
 
 use crate::server::{FORKING, Running, head, host, key, memfd, scope, tensor, worker};
 use crate::transfer::{
@@ -154,7 +154,7 @@ fn a_process_of_another_host_reads_a_small_read_only_tensor_of_bytes() {
     let text_fd = memfd(&held);
     let exclusive_fd = memfd(&[0; 64]);
     let matrix_fd = memfd(&[0; 64]);
-    let long = storage::protocol::READ_BYTES + 1;
+    let long = ::storage::protocol::READ_BYTES + 1;
     let long_fd = memfd(&vec![0; long as usize]);
     let bytes = |key: u8, storage: u32, offset: u64, length: u64, access: Access| TensorRecord {
         shape: vec![length],
@@ -208,16 +208,16 @@ fn a_process_of_another_host_reads_a_small_read_only_tensor_of_bytes() {
     }
 }
 
-/// READs between two hosts' GPUs and from host memory: the GPU tests.
+/// READs between two hosts' GPUs and from host storage: the GPU tests.
 mod device {
     use std::os::fd::AsFd;
     use std::time::{Duration, Instant};
 
-    use cuda::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
-    use storage::protocol::{
-        FabricExport, FabricHandle, Link, Memory, Priority, Span, TransferEnd,
+    use ::storage::protocol::{
+        FabricExport, FabricHandle, Link, LinkEnd, Priority, Span, TransferEnd,
     };
-    use storage::{Access, Client};
+    use ::storage::{Access, Client};
+    use cuda::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
 
     use super::{endpoint, first_difference, rdma_host, sequence};
     use crate::server::{FORKING, head, host, key, memfd, scope, tensor, worker};
@@ -230,7 +230,7 @@ mod device {
 
     #[test]
     #[ignore = "requires a CUDA device, an RDMA adapter and NIXL"]
-    fn a_read_from_another_host_moves_device_and_host_memory_into_device_memory() {
+    fn a_read_from_another_host_moves_device_and_host_storage_into_device_storage() {
         let source_host = rdma_host();
         let destination_host = rdma_host();
         let first = DeviceId(0);
@@ -238,7 +238,7 @@ mod device {
         let granularity = DeviceAllocation::granularity(first).unwrap();
 
         // The source host: read-only weights on the first GPU, 4 KiB into
-        // their storage, and an exclusive tensor in host memory.
+        // their storage, and an exclusive tensor in host storage.
         let mut source_head = head(&source_host.socket);
         let claim = source_head
             .claim(0, vec![scope("text", 0)], Vec::new())
@@ -284,7 +284,7 @@ mod device {
         let host_bytes_read = &host_source[7..7 + BYTES];
         // Reads the device source to `device_at` and the host source to
         // `host_at` of the destination, and checks the whole destination.
-        let read = |worker: &mut storage::Client, device_at: usize, host_at: usize| {
+        let read = |worker: &mut ::storage::Client, device_at: usize, host_at: usize| {
             let started = Instant::now();
             let task = worker
                 .transfer(
@@ -344,13 +344,13 @@ mod device {
         // the READs measured.
         let transfer = destination_head.list().unwrap().transfer.unwrap();
         let gpu = |device: DeviceId| device.uuid().unwrap().0;
-        for source_memory in [Some(gpu(first)), None] {
+        for source_storage in [Some(gpu(first)), None] {
             let link = Link {
-                source: Memory::Remote {
+                source: LinkEnd::Remote {
                     endpoint: source.clone(),
-                    gpu: source_memory,
+                    gpu: source_storage,
                 },
-                destination: Memory::Device { gpu: gpu(last) },
+                destination: LinkEnd::Device { gpu: gpu(last) },
             };
             let measured = transfer
                 .links
@@ -424,7 +424,7 @@ mod device {
             .unwrap();
 
         let source = endpoint(&source_host.socket);
-        let read_into = |worker: &mut storage::Client, offset: usize| {
+        let read_into = |worker: &mut ::storage::Client, offset: usize| {
             let task = worker
                 .transfer(
                     vec![span(
@@ -494,7 +494,7 @@ mod device {
         let at = granularity;
         let read_bytes = bytes - at;
 
-        // The sources: memory this process created and holds, one published
+        // The sources: storage this process created and holds, one published
         // with the fabric handle it exports, the other with a handle that
         // names no allocation.
         let mut source_head = head(&source_host.socket);
@@ -588,7 +588,7 @@ mod device {
                 .unwrap()
                 .links
                 .iter()
-                .filter(|measured| matches!(measured.link.source, Memory::Remote { .. }))
+                .filter(|measured| matches!(measured.link.source, LinkEnd::Remote { .. }))
                 .count()
         };
 

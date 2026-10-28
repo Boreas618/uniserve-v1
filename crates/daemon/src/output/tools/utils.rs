@@ -13,7 +13,7 @@ use super::Result;
 ///
 /// A streaming parser retains the input that has not yet formed a complete
 /// event, such as an unterminated tool call. Exceeding the cap fails
-/// `ToolParser::parse_into` with a parse error instead of growing memory
+/// `ToolParser::parse_into` with a parse error instead of growing storage
 /// without bound.
 pub(super) const MAX_BUFFER_BYTES: usize = 1 << 20;
 

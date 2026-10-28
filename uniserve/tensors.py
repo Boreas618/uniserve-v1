@@ -14,12 +14,12 @@ from uniserve import _slices
 def staged(host: torch.Tensor, device: torch.device | str) -> torch.Tensor:
     """``host`` (a CPU tensor) ready for a copy to ``device`` in stream order.
 
-    For a CUDA device the values are staged in page-locked memory, so the
+    For a CUDA device the values are staged in page-locked storage, so the
     caller's ``non_blocking`` copy (``.to(device, non_blocking=True)`` or
     ``.copy_(..., non_blocking=True)``) is queued on the current stream
     without the host waiting for the stream to drain; PyTorch's caching host
     allocator keeps the staging block until that copy completed, so later
-    calls never overwrite it. A copy from pageable memory would synchronize
+    calls never overwrite it. A copy from pageable storage would synchronize
     the host with the stream. For any other device ``host`` itself.
     """
     if torch.device(device).type != "cuda":

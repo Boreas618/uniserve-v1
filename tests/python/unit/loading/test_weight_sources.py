@@ -18,14 +18,14 @@ pytestmark = pytest.mark.unit
 
 
 class _Stream:
-    """The tensors of one checkpoint source, held in memory."""
+    """The tensors of one checkpoint source, held in storage."""
 
     def __init__(self, tensors):
         self.values = tensors
         self.reads = []
 
     def identity(self):
-        return "memory:test"
+        return "storage:test"
 
     def tensors(self, source):
         return [
@@ -83,15 +83,15 @@ def test_a_streamed_source_reads_as_its_files(tmp_path):
 
 def test_a_weight_source_is_named_by_its_scheme(monkeypatch):
     added = plugins.Registry()
-    added.weight_source("memory", lambda uri: ("streamed", uri))
+    added.weight_source("storage", lambda uri: ("streamed", uri))
     monkeypatch.setattr(plugins, "_registry", added)
-    assert plugins.weight_source("memory://run/7") == (
+    assert plugins.weight_source("storage://run/7") == (
         "streamed",
-        "memory://run/7",
+        "storage://run/7",
     )
     with pytest.raises(ValueError, match="no plugin streams"):
         plugins.weight_source("ipc://handles")
     with pytest.raises(ValueError, match="names no scheme"):
         plugins.weight_source("/checkpoints/next")
     with pytest.raises(ValueError, match="two plugins stream"):
-        added.weight_source("memory", lambda uri: None)
+        added.weight_source("storage", lambda uri: None)

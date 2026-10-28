@@ -1,17 +1,17 @@
 //! `uniserve storage`: the Storage Server of one host, and the operator's
 //! commands against it.
 //!
-//! `serve` holds this host's retained memory for the calling user until it
+//! `serve` holds this host's retained storage for the calling user until it
 //! is stopped with SIGTERM or SIGINT (`storage_server::serve`). A process
 //! that needs a server on a host that has none starts it with `--daemon`.
 //! With `--mooncake-master`, the server also runs the Mooncake connector,
 //! which keeps committed pages in Mooncake (L3): this executable's `storage
 //! connector` command, as a child process the server starts again when it
 //! ends. It always runs its Transfer Server, which copies between the
-//! memory it holds, the same way (`storage transfer`).
+//! storage it holds, the same way (`storage transfer`).
 //!
 //! `list` prints what a running server holds, and `retire` releases the
-//! memory of a deployment that is no longer served.
+//! storage of a deployment that is no longer served.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,7 +31,7 @@ pub(crate) struct StorageArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum StorageCommand {
-    /// Serve this host's retained memory until stopped.
+    /// Serve this host's retained storage until stopped.
     Serve {
         /// The socket to listen on; this user's default socket when unset.
         #[arg(long)]
@@ -45,8 +45,8 @@ pub(crate) enum StorageCommand {
         /// whole when the first one maps it.
         #[arg(long, default_value_t = storage_server::DEFAULT_POOL_BYTES >> 30)]
         page_pool_gib: u64,
-        /// Host memory, in GiB, that a new page pool leaves available to the
-        /// host's other processes: a pool the host's available memory less
+        /// Host storage, in GiB, that a new page pool leaves available to the
+        /// host's other processes: a pool the host's available storage less
         /// this reserve cannot hold is refused (SGLang's host KV cache keeps
         /// 10 GiB the same way).
         #[arg(long, default_value_t = 10)]
@@ -100,7 +100,7 @@ pub(crate) enum StorageCommand {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Release the memory of a deployment that is no longer served; refused
+    /// Release the storage of a deployment that is no longer served; refused
     /// while its head is connected.
     Retire {
         #[arg(long)]
@@ -143,7 +143,7 @@ pub(crate) struct Mooncake {
     /// when unset.
     #[arg(long = "mooncake-hostname")]
     hostname: Option<String>,
-    /// Host memory this host contributes to Mooncake's pool, in bytes.
+    /// Host storage this host contributes to Mooncake's pool, in bytes.
     #[arg(long = "mooncake-segment-bytes", default_value_t = 0)]
     segment_bytes: u64,
     /// `libmooncake_store.so`; found on the loader's search path when

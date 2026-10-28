@@ -265,7 +265,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::memory::allocation::{Storage, StorageView};
+    use crate::storage::allocation::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, notify};
 
     /// A host value of `elements` bytes.

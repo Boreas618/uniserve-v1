@@ -88,12 +88,12 @@ use crate::executor::python::PythonExecutor;
 use crate::executor::records::{COMPLETION_FIELDS, Records};
 use crate::executor::reports::{HostCall, HostTasks, Reports, release_borrowed};
 use crate::job::{Completion, Job};
-use crate::memory::OutputPool;
-use crate::memory::allocation::StorageView;
-use crate::memory::encoders::EncoderHostPool;
 use crate::request::RequestPool;
+use crate::storage::OutputPool;
+use crate::storage::allocation::StorageView;
+use crate::storage::encoders::EncoderHostPool;
 use crate::stream::{CUDAStream, Issue as _};
-use crate::worker::WorkerMemory;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result, lock};
 
 /// The step a computation batch's failure is reported in.
@@ -445,7 +445,7 @@ pub(crate) struct Parts<'a> {
     pub(crate) rank: usize,
     pub(crate) info: &'a WorkerInfo,
     pub(crate) requests: &'a mut RequestPool,
-    pub(crate) storage: &'a mut WorkerMemory,
+    pub(crate) storage: &'a mut WorkerStorage,
     pub(crate) computations: &'a mut Computations,
 }
 
@@ -620,7 +620,7 @@ fn ended(job: Job, failure: Failure) -> (Option<Job>, Pending) {
 /// end it: revoke the exports, release borrowed rows, end the reads,
 /// abandon the writes and seal and abandon the lease.
 fn retire(
-    storage: &WorkerMemory,
+    storage: &WorkerStorage,
     ledger: Option<&mut LatentLedger>,
     parked: Parked,
     job: Job,
@@ -927,7 +927,7 @@ fn record_last(
             // The records are checked on the builder thread right behind the
             // call that wrote them, before anything past it is performed.
             let records = Arc::clone(&parked.records);
-            let memory = Arc::clone(column.records().memory());
+            let storage = Arc::clone(column.records().storage());
             let (capacity, limits, lent_words) =
                 (column.capacity, column.limits.clone(), column.lent_words);
             job.check(Box::new(move |completion: &Completion| {
@@ -940,8 +940,9 @@ fn record_last(
                 // SAFETY: the records' host words, which the executor wrote
                 // during the call this check follows and nothing writes
                 // since; the parked batch keeps them.
-                let words =
-                    unsafe { std::slice::from_raw_parts(memory.address() as *const i64, capacity) };
+                let words = unsafe {
+                    std::slice::from_raw_parts(storage.address() as *const i64, capacity)
+                };
                 let parsed = Records::parse(words, used, &limits, lent_words)?;
                 records
                     .set(parsed)

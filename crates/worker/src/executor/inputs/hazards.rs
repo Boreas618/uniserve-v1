@@ -12,7 +12,7 @@ use ipc::{Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, MediaCall
 
 use super::{BatchInputs, Hazard};
 use crate::executor::backend::WorkerBackend;
-use crate::memory::PrefixCache;
+use crate::storage::PrefixCache;
 use crate::transfer::Retirement;
 use crate::{Error, Outcome, Result};
 

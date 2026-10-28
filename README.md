@@ -119,7 +119,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `MODEL`, `--served-model-name`, `--max-model-len` | The checkpoint, its served name and context length |
 | `--host`, `--port` | The HTTP listener (`server_config`) |
 | `--worker-groups`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Placement: a deployment file, or the tensor- and data-parallel shorthand |
-| `--max-running-requests`, `--mem-fraction-static` | Resident requests and each GPU worker's device-memory share |
+| `--max-running-requests`, `--mem-fraction-static` | Resident requests and each GPU worker's device-storage share |
 | `--worker-executable` | The `uniserve` executable the workers run as (`worker_config.executable`) |
 | `--config`, `--set`, `--print-config` | The configuration file, assignments by path, and printing the resolved tree |
 
@@ -196,20 +196,20 @@ H3=/workspace/models/FastVideo-FastH3-8-Step-V2
 TESTS="tests/python/integration/executor/test_video_executor.py tests/python/integration/executor/test_video_encoder_outputs.py tests/python/integration/executor/test_image_encoder_outputs.py"
 
 # memcheck: accesses outside an allocation, misaligned accesses.
-PYTORCH_NO_CUDA_MEMORY_CACHING=1 UNISERVE_H3_MODEL=$H3 timeout 1800 \
+PYTORCH_NO_CUDA_STORAGE_CACHING=1 UNISERVE_H3_MODEL=$H3 timeout 1800 \
   compute-sanitizer --tool memcheck --show-backtrace device --report-api-errors no \
   .venv/bin/python -m pytest -q $TESTS
 
 # initcheck: reads of storage nothing wrote, one test file per process.
 for TEST in $TESTS; do
-  PYTORCH_NO_CUDA_MEMORY_CACHING=1 UNISERVE_H3_MODEL=$H3 timeout 1800 \
-    compute-sanitizer --tool initcheck --check-api-memory-access no --show-backtrace device \
+  PYTORCH_NO_CUDA_STORAGE_CACHING=1 UNISERVE_H3_MODEL=$H3 timeout 1800 \
+    compute-sanitizer --tool initcheck --check-api-storage-access no --show-backtrace device \
     --report-api-errors no \
     .venv/bin/python -m pytest -q -p tests.python.sanitizer.initcheck_marks $TEST -k "restored or missing"
 done
 ```
 
-`PYTORCH_NO_CUDA_MEMORY_CACHING=1` gives every tensor an allocation of its own, so an access past a tensor's end is past an allocation's end. `--show-backtrace device` is required: the host backtraces the sanitizer saves at every kernel launch keep the Python frames of the launching calls alive, and with them their tensors, so the executor test's first denoising step holds 140 GiB instead of 43 GiB and its storage runs out on a GB200. initcheck does not record the stores of the cuBLAS GEMM kernels or of the SM100 block-sparse attention kernels on GB200, and reports every later read of their outputs; the `tests.python.sanitizer.initcheck_marks` plugin marks those outputs initialized through the NVTX API (it compiles `tests/python/sanitizer/mark_initialized.c` with the CUDA headers on first use), so marked outputs themselves are not checked. Under initcheck the two test files' checkpoints do not fit one GB200 in one process, so each file runs in a process of its own. `--check-api-memory-access no` leaves the copies of CUDA API calls unchecked: with them checked, initcheck reports one device-to-device copy of 3,483,648 bytes as reading uninitialized storage 129,304 times in the executor test and does not reach the tests within the timeout. The ignored `cuGetProcAddress_v2` API errors come from the CUDA Python bindings probing driver entry points.
+`PYTORCH_NO_CUDA_STORAGE_CACHING=1` gives every tensor an allocation of its own, so an access past a tensor's end is past an allocation's end. `--show-backtrace device` is required: the host backtraces the sanitizer saves at every kernel launch keep the Python frames of the launching calls alive, and with them their tensors, so the executor test's first denoising step holds 140 GiB instead of 43 GiB and its storage runs out on a GB200. initcheck does not record the stores of the cuBLAS GEMM kernels or of the SM100 block-sparse attention kernels on GB200, and reports every later read of their outputs; the `tests.python.sanitizer.initcheck_marks` plugin marks those outputs initialized through the NVTX API (it compiles `tests/python/sanitizer/mark_initialized.c` with the CUDA headers on first use), so marked outputs themselves are not checked. Under initcheck the two test files' checkpoints do not fit one GB200 in one process, so each file runs in a process of its own. `--check-api-storage-access no` leaves the copies of CUDA API calls unchecked: with them checked, initcheck reports one device-to-device copy of 3,483,648 bytes as reading uninitialized storage 129,304 times in the executor test and does not reach the tests within the timeout. The ignored `cuGetProcAddress_v2` API errors come from the CUDA Python bindings probing driver entry points.
 
 The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
@@ -226,7 +226,7 @@ crates/storage/               The Storage Server's protocol and client
 crates/storage-server/        The Storage Server, its Mooncake connector and its Transfer Server
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
 crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
-crates/nixl/                  NIXL agents with the UCX backend: memory registration, metadata exchange and READs, loaded at runtime
+crates/nixl/                  NIXL agents with the UCX backend: storage registration, metadata exchange and READs, loaded at runtime
 crates/daemon/                The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, model profiles, input and output processing, the HTTP API, metrics and the engine's client
 crates/engine/                The engine process: schedulers, KV allocation, executors, worker groups and the request interface's service
 crates/worker/                Rank runtime: the library a rank process loads through TVM-FFI
@@ -234,8 +234,8 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   model/                      Model description, loading and component placement
   executor/, runner/          Batch execution per computation and its CUDA graphs
   request/, sampling/         Request progress and sampling state
-  memory/                     KV, latent, tensor, request-slot and output backing
-  transfer/                   Local, shared-memory, CUDA VMM and channel transfers
+  storage/                     KV, latent, tensor, request-slot and output backing
+  transfer/                   Local, shared-storage, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host pools, capacity planning
 crates/uniserve/              The `uniserve` executable: `serve`, `engine`, `worker` and `storage`

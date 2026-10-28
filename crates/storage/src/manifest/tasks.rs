@@ -1,11 +1,11 @@
-//! A manifest's copies as the spans of a transfer between the memory the
+//! A manifest's copies as the spans of a transfer between the storage the
 //! Storage Server retains ([`crate::protocol::Request::Transfer`]).
 //!
-//! The Transfer Server knows memory only as regions the Storage Server
-//! holds: every chunk is retained under its key in its bound host or device memory,
+//! The Transfer Server knows storage only as regions the Storage Server
+//! holds: every chunk is retained under its key in its bound host or device storage,
 //! and each staging space of a manifest is retained under
 //! [`Manifest::staging_key`] on its rank's GPU, so a span names the copy of
-//! a key at its physical memory ([`Region::Tensor`]), wrapped in
+//! a key at its physical storage ([`Region::Tensor`]), wrapped in
 //! [`Region::Remote`] when another host owns it. A strided copy is one span of rows
 //! at its pitches for each run of rows that lies in one chunk on each side;
 //! a row that crosses a chunk bound on either side splits there into spans

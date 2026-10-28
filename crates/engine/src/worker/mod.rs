@@ -65,20 +65,20 @@ pub struct WorkerProcessArgs {
     /// workers: they map the exclusive storages those hold without taking
     /// write access, warm up on scratch units, and park until promoted.
     pub standby: bool,
-    /// How a standby launch keeps its graph memory while it parks
-    /// (`worker_config.standby_memory`).
-    pub standby_memory: proto::request::StandbyMemory,
+    /// How a standby launch keeps its graph storage while it parks
+    /// (`worker_config.standby_storage`).
+    pub standby_storage: proto::request::StandbyStorage,
     /// The exact KV cache segments the group's planes are made of: the
     /// serving workers' for a standby launch, the world's own for a
     /// relaunch of a world whose planes another world's segments began;
     /// `None` lays them out afresh.
     pub segments: Option<ipc::CacheTable>,
-    /// The world the group's workers belong to, which keys the memory they
+    /// The world the group's workers belong to, which keys the storage they
     /// create and retains what they use.
     pub world: u64,
-    /// Worlds of the deployment whose memory ends on every node before the
+    /// Worlds of the deployment whose storage ends on every node before the
     /// group's workers start: a world on trial a rollback discards, whose
-    /// memory the previous world, started again, needs.
+    /// storage the previous world, started again, needs.
     pub retire: Vec<u64>,
     /// The KV cache of the predecessor world's group of the same identity,
     /// whose segments the group's workers map read-only; `None` for a world
@@ -163,7 +163,7 @@ pub struct WorkerProcessArgs {
     pub download_dir: Option<std::path::PathBuf>,
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
-    /// The tensor- and expert-parallel degrees retained weight memory is
+    /// The tensor- and expert-parallel degrees retained weight storage is
     /// chunked for; empty for every degree up to the GPUs the worker sees.
     pub parallel_degrees: Vec<u32>,
     /// Numeric data type used by model parameters and activations.
@@ -172,7 +172,7 @@ pub struct WorkerProcessArgs {
     pub quantization_config: serde_json::Value,
     /// Numeric data type of the KV (prefix) cache, when explicitly selected.
     pub kv_cache_dtype: Option<ipc::PrefixCacheDtype>,
-    /// Each rank's share of its device's total memory, which bounds the
+    /// Each rank's share of its device's total storage, which bounds the
     /// process's static allocations, weights and KV cache;
     /// `WorkerGroupConfig::validate_mem_fraction_static` states its range.
     pub mem_fraction_static: f64,

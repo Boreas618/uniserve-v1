@@ -6,7 +6,7 @@
 //! | Kind | Export | Read |
 //! | --- | --- | --- |
 //! | local | register the spans with a producer fence | borrow in place, or copy |
-//! | posix_shm | copy into a POSIX shared-memory segment | stage on the host, then copy |
+//! | posix_shm | copy into a POSIX shared-storage segment | stage on the host, then copy |
 //! | cuda_vmm | export in place or copy into a VMM pool chunk | map the handle, then copy |
 //! | channel | copy into the locator's payload bytes | stage on the host, then copy |
 //!
@@ -31,7 +31,7 @@ use super::{
     ByteReservation, Notify, ReadReservation, Retirement, Spans, TransferCapacity, notify,
 };
 use crate::ffi::{DType, MemoryKind};
-use crate::memory::allocation::Storage;
+use crate::storage::allocation::Storage;
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 
@@ -309,7 +309,7 @@ impl Transport {
     }
 
     /// Export `source` (produced on `stream`'s stream when it is device
-    /// memory) at `offset` in its logical tensor, for `consumers`'
+    /// storage) at `offset` in its logical tensor, for `consumers`'
     /// acknowledgment slots.
     ///
     /// `bytes` is this mechanism's share of the export's byte reservation,

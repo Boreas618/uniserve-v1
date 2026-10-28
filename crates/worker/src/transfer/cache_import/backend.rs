@@ -23,8 +23,8 @@ use tvm_ffi::{Any, AnyView};
 
 use super::{CacheImport, CacheImporter};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
-use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::{CachePlanes, GroupTable, UnitColumn};
+use crate::storage::allocation::{Storage, StorageView};
+use crate::storage::{CachePlanes, GroupTable, UnitColumn};
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
 use crate::transfer::{Notify, Retirement, Spans, Transports, notify};

@@ -1,5 +1,5 @@
 //! Behavior against a real driver. These tests need a CUDA device and use a
-//! few megabytes of memory on device 0; run them with
+//! few megabytes of storage on device 0; run them with
 //! `cargo test -p cuda -- --ignored`.
 
 use std::collections::BTreeSet;
@@ -40,7 +40,7 @@ fn read(buffer: &PinnedBuffer) -> Vec<u8> {
 
 /// Blocks `stream` in a host function until the returned sender is used.
 ///
-/// Until then the caller must not release device or pinned memory: the
+/// Until then the caller must not release device or pinned storage: the
 /// release would wait on the held stream (see [`DRIVER`]). Releases queued
 /// earlier are flushed first for the same reason.
 fn block(stream: &Stream) -> mpsc::Sender<()> {
@@ -67,13 +67,13 @@ fn device_queries_report_the_device() {
     );
     assert!(DEVICE.uuid().unwrap().to_string().starts_with("GPU-"));
 
-    let memory = DEVICE.memory_info().unwrap();
-    assert!(memory.free <= memory.total && memory.total > 0);
+    let storage = DEVICE.memory_info().unwrap();
+    assert!(storage.free <= storage.total && storage.total > 0);
 }
 
 #[test]
 #[ignore = "requires a CUDA device"]
-fn fills_and_copies_round_trip_through_device_memory() {
+fn fills_and_copies_round_trip_through_device_storage() {
     let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();
     let first = DeviceAllocation::linear(DEVICE, 4096).unwrap();
@@ -316,11 +316,11 @@ fn mapped_shared_memory() -> BTreeSet<String> {
 /// A process that created interprocess events, destroyed its primary
 /// contexts and exited leaves none of the shared memory the driver mapped
 /// for those events, although another library's reference kept the context
-/// alive: the driver removes that memory with its context, and a process's
+/// alive: the driver removes that storage with its context, and a process's
 /// exit alone does not.
 #[test]
 #[ignore = "requires a CUDA device"]
-fn resetting_primary_contexts_releases_interprocess_event_memory() {
+fn resetting_primary_contexts_releases_interprocess_event_storage() {
     let _driver = exclusive_driver();
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -353,11 +353,11 @@ fn resetting_primary_contexts_releases_interprocess_event_memory() {
 }
 
 /// The process half of
-/// `resetting_primary_contexts_releases_interprocess_event_memory`: exports
+/// `resetting_primary_contexts_releases_interprocess_event_storage`: exports
 /// an interprocess event as a rank does, reports the shared memory that
 /// mapped, destroys its primary contexts and exits.
 #[test]
-#[ignore = "runs as the process of the interprocess event memory test"]
+#[ignore = "runs as the process of the interprocess event storage test"]
 fn interprocess_event_process() {
     if std::env::var_os(EVENT_PROCESS).is_none() {
         return;
@@ -386,13 +386,13 @@ fn interprocess_event_process() {
     assert!(devices.contains(&DEVICE));
 }
 
-/// A retainable allocation's descriptor keeps its physical memory alive
+/// A retainable allocation's descriptor keeps its physical storage alive
 /// after the allocation is released, as a Storage Server's does after its
 /// creator exits: later mappings of the descriptor read the contents and
 /// change their access in place, at an unchanged address.
 #[test]
 #[ignore = "requires a CUDA device"]
-fn retained_memory_outlives_its_creator_and_changes_access_in_place() {
+fn retained_storage_outlives_its_creator_and_changes_access_in_place() {
     let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();
     let granularity = DeviceAllocation::granularity(DEVICE).unwrap();
@@ -451,7 +451,7 @@ fn retained_memory_outlives_its_creator_and_changes_access_in_place() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
-fn exportable_memory_maps_through_imports_and_aliases() {
+fn exportable_storage_maps_through_imports_and_aliases() {
     let _driver = exclusive_driver();
     let granularity = DeviceAllocation::granularity(DEVICE).unwrap();
     let stream = Stream::new(DEVICE).unwrap();
@@ -470,7 +470,7 @@ fn exportable_memory_maps_through_imports_and_aliases() {
         memset_d8(second.address(), 2, granularity, &stream).unwrap();
     }
 
-    let exported = first.export().unwrap().expect("exportable memory exports");
+    let exported = first.export().unwrap().expect("exportable storage exports");
     let imported = PeerMapping::import(DEVICE, &exported, first.len()).unwrap();
     let alias = PeerMapping::alias(&[&first, &second]).unwrap();
     assert_eq!(alias.len(), 2 * granularity);
@@ -642,7 +642,7 @@ fn capture_functions() -> (BeginCapture, EndCapture, DestroyGraph) {
     }
 }
 
-/// A pool's memory keeps its addresses and contents across a suspension,
+/// A pool's storage keeps its addresses and contents across a suspension,
 /// and a graph captured over it before runs correctly after the restore; a
 /// freed chunk is given out again at its address.
 #[test]
@@ -705,14 +705,14 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
 
 #[test]
 #[ignore = "requires a CUDA device and NVML"]
-fn nvml_attributes_device_memory_to_this_process() {
+fn nvml_attributes_device_storage_to_this_process() {
     let _driver = exclusive_driver();
     let _allocation = DeviceAllocation::linear(DEVICE, 1 << 20).unwrap();
     let nvml = Nvml::init().unwrap();
 
-    let memory = nvml.memory_info(DEVICE).unwrap();
-    assert!(memory.used <= memory.total);
-    match nvml.process_memory(DEVICE) {
+    let storage = nvml.memory_info(DEVICE).unwrap();
+    assert!(storage.used <= storage.total);
+    match nvml.process_storage(DEVICE) {
         Ok(bytes) => assert!(bytes >= 1 << 20),
         // NVML lists host PIDs; a container without the host PID namespace
         // cannot find itself.
@@ -844,7 +844,7 @@ fn a_pitched_copy_across_a_released_segment_is_refused() {
 
 /// A segment a mapping creates is mapped from its descriptor, as another
 /// process maps it, and its creating handle stays with the mapping until
-/// the segment is released: NVML attributes the memory to this process
+/// the segment is released: NVML attributes the storage to this process
 /// meanwhile, as `created_bytes` counts it for capacity planning, which
 /// books it apart from the process's own, and to no process once released.
 #[test]
@@ -855,7 +855,7 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
     let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
     let bytes = (1_usize << 30).div_ceil(granularity) * granularity;
     let mut segmented = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
-    let before = match nvml.process_memory(DEVICE) {
+    let before = match nvml.process_storage(DEVICE) {
         Ok(before) => before,
         // NVML lists host PIDs; a container without the host PID namespace
         // cannot find itself.
@@ -865,7 +865,7 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
     let created_before = cuda::created_bytes(DEVICE);
     let _descriptor = segmented.create(0).unwrap();
     assert_eq!(cuda::created_bytes(DEVICE), created_before + bytes as u64);
-    let held = nvml.process_memory(DEVICE).unwrap();
+    let held = nvml.process_storage(DEVICE).unwrap();
     assert!(
         held >= before + bytes as u64 / 2,
         "NVML attributes the held creation to no process: {before} -> {held} bytes"
@@ -875,7 +875,7 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
 
     segmented.release(0).unwrap();
     assert_eq!(cuda::created_bytes(DEVICE), created_before);
-    let released = nvml.process_memory(DEVICE).unwrap();
+    let released = nvml.process_storage(DEVICE).unwrap();
     assert!(
         released < before + bytes as u64 / 2,
         "NVML attributes the released segment to this process: {before} -> {released} bytes"
@@ -957,7 +957,7 @@ fn a_released_segment_is_mapped_again_at_its_address() {
     }
     stream.synchronize().unwrap();
 
-    // Another mapping maps the same memory from the segments' descriptors.
+    // Another mapping maps the same storage from the segments' descriptors.
     let mut other = SegmentedMapping::reserve(DEVICE, &[granularity; 3], &[]).unwrap();
     for (index, descriptor) in descriptors.iter().enumerate() {
         other.import(index, descriptor).unwrap();

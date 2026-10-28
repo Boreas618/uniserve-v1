@@ -162,7 +162,7 @@ impl Interpreter {
     /// Every call `work` makes runs where `work` runs, without a handoff of
     /// its own. A call together with the Python work its arguments need,
     /// such as a view's first wrapping as a torch tensor
-    /// ([`crate::memory::allocation::StorageView::handle`]), therefore costs
+    /// ([`crate::storage::allocation::StorageView::handle`]), therefore costs
     /// one handoff, and every reference to a Python object that `work`
     /// drops is dropped on the builder thread.
     #[expect(

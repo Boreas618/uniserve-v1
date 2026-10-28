@@ -1,8 +1,8 @@
 //! The GPUs the Transfer Server copies on, and what it measures of them
-//! when it starts: every link's bandwidth and the device memory its CUDA
+//! when it starts: every link's bandwidth and the device storage its CUDA
 //! context takes on each GPU.
 //!
-//! A link's bandwidth is measured on the path its copies take, with memory
+//! A link's bandwidth is measured on the path its copies take, with storage
 //! of the kinds they copy: CUDA VMM allocations that every GPU able to
 //! address them is granted access to, and memfds registered with CUDA,
 //! bound to the GPU's closest host NUMA node as page pools are. Each link
@@ -11,9 +11,9 @@
 //! destination's when it is a GPU), timed by CUDA events; the host-to-host
 //! link is timed on the host around the CPU's copies.
 //!
-//! The context's device memory is what NVML attributes to the process once
-//! the measurement's memory is released: the contexts, their streams and
-//! the copy paths the measurement brought up. The memory the Transfer
+//! The context's device storage is what NVML attributes to the process once
+//! the measurement's storage is released: the contexts, their streams and
+//! the copy paths the measurement brought up. The storage the Transfer
 //! Server maps later belongs to its owners (NVML attributes an imported
 //! allocation to no importer). The measurement then releases the contexts:
 //! the Transfer Server holds a GPU's context only while it has work on the
@@ -23,14 +23,14 @@
 use std::os::fd::OwnedFd;
 use std::time::Instant;
 
+use ::storage::protocol::{ContextBytes, Link, LinkBandwidth, LinkEnd};
 use cuda::{
     DeviceAllocation, DeviceAttribute, DeviceId, Event, EventFlags, HostRegistration, Nvml,
     PrimaryContext, Stream, memcpy_async,
 };
-use storage::protocol::{ContextBytes, Link, LinkBandwidth, Memory};
 
-use super::memory::HostMap;
-use super::{Error, memory_name};
+use super::storage::HostMap;
+use super::{Error, storage_name};
 
 /// The bytes of one measured copy.
 const SAMPLE_BYTES: usize = 64 << 20;
@@ -48,7 +48,7 @@ pub(super) struct Gpu {
     pub(super) uuid: [u8; 16],
     /// The host NUMA node closest to it.
     pub(super) numa_node: Option<u32>,
-    /// The GPUs whose copy engines can address its memory, itself first.
+    /// The GPUs whose copy engines can address its storage, itself first.
     pub(super) readers: Vec<DeviceId>,
 }
 
@@ -60,20 +60,20 @@ pub(super) struct Gpus {
 impl Gpus {
     /// The GPUs the driver shows this process. A host without a driver, or
     /// whose driver shows the process no GPU, has none: its Transfer
-    /// Server copies between host memory only. Discovery creates no CUDA
+    /// Server copies between host storage only. Discovery creates no CUDA
     /// context.
     pub(super) fn discover() -> Result<Self, cuda::Error> {
         let count = match DeviceId::count() {
             Ok(count) => count,
             Err(cuda::Error::Load { .. }) => {
-                tracing::info!("no CUDA driver: the Transfer Server copies host memory only");
+                tracing::info!("no CUDA driver: the Transfer Server copies host storage only");
                 0
             }
             Err(cuda::Error::Driver {
                 code: CUDA_ERROR_NO_DEVICE,
                 ..
             }) => {
-                tracing::info!("no visible GPU: the Transfer Server copies host memory only");
+                tracing::info!("no visible GPU: the Transfer Server copies host storage only");
                 0
             }
             Err(error) => return Err(error),
@@ -109,7 +109,7 @@ impl Gpus {
     }
 
     /// The GPU that runs the copies no GPU of their own runs: those between
-    /// host memory and another host's GPU.
+    /// host storage and another host's GPU.
     pub(super) fn first(&self) -> Option<&Gpu> {
         self.gpus.first()
     }
@@ -120,7 +120,7 @@ impl Gpus {
     }
 }
 
-/// The measurement's memory on one GPU: two device allocations, a host
+/// The measurement's storage on one GPU: two device allocations, a host
 /// buffer on the GPU's NUMA node, and the stream the GPU's copies run on.
 struct Scratch {
     stream: Stream,
@@ -150,18 +150,18 @@ impl Scratch {
     }
 }
 
-/// Measure every link of `gpus` and the device memory of each GPU's
+/// Measure every link of `gpus` and the device storage of each GPU's
 /// context, then release the contexts: the process holds none when this
 /// returns.
 pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextBytes>), Error> {
-    // The contexts are held through the measurement and until their memory
+    // The contexts are held through the measurement and until their storage
     // is measured, whatever objects of the measurement live in them.
     let mut held = Vec::with_capacity(gpus.gpus.len());
     for gpu in &gpus.gpus {
         let started = Instant::now();
         held.push(PrimaryContext::retain(gpu.device)?);
         tracing::info!(
-            gpu = %memory_name(&Memory::Device { gpu: gpu.uuid }),
+            gpu = %storage_name(&LinkEnd::Device { gpu: gpu.uuid }),
             milliseconds = started.elapsed().as_secs_f64() * 1e3,
             "created the GPU's CUDA context to measure its links"
         );
@@ -169,8 +169,8 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
     let mut links = Vec::new();
     links.push(LinkBandwidth {
         link: Link {
-            source: Memory::Host,
-            destination: Memory::Host,
+            source: LinkEnd::Host,
+            destination: LinkEnd::Host,
         },
         bytes_per_second: host_to_host()?,
     });
@@ -180,10 +180,10 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
             .iter()
             .map(Scratch::new)
             .collect::<Result<_, _>>()?;
-        let device = |gpu: &Gpu| Memory::Device { gpu: gpu.uuid };
+        let device = |gpu: &Gpu| LinkEnd::Device { gpu: gpu.uuid };
         for (gpu, own) in gpus.gpus.iter().zip(&scratch) {
-            let mut measured = |source: Memory, destination: Memory, to: u64, from: u64| {
-                // SAFETY: both ranges are measurement memory of
+            let mut measured = |source: LinkEnd, destination: LinkEnd, to: u64, from: u64| {
+                // SAFETY: both ranges are measurement storage of
                 // `SAMPLE_BYTES` that lives until the stream drained.
                 let bytes_per_second = unsafe { time_copies(&own.stream, to, from) }?;
                 links.push(LinkBandwidth {
@@ -202,19 +202,19 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
                 own.source.address(),
             )?;
             measured(
-                Memory::Host,
+                LinkEnd::Host,
                 device(gpu),
                 own.destination.address(),
                 own.registration.address(),
             )?;
             measured(
                 device(gpu),
-                Memory::Host,
+                LinkEnd::Host,
                 own.registration.address(),
                 own.source.address(),
             )?;
             // Peer links into this GPU, on its stream: the destination's
-            // copy engine reads the source's memory over the GPUs' link.
+            // copy engine reads the source's storage over the GPUs' link.
             for (peer, theirs) in gpus.gpus.iter().zip(&scratch) {
                 if peer.device != gpu.device && peer.readers.contains(&gpu.device) {
                     measured(
@@ -227,7 +227,7 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
             }
         }
     }
-    // The measurement's memory is released before the context is measured.
+    // The measurement's storage is released before the context is measured.
     cuda::reclaim::flush()?;
     let contexts = if gpus.gpus.is_empty() {
         Vec::new()
@@ -238,7 +238,7 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
             .map(|gpu| {
                 Ok(ContextBytes {
                     gpu: gpu.uuid,
-                    bytes: nvml.process_memory(gpu.device)?,
+                    bytes: nvml.process_storage(gpu.device)?,
                 })
             })
             .collect::<Result<_, cuda::Error>>()?
@@ -247,8 +247,8 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
     cuda::reclaim::flush()?;
     for measured in &links {
         tracing::info!(
-            source = %memory_name(&measured.link.source),
-            destination = %memory_name(&measured.link.destination),
+            source = %storage_name(&measured.link.source),
+            destination = %storage_name(&measured.link.destination),
             gigabytes_per_second = measured.bytes_per_second as f64 / 1e9,
             "measured a link"
         );

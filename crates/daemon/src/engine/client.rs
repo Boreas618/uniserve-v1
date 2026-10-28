@@ -103,7 +103,7 @@ pub enum EngineState {
     Standby,
     /// It serves requests.
     Ready,
-    /// It preempted every request and executes nothing, keeping its memory
+    /// It preempted every request and executes nothing, keeping its storage
     /// and prefix cache index until it resumes or shuts down.
     Parked,
     /// It serves nothing more: its workers failed.
@@ -376,7 +376,7 @@ impl EngineClient {
     /// predecessor's prefix cache index, and serves the requests the
     /// predecessor hands over, which `recompute` their state from their
     /// tokens or not, and for which its cache `grows` into the
-    /// predecessor's memory at once or only at its commit. Waits until the
+    /// predecessor's storage at once or only at its commit. Waits until the
     /// engine reports that it serves; an engine that serves already is left
     /// as it is.
     ///
@@ -479,7 +479,7 @@ impl EngineClient {
 
     /// Parks the engine: at its next step boundary it ends every token
     /// request that resumes from its generated tokens as migratable, lets
-    /// the others finish, and executes nothing more, keeping its memory and
+    /// the others finish, and executes nothing more, keeping its storage and
     /// prefix cache index. Returns that index once it parked.
     ///
     /// # Errors
@@ -496,7 +496,7 @@ impl EngineClient {
         }
     }
 
-    /// Resumes a parked engine, ending the memory of the worlds `retire`
+    /// Resumes a parked engine, ending the storage of the worlds `retire`
     /// names on its nodes first: the successor a rollback discards.
     ///
     /// # Errors
@@ -509,7 +509,7 @@ impl EngineClient {
             .map(drop)
     }
 
-    /// Commits the engine's world: ends the memory of the worlds `retire`
+    /// Commits the engine's world: ends the storage of the worlds `retire`
     /// names (its predecessor, whose processes are gone) on its nodes, and
     /// its workers take the predecessor's storage they mapped read-only.
     /// Returns what each worker reported.
@@ -580,7 +580,7 @@ impl EngineClient {
     /// worlds of `keep_weights` (a previous world kept as its weights, whose
     /// processes exited) released every storage but their weights and the
     /// completed rollback copies named by `cache_keys` on every
-    /// node, and with `to_host` moved those weights to host memory, so that
+    /// node, and with `to_host` moved those weights to host storage, so that
     /// each GPU's ledger leaves the cache the rest. Returns each node's
     /// report of the weights kept (JSON `{"host", "released", "moved_bytes",
     /// "refused"}`), `refused` saying why a node kept them on its GPUs.
@@ -602,7 +602,7 @@ impl EngineClient {
                     change: wire::CacheChange::Grow as i32,
                     preempt_after_ms: None,
                     keep_weights,
-                    keep_in_host_memory: to_host,
+                    keep_in_host_storage: to_host,
                     cache_keys,
                     ..wire::ResizeCache::default()
                 })
@@ -617,17 +617,17 @@ impl EngineClient {
             .collect())
     }
 
-    /// The memory ledgers every node's Storage Server keeps for the
+    /// The storage ledgers every node's Storage Server keeps for the
     /// deployment, one JSON result per node: `{"host": ..., "ledgers":
-    /// [...], "host_memory": {...}}`. No worker is asked: each node's daemon
+    /// [...], "host_storage": {...}}`. No worker is asked: each node's daemon
     /// reads them over its claim.
     ///
     /// # Errors
     ///
     /// Fails when a node's daemon cannot read them, or when the engine ends
     /// first.
-    pub async fn describe_memory(&self) -> Result<Vec<String>, String> {
-        self.ask(|id| wire::engine_command::Kind::DescribeMemory(wire::DescribeMemory { id }))
+    pub async fn describe_storage(&self) -> Result<Vec<String>, String> {
+        self.ask(|id| wire::engine_command::Kind::DescribeStorage(wire::DescribeStorage { id }))
             .await
             .map(Answered::results)
     }
@@ -720,7 +720,7 @@ impl EngineClient {
             .map(drop)
     }
 
-    /// Gives back or restores the device memory of the engine's KV cache
+    /// Gives back or restores the device storage of the engine's KV cache
     /// (`wire::CacheChange`), and returns what each worker reported.
     ///
     /// # Errors

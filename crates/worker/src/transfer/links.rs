@@ -1,24 +1,24 @@
 //! Measured links between retained storage regions on deployment nodes.
 
-use crate::memory::allocation::Storage;
-use crate::memory::retained::Retained;
+use crate::storage::allocation::Storage;
+use crate::storage::retained::Retained;
 use crate::{Error, Result};
+use ::storage::manifest::weights::Sources;
+use ::storage::manifest::{Binding, Gpu};
+use ::storage::protocol::{Access, LinkBandwidth, LinkEnd, Priority, Region, Span};
+use ::storage::{Key, Placement, StorageRecord, TensorRecord};
 use std::collections::BTreeMap;
 use std::os::fd::AsFd;
-use storage::manifest::weights::Sources;
-use storage::manifest::{Binding, Gpu};
-use storage::protocol::{Access, LinkBandwidth, Memory, Priority, Region, Span};
-use storage::{Key, Placement, StorageRecord, TensorRecord};
 
 /// Bytes per sampling window used by the Transfer Server estimator.
 const LINK_SAMPLE: u64 = 64 << 20;
 
-/// The links of `sources` into local memory `at`, after the host's Transfer
+/// The links of `sources` into local storage `at`, after the host's Transfer
 /// Server measures each unmeasured remote host or device source: two copies of
 /// [`LINK_SAMPLE`] byte windows from the longest retained chunk into a
 /// scratch storage the rank creates and releases. Smaller chunks repeat
 /// until the window is complete. `device` owns the scratch allocation and
-/// CUDA registration even when the destination is host memory.
+/// CUDA registration even when the destination is host storage.
 pub(crate) fn measure(
     retained: &Retained,
     sources: &Sources,
@@ -26,13 +26,13 @@ pub(crate) fn measure(
     at: Placement,
 ) -> Result<Vec<LinkBandwidth>> {
     let into = match at {
-        Placement::Device { gpu } => Memory::Device { gpu },
-        Placement::Host { .. } => Memory::Host,
+        Placement::Device { gpu } => LinkEnd::Device { gpu },
+        Placement::Host { .. } => LinkEnd::Host,
     };
-    let reaches = |links: &[LinkBandwidth], source: &Memory| {
+    let reaches = |links: &[LinkBandwidth], source: &LinkEnd| {
         links.iter().any(|measured| {
             measured.link.destination == into && (measured.link.source == *source ||
-                matches!((source, &measured.link.source), (Memory::Remote { gpu: Some(gpu), .. }, Memory::Device { gpu: from }) if gpu == from))
+                matches!((source, &measured.link.source), (LinkEnd::Remote { gpu: Some(gpu), .. }, LinkEnd::Device { gpu: from }) if gpu == from))
         })
     };
     let mut unmeasured = BTreeMap::new();
@@ -41,7 +41,7 @@ pub(crate) fn measure(
             let Binding::Remote { endpoint, at } = &chunk.binding else {
                 continue;
             };
-            let source = Memory::Remote {
+            let source = LinkEnd::Remote {
                 endpoint: endpoint.clone(),
                 gpu: match at {
                     Placement::Device { gpu } => Some(*gpu),

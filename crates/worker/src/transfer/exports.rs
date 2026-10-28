@@ -15,9 +15,9 @@ use crate::{Error, Result};
 pub type Location = (Arc<Transport>, Locator);
 
 /// Export `source` through every export mechanism that reaches its
-/// consumers: local plus CUDA VMM for device memory when the rank exports
+/// consumers: local plus CUDA VMM for device storage when the rank exports
 /// over VMM (unless `host` forces host mechanisms), otherwise local, shared
-/// memory and the rank channel.
+/// storage and the rank channel.
 ///
 /// The export reserves its bytes from the rank's transfer budget once,
 /// whatever number of mechanisms publish it: they are locations of one
@@ -238,7 +238,7 @@ mod tests {
     use crate::EventPool;
     use crate::ffi::{Backing, DType};
     use crate::job::Job;
-    use crate::memory::allocation::{Storage, StorageView};
+    use crate::storage::allocation::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, TransportOptions};
 
     /// A rank whose only mechanism towards slot 1 is the rank channel.
@@ -392,9 +392,9 @@ mod tests {
     #[test]
     fn a_recorded_channel_export_carries_what_its_job_copied() -> Result<()> {
         let transports = channel()?;
-        let memory = Storage::host(4);
+        let storage = Storage::host(4);
         let source = Spans::single(StorageView::contiguous(
-            Arc::clone(&memory) as Arc<dyn Backing>,
+            Arc::clone(&storage) as Arc<dyn Backing>,
             0,
             DType::U8,
             &[4],
@@ -412,9 +412,9 @@ mod tests {
             job.on(None),
             |_| Ok(()),
         )?;
-        // SAFETY: four bytes of host memory this test owns.
+        // SAFETY: four bytes of host storage this test owns.
         unsafe {
-            std::ptr::copy_nonoverlapping([1_u8, 2, 3, 4].as_ptr(), memory.address() as *mut u8, 4)
+            std::ptr::copy_nonoverlapping([1_u8, 2, 3, 4].as_ptr(), storage.address() as *mut u8, 4)
         };
         job.perform().check().map_err(|failure| failure.error)?;
 

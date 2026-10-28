@@ -200,13 +200,13 @@ pub enum ComponentDistribution {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentWeights {
-    /// Every weight stays in device memory.
+    /// Every weight stays in device storage.
     #[default]
     Device,
     /// The dense projection weights of the component's repeated layer stack
-    /// stay in page-locked host memory, and each rank copies them into a few
+    /// stay in page-locked host storage, and each rank copies them into a few
     /// layer-sized device slots ahead of each layer's use. Every other
-    /// weight stays in device memory. The rank serves the component's calls
+    /// weight stays in device storage. The rank serves the component's calls
     /// without CUDA graphs.
     Host,
 }

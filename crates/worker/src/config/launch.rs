@@ -102,7 +102,7 @@ pub struct LoadOptions {
     pub mode: String,
     pub download_dir: Option<String>,
     pub num_threads: Option<u32>,
-    /// The tensor- and expert-parallel degrees retained weight memory is
+    /// The tensor- and expert-parallel degrees retained weight storage is
     /// chunked for; empty for every degree up to the GPUs the worker sees.
     pub parallel_degrees: Vec<u32>,
 }
@@ -416,7 +416,7 @@ fn execution(
             .cache_keys
             .iter()
             .copied()
-            .map(storage::Key)
+            .map(::storage::Key)
             .collect(),
         segments: descriptor.segments.clone(),
         attention_backend: descriptor.attention_backend.clone(),

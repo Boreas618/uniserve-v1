@@ -76,7 +76,7 @@ impl Function {
     /// captured.
     ///
     /// # Safety
-    /// `parameters` matches the kernel's parameter list, and the memory the
+    /// `parameters` matches the kernel's parameter list, and the storage the
     /// kernel addresses outlives every execution of the launch (including
     /// the replays of a graph that captured it).
     pub unsafe fn launch(

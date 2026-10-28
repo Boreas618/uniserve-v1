@@ -17,7 +17,7 @@
 //! from other ranks reach it before the batch executes
 //! ([`crate::executor::inputs`]), and every input the executor's preparation
 //! names is then leased from it ([`bind_prepared`]); host codecs read some
-//! inputs in place from their shared-memory exports instead. [`bind_outputs`]
+//! inputs in place from their shared-storage exports instead. [`bind_outputs`]
 //! reserves a call's outputs at their scheduler placement and [`export`]
 //! publishes a written one.
 
@@ -27,9 +27,9 @@ use crate::executor::computations::CallResources;
 use crate::executor::latents::LatentLedger;
 use crate::executor::reports::Publication;
 use crate::ffi::{Backing, DType, MemoryKind};
-use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::encoders::{self, EncoderHostPool};
-use crate::memory::{
+use crate::storage::allocation::{Storage, StorageView};
+use crate::storage::encoders::{self, EncoderHostPool};
+use crate::storage::{
     LatentUpdate, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore,
 };
 use crate::stream::{CUDAStream, Issue};
@@ -263,7 +263,7 @@ pub(crate) struct ProductCall {
     pub(crate) reports: usize,
     /// How the call publishes what its tasks wrote once they finished.
     pub(crate) publication: Option<Publication>,
-    /// Inputs read in place from their shared-memory exports, released once
+    /// Inputs read in place from their shared-storage exports, released once
     /// the call's host tasks finished.
     pub(crate) borrowed: Vec<Arc<Mutex<SharedRead>>>,
 }
@@ -275,7 +275,7 @@ struct PreparedWrite {
     shape: Vec<u64>,
     region: Option<Vec<[u64; 2]>>,
     /// `host` or `device`.
-    memory: String,
+    storage: String,
     /// A host task fills it after the batch commits.
     deferred: bool,
     /// Host readers read its export.
@@ -291,7 +291,7 @@ struct Prepared {
     /// `products`, `encoded` or `media`.
     publication: Option<String>,
     /// For a call reading rows of a round's decoded frames: the round
-    /// position each read takes, read in place from its shared-memory
+    /// position each read takes, read in place from its shared-storage
     /// export or leased.
     #[serde(default)]
     read_rows: Option<Vec<u32>>,
@@ -311,7 +311,7 @@ struct Prepared {
     image: Option<serde_json::Value>,
     /// A video latent preparation on a denoising rank: how the rank's
     /// request slot pages hold the request's samples
-    /// (`storage::manifest::StorageLayout`), which its completion reports
+    /// (`::storage::manifest::StorageLayout`), which its completion reports
     /// and a restore lays the stored values out in.
     #[serde(default)]
     latent_layout: Option<serde_json::Value>,
@@ -390,7 +390,7 @@ pub(crate) struct PreparedOwners<'a> {
     pub(crate) encoders: Option<&'a EncoderHostPool>,
     /// The stream device products host tasks wrote are fenced on.
     pub(crate) host_stream: Option<Arc<CUDAStream>>,
-    /// The inputs host codecs read in place from their shared-memory
+    /// The inputs host codecs read in place from their shared-storage
     /// exports instead of leasing them from the product store.
     pub(crate) borrowed: &'a HashSet<BufferId>,
 }
@@ -488,12 +488,12 @@ pub(crate) fn bind_prepared(
             let product = call.outputs.get(write.output).ok_or_else(|| {
                 Error::Interface("the executor prepared an undeclared output".into())
             })?;
-            let memory = match write.memory.as_str() {
+            let storage = match write.storage.as_str() {
                 "host" => MemoryKind::Host,
                 "device" => target,
                 other => {
                     return Err(Error::Interface(format!(
-                        "the executor prepared an output in {other:?} memory"
+                        "the executor prepared an output in {other:?} storage"
                     )));
                 }
             };
@@ -507,7 +507,7 @@ pub(crate) fn bind_prepared(
                         .as_ref()
                         .map(|region| region.iter().map(|&[a, b]| a..b).collect()),
                 }],
-                memory,
+                storage,
                 &placement,
             )?
             .into_iter()
@@ -715,7 +715,7 @@ fn publication(
     })
 }
 
-/// Lease one input for `consumer`, whole, in `memory`; what `stream`
+/// Lease one input for `consumer`, whole, in `storage`; what `stream`
 /// issues next waits on its writer. The lease ends with the batch's other
 /// reads, when it commits or retires.
 fn lease(
@@ -723,10 +723,10 @@ fn lease(
     batch: &mut Batch<CallResources>,
     product: &TensorRef,
     consumer: CallId,
-    memory: MemoryKind,
+    storage: MemoryKind,
     stream: impl Issue,
 ) -> Result<Arc<ProductRead>> {
-    let read = store.consume(product, consumer, Some(memory), stream)?;
+    let read = store.consume(product, consumer, Some(storage), stream)?;
     // Kept before the check below, so a refused read still ends.
     batch.reads.push(Arc::clone(&read));
     if read.region().is_some() {
@@ -766,7 +766,7 @@ pub(crate) fn publish(
     Ok(())
 }
 
-/// A borrowed shared-memory row as host bytes, viewed as long as the read
+/// A borrowed shared-storage row as host bytes, viewed as long as the read
 /// lives.
 struct MappedBytes {
     mapping: Arc<SharedMapping>,
@@ -805,7 +805,7 @@ fn row_view(read: &SharedRead) -> Result<StorageView> {
 }
 
 /// Row `row` of a round's decoded frames, read in place from its
-/// shared-memory export on this host.
+/// shared-storage export on this host.
 fn borrow_row(
     owners: &PreparedOwners<'_>,
     plan: &BatchPlan,
@@ -856,7 +856,7 @@ fn exported_rows(
         return Err(Error::Invalid("encoded units require byte rows".into()));
     }
     let (count, width) = (tensor.shape[0] as usize, tensor.shape[1] as usize);
-    let memory = Storage::host((count * width).max(1));
+    let storage = Storage::host((count * width).max(1));
     let mut filled = vec![false; count];
     for location in &tensor.locations {
         if location.offset.get(1).copied().unwrap_or(0) != 0 {
@@ -906,7 +906,7 @@ fn exported_rows(
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     row.as_ptr(),
-                    (memory.address() as *mut u8).add(target),
+                    (storage.address() as *mut u8).add(target),
                     row.len(),
                 );
             }
@@ -919,7 +919,7 @@ fn exported_rows(
         ));
     }
     StorageView::contiguous(
-        memory as Arc<dyn Backing>,
+        storage as Arc<dyn Backing>,
         0,
         DType::U8,
         &[count as i64, width as i64],

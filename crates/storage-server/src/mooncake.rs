@@ -34,9 +34,9 @@ use std::sync::{Arc, Mutex};
 use mooncake_store::{MooncakeStore, StoreError};
 use rustix::event::{PollFd, PollFlags, poll};
 
-use storage::client::Client;
-use storage::connector::Settings;
-use storage::protocol::{Event, Key, PageShape, Reply, Request, Role};
+use ::storage::client::Client;
+use ::storage::connector::Settings;
+use ::storage::protocol::{Event, Key, PageShape, Reply, Request, Role};
 
 /// The most pages one Mooncake call carries.
 pub const BATCH_PAGES: usize = 128;
@@ -47,7 +47,7 @@ pub enum Error {
     #[error("mooncake: {0}")]
     Mooncake(#[from] StoreError),
     #[error(transparent)]
-    Storage(#[from] storage::client::Error),
+    Storage(#[from] ::storage::client::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("{0}")]
@@ -171,7 +171,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
             Ok(()) => {}
             // The server closes the connection when it stops, which ends
             // the connector.
-            Err(storage::client::Error::Io(error))
+            Err(::storage::client::Error::Io(error))
                 if error.kind() == io::ErrorKind::UnexpectedEof =>
             {
                 tracing::info!("the storage server closed the connection");
@@ -183,7 +183,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
             match event {
                 Event::Pool { pool, shape, slots } => {
                     let descriptor = descriptors.into_iter().next().ok_or_else(|| {
-                        Error::Settings(format!("page pool {pool} came without its memory"))
+                        Error::Settings(format!("page pool {pool} came without its storage"))
                     })?;
                     let mapped = map(&shared.store, descriptor, shape, slots)?;
                     lock(&shared.pools).insert(pool, mapped);
@@ -196,7 +196,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                 }
                 Event::PoolReleased { pool } => {
                     // The server releases a pool once the connector has no
-                    // task on it, so no worker thread touches its memory.
+                    // task on it, so no worker thread touches its storage.
                     if let Some(mapped) = lock(&shared.pools).remove(&pool) {
                         unmap(&shared.store, mapped);
                         tracing::info!(pool, "unmapped a released page pool");

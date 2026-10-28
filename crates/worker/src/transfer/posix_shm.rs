@@ -1,4 +1,4 @@
-//! The shared-memory mechanism: a POSIX segment of this host holding a copy
+//! The shared-storage mechanism: a POSIX segment of this host holding a copy
 //! of the export behind a readiness word and one acknowledgment word per
 //! consumer slot ([`SharedBuffer`]), its export, its reads and in-place
 //! borrows ([`SharedRead`]).
@@ -23,7 +23,7 @@ use super::{
     drain_event,
 };
 use crate::ffi::{Backing, MemoryKind};
-use crate::memory::allocation::StorageView;
+use crate::storage::allocation::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -94,7 +94,7 @@ impl SharedMapping {
     }
 }
 
-/// Shared mappings are host memory that copies read or write in place.
+/// Shared mappings are host storage that copies read or write in place.
 impl Backing for SharedMapping {
     fn device(&self) -> MemoryKind {
         MemoryKind::Host
@@ -201,7 +201,7 @@ impl SharedBuffer {
 
     /// Announce bytes after their last write: behind the copies `issue`
     /// issued on the producer's stream, or in the order of its host writes
-    /// for a CPU copy. The callback touches only host memory; it neither
+    /// for a CPU copy. The callback touches only host storage; it neither
     /// enters Python nor calls CUDA.
     /// The caller issues exactly one copy sequence per buffer, to `issue`,
     /// and must not modify its payload after announcing readiness.
@@ -350,7 +350,7 @@ impl SharedRead {
         })
     }
 
-    /// Poll shared host memory without interpreter calls. `check` observes
+    /// Poll shared host storage without interpreter calls. `check` observes
     /// the consuming transfer's native cancellation state between polls.
     /// Failure or timeout leaves the claim held until release or destruction.
     pub(crate) fn wait(
@@ -410,7 +410,7 @@ impl Drop for SharedRead {
 }
 
 impl Transport {
-    /// The read of a shared-memory export of this host into `destination`
+    /// The read of a shared-storage export of this host into `destination`
     /// (see [`Transport::issue_fetch`]).
     pub(super) fn shared_read(
         &self,
@@ -506,7 +506,7 @@ impl Transport {
         Ok(locator)
     }
 
-    /// Borrow whole leading rows of a shared-memory export of this host in
+    /// Borrow whole leading rows of a shared-storage export of this host in
     /// place. `region` is in logical coordinates; releasing the returned
     /// read ends the claim.
     pub fn borrow(&self, locator: &Locator, region: Option<&[Range<u64>]>) -> Result<SharedRead> {

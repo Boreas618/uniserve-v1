@@ -373,7 +373,7 @@ class TextRunner:
         """Serve every forward eagerly at its live shape (``eager``), or by
         the graphs captured at startup again.
 
-        The graphs stay captured: the worker gives their memory back while
+        The graphs stay captured: the worker gives their storage back while
         the runner is eager and restores it at the same addresses before the
         runner replays them again.
         """  # noqa: D205

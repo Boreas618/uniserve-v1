@@ -6,7 +6,7 @@
 //! tables register exported storage until its readers finished; the cache
 //! importer retains import destinations through their physical reads. All of
 //! them move Rust-owned storage ([`Spans`] of
-//! [`crate::memory::allocation::StorageView`]s) with driver copies ordered by the
+//! [`crate::storage::allocation::StorageView`]s) with driver copies ordered by the
 //! rank's [`crate::EventPool`].
 
 use std::ops::Range;
@@ -63,7 +63,7 @@ pub type Notify = Arc<dyn Fn() + Send + Sync>;
 /// The physical retirement signal of an export, a read or a cache import.
 pub type Retirement = Completion<Notify>;
 
-/// Reader acknowledgment words in the header of a shared-memory segment or
+/// Reader acknowledgment words in the header of a shared-storage segment or
 /// a pooled VMM chunk: one per consumer slot, which a reader sets to
 /// [`CLAIMED`] before it copies and to [`ACKNOWLEDGED`] after; the producer
 /// reuses the storage only once every claimed word is acknowledged.

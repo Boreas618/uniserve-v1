@@ -18,7 +18,7 @@
 //! groups meanwhile. When their group arrives, schedulers end their
 //! in-flight token requests on it as migratable, which the daemon submits
 //! again and which wait for the relaunched workers, and fail the others;
-//! they admit work for the group again once it installed its workers. Weights and exclusive memory come back from the
+//! they admit work for the group again once it installed its workers. Weights and exclusive storage come back from the
 //! Storage Server.
 //!
 //! A group that closes during a round cancels its relaunch

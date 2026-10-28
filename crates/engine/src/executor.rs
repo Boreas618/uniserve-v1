@@ -1504,7 +1504,7 @@ pub trait Executor: Send {
     /// Closes the executor and its physical workers.
     fn close(&mut self) -> Result<(), ExecutorError>;
     /// Commits the workers' world: each worker takes the predecessor
-    /// world's memory it mapped read-only, and its group relaunches on a
+    /// world's storage it mapped read-only, and its group relaunches on a
     /// loss and keeps its standby from then on. Returns what each worker
     /// reported. The default suits an executor whose workers succeed no
     /// world.
@@ -1524,9 +1524,9 @@ pub trait Executor: Send {
         Ok(())
     }
     /// Keeps the weights alone of every world of `worlds` on the nodes of
-    /// the executor's workers, in host memory when `to_host`
+    /// the executor's workers, in host storage when `to_host`
     /// (`Claims::keep_weights`), and returns each node's report. The default
-    /// suits an executor that retains no memory, which has no node to
+    /// suits an executor that retains no storage, which has no node to
     /// report.
     fn keep_weights(
         &mut self,
@@ -1546,10 +1546,10 @@ pub trait Executor: Send {
         let _ = halve;
         Ok(Vec::new())
     }
-    /// The memory ledgers of the nodes of the executor's workers
+    /// The storage ledgers of the nodes of the executor's workers
     /// (`Claims::ledgers`): for each node, JSON of `{"host": ..., "ledgers":
-    /// [...], "host_memory": {...}}`. The default suits an executor that
-    /// retains no memory, whose ledgers are empty.
+    /// [...], "host_storage": {...}}`. The default suits an executor that
+    /// retains no storage, whose ledgers are empty.
     fn ledgers(&mut self) -> Result<Vec<String>, ExecutorError> {
         Ok(Vec::new())
     }

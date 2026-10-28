@@ -1,8 +1,8 @@
 //! What a storage's bytes are: the fields it holds, the part of a logical
 //! tensor each field is, how the field's elements lie in the bytes, and
-//! the chunks the storage's memory is allocated in.
+//! the chunks the storage's storage is allocated in.
 //!
-//! A worker's weights are storages, each a range of device memory holding
+//! A worker's weights are storages, each a range of device storage holding
 //! one or more fields (a merged projection's branches, the small tensors
 //! packed together). A field is a local tensor of one logical tensor:
 //! the model library declares which indices of the logical tensor it holds
@@ -14,7 +14,7 @@
 //!
 //! # Chunks
 //!
-//! A storage's memory is allocated in chunks, each a CUDA VMM allocation of
+//! A storage's storage is allocated in chunks, each a CUDA VMM allocation of
 //! its own mapped back to back with the next, so that another world can
 //! map any chunk it needs on its GPU without the rest. A chunk can be
 //! mapped into another world's storage only if it starts and ends at the
@@ -585,10 +585,10 @@ fn split_linear(
     }
 }
 
-/// One storage: a range of device memory and the fields it holds.
+/// One storage: a range of device storage and the fields it holds.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StorageLayout {
-    /// The bytes the fields occupy; the storage's memory rounds them up to
+    /// The bytes the fields occupy; the storage's storage rounds them up to
     /// the allocation granularity.
     pub bytes: u64,
     pub fields: Vec<Field>,
@@ -609,12 +609,12 @@ impl StorageLayout {
         Ok(())
     }
 
-    /// The storage's memory: its bytes rounded up to `granularity`.
+    /// The storage's storage: its bytes rounded up to `granularity`.
     pub fn padded(&self, granularity: u64) -> u64 {
         self.bytes.div_ceil(granularity).max(1) * granularity
     }
 
-    /// The chunks the storage's memory is allocated in, in address order,
+    /// The chunks the storage's storage is allocated in, in address order,
     /// for the parallel `degrees` in use (module documentation).
     pub fn chunks(&self, granularity: u64, degrees: &[u64]) -> Vec<Range<u64>> {
         let padded = self.padded(granularity);

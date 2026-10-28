@@ -1,4 +1,4 @@
-//! NVML bindings (`libnvidia-ml.so.1`): per-process and device memory usage,
+//! NVML bindings (`libnvidia-ml.so.1`): per-process and device storage usage,
 //! and which processes a device lists.
 //!
 //! NVML is a management library and creates no CUDA context, so a process
@@ -18,7 +18,7 @@ type NvmlDevice = *mut c_void;
 
 const NVML_SUCCESS: NvmlReturn = 0;
 const NVML_ERROR_INSUFFICIENT_SIZE: NvmlReturn = 7;
-/// `usedGpuMemory` when the driver cannot attribute memory to the process.
+/// `usedGpuMemory` when the driver cannot attribute storage to the process.
 const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
 
 /// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries.
@@ -26,12 +26,12 @@ const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
 #[derive(Clone, Copy, Default)]
 struct ProcessInfo {
     pid: u32,
-    used_gpu_memory: u64,
+    used_gpu_storage: u64,
     gpu_instance_id: u32,
     compute_instance_id: u32,
 }
 
-/// `nvmlMemory_v2_t`.
+/// `nvmlStorage_v2_t`.
 #[repr(C)]
 #[derive(Default)]
 struct RawMemory {
@@ -44,7 +44,7 @@ struct RawMemory {
 
 /// `NVML_STRUCT_VERSION(Memory, 2)`: the struct size with the version in the
 /// top byte.
-const NVML_MEMORY_V2: u32 = size_of::<RawMemory>() as u32 | (2 << 24);
+const NVML_STORAGE_V2: u32 = size_of::<RawMemory>() as u32 | (2 << 24);
 
 /// The signature of NVML's `_v3` process queries.
 type ProcessQuery = unsafe extern "C" fn(NvmlDevice, *mut u32, *mut ProcessInfo) -> NvmlReturn;
@@ -79,7 +79,7 @@ fn api() -> Result<&'static Api> {
                 device_by_uuid: symbol(&library, "nvmlDeviceGetHandleByUUID")?,
                 compute_processes: symbol(&library, "nvmlDeviceGetComputeRunningProcesses_v3")?,
                 graphics_processes: symbol(&library, "nvmlDeviceGetGraphicsRunningProcesses_v3")?,
-                memory_info: symbol(&library, "nvmlDeviceGetMemoryInfo_v2")?,
+                memory_info: symbol(&library, "nvmlDeviceGetStorageInfo_v2")?,
                 _library: library,
             })
         }
@@ -126,7 +126,7 @@ impl Api {
     }
 }
 
-/// Device memory reported by NVML, in bytes.
+/// Device storage reported by NVML, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NvmlMemory {
     pub total: u64,
@@ -173,13 +173,13 @@ impl Nvml {
         Ok(handle)
     }
 
-    /// Device memory that NVML attributes to this process on `device`: every
+    /// Device storage that NVML attributes to this process on `device`: every
     /// allocation of its context, including PyTorch's cached segments, graph
     /// pools, VMM arenas, communicator buffers and loaded modules.
     ///
     /// Fails with [`Error::ProcessNotFound`] when NVML lists no usage for this
     /// PID, as happens inside a PID namespace NVML does not report.
-    pub fn process_memory(&self, device: DeviceId) -> Result<u64> {
+    pub fn process_storage(&self, device: DeviceId) -> Result<u64> {
         let handle = self.device(device)?;
         let processes = self.processes(self.api.compute_processes, handle)?;
         let pid = std::process::id();
@@ -187,7 +187,7 @@ impl Nvml {
         let usage: Vec<u64> = processes
             .iter()
             .filter(|process| process.pid == pid)
-            .map(|process| process.used_gpu_memory)
+            .map(|process| process.used_gpu_storage)
             .collect();
         if usage.is_empty() || usage.contains(&NVML_VALUE_NOT_AVAILABLE) {
             return Err(Error::ProcessNotFound { pid, device });
@@ -245,24 +245,24 @@ impl Nvml {
         }
     }
 
-    /// Total, reserved, free and used memory of `device`.
+    /// Total, reserved, free and used storage of `device`.
     pub fn memory_info(&self, device: DeviceId) -> Result<NvmlMemory> {
         let handle = self.device(device)?;
-        let mut memory = RawMemory {
-            version: NVML_MEMORY_V2,
+        let mut storage = RawMemory {
+            version: NVML_STORAGE_V2,
             ..RawMemory::default()
         };
         self.api.check(
             // SAFETY: NVML fills the local struct, whose version field names its
-            // `nvmlMemory_v2_t` layout; `handle` came from NVML for this device.
-            unsafe { (self.api.memory_info)(handle, &mut memory) },
-            "nvmlDeviceGetMemoryInfo_v2",
+            // `nvmlStorage_v2_t` layout; `handle` came from NVML for this device.
+            unsafe { (self.api.memory_info)(handle, &mut storage) },
+            "nvmlDeviceGetStorageInfo_v2",
         )?;
         Ok(NvmlMemory {
-            total: memory.total,
-            reserved: memory.reserved,
-            free: memory.free,
-            used: memory.used,
+            total: storage.total,
+            reserved: storage.reserved,
+            free: storage.free,
+            used: storage.used,
         })
     }
 }

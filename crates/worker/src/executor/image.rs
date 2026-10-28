@@ -61,12 +61,12 @@ use crate::ffi::MemoryKind;
 use crate::host::HostTask;
 use crate::host::image::{ImageResult, ImageTask, ImageWork};
 use crate::job::{Job, Recorder};
-use crate::memory::allocation::StorageView;
-use crate::memory::encoders::{self, EncoderHostPool};
-use crate::memory::{
+use crate::request::{RequestPool, RequestProgress};
+use crate::storage::allocation::StorageView;
+use crate::storage::encoders::{self, EncoderHostPool};
+use crate::storage::{
     AttentionRow, Metadata, OutputPlacement, PrefixCache, ProductBuffer, ProductStore, ValueRange,
 };
-use crate::request::{RequestPool, RequestProgress};
 use crate::stream::{EventPool, Issue as _};
 use crate::transfer::Transports;
 use crate::{Error, Outcome, Result, lock};
@@ -396,7 +396,7 @@ fn shaped(view: &StorageView, shape: &[u64]) -> Result<StorageView> {
     }
     let signed: Vec<i64> = shape.iter().map(|&extent| extent as i64).collect();
     StorageView::contiguous(
-        Arc::clone(view.memory()),
+        Arc::clone(view.storage()),
         view.offset(),
         view.dtype(),
         &signed,
@@ -695,7 +695,7 @@ fn host_copies(
     ))
 }
 
-/// Reserve the product `write` names of `call` in `target` memory: a
+/// Reserve the product `write` names of `call` in `target` storage: a
 /// feature in the encoder cache, or an image at the scheduler's placement
 /// (`allocations`) and the prepared shape.
 fn reserve_write(

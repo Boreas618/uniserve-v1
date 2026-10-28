@@ -389,7 +389,7 @@ def _nccl_backends(world: World) -> list[Any]:
 
 
 def suspend(world: World) -> None:
-    """Release the device memory of the world's NCCL communicators.
+    """Release the device storage of the world's NCCL communicators.
 
     A parked standby calls this after its device drained; nothing runs on
     the communicators, nor a graph that captured one of their collectives,

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// The engine's block pool allocates units, and a block table maps each
 /// logical page of a cache group onto that group's number of units; worker
 /// calls name them as unit ids. The worker treats unit zero as its padding
-/// sentinel, valid memory in every plane, so the pool never allocates it.
+/// sentinel, valid storage in every plane, so the pool never allocates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct UnitId(pub u32);
 

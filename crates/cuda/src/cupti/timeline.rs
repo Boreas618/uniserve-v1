@@ -5,7 +5,7 @@
 //! ([`super::subscriber`]), the activity records of kernels
 //! (`CONCURRENT_KERNEL`, which keeps kernels concurrent, unlike `KERNEL`),
 //! copies (`MEMCPY`, `MEMCPY2`), fills (`MEMSET`), NVTX marks and their data
-//! (`MARKER`, `MARKER_DATA`), memory allocations (`MEMORY2`) and the NVLink
+//! (`MARKER`, `MARKER_DATA`), storage allocations (`STORAGE2`) and the NVLink
 //! and PCIe topology (`NVLINK`, `PCIE`), and the callbacks of every runtime
 //! and driver API call. A CUDA graph's launch is recorded by its nodes
 //! ([`GraphTrace::Nodes`]: each kernel, copy and fill of the graph carries
@@ -64,7 +64,7 @@ const KINDS: [u32; 9] = [
     records::MEMSET,
     records::MARKER,
     records::MARKER_DATA,
-    records::MEMORY2,
+    records::STORAGE2,
     records::NVLINK,
     records::PCIE,
 ];
@@ -326,7 +326,7 @@ mod tests {
         let _serial = lock(&crate::cupti::tests::SERIAL);
         subscriber::subscribe()?;
         let stream = Stream::new(DeviceId(0))?;
-        let memory = DeviceAllocation::linear(DeviceId(0), 1 << 20)?;
+        let storage = DeviceAllocation::linear(DeviceId(0), 1 << 20)?;
         let delivered: Arc<Mutex<Vec<Delivered>>> = Arc::default();
         let sink: Sink = {
             let delivered = Arc::clone(&delivered);
@@ -335,7 +335,7 @@ mod tests {
         let timeline = Timeline::start(GraphTrace::Nodes, sink)?;
         // SAFETY: the allocation holds 1 MiB and outlives the fill, which
         // the synchronization waits for.
-        unsafe { memset_d32(memory.address(), 7, 1 << 18, &stream)? };
+        unsafe { memset_d32(storage.address(), 7, 1 << 18, &stream)? };
         stream.synchronize()?;
         drop(timeline);
 

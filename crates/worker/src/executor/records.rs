@@ -37,7 +37,7 @@ use std::ops::Range;
 
 use crate::cuda_graph::GraphMode;
 use crate::executor::PendingOutput;
-use crate::memory::LogprobLayout;
+use crate::storage::LogprobLayout;
 use crate::{Error, Result};
 
 /// The first header word: `TKRC` in the high word, the record layout's

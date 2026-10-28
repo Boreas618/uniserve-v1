@@ -321,7 +321,7 @@ def weight_fields(model) -> list[Any]:
     if any(layer.expert_group != group for layer in layers):
         raise ValueError("DWDP weights must share one expert group")
     if device.type != "cuda":
-        raise ValueError("DWDP requires CUDA peer memory")
+        raise ValueError("DWDP requires CUDA peer storage")
     counts: list[int] = []
     names: list[str] = []
     shards: list[torch.Tensor] = []
@@ -536,7 +536,7 @@ class WeightPrefetch:
     def close(self) -> None:
         """Drain the copies once every invocation and graph retired.
 
-        The worker releases the weights' memory after this returns.
+        The worker releases the weights' storage after this returns.
 
         Raises:
             RuntimeError: An invocation is active.

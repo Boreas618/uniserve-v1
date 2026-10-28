@@ -1,9 +1,9 @@
-//! Device storage accounting against the GPU's memory ledger.
+//! Device storage accounting against the GPU's storage ledger.
 //!
 //! A deployment may use `⌊total × fraction⌋` of a GPU (its quota), and every
 //! world of the deployment that uses the GPU, with the host's Transfer
-//! Server, holds its memory within that one quota: the host's Storage Server
-//! keeps the GPU's ledger (`storage::GpuLedger`). A rank's grant is the
+//! Server, holds its storage within that one quota: the host's Storage Server
+//! keeps the GPU's ledger (`::storage::GpuLedger`). A rank's grant is the
 //! quota less everything the ledger books beside the rank's own process
 //! (another world's weights, KV cache segments, graph pool and process, the
 //! Transfer Server's context, the storages this rank's scope retains) and
@@ -18,7 +18,7 @@
 //! (activations, graph pools), Rust driver allocations (arenas, workspaces),
 //! communicator buffers and loaded modules. The caching allocator first
 //! returns unused cached blocks, so reusable cache does not count against
-//! the grant. NVML attributes memory held only through descriptors to no
+//! the grant. NVML attributes storage held only through descriptors to no
 //! process, so the storages the Storage Server retains count through the
 //! ledger instead: the weights, the exclusive storages and the KV cache
 //! segments. So does the part of the plugins' communication buffers NVML
@@ -29,17 +29,17 @@
 //! owners, so they count as free.
 //!
 //! Once warm, the rank books what the server cannot see in the ledger
-//! ([`DeviceBudget::book`]): its graph pools' memory and what its process
+//! ([`DeviceBudget::book`]): its graph pools' storage and what its process
 //! holds beside them, with the product storage it has yet to make resident.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use ::storage::{GpuLedger, Item};
 use cuda::{DeviceId, Nvml};
-use storage::{GpuLedger, Item};
 
 use crate::ffi::Function;
-use crate::memory::retained::Retained;
+use crate::storage::retained::Retained;
 use crate::{Error, Result};
 
 /// Per-process device storage measurements against the GPU's ledger.
@@ -51,7 +51,7 @@ pub(crate) struct DeviceBudget {
     unattributed: BTreeMap<DeviceId, u64>,
     /// `torch.cuda.synchronize(device)` and `torch.cuda.empty_cache()`,
     /// called before a measurement so blocks freed by completed work are
-    /// returned to the device and process memory excludes reusable cache.
+    /// returned to the device and process storage excludes reusable cache.
     synchronize: Function,
     empty_cache: Function,
 }
@@ -93,7 +93,7 @@ impl DeviceBudget {
         })
     }
 
-    /// Device memory this process holds on `device` after PyTorch returns
+    /// Device storage this process holds on `device` after PyTorch returns
     /// its unused cached blocks: NVML's figure with the plugins' buffers it
     /// attributes to no process, without the storages the server retains,
     /// among them the segments this process created and keeps the creating
@@ -107,7 +107,7 @@ impl DeviceBudget {
         self.empty_cache.invoke(&[])?;
         let process = self
             .nvml
-            .process_memory(device)
+            .process_storage(device)
             .map_err(|error| match error {
                 cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
                     "NVML reports no device storage for this process on {device}"
@@ -118,7 +118,7 @@ impl DeviceBudget {
         Ok(process.saturating_sub(created) + self.unattributed.get(&device).copied().unwrap_or(0))
     }
 
-    /// Device memory this process holds on `device`, with the storages its
+    /// Device storage this process holds on `device`, with the storages its
     /// scope retains there.
     pub(crate) fn process_bytes(&self, device: DeviceId) -> Result<u64> {
         Ok(self.own_bytes(device)? + self.retained.scope_bytes(device)?.held)
@@ -129,16 +129,16 @@ impl DeviceBudget {
     pub(crate) fn budget(&self, device: DeviceId, fraction: f64) -> Result<Budget> {
         let own = self.own_bytes(device)?;
         let scope = self.retained.scope_bytes(device)?;
-        let memory = device.memory_info()?;
+        let storage = device.memory_info()?;
         // Stating the quota books nothing: the rank books its own items
         // once it is warm.
         let ledger = self.retained.book(
             device,
-            memory.total,
-            quota(memory.total, fraction),
+            storage.total,
+            quota(storage.total, fraction),
             Vec::new(),
         )?;
-        let quota = ledger.quota.unwrap_or(quota(memory.total, fraction));
+        let quota = ledger.quota.unwrap_or(quota(storage.total, fraction));
         // The measurement of the process stands for what it, or another
         // process of its scope and world it replaces, booked; the
         // reclaimable storages count as free.
@@ -153,13 +153,13 @@ impl DeviceBudget {
                     && (entry.worlds.contains(&world) || entry.worlds.is_empty())
             })
             .saturating_sub(scope.reclaimable);
-        let free = memory.free + scope.reclaimable;
+        let free = storage.free + scope.reclaimable;
         Ok(Budget {
             available: quota.saturating_sub(own + others).min(free),
             full: quota.saturating_sub(own + stays),
             free,
             process: own + scope.held,
-            total: memory.total,
+            total: storage.total,
             ledger,
         })
     }
@@ -193,11 +193,11 @@ impl DeviceBudget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceBooking {
     pub device: DeviceId,
-    /// The device's total memory.
+    /// The device's total storage.
     pub total: u64,
     /// The deployment's quota of the device.
     pub quota: u64,
-    /// The memory the rank's graph pools map ([`Item::GraphPool`]).
+    /// The storage the rank's graph pools map ([`Item::GraphPool`]).
     pub graph: u64,
     /// What the process holds beside its graph pools and the retained
     /// storages, with the product storage it has yet to make resident
@@ -211,7 +211,7 @@ pub(crate) struct DeviceBooking {
 
 impl DeviceBooking {
     /// Books the items in the GPU's ledger, the graph pool only while
-    /// `graphs` are resident: a sleeping rank's graph memory is released.
+    /// `graphs` are resident: a sleeping rank's graph storage is released.
     /// Returns the ledger after the booking.
     ///
     /// Fails when the booking takes the ledger past its quota: the rank's
@@ -233,13 +233,13 @@ impl DeviceBooking {
             profiling = self.profiling,
             booked = ledger.used(),
             quota = ledger.quota,
-            "booked the worker's device memory"
+            "booked the worker's device storage"
         );
         Ok(ledger)
     }
 }
 
-/// Total memory of a CUDA device, in bytes.
+/// Total storage of a CUDA device, in bytes.
 pub(crate) fn total_bytes(device: DeviceId) -> Result<u64> {
     Ok(device.memory_info()?.total)
 }

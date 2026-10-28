@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::capi::{self, AgentConfig, Api, Handle};
 use crate::error::check;
-use crate::memory::{Access, Region, Registration, Span};
+use crate::regions::{Access, Region, Registration, Span};
 use crate::{Error, Result};
 
 /// The UCX backend's plugin name.
@@ -17,7 +17,7 @@ const UCX: &CStr = c"UCX";
 /// `engine_config`, comma-separated UCX settings without their `UCX_`
 /// prefix), over UCX's defaults and environment:
 ///
-/// - `REG_NONBLOCK_MEM_TYPES=` pins host memory when it is registered. By
+/// - `REG_NONBLOCK_MEM_TYPES=` pins host storage when it is registered. By
 ///   default UCX registers it for on-demand paging, whose page faults on
 ///   the first READs hold a link between hosts to a few GB/s (79 GB/s
 ///   pinned, 4 GB/s on demand, between two GB200 hosts), and which defers
@@ -25,24 +25,24 @@ const UCX: &CStr = c"UCX";
 ///   never completes.
 /// - `RCACHE_ENABLE=n` keeps every registration out of UCX's registration
 ///   cache. The cache keeps a released registration, and learns that its
-///   memory was unmapped only through UCX's memory hooks, which a direct
+///   storage was unmapped only through UCX's storage hooks, which a direct
 ///   system call bypasses: a later registration at the same address would
-///   then get the stale one, and READs into it would land in memory the
+///   then get the stale one, and READs into it would land in storage the
 ///   process no longer maps. Each [`Registration`] registers once and
-///   deregisters before its memory is unmapped, so the cache saves nothing.
+///   deregisters before its storage is unmapped, so the cache saves nothing.
 const ENGINE_CONFIG: &CStr = c"RCACHE_ENABLE=n,REG_NONBLOCK_MEM_TYPES=";
 
 /// One process's NIXL agent with a UCX backend.
 ///
 /// The agent's metadata ([`Agent::metadata`]) carries its UCX worker
-/// address and the remote keys of the memory registered when it is taken;
-/// a peer that loaded it ([`Agent::load_peer`]) can READ that memory. The
+/// address and the remote keys of the storage registered when it is taken;
+/// a peer that loaded it ([`Agent::load_peer`]) can READ that storage. The
 /// metadata travels over the caller's own channel: the agent runs no
 /// listener.
 ///
 /// A progress thread drives the UCX worker, so connection setup and
 /// transfers advance while the process makes no NIXL call, as a source
-/// whose memory a peer reads does. Clones share the agent; every call on it
+/// whose storage a peer reads does. Clones share the agent; every call on it
 /// is serialized, since the agent is created without its own locking.
 #[derive(Clone)]
 pub struct Agent {
@@ -137,12 +137,12 @@ impl Agent {
     /// Creates `agent`'s UCX backend with the plugin's default parameters
     /// and [`ENGINE_CONFIG`].
     fn create_backend(api: &Api, agent: Handle) -> Result<Handle> {
-        let mut memories = ptr::null_mut();
+        let mut storages = ptr::null_mut();
         let mut parameters = ptr::null_mut();
         // SAFETY: a live agent; the call writes two lists this function
         // destroys below.
         check("reading the UCX plugin's parameters", unsafe {
-            (api.get_plugin_params)(agent, UCX.as_ptr(), &mut memories, &mut parameters)
+            (api.get_plugin_params)(agent, UCX.as_ptr(), &mut storages, &mut parameters)
         })?;
         // SAFETY: the parameters read above and two NUL-terminated strings,
         // which the call copies.
@@ -162,7 +162,7 @@ impl Agent {
         });
         // SAFETY: the lists the plugin-parameter call created, used no more.
         unsafe {
-            (api.destroy_mem_list)(memories);
+            (api.destroy_mem_list)(storages);
             (api.destroy_params)(parameters);
         }
         created.map(|()| backend)
@@ -187,7 +187,7 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Fails for an empty region or when UCX cannot register the memory.
+    /// Fails for an empty region or when UCX cannot register the storage.
     pub unsafe fn register(&self, region: Region, access: Access) -> Result<Registration> {
         if region.len == 0 {
             return Err(Error::Invalid(
@@ -199,7 +199,7 @@ impl Agent {
             .with_registration_list(region, metadata, |api, agent, list| {
                 // SAFETY: a live agent and a list describing `region`, which the
                 // caller keeps mapped while registered.
-                check("registering memory", unsafe {
+                check("registering storage", unsafe {
                     (api.register_mem)(agent, list, ptr::null_mut())
                 })
             })?;
@@ -211,7 +211,7 @@ impl Agent {
     }
 
     /// This agent's metadata, for peers to load: its UCX worker address and
-    /// the memory registered now. A region registered later is readable by
+    /// the storage registered now. A region registered later is readable by
     /// a peer once it loads metadata taken after the registration.
     ///
     /// # Errors
@@ -236,7 +236,7 @@ impl Agent {
 
     /// Loads a peer's [`Agent::metadata`] and returns the peer's name, which
     /// names it to [`Agent::read`]. Loading a later export of the same peer
-    /// adds the memory it registered since.
+    /// adds the storage it registered since.
     ///
     /// # Errors
     ///
@@ -287,9 +287,9 @@ impl Agent {
         Ok(())
     }
 
-    /// Posts one READ of every span's source, in memory `peer` registered,
-    /// into its destination, in memory this agent registered. All sources
-    /// lie in one kind of memory (host or device), and so do all
+    /// Posts one READ of every span's source, in storage `peer` registered,
+    /// into its destination, in storage this agent registered. All sources
+    /// lie in one kind of storage (host or device), and so do all
     /// destinations; NIXL keeps one kind per side of a transfer.
     ///
     /// The READ is one-sided: the peer's process takes no part beyond its
@@ -301,14 +301,14 @@ impl Agent {
     /// # Errors
     ///
     /// Fails for an empty span list, spans of unequal or zero length or of
-    /// mixed memory kinds, and spans NIXL does not find within memory this
+    /// mixed memory kinds, and spans NIXL does not find within storage this
     /// agent or `peer` registered under the span's key.
     pub fn read(&self, peer: &str, spans: &[Span]) -> Result<Transfer> {
         let Some(first) = spans.first() else {
             return Err(Error::Invalid("a READ has at least one span".to_owned()));
         };
-        let source_kind = first.source.memory;
-        let destination_kind = first.destination.memory;
+        let source_kind = first.source.segment;
+        let destination_kind = first.destination.segment;
         for span in spans {
             let (source, destination) = (span.source, span.destination);
             if source.len != destination.len || source.len == 0 {
@@ -317,9 +317,9 @@ impl Agent {
                     source.len, destination.len
                 )));
             }
-            if source.memory != source_kind || destination.memory != destination_kind {
+            if source.segment != source_kind || destination.segment != destination_kind {
                 return Err(Error::Invalid(
-                    "the spans of one READ read one kind of memory into one kind".to_owned(),
+                    "the spans of one READ read one kind of storage into one kind".to_owned(),
                 ));
             }
         }
@@ -400,12 +400,12 @@ impl Shared {
         let mut list = ptr::null_mut();
         // SAFETY: the call writes a new list this function destroys below.
         check("creating a registration list", unsafe {
-            (api.create_reg_dlist)(region.memory.kind(), &mut list)
+            (api.create_reg_dlist)(region.segment.kind(), &mut list)
         })?;
         // SAFETY: the list created above; a device address is a unified
         // address, which NIXL and UCX take as a pointer value and never
         // dereference on the host; the metadata is copied by the call.
-        let result = check("describing memory", unsafe {
+        let result = check("describing storage", unsafe {
             (api.reg_dlist_add_desc)(
                 list,
                 region.address as usize,
@@ -429,7 +429,7 @@ impl Shared {
     pub(crate) fn deregister(&self, region: Region) {
         let _ = self.with_registration_list(region, &[], |api, agent, list| {
             // SAFETY: a live agent and a list describing a registered region.
-            check("deregistering memory", unsafe {
+            check("deregistering storage", unsafe {
                 (api.deregister_mem)(agent, list, ptr::null_mut())
             })
         });
@@ -456,7 +456,7 @@ impl Drop for Shared {
     }
 }
 
-/// A descriptor list of one kind of memory for a READ, destroyed on drop.
+/// A descriptor list of one kind of storage for a READ, destroyed on drop.
 struct Descriptors {
     api: &'static Api,
     list: Handle,

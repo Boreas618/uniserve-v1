@@ -1,6 +1,6 @@
 """FlashInfer's NVLink all-to-all around each rank's grouped experts.
 
-Every rank maps one workspace of its peers' memory (MNNVL), sized for
+Every rank maps one workspace of its peers' storage (MNNVL), sized for
 ``max_tokens`` tokens per rank; FlashInfer caches it process-wide. A
 dispatch writes each token's payload (states, expert ids, route weights)
 into the slots of the ranks holding its experts; a combine sums the FP32
@@ -21,7 +21,7 @@ class AllToAll(ExpertTransport):
     """One microbatch's all-to-all workspace over the expert group.
 
     Construction is collective over ``group``: the workspace maps peer
-    memory, exchanging handles through ``bootstrap``. The first call of the
+    storage, exchanging handles through ``bootstrap``. The first call of the
     transport needs no host barrier.
     """
 
@@ -80,13 +80,13 @@ class AllToAll(ExpertTransport):
 
         FlashInfer releases every member's handles collectively; the
         workspace's addresses stay reserved, so the graphs captured over it
-        replay once :meth:`restore` maps new memory there.
+        replay once :meth:`restore` maps new storage there.
         """
         self._exchange.checkpoint_prepare()
         return True
 
     def restore(self) -> None:
-        """Map new MNNVL memory at the workspace's addresses, collectively.
+        """Map new MNNVL storage at the workspace's addresses, collectively.
 
         FlashInfer re-initializes the workspace's metadata and refuses a
         layout the captured graphs do not address.

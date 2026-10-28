@@ -10,7 +10,7 @@ const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
 const CU_MEMHOSTREGISTER_PORTABLE: u32 = 1;
 const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 8;
 
-/// Device memory owned by the worker.
+/// Device storage owned by the worker.
 ///
 /// Two kinds exist:
 ///
@@ -24,7 +24,7 @@ const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 8;
 /// Dropping never calls CUDA on the dropping thread: the release is queued to
 /// the [`crate::reclaim`]er, which makes this safe inside a DLPack deleter
 /// that runs under the Python GIL. The owner guarantees that no device work
-/// still addresses the memory when the last reference drops.
+/// still addresses the storage when the last reference drops.
 ///
 /// `Send + Sync` follow from the fields: the type holds only addresses,
 /// driver handles behind thread-safe owners, and no host-side views.
@@ -37,7 +37,7 @@ pub struct DeviceAllocation {
 
 enum Kind {
     Linear {
-        _memory: LinearMemory,
+        _storage: LinearMemory,
     },
     Exportable {
         handle: u64,
@@ -78,7 +78,7 @@ fn require_bytes(bytes: usize) -> Result<()> {
 }
 
 impl DeviceAllocation {
-    /// Allocates `bytes` of linear device memory (`cuMemAlloc`, 256-byte aligned).
+    /// Allocates `bytes` of linear device storage (`cuMemAlloc`, 256-byte aligned).
     pub fn linear(device: DeviceId, bytes: usize) -> Result<Self> {
         require_bytes(bytes)?;
         let context = PrimaryContext::retain(device)?;
@@ -98,21 +98,21 @@ impl DeviceAllocation {
             address,
             bytes,
             kind: Kind::Linear {
-                _memory: LinearMemory { context, address },
+                _storage: LinearMemory { context, address },
             },
         })
     }
 
-    /// Allocates exportable device memory of at least `bytes`, rounded up to
+    /// Allocates exportable device storage of at least `bytes`, rounded up to
     /// [`DeviceAllocation::granularity`], with read-write access for `device`
     /// and every device in `access` (other local GPUs that address it).
     pub fn exportable(device: DeviceId, bytes: usize, access: &[DeviceId]) -> Result<Self> {
         Self::create_exportable(device, bytes, access, false)
     }
 
-    /// Allocates exportable device memory, as [`DeviceAllocation::exportable`],
+    /// Allocates exportable device storage, as [`DeviceAllocation::exportable`],
     /// that also exports a POSIX descriptor ([`Self::export_descriptor`]),
-    /// which a Storage Server holds to retain the memory after this process
+    /// which a Storage Server holds to retain the storage after this process
     /// releases it.
     pub fn retainable(device: DeviceId, bytes: usize, access: &[DeviceId]) -> Result<Self> {
         Self::create_exportable(device, bytes, access, true)
@@ -190,7 +190,7 @@ impl DeviceAllocation {
         self.bytes == 0
     }
 
-    /// The handle type of an exportable allocation; `None` for linear memory.
+    /// The handle type of an exportable allocation; `None` for linear storage.
     pub fn handle_type(&self) -> Option<HandleType> {
         match &self.kind {
             Kind::Linear { .. } => None,
@@ -199,7 +199,7 @@ impl DeviceAllocation {
     }
 
     /// Exports the whole physical allocation for another process. `None` for
-    /// linear memory, which cannot be shared in place.
+    /// linear storage, which cannot be shared in place.
     pub fn export(&self) -> Result<Option<ShareableHandle>> {
         match &self.kind {
             Kind::Linear { .. } => Ok(None),
@@ -231,10 +231,12 @@ impl DeviceAllocation {
 
     /// Change the allocation's access in place, at an unchanged address. The
     /// caller has drained every access the new protection forbids. Fails
-    /// for linear memory, whose access is fixed.
+    /// for linear storage, whose access is fixed.
     pub fn protect(&self, protection: Protection) -> Result<()> {
         match &self.kind {
-            Kind::Linear { .. } => Err(Error::invalid("the access of linear memory cannot change")),
+            Kind::Linear { .. } => {
+                Err(Error::invalid("the access of linear storage cannot change"))
+            }
             Kind::Exportable { access, range, .. } => {
                 let context = PrimaryContext::retain(self.device)?;
                 let _guard = context.enter()?;
@@ -258,7 +260,7 @@ impl Drop for DeviceAllocation {
     }
 }
 
-/// Page-locked host memory (`cuMemHostAlloc`, portable to every context).
+/// Page-locked host storage (`cuMemHostAlloc`, portable to every context).
 ///
 /// The buffer is addressable by copies on any device. Its owner drains every
 /// copy that reads or writes it before reading it on the host, resizing or
@@ -269,7 +271,7 @@ pub struct PinnedBuffer {
     bytes: usize,
 }
 
-// SAFETY: the buffer is plain host memory owned by this value. Shared access
+// SAFETY: the buffer is plain host storage owned by this value. Shared access
 // exposes only its address and unsafe views whose callers exclude DMA races.
 unsafe impl Send for PinnedBuffer {}
 // SAFETY: as for Send above; safe methods of a shared reference only read the
@@ -277,7 +279,7 @@ unsafe impl Send for PinnedBuffer {}
 unsafe impl Sync for PinnedBuffer {}
 
 impl PinnedBuffer {
-    /// Allocates `bytes` of pinned host memory. `device`'s primary context
+    /// Allocates `bytes` of pinned host storage. `device`'s primary context
     /// performs the allocation and is retained until the buffer is freed.
     pub fn new(device: DeviceId, bytes: usize) -> Result<Self> {
         require_bytes(bytes)?;
@@ -355,12 +357,12 @@ impl Drop for PinnedBuffer {
     }
 }
 
-/// A page-locked registration of existing host memory (`cuMemHostRegister`,
-/// portable), for example a POSIX shared-memory mapping used as a DMA source
+/// A page-locked registration of existing host storage (`cuMemHostRegister`,
+/// portable), for example a POSIX shared-storage mapping used as a DMA source
 /// or destination.
 ///
 /// Unregistration is synchronous, on the dropping thread, because the owner
-/// unmaps the memory right after: a deferred unregister could run after the
+/// unmaps the storage right after: a deferred unregister could run after the
 /// mapping disappeared. Use [`HostRegistration::unregister`] to observe
 /// failures. The owner drains all device copies that use the range first.
 pub struct HostRegistration {
@@ -371,7 +373,7 @@ pub struct HostRegistration {
 }
 
 // SAFETY: the registration only stores the address to unregister; it grants
-// no host access to the memory.
+// no host access to the storage.
 unsafe impl Send for HostRegistration {}
 // SAFETY: as for Send above; shared references only read the address and
 // length, and unregistering needs exclusive access.
@@ -389,7 +391,7 @@ impl HostRegistration {
     }
 
     /// Registers `[pointer, pointer + bytes)` in `device`'s primary context
-    /// as memory devices only read, such as a read-only mapping of retained
+    /// as storage devices only read, such as a read-only mapping of retained
     /// host storage: with `CU_MEMHOSTREGISTER_READ_ONLY` where the device
     /// supports it (`ReadOnlyHostRegisterSupported`), as a plain
     /// registration where it does not (GB200 reports 0 and refuses the

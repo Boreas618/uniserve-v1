@@ -200,7 +200,7 @@ class LatentEncoder(_Codec):
     ) -> GraphMode:
         """Encode one prepared ``[3, height, width]`` image into ``out``.
 
-        ``pixels`` are page-locked host memory the worker prepared, or a
+        ``pixels`` are page-locked host storage the worker prepared, or a
         device tensor. A sampled posterior draws its noise at ``seed`` and
         ``draw``.
 
