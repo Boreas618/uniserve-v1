@@ -57,15 +57,12 @@ pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<Schedu
     })
 }
 
-/// The draft cache refill policy `scheduling` states, with the engine's
-/// defaults for what it leaves out.
+/// The draft cache refill policy `scheduling` states: the values it states
+/// in place of the ones the world measures.
 pub(crate) fn refill_policy(scheduling: &Scheduling) -> RefillPolicy {
-    let defaults = RefillPolicy::default();
     RefillPolicy {
-        expected_speedup: scheduling
-            .expected_speedup
-            .unwrap_or(defaults.expected_speedup),
-        token_cost: scheduling.refill_token_cost.unwrap_or(defaults.token_cost),
+        expected_speedup: scheduling.expected_speedup,
+        token_cost: scheduling.refill_token_cost,
     }
 }
 

@@ -220,6 +220,7 @@ impl Scheduler {
             waiting_media: VecDeque::new(),
             running: HashMap::new(),
             running_media: HashMap::new(),
+            speculation_meter: Default::default(),
             retiring_requests: HashMap::new(),
             transfer_capacity,
             latent_dtype,

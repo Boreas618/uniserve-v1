@@ -631,8 +631,10 @@ impl Scheduler {
         // admissions (`Inflight::register_pending_batch`), matching how
         // `command_index` counts. A failed `Finish` or `Free` keeps its
         // physical ownership and is queued again.
+        let mut measured = None;
         let worker_us = if batch_complete {
             let pending = owned.remove();
+            measured = pending.measured;
             for (index, command) in pending.commands.into_iter().enumerate() {
                 let failed = report.command_results.iter().any(|result| {
                     result.command_index == index as u32
@@ -659,6 +661,10 @@ impl Scheduler {
                 .timing
                 .last_worker_exec_us
                 .store(worker_us, Ordering::Relaxed);
+            // A worker that reports its execution time measures the step.
+            if let Some(step) = measured.filter(|_| worker_us > 0) {
+                self.speculation_meter.observe_step(step, worker_us);
+            }
         }
         if batch_complete {
             self.stats

@@ -12,4 +12,5 @@ mod media_preemption;
 mod migration;
 mod multiproc_ipc;
 mod readout;
+mod speculation;
 mod support;

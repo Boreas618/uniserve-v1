@@ -418,6 +418,9 @@ pub struct Scheduler {
     waiting_media: VecDeque<PendingMedia>,
     running: HashMap<RequestId, RequestState>,
     running_media: HashMap<RequestId, MediaFlowState>,
+    /// What the world measures of speculation, which the refill policy
+    /// weighs.
+    speculation_meter: speculation::SpeculationMeter,
     /// Finished requests whose storage stays allocated until their workers
     /// acknowledge the `Finish` command.
     retiring_requests: HashMap<RequestId, RetiringRequest>,

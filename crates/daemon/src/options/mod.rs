@@ -485,13 +485,13 @@ pub struct SpeculativeOptions {
     /// does not speculate. The draft cache and the drafter's work belong
     /// to the world, so a change of it is a world change.
     pub num_draft_tokens: u32,
-    /// The tokens a verification step of a request is expected to emit:
-    /// the speedup the refill policy expects over decoding one token a
-    /// step; at least one, 2.0 when unset.
+    /// The speedup speculation gives a request, the decode steps' time one
+    /// of its verification steps takes the place of, stated in place of
+    /// the one the world measures; at least one, measured when unset.
     pub expected_speedup: Option<f64>,
     /// The time of evaluating one context token in a refill, in steps of
-    /// decoding: the refill policy's cost of each token it evaluates; not
-    /// negative, 0.01 when unset.
+    /// decoding, stated in place of the one the world measures; not
+    /// negative, measured when unset.
     pub refill_token_cost: Option<f64>,
 }
 
