@@ -398,16 +398,12 @@ impl TokenLayout {
             unit_bytes,
             available_bytes: available,
             reserved_units,
+            // A successor's own units are what a configured capacity
+            // leaves past the inherited ones, as far as its grant holds them
+            // now, or what the grant holds.
+            successor: config.predecessor.is_some(),
+            inherited_units: inherited,
         })?;
-        // The units of a world's own: what a configured capacity leaves past
-        // the inherited units, or what the grant holds.
-        if tokens.is_some() && inherited > 0 {
-            let minimum = 1 + pages
-                .iter()
-                .map(|&(_, units)| u64::from(units))
-                .sum::<u64>();
-            capacity.num_units = capacity.num_units.saturating_sub(inherited).max(minimum);
-        }
         // Every member allocates the same logical unit ids, bounded by the
         // smallest grant.
         capacity.num_units = group.all_reduce_min(&[capacity.num_units as i64])?[0] as u64;

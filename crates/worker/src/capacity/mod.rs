@@ -39,11 +39,24 @@ pub(crate) struct CacheDemand<'a> {
     pub available_bytes: Option<u64>,
     /// Units' worth of the grant that other storage occupies.
     pub reserved_units: u64,
+    /// Whether the rank's world succeeds another on its devices: its pool
+    /// is laid out beside the predecessor's segments, and the part of a
+    /// configured capacity its grant does not hold yet is created as the
+    /// predecessor's storage frees (its deferred tail segments).
+    pub successor: bool,
+    /// The units of a configured token capacity that a successor world maps
+    /// from its predecessor's segments rather than allocates: the grant pays
+    /// for the rest alone, since the ledger books those once, for the
+    /// predecessor.
+    pub inherited_units: u64,
 }
 
 impl CacheCapacity {
     /// Explicit token capacity counts whole pages of every K/V group and a
-    /// state checkpoint per request slot.
+    /// state checkpoint per request slot. A successor world's own units are
+    /// those of the capacity past the ones it inherits, of which it creates
+    /// now what its grant holds beside the reserved ones; the grant of any
+    /// other world must hold the whole capacity.
     /// Automatic sizing gives the pool the complete units the grant holds
     /// beside the reserved ones; without a grant the pool takes
     /// [`DEFAULT_NUM_UNITS`]. Every mode leaves room for the sentinel unit
@@ -56,6 +69,8 @@ impl CacheCapacity {
             unit_bytes,
             available_bytes,
             reserved_units,
+            successor,
+            inherited_units,
         } = *demand;
         if pages.is_empty()
             || pages
@@ -87,22 +102,38 @@ impl CacheCapacity {
                     "configured KV token capacity must be positive".into(),
                 ));
             }
+            if successor {
+                // The units past those it inherits are its own; the grant
+                // pays for what it creates of them now, and the rest of its
+                // tail follows as the predecessor's storage frees.
+                let own = units.saturating_sub(inherited_units);
+                let num_units = match available_bytes {
+                    Some(available) => {
+                        own.min(granted(available, unit_bytes, reserved_units, minimum)?)
+                    }
+                    None => own,
+                };
+                return Ok(Self {
+                    num_units: minimum.max(num_units),
+                });
+            }
             minimum.max(units)
         } else if let Some(available) = available_bytes {
-            let units = (available / unit_bytes).saturating_sub(reserved_units);
-            if units < minimum {
-                return Err(Error::Resource(
-                    "device storage grant cannot hold the required KV pool",
-                ));
-            }
-            units
+            granted(available, unit_bytes, reserved_units, minimum)?
         } else {
             minimum.max(DEFAULT_NUM_UNITS)
         };
 
-        if available_bytes
-            .is_some_and(|available| (num_units + reserved_units) * unit_bytes > available)
+        if let Some(available) = available_bytes
+            && (num_units + reserved_units) * unit_bytes > available
         {
+            tracing::warn!(
+                units = num_units,
+                reserved_units,
+                unit_bytes,
+                available,
+                "the configured KV capacity exceeds the device storage grant"
+            );
             return Err(Error::Resource(
                 "configured KV storage exceeds the device storage grant",
             ));
@@ -110,6 +141,27 @@ impl CacheCapacity {
 
         Ok(Self { num_units })
     }
+}
+
+/// The units of `unit_bytes` a grant of `available` bytes holds beside
+/// `reserved_units`: fails, logging the figures, when they are fewer than
+/// `minimum`, the sentinel unit and one page of every group.
+fn granted(available: u64, unit_bytes: u64, reserved_units: u64, minimum: u64) -> Result<u64> {
+    let units = (available / unit_bytes).saturating_sub(reserved_units);
+    if units < minimum {
+        tracing::warn!(
+            units,
+            minimum,
+            reserved_units,
+            unit_bytes,
+            available,
+            "the device storage grant cannot hold the KV pool"
+        );
+        return Err(Error::Resource(
+            "device storage grant cannot hold the required KV pool",
+        ));
+    }
+    Ok(units)
 }
 
 /// Unresolved calls of a token worker, including a producer and its consumer
@@ -297,4 +349,68 @@ impl ArenaCapacity {
 /// dtype and field.
 fn relay_bytes(requests: usize, depth: usize) -> u64 {
     ((requests + 1) * depth) as u64 * Call::relay_row_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One unit of the Qwen3.5 cache of 65536 configured tokens: its token
+    /// capacity of 5964 units, and the graph reservation of a 184 GiB
+    /// device in its units.
+    const UNIT_BYTES: u64 = 4_194_336;
+    const TOKEN_UNITS: u64 = 5_964;
+    const RESERVED_UNITS: u64 = 4_719;
+    /// The units the predecessor keeps over the change, which a successor
+    /// maps.
+    const INHERITED: u64 = 2_944;
+
+    fn demand(available_units: u64, successor: bool, inherited_units: u64) -> CacheDemand<'static> {
+        CacheDemand {
+            pages: &[(64, 1), (64, 1)],
+            token_units: Some(TOKEN_UNITS),
+            units: None,
+            unit_bytes: UNIT_BYTES,
+            available_bytes: Some(available_units * UNIT_BYTES),
+            reserved_units: RESERVED_UNITS,
+            successor,
+            inherited_units,
+        }
+    }
+
+    /// A successor world of a configured token capacity maps the units it
+    /// inherits from its predecessor, which the ledger books for the
+    /// predecessor, and creates now what its grant holds of the rest beside
+    /// the reserved storage: all of it when the grant holds it, part of it
+    /// otherwise (the rest follows as the predecessor's storage frees). It
+    /// fails only when the grant holds less than one page of every group.
+    #[test]
+    fn a_successor_creates_what_its_grant_holds_of_the_units_it_does_not_inherit() {
+        let own = TOKEN_UNITS - INHERITED;
+        let whole = demand(own + RESERVED_UNITS, true, INHERITED);
+        assert_eq!(CacheCapacity::derive(&whole).unwrap().num_units, own);
+        let part = demand(1_000 + RESERVED_UNITS, true, INHERITED);
+        assert_eq!(CacheCapacity::derive(&part).unwrap().num_units, 1_000);
+        let none = demand(RESERVED_UNITS + 2, true, INHERITED);
+        assert!(matches!(
+            CacheCapacity::derive(&none),
+            Err(Error::Resource(_))
+        ));
+    }
+
+    /// A world that succeeds none must hold its whole configured capacity
+    /// beside the reserved storage.
+    #[test]
+    fn a_first_world_holds_its_whole_configured_capacity() {
+        let alone = demand(TOKEN_UNITS + RESERVED_UNITS, false, 0);
+        assert_eq!(
+            CacheCapacity::derive(&alone).unwrap().num_units,
+            TOKEN_UNITS
+        );
+        let short = demand(TOKEN_UNITS + RESERVED_UNITS - 1, false, 0);
+        assert!(matches!(
+            CacheCapacity::derive(&short),
+            Err(Error::Resource(_))
+        ));
+    }
 }
