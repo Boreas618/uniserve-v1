@@ -376,11 +376,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// A graph of what `issue` issues on `stream`, captured and instantiated.
-    pub(crate) fn captured(
+    /// Keep the captured source graph alive while `record` instantiates and
+    /// exercises it. The caller synchronizes its launches before returning.
+    pub(crate) fn with_captured_graph<T>(
         stream: &Stream,
         issue: impl FnOnce(&Stream) -> Result<()>,
-    ) -> Result<crate::GraphExec> {
+        record: impl FnOnce(usize) -> Result<T>,
+    ) -> Result<T> {
         type Capture = unsafe extern "C" fn(*mut c_void, i32) -> i32;
         type Captured = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
         type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -398,14 +400,14 @@ pub(crate) mod tests {
         let mut graph = std::ptr::null_mut();
         // SAFETY: the stream is live; `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`
         // confines the capture to this thread, and the driver writes the
-        // captured graph, which is destroyed once instantiated.
+        // captured graph, which remains live through `record`.
         unsafe {
             assert_eq!(begin(stream.handle(), 1), 0);
             issue(stream)?;
             assert_eq!(end(stream.handle(), &mut graph), 0);
-            let graph_exec = crate::GraphExec::instantiate(stream.device(), graph as usize);
+            let result = record(graph as usize);
             assert_eq!(destroy(graph), 0);
-            graph_exec
+            result
         }
     }
 }

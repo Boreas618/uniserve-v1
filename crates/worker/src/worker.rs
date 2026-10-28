@@ -187,9 +187,8 @@ impl Worker {
             }
             Device::Cpu => None,
         };
-        // CUPTI's one subscription, before the rank instantiates any CUDA
-        // graph: its graph instantiation guard lets a timeline trace every
-        // graph whole (`crate::profiling::counters`).
+        // Subscribe before loading modules and capturing graphs so the
+        // shared collectors observe their CUDA resource lifetimes.
         if context.is_some() {
             crate::profiling::counters::subscribe();
         }

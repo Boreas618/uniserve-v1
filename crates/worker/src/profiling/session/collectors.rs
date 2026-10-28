@@ -45,6 +45,7 @@ enum Prepared {
     Timeline {
         graphs: GraphTrace,
         running: Option<Timeline>,
+        graph_trace: crate::ffi::Function,
     },
     FenceTimeline {
         fences: Arc<Fences>,
@@ -242,7 +243,11 @@ impl Collectors {
         let mut failed = Vec::new();
         for (&collector, prepared) in &mut self.prepared {
             let started = match prepared {
-                Prepared::Timeline { graphs, running } => {
+                Prepared::Timeline {
+                    graphs,
+                    running,
+                    graph_trace,
+                } => {
                     let rows = self.rows.clone();
                     let sink: timeline::Sink = Arc::new(move |delivered: timeline::Delivered| {
                         rows.send(Message::Timeline {
@@ -254,9 +259,15 @@ impl Collectors {
                         GraphTrace::Whole => timeline::GraphTrace::Whole,
                         GraphTrace::Nodes => timeline::GraphTrace::Nodes,
                     };
-                    Timeline::start(graphs, sink).map(|started| {
+                    Timeline::start(graphs, sink).and_then(|started| {
+                        graph_trace
+                            .call_values(&[tvm_ffi::Any::from(
+                                graphs == timeline::GraphTrace::Whole,
+                            )])
+                            .map_err(|error| cuda::Error::InvalidArgument(error.to_string()))?;
                         *running = Some(started);
                         self.nvtx_before = Some(nvtx(true));
+                        Ok(())
                     })
                 }
                 Prepared::FenceTimeline { fences, components } => {
@@ -491,9 +502,18 @@ impl Collectors {
 /// Stop one collector and hand what it collected to the file.
 fn stop(prepared: &mut Prepared, rows: &Rows) -> std::result::Result<(), String> {
     match prepared {
-        Prepared::Timeline { running, .. } => {
+        Prepared::Timeline {
+            running,
+            graph_trace,
+            ..
+        } => {
             // Dropping the timeline delivers what remains to the file.
-            drop(running.take());
+            if let Some(timeline) = running.take() {
+                drop(timeline);
+                graph_trace
+                    .call_values(&[tvm_ffi::Any::from(false)])
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(())
         }
         Prepared::FenceTimeline { fences, .. } => {
@@ -577,6 +597,8 @@ fn prepare(
             Ok(Prepared::Timeline {
                 graphs: request.timeline.graphs,
                 running: None,
+                graph_trace: crate::ffi::Interpreter::import("uniserve.cuda_graph.set_graph_trace")
+                    .map_err(|error| error.to_string())?,
             })
         }
         Collector::FenceTimeline => {

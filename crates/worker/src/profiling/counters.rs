@@ -4,9 +4,8 @@
 //! ([`cuda::cupti::activity`], reported as `ForwardStats::stream_us`).
 //!
 //! A rank subscribes the process to CUPTI as it starts ([`subscribe`]),
-//! before it loads its model or instantiates any CUDA graph, so that the
-//! subscription's graph instantiation guard covers every graph the rank
-//! instantiates and a timeline session can trace them whole. The counters
+//! before loading modules and capturing graphs so that collectors observe
+//! their CUDA resource lifetimes. The counters
 //! start once the rank serves ([`Counters::start`]) and stay on: they share
 //! the subscription with the session collectors. A profiler that holds
 //! CUPTI's one subscription (Nsight Systems) leaves the rank without them.

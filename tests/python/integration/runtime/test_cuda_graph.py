@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
-from uniserve.cuda_graph import break_graph, capture, pool
+from uniserve.cuda_graph import break_graph, capture, pool, set_graph_trace
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -121,15 +121,20 @@ def test_replay_advances_registered_generators():
         torch.cuda.manual_seed(1234)
         generator.manual_seed(99)
         with torch.cuda.stream(stream):
-            actual = [graph.replay().clone() for _ in range(2)]
+            actual = [graph.replay().clone()]
+            set_graph_trace(True)
+            actual.append(graph.replay().clone())
+            set_graph_trace(False)
+            actual.append(graph.replay().clone())
             torch.cuda.manual_seed(1234)
             generator.manual_seed(99)
-            expected = [draw() for _ in range(2)]
+            expected = [draw() for _ in range(3)]
         stream.synchronize()
         assert not torch.equal(actual[0], actual[1])
         for value, wanted in zip(actual, expected, strict=True):
             torch.testing.assert_close(value, wanted, rtol=0, atol=0)
     finally:
+        set_graph_trace(False)
         graph.release()
 
 
