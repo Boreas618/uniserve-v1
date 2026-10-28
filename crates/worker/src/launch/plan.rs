@@ -25,15 +25,15 @@ fn run(argv: &[String], python: &Path) -> crate::Result<()> {
     let (mut channel, descriptor) = register(&arguments)?;
     let transport = |error| crate::Error::transport_source("planning rank transport", error);
     let _watch = EngineWatch::start(channel.hangup().map_err(transport)?)?;
-    let source_world = loop {
-        if let Some(world) = channel.try_recv::<u64>().map_err(transport)? {
-            break world;
+    let source_worlds = loop {
+        if let Some(worlds) = channel.try_recv::<Vec<u64>>().map_err(transport)? {
+            break worlds;
         }
         channel.wait(Duration::MAX).map_err(transport)?;
     };
     let launch = resolve(descriptor, &arguments.worker_id, arguments.generation)
         .map_err(|error| crate::Error::Invalid(error.to_string()))?;
-    let planned = plan(&launch, python, source_world).map_err(|error| error.to_string());
+    let planned = plan(&launch, python, &source_worlds).map_err(|error| error.to_string());
     let succeeded = planned.is_ok();
     channel.send(&planned).map_err(transport)?;
     // A manifest can exceed the socket's send buffer. Complete the queued
@@ -49,7 +49,7 @@ fn run(argv: &[String], python: &Path) -> crate::Result<()> {
 fn plan(
     launch: &crate::config::WorkerLaunch,
     python: &Path,
-    source_world: u64,
+    source_worlds: &[u64],
 ) -> crate::Result<storage::manifest::weights::PlannedRank> {
     let (started, ready) = crossbeam_channel::bounded(1);
     let (finish, finished) = crossbeam_channel::bounded::<()>(1);
@@ -71,7 +71,7 @@ fn plan(
     ready
         .recv()
         .map_err(|_| crate::Error::State("the builder thread ended before it started"))??;
-    let planned = crate::worker::plan_rank(launch, source_world);
+    let planned = crate::worker::plan_rank(launch, source_worlds);
     let _ = finish.send(());
     planned
 }

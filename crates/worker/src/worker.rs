@@ -1540,7 +1540,7 @@ fn prepare_model(
 /// manifests visible until the complete response reaches the daemon.
 pub(crate) fn plan_rank(
     launch: &WorkerLaunch,
-    source_world: u64,
+    source_worlds: &[u64],
 ) -> Result<storage::manifest::weights::PlannedRank> {
     let device = launch.device();
     let Device::Cuda(cuda) = device else {
@@ -1683,7 +1683,7 @@ pub(crate) fn plan_rank(
     let transfer = ledger
         .transfer_context
         .saturating_sub(ledger.bytes(|entry| entry.item == storage::Item::TransferContext));
-    let mut sources = keys.sources(&retained, &launch.storage.peers, Some(source_world))?;
+    let mut sources = keys.sources(&retained, &launch.storage.peers, Some(source_worlds))?;
     if let Some(sources) = sources.as_mut() {
         keys.measure_sources(&retained, sources)?;
     }
@@ -1759,7 +1759,10 @@ fn receive_weights(
     let sources = keys.sources(
         retained,
         &launch.storage.peers,
-        launch.received.as_ref().map(|received| received.world),
+        launch
+            .received
+            .as_ref()
+            .map(|received| received.worlds.as_slice()),
     )?;
     let transfer = launch
         .received

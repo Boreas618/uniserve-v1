@@ -97,7 +97,7 @@ impl WeightKeys {
         &self,
         retained: &Retained,
         peers: &[String],
-        world: Option<u64>,
+        worlds: Option<&[u64]>,
     ) -> Result<Option<Sources>> {
         if self.devices.len() != 1 {
             return Ok(None);
@@ -106,7 +106,7 @@ impl WeightKeys {
         let fingerprints = self.fingerprint_digests();
         let listing = retained.call("listing the storage server", |client| client.list())?;
         let mut sources =
-            manifest::weights::sources(&listing, deployment, world, &fingerprints, |key| {
+            manifest::weights::sources(&listing, deployment, worlds, &fingerprints, |key| {
                 let bytes = retained.call("reading a weight manifest", |client| {
                     client.read(deployment.clone(), key)
                 })?;
@@ -137,7 +137,7 @@ impl WeightKeys {
                     .map_err(|error| Error::Interface(error.to_string()))
             };
             if let Some(remote) =
-                manifest::weights::sources(&listing, deployment, world, &fingerprints, read)?
+                manifest::weights::sources(&listing, deployment, worlds, &fingerprints, read)?
             {
                 sources.remote.extend(
                     remote
