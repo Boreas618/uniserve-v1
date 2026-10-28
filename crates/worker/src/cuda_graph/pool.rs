@@ -7,33 +7,33 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use tvm_ffi::Any;
 
-use super::memory::{GraphMemory, library_path};
+use super::storage::{PoolSlot, library_path};
 use crate::ffi::{Function, Handle};
 use crate::{Error, Result};
 
-/// The addresses each pool reserves: more than any device's memory, so a
+/// The addresses each pool reserves: more than any device's storage, so a
 /// pool is bounded by its budget and the device, never by its reservation.
 const POOL_ADDRESSES: usize = 1 << 38;
 
-/// One allocator pool on a device: the device memory Rust owns
-/// ([`GraphMemory`]), the numerical library's pool that allocates from it
+/// One allocator pool on a device: the device storage Rust owns
+/// ([`PoolSlot`]), the numerical library's pool that allocates from it
 /// (`uniserve.cuda_graph.pool`) and its allocator id.
 pub(crate) struct GraphPool {
     pub(crate) device: DeviceId,
     pub(crate) id: (u64, u64),
     pub(crate) value: Handle,
-    pub(crate) memory: GraphMemory,
+    pub(crate) storage: PoolSlot,
 }
 
 impl GraphPool {
-    /// A new pool on `device`: its device memory, and the library's pool
+    /// A new pool on `device`: its device storage, and the library's pool
     /// allocating from it through `create` (`uniserve.cuda_graph.pool`).
-    /// Returns the pool and the device's total memory.
+    /// Returns the pool and the device's total storage.
     pub(crate) fn create(create: &Function, device: DeviceId) -> Result<(Self, i64)> {
-        let memory = GraphMemory::reserve(device, POOL_ADDRESSES)?;
+        let storage = PoolSlot::reserve(device, POOL_ADDRESSES)?;
         let value: tvm_ffi::Array<Any> = create.call_as(&[
             (&Any::from(i64::from(device.0))).into(),
-            (&Any::from(memory.slot() as i64)).into(),
+            (&Any::from(storage.slot() as i64)).into(),
             (&Any::from(tvm_ffi::String::from(library_path()?.as_str()))).into(),
         ])?;
         let item = |index: usize| {
@@ -54,7 +54,7 @@ impl GraphPool {
             device,
             id: (number(1)? as u64, number(2)? as u64),
             value: Handle::new(item(0)?)?,
-            memory,
+            storage,
         };
         Ok((pool, number(3)?))
     }
@@ -66,15 +66,15 @@ impl GraphPool {
         Ok(Self::create(&create, device)?.0)
     }
 
-    /// Copies the pool's memory to the host and releases it on the device,
-    /// keeping its addresses; see [`GraphMemory::suspend`].
+    /// Copies the pool's storage to the host and releases it on the device,
+    /// keeping its addresses; see [`PoolSlot::suspend`].
     pub(crate) fn suspend(&self) -> Result<()> {
-        self.memory.suspend()
+        self.storage.suspend()
     }
 
-    /// Maps the pool's memory back with its contents.
+    /// Maps the pool's storage back with its contents.
     pub(crate) fn restore(&self) -> Result<()> {
-        self.memory.restore()
+        self.storage.restore()
     }
 }
 

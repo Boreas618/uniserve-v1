@@ -95,7 +95,7 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
             .context("failed to start this node's daemon")?,
         () = shutdown.cancelled() => return Ok(()),
     };
-    // Set by `POST /admin/shutdown`: the deployment's memory is released
+    // Set by `POST /admin/shutdown`: the deployment's storage is released
     // once its processes are down.
     let retire = Arc::new(AtomicBool::new(false));
     let address = daemon.address().map(str::to_owned);
@@ -210,9 +210,9 @@ pub(crate) async fn serve_leader(
 }
 
 /// Ends a leader's serving: shuts its engine down, stops the daemon and,
-/// when `retire` was set, releases the deployment's memory; or, when the
+/// when `retire` was set, releases the deployment's storage; or, when the
 /// deployment was handed to a hot restart's successor, lets go of the
-/// engine and leaves the service and the memory to the successor.
+/// engine and leaves the service and the storage to the successor.
 /// `served` is how serving ended.
 ///
 /// # Errors
@@ -268,7 +268,7 @@ fn retire_deployment(deployment: &str) -> Result<()> {
     let released = operator
         .retire(deployment.to_owned())
         .with_context(|| format!("retiring deployment {deployment}"))?;
-    info!(deployment, released, "released the deployment's memory");
+    info!(deployment, released, "released the deployment's storage");
     Ok(())
 }
 

@@ -22,7 +22,7 @@ use tvm_ffi::Any;
 
 use crate::config::WorkerLaunch;
 use crate::ffi::{Handle, Interpreter, integer_list, list, strings, texts};
-use crate::memory::weights::Fingerprints;
+use crate::storage::weights::Fingerprints;
 
 /// The library module that reads and loads a rank's model.
 const LOADING: &str = "uniserve.loading.rank";

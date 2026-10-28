@@ -29,25 +29,25 @@
 //! ([`LatentLedger::offload`]), and a resumed request's latent preparation
 //! copies the stored values into the bank it initializes, laid out in the
 //! rank's own pages by the copy manifest from the stored ranks' pages
-//! (`crate::memory::latent::restore`), and commits the trajectory at the
+//! (`crate::storage::latent::restore`), and commits the trajectory at the
 //! stored step ([`LatentLedger::bind_restore`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ::storage::manifest::StorageLayout;
 use cuda::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
 use ipc::{
     BufferId, Call, CallKind, ImageParams, LatentOffload, LatentParams, LatentRestore, MediaCall,
     RequestKey,
 };
-use storage::manifest::StorageLayout;
 
 use crate::Error;
 use crate::executor::batch::StreamOrder;
 use crate::job::Job;
-use crate::memory::allocation::StorageView;
-use crate::memory::latent::restore;
-use crate::memory::{LatentHostPool, TrajectoryVersion};
+use crate::storage::allocation::StorageView;
+use crate::storage::latent::restore;
+use crate::storage::{LatentHostPool, TrajectoryVersion};
 use crate::stream::Issue;
 use crate::{LatentPool, LatentStorage, LatentUpdate, Result};
 
@@ -258,7 +258,7 @@ impl LatentLedger {
     /// writes in `slot`, its commit at the stored step of `restore`, and the
     /// copies that lay the stored values `rank` reads out in `layout`, the
     /// rank's own slot pages of the request as its executor declares them
-    /// (`storage::manifest::StorageLayout`): the copy manifest from the
+    /// (`::storage::manifest::StorageLayout`): the copy manifest from the
     /// stored ranks' pages to the rank's ([`restore::copies`]), which copies
     /// a page laid out as a stored one was whole.
     ///
@@ -697,7 +697,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::DType;
-    use crate::memory::{LatentPlan, LocalMemory};
+    use crate::storage::{LatentPlan, LocalStorage};
 
     /// The ledger of a rank whose two request slots own two pages of four
     /// units each.
@@ -709,7 +709,8 @@ mod tests {
             latent_width: 1,
             dtype: DType::F32,
         };
-        let storage = LatentStorage::allocate(&plan, None, None, "latent_banks", &mut LocalMemory)?;
+        let storage =
+            LatentStorage::allocate(&plan, None, None, "latent_banks", &mut LocalStorage)?;
         Ok(LatentLedger::new(LatentPool::new(2, 5, 4)?, storage, 4, 2))
     }
 
@@ -818,7 +819,8 @@ mod tests {
             latent_width: 3,
             dtype: DType::F32,
         };
-        let storage = LatentStorage::allocate(&plan, None, None, "latent_banks", &mut LocalMemory)?;
+        let storage =
+            LatentStorage::allocate(&plan, None, None, "latent_banks", &mut LocalStorage)?;
         Ok(LatentLedger::scheduled(LatentPool::new(2, 6, 2)?, storage))
     }
 

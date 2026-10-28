@@ -1,11 +1,11 @@
 //! Host allocations holding a successor's cache pages before device admission.
 
-use storage::Key;
-use storage::manifest::cache::Page;
-use storage::manifest::{Binding, Chunk, Rank};
-use storage::protocol::Placement;
+use ::storage::Key;
+use ::storage::manifest::cache::Page;
+use ::storage::manifest::{Binding, Chunk, Rank};
+use ::storage::protocol::Placement;
 
-use crate::memory::retained::{ExclusiveSpec, Retained};
+use crate::storage::retained::{ExclusiveSpec, Retained};
 use crate::{Error, Result};
 
 struct Held {
@@ -79,7 +79,7 @@ impl Staging {
         Ok(Some((rank, key)))
     }
 
-    pub(crate) fn source(&self, gpu: storage::manifest::Gpu) -> Rank {
+    pub(crate) fn source(&self, gpu: ::storage::manifest::Gpu) -> Rank {
         Rank {
             gpu: Some(gpu),
             storages: self

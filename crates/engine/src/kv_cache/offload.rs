@@ -1,7 +1,7 @@
 //! The host KV cache (L2) of the prefix cache, and the KV storage (L3)
 //! behind it, as the scheduler drives them.
 //!
-//! Every host's Storage Server keeps page pools of host memory; each rank
+//! Every host's Storage Server keeps page pools of host storage; each rank
 //! of a worker group maps one for each of its cache groups and reports them
 //! (`PrefixCacheInfo::page_pools`). The server's Mooncake connector, when it
 //! runs one, keeps every committed page in the KV storage and reads pages
@@ -45,7 +45,7 @@
 //!   once their copies commit (`specs/online-operations.md` §6.5, steps 1
 //!   and 5; [`OffloadKind::Evicted`]). A pool answers `Full` for a page it
 //!   has no slot for: every slot is reserved, pinned or uploading, as when
-//!   the host's memory held a pool smaller than the pages the device
+//!   the host's storage held a pool smaller than the pages the device
 //!   evicts. Without a KV storage, such a page is evicted uncopied, and a
 //!   later prompt computes it again. With one, every page a pool commits
 //!   reaches the KV storage, and the pool frees slots as the connector's
@@ -53,7 +53,7 @@
 //!   until its copy commits: the evicted pages pass through the pool into
 //!   the KV storage, from which a later admission prefetches them. A page
 //!   gives up only when its pool grants the eviction no slot for
-//!   [`EVICTION_STALL`]. A host whose memory holds no pool of the world's
+//!   [`EVICTION_STALL`]. A host whose storage holds no pool of the world's
 //!   still gives a server with a KV storage small staging pools
 //!   (`storage_server::STAGING_POOL_BYTES` on each rank), through which
 //!   the pages pass the same way.
@@ -120,7 +120,7 @@ pub struct HostCacheSize {
     /// The token count over the device KV cache's.
     pub ratio: f64,
     /// The bytes of the deployment's host KV cache on each host, in place
-    /// of the budget from the host's available memory.
+    /// of the budget from the host's available storage.
     pub host_bytes: Option<u64>,
 }
 
@@ -1849,7 +1849,7 @@ mod tests {
         }
 
         /// A server that leaves `host_reserve` bytes of the host's
-        /// available memory to other processes.
+        /// available storage to other processes.
         fn reserving(host_reserve: u64) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("storage.sock");
@@ -2377,7 +2377,7 @@ mod tests {
         assert!(uploaded.is_empty());
     }
 
-    /// A host that admits no page pool, its whole memory reserved, still
+    /// A host that admits no page pool, its whole storage reserved, still
     /// stages pages through a small pool when a KV storage keeps what the
     /// pools commit: an eviction passes every page through it into the KV
     /// storage.

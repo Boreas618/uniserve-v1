@@ -54,7 +54,7 @@ where
 /// The schedulers of one engine serve ranks of one expert union, and a rank
 /// joins the union's steps of other schedulers outside its own. A hook that
 /// changes how a rank runs the union's steps (its captured joins, the
-/// memory they replay from) must find no step of any scheduler in flight,
+/// storage they replay from) must find no step of any scheduler in flight,
 /// and every rank must have run it before any scheduler steps again. Each
 /// scheduler meets the others twice: once its batches in flight completed,
 /// and once it ran the hook.
@@ -579,7 +579,7 @@ pub enum Command {
     /// Promotes a successor scheduler (`Scheduler::promote`): imports its
     /// predecessor's prefix cache index, once its cache holds the requests
     /// the predecessor hands over (which `recompute` from their tokens or
-    /// not, while it `grows` into the predecessor's memory at once or not),
+    /// not, while it `grows` into the predecessor's storage at once or not),
     /// and answers with the outcome.
     Promote {
         cache: crate::scheduler::ParkedCache,
@@ -598,7 +598,7 @@ pub enum Command {
         worlds: Vec<u64>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// Reads the memory ledgers of the nodes of the scheduler's workers
+    /// Reads the storage ledgers of the nodes of the scheduler's workers
     /// (`Executor::ledgers`), and answers with each node's.
     Ledgers(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Halves, or restores when not `halve`, the byte budgets of the links
@@ -609,7 +609,7 @@ pub enum Command {
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Keeps the weights alone of other worlds on the nodes of the
-    /// scheduler's workers, in host memory when `to_host`
+    /// scheduler's workers, in host storage when `to_host`
     /// (`Executor::keep_weights`), and answers with each node's report.
     KeepWeights {
         worlds: Vec<u64>,
@@ -647,7 +647,7 @@ pub enum Command {
         limits: Box<crate::scheduler::SchedulerConfig>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// Gives back or restores KV cache memory (`Scheduler::resize_cache`),
+    /// Gives back or restores KV cache storage (`Scheduler::resize_cache`),
     /// and answers with what each worker reported.
     ResizeCache {
         change: CacheChange,
@@ -711,7 +711,7 @@ pub struct Successor {
     pub rank_budgets: RankBudgets,
 }
 
-/// A change to the device memory of a scheduler's KV cache.
+/// A change to the device storage of a scheduler's KV cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheChange {
     /// Gives back the tail of the cache until each device has the storage a
@@ -724,17 +724,17 @@ pub enum CacheChange {
     },
     /// Creates the given-back tail again.
     Restore,
-    /// Gives back the whole cache and the CUDA graph memory, keeping the
+    /// Gives back the whole cache and the CUDA graph storage, keeping the
     /// weights, once no request runs; the scheduler admits nothing until
     /// it wakes.
     Sleep,
     /// Restores what a sleep gave back.
     Wake,
-    /// Creates as many of the given-back segments as each device's memory
+    /// Creates as many of the given-back segments as each device's storage
     /// ledger has room for.
     Grow,
     /// Plans a shrink without withdrawing anything: answers with each
-    /// device's memory beside a world succeeding this one, or fails with
+    /// device's storage beside a world succeeding this one, or fails with
     /// why such a world does not fit.
     Plan(Successor),
     /// For a parked world whose successor maps none of its cache: gives
@@ -935,7 +935,7 @@ impl CommandSender {
     }
 
     /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
-    /// workers, in host memory when `to_host` (`Command::KeepWeights`); the
+    /// workers, in host storage when `to_host` (`Command::KeepWeights`); the
     /// receiver gets each node's report.
     pub fn keep_weights(
         &self,
@@ -953,7 +953,7 @@ impl CommandSender {
         kept
     }
 
-    /// Reads the memory ledgers of the nodes of the scheduler's workers
+    /// Reads the storage ledgers of the nodes of the scheduler's workers
     /// (`Command::Ledgers`); the receiver gets each node's.
     pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, read) = crossbeam_channel::bounded(1);
@@ -1062,7 +1062,7 @@ impl CommandSender {
         receiver
     }
 
-    /// Gives back or restores KV cache memory (`Command::ResizeCache`); the
+    /// Gives back or restores KV cache storage (`Command::ResizeCache`); the
     /// receiver gets what each worker reported, or why the change failed.
     pub fn resize_cache(
         &self,

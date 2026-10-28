@@ -60,11 +60,11 @@ use crate::executor::products::ProductOwners;
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::MemoryKind;
 use crate::job::{Completion, Job};
-use crate::memory::allocation::StorageView;
-use crate::memory::{
+use crate::request::RequestPool;
+use crate::storage::allocation::StorageView;
+use crate::storage::{
     OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead, ProductStore,
 };
-use crate::request::RequestPool;
 use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result, lock};
@@ -400,7 +400,7 @@ impl<F> Batch<F> {
             // lease, read only after its seal's fences.
             unsafe { issue.copy(&copies) }
         } else {
-            // SAFETY: as above, in host memory, in the batch's order.
+            // SAFETY: as above, in host storage, in the batch's order.
             unsafe { issue.host().copy(&copies) }
         }
     }
@@ -887,7 +887,7 @@ mod tests {
     use ipc::{RequestId, SamplingParams};
 
     use super::*;
-    use crate::memory::BufferPool;
+    use crate::storage::BufferPool;
 
     /// Blocks `stream` in a host function until the returned sender is
     /// used, so the work queued behind it on any stream that waits for it
@@ -1055,7 +1055,7 @@ mod tests {
             vec![HOST],
             values.len() + 1,
             1,
-            BufferPool::allocate(1024, &[HOST], &mut crate::memory::LocalMemory)?,
+            BufferPool::allocate(1024, &[HOST], &mut crate::storage::LocalStorage)?,
             EventPool::new(),
         )?;
         let mut calls = Vec::new();

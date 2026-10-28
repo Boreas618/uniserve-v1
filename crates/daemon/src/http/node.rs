@@ -6,7 +6,7 @@
 //! world and its routes, which the node then serves on the same address,
 //! admin routes included, so that every later `PUT /admin/config` is the
 //! deployment's. The deployment's `POST /admin/shutdown` brings it down
-//! and, by default, releases its memory at the host's Storage Server; the
+//! and, by default, releases its storage at the host's Storage Server; the
 //! node then serves no deployment again and takes the next one. A node
 //! serves one single-node deployment at a time.
 
@@ -68,7 +68,7 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Serves the admin API on `server`'s address, and the deployments its first
 /// `PUT /admin/config` brings up, until `shutdown` is cancelled; the deployment
-/// serving then is brought down and its memory released.
+/// serving then is brought down and its storage released.
 ///
 /// # Errors
 ///

@@ -355,7 +355,7 @@ impl Drop for VirtualRange {
 
 /// Another allocation (or several) mapped into this process on one device.
 ///
-/// The mapping holds its own references to the physical memory, so it stays
+/// The mapping holds its own references to the physical storage, so it stays
 /// valid after the exporter or the aliased allocations release theirs.
 /// Dropping it queues unmap, address free and release to the reclaimer; the
 /// owner guarantees that no device work still reads or writes the mapping.
@@ -438,7 +438,7 @@ impl PeerMapping {
     /// `access`. `bytes` is the allocation's size, a multiple of the
     /// granularity.
     ///
-    /// The mapping holds its own reference to the physical memory, which
+    /// The mapping holds its own reference to the physical storage, which
     /// lives while any process maps it or the server holds its descriptor.
     /// An imported allocation exports no handle of its own: other processes
     /// on the host map the same descriptor, and a fabric handle of the
@@ -625,7 +625,7 @@ impl PeerMapping {
 
 /// A reserved virtual range whose segments are physical allocations of
 /// their own, each mapped, released and mapped again at its own place:
-/// memory whose parts are given back while every address stays valid, as a
+/// storage whose parts are given back while every address stays valid, as a
 /// KV cache that shrinks for a standby engine and grows back after.
 ///
 /// Each segment a mapping creates exports a POSIX descriptor, which a
@@ -677,7 +677,7 @@ static CREATED: Mutex<BTreeMap<i32, u64>> = Mutex::new(BTreeMap::new());
 
 /// The bytes of segments this process created on `device` and keeps the
 /// creating handles of ([`SegmentedMapping::create`]), which NVML counts
-/// among the process's device memory although a Storage Server retains
+/// among the process's device storage although a Storage Server retains
 /// them: what this process holds of its own is NVML's figure less these.
 pub fn created_bytes(device: DeviceId) -> u64 {
     lock(&CREATED).get(&device.0).copied().unwrap_or(0)
@@ -778,14 +778,14 @@ impl SegmentedMapping {
             .is_some_and(|(_, _, handle, _)| handle.is_some())
     }
 
-    /// Creates the physical memory of segment `index`, maps it with the
+    /// Creates the physical storage of segment `index`, maps it with the
     /// mapping's protection, and returns its POSIX descriptor for a Storage
     /// Server to retain. The segment is mapped from the descriptor, as
     /// another process maps it. The creating handle stays with the mapping
     /// until the segment is released ([`Self::release`]): where the device
-    /// creates fabric-exportable memory of the segment's length, the
+    /// creates fabric-exportable storage of the segment's length, the
     /// segment exports a fabric handle ([`Self::fabric_handle`]), which
-    /// imports only while its creator holds it. NVML attributes the memory
+    /// imports only while its creator holds it. NVML attributes the storage
     /// to this process meanwhile, and [`created_bytes`] counts it.
     ///
     /// # Errors
@@ -795,7 +795,7 @@ impl SegmentedMapping {
         let (_, bytes) = self.unmapped(index)?;
         let context = PrimaryContext::retain(self.device)?;
         let _guard = context.enter()?;
-        // Fabric-exportable too where the device makes such memory and the
+        // Fabric-exportable too where the device makes such storage and the
         // segment is a multiple of its granularity.
         let fabric = HandleType::probe(self.device)? == HandleType::Fabric
             && bytes.is_multiple_of(HandleType::Fabric.granularity(self.device)?);
@@ -978,8 +978,8 @@ impl SegmentedMapping {
     }
 
     /// Unmaps segment `index` and releases this process's reference to its
-    /// memory, at once: the caller has drained every device access to it.
-    /// The memory is freed once no other process maps it and no Storage
+    /// storage, at once: the caller has drained every device access to it.
+    /// The storage is freed once no other process maps it and no Storage
     /// Server holds its descriptor. A segment that is not mapped is left
     /// as it is.
     ///

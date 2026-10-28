@@ -1077,7 +1077,7 @@ pub struct LeaderStatus {
     pub reason: Option<String>,
     /// Whether new requests wait (`/admin/pause_generation`).
     pub paused: bool,
-    /// Whether the engine gave back its KV cache and graph memory
+    /// Whether the engine gave back its KV cache and graph storage
     /// (`/admin/sleep`).
     pub asleep: bool,
     /// Whether an engine is being replaced: by an update or a relaunch.
@@ -1239,7 +1239,7 @@ pub(crate) struct Replica {
     /// Held while an engine is replaced, by a world change, a commit, a
     /// rollback or a relaunch, so that replacements do not overlap.
     pub(crate) replacing: Arc<tokio::sync::Mutex<()>>,
-    /// The engine gave back its KV cache and graph memory (`Leader::sleep`).
+    /// The engine gave back its KV cache and graph storage (`Leader::sleep`).
     pub(crate) asleep: AtomicBool,
     /// The sleep paused new requests, which the wake lets through.
     sleep_paused: AtomicBool,
@@ -1487,7 +1487,7 @@ impl Replica {
         info!("generation continues");
     }
 
-    /// Has the serving engine give back its KV cache and CUDA graph memory
+    /// Has the serving engine give back its KV cache and CUDA graph storage
     /// and keep its weights, as vLLM's `sleep` does: new requests wait, the
     /// token requests in flight, image-generating ones included, are
     /// recomputed once it wakes, the video requests in flight continue from
@@ -1516,7 +1516,7 @@ impl Replica {
                     "the engine did not sleep, and requests wait until /admin/wake_up: {error}"
                 ))
             })?;
-        info!("the engine sleeps: its KV cache and graph memory are given back");
+        info!("the engine sleeps: its KV cache and graph storage are given back");
         Ok(results)
     }
 

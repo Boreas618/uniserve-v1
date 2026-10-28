@@ -1,12 +1,12 @@
-//! The Storage Server: memory whose contents outlive the head and the
+//! The Storage Server: storage whose contents outlive the head and the
 //! workers.
 //!
 //! The server holds descriptors of physical allocations (CUDA VMM
 //! allocations through their POSIX file descriptor handles, and host
 //! memfds), the tensors clients publish over them, and which client may
-//! write each exclusive tensor. It never maps, reads or writes the memory and
+//! write each exclusive tensor. It never maps, reads or writes the storage and
 //! never creates a CUDA context: device copies run on the workers' streams.
-//! The physical memory of a storage lives while the server holds its
+//! The physical storage of a storage lives while the server holds its
 //! descriptor or any process maps it.
 //!
 //! The server also keeps the host's page pools ([`pages`]): the slots of
@@ -14,7 +14,7 @@
 //! ([`mooncake`], run as a child process [`kv_storage`] supervises) keeps
 //! committed pages in the KV storage and reads them back for
 //! prefetches. Its Transfer Server ([`transfer`], another child process,
-//! which [`transfers`] supervises) copies bytes between the memory the
+//! which [`transfers`] supervises) copies bytes between the storage the
 //! server holds, for the tasks heads and workers submit; that process, not
 //! the server, holds the CUDA contexts the copies need.
 //!
@@ -51,19 +51,19 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::mooncake::BATCH_PAGES;
+use ::storage::protocol::{
+    Access, Allocation, Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage,
+    Item, Key, ListedDeployment, ListedTensor, Listing, MIN_VERSION, Mode, PageLevel, Placement,
+    Reply, Request, Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord,
+    VERSION, Welcome,
+};
+use ::storage::transport::Connection;
 pub use child::Launch;
 use kv_storage::{KvStorage, Task};
 pub use pages::{DEFAULT_POOL_BYTES, STAGING_POOL_BYTES};
 pub use restart::{Pending as RestartPending, TAKEOVER_DESCRIPTOR, relaunch_arguments};
 pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
 use shoot::ShootDowns;
-use storage::protocol::{
-    Access, Allocation, Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostMemory, Item,
-    Key, ListedDeployment, ListedTensor, Listing, MIN_VERSION, Mode, PageLevel, Placement, Reply,
-    Request, Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord,
-    VERSION, Welcome,
-};
-use storage::transport::Connection;
 
 /// How often a shoot-down that waits for a GPU to drop its victim polls
 /// NVML.
@@ -122,7 +122,7 @@ struct Client {
 
 struct StorageEntry {
     record: StorageRecord,
-    /// Keeps the physical memory alive.
+    /// Keeps the physical storage alive.
     _descriptor: OwnedFd,
     /// Tensors over the storage; the storage is released with its last.
     tensors: usize,
@@ -144,7 +144,7 @@ struct TensorEntry {
     access: Access,
     /// The scopes of the worlds that retain the tensor. A world retains what
     /// its workers use until they release it or the head retires the
-    /// world, so a world's memory outlives its processes and is released
+    /// world, so a world's storage outlives its processes and is released
     /// with the world.
     retainers: BTreeSet<Retainer>,
     /// The deployment and world whose worker put the tensor: a world on
@@ -216,15 +216,15 @@ pub struct Server {
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
     pages: pages::Pools,
-    /// Host memory a new page pool leaves available to the host's other
+    /// Host storage a new page pool leaves available to the host's other
     /// processes.
     host_reserve: u64,
-    /// The GPUs' memory ledgers: what the processes book and the quotas
+    /// The GPUs' storage ledgers: what the processes book and the quotas
     /// the worlds state ([`ledger`]).
     ledgers: ledger::Ledgers,
     kv_storage: KvStorage,
     transfers: transfers::Transfers,
-    /// The worlds' weights moving between GPUs and host memory.
+    /// The worlds' weights moving between GPUs and host storage.
     moves: moves::Moves,
     /// Events to send once the request being handled is answered.
     events: Vec<(ClientId, Event, Vec<Attachment>)>,
@@ -238,7 +238,7 @@ pub struct Server {
 impl Server {
     /// Serve on `listener`, which the caller bound with mode 0600, with
     /// page pools of `page_pool_bytes` each unless a worker asks for another
-    /// size, leaving `host_reserve` bytes of the host's available memory to
+    /// size, leaving `host_reserve` bytes of the host's available storage to
     /// other processes, and run the Mooncake connector `connector` and the
     /// Transfer Server `transfer` when given.
     pub fn new(
@@ -798,7 +798,7 @@ impl Server {
                 Ok(Outcome::Reply(
                     Reply::Ledger {
                         ledgers,
-                        host: self.host_memory().map_err(resource)?,
+                        host: self.host_storage().map_err(resource)?,
                     },
                     Vec::new(),
                 ))
@@ -1027,7 +1027,7 @@ impl Server {
         for id in released {
             self.remove_tensor(&id);
         }
-        // A retired world's quota ends with its memory: the ledger then
+        // A retired world's quota ends with its storage: the ledger then
         // books what its successor alone holds, under the successor's.
         self.ledgers.retire(deployment, &retired);
         tracing::info!(
@@ -1142,17 +1142,17 @@ impl Server {
         }
     }
 
-    /// Refuse `bytes` of new host memory that the host cannot hold: its
-    /// available memory less the server's reserve and what retained storage
+    /// Refuse `bytes` of new host storage that the host cannot hold: its
+    /// available storage less the server's reserve and what retained storage
     /// have yet to allocate.
     fn admit_host(&self, bytes: u64) -> Result<(), (ErrorKind, String)> {
-        let host = self.host_memory().map_err(resource)?;
+        let host = self.host_storage().map_err(resource)?;
         let room = host.room();
         if bytes > room {
             return Err((
                 ErrorKind::Resource,
                 format!(
-                    "{bytes} bytes of host memory exceed the {room} bytes the host can hold: \
+                    "{bytes} bytes of host storage exceed the {room} bytes the host can hold: \
                     {} bytes available, less {} bytes retained storage has yet to allocate and \
                      the server's reserve of {} bytes",
                     host.available, host.unallocated, host.reserve
@@ -1164,23 +1164,23 @@ impl Server {
 
     /// Admit a staging pool of `bytes` the host's room cannot hold
     /// ([`STAGING_POOL_BYTES`]): one a KV storage stands behind, no larger
-    /// than the bound, which the host's available memory less what the
+    /// than the bound, which the host's available storage less what the
     /// pools have yet to allocate holds, from the server's reserve.
     fn admit_staging(&self, bytes: u64) -> Result<(), ()> {
         if !self.kv_storage.present() || bytes > STAGING_POOL_BYTES {
             return Err(());
         }
-        let host = self.host_memory().map_err(|_| ())?;
+        let host = self.host_storage().map_err(|_| ())?;
         if bytes > host.available.saturating_sub(host.unallocated) {
             return Err(());
         }
         Ok(())
     }
 
-    /// What the host admits of new host memory now ([`Self::admit_host`]).
-    fn host_memory(&self) -> io::Result<HostMemory> {
-        Ok(HostMemory {
-            available: available_memory()?,
+    /// What the host admits of new host storage now ([`Self::admit_host`]).
+    fn host_storage(&self) -> io::Result<HostStorage> {
+        Ok(HostStorage {
+            available: available_storage()?,
             reserve: self.host_reserve,
             unallocated: self.pages.unallocated()
                 + self
@@ -1276,7 +1276,7 @@ impl Server {
         Ok(Outcome::Reply(
             Reply::Ledger {
                 ledgers: after,
-                host: self.host_memory().map_err(resource)?,
+                host: self.host_storage().map_err(resource)?,
             },
             Vec::new(),
         ))
@@ -1330,7 +1330,7 @@ impl Server {
     }
 
     /// `retire`: see [`Request::Retire`]. Processes that still map the
-    /// deployment's memory keep it alive until they end; nobody takes new
+    /// deployment's storage keep it alive until they end; nobody takes new
     /// access to it.
     fn retire(&mut self, deployment: &str) -> Result<Outcome, (ErrorKind, String)> {
         if let Some(entry) = self.deployments.get(deployment)
@@ -1683,7 +1683,7 @@ impl Server {
                 // A world on trial, which the caller does not read,
                 // published the key: the caller's bytes take the place of
                 // that world's, so that no world reads them through the
-                // caller. The world on trial's processes keep the memory
+                // caller. The world on trial's processes keep the storage
                 // they map.
                 let storage = ids[tensor.storage as usize];
                 let previous = std::mem::replace(&mut existing.storage, storage);
@@ -1731,7 +1731,7 @@ impl Server {
     /// Refuses a put whose new device storages would take a ledger of the
     /// holder's deployment past its quota. A storage is new when a tensor
     /// the put creates lies in it; a read-only tensor already retained adds
-    /// the caller's scope to its storage and no memory.
+    /// the caller's scope to its storage and no storage.
     fn admit_storages(
         &self,
         holder: &Holder,
@@ -1764,10 +1764,10 @@ impl Server {
                     return Err((
                         ErrorKind::Quota,
                         format!(
-                            "{bytes} bytes of new device storage of {} would take the memory \
+                            "{bytes} bytes of new device storage of {} would take the storage \
                              ledger of GPU {} to {} bytes, past its quota of {quota} bytes:\n{}",
                             holder.scope,
-                            storage::protocol::gpu_name(&gpu),
+                            ::storage::protocol::gpu_name(&gpu),
                             used + bytes,
                             ledger.describe()
                         ),
@@ -1951,7 +1951,7 @@ impl Server {
         }
     }
 
-    /// The GPUs whose memory process `pid` may still address: those of the
+    /// The GPUs whose storage process `pid` may still address: those of the
     /// device tensors it holds access to.
     fn gpus_held_by(&self, pidfd: &Arc<OwnedFd>) -> Vec<[u8; 16]> {
         let mut gpus: Vec<[u8; 16]> = self
@@ -1995,12 +1995,12 @@ impl Server {
 
     /// A client is gone: its role ends, but its access stays recorded until
     /// it is released or its process shot down, since the process may
-    /// still map the memory.
+    /// still map the storage.
     fn disconnect(&mut self, id: ClientId) {
         let Some(client) = self.clients.remove(&id) else {
             return;
         };
-        // What the process booked ends with it: the memory it booked is its
+        // What the process booked ends with it: the storage it booked is its
         // own, which the driver frees as the process ends.
         self.ledgers.disconnect(id);
         match &client.role {
@@ -2082,11 +2082,11 @@ impl Server {
                 )));
             }
         };
-        if bytes > storage::protocol::READ_BYTES {
+        if bytes > ::storage::protocol::READ_BYTES {
             return Err(invalid(&format!(
                 "{} holds {bytes} bytes, more than the {} a read answers with",
                 tensor.name,
-                storage::protocol::READ_BYTES
+                ::storage::protocol::READ_BYTES
             )));
         }
         let entry = self
@@ -2628,7 +2628,7 @@ impl Server {
                         .iter()
                         .map(|(_, bytes)| bytes)
                         .sum();
-                    Ok((available_memory().map_err(resource)? + releasable)
+                    Ok((available_storage().map_err(resource)? + releasable)
                         .saturating_sub(self.pages.unallocated())
                         .saturating_sub(self.host_reserve))
                 };
@@ -2731,9 +2731,9 @@ fn request_pool(request: &Request) -> Option<u64> {
     }
 }
 
-/// The host's available memory (`MemAvailable` of `/proc/meminfo`), in
+/// The host's available storage (`MemAvailable` of `/proc/meminfo`), in
 /// bytes.
-fn available_memory() -> io::Result<u64> {
+fn available_storage() -> io::Result<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo")?;
     let available = meminfo
         .lines()
@@ -2745,7 +2745,7 @@ fn available_memory() -> io::Result<u64> {
     Ok(cgroup_room().map_or(available, |room| available.min(room)))
 }
 
-/// What the server's memory cgroup (v2) lets it allocate beyond what the
+/// What the server's storage cgroup (v2) lets it allocate beyond what the
 /// cgroup holds: its limit less its usage; `None` without a limit.
 fn cgroup_room() -> Option<u64> {
     let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;

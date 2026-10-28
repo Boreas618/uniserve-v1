@@ -8,7 +8,7 @@ use cuda::{
     CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream,
 };
 
-use crate::memory::allocation::Storage;
+use crate::storage::allocation::Storage;
 use crate::stream::{Fill, Issue};
 use crate::{DescriptorGrants, Error, Result};
 
@@ -339,7 +339,7 @@ impl VmmPool {
         let destination = if bytes == 0 {
             0
         } else {
-            // Freeing pinned memory can wait for unrelated device work.
+            // Freeing pinned storage can wait for unrelated device work.
             // Reuse buffers by capacity and release the cache only at close;
             // geometric growth bounds its total size by twice its largest buffer.
             self.readback_slot = match self

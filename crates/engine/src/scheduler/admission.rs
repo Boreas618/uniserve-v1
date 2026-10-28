@@ -119,7 +119,7 @@ impl Scheduler {
         };
         // Backpressure: under overload the new submission is rejected rather
         // than letting queued requests grow without bound and exhaust process
-        // memory. The bound covers both waiting queues and retired requests
+        // storage. The bound covers both waiting queues and retired requests
         // whose events are still undelivered; `enqueue_media` applies the
         // same count.
         let waiting = self.pending_request_count() + self.output.retained_len();

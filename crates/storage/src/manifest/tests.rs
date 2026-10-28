@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::{Link, Memory, Placement};
+use crate::protocol::{Link, LinkEnd, Placement};
 
 use super::*;
 
@@ -191,8 +191,8 @@ fn gpu(index: usize) -> Gpu {
 fn links(gpus: usize) -> Vec<LinkBandwidth> {
     let mut links = vec![LinkBandwidth {
         link: Link {
-            source: Memory::Host,
-            destination: Memory::Host,
+            source: LinkEnd::Host,
+            destination: LinkEnd::Host,
         },
         bytes_per_second: 50_000_000_000,
     }];
@@ -200,8 +200,8 @@ fn links(gpus: usize) -> Vec<LinkBandwidth> {
         for target in 0..gpus {
             links.push(LinkBandwidth {
                 link: Link {
-                    source: Memory::Device { gpu: gpu(source) },
-                    destination: Memory::Device { gpu: gpu(target) },
+                    source: LinkEnd::Device { gpu: gpu(source) },
+                    destination: LinkEnd::Device { gpu: gpu(target) },
                 },
                 // A copy within a GPU is faster than one between GPUs.
                 bytes_per_second: if source == target {
@@ -674,11 +674,11 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     );
     let read = |source: usize, destination: usize, bytes_per_second: u64| LinkBandwidth {
         link: Link {
-            source: Memory::Remote {
+            source: LinkEnd::Remote {
                 endpoint: "10.0.0.1:4100".into(),
                 gpu: Some(gpu(source)),
             },
-            destination: Memory::Device {
+            destination: LinkEnd::Device {
                 gpu: gpu(destination),
             },
         },
@@ -686,8 +686,8 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     };
     let mut measured = links(4);
     measured.retain(|measured| {
-        let host = |memory: &Memory| match memory {
-            Memory::Device { gpu: on } => (0..4)
+        let host = |end: &LinkEnd| match end {
+            LinkEnd::Device { gpu: on } => (0..4)
                 .position(|index| gpu(index) == *on)
                 .map(|index| index / 2),
             _ => None,
@@ -709,10 +709,10 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     assert_fields_equal(&request, &apply(&request, &manifest));
     // The ranks on the other host receive from both source GPUs.
     let remote = [
-        Memory::Device { gpu: gpu(2) },
-        Memory::Device { gpu: gpu(3) },
+        LinkEnd::Device { gpu: gpu(2) },
+        LinkEnd::Device { gpu: gpu(3) },
     ];
-    let received: BTreeSet<Memory> = manifest
+    let received: BTreeSet<LinkEnd> = manifest
         .links
         .iter()
         .filter(|load| remote.contains(&load.target) && load.bytes > 0)
@@ -721,8 +721,8 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     assert_eq!(
         received,
         BTreeSet::from([
-            Memory::Device { gpu: gpu(0) },
-            Memory::Device { gpu: gpu(1) }
+            LinkEnd::Device { gpu: gpu(0) },
+            LinkEnd::Device { gpu: gpu(1) }
         ])
     );
 
@@ -731,8 +731,8 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     for destination in [2, 3] {
         fabric.links.push(LinkBandwidth {
             link: Link {
-                source: Memory::Device { gpu: gpu(1) },
-                destination: Memory::Device {
+                source: LinkEnd::Device { gpu: gpu(1) },
+                destination: LinkEnd::Device {
                     gpu: gpu(destination),
                 },
             },
@@ -745,7 +745,7 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
             .links
             .iter()
             .filter(|load| {
-                load.source == Memory::Device { gpu: gpu(source) } && remote.contains(&load.target)
+                load.source == LinkEnd::Device { gpu: gpu(source) } && remote.contains(&load.target)
             })
             .map(|load| load.seconds * 400e9 / load.bytes as f64)
             .collect::<Vec<_>>()
@@ -760,7 +760,7 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     let mut unmeasured = request;
     unmeasured
         .links
-        .retain(|measured| !matches!(measured.link.source, Memory::Remote { .. }));
+        .retain(|measured| !matches!(measured.link.source, LinkEnd::Remote { .. }));
     assert!(Manifest::plan(&unmeasured).is_err());
 }
 
@@ -917,15 +917,15 @@ fn mixed_host_and_device_chunks_use_their_physical_links() {
         links: vec![
             LinkBandwidth {
                 link: Link {
-                    source: Memory::Host,
-                    destination: Memory::Device { gpu: gpu(1) },
+                    source: LinkEnd::Host,
+                    destination: LinkEnd::Device { gpu: gpu(1) },
                 },
                 bytes_per_second: 128,
             },
             LinkBandwidth {
                 link: Link {
-                    source: Memory::Device { gpu: gpu(0) },
-                    destination: Memory::Device { gpu: gpu(1) },
+                    source: LinkEnd::Device { gpu: gpu(0) },
+                    destination: LinkEnd::Device { gpu: gpu(1) },
                 },
                 bytes_per_second: 256,
             },
@@ -941,8 +941,8 @@ fn mixed_host_and_device_chunks_use_their_physical_links() {
     assert_eq!(
         traffic,
         BTreeMap::from([
-            (Memory::Host, (256, 2.0)),
-            (Memory::Device { gpu: gpu(0) }, (256, 1.0))
+            (LinkEnd::Host, (256, 2.0)),
+            (LinkEnd::Device { gpu: gpu(0) }, (256, 1.0))
         ])
     );
     let spans = manifest
@@ -977,10 +977,10 @@ fn host_staging_round_trip_preserves_borrowed_region_offsets() {
         (
             device.clone(),
             host.clone(),
-            Memory::Device { gpu: gpu(0) },
-            Memory::Host,
+            LinkEnd::Device { gpu: gpu(0) },
+            LinkEnd::Host,
         ),
-        (host, device, Memory::Host, Memory::Device { gpu: gpu(0) }),
+        (host, device, LinkEnd::Host, LinkEnd::Device { gpu: gpu(0) }),
     ] {
         let request = Request {
             source: world(vec![(Some(gpu(0)), vec![source])]),
@@ -1013,7 +1013,7 @@ fn host_staging_round_trip_preserves_borrowed_region_offsets() {
         let [span] = spans.as_slice() else {
             panic!("one contiguous page transfer")
         };
-        let host_source = from == Memory::Host;
+        let host_source = from == LinkEnd::Host;
         assert_eq!(
             (span.source_offset, span.destination_offset),
             if host_source { (512, 64) } else { (64, 512) }
@@ -1055,11 +1055,11 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
         sources.push((None, vec![source]));
         measured.push(LinkBandwidth {
             link: Link {
-                source: Memory::Remote {
+                source: LinkEnd::Remote {
                     endpoint: endpoint.into(),
                     gpu: None,
                 },
-                destination: Memory::Device { gpu: gpu(0) },
+                destination: LinkEnd::Device { gpu: gpu(0) },
             },
             bytes_per_second: rate,
         });
@@ -1074,11 +1074,11 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
     assert_eq!(
         manifest.links,
         vec![LinkLoad {
-            source: Memory::Remote {
+            source: LinkEnd::Remote {
                 endpoint: "host-b:4100".into(),
                 gpu: None
             },
-            target: Memory::Device { gpu: gpu(0) },
+            target: LinkEnd::Device { gpu: gpu(0) },
             bytes: 256,
             seconds: 1.0
         }]

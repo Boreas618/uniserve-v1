@@ -15,11 +15,11 @@
 //! so every record names its step.
 //!
 //! **What a probe does.** It reads the device switch: a word per component
-//! and a master word, in device memory. A probe whose words are off
+//! and a master word, in device storage. A probe whose words are off
 //! returns at once, so switching probes needs no capture again. A probe
 //! that is on reads `%globaltimer`, takes the next sequence number from a
 //! device counter, and writes a 16-byte record (time, probe, step and the
-//! epoch tag below) into its slot of a double buffer in pinned host memory
+//! epoch tag below) into its slot of a double buffer in pinned host storage
 //! the device writes through unified addressing. Sequence number `s` writes
 //! slot `s mod N` of half `(s / N) mod 2`, `N` records a half; the epoch
 //! `s / N` is tagged in the record (12 bits). The probe that completes a
@@ -35,7 +35,7 @@
 //!
 //! **Clocks.** `%globaltimer` is a nanosecond clock of the GPU. A
 //! calibration launches a kernel that stores `%globaltimer` into pinned host
-//! memory and times its appearance on the host ([`Fences::calibrate`]); the
+//! storage and times its appearance on the host ([`Fences::calibrate`]); the
 //! sample of least uncertainty aligns the GPU's clock to the host's
 //! `CLOCK_REALTIME` and to CUPTI's clock ([`Alignment`]).
 //!
@@ -69,8 +69,8 @@ use crate::{Error, Result, lock};
 ///   (`mark == 0`) reads it;
 /// - `counter`: the `u64` sequence counter; `written`: `u32[2]`, the records
 ///   written into each half's current epoch;
-/// - `records`: `16 * 2 * N` bytes of pinned host memory; `filled`:
-///   `u64[2]` of pinned host memory;
+/// - `records`: `16 * 2 * N` bytes of pinned host storage; `filled`:
+///   `u64[2]` of pinned host storage;
 /// - `shift`: `log2 N`.
 const PTX: &str = r"
 .version 8.0
@@ -736,7 +736,7 @@ impl DeviceFences {
 
     /// The `filled` word of `half`.
     fn filled(&self, half: u64) -> u64 {
-        // SAFETY: the word is pinned host memory the device writes whole;
+        // SAFETY: the word is pinned host storage the device writes whole;
         // a volatile read observes its latest value.
         unsafe { std::ptr::read_volatile(self.filled.as_ptr().cast::<u64>().add(half as usize)) }
     }
@@ -827,7 +827,7 @@ impl DeviceFences {
     /// launch to the value's appearance: a kernel that queued behind the
     /// device's work gives a wide sample, which a narrower one replaces.
     fn calibrate(&self) -> Result<Alignment> {
-        // SAFETY: the word is pinned host memory no device work addresses
+        // SAFETY: the word is pinned host storage no device work addresses
         // now: a calibration returns only once its kernel has stored into
         // it.
         unsafe { std::ptr::write_volatile(self.clock_out.as_ptr().cast::<u64>(), 0) };

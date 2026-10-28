@@ -105,7 +105,7 @@ def _chunks(values: Sequence[int], width: int) -> list[tuple[int, ...]]:
 def _device_grid(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
     """The ``[1, axes]`` int64 patch grid of a packed sample on ``device``.
 
-    Built in page-locked memory first, so the copy does not synchronize the
+    Built in page-locked storage first, so the copy does not synchronize the
     host with the stream.
     """
     grid = torch.tensor([shape], dtype=torch.long)
@@ -729,7 +729,7 @@ class EncoderRunner:
         """Decode and transform one inline request image into ``out``.
 
         Touches no device and keeps no state, so the caller runs it beside
-        device work. ``out`` is host memory of the pixel shape
+        device work. ``out`` is host storage of the pixel shape
         :meth:`image_facts` reports for the image and of
         :meth:`pixel_dtype`.
 

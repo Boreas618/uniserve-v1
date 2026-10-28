@@ -1,4 +1,4 @@
-"""Layer weights a rank keeps in host memory and streams to its device.
+"""Layer weights a rank keeps in host storage and streams to its device.
 
 A component placed with ``"weights": "host"`` keeps the dense projection
 weight matrices of its repeated layer stack in one page-locked host region
@@ -18,7 +18,7 @@ buffers no live layer reads (:class:`Ring`), and after every projection call
 it records that the layer's buffer was read. Biases, norms and every other
 parameter stay resident.
 
-The host region is memory the host's Storage Server retains. A worker that
+The host region is storage the host's Storage Server retains. A worker that
 loaded the stack copies the matrices into it (their places in it are
 :func:`placements`); a restarted worker finds them there, bound to views of
 the region in place of their device tensors, and :func:`bind` rebinds them
@@ -342,7 +342,7 @@ class Ring:
 
 
 class HostStack:
-    """A layer stack streamed from host memory through device buffers.
+    """A layer stack streamed from host storage through device buffers.
 
     Holds the worker's page-locked host region and device buffers, each
     layer's share of the region, and the schedule that copies each layer
@@ -424,7 +424,7 @@ def bind(
     host: torch.Tensor,
     *buffers: torch.Tensor,
 ) -> HostStack:
-    """Move the stack under ``path`` into host memory and stream it.
+    """Move the stack under ``path`` into host storage and stream it.
 
     ``host`` is the worker's page-locked byte region of ``layers *
     layer_bytes`` bytes (:func:`layout`) and ``buffers`` its :func:`slots`

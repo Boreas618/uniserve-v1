@@ -1,7 +1,7 @@
 //! READs between two processes of this host, each with an agent with the
-//! UCX backend: the source registers its memory and exports its metadata,
-//! the destination registers device memory, loads the source's metadata and
-//! READs spans of the source's memory into its own, and the destination's
+//! UCX backend: the source registers its storage and exports its metadata,
+//! the destination registers device storage, loads the source's metadata and
+//! READs spans of the source's storage into its own, and the destination's
 //! bytes are then the source's bytes inside the spans and its own outside.
 //!
 //! Each case runs twice: with the transports UCX selects by itself, which
@@ -26,7 +26,7 @@ use cuda::{
     DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, Protection, SegmentedMapping, Stream,
     memcpy_async,
 };
-use nixl::{Access, Agent, Memory, Region, Span};
+use nixl::{Access, Agent, Region, Segment, Span};
 
 const DEVICE: DeviceId = DeviceId(0);
 
@@ -51,12 +51,12 @@ const DESTINATION_KEY: u64 = 2;
 /// `destination`.
 const ROLE: &str = "UNISERVE_NIXL_TEST_ROLE";
 
-/// Names the memory the source registers: `device`, `host`, or
-/// `host-read-only` (host memory mapped read-only, registered for reads
+/// Names the storage the source registers: `device`, `host`, or
+/// `host-read-only` (host storage mapped read-only, registered for reads
 /// alone).
-const SOURCE_MEMORY: &str = "UNISERVE_NIXL_TEST_SOURCE_MEMORY";
+const SOURCE_STORAGE: &str = "UNISERVE_NIXL_TEST_SOURCE_STORAGE";
 
-/// Names the destination's memory: `device` (the default), or memory the
+/// Names the destination's storage: `device` (the default), or storage the
 /// destination maps again at the address of a registration it released,
 /// `host-remap` or `device-remap`.
 const DESTINATION: &str = "UNISERVE_NIXL_TEST_DESTINATION";
@@ -99,82 +99,82 @@ enum Transports {
     Rdma,
 }
 
-/// A source whose device memory is a `cuda::vmm` allocation is READ into
-/// device memory of another process.
+/// A source whose device storage is a `cuda::vmm` allocation is READ into
+/// device storage of another process.
 #[test]
 #[ignore = "requires a CUDA device and NIXL"]
-fn a_read_moves_device_memory_into_device_memory_of_another_process() {
+fn a_read_moves_device_storage_into_device_storage_of_another_process() {
     exchange("device", Transports::Selected);
 }
 
-/// A source whose memory is ordinary host memory is READ into device
-/// memory of another process.
+/// A source whose storage is ordinary host storage is READ into device
+/// storage of another process.
 #[test]
 #[ignore = "requires a CUDA device and NIXL"]
-fn a_read_moves_host_memory_into_device_memory_of_another_process() {
+fn a_read_moves_host_storage_into_device_storage_of_another_process() {
     exchange("host", Transports::Selected);
 }
 
-/// As [`a_read_moves_device_memory_into_device_memory_of_another_process`],
+/// As [`a_read_moves_device_storage_into_device_storage_of_another_process`],
 /// through the network adapter.
 #[test]
 #[ignore = "requires a CUDA device, an RDMA adapter and NIXL"]
-fn an_rdma_read_moves_device_memory_into_device_memory_of_another_process() {
+fn an_rdma_read_moves_device_storage_into_device_storage_of_another_process() {
     exchange("device", Transports::Rdma);
 }
 
-/// As [`a_read_moves_host_memory_into_device_memory_of_another_process`],
+/// As [`a_read_moves_host_storage_into_device_storage_of_another_process`],
 /// through the network adapter.
 #[test]
 #[ignore = "requires a CUDA device, an RDMA adapter and NIXL"]
-fn an_rdma_read_moves_host_memory_into_device_memory_of_another_process() {
+fn an_rdma_read_moves_host_storage_into_device_storage_of_another_process() {
     exchange("host", Transports::Rdma);
 }
 
-/// After a READ into host memory, the destination deregisters and unmaps
+/// After a READ into host storage, the destination deregisters and unmaps
 /// it with a direct system call, as the Transfer Server does, maps other
-/// memory at the same address, registers it, and READs again: the second
-/// READ lands in the new memory. A registration cache that learned nothing
+/// storage at the same address, registers it, and READs again: the second
+/// READ lands in the new storage. A registration cache that learned nothing
 /// of the unmapping would hand the second registration the first one's
-/// pinned pages, and the READ would land there, leaving the new memory
+/// pinned pages, and the READ would land there, leaving the new storage
 /// unwritten while it reports success.
 #[test]
 #[ignore = "requires a CUDA device, an RDMA adapter and NIXL"]
-fn an_rdma_read_into_host_memory_mapped_again_at_a_released_address_lands_there() {
+fn an_rdma_read_into_host_storage_mapped_again_at_a_released_address_lands_there() {
     exchange_into("host", "host-remap", Transports::Rdma);
 }
 
-/// As [`an_rdma_read_into_host_memory_mapped_again_at_a_released_address_lands_there`],
-/// for device memory: one segment of a reserved range is unmapped and
+/// As [`an_rdma_read_into_host_storage_mapped_again_at_a_released_address_lands_there`],
+/// for device storage: one segment of a reserved range is unmapped and
 /// released, and another allocation is mapped in its place.
 #[test]
 #[ignore = "requires a CUDA device, an RDMA adapter and NIXL"]
-fn an_rdma_read_into_device_memory_mapped_again_at_a_released_address_lands_there() {
+fn an_rdma_read_into_device_storage_mapped_again_at_a_released_address_lands_there() {
     exchange_into("host", "device-remap", Transports::Rdma);
 }
 
-/// Host memory the source maps read-only, registered for reads alone, is
+/// Host storage the source maps read-only, registered for reads alone, is
 /// READ through the network adapter, as another host's Transfer Server
-/// READs a read-only tensor. UCX registers host memory lazily by default,
+/// READs a read-only tensor. UCX registers host storage lazily by default,
 /// so a registration that asked for write access would leave this READ
 /// unanswered rather than fail.
 #[test]
 #[ignore = "requires a CUDA device, an RDMA adapter and NIXL with read-only registration"]
-fn an_rdma_read_moves_read_only_host_memory_into_device_memory_of_another_process() {
+fn an_rdma_read_moves_read_only_host_storage_into_device_storage_of_another_process() {
     exchange("host-read-only", Transports::Rdma);
 }
 
 /// Runs a source and a destination process and relays the source's region
 /// and metadata to the destination, as a Transfer Server's own channel
 /// would.
-fn exchange(source_memory: &str, transports: Transports) {
-    exchange_into(source_memory, "device", transports);
+fn exchange(source_storage: &str, transports: Transports) {
+    exchange_into(source_storage, "device", transports);
 }
 
-/// [`exchange`] into the destination memory `destination` names
+/// [`exchange`] into the destination storage `destination` names
 /// ([`DESTINATION`]).
-fn exchange_into(source_memory: &str, destination: &str, transports: Transports) {
-    let mut source = Process::spawn("source", source_memory, destination, transports);
+fn exchange_into(source_storage: &str, destination: &str, transports: Transports) {
+    let mut source = Process::spawn("source", source_storage, destination, transports);
     let lines = source.lines();
     let mut region = None;
     let mut metadata = None;
@@ -192,7 +192,7 @@ fn exchange_into(source_memory: &str, destination: &str, transports: Transports)
         }
     }
 
-    let mut destination = Process::spawn("destination", source_memory, destination, transports);
+    let mut destination = Process::spawn("destination", source_storage, destination, transports);
     let mut input = destination.stdin();
     writeln!(input, "@region {}", region.unwrap()).unwrap();
     writeln!(input, "@metadata {}", metadata.unwrap()).unwrap();
@@ -221,7 +221,7 @@ struct Process {
 impl Process {
     fn spawn(
         role: &'static str,
-        source_memory: &str,
+        source_storage: &str,
         destination: &str,
         transports: Transports,
     ) -> Self {
@@ -233,7 +233,7 @@ impl Process {
         command
             .args(["--exact", test, "--ignored", "--nocapture"])
             .env(ROLE, role)
-            .env(SOURCE_MEMORY, source_memory)
+            .env(SOURCE_STORAGE, source_storage)
             .env(DESTINATION, destination)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
@@ -306,17 +306,17 @@ fn source_process() {
     let agent = new_agent("source");
     let bytes: Vec<u8> = (0..REGION_BYTES).map(source_byte).collect();
 
-    // Device memory is a `cuda::vmm` allocation (`cuMemCreate`, mapped
-    // into a reserved range), as the memory a Storage Server records is.
+    // Device storage is a `cuda::vmm` allocation (`cuMemCreate`, mapped
+    // into a reserved range), as the storage a Storage Server records is.
     let allocation;
     let read_only;
     let mut access = Access::ReadWrite;
-    let region = match std::env::var(SOURCE_MEMORY).unwrap().as_str() {
+    let region = match std::env::var(SOURCE_STORAGE).unwrap().as_str() {
         "device" => {
             allocation = DeviceAllocation::exportable(DEVICE, REGION_BYTES, &[]).unwrap();
             upload(allocation.address(), &bytes);
             Region {
-                memory: Memory::Device,
+                segment: Segment::Device,
                 address: allocation.address(),
                 len: REGION_BYTES,
                 key: SOURCE_KEY,
@@ -326,14 +326,14 @@ fn source_process() {
             read_only = ReadOnlyMapping::of(&bytes);
             access = Access::Read;
             Region {
-                memory: Memory::Host,
+                segment: Segment::Host,
                 address: read_only.address,
                 len: REGION_BYTES,
                 key: SOURCE_KEY,
             }
         }
         _ => Region {
-            memory: Memory::Host,
+            segment: Segment::Host,
             address: bytes.as_ptr() as u64,
             len: REGION_BYTES,
             key: SOURCE_KEY,
@@ -352,7 +352,7 @@ fn source_process() {
 }
 
 /// The destination half of [`exchange`]: READs the source's spans into its
-/// device memory, waits on the host, and verifies the whole region.
+/// device storage, waits on the host, and verifies the whole region.
 #[test]
 #[ignore = "runs as the destination process of the READ tests"]
 fn destination_process() {
@@ -373,15 +373,15 @@ fn destination_process() {
             metadata = unhex(value);
         }
     }
-    let source_memory = match std::env::var(SOURCE_MEMORY).unwrap().as_str() {
-        "device" => Memory::Device,
-        _ => Memory::Host,
+    let source_storage = match std::env::var(SOURCE_STORAGE).unwrap().as_str() {
+        "device" => Segment::Device,
+        _ => Segment::Host,
     };
     let agent = new_agent("destination");
     let peer = agent.load_peer(&metadata).unwrap();
     assert_eq!(peer, "source");
     let source = Region {
-        memory: source_memory,
+        segment: source_storage,
         address: source_address,
         len: REGION_BYTES,
         key: source_key,
@@ -400,7 +400,7 @@ fn destination_process() {
         _ => {}
     }
 
-    // The destination is memory a Storage Server would retain, mapped as a
+    // The destination is storage a Storage Server would retain, mapped as a
     // Transfer Server maps it: from the allocation's POSIX descriptor into
     // a range of its own. The bytes are written through the creating
     // allocation and read back through it, so they cross the mapping.
@@ -417,13 +417,13 @@ fn destination_process() {
     let before: Vec<u8> = (0..REGION_BYTES).map(destination_byte).collect();
     upload(allocation.address(), &before);
     let destination = Region {
-        memory: Memory::Device,
+        segment: Segment::Device,
         address: mapping.address(),
         len: REGION_BYTES,
         key: DESTINATION_KEY,
     };
     // SAFETY: `mapping` outlives the registration, and the host reads the
-    // memory only after the READ completed.
+    // storage only after the READ completed.
     let _registration = unsafe { agent.register(destination, Access::ReadWrite) }.unwrap();
 
     read_spans(&agent, &peer, source, destination);
@@ -469,7 +469,7 @@ fn read_into_host_mapped_again(agent: &Agent, peer: &str, source: Region) {
         let mapping = HostMapping::of(&before, address);
         address = Some(mapping.address);
         let destination = Region {
-            memory: Memory::Host,
+            segment: Segment::Host,
             address: mapping.address,
             len: REGION_BYTES,
             key,
@@ -499,7 +499,7 @@ fn read_into_device_mapped_again(agent: &Agent, peer: &str, source: Region) {
         let descriptor = allocation.export_descriptor().unwrap().unwrap();
         range.import(0, &descriptor).unwrap();
         let destination = Region {
-            memory: Memory::Device,
+            segment: Segment::Device,
             address: range.address(),
             len: REGION_BYTES,
             key,
@@ -521,7 +521,7 @@ fn new_agent(name: &str) -> Agent {
     Agent::new(name).unwrap()
 }
 
-/// Copies `bytes` to device memory at `address` and waits for the copy.
+/// Copies `bytes` to device storage at `address` and waits for the copy.
 fn upload(address: u64, bytes: &[u8]) {
     let stream = Stream::new(DEVICE).unwrap();
     let mut staging = PinnedBuffer::new(DEVICE, bytes.len()).unwrap();
@@ -533,7 +533,7 @@ fn upload(address: u64, bytes: &[u8]) {
     stream.synchronize().unwrap();
 }
 
-/// Copies `len` bytes of device memory at `address` to the host.
+/// Copies `len` bytes of device storage at `address` to the host.
 fn download(address: u64, len: usize) -> Vec<u8> {
     let stream = Stream::new(DEVICE).unwrap();
     let staging = PinnedBuffer::new(DEVICE, len).unwrap();

@@ -1,18 +1,18 @@
-//! Moving a world's weights between its GPUs and host memory: a previous
-//! world kept in host memory on trial (`Request::Offload`), and returned
+//! Moving a world's weights between its GPUs and host storage: a previous
+//! world kept in host storage on trial (`Request::Offload`), and returned
 //! to its GPUs before it starts again at a rollback (`Request::Restore`).
 //!
 //! The server never copies a byte itself: its Transfer Server does. An
 //! offload takes every device storage of read-only tensors that the world
-//! alone retains, creates host memory of each one's size (admitted under
+//! alone retains, creates host storage of each one's size (admitted under
 //! the host rule as one, so a refused offload moves nothing), and has the
 //! Transfer Server copy each storage there. A restore takes every host
 //! storage an offload of the world left, has the Transfer Server create
-//! device memory of each one's size on the GPU it came from (admitted
+//! device storage of each one's size on the GPU it came from (admitted
 //! against that GPU's ledger first) and copy it back. Only once every copy
 //! of a move ended do its tensors lie in the copies and the storages they
 //! left go: each GPU's ledger then books the move's effect at once, the
-//! device memory an offload freed for the other world, the device memory a
+//! device storage an offload freed for the other world, the device storage a
 //! restore took for the world that starts again. A copy that fails leaves
 //! every tensor where it was and releases the copies made so far.
 //!
@@ -22,8 +22,8 @@
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 
-use storage::protocol::{
-    Access, Allocation, ErrorKind, Event, Memory, Placement, Reply, StorageRecord, TransferEnd,
+use ::storage::protocol::{
+    Access, Allocation, ErrorKind, Event, LinkEnd, Placement, Reply, StorageRecord, TransferEnd,
 };
 
 use crate::{ClientId, Outcome, Server, StorageEntry, StorageId, invalid};
@@ -65,7 +65,7 @@ struct Item {
     /// The GPU the storage lies on (an offload) or returns to (a restore).
     gpu: [u8; 16],
     bytes: u64,
-    /// The copy, once its memory exists.
+    /// The copy, once its storage exists.
     target: Option<StorageId>,
     /// Whether its copy ended, well or not.
     ended: bool,
@@ -78,8 +78,8 @@ impl Server {
     /// host (an offload) or a GPU's ledger (a restore) cannot hold them,
     /// or when no Transfer Server runs.
     ///
-    /// [`Request::Offload`]: storage::protocol::Request::Offload
-    /// [`Request::Restore`]: storage::protocol::Request::Restore
+    /// [`Request::Offload`]: ::storage::protocol::Request::Offload
+    /// [`Request::Restore`]: ::storage::protocol::Request::Restore
     pub(crate) fn plan_move(
         &self,
         id: ClientId,
@@ -97,7 +97,7 @@ impl Server {
             )));
         }
         // The storages of read-only tensors the world alone retains (an
-        // offload), or that an offload of the world left in host memory (a
+        // offload), or that an offload of the world left in host storage (a
         // restore).
         let mut candidates: BTreeMap<StorageId, bool> = BTreeMap::new();
         for tensor in self.tensors.values() {
@@ -204,7 +204,7 @@ impl Server {
                         self.copy_item(number, index, target);
                     }
                     Err(error) => {
-                        self.item_ended(number, index, Some(format!("host memory: {error}")));
+                        self.item_ended(number, index, Some(format!("host storage: {error}")));
                     }
                 }
             } else {
@@ -229,7 +229,7 @@ impl Server {
         }
     }
 
-    /// The Transfer Server created the device memory of allocation
+    /// The Transfer Server created the device storage of allocation
     /// `request` (`descriptor`, `bytes` long), or `failure` says why it did
     /// not: the restore's item copies into it.
     pub(crate) fn allocated(
@@ -265,8 +265,8 @@ impl Server {
                 self.copy_item(number, index, target);
             }
             (failure, _) => {
-                let reason = failure.unwrap_or("the device memory came without its descriptor");
-                self.item_ended(number, index, Some(format!("device memory: {reason}")));
+                let reason = failure.unwrap_or("the device storage came without its descriptor");
+                self.item_ended(number, index, Some(format!("device storage: {reason}")));
             }
         }
     }
@@ -447,7 +447,7 @@ impl Server {
         }
     }
 
-    /// Refuses `bytes` of new device memory on `gpu` that would take
+    /// Refuses `bytes` of new device storage on `gpu` that would take
     /// `deployment`'s ledger of it past its quota, naming `what`.
     pub(crate) fn admit_device(
         &self,
@@ -464,9 +464,9 @@ impl Server {
                 return Err((
                     ErrorKind::Quota,
                     format!(
-                        "{bytes} bytes of {what} would take the memory ledger of GPU {} to {} \
+                        "{bytes} bytes of {what} would take the storage ledger of GPU {} to {} \
                          bytes, past its quota of {quota} bytes:\n{}",
-                        storage::protocol::gpu_name(&gpu),
+                        ::storage::protocol::gpu_name(&gpu),
                         used + bytes,
                         ledger.describe()
                     ),
@@ -477,11 +477,11 @@ impl Server {
     }
 }
 
-/// The memories a move's copy reads and writes, as the Transfer Server maps
-/// them: a device storage on its GPU, a host storage in host memory.
-pub(crate) fn memory_of(record: &StorageRecord) -> Memory {
+/// The storages a move's copy reads and writes, as the Transfer Server maps
+/// them: a device storage on its GPU, a host storage in host storage.
+pub(crate) fn storage_of(record: &StorageRecord) -> LinkEnd {
     match record.placement {
-        Placement::Device { gpu } => Memory::Device { gpu },
-        Placement::Host { .. } => Memory::Host,
+        Placement::Device { gpu } => LinkEnd::Device { gpu },
+        Placement::Host { .. } => LinkEnd::Host,
     }
 }

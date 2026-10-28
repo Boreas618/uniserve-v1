@@ -24,8 +24,8 @@ use super::TransferBatch;
 use super::latents;
 use crate::executor::latents::LatentLedger;
 use crate::ffi::{DType, MemoryKind};
-use crate::memory::{OutputPlacement, ProductBuffer, TrajectoryVersion};
-use crate::worker::WorkerMemory;
+use crate::storage::{OutputPlacement, ProductBuffer, TrajectoryVersion};
+use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 
 /// How a transfer's output product is stored.
@@ -104,7 +104,7 @@ impl TransferBatch<'_> {
             self.storage
                 .tensors
                 .write(&write, read.value(), issue, read.metadata())?;
-            let WorkerMemory {
+            let WorkerStorage {
                 tensors,
                 transports,
                 ..

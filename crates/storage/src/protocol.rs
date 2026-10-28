@@ -17,19 +17,19 @@
 //! later protocol than the running server speaks restarts the server with
 //! its own build first, which goes on with every connection.
 //!
-//! Memory belongs to worlds: a world is the set of processes that executes
+//! Storage belongs to worlds: a world is the set of processes that executes
 //! one configuration of a deployment (an engine and its workers, relaunched
 //! or not), and a deployment runs at most two at once while it updates. Each
 //! tensor is retained by the `(scope, world)` pairs that use it: a worker's
 //! requests retain and release under its own world alone, so a world that
-//! starts beside another neither takes nor releases the other's memory,
-//! and a world's memory outlives its processes until the head retires the
+//! starts beside another neither takes nor releases the other's storage,
+//! and a world's storage outlives its processes until the head retires the
 //! world.
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean.
 //!
-//! The server keeps one memory ledger per GPU for each deployment that uses
+//! The server keeps one storage ledger per GPU for each deployment that uses
 //! it ([`GpuLedger`]), so that the two worlds of a deployment and the host's
 //! Transfer Server stay within one quota on a GPU they share, rather than
 //! each sizing itself against what its own process holds. The quota is
@@ -38,7 +38,7 @@
 //! server derives from the storages it retains (the weights, each KV cache
 //! segment, the other exclusive storages), each storage once whatever
 //! number of worlds map it, and what the processes book themselves
-//! ([`Request::Book`]): a worker's graph pool, process memory and staging,
+//! ([`Request::Book`]): a worker's graph pool, process storage and staging,
 //! and the Transfer Server's staging and its CUDA context while it holds
 //! one on the GPU. The server refuses a booking or a new device storage
 //! that would take a ledger past its quota.
@@ -47,7 +47,7 @@
 //! equal slots per deployment, NUMA node and [`PageShape`], shared by the
 //! deployment's workers whose pages have that shape, of the size the
 //! worker asks for. A deployment's pools are released with its tensors.
-//! The server refuses a pool the host's available memory cannot hold.
+//! The server refuses a pool the host's available storage cannot hold.
 //! The server indexes committed pages by key
 //! and tracks each slot's state; workers copy pages in and out of the slots
 //! on their own streams, at the head's direction. Behind the pools, the
@@ -55,7 +55,7 @@
 //! in the KV storage (L3) and reads them back for prefetches.
 //!
 //! The server copies no byte itself. Its Transfer Server ([`Role::Transfer`])
-//! copies between the memory the server holds for heads and workers: a
+//! copies between the storage the server holds for heads and workers: a
 //! client submits a task of [`Span`]s with a [`Priority`]
 //! ([`Request::Transfer`]), the server resolves each [`Region`] to one of its
 //! allocations and forwards the task, and relays the Transfer Server's
@@ -94,7 +94,7 @@ pub const READ_BYTES: u64 = 64 << 20;
 /// knows no worlds, and its requests act on world 0; a client of version 4
 /// or 5 states no world as a head, which reads and publishes world 0's
 /// pages; a client before version 7 makes no transfer request and reads no
-/// transfer event; a client before version 8 names no memory of another
+/// transfer event; a client before version 8 names no storage of another
 /// host; a client before version 9 books nothing in the ledgers and marks
 /// no storage as a KV cache segment; a client before version 10 names no
 /// location of a key's copy, and its requests take every copy.
@@ -179,11 +179,11 @@ pub enum Role {
     /// The Mooncake connector the server runs.
     Connector,
     /// The Transfer Server the server runs, which copies bytes between the
-    /// memory the server holds. Every ledger of a GPU it uses books its CUDA
+    /// storage the server holds. Every ledger of a GPU it uses books its CUDA
     /// context there, as it measured it ([`Request::Measured`]), and any
     /// staging it books ([`Request::Book`]).
     Transfer,
-    /// Another host's Transfer Server, which READs memory of this host
+    /// Another host's Transfer Server, which READs storage of this host
     /// through NIXL for the tasks of its own host: it asks the server to
     /// expose regions ([`Request::Expose`]). It connects to the server's
     /// TCP endpoint.
@@ -213,7 +213,7 @@ pub enum Welcome {
     },
 }
 
-/// Where a storage's physical memory is.
+/// Where a storage's physical storage is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
@@ -230,7 +230,7 @@ pub enum Placement {
 pub struct StorageRecord {
     pub placement: Placement,
     /// The allocation's size, a multiple of the device's allocation
-    /// granularity for device memory.
+    /// granularity for device storage.
     pub bytes: u64,
     /// The KV cache segment the storage is part of, which its GPU's ledger
     /// books as that segment ([`Item::CacheSegment`]); `None` for any other
@@ -241,7 +241,7 @@ pub struct StorageRecord {
     /// holds the allocation and its GPU belongs to an NVLink fabric
     /// (multi-node NVLink): another host of the fabric imports the handle
     /// to copy the storage over NVLink while the creator holds it. `None`
-    /// for host memory, for an allocation without one, and for every
+    /// for host storage, for an allocation without one, and for every
     /// storage of a client that states none.
     #[serde(default)]
     pub fabric: Option<FabricHandle>,
@@ -280,7 +280,7 @@ impl<'de> Deserialize<'de> for FabricHandle {
 }
 
 /// One segment of a KV cache's value planes: the world that created its
-/// memory and its ordinal there. A segment is one storage per layer and
+/// storage and its ordinal there. A segment is one storage per layer and
 /// plane, which a ledger books together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Segment {
@@ -288,7 +288,7 @@ pub struct Segment {
     pub ordinal: u32,
 }
 
-/// What one entry of a GPU's memory ledger is.
+/// What one entry of a GPU's storage ledger is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Item {
@@ -300,7 +300,7 @@ pub enum Item {
     /// value planes: the cache's flags and scales, the buffer pool, the
     /// latent banks.
     Exclusive,
-    /// A worker's CUDA graph memory pool: the memory its captured graphs
+    /// A worker's CUDA graph storage pool: the storage its captured graphs
     /// address. Booked by the worker.
     GraphPool,
     /// What a worker process holds on the device beside the storages the
@@ -310,10 +310,10 @@ pub enum Item {
     /// a profiling session's collectors hold while it runs. Booked by the
     /// worker.
     Process,
-    /// Device memory a process holds to stage transfers. Booked by the
+    /// Device storage a process holds to stage transfers. Booked by the
     /// process.
     Staging,
-    /// The device memory of the Transfer Server's CUDA context, at the
+    /// The device storage of the Transfer Server's CUDA context, at the
     /// bytes it measured when it started ([`Request::Measured`]). Booked by
     /// the Transfer Server before it retains the context on the GPU, which
     /// it holds only while it has work there, and ended when it released
@@ -345,29 +345,29 @@ impl Item {
     }
 }
 
-/// One deployment's memory ledger of one GPU: everything the deployment's
+/// One deployment's storage ledger of one GPU: everything the deployment's
 /// worlds hold on it, and the Transfer Server's items there, beside which
-/// every deployment that uses the GPU holds its memory.
+/// every deployment that uses the GPU holds its storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuLedger {
     /// The GPU's UUID.
     pub gpu: [u8; 16],
     /// The deployment; empty for a GPU only the Transfer Server books.
     pub deployment: String,
-    /// The GPU's total memory, as the processes that use it state it; 0
+    /// The GPU's total storage, as the processes that use it state it; 0
     /// until one does.
     pub total: u64,
     /// `⌊total × fraction⌋` for the smallest fraction a world of the
     /// deployment states for the GPU; `None` until one states one.
     pub quota: Option<u64>,
     pub entries: Vec<LedgerEntry>,
-    /// The bandwidth of copies from host memory to the GPU, in bytes per
+    /// The bandwidth of copies from host storage to the GPU, in bytes per
     /// second, as the host's Transfer Server measured it when it started;
-    /// `None` while none did. What returns from host memory to the GPU
+    /// `None` while none did. What returns from host storage to the GPU
     /// takes its bytes over this time.
     #[serde(default)]
     pub host_link_bytes_per_second: Option<u64>,
-    /// The device memory the Transfer Server's CUDA context takes on the
+    /// The device storage the Transfer Server's CUDA context takes on the
     /// GPU while it holds one, as it measured it when it started; 0 when no
     /// Transfer Server measured the GPU. The ledger books it as an entry
     /// ([`Item::TransferContext`]) only while the Transfer Server holds the
@@ -466,11 +466,11 @@ pub fn gpu_name(gpu: &[u8; 16]) -> String {
     )
 }
 
-/// What a host's Storage Server admits of new host memory (page pools,
-/// staging, weights moved to the host): the host's available memory less
+/// What a host's Storage Server admits of new host storage (page pools,
+/// staging, weights moved to the host): the host's available storage less
 /// the server's reserve and what its retained storage has yet to allocate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostMemory {
+pub struct HostStorage {
     /// The host's `MemAvailable`.
     pub available: u64,
     /// What the server leaves to the host's other processes.
@@ -479,8 +479,8 @@ pub struct HostMemory {
     pub unallocated: u64,
 }
 
-impl HostMemory {
-    /// The bytes of new host memory the server admits now.
+impl HostStorage {
+    /// The bytes of new host storage the server admits now.
     pub fn room(&self) -> u64 {
         self.available
             .saturating_sub(self.reserve)
@@ -597,7 +597,7 @@ pub enum Mode {
     Standby,
 }
 
-/// Memory a transfer copies from or into, as its client names it.
+/// Storage a transfer copies from or into, as its client names it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Region {
@@ -622,7 +622,7 @@ pub enum Region {
     /// the byte offsets count from `offset`. The handle imports only while
     /// that process holds the allocation: CUDA exports no fabric handle
     /// from an allocation imported through its POSIX descriptor, which is
-    /// how the Storage Server and its Transfer Server hold memory, and a
+    /// how the Storage Server and its Transfer Server hold storage, and a
     /// fabric handle stops importing once its creator released the
     /// allocation. Copies import the handle into this host's Transfer
     /// Server.
@@ -632,7 +632,7 @@ pub enum Region {
         bytes: u64,
         offset: u64,
     },
-    /// Memory of another host that this host's Transfer Server READs
+    /// Storage of another host that this host's Transfer Server READs
     /// through NIXL: `region`, a retained tensor or a page pool of the
     /// caller's deployment, as a client of that host names it, at the
     /// Storage Server listening at `endpoint` (that server's
@@ -705,34 +705,34 @@ impl Priority {
     }
 }
 
-/// One end of a [`Link`]: host memory, the memory of one GPU, or memory of
+/// One end of a [`Link`]: host storage, the storage of one GPU, or storage of
 /// another host.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Memory {
+pub enum LinkEnd {
     Host,
     /// The GPU with this UUID.
     Device {
         gpu: [u8; 16],
     },
-    /// Memory of another host, which a READ reaches through the network
+    /// Storage of another host, which a READ reaches through the network
     /// adapters: the host whose Storage Server listens at `endpoint`, and
-    /// there the GPU `gpu`, or host memory when `None`.
+    /// there the GPU `gpu`, or host storage when `None`.
     Remote {
         endpoint: String,
         gpu: Option<[u8; 16]>,
     },
 }
 
-/// The path a copy takes, from the memory it reads to the memory it writes.
+/// The path a copy takes, from the storage it reads to the storage it writes.
 /// The Transfer Server measures each link within its host when it starts,
 /// and a link from another host by its first copy long enough to time; it
 /// cuts copies into chunks by the bandwidth, and keeps a byte budget per
 /// link.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Link {
-    pub source: Memory,
-    pub destination: Memory,
+    pub source: LinkEnd,
+    pub destination: LinkEnd,
 }
 
 /// A change of links' byte budgets, which the head of the executing world
@@ -811,13 +811,13 @@ pub struct LinkBandwidth {
     pub bytes_per_second: u64,
 }
 
-/// A range of memory a Transfer Server registered with its NIXL agent, as a
+/// A range of storage a Transfer Server registered with its NIXL agent, as a
 /// peer's READ names it: NIXL finds the registration in the agent's
 /// metadata by the range's key, address and length.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registered {
-    /// Host memory, or the GPU with this UUID, of the registering host.
-    pub memory: Memory,
+    /// Host storage, or the GPU with this UUID, of the registering host.
+    pub end: LinkEnd,
     /// The key the agent registered the range under, which no other
     /// registration of the agent takes, so that a peer that loaded the
     /// metadata of a registration since undone at the same address does not
@@ -845,7 +845,7 @@ pub struct FabricExport {
     pub offset: u64,
 }
 
-/// The device memory the Transfer Server's CUDA context takes on one GPU,
+/// The device storage the Transfer Server's CUDA context takes on one GPU,
 /// as NVML attributes it to the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBytes {
@@ -899,19 +899,19 @@ pub enum Request {
         cache_keys: Vec<Key>,
     },
     /// From a head: world `world` of its deployment keeps its weights in
-    /// host memory (`update_config.previous_world = "host"`, its processes
+    /// host storage (`update_config.previous_world = "host"`, its processes
     /// exited). Every device copy of read-only tensors that this world
-    /// alone retains moves to host memory: the server creates host memory of
+    /// alone retains moves to host storage: the server creates host storage of
     /// each storage's size, admitted under the host rule as one (refused,
     /// moving nothing, when the host cannot hold it all), has its Transfer
     /// Server copy each storage there, and then the tensors' copies lie in
-    /// host memory and the device storages are released: each GPU's ledger
-    /// leaves their memory to the other world. Answered with `Moved` once
+    /// host storage and the device storages are released: each GPU's ledger
+    /// leaves their storage to the other world. Answered with `Moved` once
     /// every copy ended; refused while no Transfer Server runs.
     Offload { world: u64 },
     /// From a head: world `world`'s weights that `Offload` moved to host
-    /// memory return to the GPUs they came from, before its processes start
-    /// again: its Transfer Server creates device memory of each storage's
+    /// storage return to the GPUs they came from, before its processes start
+    /// again: its Transfer Server creates device storage of each storage's
     /// size on its GPU, admitted against the GPU's ledger (refused, moving
     /// nothing, past the quota), and copies each storage there; then the
     /// tensors' copies lie on those GPUs again and the host copies are
@@ -926,7 +926,7 @@ pub enum Request {
         #[serde(default)]
         at: Vec<Placement>,
     },
-    /// Allocate an exclusive byte tensor in host memory after host
+    /// Allocate an exclusive byte tensor in host storage after host
     /// admission. Returns its retained storage through `Got`, with write
     /// ownership belonging to this worker and lifetime to its world.
     AllocateHost { key: Key, name: String, bytes: u64 },
@@ -962,7 +962,7 @@ pub enum Request {
     /// Every tensor, storage and claim the server holds.
     List,
     /// From a process of another host ([`Role::Peer`]): the bytes of the
-    /// copy of `key` in host memory that a scope of `deployment` retains
+    /// copy of `key` in host storage that a scope of `deployment` retains
     /// read-only, a one-dimensional tensor of `uint8` elements (such as a
     /// weight manifest) of at most [`READ_BYTES`] bytes. Answered with
     /// [`Reply::Read`]; refused when the deployment retains no such tensor,
@@ -974,7 +974,7 @@ pub enum Request {
     Retire { deployment: String },
     /// Hand the server to a successor server of `executable` (this
     /// server's own when `None`), which goes on with every connection, the
-    /// listening sockets, the tensors' memory and the page pools once no
+    /// listening sockets, the tensors' storage and the page pools once no
     /// request, shoot-down, connector task or transfer is in flight (a hot
     /// restart);
     /// the server then exits. Answered with the successor's process id
@@ -983,7 +983,7 @@ pub enum Request {
     /// A worker's page pool for pages of `shape` on `numa_node`: the pool
     /// of the worker's deployment of that shape, whose memfd travels with
     /// the reply. When absent it is created with `bytes` (the server's
-    /// default when `None`), refused when the host's available memory,
+    /// default when `None`), refused when the host's available storage,
     /// less the server's reserve and what its pools have yet to allocate,
     /// cannot hold it.
     PagePool {
@@ -1036,7 +1036,7 @@ pub enum Request {
     /// the bytes one token takes on all of those ranks (`token_bytes`, one
     /// entry per rank). The budget is `host_bytes`, the deployment's host KV
     /// cache on each host, when stated; otherwise four fifths of the host's
-    /// available memory (bounded by the server's memory cgroup limit, and
+    /// available storage (bounded by the server's storage cgroup limit, and
     /// counting the deployment's page pools no world maps, which the server
     /// releases for a new pool) less what the page pools have yet to
     /// allocate and the server's reserve. Answered with [`Reply::HostCache`].
@@ -1049,7 +1049,7 @@ pub enum Request {
     /// [`Event::Upload`] or [`Event::Download`]: one result per page of the
     /// task.
     Finished { task: u64, results: Vec<bool> },
-    /// Book the caller's own items on GPU `gpu` (of total memory `total`):
+    /// Book the caller's own items on GPU `gpu` (of total storage `total`):
     /// each item of `items` takes its bytes, 0 ending it; an item left out
     /// keeps its booking. A worker books [`Item::GraphPool`],
     /// [`Item::Process`] and [`Item::Staging`] in its deployment's ledger
@@ -1060,7 +1060,7 @@ pub enum Request {
     /// books [`Item::Staging`] and [`Item::TransferContext`] in every ledger
     /// of the GPU, stating no quota: its context before it retains it, which
     /// a ledger without room refuses. A booking ends with the connection of
-    /// the process that made it, as that process's memory ends with it. Refused, booking nothing, when it
+    /// the process that made it, as that process's storage ends with it. Refused, booking nothing, when it
     /// would take a ledger past its quota; answered with the ledgers of the
     /// GPU the caller books in.
     Book {
@@ -1070,7 +1070,7 @@ pub enum Request {
         items: Vec<(Item, u64)>,
     },
     /// The ledgers of `gpus` (of every GPU when empty) and what the host
-    /// admits of new host memory: of the caller's deployment for a worker
+    /// admits of new host storage: of the caller's deployment for a worker
     /// and a head, of every deployment for the Transfer Server and an
     /// operator.
     Ledger { gpus: Vec<[u8; 16]> },
@@ -1078,7 +1078,7 @@ pub enum Request {
     /// takes its turn at `priority` on every link it uses. Answered with the
     /// task's number at once; [`Event::TransferProgress`] follows as it
     /// copies and [`Event::Transferred`] when it ends. Refused, copying
-    /// nothing, when no Transfer Server runs, when a region is not memory
+    /// nothing, when no Transfer Server runs, when a region is not storage
     /// of the caller's deployment, or when a span reaches past its region
     /// or writes a read-only tensor; a region of another host is checked
     /// by that host once the task runs ([`Region::Remote`]). A task ends
@@ -1116,7 +1116,7 @@ pub enum Request {
         throttle: Throttle,
     },
     /// From the Transfer Server: each link's bandwidth and the device
-    /// memory its CUDA context takes on each GPU, once after it connected,
+    /// storage its CUDA context takes on each GPU, once after it connected,
     /// for every link within its host, and again for a link from another
     /// host once a copy timed it. The server keeps the latest report of
     /// each link and each GPU.
@@ -1135,7 +1135,7 @@ pub enum Request {
     /// host's Transfer Server register `regions`, retained tensors or page
     /// pools of `deployment` on this host, with its NIXL agent, for that
     /// Transfer Server's READs. Answered with [`Reply::Exposed`] once they
-    /// are registered; refused when a region is not memory of the
+    /// are registered; refused when a region is not storage of the
     /// deployment, when no Transfer Server is connected, or when it cannot
     /// register them. The regions stay registered for the exposure until
     /// the peer ends it ([`Request::Unexpose`]) or its connection closes,
@@ -1163,7 +1163,7 @@ pub enum Request {
         ranges: Vec<Registered>,
         failure: Option<String>,
     },
-    /// From the Transfer Server: the device memory of the server's
+    /// From the Transfer Server: the device storage of the server's
     /// [`Event::Allocate`] `request`, `bytes` long, whose POSIX descriptor
     /// travels with the request; or `failure` says why there is none.
     Allocated {
@@ -1188,7 +1188,7 @@ pub enum ErrorKind {
     /// needs a reset.
     ShootDown,
     /// The server failed to hold or pass a descriptor, or its Transfer
-    /// Server to register memory with its NIXL agent.
+    /// Server to register storage with its NIXL agent.
     Resource,
     /// No Transfer Server is connected: it has not started yet, or it
     /// ended and the server starts it again.
@@ -1265,10 +1265,10 @@ pub enum Reply {
     },
     Finished,
     /// The ledgers a `Book` or a `Ledger` names, and what the host admits
-    /// of new host memory.
+    /// of new host storage.
     Ledger {
         ledgers: Vec<GpuLedger>,
-        host: HostMemory,
+        host: HostStorage,
     },
     /// The task a [`Request::Transfer`] submitted.
     Transferring {
@@ -1340,7 +1340,7 @@ pub struct ListedTransfer {
     pub pid: i32,
     /// The links it measured when it started; empty until it reported them.
     pub links: Vec<LinkBandwidth>,
-    /// The device memory its CUDA context takes on each GPU it uses.
+    /// The device storage its CUDA context takes on each GPU it uses.
     pub contexts: Vec<ContextBytes>,
     /// The tasks it runs.
     pub tasks: Vec<ListedTask>,
@@ -1444,14 +1444,14 @@ pub enum Event {
         bytes: u64,
         end: TransferEnd,
     },
-    /// To the Transfer Server: an allocation of `bytes` in `memory`, whose
+    /// To the Transfer Server: an allocation of `bytes` in `storage`, whose
     /// descriptor travels with the event (a CUDA VMM allocation's POSIX
     /// handle, or a memfd), before the first task that copies it. It maps
     /// the allocation for writing when `writable`: a page pool, or a
     /// storage that holds an exclusive tensor.
     Allocation {
         allocation: Allocation,
-        memory: Memory,
+        end: LinkEnd,
         bytes: u64,
         writable: bool,
     },
@@ -1486,11 +1486,11 @@ pub enum Event {
         request: u64,
         allocations: Vec<Allocation>,
     },
-    /// To the Transfer Server: create device memory of at least `bytes` on
+    /// To the Transfer Server: create device storage of at least `bytes` on
     /// GPU `gpu`, retainable through a POSIX descriptor and addressed by
     /// every GPU that can, send its descriptor with
     /// [`Request::Allocated`], and keep no handle of it: the server holds
-    /// the memory from then on, which a world's restored weights take.
+    /// the storage from then on, which a world's restored weights take.
     Allocate {
         request: u64,
         gpu: [u8; 16],

@@ -1,16 +1,16 @@
 //! The worker's share of layer weights copied into device slots ahead of
-//! their use: the memory and the byte movement.
+//! their use: the storage and the byte movement.
 //!
 //! Two owners stream weights this way. Distributed expert weights (DWDP,
 //! [`DwdpManager`]) read the other ranks' shards of each expert layer from
-//! peer memory into two reusable slots; host weights ([`HostWeights`])
+//! peer storage into two reusable slots; host weights ([`HostWeights`])
 //! stream the projections of a repeated layer stack from page-locked host
-//! memory into a ring of device slots. Here the worker allocates and maps
-//! that memory and, for DWDP, plans each layer's peer reads as one batch of
+//! storage into a ring of device slots. Here the worker allocates and maps
+//! that storage and, for DWDP, plans each layer's peer reads as one batch of
 //! copies. The library's schedule (`uniserve.weight_prefetch`) owns the rest:
 //! which layer goes to which slot, the copy stream and the events that order
 //! copies against the layers' reads, and, under graph capture, each copy as
-//! the graph's break work. The worker releases the memory only after the
+//! the graph's break work. The worker releases the storage only after the
 //! schedule drained its copy stream.
 
 use std::collections::HashMap;
@@ -25,7 +25,7 @@ use super::world::World;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerLaunch};
 use crate::ffi::{Backing, DType, Handle, Interpreter};
-use crate::memory::allocation::{Storage, StorageView};
+use crate::storage::allocation::{Storage, StorageView};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result, lock};
@@ -53,7 +53,7 @@ pub(crate) struct WeightStorage {
 }
 
 /// Distributed expert weights: every rank keeps its expert shard resident
-/// and reads the other ranks' shards from peer memory into two reusable
+/// and reads the other ranks' shards from peer storage into two reusable
 /// slots per field before each layer computes.
 ///
 /// The mechanism follows TensorRT-LLM's composite-VA weight buffer. For each
@@ -171,7 +171,7 @@ impl ExpertWeights {
                 let local = published
                     .local()
                     .allocation()
-                    .ok_or_else(|| Error::Invariant("published pages are device memory".into()))?
+                    .ok_or_else(|| Error::Invariant("published pages are device storage".into()))?
                     .address();
                 // SAFETY: the shard is a live device tensor of `shard` bytes
                 // the caller keeps through this setup; the destination lies
@@ -207,7 +207,7 @@ impl ExpertWeights {
                 let resident = published
                     .local()
                     .allocation()
-                    .ok_or_else(|| Error::Invariant("published pages are device memory".into()))?;
+                    .ok_or_else(|| Error::Invariant("published pages are device storage".into()))?;
                 let mut pieces: Vec<&DeviceAllocation> = Vec::new();
                 let mut part = parts.iter();
                 if first > 0 {
@@ -587,7 +587,7 @@ impl DwdpManager {
             return Ok(None);
         }
         let Device::Cuda(device) = launch.device() else {
-            return Err(Error::Unsupported("DWDP requires CUDA peer memory".into()));
+            return Err(Error::Unsupported("DWDP requires CUDA peer storage".into()));
         };
         let stream = streams
             .preparation(device)
@@ -731,24 +731,24 @@ const HOST_WEIGHTS: &str = "uniserve.loading.host_weights";
 /// worker's weights are retained at the Storage Server.
 pub(crate) enum HostRetention<'a> {
     /// The worker's weights are not retained: each region is page-locked
-    /// memory of the worker's own.
+    /// storage of the worker's own.
     None,
-    /// The worker loaded: each region is new retained host memory that joins
+    /// The worker loaded: each region is new retained host storage that joins
     /// its published weights, filled by binding.
-    Publish(&'a mut crate::memory::weights::Published),
+    Publish(&'a mut crate::storage::weights::Published),
     /// The worker bound retained weights: each region is a retained host
     /// storage among these, already holding the matrices.
     Bound(&'a [Arc<Storage>]),
 }
 
 /// The dense projection weights of one repeated layer stack, kept in
-/// page-locked host memory and streamed through a ring of device slots.
+/// page-locked host storage and streamed through a ring of device slots.
 ///
 /// The worker allocates the host region and the slots; the library rebinds
 /// every layer's projection matrices to views of its slot and copies the
 /// layers into the slots ahead of their projection calls, on a stream of its
 /// own (`uniserve.loading.host_weights.HostStack`). The library's tensors
-/// retain the memory; the worker drains the stack's copies at close.
+/// retain the storage; the worker drains the stack's copies at close.
 pub(crate) struct HostWeights {
     /// The library's `HostStack` of the stack.
     stack: Handle,
@@ -757,7 +757,7 @@ pub(crate) struct HostWeights {
 impl HostWeights {
     /// Drain the stack's copies after every reader retired; the host region
     /// and the slots go with the library's last reference to them. A failed
-    /// drain keeps the stack, and with it the memory, until exit.
+    /// drain keeps the stack, and with it the storage, until exit.
     pub(crate) fn close(self) -> Result<()> {
         let drained = Interpreter::import(&format!("{HOST_WEIGHTS}.HostStack.close"))
             .and_then(|close| close.invoke(&[self.stack.view()]));
@@ -773,7 +773,7 @@ impl HostWeights {
     ///
     /// Runs after loading and before any numerical operator binds the
     /// layers' parameters and before capacity planning, so the device
-    /// memory the streamed matrices release becomes capacity. Each outermost
+    /// storage the streamed matrices release becomes capacity. Each outermost
     /// declared module path of such a component streams its repeated layer
     /// stack.
     ///
@@ -799,7 +799,7 @@ impl HostWeights {
             for path in model.declarations.roots(&placed.name) {
                 let owner = Self::stream(model, device, &path, retention).map_err(|error| {
                     Error::Unsupported(format!(
-                        "component {} cannot stream {path:?} from host memory: {error}",
+                        "component {} cannot stream {path:?} from host storage: {error}",
                         placed.name
                     ))
                 })?;
@@ -893,8 +893,8 @@ impl HostWeights {
         let slots = (0..count(slots)?)
             .map(|_| Storage::device(device, layer_bytes))
             .collect::<Result<Vec<_>>>()?;
-        let view = |memory: &Arc<Storage>| {
-            StorageView::whole(Arc::clone(memory) as Arc<dyn Backing>, DType::U8)
+        let view = |storage: &Arc<Storage>| {
+            StorageView::whole(Arc::clone(storage) as Arc<dyn Backing>, DType::U8)
         };
         let host_view = view(&host)?;
         let slot_views = slots.iter().map(view).collect::<Result<Vec<_>>>()?;
@@ -914,7 +914,7 @@ impl HostWeights {
             Handle::new(bind.call_values(&arguments)?)
         })?;
         tracing::info!(
-            "streaming {layers} layers of {path:?} from host memory through {} device slots of {layer_bytes} bytes",
+            "streaming {layers} layers of {path:?} from host storage through {} device slots of {layer_bytes} bytes",
             slots.len()
         );
         Ok(Self { stack })

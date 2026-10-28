@@ -16,7 +16,7 @@
 //!
 //! The member is built at the same point of every rank's startup, after
 //! loading and before capacity planning, so the exchanges' device
-//! workspaces are resident when the rank measures its free memory:
+//! workspaces are resident when the rank measures its free storage:
 //! the executor configures its agreement (`expert_storage_bytes`, which
 //! also states the peer storage its exchanges need), the worker maps the
 //! storage, and the executor creates its exchanges over it
@@ -29,9 +29,9 @@ use cuda::Stream;
 use crate::config::{Device, WorkerLaunch};
 use crate::executor::python::PythonExecutor;
 use crate::ffi::Backing;
-use crate::memory::allocation::StorageView;
 use crate::parallel::host::{HostGroup, bootstrap};
 use crate::parallel::world::World;
+use crate::storage::allocation::StorageView;
 use crate::stream::Streams;
 use crate::transfer::PeerStorage;
 use crate::{Error, Result, lock};
@@ -147,12 +147,12 @@ impl ExpertMember {
                 })
             })
             .collect();
-        let memory = serde_json::json!({ "microbatches": microbatches });
+        let storage = serde_json::json!({ "microbatches": microbatches });
         let mut storage_views: Vec<Option<StorageView>> = views.into_iter().map(Some).collect();
         storage_views.resize(streams.len(), None);
         start
             .executor
-            .connect_experts(memory.to_string(), storage_views)?;
+            .connect_experts(storage.to_string(), storage_views)?;
         tracing::info!(
             "expert union member with {} microbatches, {} bytes of peer storage each",
             streams.len(),

@@ -184,7 +184,7 @@ class Loaded:
     flow_prompt: Any = None
     tokenizer: Path | None = None
     # Loads the rank's modules of the checkpoint at a path, its tensors
-    # streamed from a weight source when one is named, into new memory, as
+    # streamed from a weight source when one is named, into new storage, as
     # the rank loaded this model (:func:`update_weights`); ``None`` for a
     # rank without checkpoint weights.
     reload: Callable[[str, str | None], nn.Module] | None = None
@@ -715,7 +715,7 @@ def update_weights(loaded: Loaded, path: str) -> bool:
     """Rewrite the rank's loaded tensors in place from the checkpoint at
     ``path``; whether the rank holds checkpoint weights to rewrite.
 
-    The checkpoint loads into new memory as the rank loaded its model (the
+    The checkpoint loads into new storage as the rank loaded its model (the
     same modules, meshes and weight choices: ``Loaded.reload``); every
     tensor of the loaded model then takes its new value where it lies, so
     the CUDA graphs and the retained storages that address it read the new
@@ -740,14 +740,14 @@ def update_weights(loaded: Loaded, path: str) -> bool:
         replaced = _update_weights(loaded, path)
     except BaseException as error:
         # The frames of a failed load hold what it allocated; drop them so
-        # the memory returns before the workers wake.
+        # the storage returns before the workers wake.
         traceback.clear_frames(error.__traceback__)
-        _release_device_memory()
+        _release_device_storage()
         raise
-    _release_device_memory()
+    _release_device_storage()
     logger.info(
         "updated %d tensors in place from %s in %.1f s; %.2f GiB of device "
-        "memory stay allocated",
+        "storage stay allocated",
         replaced,
         path,
         time.perf_counter() - started,
@@ -758,7 +758,7 @@ def update_weights(loaded: Loaded, path: str) -> bool:
     return True
 
 
-def _release_device_memory() -> None:
+def _release_device_storage() -> None:
     """Free what an update's discarded model held: its modules may hold
     each other in cycles, which only the cycle collector frees.
     """  # noqa: D205

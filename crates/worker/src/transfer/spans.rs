@@ -10,7 +10,7 @@ use std::ops::Range;
 use cuda::{CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async};
 
 use crate::ffi::{DType, MemoryKind};
-use crate::memory::allocation::StorageView;
+use crate::storage::allocation::StorageView;
 use crate::{Error, Result};
 
 /// Ordered first-axis spans of one logical tensor. Every span has the same
@@ -182,7 +182,7 @@ impl Spans {
 }
 
 /// A planner for copies between two operands of `device`'s address space,
-/// or of host memory when `device` is `None`.
+/// or of host storage when `device` is `None`.
 pub(crate) fn copy_planner(device: Option<DeviceId>, order: SourceOrder) -> Result<StridedCopy> {
     match device {
         Some(device) => Ok(StridedCopy::for_device(device, order)?),
@@ -192,7 +192,7 @@ pub(crate) fn copy_planner(device: Option<DeviceId>, order: SourceOrder) -> Resu
 
 /// Plan and submit the copy of `source` into `destination` on `stream`.
 ///
-/// Operands on one device (or a device and host memory) go through the
+/// Operands on one device (or a device and host storage) go through the
 /// batched copy APIs. Operands on two different devices are copied run by
 /// run with `cuMemcpyAsync`: the batched APIs reject peer operands unless
 /// peer access is enabled, while unified-address copies between devices
@@ -229,7 +229,7 @@ pub(crate) unsafe fn submit_copy(
 /// Execute planned copies between host operands on the calling thread.
 ///
 /// # Safety
-/// Every planned operand is host memory that stays valid, and that no other
+/// Every planned operand is host storage that stays valid, and that no other
 /// thread or device accesses, for the duration of the call.
 pub(crate) unsafe fn copy_on_host(plan: &StridedCopy) {
     // SAFETY: forwarded from the caller.
@@ -275,49 +275,49 @@ mod tests {
 
     use super::*;
     use crate::ffi::Backing;
-    use crate::memory::allocation::Storage;
+    use crate::storage::allocation::Storage;
 
-    fn write_floats(memory: &Arc<dyn Backing>, values: &[f32]) {
-        // SAFETY: test memory is host memory owned by the caller.
+    fn write_floats(storage: &Arc<dyn Backing>, values: &[f32]) {
+        // SAFETY: test storage is host storage owned by the caller.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr(),
-                memory.address() as *mut f32,
+                storage.address() as *mut f32,
                 values.len(),
             );
         }
     }
 
-    fn read_floats(memory: &Arc<dyn Backing>, count: usize) -> Vec<f32> {
-        // SAFETY: test memory is host memory owned by the caller.
-        unsafe { std::slice::from_raw_parts(memory.address() as *const f32, count) }.to_vec()
+    fn read_floats(storage: &Arc<dyn Backing>, count: usize) -> Vec<f32> {
+        // SAFETY: test storage is host storage owned by the caller.
+        unsafe { std::slice::from_raw_parts(storage.address() as *const f32, count) }.to_vec()
     }
 
     #[test]
     fn regions_split_across_spans_in_local_coordinates() -> Result<()> {
-        let memory: Arc<dyn Backing> = Storage::host(12 * 4);
+        let storage: Arc<dyn Backing> = Storage::host(12 * 4);
         let pages = Spans::new(vec![
-            StorageView::contiguous(Arc::clone(&memory), 0, DType::F32, &[2, 3])?,
-            StorageView::contiguous(Arc::clone(&memory), 24, DType::F32, &[2, 3])?,
+            StorageView::contiguous(Arc::clone(&storage), 0, DType::F32, &[2, 3])?,
+            StorageView::contiguous(Arc::clone(&storage), 24, DType::F32, &[2, 3])?,
         ])?;
         assert_eq!(pages.shape(), vec![4, 3]);
 
         let middle = pages.region(&[1..3, 1..3])?;
         assert_eq!(middle.views().len(), 2);
         assert_eq!(middle.shape(), vec![2, 2]);
-        assert_eq!(middle.views()[1].address(), memory.address() + 28);
+        assert_eq!(middle.views()[1].address(), storage.address() + 28);
         assert!(pages.region(&[0..5, 0..3]).is_err());
         Ok(())
     }
 
     #[test]
     fn destinations_reject_aliasing_but_accept_interleaved_pages() -> Result<()> {
-        let memory: Arc<dyn Backing> = Storage::host(16 * 4);
+        let storage: Arc<dyn Backing> = Storage::host(16 * 4);
         // Columns of a [4, 4] grid viewed as rows: `[columns, 4]` with
         // strides `[1, 4]`, starting at the first column's element.
         let columns = |first: usize, count: i64| {
             StorageView::strided(
-                Arc::clone(&memory),
+                Arc::clone(&storage),
                 first * 4,
                 DType::F32,
                 &[count, 4],
@@ -345,30 +345,30 @@ mod tests {
 
     #[test]
     fn host_copies_walk_both_partitions() -> Result<()> {
-        let source_memory: Arc<dyn Backing> = Storage::host(12 * 4);
-        let target_memory: Arc<dyn Backing> = Storage::host(12 * 4);
+        let source_storage: Arc<dyn Backing> = Storage::host(12 * 4);
+        let target_storage: Arc<dyn Backing> = Storage::host(12 * 4);
         write_floats(
-            &source_memory,
+            &source_storage,
             &(0..12).map(|value| value as f32).collect::<Vec<_>>(),
         );
         let source = Spans::single(StorageView::contiguous(
-            Arc::clone(&source_memory),
+            Arc::clone(&source_storage),
             0,
             DType::F32,
             &[4, 3],
         )?)?;
         // Destination pages store rows in reverse page order.
         let target = Spans::new(vec![
-            StorageView::contiguous(Arc::clone(&target_memory), 24, DType::F32, &[1, 3])?,
-            StorageView::contiguous(Arc::clone(&target_memory), 0, DType::F32, &[2, 3])?,
-            StorageView::contiguous(Arc::clone(&target_memory), 36, DType::F32, &[1, 3])?,
+            StorageView::contiguous(Arc::clone(&target_storage), 24, DType::F32, &[1, 3])?,
+            StorageView::contiguous(Arc::clone(&target_storage), 0, DType::F32, &[2, 3])?,
+            StorageView::contiguous(Arc::clone(&target_storage), 36, DType::F32, &[1, 3])?,
         ])?;
 
         let mut plan = copy_planner(None, SourceOrder::Stream)?;
         target.plan_copy(&source, &mut plan)?;
         // SAFETY: both operands are live host allocations owned by this test.
         unsafe { copy_on_host(&plan) };
-        let values = read_floats(&target_memory, 12);
+        let values = read_floats(&target_storage, 12);
         assert_eq!(&values[6..9], &[0.0, 1.0, 2.0]);
         assert_eq!(&values[0..6], &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         assert_eq!(&values[9..12], &[9.0, 10.0, 11.0]);

@@ -477,7 +477,7 @@ class RowFamily:
         firsts = np.zeros((self.tables.tables, rows), np.int64)
         firsts[:, : pages.starts.shape[1]] = pages.starts
         starts = tuple(int(value) for value in firsts.reshape(-1))
-        # The columns are pageable host memory: each copy reads its source
+        # The columns are pageable host storage: each copy reads its source
         # before it returns, so the host values may change behind it.
         fields, values = columns.tensors()
         with torch.cuda.stream(self.stream):

@@ -6,16 +6,16 @@
 //! holds the claiming connection for as long as it runs. The claim therefore
 //! outlives every engine and every world: an engine that succeeds another
 //! claims the scopes of its own world under the same claim, and its workers
-//! hold the same token as the running world's, so neither world's memory is
-//! touched by the other's claim. A claim names the worlds whose memory on
+//! hold the same token as the running world's, so neither world's storage is
+//! touched by the other's claim. A claim names the worlds whose storage on
 //! the node ends (`retire`): the world a commit superseded, or the world a
 //! rollback discarded.
 //!
-//! A previous world kept in host memory on trial (`KeepWeights` with
+//! A previous world kept in host storage on trial (`KeepWeights` with
 //! `to_host`) has its weights moved there by the server's Transfer Server
 //! (`Request::Offload`). Every claim of a world returns that world's weights
 //! to the GPUs they left before it is answered (`Request::Restore`), after
-//! the worlds it retires released their memory: a world started again at a
+//! the worlds it retires released their storage: a world started again at a
 //! rollback claims, and its workers then map its weights where they were.
 //!
 //! A server of an earlier protocol than this build's is restarted with this
@@ -52,7 +52,7 @@ pub(crate) struct ClaimHolder {
     executable: std::path::PathBuf,
     /// Whether processes on other nodes reach this node's server (their
     /// engine's page requests, their Transfer Servers' reads of its
-    /// memory): the server it starts then also listens on TCP.
+    /// storage): the server it starts then also listens on TCP.
     remote_pages: bool,
     /// This node's address other nodes reach, which names that listener.
     address: Option<std::net::IpAddr>,
@@ -201,7 +201,7 @@ impl ClaimHolder {
 
     /// Has this node's Storage Server keep the weights alone of `worlds` of
     /// `deployment` (`Request::KeepWeights`), over the claim this daemon
-    /// holds, and with `to_host` move them to host memory
+    /// holds, and with `to_host` move them to host storage
     /// (`Request::Offload`). Returns how many storages it released, the
     /// bytes it moved, and why it kept the weights on the GPUs when the
     /// server refused or failed the move: the weights then stay where they
@@ -263,7 +263,7 @@ impl ClaimHolder {
                         world,
                         storages,
                         bytes,
-                        "a world's weights moved to host memory"
+                        "a world's weights moved to host storage"
                     );
                 }
                 // A world that cannot is kept as its weights on the GPUs.
@@ -315,10 +315,10 @@ impl ClaimHolder {
         Ok(())
     }
 
-    /// The memory ledgers this node's Storage Server keeps for
+    /// The storage ledgers this node's Storage Server keeps for
     /// `deployment`, one per GPU of the node it uses, and what the host
-    /// admits of new host memory, as JSON (`{"ledgers": [...],
-    /// "host_memory": {...}}`), read over the claim this daemon holds.
+    /// admits of new host storage, as JSON (`{"ledgers": [...],
+    /// "host_storage": {...}}`), read over the claim this daemon holds.
     ///
     /// # Errors
     ///
@@ -334,8 +334,8 @@ impl ClaimHolder {
         let (ledgers, host) = held
             .client
             .ledger(Vec::new())
-            .with_context(|| format!("reading the memory ledgers of deployment {deployment}"))?;
-        Ok(serde_json::json!({ "ledgers": ledgers, "host_memory": host }).to_string())
+            .with_context(|| format!("reading the storage ledgers of deployment {deployment}"))?;
+        Ok(serde_json::json!({ "ledgers": ledgers, "host_storage": host }).to_string())
     }
 
     /// Restarts the server at `socket` with this daemon's executable when it
@@ -379,7 +379,7 @@ impl ClaimHolder {
     }
 }
 
-/// Returns `world`'s weights that an offload left in host memory to the
+/// Returns `world`'s weights that an offload left in host storage to the
 /// GPUs they left (`Request::Restore`), which answers at once when there
 /// are none.
 fn restore(client: &mut storage::Client, deployment: &str, world: u64) -> anyhow::Result<()> {
@@ -394,7 +394,7 @@ fn restore(client: &mut storage::Client, deployment: &str, world: u64) -> anyhow
             world,
             storages,
             bytes,
-            "a world's weights returned from host memory"
+            "a world's weights returned from host storage"
         );
     }
     Ok(())

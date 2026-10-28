@@ -21,7 +21,7 @@ fn defaults() -> Value {
             "host_kv_cache": false,
             "world": 0,
             "standby": false,
-            "standby_memory": "auto",
+            "standby_storage": "auto",
         },
         "host": "localhost",
         "device": "cpu",

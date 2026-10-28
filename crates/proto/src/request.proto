@@ -89,7 +89,7 @@ enum EngineState {
   // captured its graphs; it executes nothing until promoted.
   ENGINE_STATE_STANDBY = 5;
   // Parked: it preempted every request at a step boundary and executes
-  // nothing; it keeps its workers, memory and prefix cache index until it
+  // nothing; it keeps its workers, storage and prefix cache index until it
   // resumes or shuts down.
   ENGINE_STATE_PARKED = 6;
 }
@@ -153,7 +153,7 @@ message CacheSegments {
 }
 
 message CacheSegment {
-  // The world that created the segment's memory.
+  // The world that created the segment's storage.
   uint64 world = 1;
   // The segment's ordinal among those its world created.
   uint32 ordinal = 2;
@@ -240,7 +240,7 @@ message EngineCommand {
     // it as itself, reports itself ready there, and serves both, each its
     // own requests, until the last closes its connection.
     Attach attach = 7;
-    // Give back or restore KV cache memory on every scheduler; answered
+    // Give back or restore KV cache storage on every scheduler; answered
     // with `Hooked`.
     ResizeCache resize_cache = 8;
     // Rewrite the weights in place from another checkpoint of the same
@@ -255,13 +255,13 @@ message EngineCommand {
     // with `CacheDescribed`.
     DescribeCache describe_cache = 13;
     // The trial of a promoted engine ended: its predecessor is gone, so its
-    // workers take the predecessor's memory they mapped read-only, and a
+    // workers take the predecessor's storage they mapped read-only, and a
     // lost worker group is relaunched from then on; answered with `Hooked`.
     Commit commit = 12;
-    // Read the memory ledgers every node's Storage Server keeps for the
+    // Read the storage ledgers every node's Storage Server keeps for the
     // deployment, each node's daemon over its claim, without asking a
     // worker; answered with `Hooked`, one JSON result per node.
-    DescribeMemory describe_memory = 14;
+    DescribeStorage describe_storage = 14;
     // Halve, or restore, the byte budgets of the links the deployment's
     // transfers use at every node's Transfer Server, each node's daemon over
     // its claim; answered with `Hooked`.
@@ -286,7 +286,7 @@ message CommitExperts {
   map<string, ExpertOrder> order = 2;
 }
 
-message DescribeMemory {
+message DescribeStorage {
   // Matches the `Hooked` answer.
   uint64 id = 1;
 }
@@ -369,7 +369,7 @@ enum WeightsInFlight {
   WEIGHTS_IN_FLIGHT_ABORT = 2;
 }
 
-// A change to the device memory of every scheduler's KV cache.
+// A change to the device storage of every scheduler's KV cache.
 message ResizeCache {
   // Matches the `Hooked` answer.
   uint64 id = 1;
@@ -379,7 +379,7 @@ message ResizeCache {
   optional uint64 preempt_after_ms = 3;
   // Before the change: worlds of the deployment that keep their weights
   // alone on every node (a previous world kept as its weights, whose
-  // processes exited), so that a growth takes the rest of their memory.
+  // processes exited), so that a growth takes the rest of their storage.
   repeated uint64 keep_weights = 4;
   // For a shrink or a plan, what the world that succeeds this one adds: it
   // loads its weights from the model's files (their keys differ), and it
@@ -390,14 +390,14 @@ message ResizeCache {
   // For a shrink or a plan: the successor's graph policy captures graphs,
   // so its warmup takes a graph share where its model can be captured.
   bool successor_captures_graphs = 8;
-  // With `keep_weights`: the worlds keep their weights in host memory
+  // With `keep_weights`: the worlds keep their weights in host storage
   // (`update_config.previous_world = "host"`), which moves the weights each
   // world alone retains there through every node's Transfer Server; a node
   // that cannot keeps them on its GPUs. The `Hooked` answer then carries
   // each node's report first, as JSON `{"kept": {"host", "released",
   // "moved_bytes", "refused"}}`, `refused` saying why a node kept the
   // weights on its GPUs.
-  bool keep_in_host_memory = 7;
+  bool keep_in_host_storage = 7;
   // For a make-room change: the device bytes each device's storage ledger
   // must have room for beside everything it books.
   uint64 room_bytes = 9;
@@ -453,23 +453,23 @@ message CachePageBudget {
 }
 
 enum CacheChange {
-  // Give back the tail of the KV cache until each device has the memory a
-  // world succeeding this one needs beside the memory they share: the
+  // Give back the tail of the KV cache until each device has the storage a
+  // world succeeding this one needs beside the storage they share: the
   // requests that hold the tail run on, and are recomputed only past the
   // shrink's `preempt_after_ms`.
   CACHE_CHANGE_SHRINK = 0;
   // Create the given-back tail again.
   CACHE_CHANGE_RESTORE = 1;
-  // Give back the whole KV cache and the CUDA graph memory, keeping the
+  // Give back the whole KV cache and the CUDA graph storage, keeping the
   // weights, once no request runs.
   CACHE_CHANGE_SLEEP = 2;
   // Restore what a sleep gave back.
   CACHE_CHANGE_WAKE = 3;
-  // Create as many of the segments given back as each device's memory
+  // Create as many of the segments given back as each device's storage
   // ledger has room for: a successor world's cache grows as its
-  // predecessor's memory frees.
+  // predecessor's storage frees.
   CACHE_CHANGE_GROW = 4;
-  // Change nothing: answer, for each device, with the memory the serving
+  // Change nothing: answer, for each device, with the storage the serving
   // world and a world succeeding it hold there and the KV cache limit that
   // leaves the serving world, or fail with why such a world does not fit.
   CACHE_CHANGE_PLAN = 5;
@@ -505,7 +505,7 @@ message Promote {
   // again from their tokens: the promoted engine computes other numerics,
   // and the change recomputes them (`in_flight = recompute`).
   bool recompute = 2;
-  // Whether the predecessor's memory frees once the engine is promoted
+  // Whether the predecessor's storage frees once the engine is promoted
   // (its processes exit), so that the cache grows into it at once and the
   // requests it hands over wait for that rather than for a commit.
   bool grows = 3;
@@ -532,7 +532,7 @@ message Parked {
 message Resume {
   // Matches the `Hooked` answer.
   uint64 id = 1;
-  // Worlds whose memory ends on every node of the engine: the one a
+  // Worlds whose storage ends on every node of the engine: the one a
   // rollback discarded.
   repeated uint64 retire = 2;
 }
@@ -541,7 +541,7 @@ message Resume {
 message Commit {
   // Matches the `Hooked` answer.
   uint64 id = 1;
-  // Worlds whose memory ends on every node of the engine: the predecessor,
+  // Worlds whose storage ends on every node of the engine: the predecessor,
   // whose processes are gone.
   repeated uint64 retire = 2;
   reserved 3;
@@ -1104,7 +1104,7 @@ message EngineSpec {
   reserved 15;
   reserved "standby";
   // The world the engine executes: the daemon's identity of the processes
-  // that execute one configuration of the deployment, which keys the memory
+  // that execute one configuration of the deployment, which keys the storage
   // they create. An engine relaunched after a loss keeps its world.
   uint64 world = 16;
   // Present for an engine that succeeds the serving one on the same
@@ -1115,9 +1115,9 @@ message EngineSpec {
   // engine that replaces a lost one of its world (or restarts it at a
   // rollback) takes as its own; empty to lay the planes out afresh.
   repeated CacheSegments segments = 18;
-  // Worlds of the deployment whose memory ends on every node before this
+  // Worlds of the deployment whose storage ends on every node before this
   // engine's workers start: the world on trial a rollback discards, whose
-  // memory the previous world, started again on its kept weights, needs.
+  // storage the previous world, started again on its kept weights, needs.
   repeated uint64 retire = 19;
   // Speculative decoding with the model's drafter (`speculative_config`);
   // absent for a deployment that does not speculate. A world that
@@ -1276,12 +1276,12 @@ message Workers {
   string download_dir = 10;
   optional uint32 load_threads = 11;
   // `auto`, `resident` or `suspended`; empty for `auto`.
-  string standby_memory = 12;
+  string standby_storage = 12;
   // A plugin's weight source (`scheme://...`) that streams the checkpoint's
   // tensors in place of its files, as an in-place weight update from it
   // left them; empty to read the files.
   string weights = 13;
-  // The tensor- and expert-parallel degrees retained weight memory is
+  // The tensor- and expert-parallel degrees retained weight storage is
   // chunked for; empty for every degree up to the GPUs a worker sees.
   repeated uint32 parallel_degrees = 14;
 }

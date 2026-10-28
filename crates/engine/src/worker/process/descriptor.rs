@@ -17,7 +17,7 @@ impl WorkerProcessArgs {
     /// How long a submitted batch may go without rank progress before the
     /// group is replaced (`worker_config.watchdog_timeout`), as SGLang's default.
     pub const DEFAULT_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-    /// Share of device memory a rank may hold for weights and KV cache.
+    /// Share of device storage a rank may hold for weights and KV cache.
     pub const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.70;
     /// Attention provider name: a native kernel chosen per call.
     pub const DEFAULT_ATTENTION_BACKEND: &'static str = "auto";
@@ -56,7 +56,7 @@ impl Default for WorkerProcessArgs {
             kv_storage: None,
             keep_standby: false,
             standby: false,
-            standby_memory: proto::request::StandbyMemory::Auto,
+            standby_storage: proto::request::StandbyStorage::Auto,
             segments: None,
             world: 0,
             retire: Vec::new(),
@@ -186,7 +186,7 @@ impl WorkerProcessArgs {
         // A standby that may suspend its NCCL communicators while it parks
         // captures their collectives without registering graph buffers:
         // the registrations would not survive the suspension.
-        if self.standby && self.standby_memory != proto::request::StandbyMemory::Resident {
+        if self.standby && self.standby_storage != proto::request::StandbyStorage::Resident {
             environment.insert("NCCL_GRAPH_REGISTER".to_owned(), "0".to_owned());
         }
         Ok(environment)
@@ -389,7 +389,7 @@ const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
 /// the engine sets `MIMALLOC_ALLOW_THP` itself. mimalloc otherwise advises its
 /// 1 GiB arenas for huge pages. On a kernel with 64 KiB base pages a huge
 /// page is 512 MiB, and each time khugepaged collapses one it holds the
-/// rank's memory map for about 90 ms, which stalls the rank's service
+/// rank's storage map for about 90 ms, which stalls the rank's service
 /// thread. With the option off, mimalloc disables transparent huge pages
 /// for the rank process.
 ///
@@ -438,7 +438,7 @@ mod tests {
             peers: vec!["10.0.0.1:4100".into()],
             world: 3,
             standby: false,
-            standby_memory: proto::request::StandbyMemory::Suspended,
+            standby_storage: proto::request::StandbyStorage::Suspended,
         }
     }
 

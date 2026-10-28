@@ -3,10 +3,10 @@
 //! model, or from a plugin's weight source that streams its tensors, and
 //! renames its retained weights after it.
 //!
-//! The library loads the checkpoint into new memory as the rank loaded its
+//! The library loads the checkpoint into new storage as the rank loaded its
 //! model and copies every tensor into place once all of them match
 //! (`uniserve.loading.rank.update_weights`); the engine runs the update
-//! while the rank sleeps, so the KV cache's memory holds the new copy. The
+//! while the rank sleeps, so the KV cache's storage holds the new copy. The
 //! retained weights are mapped read-only, so the rank maps them writable
 //! for the copy and read-only again after. Their keys digest the checkpoint
 //! they were loaded from (`weights`): the Storage Server moves them to the
@@ -23,14 +23,14 @@ use tvm_ffi::Any;
 use super::loading::{Description, LoadedModel};
 use crate::config::{ExpertUnion, WorkerLaunch};
 use crate::ffi::{Backing, Handle, Interpreter, MemoryKind};
-use crate::memory::CachePlan;
-use crate::memory::allocation::Storage;
-use crate::memory::prefix_cache::host::page_contents;
-use crate::memory::retained::Retained;
-use crate::memory::weights::{self, Planned, Rebalance, WeightKeys};
 use crate::parallel::{DwdpUpdate, ExpertWeights};
+use crate::storage::CachePlan;
+use crate::storage::allocation::Storage;
+use crate::storage::prefix_cache::host::page_contents;
+use crate::storage::retained::Retained;
+use crate::storage::weights::{self, Planned, Rebalance, WeightKeys};
 use crate::{Error, Result};
-use storage::manifest::weights::{Sources, Transfer};
+use ::storage::manifest::weights::{Sources, Transfer};
 
 /// What an in-place weight update rewrites and renames.
 pub(crate) struct WeightUpdate {
@@ -50,7 +50,7 @@ pub(crate) struct WeightUpdate {
     /// Runtime-owned expert routing, bound before numerical graph capture.
     pub(crate) routing: Handle,
     /// Creating handles of the allocations currently mapped at graph addresses.
-    pub(crate) allocations: BTreeMap<storage::Key, Arc<cuda::PhysicalAllocation>>,
+    pub(crate) allocations: BTreeMap<::storage::Key, Arc<cuda::PhysicalAllocation>>,
     /// Background weight redistribution, before the common commit boundary.
     pub(crate) rebalance: Option<ExpertUpdate>,
     pub(crate) distributed: Option<Arc<DwdpUpdate>>,
@@ -298,8 +298,8 @@ impl WeightUpdate {
     }
 
     /// Why the rank's weights cannot be rewritten in place, if so: stacks
-    /// streamed from host memory lie in sealed host memory, and DWDP moves
-    /// the routed experts into memory of the expert union.
+    /// streamed from host storage lie in sealed host storage, and DWDP moves
+    /// the routed experts into storage of the expert union.
     fn refusal(&self) -> Option<&'static str> {
         if self
             .launch
@@ -307,7 +307,7 @@ impl WeightUpdate {
             .values()
             .any(|component| component.weights == ipc::ComponentWeights::Host)
         {
-            return Some("weights streamed from host memory lie in sealed memory");
+            return Some("weights streamed from host storage lie in sealed storage");
         }
         if self
             .launch
@@ -315,12 +315,12 @@ impl WeightUpdate {
             .as_ref()
             .is_some_and(ExpertUnion::prefetches_weights)
         {
-            return Some("DWDP keeps the routed experts in memory of the expert union");
+            return Some("DWDP keeps the routed experts in storage of the expert union");
         }
         None
     }
 
-    /// The retained storages in device memory, which the rank maps
+    /// The retained storages in device storage, which the rank maps
     /// read-only once published.
     fn device_storages(&self) -> impl Iterator<Item = &Arc<Storage>> {
         self.storages

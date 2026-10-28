@@ -49,8 +49,8 @@ impl Device {
         }
     }
 
-    /// The memory a binding on this device computes in.
-    pub(crate) fn memory(self) -> MemoryKind {
+    /// The storage a binding on this device computes in.
+    pub(crate) fn storage(self) -> MemoryKind {
         match self {
             Self::Cpu => MemoryKind::Host,
             Self::Cuda(device) => MemoryKind::Cuda(device),

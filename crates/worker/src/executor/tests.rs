@@ -5,7 +5,7 @@
 //! The rank under test holds no component: it serves lifecycle batches
 //! (Start, Finish and Free commands), whose forwards submit no job, so each
 //! batch runs from its admission to its result on the calling thread. The
-//! retirement cases give the rank its storage owners on host memory: the
+//! retirement cases give the rank its storage owners on host storage: the
 //! product store holds the request products whose readers a retirement
 //! waits for.
 
@@ -23,9 +23,9 @@ use super::{Batch, Executor, Submission};
 use crate::config::placement::{Components, GroupPlacement};
 use crate::error::WorkerError;
 use crate::ffi::MemoryKind;
-use crate::memory::{BufferPool, OutputPlacement, ProductRead, ProductStore};
+use crate::storage::{BufferPool, OutputPlacement, ProductRead, ProductStore};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
-use crate::worker::WorkerMemory;
+use crate::worker::WorkerStorage;
 use crate::{Error, ErrorCode, EventPool};
 
 type Result<T> = std::result::Result<T, WorkerError>;
@@ -198,7 +198,7 @@ fn cpu_worker(capacity: usize) -> Result<Executor> {
         vec![MemoryKind::Host],
         0,
         0,
-        BufferPool::allocate(1024, &[MemoryKind::Host], &mut crate::memory::LocalMemory)?,
+        BufferPool::allocate(1024, &[MemoryKind::Host], &mut crate::storage::LocalStorage)?,
         Arc::clone(&events),
     )?;
     let options = TransportOptions {
@@ -214,13 +214,15 @@ fn cpu_worker(capacity: usize) -> Result<Executor> {
         Arc::clone(&events),
         &options,
     )?;
-    executor.backend_mut().set_worker_storage(WorkerMemory::new(
-        events,
-        tensors,
-        Arc::new(transports),
-        None,
-        None,
-    ));
+    executor
+        .backend_mut()
+        .set_worker_storage(WorkerStorage::new(
+            events,
+            tensors,
+            Arc::new(transports),
+            None,
+            None,
+        ));
     Ok(executor)
 }
 

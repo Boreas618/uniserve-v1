@@ -1,9 +1,9 @@
 //! Transfer Server tasks borrowing scheduler-owned cache pages.
 
-use storage::manifest::cache::Copy;
-use storage::protocol::{Priority, TransferEnd};
+use ::storage::manifest::cache::Copy;
+use ::storage::protocol::{Priority, TransferEnd};
 
-use crate::memory::retained::Retained;
+use crate::storage::retained::Retained;
 use crate::{Error, Result};
 
 /// The rank's current warming round. Keeping the task at its connection

@@ -33,7 +33,7 @@ use super::read::{NativeRead, ReadCall};
 use super::transport::{Staged, read_destination};
 use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Spans, copy_planner};
 use crate::ffi::{Backing, DType, MemoryKind};
-use crate::memory::allocation::{Residency, Storage, StorageView};
+use crate::storage::allocation::{Residency, Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 use handle::AllocationHandle;
@@ -161,9 +161,9 @@ impl CudaExports {
             ));
         };
         let first = source.first();
-        let backing = Arc::as_ptr(first.memory()).cast::<()>();
+        let backing = Arc::as_ptr(first.storage()).cast::<()>();
         if source.views().iter().any(|view| {
-            Arc::as_ptr(view.memory()).cast::<()>() != backing || view.strides() != first.strides()
+            Arc::as_ptr(view.storage()).cast::<()>() != backing || view.strides() != first.strides()
         }) {
             return Err(Error::Invalid(
                 "CUDA VMM export spans require one allocation and stride".into(),
@@ -201,17 +201,17 @@ impl CudaExports {
 
         let result = (|| -> Result<Option<Staged>> {
             let first = source.first().address();
-            // Memory registered as exportable is exported in place when it
-            // has a handle its readers can import: retained memory exports
+            // Storage registered as exportable is exported in place when it
+            // has a handle its readers can import: retained storage exports
             // its descriptor, which reaches this host's readers only.
             let in_place = match Storage::exportable_containing(first) {
-                Some((memory, offset, residency)) => memory
+                Some((storage, offset, residency)) => storage
                     .export(self.cross_host)?
-                    .map(|shareable| (memory, offset, residency, shareable)),
+                    .map(|shareable| (storage, offset, residency, shareable)),
                 None => None,
             };
             let (spans, handle, size, offset, residency) = match in_place {
-                Some((memory, offset, residency, shareable)) => {
+                Some((storage, offset, residency, shareable)) => {
                     let handle = AllocationHandle::of(&shareable);
                     if let ShareableHandle::Descriptor(fd) = shareable {
                         state.descriptor = Some(fd);
@@ -219,7 +219,7 @@ impl CudaExports {
                     (
                         source.clone(),
                         handle,
-                        memory.bytes() as u64,
+                        storage.bytes() as u64,
                         offset,
                         residency,
                     )
@@ -231,11 +231,11 @@ impl CudaExports {
                         return Ok(None);
                     };
                     state.allocation = Some((Arc::clone(&pool.pool), Arc::clone(&chunk)));
-                    let memory = Arc::clone(lock(&pool.pool).backing()?);
+                    let storage = Arc::clone(lock(&pool.pool).backing()?);
                     // Readers map the whole allocation, whose length the
                     // driver rounded up to its granularity.
-                    let storage_bytes = memory.bytes() as u64;
-                    let backing = memory as Arc<dyn Backing>;
+                    let storage_bytes = storage.bytes() as u64;
+                    let backing = storage as Arc<dyn Backing>;
                     let shape: Vec<i64> =
                         source.shape().iter().map(|&extent| extent as i64).collect();
                     let payload = Spans::single(StorageView::contiguous(
@@ -393,10 +393,10 @@ impl CudaExports {
             return Ok(Arc::clone(pool));
         }
         // Readers in this process may copy from another device.
-        let memory = Storage::exportable(device, self.pool_bytes, &Storage::peers(device)?)?;
-        let allocation = memory
+        let storage = Storage::exportable(device, self.pool_bytes, &Storage::peers(device)?)?;
+        let allocation = storage
             .allocation()
-            .ok_or_else(|| Error::Invariant("an export pool is device memory".into()))?;
+            .ok_or_else(|| Error::Invariant("an export pool is device storage".into()))?;
         let shareable = allocation.export()?.ok_or_else(|| {
             Error::Invariant("an export pool allocation has a shareable handle".into())
         })?;
@@ -405,11 +405,11 @@ impl CudaExports {
             ShareableHandle::Descriptor(fd) => Some(fd),
             ShareableHandle::Fabric(_) => None,
         };
-        let address = memory.address() as usize;
-        let capacity = memory.bytes();
-        // SAFETY: the pool retains `memory`, which maps `capacity` writable
+        let address = storage.address() as usize;
+        let capacity = storage.bytes();
+        // SAFETY: the pool retains `storage`, which maps `capacity` writable
         // bytes at `address`; producer streams outlive the transport.
-        let pool = unsafe { VmmPool::new(memory, device, address, capacity) }?;
+        let pool = unsafe { VmmPool::new(storage, device, address, capacity) }?;
         let pool = Arc::new(DevicePool {
             pool: Arc::new(Mutex::new(pool)),
             handle,

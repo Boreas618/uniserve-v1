@@ -4,14 +4,14 @@
 //! The program is a second deployment on the serving deployment's Storage
 //! Server (the one its daemon started, on the same socket). It claims its
 //! own deployment as a head, connects as that deployment's worker under the
-//! claim, allocates retainable CUDA VMM memory on GPU A and GPU B and a host
+//! claim, allocates retainable CUDA VMM storage on GPU A and GPU B and a host
 //! memfd on GPU A's NUMA node, publishes them as tensors, and then keeps the
 //! Transfer Server copying into GPU A over three links, one at a time:
 //!
 //! | Link | Source → destination | Copy engines |
 //! | --- | --- | --- |
 //! | `local` | GPU A → GPU A | GPU A's |
-//! | `host` | host memory → GPU A | GPU A's |
+//! | `host` | host storage → GPU A | GPU A's |
 //! | `peer` | GPU B → GPU A | GPU A's, reading over the GPUs' link |
 //!
 //! For every link (in `--links` order) and every budget (in `--halvings`
@@ -68,13 +68,13 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ::storage::protocol::{Event, Link, LinkEnd, Priority, Region, Span, Throttle, TransferEnd};
+use ::storage::{
+    Access, Client, GpuLedger, Key, Placement, Role, Scope, StorageRecord, TensorRecord,
+};
 use anyhow::{Context, bail, ensure};
 use cuda::{DeviceAllocation, DeviceAttribute, DeviceId};
 use rustix::event::{PollFd, PollFlags, poll};
-use storage::protocol::{Event, Link, Memory, Priority, Region, Span, Throttle, TransferEnd};
-use storage::{
-    Access, Client, GpuLedger, Key, Placement, Role, Scope, StorageRecord, TensorRecord,
-};
 
 /// The budget a restored link regains per second, as a share of its
 /// bandwidth (the Transfer Server's `RESTORE_PER_SECOND`).
@@ -318,7 +318,7 @@ fn host_memfd(bytes: u64, node: Option<u32>) -> anyhow::Result<OwnedFd> {
 
 /// The Storage Server's listing once its Transfer Server reported its
 /// links.
-fn measured_listing(socket: &std::path::Path) -> anyhow::Result<storage::Listing> {
+fn measured_listing(socket: &std::path::Path) -> anyhow::Result<::storage::Listing> {
     let mut operator = Client::connect(socket, Role::Operator)?;
     let deadline = Instant::now() + PATIENCE;
     loop {
@@ -370,7 +370,7 @@ struct Route {
     link: Link,
 }
 
-/// The copy deployment's connections and the memory it published.
+/// The copy deployment's connections and the storage it published.
 struct Copier {
     head: Client,
     worker: Client,
@@ -612,10 +612,10 @@ fn run(options: &Options) -> anyhow::Result<()> {
         .ok()
         .and_then(|node| u32::try_from(node).ok());
 
-    let device = |gpu: [u8; 16]| Memory::Device { gpu };
+    let device = |gpu: [u8; 16]| LinkEnd::Device { gpu };
     let routes = [
         (LinkKind::Local, "source-a", device(gpu_a)),
-        (LinkKind::Host, "source-host", Memory::Host),
+        (LinkKind::Host, "source-host", LinkEnd::Host),
         (LinkKind::Peer, "source-b", device(gpu_b)),
     ]
     .map(|(kind, source, from)| Route {

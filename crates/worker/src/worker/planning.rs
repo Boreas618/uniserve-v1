@@ -20,8 +20,8 @@ use crate::capacity::video::{VideoCapacity, VideoManifest};
 use crate::config::placement::Capability;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
-use crate::memory::{CachePlan, GroupShape, LatentPlan, PrefixCache, UnitColumn};
 use crate::parallel::world::World;
+use crate::storage::{CachePlan, GroupShape, LatentPlan, PrefixCache, UnitColumn};
 use crate::{Error, Result};
 
 /// Block-table width that holds the longest admitted sequence in every
@@ -78,7 +78,7 @@ pub(super) fn cache_budget(
     launch: &WorkerLaunch,
     config: &WorkerConfig,
     plan: &Plan,
-    budget: &mut storage::manifest::weights::RankBudget,
+    budget: &mut ::storage::manifest::weights::RankBudget,
 ) -> Result<()> {
     let Some(cache) = plan.cache.as_ref() else {
         return Ok(());
@@ -115,7 +115,7 @@ pub(super) fn cache_budget(
         .groups
         .iter()
         .filter(|group| !group.draft)
-        .map(|group| storage::manifest::weights::CachePage {
+        .map(|group| ::storage::manifest::weights::CachePage {
             tokens: group.block_size,
             bytes: u64::from(group.units_per_page) * value_bytes,
             window: group.window,

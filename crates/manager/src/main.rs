@@ -19,8 +19,8 @@
 //!   `--commit-after` commits once it served that long and before the next
 //!   node changes, so that every other node serves meanwhile.
 //! - `commit`, `rollback`: end each node's trial.
-//! - `shutdown`: brings each node's deployment down, releasing its memory
-//!   unless `--keep-memory`.
+//! - `shutdown`: brings each node's deployment down, releasing its storage
+//!   unless `--keep-storage`.
 //! - `restart`: a rolling hot restart of each node's daemon, one node after
 //!   another, stopping at the first that fails.
 //! - `pause`, `continue`, `flush-cache`: the generation and cache operations
@@ -100,7 +100,7 @@ enum Command {
         /// Keep the deployment's weights and caches retained for a restart
         /// of the same deployment.
         #[arg(long)]
-        keep_memory: bool,
+        keep_storage: bool,
     },
     /// A rolling hot restart of each node's daemon, to its own build or the
     /// one `--executable` names: each node in turn, stopping at the first
@@ -313,9 +313,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Shutdown { keep_memory } => {
+        Command::Shutdown { keep_storage } => {
             for node in &nodes {
-                node.post("/admin/shutdown", &json!({ "retire": !keep_memory }))
+                node.post("/admin/shutdown", &json!({ "retire": !keep_storage }))
                     .await?;
                 println!("{}: shutting down", node.base);
             }

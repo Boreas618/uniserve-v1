@@ -30,8 +30,8 @@ use ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
 use ipc::{CallId, RequestId, UnitId};
 use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
 use worker::ffi::{Function, Handle, Interpreter};
-use worker::memory::LocalMemory;
-use worker::memory::{CachePlan, PrefixCache, StorageView, UnitColumn};
+use worker::storage::LocalStorage;
+use worker::storage::{CachePlan, PrefixCache, StorageView, UnitColumn};
 use worker::transfer::exports;
 use worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
 use worker::{EventPool, Result};
@@ -150,7 +150,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         1,
         Some(devices[0]),
         Some(&streams[0]),
-        &mut LocalMemory,
+        &mut LocalStorage,
     )?;
     let mut destination = PrefixCache::new(
         Arc::clone(&destination_plan),
@@ -161,7 +161,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         2,
         Some(devices[1]),
         Some(&streams[1]),
-        &mut LocalMemory,
+        &mut LocalStorage,
     )?;
 
     // Python writes the producer's tokens through the bound views.
@@ -313,7 +313,7 @@ fn lifecycle(config: Any) -> Result<Map<FfiString, Any>> {
         1,
         None,
         None,
-        &mut LocalMemory,
+        &mut LocalStorage,
     )?;
     let column = cache.bind_units(None)?;
     let views = tensor_map(&cache.views()?)?;

@@ -50,7 +50,7 @@ class VisionImage:
 
     Attributes:
         pixels: Its prepared ``[patches, row]`` patch rows: page-locked
-            host memory the worker prepared, or a device tensor.
+            host storage the worker prepared, or a device tensor.
         grid: Its ``(rows, columns)`` patch grid.
         out: The ``[features, output_size]`` product its features fill.
     """

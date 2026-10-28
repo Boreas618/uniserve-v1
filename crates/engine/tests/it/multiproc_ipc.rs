@@ -359,7 +359,7 @@ fn a_serving_worker_leaves_interrupt_and_termination_to_its_engine() -> anyhow::
         // of the job; the rank keeps serving until its engine closes it.
         let pid = libc::pid_t::try_from(child.id())?;
         for signal in [libc::SIGINT, libc::SIGTERM] {
-            // SAFETY: kill takes only integer arguments and touches no memory of this process.
+            // SAFETY: kill takes only integer arguments and touches no storage of this process.
             anyhow::ensure!(unsafe { libc::kill(pid, signal) } == 0);
         }
         serve(2, 62, 2)?;
@@ -413,7 +413,7 @@ fn a_starting_worker_stops_on_interrupt_and_dies_of_termination() -> anyhow::Res
             rendezvous.set_nonblocking(false)?;
             let (_peer, _) = rendezvous.accept()?;
             let pid = libc::pid_t::try_from(child.id())?;
-            // SAFETY: kill takes only integer arguments and touches no memory of this process.
+            // SAFETY: kill takes only integer arguments and touches no storage of this process.
             anyhow::ensure!(unsafe { libc::kill(pid, signal) } == 0);
             let status = wait_exit(&mut child, Duration::from_secs(30))?;
             if expect_interrupt {
@@ -1053,7 +1053,7 @@ fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
         )?;
         let pid =
             std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
-        // SAFETY: kill takes only integer arguments and touches no memory of this process.
+        // SAFETY: kill takes only integer arguments and touches no storage of this process.
         anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
 
         let loss = worker
@@ -1692,7 +1692,7 @@ fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()>
 
     // Losing rank 0 relaunches the group.
     let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
-    // SAFETY: kill takes only integer arguments and touches no memory of this process.
+    // SAFETY: kill takes only integer arguments and touches no storage of this process.
     anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
     let failure = worker
         .poll_batch(Duration::from_secs(60))
@@ -1777,7 +1777,7 @@ fn a_relaunching_group_leaves_its_executor_serving_the_others() -> anyhow::Resul
     };
 
     let pid = std::fs::read_to_string(directory.path().join("1.pid"))?.parse::<libc::pid_t>()?;
-    // SAFETY: kill takes only integer arguments and touches no memory of this process.
+    // SAFETY: kill takes only integer arguments and touches no storage of this process.
     anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let loss = loop {
@@ -1861,7 +1861,7 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     // boundary as a missing deployment prerequisite, without changing IPC.
     remove_file(wrapper)?;
     let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
-    // SAFETY: kill takes only integer arguments and touches no memory of this process.
+    // SAFETY: kill takes only integer arguments and touches no storage of this process.
     anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !engine.is_dead() && std::time::Instant::now() < deadline {
@@ -1920,7 +1920,7 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
     let result = (|| -> anyhow::Result<()> {
         let pid =
             std::fs::read_to_string(directory.path().join("1-0.pid"))?.parse::<libc::pid_t>()?;
-        // SAFETY: kill takes only integer arguments and touches no memory of this process.
+        // SAFETY: kill takes only integer arguments and touches no storage of this process.
         anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
         // The relaunch has started once its first rank recorded itself.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -2337,7 +2337,7 @@ fn a_request_on_a_lost_group_migrates_and_continues_after_the_relaunch() -> anyh
         }
         let pid =
             std::fs::read_to_string(directory.path().join("1-0.pid"))?.parse::<libc::pid_t>()?;
-        // SAFETY: kill takes only integer arguments and touches no memory of this process.
+        // SAFETY: kill takes only integer arguments and touches no storage of this process.
         anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
         let (tokens, terminal) = tokens_until_terminal(&mut events)?;
         generated.extend(tokens);
@@ -2384,9 +2384,9 @@ fn a_request_on_a_lost_group_migrates_and_continues_after_the_relaunch() -> anyh
 /// own default pool.
 /// Launched ranks keep their host heap out of transparent huge pages: no
 /// mapping of a rank process is advised for them (`MADV_HUGEPAGE`, VmFlags
-/// `hg`), so khugepaged never collapses a serving rank's memory.
+/// `hg`), so khugepaged never collapses a serving rank's storage.
 #[test]
-fn launched_workers_hold_no_huge_page_advised_memory() -> anyhow::Result<()> {
+fn launched_workers_hold_no_huge_page_advised_storage() -> anyhow::Result<()> {
     let mut args = worker_group_args();
     args.worker_id = "huge-pages".into();
     let worker = WorkerGroup::spawn(args)?;
@@ -2596,7 +2596,7 @@ impl PausedProcess {
     fn new(pid: i32) -> anyhow::Result<Self> {
         anyhow::ensure!(pid > 0, "worker process id must be positive");
         anyhow::ensure!(
-            // SAFETY: kill takes only integer arguments and touches no memory of this process.
+            // SAFETY: kill takes only integer arguments and touches no storage of this process.
             unsafe { libc::kill(pid, libc::SIGSTOP) } == 0,
             "failed to pause the selected worker: {}",
             std::io::Error::last_os_error()
@@ -2617,7 +2617,7 @@ impl PausedProcess {
     fn resume(&mut self) -> anyhow::Result<()> {
         if let Some(pid) = self.0 {
             anyhow::ensure!(
-                // SAFETY: kill takes only integer arguments and touches no memory of this process.
+                // SAFETY: kill takes only integer arguments and touches no storage of this process.
                 unsafe { libc::kill(pid, libc::SIGCONT) } == 0,
                 "failed to resume the selected worker: {}",
                 std::io::Error::last_os_error()
@@ -2630,7 +2630,7 @@ impl PausedProcess {
     fn terminate(mut self) -> anyhow::Result<()> {
         let pid = self.0.context("selected worker is no longer paused")?;
         anyhow::ensure!(
-            // SAFETY: kill takes only integer arguments and touches no memory of this process.
+            // SAFETY: kill takes only integer arguments and touches no storage of this process.
             unsafe { libc::kill(pid, libc::SIGKILL) } == 0,
             "failed to terminate the selected worker: {}",
             std::io::Error::last_os_error()
@@ -2716,7 +2716,7 @@ fn worker_group_args() -> WorkerProcessArgs {
 /// states it, as a launch's does.
 const STUB_WORKER: &str = "worker";
 
-/// The Storage Server the directly driven stub workers keep their memory
+/// The Storage Server the directly driven stub workers keep their storage
 /// at, served by a thread of this test process, and the claim its head,
 /// this process, holds for their deployment.
 fn stub_storage() -> ipc::StorageLaunch {
@@ -2760,7 +2760,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 peers: Vec::new(),
                 world: 0,
                 standby: false,
-                standby_memory: proto::request::StandbyMemory::Auto,
+                standby_storage: proto::request::StandbyStorage::Auto,
             };
             (std::sync::Mutex::new(head), launch)
         })
@@ -4768,7 +4768,7 @@ fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Re
 /// installed and the token the source sampled: the target's greedy
 /// continuation of a prompt equals the source's token for token, since the
 /// installed pages hold the source's bytes. Cache and token cross over shared
-/// memory and over CUDA VMM. Over CUDA VMM the source's pages are read where
+/// storage and over CUDA VMM. Over CUDA VMM the source's pages are read where
 /// they lie, and the token, a relay scalar outside exportable storage, is
 /// copied into the source's export pool beside its cache pool of a served
 /// model's scale. `UNISERVE_KV_INSTALL_MODEL` names the checkpoint and
@@ -5013,7 +5013,7 @@ fn cuda_worker(
 }
 
 /// The deployments of a test's CUDA workers, retired at the host's Storage
-/// Server once the test's workers are gone: their device memory outlives
+/// Server once the test's workers are gone: their device storage outlives
 /// them there, and no later launch claims a test's deployment again. A test
 /// declares it before its workers, so that it drops after them.
 #[derive(Default)]
@@ -5110,7 +5110,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 
     // The ranks are `media_worker` processes speaking the rank protocol. Each
     // answers Info with a real stub group's worker info, completes every
-    // call it receives and attaches a shared-memory media payload to a
+    // call it receives and attaches a shared-storage media payload to a
     // completion, selected by case: a valid payload from rank 0
     // ("retained"), a payload on a call identity the batch never carried
     // ("unknown-call"), a payload from rank 1 ("rank-output"), and a payload

@@ -329,7 +329,7 @@ impl WorkerGroup {
 
         // A world on trial is not repaired: a fault of its workers fails the
         // engine, and the daemon rolls the deployment back to the
-        // predecessor world, which never gave up its memory.
+        // predecessor world, which never gave up its storage.
         if self.process_args.predecessor.is_some() {
             if let Err(error) = super::processes::lock(&self.processes)
                 .and_then(|mut processes| processes.stop(&self.process_args.worker_id))

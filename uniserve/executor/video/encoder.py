@@ -59,7 +59,7 @@ __all__ = [
 
 # The posterior draws held at most: one per condition size, the oldest
 # released first. Sixteen draws of five-second 16:9 references take about
-# 230 MB of page-locked memory.
+# 230 MB of page-locked storage.
 POSTERIORS = 16
 
 

@@ -28,7 +28,7 @@ use crate::profiling::kernels::KernelWatch;
 use crate::profiling::profiler::Profiler;
 use crate::profiling::session::Session;
 use crate::request::RequestPool;
-use crate::worker::WorkerMemory;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 
 pub(crate) use steps::WorkerBatch;
@@ -72,7 +72,7 @@ pub(crate) struct WorkerBackend {
 #[derive(Default)]
 pub(crate) struct Owners {
     /// The rank's storage owners (events, products, transports, prefix cache).
-    worker_storage: Option<WorkerMemory>,
+    worker_storage: Option<WorkerStorage>,
     /// The rank's executor, shared by the computations, the expert union member
     /// and warmup, and closed after them.
     executor: Option<Arc<PythonExecutor>>,
@@ -83,7 +83,7 @@ pub(crate) struct Owners {
     experts: Option<ExpertMember>,
     /// Distributed expert weights, on ranks that prefetch them.
     weights: Option<crate::parallel::DwdpManager>,
-    /// Layer stacks streamed from host memory, on ranks of components that
+    /// Layer stacks streamed from host storage, on ranks of components that
     /// keep their weights there.
     host_weights: Vec<crate::parallel::HostWeights>,
     /// The transfer runtime: tensor transfers, cache exports and installs, and
@@ -114,7 +114,7 @@ pub(crate) struct Parts<'a> {
     pub placement: &'a GroupPlacement,
     pub rank: usize,
     pub requests: &'a mut RequestPool,
-    pub storage: Option<&'a mut WorkerMemory>,
+    pub storage: Option<&'a mut WorkerStorage>,
     pub computations: Option<&'a mut Computations>,
     pub transfer: Option<&'a mut super::transfer::TransferRuntime>,
 }
@@ -235,16 +235,16 @@ impl WorkerBackend {
     }
 
     /// Install the rank's storage owners.
-    pub(crate) fn set_worker_storage(&mut self, storage: WorkerMemory) {
+    pub(crate) fn set_worker_storage(&mut self, storage: WorkerStorage) {
         self.owners.worker_storage = Some(storage);
         self.serve_events();
     }
 
-    pub(crate) fn worker_storage(&self) -> Option<&WorkerMemory> {
+    pub(crate) fn worker_storage(&self) -> Option<&WorkerStorage> {
         self.owners.worker_storage.as_ref()
     }
 
-    pub(crate) fn worker_storage_mut(&mut self) -> Option<&mut WorkerMemory> {
+    pub(crate) fn worker_storage_mut(&mut self) -> Option<&mut WorkerStorage> {
         self.owners.worker_storage.as_mut()
     }
 
@@ -305,7 +305,7 @@ impl WorkerBackend {
         self.owners.weights = Some(weights);
     }
 
-    /// Install the layer stacks streamed from host memory.
+    /// Install the layer stacks streamed from host storage.
     pub(crate) fn set_host_weights(&mut self, weights: Vec<crate::parallel::HostWeights>) {
         self.owners.host_weights = weights;
     }
@@ -328,7 +328,7 @@ impl WorkerBackend {
             None => Ok(()),
         };
         // Host weights' copies run on the library's streams, which a close
-        // drains; an aborted close keeps their memory until exit, since
+        // drains; an aborted close keeps their storage until exit, since
         // copies may still be queued.
         let mut host = Ok(());
         for streamed in std::mem::take(&mut self.owners.host_weights) {
@@ -678,7 +678,7 @@ impl WorkerBackend {
             .owners
             .worker_storage
             .as_ref()
-            .is_some_and(WorkerMemory::awaiting_acknowledgment))
+            .is_some_and(WorkerStorage::awaiting_acknowledgment))
     }
 
     /// Whether a join of the union's step is in flight

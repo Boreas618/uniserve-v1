@@ -15,7 +15,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// How long the server waits before starting a child that ended again, so a
-/// child that fails at once (it cannot reach Mooncake, a GPU has no memory
+/// child that fails at once (it cannot reach Mooncake, a GPU has no storage
 /// for its context) does not restart in a loop.
 pub(super) const RESTART_DELAY: Duration = Duration::from_secs(5);
 

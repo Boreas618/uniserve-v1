@@ -12,7 +12,7 @@
 //!
 //! An operation names its stream, so one job orders work across the rank's
 //! device stream and the streams forked from it, and a job of a rank without a
-//! CUDA device (no stream) is plain memory writes and calls.
+//! CUDA device (no stream) is plain storage writes and calls.
 //!
 //! A job is performed completely or it fails at one operation. After a failure
 //! the remaining copies, fills, calls, host functions and waits are not
@@ -95,7 +95,7 @@ pub(super) enum Operation {
 }
 
 /// A host check of a job's completion so far ([`Job::check`]): it reads what
-/// the calls recorded before it returned and the host memory they wrote,
+/// the calls recorded before it returned and the host storage they wrote,
 /// touches no stream, and refuses with an error.
 pub(crate) type Check = Box<dyn FnOnce(&Completion) -> Result<()> + Send>;
 
@@ -239,7 +239,7 @@ impl Job {
     }
 
     /// Record what its user issues as operations of this job on `stream`
-    /// (host memory without one).
+    /// (host storage without one).
     pub(crate) fn on<'r>(&'r self, stream: Option<&'r Stream>) -> Recorder<'r> {
         Recorder { job: self, stream }
     }
@@ -429,7 +429,7 @@ impl Issue for Recorder<'_> {
                 let total = copies.iter().map(|(_, _, bytes)| bytes).sum();
                 let mut sources = Vec::with_capacity(total);
                 for (_, source, bytes) in copies.iter() {
-                    // SAFETY: the caller's sources are host memory readable
+                    // SAFETY: the caller's sources are host storage readable
                     // during this call.
                     sources.extend_from_slice(unsafe {
                         std::slice::from_raw_parts(source as *const u8, bytes)

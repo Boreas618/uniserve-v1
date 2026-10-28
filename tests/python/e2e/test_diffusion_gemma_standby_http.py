@@ -5,7 +5,7 @@ fused MegaMoE kernel, whose symmetric buffers live in an NVSHMEM heap. With
 ``worker_config.standby`` the failure domain keeps a standby world: once
 both schedulers serve, each worker group is launched a second time at a
 rendezvous of its own, captures its graphs and parks. Suspended
-(``worker_config.standby_memory``), the standby frees its graph memory, its
+(``worker_config.standby_storage``), the standby frees its graph storage, its
 NCCL buffers and its NVSHMEM heap, whose addresses NVSHMEM does not keep
 across leaving and joining; its promotion restores the first two, joins
 NVSHMEM again with new buffers and captures the graphs that run expert
@@ -124,9 +124,9 @@ def _ask(base_url: str) -> str:
     return response.json()["choices"][0]["message"]["content"]
 
 
-@pytest.mark.parametrize("standby_memory", ["resident", "suspended"])
+@pytest.mark.parametrize("standby_storage", ["resident", "suspended"])
 def test_a_megamoe_world_promotes_its_standby_world_when_a_rank_is_lost(
-    tmp_path: Path, standby_memory: str
+    tmp_path: Path, standby_storage: str
 ):
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
@@ -154,7 +154,7 @@ def test_a_megamoe_world_promotes_its_standby_world_when_a_rank_is_lost(
         "--set",
         "worker_config.standby=true",
         "--set",
-        f"worker_config.standby_memory={standby_memory}",
+        f"worker_config.standby_storage={standby_storage}",
     ]
     env = {"CUDA_VISIBLE_DEVICES": "0,1", "XDG_RUNTIME_DIR": str(runtime)}
     log = tmp_path / "server.log"
@@ -179,7 +179,7 @@ def test_a_megamoe_world_promotes_its_standby_world_when_a_rank_is_lost(
         return any(text in line for line in lines)
 
     assert not logged("relaunching the failure domain's worker groups")
-    if standby_memory == "suspended":
+    if standby_storage == "suspended":
         for event in (
             "the standby worker released its expert workspaces",
             "the standby worker suspended its communicators",
@@ -188,5 +188,5 @@ def test_a_megamoe_world_promotes_its_standby_world_when_a_rank_is_lost(
         ):
             assert logged(event), event
     else:
-        assert logged("the standby worker keeps its graph memory resident")
+        assert logged("the standby worker keeps its graph storage resident")
     assert before and after == before

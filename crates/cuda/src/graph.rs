@@ -6,7 +6,7 @@ use crate::{DeviceId, PrimaryContext, Result, Stream, reclaim};
 /// A CUDA graph executable (`CUgraphExec`) owned by this value: it is
 /// instantiated from a captured graph and destroyed when the value drops.
 ///
-/// The executable holds the addresses of the memory its nodes read and
+/// The executable holds the addresses of the storage its nodes read and
 /// write and calls the kernels of the modules it was captured with; its
 /// owner keeps both until the executable is dropped, and drains every
 /// stream it was launched on first.

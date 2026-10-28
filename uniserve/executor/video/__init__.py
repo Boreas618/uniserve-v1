@@ -9,7 +9,7 @@ under assembly) from the request's start to its slot's release.
 
 A batch is served in two calls. :meth:`VideoExecutor.prepare` states what
 each call reads and writes: which inputs, and every output's shape, region and
-memory, whether a host task fills it after the batch commits and how it is
+storage, whether a host task fills it after the batch commits and how it is
 published. The worker leases the reads and binds the writes, then
 :meth:`VideoExecutor.execute` runs the calls on the batch's stream with
 those tensors, and starts the host tasks of host calls. The trajectory
@@ -804,7 +804,7 @@ class VideoExecutor:
         """What each call of a batch reads and writes, in call order.
 
         Each entry: ``reads`` (input indices), ``writes`` (each output's
-        ``output`` index, ``shape``, ``region`` or None, ``memory`` ``host``
+        ``output`` index, ``shape``, ``region`` or None, ``storage`` ``host``
         or ``device``, whether a host task fills it (``deferred``) and
         whether host readers read its export (``host_export``)),
         ``publication`` (``products``, ``encoded`` with the written
@@ -1409,7 +1409,7 @@ class VideoExecutor:
             raise ValueError("media reading requires admitted conditions")
         if self.reader is None:
             raise ValueError("media reading requires the condition encoders")
-        memory = "host" if self.staging is None else "device"
+        storage = "host" if self.staging is None else "device"
         writes = []
         for index, name in enumerate(entry["output_names"]):
             if name == "condition_pixels":
@@ -1434,7 +1434,7 @@ class VideoExecutor:
                 _write(
                     index,
                     [rows, width],
-                    memory=memory,
+                    storage=storage,
                     deferred=True,
                     name=name,
                 )
@@ -1501,7 +1501,7 @@ class VideoExecutor:
             return _nothing()
         row_bytes = _row_width(call["outputs"][0])
         # One read per unit: the unit's row of the round's decoded frames,
-        # read in place from its shared-memory export or leased.
+        # read in place from its shared-storage export or leased.
         return {
             "reads": [0 for _ in run],
             "read_rows": list(run),
@@ -1510,7 +1510,7 @@ class VideoExecutor:
                     0,
                     [int(decode["max_units"]), row_bytes],
                     [[run.start, run.stop], [0, row_bytes]],
-                    memory="host",
+                    storage="host",
                     deferred=True,
                 )
             ],
@@ -1694,7 +1694,7 @@ def _write(
     shape: Sequence[int],
     region: Sequence[Sequence[int]] | None = None,
     *,
-    memory: str = "device",
+    storage: str = "device",
     deferred: bool = False,
     host_export: bool = False,
     **extra: Any,
@@ -1705,7 +1705,7 @@ def _write(
         "region": None
         if region is None
         else [[int(a), int(b)] for a, b in region],
-        "memory": memory,
+        "storage": storage,
         "deferred": deferred,
         "host_export": host_export,
         **extra,

@@ -174,7 +174,7 @@ class TiledEncoder(nn.Module):
     any excess overlap over the seams, and the encoded tiles cross-fade over
     ``overlap / ratio`` latent positions in the encoder's output precision.
     Tiles are encoded one after another: an encoder's activations at input
-    resolution dominate its memory, so the peak stays that of one tile
+    resolution dominate its storage, so the peak stays that of one tile
     whatever the raster.
 
     A band of latent rows can be encoded on its own: only the tile rows the

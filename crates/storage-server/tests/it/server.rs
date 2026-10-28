@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use storage::protocol::{ErrorKind, Item};
-use storage::{
+use ::storage::protocol::{ErrorKind, Item};
+use ::storage::{
     Access, Claim, Client, Error, Key, Mode, Placement, Role, Scope, StorageRecord, TensorRecord,
     socket,
 };
@@ -49,7 +49,7 @@ impl Running {
     }
 
     /// A server that leaves `host_reserve` bytes of the host's available
-    /// memory to other processes.
+    /// storage to other processes.
     fn reserving(host_reserve: u64) -> Self {
         Self::serving(host_reserve, |_| None)
     }
@@ -563,7 +563,7 @@ fn retry<T>(mut attempt: impl FnMut() -> Result<T, Error>) -> T {
 
 #[test]
 fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
-    use storage::protocol::{PageLevel, PageShape, PageSlot, Reply, Request};
+    use ::storage::protocol::{PageLevel, PageShape, PageSlot, Reply, Request};
 
     let server = Running::start();
     let claim = head(&server.socket)
@@ -657,7 +657,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
 }
 
 /// The next event `client` receives, waiting up to ten seconds.
-pub(crate) fn next_event(client: &mut Client) -> (storage::protocol::Event, Vec<OwnedFd>) {
+pub(crate) fn next_event(client: &mut Client) -> (::storage::protocol::Event, Vec<OwnedFd>) {
     for _ in 0..1000 {
         client.pump().unwrap();
         if let Some(event) = client.next_event() {
@@ -676,7 +676,7 @@ pub(crate) fn next_event(client: &mut Client) -> (storage::protocol::Event, Vec<
 
 #[test]
 fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() {
-    use storage::protocol::{Event, PageLevel, PageShape, PageSlot, Reply, Request};
+    use ::storage::protocol::{Event, PageLevel, PageShape, PageSlot, Reply, Request};
 
     let server = Running::start();
     let mut head = head(&server.socket);
@@ -704,7 +704,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         panic!("the page pool was refused");
     };
 
-    // The connector is given the pool with its memory.
+    // The connector is given the pool with its storage.
     let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
     let (event, descriptors) = next_event(&mut connector);
     assert_eq!(
@@ -876,7 +876,7 @@ fn scope_of(deployment: &str) -> Scope {
 /// The page pool `worker` maps for pages of 16 bytes, asking for `bytes`:
 /// its id and slots.
 fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Error> {
-    use storage::protocol::{PageShape, Reply, Request};
+    use ::storage::protocol::{PageShape, Reply, Request};
 
     let shape = PageShape {
         layout: key(3),
@@ -900,7 +900,7 @@ fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Erro
 
 #[test]
 fn page_pools_belong_to_their_deployment_and_leave_with_it() {
-    use storage::protocol::{Reply, Request};
+    use ::storage::protocol::{Reply, Request};
 
     let server = Running::start();
     // The head stays connected, so another deployment's claim keeps this
@@ -1027,15 +1027,15 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
 }
 
 #[test]
-fn a_page_pool_the_hosts_memory_cannot_hold_is_refused() {
-    use storage::protocol::{PageShape, Request};
+fn a_page_pool_the_hosts_storage_cannot_hold_is_refused() {
+    use ::storage::protocol::{PageShape, Request};
 
     let server = Running::start();
     let claim = head(&server.socket)
         .claim(0, vec![scope("text", 0)], Vec::new())
         .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
-    // A million pages of a GiB: a pebibyte, beyond any host's memory.
+    // A million pages of a GiB: a pebibyte, beyond any host's storage.
     let shape = PageShape {
         layout: key(3),
         kv_head_offset: 0,
@@ -1054,7 +1054,7 @@ fn a_page_pool_the_hosts_memory_cannot_hold_is_refused() {
         .unwrap();
     assert!(matches!(
         refused.reply,
-        storage::protocol::Reply::Error {
+        ::storage::protocol::Reply::Error {
             kind: ErrorKind::Resource,
             ..
         }
@@ -1091,11 +1091,11 @@ fn retained_names(client: &mut Client) -> Vec<String> {
 }
 
 /// Two worlds of one deployment share a scope without touching each other's
-/// memory: the head keeps one claim token for both, each world's `retain`
+/// storage: the head keeps one claim token for both, each world's `retain`
 /// releases its own tensors alone, and a claim that retires a world releases
 /// the tensors no other world retains.
 #[test]
-fn worlds_retain_their_own_memory_and_a_claim_retires_one() {
+fn worlds_retain_their_own_storage_and_a_claim_retires_one() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let first_claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
@@ -1198,7 +1198,7 @@ fn engine_head(socket: &Path, world: u64) -> Client {
 
 /// A page pool of four 16-byte pages that `worker` maps.
 fn trial_pool(worker: &mut Client) -> u64 {
-    use storage::protocol::{PageShape, Reply, Request};
+    use ::storage::protocol::{PageShape, Reply, Request};
 
     let shape = PageShape {
         layout: key(3),
@@ -1224,7 +1224,7 @@ fn trial_pool(worker: &mut Client) -> u64 {
 
 /// `head` writes and commits the pages of `keys` in `pool`.
 fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
-    use storage::protocol::{PageSlot, Reply, Request};
+    use ::storage::protocol::{PageSlot, Reply, Request};
 
     let Reply::Reserved { slots } = head
         .call(
@@ -1259,8 +1259,8 @@ fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
 
 /// The levels `head` finds the pages of `keys` at in `pool`, without a
 /// connector.
-fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<storage::protocol::PageLevel> {
-    use storage::protocol::{Reply, Request};
+fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<::storage::protocol::PageLevel> {
+    use ::storage::protocol::{Reply, Request};
 
     let Reply::Lookup { levels } = head
         .call(
@@ -1283,7 +1283,7 @@ fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<storage::protocol::
 /// storage, which takes them only once the world is explicitly committed. The world on trial reads the serving world's pages.
 #[test]
 fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
-    use storage::protocol::{Event, PageLevel, Request};
+    use ::storage::protocol::{Event, PageLevel, Request};
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
@@ -1337,12 +1337,12 @@ fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
     finish(&mut connector, task, vec![false]);
     assert_eq!(
         serving.wait(lookup).unwrap().reply,
-        storage::protocol::Reply::Lookup {
+        ::storage::protocol::Reply::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Absent]
         }
     );
     // Nor does it pin it.
-    let storage::protocol::Reply::Pinned { slots } = serving
+    let ::storage::protocol::Reply::Pinned { slots } = serving
         .call(
             &Request::Pin {
                 pool,
@@ -1382,7 +1382,7 @@ fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
 /// of the numerical order of the world identifiers.
 #[test]
 fn independent_replicas_publish_successors_as_a_group() {
-    use storage::protocol::PageLevel::{Absent, Host};
+    use ::storage::protocol::PageLevel::{Absent, Host};
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
@@ -1450,7 +1450,7 @@ fn independent_replicas_publish_successors_as_a_group() {
 /// that the serving world puts carries the serving world's bytes.
 #[test]
 fn a_rollback_discards_what_the_world_on_trial_published() {
-    use storage::protocol::PageLevel;
+    use ::storage::protocol::PageLevel;
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
@@ -1504,9 +1504,9 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
     assert_eq!(contents(got.storages.remove(0).1), b"good");
 
     // World 2 reserves a page it commits only after the rollback.
-    let storage::protocol::Reply::Reserved { .. } = trial
+    let ::storage::protocol::Reply::Reserved { .. } = trial
         .call(
-            &storage::protocol::Request::Reserve {
+            &::storage::protocol::Request::Reserve {
                 pool,
                 writer: scope("text", 0),
                 keys: vec![key(8)],
@@ -1526,7 +1526,7 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
     daemon.claim(1, vec![scope("text", 0)], vec![2]).unwrap();
     trial
         .call(
-            &storage::protocol::Request::Commit {
+            &::storage::protocol::Request::Commit {
                 pool,
                 keys: vec![key(8)],
             },
@@ -1588,7 +1588,7 @@ fn a_world_reads_what_it_published_that_only_a_world_on_trial_retains() {
 /// takes on all of them holds fewer.
 #[test]
 fn a_host_sizes_the_host_kv_cache_of_a_world_in_tokens() {
-    use storage::protocol::{Reply, Request};
+    use ::storage::protocol::{Reply, Request};
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
@@ -1615,7 +1615,7 @@ fn a_host_sizes_the_host_kv_cache_of_a_world_in_tokens() {
     // A stated budget of 64 MiB holds 16384 tokens of 4 KiB over both ranks.
     assert_eq!(ask(1 << 20, Some(64 << 20)), 16384);
     assert_eq!(ask(4096, Some(64 << 20)), 4096);
-    // The host's available memory holds a few thousand tokens.
+    // The host's available storage holds a few thousand tokens.
     assert_eq!(ask(4096, None), 4096);
 }
 
@@ -1659,7 +1659,7 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
     }
 }
 
-/// A host that admits no page pool, its whole memory reserved, holds no
+/// A host that admits no page pool, its whole storage reserved, holds no
 /// token of a world's host KV cache and refuses its pools. Once a KV
 /// storage keeps what the pools commit (a connector connected), it holds
 /// what a staging pool of `STAGING_POOL_BYTES` holds on each rank, and
@@ -1667,7 +1667,7 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
 /// through it into the KV storage.
 #[test]
 fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
-    use storage::protocol::{PageShape, Reply, Request};
+    use ::storage::protocol::{PageShape, Reply, Request};
     use storage_server::STAGING_POOL_BYTES;
 
     let server = Running::reserving(u64::MAX);
@@ -1732,7 +1732,7 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
 /// own build first; an operator's connection speaks what the server serves.
 #[test]
 fn a_server_serves_earlier_clients_and_refuses_later_ones() {
-    use storage::protocol::{MIN_VERSION, VERSION};
+    use ::storage::protocol::{MIN_VERSION, VERSION};
 
     let server = Running::start();
     let operator = Client::connect_operator(&server.socket).unwrap();
@@ -1740,12 +1740,12 @@ fn a_server_serves_earlier_clients_and_refuses_later_ones() {
     const { assert!(MIN_VERSION < VERSION) };
 
     let welcome = |version: u32| {
-        let mut connection = storage::transport::Connection::new(
+        let mut connection = ::storage::transport::Connection::new(
             std::os::unix::net::UnixStream::connect(&server.socket).unwrap(),
         );
         connection
             .send(
-                &storage::protocol::ClientMessage::Hello(storage::protocol::Hello {
+                &::storage::protocol::ClientMessage::Hello(::storage::protocol::Hello {
                     version,
                     role: Role::Operator,
                 }),
@@ -1753,17 +1753,17 @@ fn a_server_serves_earlier_clients_and_refuses_later_ones() {
             )
             .unwrap();
         connection
-            .recv::<storage::protocol::ServerMessage>()
+            .recv::<::storage::protocol::ServerMessage>()
             .unwrap()
             .0
     };
     assert!(matches!(
         welcome(MIN_VERSION),
-        storage::protocol::ServerMessage::Welcome(storage::protocol::Welcome::Accepted { .. })
+        ::storage::protocol::ServerMessage::Welcome(::storage::protocol::Welcome::Accepted { .. })
     ));
     assert!(matches!(
         welcome(VERSION + 1),
-        storage::protocol::ServerMessage::Welcome(storage::protocol::Welcome::Refused { .. })
+        ::storage::protocol::ServerMessage::Welcome(::storage::protocol::Welcome::Refused { .. })
     ));
 }
 
@@ -1862,11 +1862,11 @@ fn one_key_keeps_a_copy_at_each_location() {
 }
 
 /// The GPU the ledger tests book on, which no process touches: the server
-/// never interprets a storage, so a memfd stands for device memory.
+/// never interprets a storage, so a memfd stands for device storage.
 pub(crate) const GPU: [u8; 16] = [0x5a; 16];
 
 /// A storage of `bytes` on [`GPU`], of KV cache `segment` when given.
-pub(crate) fn device(bytes: u64, segment: Option<storage::Segment>) -> StorageRecord {
+pub(crate) fn device(bytes: u64, segment: Option<::storage::Segment>) -> StorageRecord {
     StorageRecord {
         placement: Placement::Device { gpu: GPU },
         bytes,
@@ -1876,19 +1876,19 @@ pub(crate) fn device(bytes: u64, segment: Option<storage::Segment>) -> StorageRe
 }
 
 /// Segment `ordinal` of `world`.
-fn segment(world: u64, ordinal: u32) -> Option<storage::Segment> {
-    Some(storage::Segment { world, ordinal })
+fn segment(world: u64, ordinal: u32) -> Option<::storage::Segment> {
+    Some(::storage::Segment { world, ordinal })
 }
 
 /// The deployment's ledger of [`GPU`] as `client` reads it.
-pub(crate) fn ledger(client: &mut Client) -> storage::GpuLedger {
+pub(crate) fn ledger(client: &mut Client) -> ::storage::GpuLedger {
     let (ledgers, _) = client.ledger(vec![GPU]).unwrap();
     assert_eq!(ledgers.len(), 1, "{ledgers:?}");
     ledgers.into_iter().next().unwrap()
 }
 
 /// The bytes of `ledger`'s entries of `item` held by exactly `worlds`.
-pub(crate) fn booked(ledger: &storage::GpuLedger, item: Item, worlds: &[u64]) -> u64 {
+pub(crate) fn booked(ledger: &::storage::GpuLedger, item: Item, worlds: &[u64]) -> u64 {
     ledger.bytes(|entry| entry.item == item && entry.worlds == worlds)
 }
 
@@ -2068,7 +2068,7 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     // A worker is no head.
     let refused = second
         .call(
-            &storage::protocol::Request::KeepWeights {
+            &::storage::protocol::Request::KeepWeights {
                 worlds: vec![1],
                 cache_keys: Vec::new(),
             },
@@ -2078,7 +2078,7 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     assert!(
         matches!(
             refused.reply,
-            storage::protocol::Reply::Error {
+            ::storage::protocol::Reply::Error {
                 kind: ErrorKind::Invalid,
                 ..
             }
@@ -2088,10 +2088,10 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     );
 }
 
-/// A head moves a world's weights between its GPUs and host memory only
+/// A head moves a world's weights between its GPUs and host storage only
 /// through the Transfer Server: without one, an offload of weights is
 /// refused and moves nothing, while a world with no weights to move (none
-/// that it alone retains on a GPU, none in host memory) is answered at once.
+/// that it alone retains on a GPU, none in host storage) is answered at once.
 /// Only the head moves weights.
 #[test]
 fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
@@ -2119,17 +2119,17 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
         ErrorKind::Unavailable
     );
     assert_eq!(booked(&ledger(&mut head), Item::Weights, &[1]), 200);
-    // World 2 retains nothing; world 1 has nothing in host memory.
+    // World 2 retains nothing; world 1 has nothing in host storage.
     assert_eq!(head.move_weights(2, true).unwrap(), (0, 0));
     assert_eq!(head.move_weights(1, false).unwrap(), (0, 0));
     // A worker is no head.
     let refused = first
-        .call(&storage::protocol::Request::Offload { world: 1 }, &[])
+        .call(&::storage::protocol::Request::Offload { world: 1 }, &[])
         .unwrap();
     assert!(
         matches!(
             refused.reply,
-            storage::protocol::Reply::Error {
+            ::storage::protocol::Reply::Error {
                 kind: ErrorKind::Invalid,
                 ..
             }

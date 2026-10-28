@@ -2,16 +2,16 @@
 
 Two schedules share one mechanism, :class:`SlotCopies`. Distributed expert
 weights (``uniserve.distributed.experts.WeightPrefetch``) read the other
-ranks' shards of the next expert layer from peer memory into two slots;
+ranks' shards of the next expert layer from peer storage into two slots;
 host weights (``uniserve.loading.host_weights.HostStack``) stream the
-projections of a repeated layer stack from page-locked host memory into a
+projections of a repeated layer stack from page-locked host storage into a
 few slots. Each schedule decides which layer is copied when; this module
 orders those copies against the streams that read the slots.
 
-The worker owns the memory: the slots, the sources the copies read and the
+The worker owns the storage: the slots, the sources the copies read and the
 storage they live in. A schedule receives the byte movement of one layer as
 a function (``copy(layer, stream)``) and owns the stream it runs on and the
-events around it. The worker releases the memory only after the schedule's
+events around it. The worker releases the storage only after the schedule's
 :meth:`SlotCopies.close` drained that stream.
 """
 
@@ -125,7 +125,7 @@ class SlotCopies:
 
         The caller retires the slots' readers and every captured graph that
         submits copies first. Once this returns, the worker may release the
-        memory the copies address.
+        storage the copies address.
         """
         if not self._closed:
             self.stream.synchronize()

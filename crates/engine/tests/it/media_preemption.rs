@@ -510,7 +510,7 @@ fn park(server: &StorageServer, pool: u64, shares: &[(u64, u64)]) -> (Trajectory
     (stored, seed, preempted)
 }
 
-/// A sleep, which gives back the workers' memory in normal serving,
+/// A sleep, which gives back the workers' storage in normal serving,
 /// preempts a denoising video request at its next step boundary: the
 /// trajectory's pages reach the host latent pool, and the request leaves
 /// with the steps it took. Submitted again once the workers woke, it

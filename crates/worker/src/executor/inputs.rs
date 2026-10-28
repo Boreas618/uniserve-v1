@@ -50,7 +50,7 @@ use crate::error::WorkerError;
 use crate::executor::Submission;
 use crate::ffi::MemoryKind;
 use crate::job::{Completion, Job};
-use crate::memory::{PendingImport, ProductRead, ProductStore};
+use crate::storage::{PendingImport, ProductRead, ProductStore};
 use crate::transfer::{Notify, Retirement, fetch};
 use crate::{Error, Result};
 use ipc::{Batch as BatchPlan, BufferId, CacheTransfer, TensorRef};
@@ -234,7 +234,7 @@ pub(crate) fn component_device(backend: &WorkerBackend, component: &str) -> Resu
         .components()
         .get(component)
         .ok_or_else(|| Error::Invalid(format!("call targets unplaced component {component:?}")))?;
-    Ok(placed.device.memory())
+    Ok(placed.device.storage())
 }
 
 /// Admit the batch's product imports that can be admitted now, recording what
@@ -587,8 +587,8 @@ fn publish(
 fn latent_pool(
     backend: &mut WorkerBackend,
 ) -> Result<(
-    &mut crate::memory::LatentPool,
-    &crate::memory::LatentStorage,
+    &mut crate::storage::LatentPool,
+    &crate::storage::LatentStorage,
 )> {
     let ledger = backend
         .parts()

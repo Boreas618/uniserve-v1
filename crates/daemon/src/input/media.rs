@@ -284,7 +284,7 @@ impl MediaConnector {
     /// Largest number of http(s) downloads in progress at once on one connector.
     ///
     /// Each download buffers at most the per-medium limit, so the limit also
-    /// bounds the memory in-flight downloads hold (1.28 GB at the 20 MB image
+    /// bounds the storage in-flight downloads hold (1.28 GB at the 20 MB image
     /// default). Further fetches wait for a slot; `data:` and `file://`
     /// references never take one.
     pub const MAX_CONCURRENT_FETCHES: usize = 64;

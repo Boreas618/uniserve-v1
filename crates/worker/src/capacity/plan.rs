@@ -29,9 +29,9 @@ use super::{
 };
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::graph_storage_budget_bytes;
-use crate::memory::prefix_cache::planes::PlaneLayout;
-use crate::memory::{CachePlan, LatentPlan};
 use crate::parallel::host::HostGroup;
+use crate::storage::prefix_cache::planes::PlaneLayout;
+use crate::storage::{CachePlan, LatentPlan};
 use crate::{Error, Result};
 
 /// Bytes one product slot of a component's outputs retains: every output's
@@ -352,7 +352,7 @@ impl TokenLayout {
     /// units. Graph padding
     /// takes no unit: padding rows read the sentinel unit and write no K/V.
     /// A configured token capacity sizes the pool instead. `total_bytes` is
-    /// the device's total memory, zero on CPU. `unit_overhead` is device
+    /// the device's total storage, zero on CPU. `unit_overhead` is device
     /// storage other owners keep per unit (unit index columns), charged with
     /// each unit. `granularity` is the device's allocation granularity, in
     /// whose granules a device pool splits its planes into segments; `None`
@@ -428,7 +428,7 @@ impl TokenLayout {
         // smallest grant.
         capacity.num_units = group.all_reduce_min(&[capacity.num_units as i64])?[0] as u64;
         // A device pool splits its value planes into segments of whole
-        // allocation granules, which give memory back: its own units round
+        // allocation granules, which give storage back: its own units round
         // down to them, alike on every member. An adopted pool split
         // already.
         let mut planes = None;
@@ -450,7 +450,7 @@ impl TokenLayout {
                     )?)
                 }
                 (None, _) => {
-                    let rounded = crate::memory::prefix_cache::planes::segmented_units(
+                    let rounded = crate::storage::prefix_cache::planes::segmented_units(
                         own,
                         cache.plane_bytes,
                         granularity,
@@ -536,7 +536,7 @@ impl TokenLayout {
             cache.plane_bytes,
             granularity,
         );
-        let tail = crate::memory::prefix_cache::planes::segmented_units(
+        let tail = crate::storage::prefix_cache::planes::segmented_units(
             full.saturating_sub(head + inherited),
             cache.plane_bytes,
             granularity,
@@ -762,7 +762,7 @@ pub(crate) mod tests {
             // Key and value planes, each with one initialization flag.
             unit_bytes: 2 * (plane_bytes + 1),
             dtype: ipc::PrefixCacheDtype::BFloat16,
-            groups: vec![crate::memory::CacheGroupPlan {
+            groups: vec![crate::storage::CacheGroupPlan {
                 window: None,
                 state: false,
                 draft: false,
@@ -770,7 +770,7 @@ pub(crate) mod tests {
                 units_per_page: 2,
                 layers: vec!["layers.0".into(), "layers.1".into()],
                 layer_ids: vec![0, 1],
-                axis: crate::memory::GroupAxis {
+                axis: crate::storage::GroupAxis {
                     offset: 0,
                     total: 2,
                 },
@@ -866,7 +866,7 @@ pub(crate) mod tests {
         };
         let context = cache();
         let mut drafting = cache();
-        drafting.groups.push(crate::memory::CacheGroupPlan {
+        drafting.groups.push(crate::storage::CacheGroupPlan {
             draft: true,
             block_size: 16 * 64,
             units_per_page: 1,

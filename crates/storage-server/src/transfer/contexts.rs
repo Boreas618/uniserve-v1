@@ -1,7 +1,7 @@
 //! Each GPU's CUDA context, held only while the Transfer Server has work on
-//! the GPU, and booked in the GPU's memory ledgers only while held.
+//! the GPU, and booked in the GPU's storage ledgers only while held.
 //!
-//! A primary context takes device memory whether or not anything runs in it
+//! A primary context takes device storage whether or not anything runs in it
 //! (hundreds of MiB on a GB200), and the Transfer Server runs on every host
 //! with a Storage Server, so it holds a context only for the work that needs
 //! one, as an update's preparation does:
@@ -15,7 +15,7 @@
 //!   tasks, until its client closes the session or disconnects. Opening a
 //!   session alone neither starts nor books a CUDA context.
 //! - The first use of a GPU under its holds starts a [`Session`]
-//!   ([`Slot::retain`]): the context is booked in every memory ledger of the
+//!   ([`Slot::retain`]): the context is booked in every storage ledger of the
 //!   GPU, at the bytes the Transfer Server measured it at when it started,
 //!   and then the GPU's primary context is retained. A ledger that has no
 //!   room for it refuses the booking, and the use fails, so a ledger never
@@ -23,7 +23,7 @@
 //!   creates in the context lives in the session or under one of its holds:
 //!   device mappings of the server's allocations, host allocations
 //!   registered for the GPU's copy engines, NIXL registrations of device
-//!   memory, and the lanes' streams and events.
+//!   storage, and the lanes' streams and events.
 //! - When the last hold of a GPU ends, its session closes ([`Slot::release`]):
 //!   the registrations, then the mappings, then the context are released,
 //!   the process waits for the driver calls it deferred (`cuda::reclaim`),
@@ -37,7 +37,7 @@
 //!
 //! An allocation the server takes back leaves every session once no piece
 //! copies it ([`Contexts::forget`]), so that a GPU busy for long does not
-//! keep released memory mapped.
+//! keep released storage mapped.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -46,12 +46,12 @@ use std::time::Instant;
 
 use cuda::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
 
-use super::memory::{HostMap, Mapped};
+use super::storage::{HostMap, Mapped};
 
 /// A value made once, or why it could not be made.
 type Made<T> = OnceLock<Result<T, String>>;
 
-/// One GPU as its context is booked: its device, UUID and total memory, and
+/// One GPU as its context is booked: its device, UUID and total storage, and
 /// the bytes its context takes, as the Transfer Server measured them when
 /// it started.
 pub(super) struct Booked {
@@ -62,8 +62,8 @@ pub(super) struct Booked {
 }
 
 /// A change of a GPU's booking the main thread places in the server's
-/// ledgers ([`Request::Book`](storage::protocol::Request::Book) of
-/// [`Item::TransferContext`](storage::protocol::Item::TransferContext)).
+/// ledgers ([`Request::Book`](::storage::protocol::Request::Book) of
+/// [`Item::TransferContext`](::storage::protocol::Item::TransferContext)).
 pub(super) struct Booking {
     pub(super) gpu: [u8; 16],
     pub(super) total: u64,
@@ -201,8 +201,8 @@ impl Slot {
     }
 
     /// The moment the Transfer Server starts to hold the GPU's context: it
-    /// books the context's bytes in every memory ledger of the GPU, and once
-    /// the server booked them, retains the context. Its memory counts in the
+    /// books the context's bytes in every storage ledger of the GPU, and once
+    /// the server booked them, retains the context. Its storage counts in the
     /// ledgers from here until [`Slot::release`].
     fn retain(&self) -> Result<Arc<Session>, String> {
         let (answer, answered) = mpsc::sync_channel(1);
@@ -217,7 +217,7 @@ impl Slot {
             .map_err(|_| "the Transfer Server stops".to_owned())?
             .map_err(|refusal| {
                 format!(
-                    "the memory ledgers of {} have no room for the Transfer Server's CUDA \
+                    "the storage ledgers of {} have no room for the Transfer Server's CUDA \
                      context: {refusal}",
                     self.name()
                 )
@@ -252,7 +252,7 @@ impl Slot {
 
     /// The moment the Transfer Server stops holding the GPU's context: the
     /// session's registrations, mappings and context are released, the
-    /// driver calls they deferred have run, so the context's device memory
+    /// driver calls they deferred have run, so the context's device storage
     /// is free, and then its booking ends.
     fn release(&self, session: &Session) {
         let started = Instant::now();
@@ -396,7 +396,7 @@ impl Session {
         }
     }
 
-    /// The address of byte 0 of `mapped`, host memory, in this GPU's own
+    /// The address of byte 0 of `mapped`, host storage, in this GPU's own
     /// mapping of it, registered so that the GPU's copy engines reach it.
     ///
     /// A read-only allocation registers for reads alone where the device
@@ -412,7 +412,7 @@ impl Session {
             || {
                 let length = mapped.length()?;
                 let map = HostMap::new(mapped.descriptor(), length, mapped.writable())
-                    .map_err(|error| format!("mapping host memory: {error}"))?;
+                    .map_err(|error| format!("mapping host storage: {error}"))?;
                 let pointer = map.address() as *mut u8;
                 // SAFETY: `map` maps the whole range and is kept beside the
                 // registration, which is undone first.
@@ -424,7 +424,7 @@ impl Session {
                     }
                 };
                 let registration =
-                    registered.map_err(|error| format!("registering host memory: {error}"))?;
+                    registered.map_err(|error| format!("registering host storage: {error}"))?;
                 Ok(HostRange {
                     registration,
                     _map: map,
@@ -455,10 +455,10 @@ impl Session {
             mapped.id(),
             || {
                 let region = nixl::Region {
-                    memory: nixl::Memory::Device,
+                    segment: nixl::Segment::Device,
                     address,
                     len: mapped.length()?,
-                    key: super::memory::nixl_key(),
+                    key: super::storage::nixl_key(),
                 };
                 // SAFETY: the session keeps the mapping until after the
                 // registration dropped (`Live`'s field order, and `forget`
@@ -466,7 +466,7 @@ impl Session {
                 // no Rust reference to the bytes, which its copies reach
                 // through raw addresses only.
                 unsafe { agent.register(region, nixl::Access::ReadWrite) }
-                    .map_err(|error| format!("registering memory with NIXL: {error}"))
+                    .map_err(|error| format!("registering storage with NIXL: {error}"))
             },
         )?;
         let made = entry.get().map(Result::as_ref);

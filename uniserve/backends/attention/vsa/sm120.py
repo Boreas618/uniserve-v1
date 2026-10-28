@@ -8,7 +8,7 @@ FlashInfer's ``bsa_attn_sm120_blk64_fwd`` copies the query, key and value
 to contiguous storage before the launch, although the kernel it compiles
 takes their strides at run time. Segment attention passes strided views of
 one ``[rows, q | k | v | gate]`` projection matrix, so those copies would
-move the three projections through device memory at every layer. ``_launch``
+move the three projections through device storage at every layer. ``_launch``
 calls the same compiled kernel on the caller's views instead, and uses the
 public wrapper only for views the kernel's alignment does not admit.
 

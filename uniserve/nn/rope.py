@@ -256,7 +256,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         # Host copies of the constants, which stay on the host when the
         # buffers move to a device: positions on the host (a request's
-        # prepared tables) are evaluated without copying device memory,
+        # prepared tables) are evaluated without copying device storage,
         # which would make the host wait for the device.
         self._host_inv_freq = inv_freq.cpu()
         self._host_frequency_axes: torch.Tensor | None = None

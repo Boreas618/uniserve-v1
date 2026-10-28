@@ -6,7 +6,7 @@ TP2 text encoder beside the decoders, and the CPU media group. One
 ``t2va`` request is served uninterrupted as the reference. The same
 request, as a video job, is then preempted at a denoising step boundary:
 
-- by a sleep, which serving uses to give back device memory: the engine
+- by a sleep, which serving uses to give back device storage: the engine
   stores the trajectory in the host latent pools and the request waits in
   the hold until the wake, after which the engine restores the stored step
   and denoises the steps left;

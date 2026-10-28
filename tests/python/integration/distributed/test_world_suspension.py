@@ -2,7 +2,7 @@
 
 A parked standby suspends its world's NCCL communicators
 (``uniserve.distributed.world.suspend``), which releases their device
-memory, and resumes them at its promotion before any graph runs. Two ranks
+storage, and resumes them at its promotion before any graph runs. Two ranks
 capture an all-reduce over the world's instance communicator into a CUDA
 graph, suspend and resume the world, and replay the graph: it sums the new
 inputs of both ranks, at a small and at a large message size.
@@ -51,7 +51,7 @@ def _replay_after_resume(rank, listener):
             held = torch.cuda.mem_get_info(world.device)[0]
             distributed.suspend(world)
             released = torch.cuda.mem_get_info(world.device)[0] - held
-            assert released > 0, "suspending released no device memory"
+            assert released > 0, "suspending released no device storage"
             distributed.resume(world)
             assert replay(2.0)
             graph.release()

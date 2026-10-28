@@ -1,5 +1,5 @@
 //! Simulated components shared by the crate's tests, one fixture each: the
-//! byte tokenizer, in-memory tokenizer loading, the engine over simulated
+//! byte tokenizer, in-storage tokenizer loading, the engine over simulated
 //! schedulers, the video service, and the server's router.
 //!
 //! Requests travel through the server's router (`http::router`) into a real
@@ -42,7 +42,7 @@ use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 /// Served model name the simulated engines answer to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
-/// Loads a `tokenizers` definition in memory, as the server loads a
+/// Loads a `tokenizers` definition in storage, as the server loads a
 /// checkpoint's `tokenizer.json`.
 pub(crate) fn load_tokenizer(definition: &TokenizerBuilder) -> HuggingFaceTokenizer {
     let json = definition.to_string(false).expect("serialize tokenizer");

@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 # The Storage Server of one host, its Mooncake connector and its Transfer
-# Server. It links no CUDA runtime: the server holds device memory only
+# Server. It links no CUDA runtime: the server holds device storage only
 # through descriptors and asks NVML (`cuda`) which processes a GPU still
 # lists, and the Transfer Server loads the CUDA driver, and NIXL for copies
 # between hosts (`nixl`), at run time.

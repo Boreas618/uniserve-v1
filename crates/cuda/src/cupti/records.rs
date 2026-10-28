@@ -32,8 +32,8 @@ pub const MEMCPY2: u32 = 22;
 pub const NVLINK: u32 = 40;
 /// `CUPTI_ACTIVITY_KIND_PCIE`.
 pub const PCIE: u32 = 46;
-/// `CUPTI_ACTIVITY_KIND_MEMORY2`.
-pub const MEMORY2: u32 = 49;
+/// `CUPTI_ACTIVITY_KIND_STORAGE2`.
+pub const STORAGE2: u32 = 49;
 /// `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`.
 pub const GRAPH_TRACE: u32 = super::subscriber::GRAPH_TRACE;
 
@@ -102,7 +102,7 @@ pub struct Fill {
     pub graph_node: u64,
 }
 
-/// A memory allocation or release (`CUpti_ActivityMemory4`).
+/// A storage allocation or release (`CUpti_ActivityStorage4`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Memory {
     /// `CUpti_ActivityMemoryOperationType`: 1 allocation, 2 release.
@@ -362,7 +362,7 @@ pub(super) unsafe fn decode(record: *const u8, names: &mut Names) -> Option<Reco
                 graph: read(record, 72),
                 graph_node: read(record, 64),
             }),
-            MEMORY2 => Record::Memory(Memory {
+            STORAGE2 => Record::Memory(Memory {
                 operation: read(record, 4),
                 memory_kind: read(record, 8),
                 correlation: read(record, 12),

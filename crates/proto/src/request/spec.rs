@@ -104,19 +104,19 @@ pub enum GraphPolicy {
     Full,
 }
 
-/// How a parked standby worker keeps the device memory its graphs and
+/// How a parked standby worker keeps the device storage its graphs and
 /// scratch address.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StandbyMemory {
-    /// Resident while every device keeps beside it the share of its memory
+pub enum StandbyStorage {
+    /// Resident while every device keeps beside it the share of its storage
     /// a serving worker leaves for graphs and activations, suspended
     /// otherwise.
     #[default]
     Auto,
     /// Stays mapped while the standby parks.
     Resident,
-    /// Moves to host memory while the standby parks, keeping its addresses,
+    /// Moves to host storage while the standby parks, keeping its addresses,
     /// and back at the promotion.
     Suspended,
 }

@@ -1,5 +1,5 @@
 //! The path between hosts outside one NVLink fabric: NIXL READs this host's
-//! Transfer Server posts, from memory another host's Transfer Server
+//! Transfer Server posts, from storage another host's Transfer Server
 //! registered with its own agent.
 //!
 //! The process has one NIXL agent with the UCX backend, created at its first
@@ -7,8 +7,8 @@
 //! loads NIXL. The agent serves both ends of a READ:
 //!
 //! - **Source.** The server has the Transfer Server register allocations a
-//!   peer asked it to expose ([`Event::Register`]): host memory with the
-//!   allocation ([`Mapped::nixl_host_region`]), device memory in its GPU's
+//!   peer asked it to expose ([`Event::Register`]): host storage with the
+//!   allocation ([`Mapped::nixl_host_region`]), device storage in its GPU's
 //!   session, which the exposure holds until the peer ends it
 //!   ([`Event::Deregister`]); the report carries each range and the agent's
 //!   metadata taken after the registrations ([`register`]).
@@ -38,23 +38,23 @@
 //! exposed for each task, not remembered between tasks: a region's
 //! allocation, and its registration, may change between two tasks.
 //!
-//! [`Event::Register`]: storage::protocol::Event::Register
-//! [`Event::Deregister`]: storage::protocol::Event::Deregister
-//! [`Request::Expose`]: storage::protocol::Request::Expose
-//! [`Role::Peer`]: storage::protocol::Role::Peer
+//! [`Event::Register`]: ::storage::protocol::Event::Register
+//! [`Event::Deregister`]: ::storage::protocol::Event::Deregister
+//! [`Request::Expose`]: ::storage::protocol::Request::Expose
+//! [`Role::Peer`]: ::storage::protocol::Role::Peer
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ::storage::Client;
+use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registered};
 use cuda::DeviceId;
-use storage::Client;
-use storage::protocol::{FabricExport, Link, Memory, Region, Registered};
 
 use super::contexts::Hold;
 use super::lanes::{End, LaneKey, Piece, Runner};
-use super::memory::{Fabric, Mapped};
+use super::storage::{Fabric, Mapped};
 
 /// How long another host's Storage Server may take to accept the connection
 /// and to answer an exposure: far longer than registering the largest
@@ -84,13 +84,13 @@ struct Host {
     peer: Option<String>,
 }
 
-/// A region of another host's memory that its Transfer Server registered,
+/// A region of another host's storage that its Transfer Server registered,
 /// which READs read.
 pub(super) struct Source {
     /// The host's Storage Server, which names it in errors.
     pub(super) endpoint: String,
-    /// The link end the region is: the host and its GPU or host memory.
-    pub(super) memory: Memory,
+    /// The link end the region is: the host and its GPU or host storage.
+    pub(super) end: LinkEnd,
     /// The agent that registered it.
     pub(super) peer: String,
     /// The range from the region's first byte to the end of its
@@ -101,7 +101,7 @@ pub(super) struct Source {
     pub(super) fabric: Option<FabricExport>,
 }
 
-/// A task's move from another host's memory into an allocation of this
+/// A task's move from another host's storage into an allocation of this
 /// host's, before that host exposed its source; `hold` holds the GPU of a
 /// device destination.
 pub(super) struct Inbound {
@@ -134,7 +134,7 @@ pub(super) struct Sources {
 }
 
 /// An allocation exposed to another host, with the hold on its GPU for
-/// device memory.
+/// device storage.
 pub(super) type Exposed = (Arc<Mapped>, Option<Hold>);
 
 impl Network {
@@ -165,7 +165,7 @@ impl Network {
     }
 
     /// The pieces of task `task`'s moves from other hosts, each on the lane
-    /// of its link from the source host's memory, and the exposures the task
+    /// of its link from the source host's storage, and the exposures the task
     /// ends when it ends: every host exposes the task's regions there in one
     /// request per deployment, and every destination is registered with this
     /// agent, so a task whose sources or destinations cannot be read or
@@ -217,10 +217,10 @@ impl Network {
             }
             for (region, range) in regions.into_iter().zip(ranges) {
                 let source = Source {
-                    memory: Memory::Remote {
+                    end: LinkEnd::Remote {
                         endpoint: endpoint.clone(),
-                        gpu: match range.memory {
-                            Memory::Device { gpu } => Some(gpu),
+                        gpu: match range.end {
+                            LinkEnd::Device { gpu } => Some(gpu),
                             _ => None,
                         },
                     },
@@ -310,8 +310,8 @@ impl Network {
                 None => mapped.nixl_host_region(agent)?,
             };
             let link = Link {
-                source: source.memory.clone(),
-                destination: mapped.memory.clone(),
+                source: source.end.clone(),
+                destination: mapped.end.clone(),
             };
             pieces.push((
                 LaneKey {
@@ -409,7 +409,7 @@ impl Host {
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> storage::Result<(u64, Vec<u8>, Vec<Registered>)> {
+    ) -> ::storage::Result<(u64, Vec<u8>, Vec<Registered>)> {
         let mut retry = self.client.is_some();
         loop {
             let client = match &mut self.client {
@@ -419,7 +419,7 @@ impl Host {
                     .insert(Client::connect_peer(endpoint, PEER_TIMEOUT)?),
             };
             match client.expose(deployment.to_owned(), regions.clone()) {
-                Err(error @ (storage::Error::Io(_) | storage::Error::Protocol(_))) => {
+                Err(error @ (::storage::Error::Io(_) | ::storage::Error::Protocol(_))) => {
                     self.client = None;
                     if !retry {
                         return Err(error);
@@ -449,8 +449,8 @@ fn over_fabric(
     hold: &Hold,
     imports: &mut HashMap<([u8; 64], DeviceId), Arc<Fabric>>,
 ) -> Result<(LaneKey, End), String> {
-    let Memory::Remote { gpu: Some(gpu), .. } = &source.memory else {
-        return Err("a fabric handle names device memory".into());
+    let LinkEnd::Remote { gpu: Some(gpu), .. } = &source.end else {
+        return Err("a fabric handle names device storage".into());
     };
     let device = destination.device()?;
     // The destination's GPU context, which the import lives in.
@@ -464,8 +464,8 @@ fn over_fabric(
     Ok((
         LaneKey {
             link: Link {
-                source: Memory::Device { gpu: *gpu },
-                destination: destination.memory.clone(),
+                source: LinkEnd::Device { gpu: *gpu },
+                destination: destination.end.clone(),
             },
             runner: Runner::Device(device),
         },
@@ -477,7 +477,7 @@ fn over_fabric(
 }
 
 /// Register `allocations` with `network`'s agent for other hosts' READs,
-/// each with the hold on its GPU for device memory: each one's range, in
+/// each with the hold on its GPU for device storage: each one's range, in
 /// order, and the agent's metadata taken after the registrations, which
 /// carries them.
 pub(super) fn register(
@@ -493,7 +493,7 @@ pub(super) fn register(
                 None => mapped.nixl_host_region(agent)?,
             };
             Ok(Registered {
-                memory: mapped.memory.clone(),
+                end: mapped.end.clone(),
                 key: region.key,
                 address: region.address,
                 bytes: region.len as u64,
@@ -510,15 +510,15 @@ pub(super) fn register(
 
 /// A range another host's agent registered, as this agent's READs name it.
 fn source_region(range: &Registered) -> Result<nixl::Region, String> {
-    let memory = match range.memory {
-        Memory::Host => nixl::Memory::Host,
-        Memory::Device { .. } => nixl::Memory::Device,
-        Memory::Remote { .. } => {
-            return Err("another host exposed memory it does not hold".into());
+    let segment = match range.end {
+        LinkEnd::Host => nixl::Segment::Host,
+        LinkEnd::Device { .. } => nixl::Segment::Device,
+        LinkEnd::Remote { .. } => {
+            return Err("another host exposed storage it does not hold".into());
         }
     };
     Ok(nixl::Region {
-        memory,
+        segment,
         address: range.address,
         key: range.key,
         len: usize::try_from(range.bytes)

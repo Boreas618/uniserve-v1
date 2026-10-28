@@ -15,7 +15,7 @@
 //! its daemon's exit report. A rank whose builder thread stays inside one
 //! job reports it unasked (`WorkerResponse::Stalled`), and the engine fails
 //! that rank as it fails a dead one. The daemon that started a rank reaps it and removes
-//! the CUDA driver memory a rank that did not end in order left behind.
+//! the CUDA driver storage a rank that did not end in order left behind.
 //!
 //! The engine exchanges batch descriptors and bounded result values while
 //! tensors, cache pages, and latent storage remain worker-resident.
@@ -357,7 +357,7 @@ impl WorkerProcess {
             }
             WorkerResponse::Result { result, .. } => {
                 // Receiving claims any media the result published, so the
-                // shared-memory objects are released rather than left named.
+                // shared-storage objects are released rather than left named.
                 drop(WorkerResult::receive(result));
                 bail!("unexpected startup result response");
             }

@@ -4,7 +4,7 @@
 //! `uniserve worker` command loads this library and calls its exported
 //! [`worker_main`], which runs the control thread on the process's main
 //! thread and the interpreter on its builder thread. Rust owns
-//! request state, storage, streams, the CUDA graph policy and graph memory,
+//! request state, storage, streams, the CUDA graph policy and graph storage,
 //! transfers and the IPC service; one Python executor per rank
 //! (`uniserve.executor.Executor`) computes every model family's numerics
 //! through the library functions Rust imports by path.
@@ -30,12 +30,12 @@ mod job;
 pub mod launch;
 mod logging;
 mod manifests;
-pub mod memory;
 pub mod parallel;
 mod profiling;
 mod request;
 mod rules;
 mod service;
+pub mod storage;
 mod stream;
 pub mod transfer;
 mod worker;
@@ -48,10 +48,10 @@ pub use stream::EventPool;
 
 pub(crate) use executor::{Batch, Executor, Submission};
 pub(crate) use host::HostTask;
-pub(crate) use memory::{
+pub(crate) use request::{RequestPool, RequestProgress};
+pub(crate) use storage::{
     BlockTables, BufferBinding, LatentPool, LatentStorage, LatentUpdate, OutputBuffer, ProductStore,
 };
-pub(crate) use request::{RequestPool, RequestProgress};
 pub(crate) use transfer::DescriptorGrants;
 
 /// Lock `mutex`, keeping the state a panicking holder left.
@@ -70,7 +70,7 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
 ///
 /// An aborted close, or a release whose device completion is unknown,
 /// cannot tell when device work, a DMA engine or a peer rank stops
-/// addressing what `value` owns: releasing it could hand memory, a mapping
+/// addressing what `value` owns: releasing it could hand storage, a mapping
 /// or a stream that is still in use to a new owner. The value is leaked
 /// instead, and process exit returns its resources to the driver.
 #[expect(

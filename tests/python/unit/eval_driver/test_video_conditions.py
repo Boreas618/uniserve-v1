@@ -406,7 +406,7 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
                         "status": "completed",
                         "inference_time_s": 33.0,
                         "stage_durations": stages,
-                        "peak_memory_mb": 91000.5,
+                        "peak_storage_mb": 91000.5,
                     },
                 )
             headers = {"content-type": "video/mp4"}
@@ -414,7 +414,7 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
                 headers |= {
                     "x-inference-time-s": "33.0",
                     "x-stage-durations": json.dumps(stages),
-                    "x-peak-memory-mb": "91000.5",
+                    "x-peak-storage-mb": "91000.5",
                 }
             return web.Response(body=b"mp4", headers=headers)
 
@@ -441,7 +441,7 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
     record = asyncio.run(exercise())
     assert record.server_inference_s == 33.0
     assert record.server_stage_s == stages
-    assert record.server_peak_memory_mib == 91000.5
+    assert record.server_peak_storage_mib == 91000.5
     assert record.record_dict()["server_stage_s"] == stages
 
     # Summaries cover the requests whose output decoded.
@@ -465,7 +465,7 @@ def test_server_reported_timings_are_recorded_and_summarized(inputs, endpoint):
     metrics = summarize([record], 40.0)
     assert metrics["server_inference_ms"]["p50"] == 33_000.0
     assert metrics["server_stage_ms"]["denoising_stage"]["p50"] == 30_500.0
-    assert metrics["server_peak_memory_mib"] == 91000.5
+    assert metrics["server_peak_storage_mib"] == 91000.5
 
 
 @pytest.mark.parametrize("endpoint", [VIDEOS_SYNC, "/v1/videos"])
@@ -511,4 +511,4 @@ def test_stage_durations_alone_are_recorded_for_a_uniserve_request(
     record = asyncio.run(exercise())
     assert record.server_stage_s == stages
     assert record.server_inference_s is None
-    assert record.server_peak_memory_mib is None
+    assert record.server_peak_storage_mib is None

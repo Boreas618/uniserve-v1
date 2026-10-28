@@ -28,7 +28,7 @@ use super::{
 };
 use crate::ffi::{Backing, DType, MemoryKind};
 use crate::host::HostTask;
-use crate::memory::allocation::{Storage, StorageView};
+use crate::storage::allocation::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result, lock};
 
@@ -147,7 +147,7 @@ impl Read {
         if state.ticket.producer().is_some() {
             let MemoryKind::Cuda(device) = value.device() else {
                 return Err(Error::Invariant(
-                    "a fenced transfer result is not device memory".into(),
+                    "a fenced transfer result is not device storage".into(),
                 ));
             };
             let consumer = stream.stream().ok_or_else(|| {
@@ -419,14 +419,14 @@ impl ReadContext {
     fn staging(&self, device: DeviceId, bytes: usize) -> Result<Arc<Storage>> {
         let key = (std::thread::current().id(), device);
         let mut staging = lock(&self.staging);
-        if let Some(memory) = staging.get(&key)
-            && memory.bytes() >= bytes
+        if let Some(storage) = staging.get(&key)
+            && storage.bytes() >= bytes
         {
-            return Ok(Arc::clone(memory));
+            return Ok(Arc::clone(storage));
         }
-        let memory = Storage::pinned(device, bytes.max(1).next_power_of_two())?;
-        staging.insert(key, Arc::clone(&memory));
-        Ok(memory)
+        let storage = Storage::pinned(device, bytes.max(1).next_power_of_two())?;
+        staging.insert(key, Arc::clone(&storage));
+        Ok(storage)
     }
 
     fn forget_staging(&self, device: DeviceId) {
@@ -449,7 +449,7 @@ pub(crate) enum ReadCall {
         destination: Spans,
         producer: Option<Arc<Event>>,
     },
-    /// Copy a shared-memory export of this host into the destination.
+    /// Copy a shared-storage export of this host into the destination.
     Shared {
         locator: Arc<Locator>,
         slot: usize,
@@ -547,7 +547,7 @@ impl NativeRead {
         let Some(device) = copy_device(source, destination) else {
             let mut plan = copy_planner(None, SourceOrder::Stream)?;
             destination.plan_copy(source, &mut plan)?;
-            // SAFETY: both operands are host memory retained by this read;
+            // SAFETY: both operands are host storage retained by this read;
             // the destination's owner does not access it until completion.
             unsafe { copy_on_host(&plan) };
             return self.read.complete(destination.clone(), None);

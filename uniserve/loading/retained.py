@@ -17,7 +17,7 @@ stores bytes; this module defines what they are:
   fingerprint, so a change to one source's files reloads only its tensors;
   the manifest and the tensors no source loads are keyed by the structure.
   The worker adds the region of each logical tensor a chunk of retained
-  memory holds and where it lies in the chunk to form the chunk's key, so
+  storage holds and where it lies in the chunk to form the chunk's key, so
   the key names neither the rank nor its GPU.
 - :class:`Layout` describes a loaded model's device tensors for publishing:
   each parameter and buffer as its fields (a dense tensor's data, or a
@@ -25,7 +25,7 @@ stores bytes; this module defines what they are:
   view, each field with the part of its logical tensor it holds and how
   its bytes encode it (:func:`field_parts`, from the modules' declared
   logical tensors, ``uniserve.distributed.logical``), and a manifest naming
-  each tensor's representation. The worker allocates retained memory per
+  each tensor's representation. The worker allocates retained storage per
   storage, in chunks; :meth:`Layout.publish` copies one storage into the
   chunks the worker created and rebinds every field that viewed it, so
   branches that loading coalesced into one storage stay adjacent.
@@ -333,7 +333,7 @@ class _Entry:
 
     ``source`` names the checkpoint source the tensor is loaded from, empty
     for a tensor no source loads; ``host`` marks a matrix streamed from
-    host memory. ``parts`` describes each field's part of its logical
+    host storage. ``parts`` describes each field's part of its logical
     tensor and its encoding (:func:`field_parts`).
     """
 
@@ -609,11 +609,11 @@ class Layout:
     """A loaded model's device tensors, grouped by the torch storage they view.
 
     The worker reads the manifest and the flat lists below, allocates
-    retained memory for each storage on its device, and calls
+    retained storage for each storage on its device, and calls
     :meth:`publish` once per storage, in order. Lists over fields run
     storage by storage.
 
-    The projection matrices of a stack streamed from host memory
+    The projection matrices of a stack streamed from host storage
     (``uniserve.loading.host_weights``) are manifest entries whose data
     lies in the stack's host region instead of a device storage:
     :meth:`host_fields` lists them for each stack.
@@ -631,7 +631,7 @@ class Layout:
         default_factory=list
     )
     # Bytes freed into the torch allocator cache since it last returned
-    # memory to the driver.
+    # storage to the driver.
     _cached: int = 0
     # The entries of host-streamed matrices, by parameter identity.
     _host: dict[int, _Entry] = field(default_factory=dict)
@@ -699,7 +699,7 @@ class Layout:
 
         Meta tensors (modules this rank does not hold) are left out.
         ``host`` names the parameters (by object identity) a stack streams
-        from host memory, which no device storage holds. ``origins`` names
+        from host storage, which no device storage holds. ``origins`` names
         each loaded tensor's checkpoint source by object identity
         (``uniserve.loading.loader.Result.origins``). ``only`` narrows the
         tensors to publish to those identities; ``None`` publishes all.
@@ -728,7 +728,7 @@ class Layout:
                 continue
             if tensor.device.type not in devices:
                 raise ValueError(
-                    f"{identity} lies in {tensor.device.type} memory; "
+                    f"{identity} lies in {tensor.device.type} storage; "
                     "only CUDA weights are retained"
                 )
             if identity in borrowed:
@@ -871,36 +871,36 @@ class Layout:
     def publish(
         self,
         index: int,
-        memory: torch.Tensor,
+        storage: torch.Tensor,
         offset: int,
         written: Sequence[int] | None = None,
     ) -> None:
-        """Move storage ``index`` into ``memory`` at byte ``offset``.
+        """Move storage ``index`` into ``storage`` at byte ``offset``.
 
-        ``memory`` is a one-dimensional ``uint8`` tensor over a whole
+        ``storage`` is a one-dimensional ``uint8`` tensor over a whole
         retained storage on the storage's device, made of chunks. The
         storage's bytes in the chunks the worker created, ``written`` (flat
         ``[start, end, ...]`` byte ranges relative to the storage, one per
         chunk; all of them when ``None``), are copied; the chunks it mapped
         from another world hold the same bytes already. Every field that
-        viewed the storage is rebound to the same place in ``memory``. Each
+        viewed the storage is rebound to the same place in ``storage``. Each
         field keeps its tensor object, so every module that holds it reads
         the retained bytes. The loaded storage returns to the driver with
         the allocator cache once the cache holds ``_RELEASE_BYTES``, and
         after the last storage, so the next retained chunks can take its
-        memory; the copies have then completed.
+        storage; the copies have then completed.
         """
         storage = self._storages[index]
         size = storage.nbytes()
-        device = memory.device
+        device = storage.device
         source = torch.empty(0, dtype=torch.uint8, device=device)
         source.set_(storage, 0, (size,), (1,))
-        target = memory.untyped_storage()
-        base = memory.storage_offset() + offset
+        target = storage.untyped_storage()
+        base = storage.storage_offset() + offset
         # One copy per chunk: a copy stays inside one allocation.
         bounds = [0, size] if written is None else [int(b) for b in written]
         for start, end in zip(bounds[::2], bounds[1::2], strict=True):
-            memory[offset + start : offset + end].copy_(source[start:end])
+            storage[offset + start : offset + end].copy_(source[start:end])
         for _, _, tensor, position in self._views[index]:
             element = tensor.element_size()
             start = base + position
@@ -965,7 +965,7 @@ def describe(
     """The publish layout of a rank's loaded model (``rank.Loaded``).
 
     ``host_paths`` are the module paths whose layer stacks stream from host
-    memory (``uniserve.loading.host_weights``). ``only`` names the tensors
+    storage (``uniserve.loading.host_weights``). ``only`` names the tensors
     to publish, those the rank read while it bound the others; ``None``
     publishes all.
     """
@@ -1036,13 +1036,13 @@ class Retained:
             shape = tuple(int(extent) for extent in field_shapes[bounds])
             strides = tuple(int(stride) for stride in field_strides[bounds])
             position += rank
-            memory = storages[int(field_storages[index])]
+            storage = storages[int(field_storages[index])]
             dtype = _dtype(str(field_dtypes[index]))
             element = torch.empty(0, dtype=dtype).element_size()
-            start = memory.storage_offset() + int(field_offsets[index])
-            view = torch.empty(0, dtype=dtype, device=memory.device)
+            start = storage.storage_offset() + int(field_offsets[index])
+            view = torch.empty(0, dtype=dtype, device=storage.device)
             view.set_(
-                memory.untyped_storage(), start // element, shape, strides
+                storage.untyped_storage(), start // element, shape, strides
             )
             fields[str(identity)] = view
 

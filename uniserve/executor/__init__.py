@@ -2,7 +2,7 @@
 
 The worker (Rust) owns the control plane and the data plane: requests,
 batches, the builder thread and the streams, product storage and transfers,
-the prefix cache's pages, the latent ledger, the graph pools' device memory
+the prefix cache's pages, the latent ledger, the graph pools' device storage
 and the host groups. The executor owns every numerical decision and
 computation of the rank: the components' runners, their buffers, layouts
 and buckets, graph capture and replay, sampling, slot state, expert steps
@@ -116,7 +116,7 @@ class _Binding:
 
     @classmethod
     def parse(
-        cls, memory: Mapping[str, Any], values: Sequence[Any]
+        cls, storage: Mapping[str, Any], values: Sequence[Any]
     ) -> _Binding:
         """Read ``bind``'s JSON and values, in the worker's order.
 
@@ -138,7 +138,7 @@ class _Binding:
             return taken
 
         streams: list[torch.cuda.Stream | None] = []
-        for handle, ordinal in memory["streams"]:
+        for handle, ordinal in storage["streams"]:
             streams.append(
                 None
                 if ordinal is None
@@ -147,25 +147,25 @@ class _Binding:
                 )
             )
         scratches = take(len(streams))
-        host_scratch = take(1)[0] if memory["host_scratch"] else None
+        host_scratch = take(1)[0] if storage["host_scratch"] else None
         binding = cls(
-            slots=int(memory["slots"]),
-            max_calls=int(memory["max_calls"]),
+            slots=int(storage["slots"]),
+            max_calls=int(storage["max_calls"]),
             streams=streams,
             scratches=scratches,
-            pools=take(len(streams)) if memory["pools"] else None,
+            pools=take(len(streams)) if storage["pools"] else None,
             computations=[
-                dict(computation) for computation in memory["computations"]
+                dict(computation) for computation in storage["computations"]
             ],
-            experts=[int(index) for index in memory["experts"]],
+            experts=[int(index) for index in storage["experts"]],
             host_scratch=host_scratch,
         )
-        if memory["pools"]:
+        if storage["pools"]:
             for index in range(len(streams)):
                 binding.peer_pools[index] = [
-                    (int(ordinal), take(1)[0]) for ordinal in memory["peers"]
+                    (int(ordinal), take(1)[0]) for ordinal in storage["peers"]
                 ]
-        pages = memory.get("pages")
+        pages = storage.get("pages")
         if pages is not None:
             (binding.unit_pool,) = take(1)
             names = [str(name) for name in pages["tables"]]
@@ -176,14 +176,14 @@ class _Binding:
             if "pages" in computation["resources"]:
                 tokens, flags = take(2)
                 binding.staging[index] = (tokens, flags)
-        if memory["latents"]:
+        if storage["latents"]:
             first, second = take(2)
             binding.banks = (first, second)
-        binding.reports = memory.get("reports")
-        for group in memory["collectives"]:
+        binding.reports = storage.get("reports")
+        for group in storage["collectives"]:
             (handle,) = take(1)
             binding.collectives.append((dict(group), handle))
-        if memory["prefetch"]:
+        if storage["prefetch"]:
             (binding.prefetch,) = take(1)
         if rest:
             raise ValueError("bind received more values than it names")
@@ -705,23 +705,23 @@ class Executor:
         return self._union.storage_bytes()
 
     def connect_experts(
-        self, memory: str, *storages: torch.Tensor | None
+        self, storage: str, *storages: torch.Tensor | None
     ) -> None:
         """Create the expert union's exchanges, collectively.
 
-        ``memory`` is JSON ``{"microbatches": [{stream, device, pointers}]}``
+        ``storage`` is JSON ``{"microbatches": [{stream, device, pointers}]}``
         and ``storages`` each microbatch's peer-mapped storage or ``None``.
         """
         self._require_union().connect(
-            json.loads(str(memory))["microbatches"], list(storages)
+            json.loads(str(storage))["microbatches"], list(storages)
         )
 
     # Binding, warmup and seal.
 
-    def bind(self, memory: str, *values: Any) -> str:
+    def bind(self, storage: str, *values: Any) -> str:
         """Construct the runners on the storage the worker granted.
 
-        ``memory`` is JSON: ``slots``, ``max_calls``, the ``streams``
+        ``storage`` is JSON: ``slots``, ``max_calls``, the ``streams``
         (``[handle, ordinal]`` each), whether graph ``pools`` follow and
         the ``peers`` devices they follow on, the ``computations`` (each
         one's ``component``, ``kinds``, ``streams`` and ``resources``), the
@@ -734,11 +734,11 @@ class Executor:
         shapes, captured sizes, guidance tokens, capacity and capture-order
         digests) or ``null``.
         """
-        binding = _Binding.parse(json.loads(str(memory)), values)
+        binding = _Binding.parse(json.loads(str(storage)), values)
         if len(binding.computations) != len(self._computations):
             raise ValueError("bind names other computations than the manifest")
         # PyTorch creates a thread's cuBLAS handle for a device at the
-        # thread's first matmul there, and creating one frees device memory
+        # thread's first matmul there, and creating one frees device storage
         # (``cuMemFree``), which waits for the device. The thread binding the
         # executor runs every computation, so it creates each bound device's
         # handle now: no serving call may wait for the device, and with
@@ -854,7 +854,7 @@ class Executor:
         the graphs captured at startup again.
 
         A serving world runs eagerly while a successor prepares, so that the
-        worker can give its graph memory to the successor's captures
+        worker can give its graph storage to the successor's captures
         (``update_config.eager_prepare``); the graphs stay captured.
 
         Raises:
@@ -884,7 +884,7 @@ class Executor:
         Past the seal a serving call (``start``, ``release``, ``prepare``,
         ``execute``, ``commit``, an expert step's join) only queues work on
         the computations' streams: a PyTorch operation that would make the
-        host wait for a stream (a copy from or to pageable memory, a device
+        host wait for a stream (a copy from or to pageable storage, a device
         scalar read on the host) raises instead, which fails the call. The
         mode is process-wide, so it is set around the call and restored:
         startup, warmup and lifecycle calls may synchronize.

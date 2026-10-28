@@ -40,9 +40,9 @@ use crate::executor::columns::{ForwardRows, GroupPages, host_tensor};
 use crate::executor::computations::CallResources;
 use crate::ffi::{Backing, DType as Element, MemoryKind};
 use crate::job::{Job, Recorder};
-use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::{AttentionRow, OutputPlacement, PrefixCache, ProductBuffer, UnitColumn};
 use crate::request::RequestPool;
+use crate::storage::allocation::{Storage, StorageView};
+use crate::storage::{AttentionRow, OutputPlacement, PrefixCache, ProductBuffer, UnitColumn};
 use crate::{Error, ProductStore, Result};
 
 /// What the rank's cache-backed computations share.
@@ -195,18 +195,23 @@ const COMPLETIONS: i64 = 1;
 
 impl RelayStaging {
     /// Staging for batches of at most `calls` calls on `device` (host
-    /// memory without one).
+    /// storage without one).
     pub(crate) fn allocate(device: Option<DeviceId>, calls: usize) -> Result<Self> {
         let calls = calls.max(1);
         let bytes = calls * (size_of::<i64>() + 2);
-        let memory: Arc<dyn Backing> = match device {
+        let storage: Arc<dyn Backing> = match device {
             Some(device) => Storage::device(device, bytes)?,
             None => Storage::host(bytes),
         };
         Ok(Self {
-            tokens: StorageView::contiguous(Arc::clone(&memory), 0, Element::I64, &[calls as i64])?,
+            tokens: StorageView::contiguous(
+                Arc::clone(&storage),
+                0,
+                Element::I64,
+                &[calls as i64],
+            )?,
             flags: StorageView::contiguous(
-                memory,
+                storage,
                 calls * size_of::<i64>(),
                 Element::U8,
                 &[2, calls as i64],

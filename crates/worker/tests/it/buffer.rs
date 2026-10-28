@@ -3,8 +3,8 @@
 use ipc::{BufferAllocation, BufferId, RequestKey};
 use ipc::{CallId, RequestId};
 use worker::ffi::{Backing, MemoryKind};
-use worker::memory::BufferPool;
-use worker::memory::LocalMemory;
+use worker::storage::BufferPool;
+use worker::storage::LocalStorage;
 use worker::{Error, Result};
 
 const HOST: MemoryKind = MemoryKind::Host;
@@ -24,7 +24,7 @@ fn allocation(output_index: u16, offset: u64, bytes: u64) -> BufferAllocation {
 
 #[test]
 fn fixed_ranges_reserve_their_padding_until_released() -> Result<()> {
-    let mut pool = BufferPool::allocate(32, &[HOST], &mut LocalMemory)?;
+    let mut pool = BufferPool::allocate(32, &[HOST], &mut LocalStorage)?;
 
     let first = allocation(0, 0, 16);
     let (binding, arena) = pool.bind(first, HOST, 8, 4)?;
@@ -35,8 +35,8 @@ fn fixed_ranges_reserve_their_padding_until_released() -> Result<()> {
     assert!(pool.bind(allocation(1, 8, 8), HOST, 8, 4).is_err());
     let (neighbor, arena) = pool.bind(allocation(1, 16, 16), HOST, 16, 4)?;
     assert_eq!(neighbor.physical_offset(), 16);
-    assert_eq!(arena.address(), base, "one arena per memory");
-    // A memory the pool holds no arena of binds nothing.
+    assert_eq!(arena.address(), base, "one arena per storage");
+    // A storage the pool holds no arena of binds nothing.
     assert!(
         pool.bind(allocation(2, 0, 8), MemoryKind::PinnedHost, 8, 4)
             .is_err()
@@ -51,8 +51,8 @@ fn fixed_ranges_reserve_their_padding_until_released() -> Result<()> {
 
 #[test]
 fn released_ranges_rebind_without_accepting_stale_or_foreign_handles() -> Result<()> {
-    let mut pool = BufferPool::allocate(1024, &[HOST], &mut LocalMemory)?;
-    let mut other = BufferPool::allocate(1024, &[HOST], &mut LocalMemory)?;
+    let mut pool = BufferPool::allocate(1024, &[HOST], &mut LocalStorage)?;
+    let mut other = BufferPool::allocate(1024, &[HOST], &mut LocalStorage)?;
     let first = allocation(0, 0, 512);
     let second = allocation(1, 512, 512);
     let (binding, _) = pool.bind(first, HOST, 128, 4)?;

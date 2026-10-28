@@ -1,21 +1,21 @@
-//! A pool of device memory at stable addresses: a reserved virtual address
-//! range whose physical memory is mapped as it is used, and which can be
+//! A pool of device storage at stable addresses: a reserved virtual address
+//! range whose physical storage is mapped as it is used, and which can be
 //! released and mapped back at the same addresses.
 //!
-//! A CUDA graph holds the addresses of the memory its nodes read and write,
-//! so the memory behind a graph must stay at its addresses for the graph's
+//! A CUDA graph holds the addresses of the storage its nodes read and write,
+//! so the storage behind a graph must stay at its addresses for the graph's
 //! life. A [`VirtualPool`] gives out chunks of one reservation, each its own
 //! physical allocation mapped at an address that never changes. Freed
 //! chunks stay mapped and are given out again by the same pool, so the
-//! physical memory returns to the driver only when the pool is dropped.
+//! physical storage returns to the driver only when the pool is dropped.
 //!
-//! Every device that can access the pool's device's memory may read and
+//! Every device that can access the pool's device's storage may read and
 //! write the chunks: a module placed on another device (a generation tower)
 //! copies its inputs from tensors a capture allocated in the pool.
 //!
 //! [`VirtualPool::suspend`] copies every chunk's contents to page-locked
-//! host memory and releases the physical memory while keeping the
-//! reservation; [`VirtualPool::restore`] maps new physical memory at the
+//! host storage and releases the physical storage while keeping the
+//! reservation; [`VirtualPool::restore`] maps new physical storage at the
 //! same addresses and copies the contents back. Nothing may read or write
 //! the pool between the two.
 
@@ -38,12 +38,12 @@ struct Chunk {
     free: bool,
 }
 
-/// Device memory at stable addresses; see the module documentation.
+/// Device storage at stable addresses; see the module documentation.
 pub struct VirtualPool {
     context: PrimaryContext,
     device: DeviceId,
     /// The ordinals granted access to the chunks: the device's, then each
-    /// peer's that can access its memory.
+    /// peer's that can access its storage.
     access: Vec<i32>,
     address: u64,
     reserved: usize,
@@ -60,7 +60,7 @@ pub struct VirtualPool {
 
 impl VirtualPool {
     /// Reserves `bytes` of virtual addresses on `device`, rounded up to the
-    /// allocation granularity; no physical memory is mapped yet.
+    /// allocation granularity; no physical storage is mapped yet.
     ///
     /// # Errors
     ///
@@ -113,7 +113,7 @@ impl VirtualPool {
         self.device
     }
 
-    /// The bytes of physical memory the pool maps, or would map once
+    /// The bytes of physical storage the pool maps, or would map once
     /// restored.
     pub fn mapped_bytes(&self) -> usize {
         self.chunks.iter().map(|chunk| chunk.bytes).sum()
@@ -127,16 +127,16 @@ impl VirtualPool {
     /// A chunk of at least `bytes`, readable and writable by the pool's
     /// device and its peers, at an address it keeps for the pool's life: a
     /// freed chunk of
-    /// the same rounded size, or new physical memory mapped after the
+    /// the same rounded size, or new physical storage mapped after the
     /// chunks given out so far.
     ///
     /// # Errors
     ///
     /// Fails while the pool is suspended, when the reservation is
-    /// exhausted, and when the driver cannot allocate or map the memory.
+    /// exhausted, and when the driver cannot allocate or map the storage.
     pub fn allocate(&mut self, bytes: usize) -> Result<u64> {
         if self.suspended {
-            return Err(Error::invalid("a suspended pool gives out no memory"));
+            return Err(Error::invalid("a suspended pool gives out no storage"));
         }
         let bytes = bytes.max(1).next_multiple_of(self.granularity);
         if let Some(chunk) = self
@@ -179,7 +179,7 @@ impl VirtualPool {
         }
     }
 
-    /// Creates `bytes` of physical memory and maps it at `offset`, readable
+    /// Creates `bytes` of physical storage and maps it at `offset`, readable
     /// and writable by the pool's device and its peers. Returns its handle.
     fn map(&self, offset: u64, bytes: usize) -> Result<u64> {
         let ordinal = self.device.handle()?;
@@ -230,8 +230,8 @@ impl VirtualPool {
         })
     }
 
-    /// Copies every chunk's contents to page-locked host memory and releases
-    /// its physical memory, keeping the reservation and every address. The
+    /// Copies every chunk's contents to page-locked host storage and releases
+    /// its physical storage, keeping the reservation and every address. The
     /// caller has drained all work that reads or writes the pool and starts
     /// none until [`Self::restore`]. Suspending a suspended pool does
     /// nothing.
@@ -284,7 +284,7 @@ impl VirtualPool {
         Ok(())
     }
 
-    /// Maps new physical memory at every chunk's address and copies its
+    /// Maps new physical storage at every chunk's address and copies its
     /// saved contents back. Restoring a pool that is not suspended does
     /// nothing.
     ///

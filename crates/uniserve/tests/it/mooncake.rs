@@ -6,7 +6,7 @@
 //! Runs when `UNISERVE_MOONCAKE_MASTER` names a master (`host:port`) and
 //! `MOONCAKE_STORE_LIBRARY` names `libmooncake_store.so`; it returns at once
 //! otherwise. The connectors use Mooncake's P2P handshake for metadata and
-//! TCP for transfers. The first server contributes memory to Mooncake's pool
+//! TCP for transfers. The first server contributes storage to Mooncake's pool
 //! and the second contributes none, so the second is a client of the
 //! first's segment.
 
@@ -121,8 +121,8 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
     let Reply::PagePool { pool, slots, .. } = answer.reply else {
         panic!("the page pool was refused: {:?}", answer.reply);
     };
-    let memory = answer.descriptors.into_iter().next().unwrap();
-    let mapping = Mapping::new(&memory, (slots * PAGE_BYTES) as usize);
+    let storage = answer.descriptors.into_iter().next().unwrap();
+    let mapping = Mapping::new(&storage, (slots * PAGE_BYTES) as usize);
     (head, worker, pool, mapping)
 }
 
@@ -133,7 +133,7 @@ struct Mapping {
 }
 
 impl Mapping {
-    fn new(memory: &OwnedFd, bytes: usize) -> Self {
+    fn new(storage: &OwnedFd, bytes: usize) -> Self {
         // SAFETY: a new shared mapping of the pool's whole memfd.
         let address = unsafe {
             rustix::mm::mmap(
@@ -141,7 +141,7 @@ impl Mapping {
                 bytes,
                 rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
                 rustix::mm::MapFlags::SHARED,
-                memory.as_fd(),
+                storage.as_fd(),
                 0,
             )
         }

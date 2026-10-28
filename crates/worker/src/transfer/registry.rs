@@ -1,4 +1,4 @@
-//! Registered source storage shared by local, shared-memory and device reads.
+//! Registered source storage shared by local, shared-storage and device reads.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -177,20 +177,20 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::memory::allocation::{Storage, StorageView};
+    use crate::storage::allocation::{Storage, StorageView};
     use crate::transfer::backing::TransportBuffer;
     use crate::transfer::{ByteReservation, Spans, TransferCapacity};
 
     /// A registered local export of four host bytes and a weak reference
-    /// to the memory it retains.
+    /// to the storage it retains.
     fn source(
         key: u64,
         capacity: &Arc<TransferCapacity>,
     ) -> Result<(SourceKey, Source, Weak<Storage>)> {
-        let memory = Storage::host(4);
-        let retained = Arc::downgrade(&memory);
+        let storage = Storage::host(4);
+        let retained = Arc::downgrade(&storage);
         let spans = Spans::single(StorageView::contiguous(
-            memory as Arc<dyn Backing>,
+            storage as Arc<dyn Backing>,
             0,
             DType::U8,
             &[4],

@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use storage::protocol::Key;
+use ::storage::protocol::Key;
 
 use crate::child::{Launch, Supervised};
 

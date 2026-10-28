@@ -18,7 +18,7 @@
 //!   admission and growth compare the sum of every group's unit demand with
 //!   the free units.
 //! - Unit zero: the worker treats unit zero as its padding sentinel, valid
-//!   memory in every plane, so the pool never allocates it and excludes it
+//!   storage in every plane, so the pool never allocates it and excludes it
 //!   from capacity.
 //! - Free queue: an intrusive doubly linked queue of unreferenced units.
 //!   Allocation takes units from the head and released units join the tail,
@@ -207,7 +207,7 @@ struct PoolInner {
     stats: BlockPoolStats,
     /// Units `1..=scratch`, which the pool never allocates.
     scratch: u32,
-    /// The first unit withdrawn from allocation, as the memory holding the
+    /// The first unit withdrawn from allocation, as the storage holding the
     /// units from it on is given back (`BlockPool::withdraw`); the unit
     /// count while none is.
     withdrawn: u32,
@@ -469,7 +469,7 @@ impl BlockPool {
         }
     }
 
-    /// Withdraws the units from `first` on from allocation, as the memory
+    /// Withdraws the units from `first` on from allocation, as the storage
     /// holding them is to be given back: the queued ones leave the queue,
     /// their published pages the prefix index, and the ones requests hold
     /// leave as their holders let them go. Returns how many are held.
@@ -522,7 +522,7 @@ impl BlockPool {
         (inner.withdrawn as usize) < inner.meta.len()
     }
 
-    /// Returns every withdrawn unit to allocation: their memory was created
+    /// Returns every withdrawn unit to allocation: their storage was created
     /// again and reset. A unit a request still holds, as when a restore
     /// cancels a shrink, is queued once its holder lets it go.
     pub(crate) fn restore(&self) {
@@ -531,7 +531,7 @@ impl BlockPool {
     }
 
     /// Returns the withdrawn units below `end` to allocation, as
-    /// [`Self::restore`] returns them all: the memory of the segments
+    /// [`Self::restore`] returns them all: the storage of the segments
     /// holding them was created.
     pub(crate) fn restore_to(&self, end: u32) {
         let mut inner = lock(&self.inner);
@@ -572,7 +572,7 @@ impl BlockPool {
     }
 
     /// Returns the inherited units to allocation: the predecessor world is
-    /// gone and the workers took its memory. Their pages stay published.
+    /// gone and the workers took its storage. Their pages stay published.
     pub(crate) fn take_inherited(&self) {
         let mut inner = lock(&self.inner);
         let range = std::mem::replace(&mut inner.inherited, 0..0);

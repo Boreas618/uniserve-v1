@@ -53,7 +53,7 @@ pub(crate) struct MemAllocationProp {
 pub(crate) const CU_MEM_ALLOCATION_TYPE_PINNED: i32 = 1;
 
 impl MemAllocationProp {
-    /// Device-resident physical memory exportable as `handle_types`.
+    /// Device-resident physical storage exportable as `handle_types`.
     pub(crate) fn device(ordinal: i32, handle_types: i32) -> Self {
         Self {
             kind: CU_MEM_ALLOCATION_TYPE_PINNED,

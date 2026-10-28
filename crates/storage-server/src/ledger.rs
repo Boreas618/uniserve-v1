@@ -1,4 +1,4 @@
-//! The GPUs' memory ledgers ([`GpuLedger`]): one per GPU for each deployment
+//! The GPUs' storage ledgers ([`GpuLedger`]): one per GPU for each deployment
 //! that uses it.
 //!
 //! A ledger is derived on demand from three sources:
@@ -13,31 +13,31 @@
 //!   retired: the commit's handover of the segments is a transfer on the
 //!   ledger, never a release and an allocation.
 //! - What the processes book themselves ([`Request::Book`]), which the server
-//!   cannot see: a worker's graph pool, process memory and staging under its
+//!   cannot see: a worker's graph pool, process storage and staging under its
 //!   scope and world; the Transfer Server's staging, and its CUDA context
 //!   while it holds the context on the GPU, in every ledger of the GPU. A
 //!   booking lives as long as its process's connection, since the process's
-//!   memory ends with the process. The processes of one scope and world
+//!   storage ends with the process. The processes of one scope and world
 //!   serve in turn (a rank and the relaunch or standby that replaces it), so
 //!   the largest of their bookings of an item counts.
 //!
 //! The quota of a deployment's ledger is `⌊total × fraction⌋` of the whole
 //! GPU, which its workers state with their bookings; while two worlds that
-//! state different fractions hold memory on the GPU, the smaller quota
+//! state different fractions hold storage on the GPU, the smaller quota
 //! holds. Every change that adds to a ledger, a booking or a new device
 //! storage, is refused when it would take the ledger past its quota, so a
 //! ledger's sum never exceeds it. The Transfer Server books its context
 //! before it retains the context, so a ledger without room for it refuses
 //! the context and the work that needed it.
 //!
-//! [`Request::Book`]: storage::protocol::Request::Book
+//! [`Request::Book`]: ::storage::protocol::Request::Book
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
-use storage::protocol::{
+use ::storage::protocol::{
     Access, GpuLedger, Item, LedgerEntry, Retainer, Scope, Segment, StorageRecord,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::ClientId;
 
@@ -66,12 +66,12 @@ pub(crate) struct Held<'a> {
     pub(crate) retainers: BTreeSet<&'a Retainer>,
 }
 
-/// The ledgers' own state: every GPU's total memory, the quotas the worlds
+/// The ledgers' own state: every GPU's total storage, the quotas the worlds
 /// state and the processes' bookings. The storages they derive the rest
 /// from are the server's.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct Ledgers {
-    /// Each GPU's total memory, as the last process that booked on it
+    /// Each GPU's total storage, as the last process that booked on it
     /// stated it.
     totals: BTreeMap<[u8; 16], u64>,
     /// The quota each world of a deployment states for a GPU, by
@@ -123,7 +123,7 @@ impl Ledgers {
         self.bookings.remove(&client);
     }
 
-    /// The quotas the worlds of `retired` stated end with their memory.
+    /// The quotas the worlds of `retired` stated end with their storage.
     pub(crate) fn retire(&mut self, deployment: &str, retired: &BTreeSet<u64>) {
         self.quotas
             .retain(|(of, _, world), _| of != deployment || !retired.contains(world));
@@ -151,7 +151,7 @@ impl Ledgers {
 
         // Each retained storage once per deployment that retains it.
         for storage in held {
-            let storage::protocol::Placement::Device { gpu } = storage.record.placement else {
+            let ::storage::protocol::Placement::Device { gpu } = storage.record.placement else {
                 continue;
             };
             if !gpus(&gpu) {
@@ -309,9 +309,9 @@ pub(crate) fn overrun(before: &[GpuLedger], after: &[GpuLedger]) -> Option<Strin
             .map_or(0, GpuLedger::used);
         (used > quota && used > previous).then(|| {
             format!(
-                "the memory ledger of GPU {} would book {used} bytes, past its quota of {quota} \
+                "the storage ledger of GPU {} would book {used} bytes, past its quota of {quota} \
                  bytes by {}:\n{}",
-                storage::protocol::gpu_name(&ledger.gpu),
+                ::storage::protocol::gpu_name(&ledger.gpu),
                 used - quota,
                 ledger.describe()
             )

@@ -38,7 +38,7 @@
 //!   chunks queued or in flight, and ends when it has none; the next piece
 //!   queued on the lane starts another. A GPU lane's thread holds its GPU
 //!   ([`Hold`]) and creates its stream in the GPU's context, and every piece
-//!   holds the GPUs whose memory or context its ends need, so a GPU's
+//!   holds the GPUs whose storage or context its ends need, so a GPU's
 //!   context is released once its last task's last chunk completed and its
 //!   lanes' threads ended ([`super::contexts`]).
 //!
@@ -52,12 +52,12 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use ::storage::protocol::{Link, LinkBandwidth, LinkEnd, Priority, Throttle, TransferEnd};
 use cuda::{DeviceId, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream, memcpy_async};
-use storage::protocol::{Link, LinkBandwidth, Memory, Priority, Throttle, TransferEnd};
 
 use super::contexts::{Contexts, Hold};
-use super::memory::{Fabric, Mapped};
 use super::network::{Network, Source};
+use super::storage::{Fabric, Mapped};
 
 /// How often a running task reports its progress, at most.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -117,14 +117,14 @@ pub(super) struct LaneKey {
 }
 
 /// One end of a piece: an allocation the server gave, another host's
-/// allocation imported on the lane's GPU, or another host's memory that a
+/// allocation imported on the lane's GPU, or another host's storage that a
 /// READ reaches. Each holds the GPU whose context reaches it, declared after
 /// what lives in that context, so that it is dropped last.
 #[derive(Clone)]
 pub(super) enum End {
     /// An allocation the server gave, and the hold on the GPU whose session
     /// maps or registers it: a device allocation's own GPU; for host
-    /// memory, the GPU whose copy engines run the copy, and none when the
+    /// storage, the GPU whose copy engines run the copy, and none when the
     /// CPU copies it or a READ writes it.
     Given {
         mapped: Arc<Mapped>,
@@ -152,17 +152,17 @@ impl End {
                 Runner::Device(_),
             ) => {
                 let session = hold.session()?;
-                match mapped.memory {
-                    Memory::Device { .. } => session.device_address(mapped),
-                    Memory::Host => session.host_address(mapped),
-                    Memory::Remote { .. } => {
+                match mapped.end {
+                    LinkEnd::Device { .. } => session.device_address(mapped),
+                    LinkEnd::Host => session.host_address(mapped),
+                    LinkEnd::Remote { .. } => {
                         Err("the server gives allocations of this host only".into())
                     }
                 }
             }
             (End::Fabric { import, .. }, Runner::Device(_)) => import.address(),
             (End::Remote(_), _) | (_, Runner::Network) => {
-                Err("another host's memory is read by a READ, not copied by address".into())
+                Err("another host's storage is read by a READ, not copied by address".into())
             }
             _ => Err("a copy's runner does not reach one of its ends".into()),
         }
@@ -710,7 +710,7 @@ fn sample(samples: &mut Samples, piece: &Piece, seconds: f64) -> Option<f64> {
 ///
 /// The thread holds the GPU and makes its stream in the GPU's context. A
 /// context it cannot retain, or a stream it cannot make (the GPU has no
-/// memory left for them), fails the lane's chunks, not the process: no copy
+/// storage left for them), fails the lane's chunks, not the process: no copy
 /// ran in the context.
 fn device_lane(
     shared: &Shared,
@@ -874,7 +874,7 @@ fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Dur
     }
 }
 
-/// Run `lane`'s chunks, from another host's memory into this host's, as
+/// Run `lane`'s chunks, from another host's storage into this host's, as
 /// NIXL READs this process's agent posts, until nothing is queued or in
 /// flight.
 ///
@@ -946,13 +946,13 @@ fn network_lane(
 }
 
 /// Post `piece` as one READ of `network`'s agent: from another host's
-/// memory, which its Transfer Server registered, into an allocation of this
-/// host's, registered here at its first READ: device memory in its GPU's
-/// session, host memory with the allocation.
+/// storage, which its Transfer Server registered, into an allocation of this
+/// host's, registered here at its first READ: device storage in its GPU's
+/// session, host storage with the allocation.
 fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
     let (End::Remote(source), End::Given { mapped, hold }) = (&piece.source, &piece.destination)
     else {
-        return Err("a READ reads another host's memory into this host's".into());
+        return Err("a READ reads another host's storage into this host's".into());
     };
     let agent = network.agent()?;
     let local = match hold {

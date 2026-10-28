@@ -172,7 +172,7 @@ class Scratch:
     backing that fits; a larger request allocates a new backing in front and
     keeps the older ones, which already captured graphs still address. In a
     worker, backings on ``device`` allocate from ``pool``, the allocator pool
-    of the device memory the worker owns for this scratch. A context whose
+    of the device storage the worker owns for this scratch. A context whose
     module computes on another device (a generation tower) takes backings
     there from torch's own allocator: a pool's use count lives on the
     device that created it, so using it on another device would release it
@@ -229,7 +229,7 @@ class Scratch:
 
 
 class Workspace:
-    """The workspace of an execution context, in torch memory.
+    """The workspace of an execution context, in torch storage.
 
     Shared scratch is grown and kept by a :class:`Scratch`; persistent
     fields are tensors of their own.

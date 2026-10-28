@@ -1,12 +1,12 @@
 //! NIXL agents with the UCX backend: registration of host and device
-//! memory, exchange of agent metadata, and READs the destination posts and
+//! storage, exchange of agent metadata, and READs the destination posts and
 //! waits for on the host.
 //!
 //! A transfer between two agents takes three steps:
 //!
-//! 1. each process creates an [`Agent`] and registers the memory a transfer
-//!    reads or writes ([`Agent::register`]), device memory (including
-//!    memory `cuda::vmm` maps) or host memory, each region under a key of
+//! 1. each process creates an [`Agent`] and registers the storage a transfer
+//!    reads or writes ([`Agent::register`]), device storage (including
+//!    storage `cuda::vmm` maps) or host storage, each region under a key of
 //!    its own ([`Region::key`]) and for the access it needs ([`Access`]):
 //!    a READ's destination for reads and writes, a source mapped read-only
 //!    for reads alone;
@@ -25,9 +25,9 @@ mod agent;
 mod capi;
 mod error;
 mod library;
-mod memory;
+mod regions;
 
 pub use agent::{Agent, Transfer};
 pub use error::{Error, Result};
 pub use library::load_library;
-pub use memory::{Access, Memory, Region, Registration, Span};
+pub use regions::{Access, Region, Registration, Segment, Span};

@@ -2,7 +2,7 @@
 //! (`uniserve.executor.Executor`).
 //!
 //! The worker owns the control and data planes (requests, batches, jobs,
-//! products, transfers and memory); the executor owns every numerical decision
+//! products, transfers and storage); the executor owns every numerical decision
 //! and computation of the components it serves. One executor serves a rank,
 //! shared by what calls it (the executor computations, the expert union member,
 //! warmup), and the backend closes it once after them. It serves each
@@ -31,8 +31,8 @@ use tvm_ffi::Any;
 
 use crate::ffi::{Argument, MethodCall};
 use crate::ffi::{Function, Handle, Interpreter};
-use crate::memory::allocation::StorageView;
 use crate::profiling::kernels::{KernelRecord, parse_listing};
+use crate::storage::allocation::StorageView;
 use crate::{Error, Result};
 
 const EXECUTOR: &str = "uniserve.executor.Executor";
@@ -139,11 +139,11 @@ impl PythonExecutor {
     }
 
     /// Construct every computation on the storage capacity planning granted:
-    /// `memory` is the JSON `bind` reads and `values` the handles and tensors
+    /// `storage` is the JSON `bind` reads and `values` the handles and tensors
     /// it names, in its order (`crate::worker::computations`). Returns the JSON
     /// the executor states of its bound computations.
-    pub(crate) fn bind(&self, memory: String, values: Vec<Argument>) -> Result<String> {
-        let mut arguments = vec![Argument::Text(memory)];
+    pub(crate) fn bind(&self, storage: String, values: Vec<Argument>) -> Result<String> {
+        let mut arguments = vec![Argument::Text(storage)];
         arguments.extend(values);
         self.texts(&self.functions.bind, arguments)
     }
@@ -237,15 +237,15 @@ impl PythonExecutor {
             .map_err(|_| Error::Interface(format!("{} returns a byte count", function.name())))
     }
 
-    /// Create the expert union's exchanges, collectively: `memory` is the
+    /// Create the expert union's exchanges, collectively: `storage` is the
     /// JSON `connect_experts` reads (each microbatch's stream and peer
     /// addresses) and `storages` each microbatch's peer-mapped storage.
     pub(crate) fn connect_experts(
         &self,
-        memory: String,
+        storage: String,
         storages: Vec<Option<StorageView>>,
     ) -> Result<()> {
-        let mut arguments = vec![Argument::Text(memory)];
+        let mut arguments = vec![Argument::Text(storage)];
         arguments.extend(storages.into_iter().map(|storage| match storage {
             Some(view) => Argument::Tensor(view),
             None => Argument::None,

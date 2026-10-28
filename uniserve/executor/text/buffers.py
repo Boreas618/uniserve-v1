@@ -752,7 +752,7 @@ class Staging:
     event recorded behind them. The arena is reused only once its event
     completed, because the copies read it when the device reaches them,
     which may be well after the host returned. Arenas grow to the largest
-    stage and their number to the stages in flight. Columns in host memory
+    stage and their number to the stages in flight. Columns in host storage
     take their values at once, without an arena.
 
     Args:

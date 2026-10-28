@@ -1,9 +1,9 @@
 //! DLPack export of Rust-owned storage.
 //!
-//! The worker allocates runtime storage itself (device memory, pinned host
-//! memory, shared mappings) and hands Python views of it. A view is exported
+//! The worker allocates runtime storage itself (device storage, pinned host
+//! storage, shared mappings) and hands Python views of it. A view is exported
 //! as a versioned DLPack tensor whose deleter releases one strong reference to
-//! the owning allocation, so Python keeps the memory alive for as long as any
+//! the owning allocation, so Python keeps the storage alive for as long as any
 //! torch tensor derived from it exists, and the allocation is released only
 //! after both sides have dropped their references.
 
@@ -16,18 +16,18 @@ use tvm_ffi::{Any, Tensor};
 
 use crate::{Error, Result};
 
-/// The kind of memory a view's bytes live in: host memory, page-locked
-/// host memory, or the memory of one CUDA device.
+/// The kind of storage a view's bytes live in: host storage, page-locked
+/// host storage, or the storage of one CUDA device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryKind {
     Host,
-    /// Page-locked host memory, readable by CUDA copies.
+    /// Page-locked host storage, readable by CUDA copies.
     PinnedHost,
     Cuda(DeviceId),
 }
 
 impl MemoryKind {
-    /// The CUDA device of device memory.
+    /// The CUDA device of device storage.
     pub(crate) fn cuda(self) -> Option<DeviceId> {
         match self {
             Self::Cuda(device) => Some(device),
@@ -36,7 +36,7 @@ impl MemoryKind {
     }
 
     /// The device spelling of transfer locators (`cuda:<ordinal>`, or
-    /// `cpu` for host memory of either kind), which consumers read back
+    /// `cpu` for host storage of either kind), which consumers read back
     /// with [`Self::from_locator`].
     pub(crate) fn locator_name(self) -> String {
         match self {
@@ -45,8 +45,8 @@ impl MemoryKind {
         }
     }
 
-    /// The memory a transfer locator's device names: CUDA memory for
-    /// `cuda:<ordinal>`, host memory otherwise.
+    /// The storage a transfer locator's device names: CUDA storage for
+    /// `cuda:<ordinal>`, host storage otherwise.
     pub(crate) fn from_locator(name: &str) -> Self {
         name.strip_prefix("cuda:")
             .and_then(|ordinal| ordinal.parse().ok())
@@ -59,7 +59,7 @@ impl MemoryKind {
                 device_type: DLDeviceType::kDLCPU,
                 device_id: 0,
             },
-            // Page-locked memory crosses as CPU memory: torch imports no
+            // Page-locked storage crosses as CPU storage: torch imports no
             // `kDLCUDAHost` tensor, and it recognizes the pages as pinned
             // from the pointer itself, so non-blocking copies stay
             // asynchronous.
@@ -217,13 +217,13 @@ impl TryFrom<DType> for ipc::DType {
 /// for as long as the value is alive.
 pub trait Backing: Send + Sync + 'static {
     fn device(&self) -> MemoryKind;
-    /// Base address: a device pointer for CUDA memory, a host pointer
+    /// Base address: a device pointer for CUDA storage, a host pointer
     /// otherwise.
     fn address(&self) -> u64;
     /// Length of the allocation in bytes.
     fn bytes(&self) -> usize;
-    /// The most bytes one copy may address in this memory: the length of a
-    /// segment of memory mapped in segments that are unmapped apart, where
+    /// The most bytes one copy may address in this storage: the length of a
+    /// segment of storage mapped in segments that are unmapped apart, where
     /// the driver refuses a copy whose range holds an unmapped segment.
     fn copy_span(&self) -> u64 {
         u64::MAX
@@ -330,7 +330,7 @@ pub(crate) fn export(
 }
 
 /// Reject views reaching outside their backing, so a bad layout fails in
-/// Rust instead of corrupting memory in a kernel.
+/// Rust instead of corrupting storage in a kernel.
 fn check_bounds(
     len: usize,
     offset: usize,

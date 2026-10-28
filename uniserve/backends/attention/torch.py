@@ -498,7 +498,7 @@ class Backend(_Backend):
 
     # A captured packed call is evaluated row by row over the call's whole
     # prepared capacity (``_captured``): every row adds its gathers, masks
-    # and attention to the graph, so an instantiated graph's device memory
+    # and attention to the graph, so an instantiated graph's device storage
     # grows with its rows, and every replay attends over the full capacity
     # of each row. Serving therefore runs this provider eagerly.
     captures = False

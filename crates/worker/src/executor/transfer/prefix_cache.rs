@@ -19,11 +19,11 @@
 
 use super::TransferBatch;
 use crate::executor::inputs::Inputs;
-use crate::memory::{PendingImport, PrefixCache, UnitColumn};
+use crate::storage::{PendingImport, PrefixCache, UnitColumn};
 use crate::stream::Issue;
 use crate::transfer::cache_export::CacheExport;
 use crate::transfer::exports::{self, Location};
-use crate::worker::WorkerMemory;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 use ipc::{BufferId, CacheTransfer, Call};
 use std::collections::HashSet;
@@ -44,7 +44,7 @@ impl Exporting {
     /// The export with its transfer and locations, once the issuer's work
     /// was performed: at once after a stream, from the job's completion on
     /// after a recorder.
-    pub(crate) fn locate(self, storage: &mut WorkerMemory) -> Result<Published> {
+    pub(crate) fn locate(self, storage: &mut WorkerStorage) -> Result<Published> {
         let (transfer, locations) = cache(storage)?.locate_export(self.export)?;
         Ok(Published {
             call: self.call,
@@ -56,14 +56,14 @@ impl Exporting {
 
     /// Revoke an export that is not published, under the same condition as
     /// [`Self::locate`].
-    pub(crate) fn revoke(self, storage: &mut WorkerMemory) -> Result<()> {
+    pub(crate) fn revoke(self, storage: &mut WorkerStorage) -> Result<()> {
         cache(storage)?.revoke_export(self.export);
         Ok(())
     }
 }
 
 /// The prefix cache of a rank that transfers prefix cache.
-fn cache(storage: &mut WorkerMemory) -> Result<&mut PrefixCache> {
+fn cache(storage: &mut WorkerStorage) -> Result<&mut PrefixCache> {
     storage
         .prefix_cache
         .as_mut()
@@ -86,7 +86,7 @@ pub(crate) type Installation = (BufferId, BufferId, CacheTransfer);
 /// Export call `index`'s visible cache extent (`visible` tokens of `slot`) in
 /// the order of `stream`, which orders after the batches that wrote it.
 pub(crate) fn export(
-    storage: &mut WorkerMemory,
+    storage: &mut WorkerStorage,
     index: usize,
     call: &Call,
     slot: usize,
@@ -132,7 +132,7 @@ pub(crate) fn export(
 /// Adopt `import` of `call`'s source export into its slot in `stream`'s
 /// order; returns the installation and the installed extent.
 pub(crate) fn install(
-    storage: &mut WorkerMemory,
+    storage: &mut WorkerStorage,
     call: &Call,
     import: &PendingImport,
     stream: impl Issue,
@@ -160,7 +160,7 @@ pub(crate) fn install(
 /// Check, before the commit point, that the exports and installs form
 /// chains on their destinations' accepted bases.
 pub(crate) fn validate(
-    storage: &mut WorkerMemory,
+    storage: &mut WorkerStorage,
     published: &[Published],
     installations: &[Installation],
 ) -> Result<()> {
@@ -177,7 +177,7 @@ pub(crate) fn validate(
 /// Make the exports and installs resident at the commit point and register
 /// the exports' locations, revoked with the export buffer's release.
 pub(crate) fn apply(
-    storage: &mut WorkerMemory,
+    storage: &mut WorkerStorage,
     published: Vec<Published>,
     installations: Vec<Installation>,
 ) -> Result<()> {
@@ -199,7 +199,7 @@ pub(crate) fn apply(
 
 /// Revoke the exports of a batch that failed before its commit point and
 /// release their physical reservations.
-pub(crate) fn revoke(storage: &mut WorkerMemory, published: Vec<Published>) -> Result<()> {
+pub(crate) fn revoke(storage: &mut WorkerStorage, published: Vec<Published>) -> Result<()> {
     let mut result = Ok(());
     for export in &published {
         result = result.and(exports::release(&export.locations));

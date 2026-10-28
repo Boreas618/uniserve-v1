@@ -1,4 +1,4 @@
-//! Weight chunking and copy manifests (`storage::manifest`), exported to
+//! Weight chunking and copy manifests (`::storage::manifest`), exported to
 //! Python.
 //!
 //! A planner of a world change computes the retained storages a rank of a
@@ -11,8 +11,8 @@
 //! that a manifest turns one into the other. Each function takes and
 //! returns JSON text; a description it cannot read raises `ValueError`.
 
-use crate::memory::latent::restore as latent;
-use crate::memory::weights;
+use crate::storage::latent::restore as latent;
+use crate::storage::weights;
 
 type Result<T> = tvm_ffi::Result<T>;
 
@@ -30,11 +30,11 @@ fn weight_storages(description: tvm_ffi::String) -> Result<tvm_ffi::String> {
 }
 
 /// `copy_manifest(request) -> manifest`: the manifest of a
-/// `storage::manifest::Request`, both as JSON.
+/// `::storage::manifest::Request`, both as JSON.
 fn copy_manifest(request: tvm_ffi::String) -> Result<tvm_ffi::String> {
-    let request: storage::manifest::Request = serde_json::from_str(request.as_str())
+    let request: ::storage::manifest::Request = serde_json::from_str(request.as_str())
         .map_err(|error| value_error(&format!("a copy manifest request: {error}")))?;
-    let manifest = storage::manifest::Manifest::plan(&request)
+    let manifest = ::storage::manifest::Manifest::plan(&request)
         .map_err(|error| value_error(&error.to_string()))?;
     serde_json::to_string(&manifest)
         .map(|manifest| tvm_ffi::String::from(manifest.as_str()))
@@ -55,7 +55,7 @@ struct LatentRestore {
 
 #[derive(serde::Deserialize)]
 struct LatentPages {
-    layout: storage::manifest::StorageLayout,
+    layout: ::storage::manifest::StorageLayout,
     page_bytes: u64,
 }
 

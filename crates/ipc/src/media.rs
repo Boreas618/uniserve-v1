@@ -55,7 +55,7 @@ pub enum SharedMediaError {
     Map(#[source] Arc<io::Error>),
 }
 
-/// Read-only mapping of one claimed shared-memory media export.
+/// Read-only mapping of one claimed shared-storage media export.
 ///
 /// The mapping covers exactly the published byte count and is unmapped on
 /// drop. Share it with `Arc` rather than reopening: the name no longer exists

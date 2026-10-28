@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from uniserve_kernels.host_memory import record_host_usage
+from uniserve_kernels.host_storage import record_host_usage
 
 from uniserve.nn.attention.inputs import (
     DenseInput,
@@ -54,7 +54,7 @@ class _Upload:
 class _Uploads:
     """Page-locked host sources of one native wrapper's plans, reused in turn.
 
-    A plan writes host memory that copies enqueued on the current stream read
+    A plan writes host storage that copies enqueued on the current stream read
     only when the stream reaches them: FlashInfer's planner writes the
     wrapper's int workspace (``_pin_memory_int_workspace_buffer``) and
     enqueues its own copy, and the plan's metadata arrays are copied into

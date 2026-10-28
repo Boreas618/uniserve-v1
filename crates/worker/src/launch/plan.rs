@@ -50,7 +50,7 @@ fn plan(
     launch: &crate::config::WorkerLaunch,
     python: &Path,
     source_worlds: &[u64],
-) -> crate::Result<storage::manifest::weights::PlannedRank> {
+) -> crate::Result<::storage::manifest::weights::PlannedRank> {
     let (started, ready) = crossbeam_channel::bounded(1);
     let (finish, finished) = crossbeam_channel::bounded::<()>(1);
     let python = python.to_owned();

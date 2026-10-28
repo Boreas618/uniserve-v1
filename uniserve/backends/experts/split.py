@@ -293,7 +293,7 @@ class Buffer:
         """Retire collectively after every caller drains its local readers."""
         if self.storage is None:
             return
-        # A local stream drain does not retire a peer's remote memory reads.
+        # A local stream drain does not retire a peer's remote storage reads.
         # Every owner reaches this host barrier after draining its own work.
         self.bootstrap.barrier()
         self.x = self.scales = self.ids = self.weights = None

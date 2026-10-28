@@ -1,8 +1,8 @@
 //! Running a Storage Server, and the operator's commands against one.
 //!
-//! [`serve`] holds this host's retained memory for the calling user until it
+//! [`serve`] holds this host's retained storage for the calling user until it
 //! is stopped with SIGTERM or SIGINT. A process that starts a server when its
-//! host has none starts it with `daemon` set (`storage::socket::ensure`):
+//! host has none starts it with `daemon` set (`::storage::socket::ensure`):
 //! the server then leaves its starter's session and process tree, writes its
 //! log beside its socket and signals its starter once it listens, so a
 //! starter's end never ends it.
@@ -20,11 +20,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ::storage::connector::Settings;
+use ::storage::{Client, socket};
 use anyhow::Context;
-use storage::connector::Settings;
-use storage::{Client, socket};
 
-use crate::transfer::memory_name;
+use crate::transfer::storage_name;
 use crate::{Launch, Server};
 
 /// How to serve: the arguments of `uniserve storage serve`.
@@ -37,7 +37,7 @@ pub struct ServeOptions {
     pub daemon: bool,
     /// The size of each host page pool whose worker states none, in bytes.
     pub page_pool_bytes: u64,
-    /// Host memory a new page pool leaves available to the host's other
+    /// Host storage a new page pool leaves available to the host's other
     /// processes, in bytes.
     pub host_reserve_bytes: u64,
     /// Also accept other hosts' page requests on this TCP address
@@ -126,7 +126,7 @@ pub fn run_transfer_server(
 /// # Errors
 ///
 /// Fails when the server cannot be reached or refuses the listing.
-pub fn list(socket: &Path) -> storage::Result<()> {
+pub fn list(socket: &Path) -> ::storage::Result<()> {
     let mut client = Client::connect_operator(socket)?;
     let listing = client.list()?;
     for tensor in &listing.tensors {
@@ -188,8 +188,8 @@ pub fn list(socket: &Path) -> storage::Result<()> {
         for measured in &transfer.links {
             println!(
                 "link {} -> {}: {:.1} GB/s",
-                memory_name(&measured.link.source),
-                memory_name(&measured.link.destination),
+                storage_name(&measured.link.source),
+                storage_name(&measured.link.destination),
                 measured.bytes_per_second as f64 / 1e9
             );
         }
@@ -212,14 +212,14 @@ pub fn list(socket: &Path) -> storage::Result<()> {
     Ok(())
 }
 
-/// Release the memory of `deployment`, which is no longer served, at the
+/// Release the storage of `deployment`, which is no longer served, at the
 /// server on `socket`.
 ///
 /// # Errors
 ///
 /// Fails when the server cannot be reached, or refuses because the
 /// deployment's head is connected.
-pub fn retire(socket: &Path, deployment: &str) -> storage::Result<()> {
+pub fn retire(socket: &Path, deployment: &str) -> ::storage::Result<()> {
     let mut client = Client::connect_operator(socket)?;
     let released = client.retire(deployment.to_owned())?;
     println!("released {released} tensors of {deployment}");

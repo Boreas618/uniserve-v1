@@ -62,7 +62,7 @@ pub struct WorkerConfig {
     /// virtual addresses for staged transfer (`LaunchDescriptor::stage_cache`).
     pub stage_cache: bool,
     /// Existing Host cache storages retained for this world's rollback.
-    pub cache_keys: Vec<storage::Key>,
+    pub cache_keys: Vec<::storage::Key>,
     /// The exact KV cache segments the rank's planes are made of
     /// (`LaunchDescriptor::segments`).
     pub segments: Option<ipc::CacheTable>,
@@ -103,13 +103,13 @@ pub struct WorkerConfig {
     /// Device-storage grant after loaded weights and fixed overhead, in bytes.
     pub pool_storage_bytes: Option<usize>,
     /// The bytes the rank's fraction of the device grants it once nothing
-    /// else holds the device: the grant before the device's free memory
+    /// else holds the device: the grant before the device's free storage
     /// bounds it, which a successor world's KV pool grows into once its
     /// predecessor is gone.
     pub pool_storage_full_bytes: Option<usize>,
     pub model_dtype: String,
     pub prefix_cache_dtype: Option<String>,
-    /// Fraction of the device's total memory this process may hold for
+    /// Fraction of the device's total storage this process may hold for
     /// static allocations, weights and KV cache (`--mem-fraction-static`).
     pub mem_fraction_static: f64,
 

@@ -88,7 +88,7 @@ pub(crate) struct Admin {
     next_operation: AtomicU64,
     /// Cancelled to stop serving: a shutdown.
     shutdown: CancellationToken,
-    /// Whether the shutdown releases the deployment's memory at the host's
+    /// Whether the shutdown releases the deployment's storage at the host's
     /// Storage Server, once its engine is down.
     retire: Arc<AtomicBool>,
     /// Set once a hot restart handed the deployment to a successor, which
@@ -446,7 +446,7 @@ struct ConfigBody {
 
 /// `GET /admin/config`: the configuration, its digest, the two slots'
 /// worlds, the change in progress, the trial, the configurations a
-/// rollback marked unavailable and every item of the GPUs' memory ledgers
+/// rollback marked unavailable and every item of the GPUs' storage ledgers
 /// (`Leader::config_status`).
 async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
     Json(state.leader.config_status().await)
@@ -715,7 +715,7 @@ async fn rebalance_experts(State(state): State<AdminState>, body: axum::body::By
 }
 
 /// `POST /admin/sleep`: the engine gives back its KV cache and CUDA graph
-/// memory and keeps its weights (vLLM's `sleep`); new requests wait until
+/// storage and keeps its weights (vLLM's `sleep`); new requests wait until
 /// `/admin/wake_up`.
 async fn sleep(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
@@ -966,7 +966,7 @@ struct ShutdownBody {
 
 /// `POST /admin/shutdown`: brings the deployment down as SIGTERM does,
 /// finishing what is in flight within `server_config.shutdown_timeout`, and
-/// releases its memory unless `retire` is false. Answers at once (`202`).
+/// releases its storage unless `retire` is false. Answers at once (`202`).
 async fn shutdown(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         ShutdownBody { retire: true }
@@ -982,9 +982,9 @@ async fn shutdown(State(state): State<AdminState>, body: axum::body::Bytes) -> R
         admin.record(
             "deployment",
             if body.retire {
-                "shutting down; the deployment's memory is released after"
+                "shutting down; the deployment's storage is released after"
             } else {
-                "shutting down; the deployment's memory stays retained"
+                "shutting down; the deployment's storage stays retained"
             },
         );
         admin.shutdown.cancel();

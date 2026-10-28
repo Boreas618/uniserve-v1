@@ -68,6 +68,10 @@ use std::os::unix::fs::FileExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ::storage::protocol::{
+    Event, FabricHandle, LinkEnd, Priority, Region, Reply, Request, Span, TransferEnd,
+};
+use ::storage::{Access, Client, Key, Placement, Role, Scope, StorageRecord, TensorRecord};
 use anyhow::{Context, bail, ensure};
 use clap::Parser as _;
 use cuda::{
@@ -75,10 +79,6 @@ use cuda::{
     SourceOrder, Stream,
 };
 use rustix::event::{PollFd, PollFlags, poll};
-use storage::protocol::{
-    Event, FabricHandle, Memory, Priority, Region, Reply, Request, Span, TransferEnd,
-};
-use storage::{Access, Client, Key, Placement, Role, Scope, StorageRecord, TensorRecord};
 
 /// The two roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -805,14 +805,14 @@ fn read(options: &Options) -> anyhow::Result<()> {
         .links
         .iter()
         .filter_map(|measured| match &measured.link.source {
-            Memory::Remote {
+            LinkEnd::Remote {
                 endpoint,
                 gpu: remote,
             } if *endpoint == source => Some(serde_json::json!({
                 "source": remote.map_or_else(|| "host".to_owned(), |gpu| hex(&gpu)),
                 "destination": match &measured.link.destination {
-                    Memory::Device { gpu } => hex(gpu),
-                    Memory::Host => "host".to_owned(),
+                    LinkEnd::Device { gpu } => hex(gpu),
+                    LinkEnd::Host => "host".to_owned(),
                     other => format!("{other:?}"),
                 },
                 "bytes_per_second": measured.bytes_per_second,

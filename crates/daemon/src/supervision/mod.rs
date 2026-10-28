@@ -129,7 +129,7 @@ impl Daemon {
             let (joins, members) = join_members(&options)?;
             let leader_address = leader_address(&options, &members);
             // While nodes may join, their processes reach this node's
-            // Storage Server too: their Transfer Servers read its memory.
+            // Storage Server too: their Transfer Servers read its storage.
             let local = local(&options, leader_address, joins.is_some())?;
             let host = options.host.clone();
             let thread = std::thread::Builder::new()
@@ -276,7 +276,7 @@ impl Drop for Daemon {
 /// This node's supervisor and claims. `remote_pages` says whether another
 /// node's processes reach this node's Storage Server: a member node's
 /// server serves the engine on the leader's page requests, and every node's
-/// server of a deployment that other nodes may join exposes its memory to
+/// server of a deployment that other nodes may join exposes its storage to
 /// their Transfer Servers' reads.
 fn local(
     options: &DaemonOptions,

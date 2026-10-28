@@ -80,7 +80,7 @@ pub fn rank_launches(spec: &EngineSpec) -> anyhow::Result<Vec<RankLaunch>> {
                 peers: Vec::new(),
                 world: args.world,
                 standby: false,
-                standby_memory: args.standby_memory,
+                standby_storage: args.standby_storage,
             };
             let descriptor = args.launch_descriptor(rank, storage, None, None, None)?;
             let (agreement, agreement_index) = match &descriptor.expert_parallel {

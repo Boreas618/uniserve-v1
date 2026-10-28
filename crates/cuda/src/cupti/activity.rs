@@ -530,25 +530,25 @@ pub(crate) mod tests {
 
         const FILL_BYTES: usize = 1 << 30;
 
-        /// Queue `count` fills of `memory` on `stream` between two timing
+        /// Queue `count` fills of `storage` on `stream` between two timing
         /// events, and return the events.
-        fn fills(memory: &DeviceAllocation, stream: &Stream, count: usize) -> Result<[Event; 2]> {
+        fn fills(storage: &DeviceAllocation, stream: &Stream, count: usize) -> Result<[Event; 2]> {
             let flags = EventFlags {
                 timing: true,
                 ..EventFlags::default()
             };
             let events = [Event::new(flags), Event::new(flags)];
             events[0].record(stream)?;
-            fill(memory, stream, count)?;
+            fill(storage, stream, count)?;
             events[1].record(stream)?;
             Ok(events)
         }
 
-        fn fill(memory: &DeviceAllocation, stream: &Stream, count: usize) -> Result<()> {
+        fn fill(storage: &DeviceAllocation, stream: &Stream, count: usize) -> Result<()> {
             for value in 0..count {
                 // SAFETY: the allocation holds `FILL_BYTES` and outlives the
                 // stream's work, which the test synchronizes.
-                unsafe { memset_d32(memory.address(), value as u32, FILL_BYTES / 4, stream)? };
+                unsafe { memset_d32(storage.address(), value as u32, FILL_BYTES / 4, stream)? };
             }
             Ok(())
         }
@@ -557,8 +557,12 @@ pub(crate) mod tests {
             Ok((f64::from(begin.elapsed_ms(end)?) * 1000.0) as u64)
         }
 
-        /// Capture `count` fills of `memory` on `stream` into a graph.
-        fn captured(memory: &DeviceAllocation, stream: &Stream, count: usize) -> Result<GraphExec> {
+        /// Capture `count` fills of `storage` on `stream` into a graph.
+        fn captured(
+            storage: &DeviceAllocation,
+            stream: &Stream,
+            count: usize,
+        ) -> Result<GraphExec> {
             type Capture = unsafe extern "C" fn(*mut c_void, i32) -> i32;
             type Captured = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
             type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -580,7 +584,7 @@ pub(crate) mod tests {
             // captured graph, which is destroyed once instantiated.
             unsafe {
                 assert_eq!(begin(stream.handle(), 1), 0);
-                fill(memory, stream, count)?;
+                fill(storage, stream, count)?;
                 assert_eq!(end(stream.handle(), &mut graph), 0);
                 let graph_exec = GraphExec::instantiate(stream.device(), graph as usize);
                 assert_eq!(destroy(graph), 0);
@@ -595,16 +599,16 @@ pub(crate) mod tests {
             let device = DeviceId(0);
             let stream = Stream::new(device)?;
             let other = Stream::new(device)?;
-            let memory = DeviceAllocation::linear(device, FILL_BYTES)?;
-            let graph = captured(&memory, &stream, 16)?;
+            let storage = DeviceAllocation::linear(device, FILL_BYTES)?;
+            let graph = captured(&storage, &stream, 16)?;
             let pause = Duration::from_millis(50);
             let activity = StreamActivity::start([("device", &stream)])?;
 
-            let first = fills(&memory, &stream, 16)?;
+            let first = fills(&storage, &stream, 16)?;
             stream.synchronize()?;
             // The stream stands idle for the pause while another stream, one
             // that is not registered, works.
-            fill(&memory, &other, 16)?;
+            fill(&storage, &other, 16)?;
             std::thread::sleep(pause);
             other.synchronize()?;
             // The graph, instantiated before the recording started, is

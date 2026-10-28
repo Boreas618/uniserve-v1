@@ -24,7 +24,7 @@ the same request alone, with the same usage.
   stream continues on it, and the configuration is marked unavailable:
   applying it again is refused unless forced.
 - A fault of the world on trial rolls it back by itself: a worker process
-  that exits, a job that never ends, an illegal memory access, non-finite
+  that exits, a job that never ends, an illegal storage access, non-finite
   logits, and the exit of its engine process. A plugin of the test's
   (``FAULT_PLUGIN``) arms each fault in the workers of the world the admin
   API reaches, the one on trial, so the production code has no test path.
@@ -531,10 +531,10 @@ def _change_under_traffic(
     return report, streams
 
 
-def _planned_memory(base_url: str, *assignments: str) -> dict:
-    """The memory plan of a dry run of `assignments`, which changes nothing:
+def _planned_storage(base_url: str, *assignments: str) -> dict:
+    """The storage plan of a dry run of `assignments`, which changes nothing:
     for every GPU, the serving world's KV cache limit beside a successor
-    from the GPU's ledger, and every host's admission of host memory.
+    from the GPU's ledger, and every host's admission of host storage.
     """  # noqa: D205
     response = httpx.put(
         f"{base_url}/admin/config",
@@ -544,11 +544,11 @@ def _planned_memory(base_url: str, *assignments: str) -> dict:
     assert response.status_code == 200, response.text
     result = response.json()["result"]
     assert result["change"] == "planned", result
-    return result["plan"]["memory"]
+    return result["plan"]["storage"]
 
 
 def _ledgers(status: dict) -> list[dict]:
-    """Every GPU's memory ledger ``GET /admin/config`` reports, each of
+    """Every GPU's storage ledger ``GET /admin/config`` reports, each of
     whose entries' bytes sum to no more than its quota.
     """  # noqa: D205
     nodes = status["ledgers"]
@@ -741,10 +741,10 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         streaming.wait_for(EARLY_TOKENS)
         # A dry run plans the change on every GPU's ledger and changes
         # nothing: the successor fits beside the serving world.
-        memory = _planned_memory(base_url, CHANGE)
-        assert memory["feasible"] is True, memory
-        assert memory["gpus"] and memory["hosts"], memory
-        for gpu in memory["gpus"]:
+        storage = _planned_storage(base_url, CHANGE)
+        assert storage["feasible"] is True, storage
+        assert storage["gpus"] and storage["hosts"], storage
+        for gpu in storage["gpus"]:
             # A GPU holding a KV cache keeps at least its first segment; a
             # dedicated expert GPU holds none, so its floor is zero.
             if gpu["segments_held"]:
@@ -762,7 +762,7 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         streaming.mark()
         world = report["world"]
         assert report["previous_world"] == serving["world"], report
-        assert report["memory"]["feasible"] is True, report
+        assert report["storage"]["feasible"] is True, report
         print(
             f"promotion pause: {report['pause_seconds']:.3f} s "
             f"(park {report['park_seconds']:.3f} s, "
@@ -974,7 +974,7 @@ def _forwards(base_url: str, mode: str) -> float:
 
 
 @pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
-def test_a_serving_world_gives_its_graph_memory_to_a_preparing_successor(
+def test_a_serving_world_gives_its_graph_storage_to_a_preparing_successor(
     tmp_path: Path, topology: str
 ):
     devices, options = _topology(topology, tmp_path)
@@ -985,7 +985,7 @@ def test_a_serving_world_gives_its_graph_memory_to_a_preparing_successor(
         eager = _forwards(base_url, "eager")
 
         # The serving world decodes the count eagerly while the successor
-        # prepares in its graph memory, once its eager steps made the
+        # prepares in its graph storage, once its eager steps made the
         # baseline its successor's transfers yield to.
         report = _world_change(
             base_url, CHANGE, "update_config.eager_prepare=true"
@@ -1197,7 +1197,7 @@ def test_a_change_of_model_files_loads_the_successors_weights(
     state it reached. The successor answers with its weights. A commit
     leaves its weights alone on the GPU; a rollback answers as before on the
     previous world: parked, started again on the weights it kept on the GPU,
-    or on the weights it kept in host memory, which return to the GPU
+    or on the weights it kept in host storage, which return to the GPU
     first.
     """  # noqa: D205
     name = "qwen3-world-weights"
@@ -1216,13 +1216,13 @@ def test_a_change_of_model_files_loads_the_successors_weights(
 
         # The plan counts the successor's weights beside the serving
         # world's, and fits.
-        memory = _planned_memory(base_url, *change)
-        assert memory["feasible"] is True, memory
-        for gpu in memory["gpus"]:
+        storage = _planned_storage(base_url, *change)
+        assert storage["feasible"] is True, storage
+        for gpu in storage["gpus"]:
             assert gpu["successor"]["weights"] == gpu["serving"]["weights"], gpu
         if previous_world == "host":
-            # The host admits the previous world's weights in host memory.
-            for host in memory["hosts"]:
+            # The host admits the previous world's weights in host storage.
+            for host in storage["hosts"]:
                 assert host["previous_world_weights"] > 0, host
                 assert host["feasible"] is True, host
         report = _world_change(base_url, *change)
@@ -1238,7 +1238,7 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         )
 
         # The successor answers with its own weights. The previous world
-        # keeps its weights on the GPU, or in host memory, which leaves the
+        # keeps its weights on the GPU, or in host storage, which leaves the
         # GPU's ledger with the successor's alone.
         changed = _chat(base_url, name, CACHED_PROMPT)
         assert changed != original, "the checkpoints answer alike"
@@ -1316,7 +1316,7 @@ def _mooncake_options() -> tuple[str, ...]:
 
 def _no_pool_storage() -> tuple[str, ...]:
     """The options of a Storage Server whose host admits no page pool, its
-    whole memory reserved, with Mooncake behind its pools: it stages the
+    whole storage reserved, with Mooncake behind its pools: it stages the
     pages of each rank through a pool of `STAGING_POOL_BYTES` (256 MiB).
     """  # noqa: D205
     return (
@@ -1365,7 +1365,7 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
     state again maps none of the serving world's KV cache. The previous
     world, parked, evicts every segment past its first once the idle pages
     there reached the host KV cache, and the successor's cache grows into
-    their memory; the dry run states what that frees. A rollback creates
+    their storage; the dry run states what that frees. A rollback creates
     the segments again and reads the evicted pages back from the host KV
     cache, answering as before.
 
@@ -1411,7 +1411,7 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         assert planned.status_code == 200, planned.text
         plan = planned.json()["result"]["plan"]
         assert plan["kv_cache"] == "recomputed", plan
-        for gpu in plan["memory"]["gpus"]:
+        for gpu in plan["storage"]["gpus"]:
             steps = gpu["steps"]
             assert steps["trial"]["unmapped_kv_segments"] > 0, gpu
             assert steps["promotion_stall_ms"] is not None, gpu
@@ -1426,13 +1426,13 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         assert report["kv_cache"] == "recomputed", report
         # The preparation gave back the tail past what the successor's
         # weights left; the trial evicts what stayed past the first segment.
-        kept = min(gpu["segments_kept"] for gpu in report["memory"]["gpus"])
+        kept = min(gpu["segments_kept"] for gpu in report["storage"]["gpus"])
         evicted = report["evicted"]
         assert evicted["evicted_segments"] == kept - 1, report
         assert evicted["evicted_bytes"] > 0, report
         world = report["world"]
         # The previous world keeps its first segment; the successor's cache
-        # grew past its head segment into the memory freed.
+        # grew past its head segment into the storage freed.
         assert _segments_of(base_url, previous) == 1
         assert _segments_of(base_url, world) > 1
         assert _chat(base_url, name, cached) != original
@@ -1529,7 +1529,7 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
         # The configuration is marked with the fault's first error.
         cause = {
             "non_finite": "non-finite logits",
-            "illegal_access": "illegal memory access",
+            "illegal_access": "illegal storage access",
             "stall": "stalled",
         }.get(fault, f"world {world}")
         assert cause in unavailable["reason"], unavailable

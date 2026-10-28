@@ -1,7 +1,7 @@
 //! Native transports: exports, reads and retirement.
 //!
-//! The tests without an `ignore` attribute run on host memory. The others
-//! need a CUDA device and use a few megabytes of device memory; run them
+//! The tests without an `ignore` attribute run on host storage. The others
+//! need a CUDA device and use a few megabytes of device storage; run them
 //! with `cargo test -p worker --test it transports -- --ignored`.
 
 use std::collections::HashSet;
@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
 use ipc::{Locator, TensorTransfer, TransferTransport, WorkerEndpoint};
 use worker::ffi::{Backing, DType, MemoryKind};
-use worker::memory::LocalMemory;
-use worker::memory::{LatentPlan, LatentStorage, Storage, StorageView};
+use worker::storage::LocalStorage;
+use worker::storage::{LatentPlan, LatentStorage, Storage, StorageView};
 use worker::transfer::exports::{self, Location};
 use worker::transfer::{
     Notify, Read, Retirement, Spans, TransferCapacity, Transport, TransportKind, TransportOptions,
@@ -119,17 +119,17 @@ fn settle(transports: &Transports, capacity: &TransferCapacity, events: &EventPo
 /// A host tensor of `shape` holding `0, 1, 2, ...` as f32.
 fn counting(shape: &[i64]) -> Result<Spans> {
     let elements: i64 = shape.iter().product();
-    let memory = Storage::host(elements as usize * 4);
+    let storage = Storage::host(elements as usize * 4);
     for index in 0..elements {
-        // SAFETY: fresh host memory of `elements` floats owned by the test.
+        // SAFETY: fresh host storage of `elements` floats owned by the test.
         unsafe {
-            (memory.address() as *mut f32)
+            (storage.address() as *mut f32)
                 .add(index as usize)
                 .write(index as f32)
         };
     }
     Spans::single(StorageView::contiguous(
-        memory as Arc<dyn Backing>,
+        storage as Arc<dyn Backing>,
         0,
         DType::F32,
         shape,
@@ -395,7 +395,7 @@ fn observers_of_one_read_run_once_each() -> Result<()> {
     transports.close()
 }
 
-/// The child half of the two-process shared-memory test reads this
+/// The child half of the two-process shared-storage test reads this
 /// variable.
 const SHARED_LOCATOR: &str = "UNISERVE_TEST_SHM_LOCATOR";
 /// The line the consumer prints once it holds its claim on the export.
@@ -423,7 +423,7 @@ fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result
     let (_, locator) = locations
         .iter()
         .find(|(_, locator)| TransportKind::of(locator) == TransportKind::PosixShm)
-        .ok_or(Error::State("no shared-memory location was exported"))?;
+        .ok_or(Error::State("no shared-storage location was exported"))?;
 
     let locator = serde_json::to_string(locator)
         .map_err(|error| Error::Invalid(format!("unserializable locator: {error}")))?;
@@ -484,7 +484,7 @@ fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result
 /// `shared_exports_retire_once_another_process_acknowledged_its_reads`: copy
 /// the export, then borrow it in place until the producer answers.
 #[test]
-#[ignore = "runs as the consumer process of the shared-memory export test"]
+#[ignore = "runs as the consumer process of the shared-storage export test"]
 fn shared_export_consumer() -> Result<()> {
     let Ok(locator) = std::env::var(SHARED_LOCATOR) else {
         return Ok(());
@@ -495,7 +495,7 @@ fn shared_export_consumer() -> Result<()> {
         transports(&[TransportKind::PosixShm], "consumer", 1, 1 << 12, 1 << 20)?;
     let transport = transports
         .get(TransportKind::PosixShm)
-        .ok_or(Error::State("no shared-memory transport is bound"))?;
+        .ok_or(Error::State("no shared-storage transport is bound"))?;
 
     // A copy read acknowledges its claim when its task retires.
     let destination = zeros(&[2, 3])?;
@@ -538,7 +538,7 @@ const CHILD_LOCATOR: &str = "UNISERVE_TEST_VMM_LOCATOR";
 
 /// Blocks `stream` in a host function until the returned sender is used.
 ///
-/// Until then the caller must not release device or pinned memory: the
+/// Until then the caller must not release device or pinned storage: the
 /// release would wait on the held stream (see `crate::device`). Releases queued
 /// earlier are flushed first for the same reason.
 fn block(stream: &Stream) -> Result<mpsc::Sender<()>> {
@@ -580,17 +580,17 @@ fn device_counting(shape: &[i64], stream: &Stream) -> Result<StorageView> {
 /// A device f32 tensor of `shape` holding `first, first + 1, ...`.
 fn device_counting_from(shape: &[i64], first: i64, stream: &Stream) -> Result<StorageView> {
     let elements: i64 = shape.iter().product();
-    let memory = Storage::device(DEVICE, elements as usize * 4)?;
+    let storage = Storage::device(DEVICE, elements as usize * 4)?;
     let values: Vec<f32> = (first..first + elements)
         .map(|value| value as f32)
         .collect();
     let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-    batch.push(memory.address(), values.as_ptr() as u64, values.len() * 4);
+    batch.push(storage.address(), values.as_ptr() as u64, values.len() * 4);
     // SAFETY: the allocation holds the values; the source is read during
     // the call.
     unsafe { batch.submit(stream) }?;
     stream.synchronize()?;
-    StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::F32, shape)
+    StorageView::contiguous(storage as Arc<dyn Backing>, 0, DType::F32, shape)
 }
 
 /// An uninitialized device f32 destination of `shape`.
@@ -791,7 +791,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
         Some(DEVICE),
         Some(&stream),
         "latent_banks",
-        &mut LocalMemory,
+        &mut LocalStorage,
     )?;
     let source = latents.spans(0, &[1], 768)?;
     assert_eq!(source.nbytes(), 6 << 20);

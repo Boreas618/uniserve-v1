@@ -80,7 +80,7 @@ pub enum TransferTransport {
         /// product arenas, pools and cache planes) rather than as long as
         /// this export (staging of one export). A reader may keep its
         /// mapping of a resident allocation for later reads of the same
-        /// allocation; a kept mapping of a transient one would hold memory
+        /// allocation; a kept mapping of a transient one would hold storage
         /// its producer released.
         resident: bool,
     },

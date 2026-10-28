@@ -1560,7 +1560,7 @@ impl Executor for WorkerExecutor {
         }
     }
 
-    /// Reads the memory ledgers of the deployment's nodes through the
+    /// Reads the storage ledgers of the deployment's nodes through the
     /// claims every group shares.
     fn ledgers(&mut self) -> anyhow::Result<Vec<String>> {
         let Some((_, group)) = self.workers.first() else {

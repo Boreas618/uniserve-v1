@@ -1015,7 +1015,7 @@ def test_cuda_rotary_calls_without_a_kernel_raise(case, reason):
 @pytest.mark.parametrize("sections", [None, (24, 20, 20)])
 def test_host_positions_evaluate_without_reading_the_device(sections):
     # A rank fills a request's tables on the host while the layer's buffers
-    # live on its device; evaluating them must not copy device memory, which
+    # live on its device; evaluating them must not copy device storage, which
     # would make the host wait for the device.
     host = RotaryEmbedding(128, theta=5_000_000.0, sections=sections)
     moved = RotaryEmbedding(128, theta=5_000_000.0, sections=sections).cuda()

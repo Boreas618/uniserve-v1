@@ -24,7 +24,7 @@
 //! A worker that ends at once runs no teardown and does not destroy its
 //! device contexts (`end`). Every worker that does not close in order with
 //! its group removes the names of its CUDA driver's and NCCL's shared
-//! memory before it ends (`release_names`).
+//! storage before it ends (`release_names`).
 
 mod arguments;
 mod plan;
@@ -111,8 +111,8 @@ impl<E: Into<WorkerError>> From<E> for Failure {
 /// and NCCL keep in `/dev/shm`, for a worker that ends without destroying its
 /// communicators with its peers, or its device contexts.
 ///
-/// The driver names its memory for the process
-/// ([`cuda::shm::remove_event_memory`]); NCCL's names are random,
+/// The driver names its storage for the process
+/// ([`cuda::shm::remove_event_storage`]); NCCL's names are random,
 /// and those still linked among this process's mappings are its own
 /// ([`cuda::shm::NcclSegments`]). Removing a name leaves every
 /// mapping of the object, this process's and those its peers opened, valid
@@ -121,7 +121,7 @@ impl<E: Into<WorkerError>> From<E> for Failure {
 fn release_names() {
     // SAFETY: getuid and getpid have no preconditions.
     let (uid, pid) = unsafe { (libc::getuid(), libc::getpid()) };
-    let _ = cuda::shm::remove_event_memory(uid, pid as u32);
+    let _ = cuda::shm::remove_event_storage(uid, pid as u32);
     if let Ok(segments) = cuda::shm::NcclSegments::mapped_by(None) {
         let _ = segments.remove();
     }

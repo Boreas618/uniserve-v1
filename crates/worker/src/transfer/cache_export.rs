@@ -24,8 +24,8 @@ use ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
 use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};
 use crate::ffi::{Backing, DType};
-use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
+use crate::storage::allocation::{Storage, StorageView};
+use crate::storage::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -42,9 +42,9 @@ fn pages(start: u64, end: u64, block_size: u64) -> Vec<(u64, u32, u32)> {
     pages
 }
 
-/// Staging for frozen exports: exportable memory of the pool's device, which
+/// Staging for frozen exports: exportable storage of the pool's device, which
 /// a CUDA VMM export names where it lies and local peer devices may address,
-/// or host memory for a CPU pool.
+/// or host storage for a CPU pool.
 fn staging(planes: &CachePlanes, bytes: usize) -> Result<Arc<Storage>> {
     match planes.device() {
         Some(device) => Storage::export_staging(device, bytes.max(1), &Storage::peers(device)?),
@@ -62,10 +62,10 @@ fn freeze(
     frozen: &mut Vec<Arc<Storage>>,
 ) -> Result<Spans> {
     let shape: Vec<i64> = source.shape().iter().map(|&extent| extent as i64).collect();
-    let memory = staging(planes, source.nbytes() as usize)?;
-    frozen.push(Arc::clone(&memory));
+    let storage = staging(planes, source.nbytes() as usize)?;
+    frozen.push(Arc::clone(&storage));
     let target = Spans::single(StorageView::contiguous(
-        memory as Arc<dyn Backing>,
+        storage as Arc<dyn Backing>,
         0,
         source.dtype(),
         &shape,
@@ -188,7 +188,7 @@ impl CacheExport {
 pub(crate) fn export(
     accesses: &mut UnitAccesses,
     bases: &TransferBases,
-    tables: &crate::memory::BlockTables,
+    tables: &crate::storage::BlockTables,
     planes: &CachePlanes,
     slot: u32,
     visible: u32,
@@ -389,14 +389,14 @@ fn export_group(
         for field in 0..2 {
             for row in 0..table.shape.units_per_page {
                 let units = table.row(row as usize);
-                let memory = staging(planes, pages.len() * columns as usize * 4)?;
-                frozen.push(Arc::clone(&memory));
+                let storage = staging(planes, pages.len() * columns as usize * 4)?;
+                frozen.push(Arc::clone(&storage));
                 let mut batch = CopyBatch::new(SourceOrder::Stream);
                 for (index, &(page, _, _)) in pages.iter().enumerate() {
                     let unit = units[(page - u64::from(table.start_page)) as usize];
                     for column in 0..columns {
                         batch.push(
-                            memory.address()
+                            storage.address()
                                 + ((index * columns as usize + column as usize) * 4) as u64,
                             planes.scale_address(field, column, unit)?,
                             4,
@@ -408,7 +408,7 @@ fn export_group(
                 // stream both are host operands of a CPU pool.
                 unsafe { stream.copy(&batch) }?;
                 let source = Spans::single(StorageView::contiguous(
-                    memory as Arc<dyn Backing>,
+                    storage as Arc<dyn Backing>,
                     0,
                     DType::F32,
                     &[pages.len() as i64, 1, i64::from(columns), 1],
@@ -453,7 +453,7 @@ mod tests {
     use super::*;
     use crate::EventPool;
     use crate::job::Job;
-    use crate::memory::{BlockTables, CacheGroupPlan, CachePlan, GroupAxis};
+    use crate::storage::{BlockTables, CacheGroupPlan, CachePlan, GroupAxis};
     use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
     #[test]
@@ -484,7 +484,7 @@ mod tests {
     /// The export runs in a child process in which every allocation of
     /// 64 KiB or more is its own mapping, returned to the system when it is
     /// freed, so a job that copied into staging released before it ran
-    /// faults instead of writing memory that is no longer the export's.
+    /// faults instead of writing storage that is no longer the export's.
     #[test]
     fn a_recorded_fp8_export_carries_what_its_job_froze() -> Result<()> {
         if std::env::var_os(FROZEN_CHILD).is_none() {
@@ -544,7 +544,7 @@ mod tests {
             2,
             None,
             None,
-            &mut crate::memory::LocalMemory,
+            &mut crate::storage::LocalStorage,
         )?;
         let mut tables = BlockTables::new(plan.group_shapes()?, 1, 1, 2)?;
         let update = tables.prepare(&[BlockTable {
@@ -668,7 +668,7 @@ mod tests {
     /// A device cache export larger than the rank's VMM pool reaches a
     /// same-host VMM reader without a host mechanism. Planes that are one
     /// allocation per field are exported where the pages lie, as resident
-    /// memory; planes split into segments, which other ranks cannot map as
+    /// storage; planes split into segments, which other ranks cannot map as
     /// one, through a frozen copy that is the export's own and not resident.
     #[test]
     #[ignore = "requires a CUDA device"]
@@ -716,14 +716,14 @@ mod tests {
                 handle: crate::ffi::Handle::none(),
             });
             let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
-            let layout = crate::memory::PlaneLayout::own(0, 2, plan.plane_bytes, granularity);
+            let layout = crate::storage::PlaneLayout::own(0, 2, plan.plane_bytes, granularity);
             let planes = CachePlanes::allocate(
                 Arc::clone(&plan),
                 Some(device),
                 2,
                 layout.as_ref(),
                 Some(&stream),
-                &mut crate::memory::LocalMemory,
+                &mut crate::storage::LocalStorage,
             )?;
             assert_eq!(
                 planes.segments().is_some(),

@@ -2,7 +2,7 @@
 //!
 //! The server sends SIGKILL to the victim's process group (the victim alone
 //! when it leads no group), waits for its exit on its pidfd, then waits until
-//! NVML no longer lists it on any GPU whose memory it held, which is when
+//! NVML no longer lists it on any GPU whose storage it held, which is when
 //! its context, and every mapping and queued kernel of it, is gone. A
 //! process that has not left a GPU by the deadline is a failed shoot-down:
 //! it keeps its access, and the requests that waited for it fail.
@@ -55,7 +55,7 @@ impl ShootDowns {
         {
             return;
         }
-        // SAFETY: getpgid has no memory effects.
+        // SAFETY: getpgid has no storage effects.
         let group = unsafe { libc::getpgid(pid) };
         if group == pid {
             // A worker leads its own process group, which holds the children

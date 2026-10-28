@@ -1,5 +1,5 @@
 //! The Transfer Server: the Storage Server's child process that copies
-//! bytes between the memory the server holds.
+//! bytes between the storage the server holds.
 //!
 //! The server runs it as `uniserve storage transfer` and starts it again
 //! when it ends, so a fault in a copy or a CUDA context ends this process
@@ -10,24 +10,24 @@
 //! configurations, requests or byte encodings.
 //!
 //! When it starts it measures the bandwidth of every link (each GPU's own
-//! memory, each pair of GPUs, each GPU to and from host memory, and host
-//! memory to itself) and the device memory its context takes on each GPU
+//! storage, each pair of GPUs, each GPU to and from host storage, and host
+//! storage to itself) and the device storage its context takes on each GPU
 //! ([`devices`]), then releases its contexts, connects as
 //! [`Role::Transfer`] and reports both ([`Request::Measured`]). It holds a
 //! GPU's context again only while it has work on the GPU, booked in the
-//! GPU's memory ledgers at the measured bytes meanwhile ([`contexts`]). It
+//! GPU's storage ledgers at the measured bytes meanwhile ([`contexts`]). It
 //! then runs the server's tasks
 //! ([`Event::Transfer`]): every move goes to the lane of its link and of
 //! what runs its copies ([`lanes`]), by path:
 //!
 //! | Source → destination | Runs on |
 //! | --- | --- |
-//! | one GPU's memory → the same GPU | that GPU's copy engines |
+//! | one GPU's storage → the same GPU | that GPU's copy engines |
 //! | GPU → another GPU of the host | the destination's copy engines, reading over the GPUs' link |
-//! | host → GPU, GPU → host | the GPU's copy engines, with the host memory registered |
-//! | another host's GPU of the NVLink fabric ↔ this host | the local GPU's copy engines (the first GPU's for host memory), with the fabric handle imported |
+//! | host → GPU, GPU → host | the GPU's copy engines, with the host storage registered |
+//! | another host's GPU of the NVLink fabric ↔ this host | the local GPU's copy engines (the first GPU's for host storage), with the fabric handle imported |
 //! | host → host | the CPU |
-//! | another host's GPU or host memory → this host | NIXL READs this host's agent posts, through the network adapters ([`network`]) |
+//! | another host's GPU or host storage → this host | NIXL READs this host's agent posts, through the network adapters ([`network`]) |
 //!
 //! No compute kernel runs: copies use copy engines or the network adapters
 //! only, so the world executing beside them keeps its compute units. A
@@ -37,7 +37,7 @@
 //! reported ([`Request::Measured`]), with the chunks, priorities and
 //! budget of every lane.
 //!
-//! The same agent serves other hosts' READs of this host's memory: the
+//! The same agent serves other hosts' READs of this host's storage: the
 //! server has it register the allocations a peer asks to expose
 //! ([`Event::Register`]), and it reports the ranges and its metadata
 //! ([`Request::Registered`]); the registrations, and the GPU contexts they
@@ -48,12 +48,12 @@
 //! events and the lanes' reports meanwhile, and places the bookings the
 //! other threads wait for.
 //!
-//! It also creates device memory the server holds from then on: a world's
-//! weights returning from host memory need memory on their GPUs, and the
+//! It also creates device storage the server holds from then on: a world's
+//! weights returning from host storage need storage on their GPUs, and the
 //! server creates no CUDA context ([`Event::Allocate`]). It creates the
 //! allocation on a helper, retainable through a POSIX descriptor, sends the
 //! descriptor ([`Request::Allocated`]) and drops its own handle: the
-//! descriptor keeps the memory, and the server gives it back for the copy.
+//! descriptor keeps the storage, and the server gives it back for the copy.
 //!
 //! It reports each task's progress and end ([`Request::Copied`]) only
 //! after the host saw the copies complete (an event its lane queried, or a
@@ -63,8 +63,8 @@
 mod contexts;
 mod devices;
 mod lanes;
-mod memory;
 mod network;
+mod storage;
 
 use std::collections::HashMap;
 use std::io;
@@ -73,19 +73,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use cuda::DeviceId;
-use rustix::event::{PollFd, PollFlags, poll};
-use storage::client::Client;
-use storage::protocol::{
-    Allocation, ContextBytes, Event, Item, Link, Memory, Move, Priority, Registered, Reply,
+use ::storage::client::Client;
+use ::storage::protocol::{
+    Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registered, Reply,
     Request, Role, TransferEnd,
 };
+use cuda::DeviceId;
+use rustix::event::{PollFd, PollFlags, poll};
 
 use contexts::{Booked, Booking, Bookings, Contexts, Hold};
 use devices::Gpus;
 use lanes::{End, LaneKey, Lanes, Piece, Runner};
-use memory::{Fabric, Mapped};
 use network::{Exposed, Inbound, Lease, Network, Sources};
+use storage::{Fabric, Mapped};
 
 /// How the Transfer Server copies.
 #[derive(Debug, Clone)]
@@ -107,7 +107,7 @@ pub enum Error {
     #[error(transparent)]
     Cuda(#[from] cuda::Error),
     #[error(transparent)]
-    Storage(#[from] storage::client::Error),
+    Storage(#[from] ::storage::client::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -117,7 +117,7 @@ pub enum Error {
 ///
 /// # Errors
 ///
-/// Fails when a GPU cannot be measured (it has no memory for the context
+/// Fails when a GPU cannot be measured (it has no storage for the context
 /// or the measurement) or the server cannot be reached.
 pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
     let gpus = Gpus::discover()?;
@@ -190,7 +190,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
             Ok(()) => {}
             // The server closes the connection when it stops, which ends
             // the Transfer Server.
-            Err(storage::client::Error::Io(error))
+            Err(::storage::client::Error::Io(error))
                 if error.kind() == io::ErrorKind::UnexpectedEof =>
             {
                 tracing::info!("the storage server closed the connection");
@@ -233,7 +233,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
 }
 
 /// Each GPU as its context is booked: the context's bytes as measured, and
-/// the GPU's total memory as NVML reports it.
+/// the GPU's total storage as NVML reports it.
 fn booked(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Booked>, Error> {
     let identities: Vec<(DeviceId, [u8; 16])> = gpus.identities().collect();
     if identities.is_empty() {
@@ -275,7 +275,7 @@ enum Done {
         holds: Vec<Hold>,
         registered: Result<(Vec<u8>, Vec<Registered>), String>,
     },
-    /// The device memory of the server's allocation `request`: its POSIX
+    /// The device storage of the server's allocation `request`: its POSIX
     /// descriptor and its size, rounded up to the GPU's granularity; or
     /// why it could not be created.
     Allocated {
@@ -285,7 +285,7 @@ enum Done {
 }
 
 /// Runs work that waits on another host, on a GPU's context or on
-/// registering memory, off the main thread, and wakes the main thread with
+/// registering storage, off the main thread, and wakes the main thread with
 /// its outcome.
 struct Helpers {
     sender: mpsc::Sender<Done>,
@@ -417,7 +417,7 @@ impl Served {
         match event {
             Event::Allocation {
                 allocation,
-                memory,
+                end,
                 bytes,
                 writable,
             } => {
@@ -426,7 +426,7 @@ impl Served {
                     return;
                 };
                 let mapped = Mapped::new(
-                    memory,
+                    end,
                     bytes,
                     writable,
                     descriptor,
@@ -541,8 +541,8 @@ impl Served {
                     deployment,
                     region,
                 } => self.given(&copy.destination).and_then(|destination| {
-                    let hold = match destination.memory {
-                        Memory::Device { .. } => {
+                    let hold = match destination.end {
+                        LinkEnd::Device { .. } => {
                             Some(self.hold(&mut holds, destination.device()?)?)
                         }
                         _ => None,
@@ -607,16 +607,16 @@ impl Served {
     }
 
     /// Register `allocations` with the NIXL agent for another host's READs,
-    /// on a helper: registering device memory retains its GPU's context and
-    /// pins the memory, which takes a while for a large page pool.
+    /// on a helper: registering device storage retains its GPU's context and
+    /// pins the storage, which takes a while for a large page pool.
     fn register(&mut self, request: u64, allocations: &[Allocation]) {
         let mut holds = TaskHolds::new();
         let exposed: Result<Vec<Exposed>, String> = allocations
             .iter()
             .map(|allocation| {
                 let mapped = self.given(allocation)?;
-                let hold = match mapped.memory {
-                    Memory::Device { .. } => Some(self.hold(&mut holds, mapped.device()?)?),
+                let hold = match mapped.end {
+                    LinkEnd::Device { .. } => Some(self.hold(&mut holds, mapped.device()?)?),
                     _ => None,
                 };
                 Ok((mapped, hold))
@@ -636,7 +636,7 @@ impl Served {
         });
     }
 
-    /// Create `bytes` of device memory on GPU `gpu` for the server's
+    /// Create `bytes` of device storage on GPU `gpu` for the server's
     /// allocation `request`, on a helper: creating tens of gigabytes takes
     /// a while, and the lanes' reports go on meanwhile.
     fn allocate(&mut self, request: u64, gpu: [u8; 16], bytes: u64) {
@@ -657,7 +657,7 @@ impl Served {
             // last hold ends, after the allocation's handle was released.
             let allocated = held.and_then(|(hold, device, readers)| {
                 hold.session()?;
-                device_memory(device, bytes, &readers)
+                device_storage(device, bytes, &readers)
             });
             Some(Done::Allocated { request, allocated })
         });
@@ -701,7 +701,7 @@ impl Served {
                     Some(descriptor),
                 ),
                 Err(message) => {
-                    tracing::warn!(message, "creating device memory for the server failed");
+                    tracing::warn!(message, "creating device storage for the server failed");
                     (
                         Request::Allocated {
                             request,
@@ -728,7 +728,7 @@ impl Served {
                         }
                     }
                     Err(message) => {
-                        tracing::warn!(message, "registering memory for another host failed");
+                        tracing::warn!(message, "registering storage for another host failed");
                         self.helpers.spawn(move || {
                             drop(holds);
                             None
@@ -769,8 +769,8 @@ impl Served {
         let source = self.side(&copy.source)?;
         let destination = self.side(&copy.destination)?;
         let link = Link {
-            source: source.memory(),
-            destination: destination.memory(),
+            source: source.end(),
+            destination: destination.end(),
         };
         let runner = self.runner(&source, &destination)?;
         let piece = Piece {
@@ -788,7 +788,7 @@ impl Served {
     }
 
     /// A piece's end on `runner`, holding the GPU whose context reaches it:
-    /// a device allocation's own GPU, the runner's for host memory a GPU
+    /// a device allocation's own GPU, the runner's for host storage a GPU
     /// copies and for another host's allocation of the fabric, which is
     /// imported there once per task (`imports`).
     fn end(
@@ -800,9 +800,9 @@ impl Served {
     ) -> Result<End, String> {
         match (side, runner) {
             (Side::Given(mapped), _) => {
-                let gpu = match (&mapped.memory, runner) {
-                    (Memory::Device { .. }, _) => Some(mapped.device()?),
-                    (Memory::Host, Runner::Device(device)) => Some(device),
+                let gpu = match (&mapped.end, runner) {
+                    (LinkEnd::Device { .. }, _) => Some(mapped.device()?),
+                    (LinkEnd::Host, Runner::Device(device)) => Some(device),
                     _ => None,
                 };
                 let hold = gpu.map(|device| self.hold(holds, device)).transpose()?;
@@ -821,7 +821,7 @@ impl Served {
                 })
             }
             (Side::Fabric { .. }, Runner::Host | Runner::Network) => {
-                Err("another host's GPU memory is copied by a GPU of this host".into())
+                Err("another host's GPU storage is copied by a GPU of this host".into())
             }
         }
     }
@@ -831,7 +831,7 @@ impl Served {
         match self.side(allocation)? {
             Side::Given(mapped) => Ok(mapped),
             Side::Fabric { .. } => {
-                Err("another host's memory of the fabric is neither READ into nor exposed".into())
+                Err("another host's storage of the fabric is neither READ into nor exposed".into())
             }
         }
     }
@@ -852,18 +852,18 @@ impl Served {
                 bytes: *bytes,
             }),
             Allocation::Remote { endpoint, .. } => Err(format!(
-                "memory of {endpoint} is read by a READ into this host, never copied otherwise"
+                "storage of {endpoint} is read by a READ into this host, never copied otherwise"
             )),
         }
     }
 
     /// What runs a copy from `source` to `destination`: the copy engines of
     /// the destination's GPU, else of the source's, else (between host
-    /// memory and another host's GPU) of this host's first GPU; the CPU
+    /// storage and another host's GPU) of this host's first GPU; the CPU
     /// between host buffers. The runner's copy engines must address both.
     fn runner(&self, source: &Side, destination: &Side) -> Result<Runner, String> {
         let local = |side: &Side| match side {
-            Side::Given(mapped) if matches!(mapped.memory, Memory::Device { .. }) => {
+            Side::Given(mapped) if matches!(mapped.end, LinkEnd::Device { .. }) => {
                 mapped.device().map(Some)
             }
             _ => Ok(None),
@@ -874,23 +874,23 @@ impl Served {
             (None, None) => Runner::Device(
                 self.gpus
                     .first()
-                    .ok_or("this host has no GPU to import another host's memory on")?
+                    .ok_or("this host has no GPU to import another host's storage on")?
                     .device,
             ),
         };
         if let Runner::Device(device) = runner {
             for side in [source, destination] {
                 if let Side::Given(mapped) = side
-                    && matches!(mapped.memory, Memory::Device { .. })
+                    && matches!(mapped.end, LinkEnd::Device { .. })
                     && !mapped.readable_by(device)
                 {
                     let reader = self.gpus.by_device(device).map_or_else(
                         || device.to_string(),
-                        |gpu| memory_name(&Memory::Device { gpu: gpu.uuid }),
+                        |gpu| storage_name(&LinkEnd::Device { gpu: gpu.uuid }),
                     );
                     return Err(format!(
-                        "{reader} cannot address the memory of {}",
-                        memory_name(&mapped.memory)
+                        "{reader} cannot address the storage of {}",
+                        storage_name(&mapped.end)
                     ));
                 }
             }
@@ -914,46 +914,46 @@ enum Side {
 }
 
 impl Side {
-    fn memory(&self) -> Memory {
+    fn end(&self) -> LinkEnd {
         match self {
-            Side::Given(mapped) => mapped.memory.clone(),
-            Side::Fabric { gpu, .. } => Memory::Device { gpu: *gpu },
+            Side::Given(mapped) => mapped.end.clone(),
+            Side::Fabric { gpu, .. } => LinkEnd::Device { gpu: *gpu },
         }
     }
 
     fn is_host(&self) -> bool {
-        self.memory() == Memory::Host
+        self.end() == LinkEnd::Host
     }
 }
 
 /// A link end's name, for the log and the listing: `host`, a GPU's UUID,
 /// or another host's Storage Server endpoint with its GPU or `host`.
-pub(crate) fn memory_name(memory: &Memory) -> String {
-    match memory {
-        Memory::Host => "host".into(),
-        Memory::Device { gpu } => cuda::DeviceUuid(*gpu).to_string(),
-        Memory::Remote { endpoint, gpu } => match gpu {
+pub(crate) fn storage_name(end: &LinkEnd) -> String {
+    match end {
+        LinkEnd::Host => "host".into(),
+        LinkEnd::Device { gpu } => cuda::DeviceUuid(*gpu).to_string(),
+        LinkEnd::Remote { endpoint, gpu } => match gpu {
             Some(gpu) => format!("{endpoint} {}", cuda::DeviceUuid(*gpu)),
             None => format!("{endpoint} host"),
         },
     }
 }
 
-/// `bytes` of device memory on `device`, which every GPU of `readers` can
+/// `bytes` of device storage on `device`, which every GPU of `readers` can
 /// address, retainable through a POSIX descriptor: the descriptor and the
 /// size, rounded up to the device's granularity. The allocation's handle
-/// and mapping here are dropped; the descriptor alone keeps the memory.
-fn device_memory(
+/// and mapping here are dropped; the descriptor alone keeps the storage.
+fn device_storage(
     device: cuda::DeviceId,
     bytes: u64,
     readers: &[cuda::DeviceId],
 ) -> Result<(OwnedFd, u64), String> {
     let length = usize::try_from(bytes).map_err(|_| format!("{bytes} bytes overflow"))?;
     let allocation = cuda::DeviceAllocation::retainable(device, length, readers)
-        .map_err(|error| format!("creating {bytes} bytes of device memory: {error}"))?;
+        .map_err(|error| format!("creating {bytes} bytes of device storage: {error}"))?;
     let descriptor = allocation
         .export_descriptor()
-        .map_err(|error| format!("exporting device memory: {error}"))?
+        .map_err(|error| format!("exporting device storage: {error}"))?
         .ok_or_else(|| "a retainable allocation exported no descriptor".to_owned())?;
     Ok((descriptor, allocation.len() as u64))
 }

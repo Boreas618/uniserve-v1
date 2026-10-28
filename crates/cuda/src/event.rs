@@ -163,7 +163,7 @@ impl Event {
                     // done with the devices: a test harness after its last
                     // test, a Python interpreter after its finalization. A
                     // rank never does. An unregistered handler only leaves
-                    // the memory behind, so the event is not failed for it.
+                    // the storage behind, so the event is not failed for it.
                     // SAFETY: as above.
                     let _ = unsafe { PrimaryContext::reset_all_at_exit() };
                 }

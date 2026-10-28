@@ -30,9 +30,9 @@ use crate::executor::pages::PageReservation;
 use crate::executor::records::{self, CallLimits};
 use crate::ffi::{Backing, DType as Element};
 use crate::job::Recorder;
-use crate::memory::Metadata;
-use crate::memory::allocation::{Storage, StorageView};
 use crate::request::RequestProgress;
+use crate::storage::Metadata;
+use crate::storage::allocation::{Storage, StorageView};
 use crate::{Error, ProductStore, Result, lock};
 
 /// Fields of one call's column.
@@ -242,13 +242,13 @@ pub(crate) fn field_major<const F: usize>(columns: &[[i64; F]]) -> Vec<i64> {
 
 /// A host `int64` tensor of `shape` holding `values`, for the executor.
 pub(crate) fn host_tensor(values: &[i64], shape: &[i64]) -> Result<StorageView> {
-    let memory = Storage::host(size_of_val(values).max(size_of::<i64>()));
-    // SAFETY: fresh host memory of at least the values' bytes, which
+    let storage = Storage::host(size_of_val(values).max(size_of::<i64>()));
+    // SAFETY: fresh host storage of at least the values' bytes, which
     // nothing else references yet.
     unsafe {
-        std::ptr::copy_nonoverlapping(values.as_ptr(), memory.address() as *mut i64, values.len());
+        std::ptr::copy_nonoverlapping(values.as_ptr(), storage.address() as *mut i64, values.len());
     }
-    StorageView::contiguous(memory as Arc<dyn Backing>, 0, Element::I64, shape)
+    StorageView::contiguous(storage as Arc<dyn Backing>, 0, Element::I64, shape)
 }
 
 /// What a batch hands the executor, and what checks the records it writes.
@@ -291,13 +291,13 @@ pub(crate) fn column_step(
     issue: Recorder<'_>,
 ) -> Result<ColumnStep> {
     let forward = &plan.forward;
-    let memory = batch.target();
+    let storage = batch.target();
 
     // The features of vision blocks and latent conditioning.
     let mut features: Vec<StorageView> = Vec::new();
     let mut entries: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut lease = |reference: &TensorRef, call: &Call| -> Result<(usize, u32, u32)> {
-        let read = tensors.consume(reference, call.call_id, Some(memory), issue)?;
+        let read = tensors.consume(reference, call.call_id, Some(storage), issue)?;
         batch.reads.push(Arc::clone(&read));
         let Some(Metadata::Feature { height, width }) = read.metadata() else {
             return Err(Error::Invalid(

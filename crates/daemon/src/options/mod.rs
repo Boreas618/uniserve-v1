@@ -33,7 +33,7 @@ use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 use proto::request::wire;
 use proto::request::{
     ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, ModelDtype, PrefixCacheDtype,
-    SchedulingPolicy, StandbyMemory,
+    SchedulingPolicy, StandbyStorage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -176,7 +176,7 @@ pub struct ServeConfig {
     /// Token work admitted in one scheduling step, 8192 when unset; token
     /// models only.
     pub max_num_batched_tokens: Option<NonZeroUsize>,
-    /// Each rank's share of its device's total memory for weights, static
+    /// Each rank's share of its device's total storage for weights, static
     /// allocations and the KV cache, in (0, 1]. A deployment group's
     /// `mem_fraction_static` overrides it.
     pub mem_fraction_static: f64,
@@ -329,7 +329,7 @@ pub struct LoadOptions {
     /// checkpoint's tensors in place of its files; the files when unset.
     pub weights: Option<String>,
     /// The tensor- and expert-parallel degrees the configurations of the
-    /// deployment use, which retained weight memory is chunked for so that
+    /// deployment use, which retained weight storage is chunked for so that
     /// a world of any of them maps the chunks it shares with another;
     /// every degree up to the GPUs a worker sees when empty.
     pub parallel_degrees: Vec<NonZeroU32>,
@@ -351,7 +351,7 @@ impl Default for LoadOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvCacheOptions {
-    /// Capacity in tokens; sized from memory when unset.
+    /// Capacity in tokens; sized from storage when unset.
     pub max_tokens: Option<NonZeroU64>,
     /// Tokens per page of the cache group with the widest token rows, a
     /// power of two; the largest size up to 64 the attention kernels read
@@ -371,7 +371,7 @@ pub struct KvCacheOptions {
     /// The host KV cache's token count over the device KV cache's, the
     /// same on every rank of a world (as SGLang's `--hicache-ratio`); each
     /// host's Storage Server lowers it for the whole world to what four
-    /// fifths of its available memory hold. The engine's default (2.0)
+    /// fifths of its available storage hold. The engine's default (2.0)
     /// when unset.
     pub host_ratio: Option<f64>,
     /// The deployment's host KV cache on each host, in GiB, over the ranks
@@ -425,7 +425,7 @@ pub struct MooncakeOptions {
     /// The RDMA devices; selected automatically when empty.
     #[serde(default)]
     pub device: String,
-    /// Host memory each host contributes to Mooncake's pool, in GiB; zero
+    /// Host storage each host contributes to Mooncake's pool, in GiB; zero
     /// makes the hosts clients of segments others provide.
     #[serde(default)]
     pub global_segment_gib: u64,
@@ -650,21 +650,21 @@ pub struct WorkerOptions {
     /// or a group on several nodes, keep a standby world: a second launch of
     /// every group of the failure domain, with communicators of its own,
     /// promoted together when one of them fails. Each standby rank holds a
-    /// CUDA context, graph pools and workspaces of its own, which the memory
+    /// CUDA context, graph pools and workspaces of its own, which the storage
     /// `mem_fraction_static` leaves must hold.
     pub standby: bool,
     /// How a parked standby (a group's, a failure domain's world, or a hot
-    /// update's engine) keeps the device memory of its graph pools, scratch,
+    /// update's engine) keeps the device storage of its graph pools, scratch,
     /// expert all-to-all workspaces and NCCL communicators: `auto` keeps it
     /// resident while every device has the share a serving worker leaves
     /// for graphs and activations to spare, and suspends it otherwise, every
     /// rank of a world or group alike; `resident`; or `suspended`, released
-    /// on the device and restored at the promotion, the graph memory with
+    /// on the device and restored at the promotion, the graph storage with
     /// its contents at unchanged addresses; workspaces that cannot keep
     /// their addresses (DeepEP's windows, colocated MegaMoE's NVSHMEM heap)
     /// are created again at the promotion, which captures the graphs that
     /// use them anew.
-    pub standby_memory: StandbyMemory,
+    pub standby_storage: StandbyStorage,
 }
 
 impl Default for WorkerOptions {
@@ -675,7 +675,7 @@ impl Default for WorkerOptions {
             mesh: None,
             distributed_backend: None,
             standby: false,
-            standby_memory: StandbyMemory::Auto,
+            standby_storage: StandbyStorage::Auto,
         }
     }
 }
@@ -969,7 +969,7 @@ pub struct UpdateOptions {
     /// default is the value measured on GB200 (`docs/configuration.md`).
     pub transfer_slowdown: f64,
     /// Whether the serving world runs its forwards eagerly while the
-    /// successor prepares, giving its CUDA graph memory to the successor's
+    /// successor prepares, giving its CUDA graph storage to the successor's
     /// captures: the serving world steps slower meanwhile, and replays its
     /// graphs again if it serves on or resumes.
     pub eager_prepare: bool,
@@ -1006,13 +1006,13 @@ impl Default for UpdateOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviousWorld {
-    /// Its processes, communicators, graph memory, weights and the KV cache
+    /// Its processes, communicators, graph storage, weights and the KV cache
     /// its successor maps: a rollback resumes it at once.
     Parked,
     /// Its weights (and the KV cache its successor maps): a rollback starts
     /// its processes again, which bind them.
     Weights,
-    /// The KV cache its successor maps, and in host memory the weights its
+    /// The KV cache its successor maps, and in host storage the weights its
     /// successor does not map: a rollback copies them back and starts its
     /// processes again.
     Host,
@@ -1368,7 +1368,7 @@ impl ServeConfig {
                 load_format: word(&self.load_config.format),
                 download_dir: text(&self.load_config.download_dir),
                 load_threads: self.load_config.threads.map(NonZeroU32::get),
-                standby_memory: word(&worker.standby_memory),
+                standby_storage: word(&worker.standby_storage),
                 weights: self.load_config.weights.clone().unwrap_or_default(),
                 parallel_degrees: self
                     .load_config

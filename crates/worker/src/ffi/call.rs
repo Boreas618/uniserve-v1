@@ -9,7 +9,7 @@
 use tvm_ffi::Any;
 
 use super::{Function, Handle, Interpreter, Shape};
-use crate::memory::allocation::StorageView;
+use crate::storage::allocation::StorageView;
 use crate::{Error, Result};
 
 /// One argument of a method call.

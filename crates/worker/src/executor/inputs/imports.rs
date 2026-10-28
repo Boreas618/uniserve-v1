@@ -15,7 +15,7 @@ use super::{Input, component_device, installs};
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::transfer::latents::{self};
 use crate::job::Job;
-use crate::memory::{Metadata, OutputPlacement, ValueRange};
+use crate::storage::{Metadata, OutputPlacement, ValueRange};
 use crate::{Error, Result};
 
 /// The calls reading each supplied product, as an input or a predicate.

@@ -1,12 +1,12 @@
 //! Transfers through the server's Transfer Server: copying between the
-//! memory the server holds, completion, cancellation, priorities, and a
+//! storage the server holds, completion, cancellation, priorities, and a
 //! Transfer Server that crashes.
 //!
 //! The server runs on a thread of the test process; its Transfer Server is
 //! the real one (`storage_server::run_transfer_server`), run as the
 //! server's child process by this test binary (`stand_in_transfer_server`).
 //! The host tests hide every GPU from it (`CUDA_VISIBLE_DEVICES` empty), so
-//! it copies host memory with the CPU and no GPU is touched. The device
+//! it copies host storage with the CPU and no GPU is touched. The device
 //! tests need a CUDA device and see the GPUs this process sees; run them
 //! with `cargo test -p storage-server --test it transfer -- --ignored`.
 
@@ -15,11 +15,11 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use storage::protocol::{
-    ErrorKind, Event, Link, Memory, PageShape, Priority, Region, Reply, Request, Span, Throttle,
+use ::storage::protocol::{
+    ErrorKind, Event, Link, LinkEnd, PageShape, Priority, Region, Reply, Request, Span, Throttle,
     TransferEnd,
 };
-use storage::{Access, Client, Role};
+use ::storage::{Access, Client, Role};
 use storage_server::Launch;
 
 use crate::server::{
@@ -48,7 +48,7 @@ fn stand_in_transfer_server() {
 /// Which GPUs the Transfer Server sees.
 #[derive(Clone, Copy)]
 pub(crate) enum Gpus {
-    /// None: it copies host memory only.
+    /// None: it copies host storage only.
     Hidden,
     /// Those this process sees.
     Visible,
@@ -287,8 +287,8 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
     let listing = head.list().unwrap();
     let transfer = listing.transfer.expect("the Transfer Server is listed");
     let host_link = Link {
-        source: Memory::Host,
-        destination: Memory::Host,
+        source: LinkEnd::Host,
+        destination: LinkEnd::Host,
     };
     assert!(
         transfer
@@ -394,7 +394,7 @@ fn a_span_of_rows_copies_each_row_at_its_pitches() {
 }
 
 #[test]
-fn a_transfer_is_refused_whole_unless_every_span_fits_memory_of_its_deployment() {
+fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
     let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
@@ -445,7 +445,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_memory_of_its_deployment()
             span(tensor_region(1), 0, tensor_region(2), 0, 8),
             span(tensor_region(1), 0, tensor_region(2), 0, 0),
         ],
-        // Another host's memory is a source only: this host READs it.
+        // Another host's storage is a source only: this host READs it.
         vec![span(
             tensor_region(1),
             0,
@@ -469,7 +469,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_memory_of_its_deployment()
         let result = worker.transfer(spans, Priority::Background, 1);
         assert_eq!(server_error(result), ErrorKind::Invalid);
     }
-    // Another deployment's head names none of this deployment's memory.
+    // Another deployment's head names none of this deployment's storage.
     let result = other_head.transfer(
         vec![span(tensor_region(1), 0, tensor_region(2), 0, 8)],
         Priority::Background,
@@ -534,8 +534,8 @@ fn slow(server: &Running, bytes: u64) -> Slow {
         )
         .unwrap();
     let link = Link {
-        source: Memory::Host,
-        destination: Memory::Host,
+        source: LinkEnd::Host,
+        destination: LinkEnd::Host,
     };
     for _ in 0..8 {
         head.throttle(vec![link.clone()], Throttle::Halve).unwrap();
@@ -782,32 +782,32 @@ fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
         .unwrap();
 
     match head.move_weights(1, true) {
-        Err(storage::Error::Server {
+        Err(::storage::Error::Server {
             kind: ErrorKind::Resource,
             message,
         }) => assert!(message.contains("the host can hold"), "{message}"),
         other => panic!("expected a refusal under the host rule, got {other:?}"),
     }
     assert_eq!(
-        booked(&ledger(&mut head), storage::Item::Weights, &[1]),
+        booked(&ledger(&mut head), ::storage::Item::Weights, &[1]),
         bytes
     );
 }
 
-/// GPU tests: device memory the test process allocates and retains at the
+/// GPU tests: device storage the test process allocates and retains at the
 /// server, as a worker does.
 pub(crate) mod device {
     use std::os::fd::{AsFd, OwnedFd};
 
     use std::time::{Duration, Instant};
 
+    use ::storage::Access;
+    use ::storage::protocol::{
+        Event, Link, LinkEnd, Placement, Priority, Region, StorageRecord, Throttle, TransferEnd,
+    };
     use cuda::{
         CopyBatch, DeviceAllocation, DeviceId, HandleType, Nvml, PinnedBuffer, ShareableHandle,
         SourceOrder, Stream,
-    };
-    use storage::Access;
-    use storage::protocol::{
-        Event, Link, Memory, Placement, Priority, Region, StorageRecord, Throttle, TransferEnd,
     };
 
     use super::{Gpus, end_of, pattern, read, serving, span, tensor_region};
@@ -859,9 +859,9 @@ pub(crate) mod device {
 
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn a_manifest_stages_borrowed_device_regions_through_host_memory() {
-        use storage::manifest::Span as LogicalSpan;
-        use storage::manifest::{
+    fn a_manifest_stages_borrowed_device_regions_through_host_storage() {
+        use ::storage::manifest::Span as LogicalSpan;
+        use ::storage::manifest::{
             Binding, Chunk, Encoding, Field, Logical, Manifest, Rank, Request, Segment, Storage,
             StorageLayout, World,
         };
@@ -960,7 +960,7 @@ pub(crate) mod device {
             let spans = manifest
                 .bind(&request, &request.source)
                 .spans()
-                .collect::<storage::manifest::Result<Vec<_>>>()
+                .collect::<::storage::manifest::Result<Vec<_>>>()
                 .unwrap();
             let task = worker.transfer(spans, Priority::Background, 1).unwrap();
             assert_eq!(end_of(&mut worker, task), (256, TransferEnd::Complete));
@@ -980,7 +980,7 @@ pub(crate) mod device {
     /// The context bytes the Transfer Server of the server on `socket`
     /// measured on `gpu` when it started.
     fn measured_context(socket: &std::path::Path, gpu: [u8; 16]) -> u64 {
-        let mut operator = storage::Client::connect(socket, storage::Role::Operator).unwrap();
+        let mut operator = ::storage::Client::connect(socket, ::storage::Role::Operator).unwrap();
         operator
             .list()
             .unwrap()
@@ -997,12 +997,12 @@ pub(crate) mod device {
 
     /// The Transfer Server's context as the deployment's ledger of `gpu`
     /// books it, if it does.
-    fn booked_context(client: &mut storage::Client, gpu: [u8; 16]) -> Option<u64> {
+    fn booked_context(client: &mut ::storage::Client, gpu: [u8; 16]) -> Option<u64> {
         let (ledgers, _) = client.ledger(vec![gpu]).unwrap();
         ledgers
             .iter()
             .flat_map(|ledger| &ledger.entries)
-            .find(|entry| entry.item == storage::Item::TransferContext)
+            .find(|entry| entry.item == ::storage::Item::TransferContext)
             .map(|entry| entry.bytes)
     }
 
@@ -1015,7 +1015,7 @@ pub(crate) mod device {
 
     /// Wait, at most ten seconds, until the Transfer Server `pid` holds no
     /// context on `device`, and the ledger `client` reads books none.
-    fn await_release(nvml: &Nvml, client: &mut storage::Client, device: DeviceId, pid: i32) {
+    fn await_release(nvml: &Nvml, client: &mut ::storage::Client, device: DeviceId, pid: i32) {
         let gpu = device.uuid().unwrap().0;
         let deadline = Instant::now() + Duration::from_secs(10);
         while holds_context(nvml, device, pid) || booked_context(client, gpu).is_some() {
@@ -1066,7 +1066,7 @@ pub(crate) mod device {
             )
             .unwrap();
         assert_eq!(booked_context(&mut head, gpu), None);
-        // The ledger states the bandwidth from host memory to the GPU the
+        // The ledger states the bandwidth from host storage to the GPU the
         // Transfer Server measured.
         let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
         assert!(!ledgers.is_empty());
@@ -1080,8 +1080,8 @@ pub(crate) mod device {
         // The host link into the GPU at its floor, so that the task lasts
         // long enough to observe.
         let link = Link {
-            source: Memory::Host,
-            destination: Memory::Device { gpu },
+            source: LinkEnd::Host,
+            destination: LinkEnd::Device { gpu },
         };
         for _ in 0..8 {
             head.throttle(vec![link.clone()], Throttle::Halve).unwrap();
@@ -1145,7 +1145,7 @@ pub(crate) mod device {
         await_release(&nvml, &mut head, first, pid);
     }
 
-    /// A GPU whose memory ledger has no room for the Transfer Server's
+    /// A GPU whose storage ledger has no room for the Transfer Server's
     /// context refuses the context: a task that needs the GPU fails, naming
     /// the ledger, and the context is neither booked nor retained, so the
     /// ledger stays within its quota.
@@ -1185,7 +1185,7 @@ pub(crate) mod device {
                 gpu,
                 total,
                 Some(quota),
-                vec![(storage::Item::Process, 4096)],
+                vec![(::storage::Item::Process, 4096)],
             )
             .unwrap();
 
@@ -1209,7 +1209,7 @@ pub(crate) mod device {
             ledger
                 .entries
                 .iter()
-                .all(|entry| entry.item != storage::Item::TransferContext)
+                .all(|entry| entry.item != ::storage::Item::TransferContext)
         );
         assert!(ledger.used() <= quota);
         assert!(!holds_context(&nvml, first, pid));
@@ -1218,26 +1218,26 @@ pub(crate) mod device {
 
     /// The weights booked on `gpu` in `head`'s ledger of it: each entry's
     /// worlds and bytes, sorted.
-    fn weights_on(head: &mut storage::Client, gpu: [u8; 16]) -> Vec<(Vec<u64>, u64)> {
+    fn weights_on(head: &mut ::storage::Client, gpu: [u8; 16]) -> Vec<(Vec<u64>, u64)> {
         let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
         let mut weights: Vec<(Vec<u64>, u64)> = ledgers
             .iter()
             .flat_map(|ledger| &ledger.entries)
-            .filter(|entry| entry.item == storage::Item::Weights)
+            .filter(|entry| entry.item == ::storage::Item::Weights)
             .map(|entry| (entry.worlds.clone(), entry.bytes))
             .collect();
         weights.sort();
         weights
     }
 
-    /// The weights a world alone retains move to host memory and back
+    /// The weights a world alone retains move to host storage and back
     /// through the Transfer Server, bytes intact: the offload leaves them in
-    /// host memory and the GPU's ledger without them, while the weights its
+    /// host storage and the GPU's ledger without them, while the weights its
     /// successor maps stay on the GPU; the restore returns them to the GPU
     /// they left and to its ledger.
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn a_worlds_own_weights_move_to_host_memory_and_back() {
+    fn a_worlds_own_weights_move_to_host_storage_and_back() {
         let server = serving(Gpus::Visible);
         let first = DeviceId(0);
         let gpu = first.uuid().unwrap().0;
@@ -1267,10 +1267,10 @@ pub(crate) mod device {
         head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
         let mut successor = world_worker(&server.socket, scope("text", 0), 2, claim);
         successor
-            .get(vec![key(2)], storage::Mode::Read, Vec::new())
+            .get(vec![key(2)], ::storage::Mode::Read, Vec::new())
             .unwrap();
         // The previous world's processes exited: the server alone holds its
-        // memory.
+        // storage.
         drop(previous);
         drop((own, own_fd, shared, shared_fd));
         assert_eq!(
@@ -1279,7 +1279,7 @@ pub(crate) mod device {
         );
 
         // The bytes of world 1's own weights wherever they lie, copied into
-        // host memory of the successor's: a copy retains nothing.
+        // host storage of the successor's: a copy retains nothing.
         let copy = memfd(&vec![0; granularity]);
         successor
             .put(
@@ -1288,7 +1288,7 @@ pub(crate) mod device {
             )
             .unwrap();
         let mut update = 0;
-        let mut own_weights = |successor: &mut storage::Client| {
+        let mut own_weights = |successor: &mut ::storage::Client| {
             update += 1;
             let task = successor
                 .transfer(
@@ -1300,7 +1300,7 @@ pub(crate) mod device {
             assert_eq!(end_of(successor, task), (size, TransferEnd::Complete));
             read(&copy, 0, granularity)
         };
-        let placement = |head: &mut storage::Client| {
+        let placement = |head: &mut ::storage::Client| {
             let listing = head.list().unwrap();
             let listed = listing.tensors.iter().find(|listed| listed.key == key(1));
             listed.unwrap().placement
@@ -1402,16 +1402,16 @@ pub(crate) mod device {
             assert_eq!(device_bytes(peer), source_bytes);
         }
 
-        // The listing names every measured link and the device memory of
+        // The listing names every measured link and the device storage of
         // the Transfer Server's context on each GPU.
         let transfer = head.list().unwrap().transfer.unwrap();
-        let gpu = |device: DeviceId| Memory::Device {
+        let gpu = |device: DeviceId| LinkEnd::Device {
             gpu: device.uuid().unwrap().0,
         };
         let mut expected = vec![
             (gpu(first), gpu(first)),
-            (Memory::Host, gpu(first)),
-            (gpu(first), Memory::Host),
+            (LinkEnd::Host, gpu(first)),
+            (gpu(first), LinkEnd::Host),
         ];
         if peer.is_some() {
             expected.push((gpu(first), gpu(DeviceId(1))));
@@ -1471,7 +1471,7 @@ pub(crate) mod device {
             )
             .unwrap();
 
-        // The source is memory this process created and holds, as the
+        // The source is storage this process created and holds, as the
         // creating worker of another host does; it names it by the fabric
         // handle it exports, which the server never holds.
         let source_bytes = pattern(granularity, 41);

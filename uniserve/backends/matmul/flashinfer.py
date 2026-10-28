@@ -52,7 +52,7 @@ class _FlashInferOperator(_Operator):
         # FlashInfer launches its CUTLASS NVFP4 GEMM with programmatic
         # dependent launch: the GEMM's thread blocks may start while the
         # kernel before it on the stream still runs, and its epilogue reads
-        # alpha from device memory as each block starts, before waiting for
+        # alpha from device storage as each block starts, before waiting for
         # that kernel. Alpha is therefore computed before the input is
         # repacked. CUTLASS serves only linear input scales, so their swizzle
         # kernels always run between the alpha write and the GEMM, which

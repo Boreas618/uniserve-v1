@@ -759,7 +759,7 @@ impl Scheduler {
             .general
             .pending
             .store(self.pending_request_count(), Ordering::Relaxed);
-        // The units the cache holds change with its memory (a successor's
+        // The units the cache holds change with its storage (a successor's
         // segments grow at its commit), so its usage counts them anew.
         self.stats
             .prefix_cache

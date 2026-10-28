@@ -10,7 +10,7 @@
 //! written. It then stops both, and hands the successor its state with
 //! every descriptor it holds: the
 //! listening sockets and their lock, each client's connection and pidfd,
-//! each storage's memory and each page pool's memfd ([`Server::hand_over`]).
+//! each storage's storage and each page pool's memfd ([`Server::hand_over`]).
 //! The successor goes on from there ([`Server::resume`]), starts its own
 //! connector and Transfer Server, says it serves, and this server exits. A client's request
 //! sent meanwhile waits in its connection until the successor reads it.
@@ -24,16 +24,16 @@ use std::os::unix::process::CommandExt as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ::storage::protocol::{Access, Claim, Key, Placement, Role, Scope, StorageRecord};
+use ::storage::transport::{Connection, Socket};
 use serde::{Deserialize, Serialize};
-use storage::protocol::{Access, Claim, Key, Placement, Role, Scope, StorageRecord};
-use storage::transport::{Connection, Socket};
 
 use crate::kv_storage::KvStorage;
 use crate::ledger::Ledgers;
 use crate::pages::{HandedPools, Pools};
 use crate::transfers::Transfers;
 use crate::{ClientId, Deployment, Holder, Launch, Server, StorageEntry, TensorEntry};
-use storage::protocol::Retainer;
+use ::storage::protocol::Retainer;
 
 /// The descriptor a successor finds the handoff socket at.
 pub const TAKEOVER_DESCRIPTOR: i32 = 3;
@@ -63,7 +63,7 @@ enum Message {
 /// A server's state, its descriptors travelling apart: first the listener
 /// and its lock, then the TCP listener when there is one, then every pidfd
 /// of [`HandedServer::pidfds`], every client's connection, every storage's
-/// memory and every page pool's memfd.
+/// storage and every page pool's memfd.
 #[derive(Debug, Serialize, Deserialize)]
 struct HandedServer {
     tcp: Option<String>,
@@ -696,8 +696,8 @@ mod tests {
     use std::os::fd::IntoRawFd as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use storage::protocol::{Item, Mode, Placement, TensorRecord};
-    use storage::{Client, socket};
+    use ::storage::protocol::{Item, Mode, Placement, TensorRecord};
+    use ::storage::{Client, socket};
 
     use super::*;
 
@@ -755,8 +755,8 @@ mod tests {
             },
         )
         .unwrap();
-        let mut memory = tempfile::tempfile().unwrap();
-        memory.write_all(b"abcd").unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcd").unwrap();
         worker
             .put(
                 vec![TensorRecord {
@@ -776,11 +776,11 @@ mod tests {
                         segment: None,
                         fabric: None,
                     },
-                    memory.as_fd(),
+                    file.as_fd(),
                 )],
             )
             .unwrap();
-        // The worker books its process memory on a GPU under a quota.
+        // The worker books its process storage on a GPU under a quota.
         let gpu = [9; 16];
         worker
             .book(gpu, 1000, Some(700), vec![(Item::Process, 300)])
@@ -819,7 +819,7 @@ mod tests {
                             segment: None,
                             fabric: None,
                         },
-                        memory.as_fd(),
+                        file.as_fd(),
                     )],
                 )
                 .unwrap();
@@ -883,8 +883,8 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(storage::Error::Server {
-                    kind: storage::protocol::ErrorKind::Quota,
+                Err(::storage::Error::Server {
+                    kind: ::storage::protocol::ErrorKind::Quota,
                     ..
                 })
             ),

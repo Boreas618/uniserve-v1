@@ -6,7 +6,7 @@ sources a request is initialized from), the layouts the denoiser evaluates
 and their captured steps, and the text conditioner of the pipeline stage
 that holds it.
 
-A request's samples live in the latent banks the rank's memory owns: two
+A request's samples live in the latent banks the rank's storage owns: two
 banks of pages, the request slot owning a run of consecutive pages after
 page 0 (:class:`~uniserve.executor.video.plan.SamplePages`). The trajectory
 ledger, which bank holds a request's committed step, is the worker's: every
