@@ -338,8 +338,8 @@ def _differing_fields(planned, applied, direct) -> list[str]:
             shape = (*field["shape"], element)
             strides = (*(stride * element for stride in field["strides"]), 1)
 
-            def elements(storage, shape=shape, strides=strides, field=field):
-                return storage.as_strided(shape, strides, field["offset"])
+            def elements(values, shape=shape, strides=strides, field=field):
+                return values.as_strided(shape, strides, field["offset"])
 
             if not torch.equal(elements(image), elements(loaded)):
                 differing.append(field["tensor"])
