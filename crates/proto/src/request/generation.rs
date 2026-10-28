@@ -860,6 +860,13 @@ pub enum GenerationResourceError {
 }
 
 /// Scheduler-relevant prefix-cache behavior resolved during compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CacheResume {
+    pub world: u64,
+    pub request_id: u64,
+}
+
+/// Scheduler-relevant prefix-cache behavior resolved during compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachePolicy {
     /// Whether admission may reuse cached prefixes or encoder outputs.
@@ -876,6 +883,9 @@ pub struct CachePolicy {
     /// no page (`write`), since its pages are neither world's.
     #[serde(default)]
     pub state_seed: Option<u64>,
+    /// Private recovered pages of a prior request. This is runtime
+    /// provenance, independent of the content keys of shared cache pages.
+    pub resume: Option<CacheResume>,
 }
 
 impl Default for CachePolicy {
@@ -886,6 +896,7 @@ impl Default for CachePolicy {
             write: true,
             isolation_key: None,
             state_seed: None,
+            resume: None,
         }
     }
 }
@@ -1525,6 +1536,7 @@ mod tests {
                 write: false,
                 isolation_key: Some(91),
                 state_seed: Some(5),
+                resume: None,
             },
             image_generation: policy,
             readout: Vec::new(),

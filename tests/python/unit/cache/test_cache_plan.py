@@ -381,10 +381,80 @@ def test_layers_kept_per_request_bind_slots_and_checkpoint_in_the_state_group():
     assert read["count.initialized"].tolist() == [True, False]
     assert torch.equal(fields["key.values"][:, 0], sentinel)
 
+    # A transfer consumer can read the checkpoint through the same byte
+    # and tensor declarations supplied to the native worker.
+    checkpoint = json.loads(plan.checkpoints())[0]
+    values = fields["key.values"][0, 2]
+    exported = {}
+    for field in checkpoint["fields"]:
+        dtype = getattr(torch, field["dtype"])
+        start = field["offset"]
+        exported[field["tensor"].split("/")[-1]] = (
+            values[start : start + field["element"]].view(dtype).item()
+        )
+    assert exported == {"count.values": 48, "count.initialized": True}
+
     # A bank of another shape is refused.
     fields["backbone.layers.0.count/count.values"] = torch.zeros(4, 2)
     with pytest.raises(ValueError, match="disagrees"):
         cache.pool(plan, 4, list(fields), *fields.values())
+
+
+def test_recurrent_state_copies_global_convolution_and_value_heads():
+    from uniserve.nn.gated_delta import GatedDeltaState
+
+    config = GatedDeltaState(
+        channels=10,
+        taps=2,
+        num_key_heads=2,
+        key_heads=(1,),
+        num_value_heads=4,
+        value_heads=(2, 3),
+        key_dim=2,
+        value_dim=3,
+        dtype=torch.float32,
+        state_dtype=torch.float32,
+    )
+    source = {
+        "conv.values": torch.arange(40, dtype=torch.float32).view(20, 2),
+        "conv.initialized": torch.tensor(True),
+        "recurrent.values": torch.arange(24, dtype=torch.float32).view(4, 2, 3),
+        "recurrent.initialized": torch.tensor(True),
+    }
+    buffers = {
+        name: torch.zeros(spec.shape, dtype=spec.dtype)
+        for name, spec in config.buffers(
+            num_blocks=1, block_size=1, dtype=None, quantizer=None
+        ).items()
+    }
+    for name, logical in config.logical_tensors().items():
+        for spans, local in logical.blocks():
+            read = tuple(
+                slice(
+                    span.start, span.start + span.count * span.step, span.step
+                )
+                for span in spans
+            )
+            write = tuple(
+                slice(start, start + span.count)
+                for start, span in zip(local, spans, strict=True)
+            )
+            buffers[name][0][write] = source[name][read]
+    state = config.bind(buffers, block_size=1, dtype=None, quantizer=None)
+    assert torch.equal(
+        state.tensors["conv"][0],
+        torch.cat(
+            (
+                source["conv.values"][2:4],
+                source["conv.values"][6:8],
+                source["conv.values"][14:20],
+            )
+        ),
+    )
+    assert torch.equal(
+        state.tensors["recurrent"][0], source["recurrent.values"][2:4]
+    )
+    assert state.initialized["conv"][0] and state.initialized["recurrent"][0]
 
 
 class _Pages(nn.Module):

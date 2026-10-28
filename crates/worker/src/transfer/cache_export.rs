@@ -535,6 +535,7 @@ mod tests {
                 compute_dtype: DType::BF16,
             }],
             states: Vec::new(),
+            checkpoints: Vec::new(),
             handle: crate::ffi::Handle::none(),
         });
         let planes = CachePlanes::allocate(
@@ -711,6 +712,7 @@ mod tests {
                     compute_dtype: DType::BF16,
                 }],
                 states: Vec::new(),
+                checkpoints: Vec::new(),
                 handle: crate::ffi::Handle::none(),
             });
             let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;

@@ -36,6 +36,7 @@ mod spans;
 mod ticket;
 mod transport;
 pub(crate) mod vmm;
+pub(crate) mod warming;
 
 pub(crate) use cache_import::{
     CacheImport, CacheImporter, ImportCopy, ImportEntry, ImportWorkspace, Retired,

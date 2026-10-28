@@ -1200,6 +1200,15 @@ impl SchedulerHandle {
         self.commands.publish_world()
     }
 
+    /// Pin or publish a scheduler's pages for a shared transfer round.
+    pub fn cache_warm(
+        &self,
+        operation: storage::manifest::cache::Operation,
+        together: Arc<crate::HookBarrier>,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.cache_warm(operation, together)
+    }
+
     /// Ends the memory of `worlds` on the nodes of the scheduler's workers,
     /// which the deployment's claims cover, discarding the pages the
     /// scheduler's world does not hit when `discard_pages`; the receiver

@@ -933,6 +933,7 @@ impl Worker {
             .map(|(name, stream)| Ok((name, stream.stream()?.clone())))
             .collect::<Result<Vec<_>>>()?;
         let maintenance = crate::service::Maintenance {
+            cache_copies: crate::transfer::warming::Copies::default(),
             retained: Some(Arc::clone(&self.retained)),
             weights: Some(update::WeightUpdate {
                 launch: self.launch.clone(),

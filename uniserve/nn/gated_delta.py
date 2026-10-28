@@ -65,6 +65,8 @@ class GatedDeltaState(StateConfig):
 
     channels: int
     taps: int
+    num_key_heads: int
+    key_heads: tuple[int, ...]
     num_value_heads: int
     value_heads: tuple[int, ...]
     key_dim: int
@@ -80,6 +82,52 @@ class GatedDeltaState(StateConfig):
     @property
     def state_heads(self) -> tuple[int, ...]:
         return self.value_heads
+
+    def logical_tensors(self):
+        """Convolution channels and recurrent heads in global head order."""
+        from uniserve.distributed.distribution import Segment, Span
+        from uniserve.distributed.logical import Logical
+
+        key_width = self.num_key_heads * self.key_dim
+        channels = []
+        local = 0
+        for base, heads, width in (
+            (0, self.key_heads, self.key_dim),
+            (key_width, self.key_heads, self.key_dim),
+            (2 * key_width, self.value_heads, self.value_dim),
+        ):
+            for head in heads:
+                channels.append(
+                    Segment(Span(base + head * width, width), local)
+                )
+                local += width
+        recurrent = Logical(
+            (self.num_value_heads, self.key_dim, self.value_dim),
+            ("head", "key", "value"),
+            (1, 0, 0),
+            (
+                tuple(
+                    Segment(Span(head, 1), index)
+                    for index, head in enumerate(self.value_heads)
+                ),
+                (Segment(Span(0, self.key_dim), 0),),
+                (Segment(Span(0, self.value_dim), 0),),
+            ),
+        )
+        return {
+            "conv.values": Logical(
+                (
+                    2 * key_width + self.num_value_heads * self.value_dim,
+                    self.taps,
+                ),
+                ("channel", "tap"),
+                (1, 0),
+                (tuple(channels), (Segment(Span(0, self.taps), 0),)),
+            ),
+            "conv.initialized": Logical.whole(()),
+            "recurrent.values": recurrent,
+            "recurrent.initialized": Logical.whole(()),
+        }
 
     def buffers(
         self, *, num_blocks, block_size, dtype, quantizer
@@ -213,6 +261,8 @@ class GatedDeltaNet(nn.Module):
         return GatedDeltaState(
             channels=int(self.conv_weight.shape[0]),
             taps=self.kernel - 1,
+            num_key_heads=self.num_key_heads,
+            key_heads=tuple(self.key_heads),
             num_value_heads=self.num_value_heads,
             value_heads=tuple(self.value_heads),
             key_dim=self.key_dim,

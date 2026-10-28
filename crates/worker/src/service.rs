@@ -83,6 +83,7 @@ pub(crate) struct ParkedExperts {
 /// Storage Server connection the cache planes' segments are retained
 /// through, and the graph pools a sleeping worker suspends.
 pub(crate) struct Maintenance {
+    pub(crate) cache_copies: crate::transfer::warming::Copies,
     /// `None` for a rank whose planes this process allocated for itself
     /// (`LocalMemory`).
     pub(crate) retained: Option<Arc<Retained>>,
@@ -688,6 +689,104 @@ impl Service<'_> {
             None => &mut local,
         };
         let result = match name {
+            "uniserve.cache_transfer" => {
+                let copies = serde_json::from_value(payload)
+                    .map_err(|error| Error::Invalid(format!("cache transfer: {error}")))?;
+                let retained = retained
+                    .as_deref()
+                    .ok_or(Error::State("cache transfers require retained storage"))?;
+                self.maintenance.cache_copies.start(retained, copies)?;
+                serde_json::Value::Null
+            }
+            "uniserve.cache_poll" => {
+                let retained = retained
+                    .as_deref()
+                    .ok_or(Error::State("cache transfers require retained storage"))?;
+                serde_json::Value::Bool(self.maintenance.cache_copies.poll(retained)?)
+            }
+            "uniserve.cache_cancel" => {
+                let retained = retained
+                    .as_deref()
+                    .ok_or(Error::State("cache transfers require retained storage"))?;
+                self.maintenance.cache_copies.cancel(retained)?;
+                serde_json::Value::Null
+            }
+            "uniserve.cache_links" => {
+                let sources: Vec<storage::manifest::cache::Sources> =
+                    serde_json::from_value(payload)
+                        .map_err(|error| Error::Invalid(format!("cache sources: {error}")))?;
+                let links = if let (Some(planes), Some(retained), Some(source)) = (
+                    planes.as_ref(),
+                    retained.as_deref(),
+                    sources
+                        .into_iter()
+                        .find(|source| source.host == self.info.endpoint.host),
+                ) {
+                    let device = planes
+                        .device()
+                        .ok_or(Error::State("cache transfers require a device pool"))?;
+                    let mut sources = source.sources;
+                    sources.links.extend(
+                        retained
+                            .call("reading measured cache links", |client| client.list())?
+                            .transfer
+                            .map(|transfer| transfer.links)
+                            .unwrap_or_default(),
+                    );
+                    crate::transfer::links::measure(
+                        retained,
+                        &sources,
+                        device,
+                        storage::protocol::Placement::Device {
+                            gpu: device.uuid()?.0,
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
+                serde_json::to_value(links).map_err(|error| Error::Invalid(error.to_string()))?
+            }
+            "uniserve.cache_publish" => {
+                let pages: Vec<storage::manifest::cache::Page> = serde_json::from_value(payload)
+                    .map_err(|error| Error::Invalid(format!("cache pages: {error}")))?;
+                if let (Some(planes), Some(retained)) = (planes.as_ref(), retained.as_deref()) {
+                    let mut units: Vec<_> = pages
+                        .iter()
+                        .filter(|page| page.worker_group == retained.scope().group)
+                        .flat_map(|page| page.units.iter().copied())
+                        .collect();
+                    units.sort_unstable();
+                    units.dedup();
+                    if !units.is_empty() {
+                        let stream = cuda::Stream::new(planes.device().ok_or_else(|| {
+                            Error::Invalid("cache publication requires a device pool".into())
+                        })?)?;
+                        let column = crate::memory::prefix_cache::planes::UnitColumn::bind(
+                            planes,
+                            Some(&stream),
+                        )?;
+                        column.mark_initialized(planes, &units, &stream)?;
+                        stream.synchronize()?;
+                    }
+                }
+                serde_json::Value::Null
+            }
+            "uniserve.cache_manifest" => {
+                let pages: Vec<storage::manifest::cache::Page> = serde_json::from_value(payload)
+                    .map_err(|error| Error::Invalid(format!("cache pages: {error}")))?;
+                match (planes.as_ref(), retained.as_deref()) {
+                    (Some(planes), Some(retained)) => {
+                        serde_json::to_value(storage::manifest::cache::Rank {
+                            worker_group: retained.scope().group.clone(),
+                            rank: retained.scope().rank,
+                            host: self.info.endpoint.host.clone(),
+                            storage: planes.manifest(&pages, retained)?,
+                        })
+                        .map_err(|error| Error::Invalid(format!("cache manifest: {error}")))?
+                    }
+                    _ => serde_json::Value::Null,
+                }
+            }
             "uniserve.cache_memory" => {
                 // The cache's device; a rank without a cache (an expert
                 // worker) reports its primary device's memory.
@@ -1388,6 +1487,7 @@ mod tests {
             Duration::from_secs(150),
             None,
             super::Maintenance {
+                cache_copies: crate::transfer::warming::Copies::default(),
                 retained: None,
                 weights: None,
                 pools: Vec::new(),

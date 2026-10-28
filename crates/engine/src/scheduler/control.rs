@@ -168,6 +168,13 @@ impl Scheduler {
             Command::DescribeRequests(answer) => {
                 let _ = answer.send(self.migrating_cache().1);
             }
+            Command::CacheWarm {
+                operation,
+                together,
+                answer,
+            } => {
+                let _ = answer.send(self.warm_cache(operation, &together));
+            }
             Command::FlushCache => {
                 let pages = self.storage.flush_prefix_cache();
                 tracing::info!(pages, "flushed the prefix cache");

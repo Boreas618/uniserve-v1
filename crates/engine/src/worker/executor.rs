@@ -1551,6 +1551,13 @@ impl Executor for WorkerExecutor {
             .collect()
     }
 
+    fn storage_nodes(&self) -> BTreeMap<String, String> {
+        self.workers
+            .first()
+            .map(|(_, group)| group.claims().endpoints().clone())
+            .unwrap_or_default()
+    }
+
     /// Runs the worker hook on every group, the groups together, and
     /// returns each group's identity with its ranks' results.
     fn hook_groups(

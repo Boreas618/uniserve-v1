@@ -456,6 +456,24 @@ impl Retained {
         Ok(())
     }
 
+    /// Cancel a task and wait for its final event before freeing its targets.
+    pub(crate) fn cancel_transfer(&self, task: u64) -> Result<()> {
+        self.call("cancelling a transfer", |client| {
+            client.cancel(vec![task], None)
+        })?;
+        loop {
+            if self
+                .call("draining a cancelled transfer", |client| {
+                    client.poll_transfer(task)
+                })?
+                .is_some()
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Note tensors the worker uses, which its startup retains.
     pub(crate) fn use_keys(&self, keys: impl IntoIterator<Item = Key>) {
         lock(&self.state).used.extend(keys);

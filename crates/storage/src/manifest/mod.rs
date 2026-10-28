@@ -44,6 +44,7 @@
 //! its Transfer Server executes. The source world of weights is what the
 //! manifests a world retains name ([`weights::sources`]).
 
+pub mod cache;
 pub mod layout;
 mod plan;
 pub mod region;

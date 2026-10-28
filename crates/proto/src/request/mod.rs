@@ -24,7 +24,7 @@ pub use event::{
     Request, StopReason, Trajectory,
 };
 pub use generation::{
-    CachePolicy, FeedbackImage, FeedbackNextToken, FeedbackSource, GeneratedImage,
+    CachePolicy, CacheResume, FeedbackImage, FeedbackNextToken, FeedbackSource, GeneratedImage,
     GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
     GenerationRequest, GenerationRequestError, GenerationResourceError, ImageEncoderInput,
     ImageGenerationConfig, ImageInput, ImagePixels, ImageTrigger, MultimodalInputs, PixelRange,

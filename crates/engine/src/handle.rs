@@ -623,6 +623,11 @@ pub enum Command {
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
     /// Accepted prefixes of running requests that can move to another world.
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
+    CacheWarm {
+        operation: storage::manifest::cache::Operation,
+        together: Arc<HookBarrier>,
+        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    },
     /// Revokes every cached prefix page, so that later prompts compute
     /// their prefixes anew; requests in flight keep their pages.
     FlushCache,
@@ -981,6 +986,21 @@ impl CommandSender {
         let (answer, described) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::DescribeRequests(answer));
         described
+    }
+
+    /// Execute one scheduler-owned cache warming operation at a batch boundary.
+    pub fn cache_warm(
+        &self,
+        operation: storage::manifest::cache::Operation,
+        together: Arc<HookBarrier>,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, response) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::CacheWarm {
+            operation,
+            together,
+            answer,
+        });
+        response
     }
 
     /// Commits a successor scheduler's world (`Command::Commit`); the

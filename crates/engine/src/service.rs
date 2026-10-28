@@ -82,6 +82,7 @@ struct InFlight {
 struct Routing {
     slots: Vec<Slot>,
     requests: Mutex<HashMap<RequestId, InFlight>>,
+    cache_routes: Mutex<HashMap<proto::request::CacheResume, usize>>,
     /// The next slot a load scan starts from, so equal loads rotate.
     next: AtomicUsize,
     /// Each connected daemon's frame queue, by the order it connected; a
@@ -261,6 +262,7 @@ fn serve(
             })
             .collect(),
         requests: Mutex::default(),
+        cache_routes: Mutex::default(),
         next: AtomicUsize::new(0),
         fronts: Mutex::default(),
         parked: AtomicBool::new(false),
@@ -524,6 +526,9 @@ fn read_requests(
                 Some(wire::engine_command::Kind::DescribeRequests(describe)) => {
                     describe_requests(describe.id, front, routing);
                 }
+                Some(wire::engine_command::Kind::CacheWarm(warm)) => {
+                    warm_cache(warm, front, routing);
+                }
                 Some(wire::engine_command::Kind::DescribeMemory(describe)) => {
                     // The deployment's claims cover every node, so the first
                     // scheduler reads them all.
@@ -620,7 +625,14 @@ fn submit_all(
                 continue;
             }
         };
-        let Some(index) = routing.pick() else {
+        let recovered = match &request {
+            Request::Generation(request) => request
+                .cache
+                .resume
+                .and_then(|resume| crate::lock(&routing.cache_routes).remove(&resume)),
+            Request::Diffusion(_) => None,
+        };
+        let Some(index) = recovered.or_else(|| routing.pick()) else {
             let (event, _) = Event::Error {
                 message: "the engine is unavailable after a worker failure".to_owned(),
             }
@@ -707,6 +719,73 @@ fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
         })
         .collect();
     answer_hooked(hook.id, answers, front, routing);
+}
+
+fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
+    use storage::manifest::cache::Operation;
+    let operation: Operation = match serde_json::from_slice(&warm.operation) {
+        Ok(operation) => operation,
+        Err(error) => {
+            routing.send(
+                front,
+                Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
+                    id: warm.id,
+                    results: Vec::new(),
+                    error: error.to_string(),
+                })),
+            );
+            return;
+        }
+    };
+    let operations = match operation {
+        Operation::Reserve { prefixes, keep } => {
+            let mut assigned = vec![Vec::new(); routing.slots.len()];
+            let mut routes = crate::lock(&routing.cache_routes);
+            for prefix in prefixes {
+                let resume = proto::request::CacheResume {
+                    world: prefix.world,
+                    request_id: prefix.request,
+                };
+                let next = routes.len() % routing.slots.len();
+                let slot = *routes.entry(resume).or_insert(next);
+                assigned[slot].push(prefix);
+            }
+            assigned
+                .into_iter()
+                .map(|prefixes| Operation::Reserve { prefixes, keep })
+                .collect::<Vec<_>>()
+        }
+        Operation::Coverage { prefixes, keep } => {
+            let mut assigned = vec![Vec::new(); routing.slots.len()];
+            let routes = crate::lock(&routing.cache_routes);
+            for prefix in prefixes {
+                let resume = proto::request::CacheResume {
+                    world: prefix.world,
+                    request_id: prefix.request,
+                };
+                if let Some(&slot) = routes.get(&resume) {
+                    assigned[slot].push(prefix);
+                }
+            }
+            assigned
+                .into_iter()
+                .map(|prefixes| Operation::Coverage { prefixes, keep })
+                .collect()
+        }
+        Operation::Discard => {
+            crate::lock(&routing.cache_routes).clear();
+            vec![Operation::Discard; routing.slots.len()]
+        }
+        operation => vec![operation; routing.slots.len()],
+    };
+    let together = crate::HookBarrier::new(routing.slots.len());
+    let answers = routing
+        .slots
+        .iter()
+        .zip(operations)
+        .map(|(slot, operation)| slot.handle.cache_warm(operation, Arc::clone(&together)))
+        .collect();
+    answer_hooked(warm.id, answers, front, routing);
 }
 
 /// Gives back or restores every scheduler's KV cache memory, and answers

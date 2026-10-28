@@ -268,7 +268,15 @@ message EngineCommand {
     ThrottleTransfers throttle_transfers = 15;
     // Accepted prefix lengths used to budget a successor's request state.
     DescribeRequests describe_requests = 16;
+    // Pin, reserve, publish or release a round of prefix-cache transfers.
+    CacheWarm cache_warm = 17;
   }
+}
+
+message CacheWarm {
+  // Matches the Hooked answer; operation is manifest::cache::Operation JSON.
+  uint64 id = 1;
+  bytes operation = 2;
 }
 
 message DescribeMemory {
@@ -709,6 +717,12 @@ message CachePolicy {
   // The prefix seed of the world whose state a migrated request continues
   // with (a world change's `in_flight = keep`).
   optional uint64 state_seed = 4;
+  CacheResume resume = 5;
+}
+
+message CacheResume {
+  uint64 world = 1;
+  uint64 request_id = 2;
 }
 
 message ImageGenerationConfig {

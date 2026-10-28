@@ -507,7 +507,10 @@ impl RequestEvents {
             MigrationCause::Drain => self.stream.world().and_then(|world| hold.kept(world)),
             MigrationCause::Loss => None,
         };
-        let continuation = request.continuation(&migration, kept);
+        let mut continuation = request.continuation(&migration, kept);
+        if let Request::Generation(generation) = &mut continuation {
+            generation.cache.resume = self.stream.cache_resume();
+        }
         let (stream, _scheduler) = hold
             .submit(continuation.clone())
             .await

@@ -45,7 +45,9 @@ use crate::ffi::{
     Backing, DType, DeferredCall, Function, Handle, Interpreter, MemoryKind, strings,
 };
 use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::retained::{ExclusiveMemory, ExclusiveSpec, SegmentPart, SegmentedSpec};
+use crate::memory::retained::{
+    ExclusiveMemory, ExclusiveSpec, Retained, SegmentPart, SegmentedSpec,
+};
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
@@ -335,6 +337,73 @@ pub struct CachePlanes {
 }
 
 impl CachePlanes {
+    /// One plane cell as a borrowed region of its retained allocation.
+    /// The caller keeps the scheduler's page reference until every reader
+    /// of this region finishes; a descriptor alone does not pin a page.
+    pub(crate) fn retained_region(
+        &self,
+        retained: &Retained,
+        field: usize,
+        column: u32,
+        unit: u32,
+        suffix: &str,
+    ) -> Result<storage::manifest::Chunk> {
+        let device = self
+            .device
+            .ok_or_else(|| Error::Invalid("cache transfers require a device pool".into()))?;
+        let gpu = device.uuid()?.0;
+        let name = format!("prefix_cache.{}.{suffix}", FIELDS[field]);
+        let bytes = match suffix {
+            "values" => self.plan.plane_bytes,
+            "scale" => 4,
+            "initialized" => 1,
+            _ => return Err(Error::Invalid(format!("unknown cache field {suffix}"))),
+        };
+        let (key, offset) = if suffix == "values"
+            && let Some(segmented) = &self.segmenting
+        {
+            let mut first = 0;
+            let segment = segmented
+                .segments
+                .iter()
+                .enumerate()
+                .find_map(|(index, (segment, _))| {
+                    let start = first;
+                    first += segment.units;
+                    (unit < first).then_some((index, start))
+                })
+                .ok_or_else(|| Error::Invalid(format!("cache unit {unit} is outside its pool")))?;
+            if segment.0 as u32 >= segmented.released_from.load(Ordering::Acquire) {
+                return Err(Error::Invalid(format!(
+                    "cache unit {unit} has no retained storage"
+                )));
+            }
+            let part = &segmented.parts[column as usize * segmented.segments.len() + segment.0];
+            (
+                retained.segment_key(&name, part, &gpu),
+                u64::from(unit - segment.1) * bytes,
+            )
+        } else {
+            let spec = ExclusiveSpec {
+                name: &name,
+                device,
+                bytes: (u64::from(self.plan.columns) * u64::from(self.num_units) * bytes) as usize,
+                access: &[],
+            };
+            (
+                retained.exclusive_key(&spec, &gpu),
+                (u64::from(column) * u64::from(self.num_units) + u64::from(unit)) * bytes,
+            )
+        };
+        Ok(storage::manifest::Chunk {
+            offset: 0,
+            length: bytes,
+            key,
+            storage_offset: offset,
+            binding: storage::manifest::Binding::Rank,
+        })
+    }
+
     /// Allocate a pool of `num_units` units (the sentinel included), and
     /// reset the planes whose memory is new: values and flags zero, scales
     /// one. On a device the resets run on `stream`, which is synchronized

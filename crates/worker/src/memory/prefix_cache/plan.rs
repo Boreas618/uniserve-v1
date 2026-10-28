@@ -29,6 +29,14 @@ pub struct StateField {
     pub shape: Vec<i64>,
 }
 
+/// One layer's checkpoint, packed into consecutive planes of a state page.
+#[derive(serde::Deserialize)]
+pub struct Checkpoint {
+    pub first_plane: u32,
+    pub planes: u32,
+    pub fields: Vec<storage::manifest::Field>,
+}
+
 impl StateField {
     /// The field as a device bank of the request slots.
     pub(crate) fn slot(&self) -> SlotField {
@@ -130,6 +138,7 @@ pub struct CachePlan {
     pub groups: Vec<CacheGroupPlan>,
     /// The fields of the layers kept per request slot (`state_fields`).
     pub states: Vec<StateField>,
+    pub checkpoints: Vec<Checkpoint>,
     /// The library's `CachePlan`, passed back to its cache functions.
     pub handle: Handle,
 }
@@ -258,6 +267,9 @@ impl CachePlan {
         let states: tvm_ffi::String = call("state_fields")?
             .try_into()
             .map_err(|error| Error::numerical("state_fields", &error))?;
+        let checkpoints: tvm_ffi::String = call("checkpoints")?
+            .try_into()
+            .map_err(|error| Error::numerical("checkpoints", &error))?;
 
         Ok(Self {
             columns: count("columns")? as u32,
@@ -267,6 +279,8 @@ impl CachePlan {
             dtype,
             groups,
             states: state_fields(states.as_str())?,
+            checkpoints: serde_json::from_str(checkpoints.as_str())
+                .map_err(|error| Error::Interface(format!("checkpoint fields: {error}")))?,
             handle,
         })
     }

@@ -769,6 +769,7 @@ pub(crate) mod tests {
                 compute_dtype: crate::ffi::DType::BF16,
             }],
             states: Vec::new(),
+            checkpoints: Vec::new(),
             handle: crate::ffi::Handle::none(),
         }
     }
