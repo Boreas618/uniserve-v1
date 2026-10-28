@@ -1997,13 +1997,31 @@ impl Replica {
         let mut host_refused = None;
         let mut moved_bytes = 0;
         match &previous {
-            // Host staging already released the copied tail at promotion.
-            // Otherwise these device pages remain the rollback backing.
-            Previous::Parked(_) => {
-                if !adds.unmapped_cache
-                    && let Err(error) = successor.resize_cache(wire::CacheChange::Grow).await
-                {
-                    warn!("the successor's writable cache did not grow: {error}");
+            Previous::Parked(parked) => {
+                // A parked previous world whose cache the successor maps none
+                // of keeps it for a rollback alone: it evicts every segment
+                // past its first once their idle pages reached the host KV
+                // cache, and the successor grows into them (step 5 of
+                // `specs/online-operations.md` §6.5). A rollback reads them
+                // back from there and computes the rest again. Host staging
+                // evicted them at the promotion, where the successor loaded
+                // its staged cache.
+                if !(adds.unmapped_cache && adds.host_cache) {
+                    if adds.unmapped_cache {
+                        match parked.resize_cache(wire::CacheChange::Evict).await {
+                            Ok(results) => {
+                                evicted = results
+                                    .iter()
+                                    .find_map(|result| serde_json::from_str(result).ok());
+                            }
+                            Err(error) => {
+                                warn!("the parked world did not evict its KV cache: {error}");
+                            }
+                        }
+                    }
+                    if let Err(error) = successor.resize_cache(wire::CacheChange::Grow).await {
+                        warn!("the successor's writable cache did not grow: {error}");
+                    }
                 }
             }
             Previous::Weights => {
