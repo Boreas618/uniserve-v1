@@ -26,6 +26,7 @@ mod channel;
 mod export_table;
 pub mod exports;
 pub mod fetch;
+pub(crate) mod links;
 mod local;
 mod pool;
 mod posix_shm;
