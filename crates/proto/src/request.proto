@@ -363,6 +363,9 @@ message ResizeCache {
   // "moved_bytes", "refused"}}`, `refused` saying why a node kept the
   // weights on its GPUs.
   bool keep_in_host_memory = 7;
+  // For a make-room change: the device bytes each device's storage ledger
+  // must have room for beside everything it books.
+  uint64 room_bytes = 9;
 }
 
 enum CacheChange {
@@ -392,6 +395,11 @@ enum CacheChange {
   // that the successor's cache grows into them. Answered with the segments
   // and bytes evicted; a resume creates them again.
   CACHE_CHANGE_EVICT = 6;
+  // Give back the tail of the KV cache until each device's storage ledger
+  // has room for `room_bytes` (a profiling session's device storage): the
+  // requests that hold the tail run on. Fails, changing nothing, when even
+  // the segments the cache cannot give back leave too little room.
+  CACHE_CHANGE_MAKE_ROOM = 7;
 }
 
 // Where the daemon an engine attaches to listens.

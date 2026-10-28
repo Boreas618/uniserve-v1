@@ -180,6 +180,7 @@ impl DeviceBudget {
             quota: quota(total, fraction),
             graph,
             process: own.saturating_sub(graph) + pending,
+            profiling: 0,
         })
     }
 }
@@ -199,6 +200,10 @@ pub(crate) struct DeviceBooking {
     /// storages, with the product storage it has yet to make resident
     /// ([`Item::Process`]).
     pub process: u64,
+    /// The device storage a profiling session's collectors hold while the
+    /// session runs (the range profiler's pass), which the process's item
+    /// books beside `process`; 0 without a session.
+    pub profiling: u64,
 }
 
 impl DeviceBooking {
@@ -207,19 +212,22 @@ impl DeviceBooking {
     /// Returns the ledger after the booking.
     ///
     /// Fails when the booking takes the ledger past its quota: the rank's
-    /// initialized runtime exceeds what the deployment may hold.
+    /// initialized runtime, with a profiling session's storage, exceeds what
+    /// the deployment may hold.
     pub(crate) fn submit(&self, retained: &Retained, graphs: bool) -> Result<GpuLedger> {
         let graph = if graphs { self.graph } else { 0 };
+        let process = self.process + self.profiling;
         let ledger = retained.book(
             self.device,
             self.total,
             self.quota,
-            vec![(Item::GraphPool, graph), (Item::Process, self.process)],
+            vec![(Item::GraphPool, graph), (Item::Process, process)],
         )?;
         tracing::info!(
             device = %self.device,
             graph_pool = graph,
-            process = self.process,
+            process,
+            profiling = self.profiling,
             booked = ledger.used(),
             quota = ledger.quota,
             "booked the worker's device memory"
