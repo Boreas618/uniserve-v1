@@ -832,6 +832,16 @@ pub(crate) mod device {
             )
             .unwrap();
         assert_eq!(booked_context(&mut head, gpu), None);
+        // The ledger states the bandwidth from host memory to the GPU the
+        // Transfer Server measured.
+        let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
+        assert!(!ledgers.is_empty());
+        assert!(
+            ledgers.iter().all(|ledger| ledger
+                .host_link_bytes_per_second
+                .is_some_and(|bandwidth| bandwidth > 0)),
+            "{ledgers:?}"
+        );
 
         // The host link into the GPU at its floor, so that the task lasts
         // long enough to observe.

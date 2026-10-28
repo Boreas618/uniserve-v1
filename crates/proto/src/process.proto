@@ -177,6 +177,11 @@ message Claim {
   // Worlds of the deployment whose memory on the node ends: a world the
   // claiming one superseded at a commit, or one a rollback discarded.
   repeated uint64 retire = 6;
+  // The claiming world computes other numerics than the worlds before it
+  // (another root of its pages' keys): it hits none of the pages they
+  // published, which the node's page pools discard (the server's
+  // `DiscardPages`).
+  bool discard_pages = 7;
 }
 
 message Scope {

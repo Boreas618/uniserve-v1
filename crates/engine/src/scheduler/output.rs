@@ -1754,7 +1754,14 @@ impl Scheduler {
         });
         if let Some((kv_offload, worker)) = kv_offload {
             // Pages published now are offloaded to the host KV cache, but
-            // for the host KV cache's own hit, whose loads are now done.
+            // for the host KV cache's own hit, whose loads are now done. Each
+            // page keeps its key, under which a withdrawal that evicts it
+            // verifies its copy first.
+            for (_, keys, pages, _) in &reserved {
+                for (key, page) in keys.iter().zip(pages) {
+                    prefix_cache.block_pool.set_host_key(page, *key);
+                }
+            }
             for (group, keys, pages, kind) in reserved {
                 kv_offload.offload(worker, group, keys, pages, kind);
             }

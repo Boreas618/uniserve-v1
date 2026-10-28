@@ -709,6 +709,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         },
         Ok(wire::CacheChange::Grow) => crate::CacheChange::Grow,
         Ok(wire::CacheChange::Plan) => crate::CacheChange::Plan(successor),
+        Ok(wire::CacheChange::Evict) => crate::CacheChange::Evict,
         Ok(wire::CacheChange::Restore) => crate::CacheChange::Restore,
         Ok(wire::CacheChange::Sleep) => crate::CacheChange::Sleep,
         Ok(wire::CacheChange::Wake) => crate::CacheChange::Wake,
@@ -960,7 +961,7 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
     let retired = routing
         .slots
         .first()
-        .map(|slot| slot.handle.retire(resume.retire.clone()));
+        .map(|slot| slot.handle.retire(resume.retire.clone(), false));
     let answers: Vec<_> = routing
         .slots
         .iter()
@@ -1015,7 +1016,11 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
 /// predecessor), then commits every scheduler, on a thread of its own, and
 /// answers the daemon `front` with `Hooked` and every worker's report.
 fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>) {
-    tracing::info!(retire = ?commit.retire, "the engine's world is committed");
+    tracing::info!(
+        retire = ?commit.retire,
+        discard_pages = commit.discard_pages,
+        "the engine's world is committed"
+    );
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
         .name("commit".to_owned())
@@ -1023,7 +1028,11 @@ fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>)
             let mut results = Vec::new();
             let mut error = String::new();
             if let Some(slot) = routing.slots.first() {
-                match slot.handle.retire(commit.retire.clone()).recv() {
+                match slot
+                    .handle
+                    .retire(commit.retire.clone(), commit.discard_pages)
+                    .recv()
+                {
                     Ok(Ok(())) => {}
                     Ok(Err(failed)) => error = failed,
                     Err(_) => error = "a scheduler stopped".to_owned(),

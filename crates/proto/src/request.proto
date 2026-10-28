@@ -370,6 +370,12 @@ enum CacheChange {
   // world and a world succeeding it hold there and the KV cache limit that
   // leaves the serving world, or fail with why such a world does not fit.
   CACHE_CHANGE_PLAN = 5;
+  // For a parked world whose successor maps none of its cache: give back
+  // every segment past the first, once the idle cached pages they hold
+  // reached the host KV cache (verified there, or copied there again), so
+  // that the successor's cache grows into them. Answered with the segments
+  // and bytes evicted; a resume creates them again.
+  CACHE_CHANGE_EVICT = 6;
 }
 
 // Where the daemon an engine attaches to listens.
@@ -430,6 +436,10 @@ message Commit {
   // Worlds whose memory ends on every node of the engine: the predecessor,
   // whose processes are gone.
   repeated uint64 retire = 2;
+  // The committed world computes other numerics than its predecessor
+  // (another root of its pages' keys): every node's host KV cache discards
+  // the pages it did not publish, which it never hits.
+  bool discard_pages = 3;
 }
 
 // A request for the engine's KV cache segments.

@@ -119,10 +119,14 @@ impl Scheduler {
             Command::Commit(answer) => {
                 let _ = answer.send(self.commit());
             }
-            Command::Retire { worlds, answer } => {
+            Command::Retire {
+                worlds,
+                discard_pages,
+                answer,
+            } => {
                 let retired = self
                     .executor
-                    .retire(&worlds)
+                    .retire(&worlds, discard_pages)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(retired);
             }

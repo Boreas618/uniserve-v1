@@ -277,6 +277,40 @@ impl Scheduler {
             }
         }
 
+        // A resize waits for the copies of the idle cached pages it evicts:
+        // while no text batch carries them (nothing runs, as on a parked
+        // world), batches of page offloads alone do.
+        if self.resizing.is_some()
+            && self.inflight.pending_submissions.is_empty()
+            && self.inflight.pending_batches.is_empty()
+            && let Some(workers) = self
+                .kv_offload
+                .as_ref()
+                .map(crate::kv_cache::KvOffloadManager::queued_workers)
+        {
+            for worker in workers {
+                let mut batch = self.finish_generation_batch(
+                    ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new()),
+                    Instant::now(),
+                );
+                let Some(kv_offload) = self.kv_offload.as_mut() else {
+                    break;
+                };
+                let pages = kv_offload.take_offloads(&worker, batch.id);
+                batch.page_offloads = Some(crate::executor::PageOffloads {
+                    worker,
+                    pages,
+                    latents: Vec::new(),
+                });
+                self.inflight.pending_submissions.push_back(batch);
+                progressed = true;
+            }
+            self.dispatch_submissions(&mut blocked_workers);
+            if self.fatal {
+                return progressed;
+            }
+        }
+
         // Lifecycle commands that no scheduling pass carried go out in
         // command-only batches while nothing else awaits submission.
         while self.inflight.pending_submissions.is_empty()

@@ -552,14 +552,26 @@ impl Pools {
     }
 
     /// Discard the pages `world` of `deployment` published while on trial
-    /// ([`Pool::discard_world`]).
+    /// ([`Pool::discard_where`]).
     pub(super) fn discard_world(&mut self, deployment: &str, world: u64) {
+        self.discard_where(deployment, |published| published == world);
+    }
+
+    /// Discard every page of `deployment` that world `except` did not
+    /// publish ([`Pool::discard_where`]); returns how many.
+    pub(super) fn discard_except(&mut self, deployment: &str, except: u64) -> u64 {
+        self.discard_where(deployment, |published| published != except)
+    }
+
+    fn discard_where(&mut self, deployment: &str, discarded: impl Fn(u64) -> bool) -> u64 {
+        let mut pages = 0;
         for pool in self.pools.values_mut() {
             if pool.deployment == deployment {
-                pool.discard_world(world);
+                pages += pool.discard_where(&discarded);
             }
         }
         self.settle();
+        pages
     }
 
     /// The pages `world` of `deployment` published, by pool.
@@ -945,7 +957,8 @@ impl Pool {
             {
                 *uploads -= 1;
                 if Slot::idle(pins, *uploads) {
-                    self.evictable.insert(*touched, *slot);
+                    let (touched, slot) = (*touched, *slot);
+                    self.idle_again(touched, slot);
                 }
             }
         }
@@ -1022,11 +1035,13 @@ impl Pool {
         self.leave(slot, key);
     }
 
-    /// Discard the pages `world` published, a world on trial that a
-    /// rollback retires: those nobody reads leave the pool, and no world
+    /// Discard the pages published by the worlds `discarded` picks (a world
+    /// on trial that a rollback retires, or every world but a committed one
+    /// of other numerics): those nobody reads leave the pool, and no world
     /// reads the others, which leave it once their readers unpin them, nor
-    /// the pages it reserved and commits later.
-    pub(super) fn discard_world(&mut self, world: u64) {
+    /// the pages they reserved and commit later. Returns how many.
+    pub(super) fn discard_where(&mut self, discarded: impl Fn(u64) -> bool) -> u64 {
+        let mut pages = 0;
         for slot in 0..self.slots.len() as u32 {
             let idle = match &mut self.slots[slot as usize] {
                 Slot::Ready {
@@ -1034,14 +1049,16 @@ impl Pool {
                     pins,
                     uploads,
                     ..
-                } if *published == world => {
+                } if *published != DISCARDED && discarded(*published) => {
                     *published = DISCARDED;
+                    pages += 1;
                     Slot::idle(pins, *uploads)
                 }
                 Slot::Reserved {
                     world: published, ..
-                } if *published == world => {
+                } if *published != DISCARDED && discarded(*published) => {
                     *published = DISCARDED;
+                    pages += 1;
                     false
                 }
                 _ => false,
@@ -1050,6 +1067,7 @@ impl Pool {
                 self.free_slot(slot);
             }
         }
+        pages
     }
 
     /// The pages `world` published, with their slots: those every world
@@ -1129,8 +1147,26 @@ impl Pool {
         if let Some(position) = pins.iter().position(matches) {
             pins.remove(position);
             if Slot::idle(pins, *uploads) {
-                self.evictable.insert(*touched, slot);
+                let touched = *touched;
+                self.idle_again(touched, slot);
             }
+        }
+    }
+
+    /// A ready `slot`, last touched at `touched`, that nobody reads any more:
+    /// a discarded page, which no world reads, leaves the pool; another
+    /// waits for eviction, least recently used first.
+    fn idle_again(&mut self, touched: u64, slot: u32) {
+        if matches!(
+            self.slots[slot as usize],
+            Slot::Ready {
+                world: DISCARDED,
+                ..
+            }
+        ) {
+            self.free_slot(slot);
+        } else {
+            self.evictable.insert(touched, slot);
         }
     }
 

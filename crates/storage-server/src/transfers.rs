@@ -941,6 +941,20 @@ impl Server {
             .collect()
     }
 
+    /// The bandwidth of copies from host memory to `gpu` the connected
+    /// Transfer Server measured, in bytes per second.
+    pub(super) fn host_link(&self, gpu: [u8; 16]) -> Option<u64> {
+        let link = Link {
+            source: Memory::Host,
+            destination: Memory::Device { gpu },
+        };
+        self.transfers
+            .links
+            .iter()
+            .find(|measured| measured.link == link)
+            .map(|measured| measured.bytes_per_second)
+    }
+
     /// The Transfer Server in a listing, while it is connected.
     pub(super) fn listed_transfer(&self) -> Option<ListedTransfer> {
         let client = self.clients.get(&self.transfers.client?)?;

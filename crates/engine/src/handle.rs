@@ -591,9 +591,11 @@ pub enum Command {
     /// with what each worker reported.
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Ends the memory of other worlds on the nodes of the scheduler's
-    /// workers (`Executor::retire`), and answers whether it did.
+    /// workers, discarding the pages the scheduler's world does not hit when
+    /// `discard_pages` (`Executor::retire`), and answers whether it did.
     Retire {
         worlds: Vec<u64>,
+        discard_pages: bool,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Reads the memory ledgers of the nodes of the scheduler's workers
@@ -701,6 +703,11 @@ pub enum CacheChange {
     /// device's memory beside a world succeeding this one, or fails with
     /// why such a world does not fit.
     Plan(Successor),
+    /// For a parked world whose successor maps none of its cache: gives
+    /// back every segment past the first, once the idle cached pages they
+    /// hold reached the host KV cache, so that the successor's cache grows
+    /// into them. A resume creates them again.
+    Evict,
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the
@@ -869,11 +876,20 @@ impl CommandSender {
         promoted
     }
 
-    /// Ends the memory of `worlds` on the nodes of the scheduler's workers
-    /// (`Command::Retire`); the receiver gets whether it did.
-    pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
+    /// Ends the memory of `worlds` on the nodes of the scheduler's workers,
+    /// discarding the pages the scheduler's world does not hit when
+    /// `discard_pages` (`Command::Retire`); the receiver gets whether it did.
+    pub fn retire(
+        &self,
+        worlds: Vec<u64>,
+        discard_pages: bool,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, retired) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Retire { worlds, answer });
+        let _ = self.send(Command::Retire {
+            worlds,
+            discard_pages,
+            answer,
+        });
         retired
     }
 
