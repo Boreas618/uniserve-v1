@@ -259,12 +259,12 @@ def _server_timings(successful: list[RequestRecord]) -> dict[str, Any]:
         }
 
     peaks = [
-        record.server_peak_memory_mib
+        record.server_peak_storage_mib
         for record in successful
-        if record.server_peak_memory_mib is not None
+        if record.server_peak_storage_mib is not None
     ]
     if peaks:
-        summary["server_peak_memory_mib"] = max(peaks)
+        summary["server_peak_storage_mib"] = max(peaks)
     return summary
 
 

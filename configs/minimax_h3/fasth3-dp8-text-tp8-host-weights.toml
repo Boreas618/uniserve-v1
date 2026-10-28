@@ -1,5 +1,5 @@
 # FastH3 on eight GPUs of one host: eight one-GPU denoiser replicas whose layer
-# projections stay in host memory, sharing one TP8 text encoder. Serve it with
+# projections stay in host storage, sharing one TP8 text encoder. Serve it with
 # --graph-policy off.
 
 [[worker_groups]]

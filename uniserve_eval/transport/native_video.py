@@ -10,10 +10,10 @@ requests: the media bytes were read when the request was built. The caller
 owns the overall deadline and retains bodies for later inspection.
 
 A server's own timings of a request (its inference time, named stage
-durations and peak device memory) are recorded as it reports them: in the
-``X-Inference-Time-S``, ``X-Stage-Durations`` and ``X-Peak-Memory-MB``
+durations and peak device storage) are recorded as it reports them: in the
+``X-Inference-Time-S``, ``X-Stage-Durations`` and ``X-Peak-Storage-MB``
 headers of a synchronous response, or the ``inference_time_s``,
-``stage_durations`` and ``peak_memory_mb`` fields of a completed job.
+``stage_durations`` and ``peak_storage_mb`` fields of a completed job.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from ..types import RequestRecord, TaskRequest
 _TIMING_HEADERS = (
     "x-inference-time-s",
     "x-stage-durations",
-    "x-peak-memory-mb",
+    "x-peak-storage-mb",
 )
 
 # vLLM-Omni and FastVideo present a request's references grouped by media
@@ -77,7 +77,7 @@ async def receive_video(
         record,
         job.get("inference_time_s"),
         job.get("stage_durations"),
-        job.get("peak_memory_mb"),
+        job.get("peak_storage_mb"),
     )
 
     # SGLang may publish a storage URL instead of a local content route.
@@ -270,7 +270,7 @@ def _record_timings(
     record: RequestRecord,
     inference_s: Any,
     stages: Any,
-    peak_memory_mib: Any,
+    peak_storage_mib: Any,
 ) -> None:
     """Record the server-reported timings that parse as finite numbers.
 
@@ -278,7 +278,7 @@ def _record_timings(
     is left unset rather than failing a request that returned its media.
     """
     record.server_inference_s = _finite(inference_s)
-    record.server_peak_memory_mib = _finite(peak_memory_mib)
+    record.server_peak_storage_mib = _finite(peak_storage_mib)
     if isinstance(stages, str):
         try:
             stages = json.loads(stages)
@@ -332,7 +332,7 @@ async def _body(
     ) as response:
         record.note_http(response.status)
         record.video_mime = response.headers.get("content-type", "")
-        # Encoded bodies are buffered in host memory; no media work delays the
+        # Encoded bodies are buffered in host storage; no media work delays the
         # next slot. Keep even invalid bodies for post-run failure artifacts.
         record.video_body = await response.read()
         record.close_now()
@@ -346,5 +346,5 @@ async def _body(
                     record,
                     response.headers.get("x-inference-time-s"),
                     response.headers.get("x-stage-durations"),
-                    response.headers.get("x-peak-memory-mb"),
+                    response.headers.get("x-peak-storage-mb"),
                 )

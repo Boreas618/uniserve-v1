@@ -185,7 +185,7 @@ class VideoTask(BenchmarkTask):
         A row without its own duration or seed takes the point's video
         duration and load seed. The stated schedule fields are sent when the
         point sets them. The row's condition media are read here, so a
-        backend that uploads them sends bytes already in memory.
+        backend that uploads them sends bytes already in storage.
 
         Raises:
             ValueError: The duration lies outside 4 to 15 seconds, the

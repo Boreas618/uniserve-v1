@@ -69,7 +69,7 @@ def main() -> None:
                             f"    GPU {copy.start_ns}..{copy.end_ns} ns: "
                             f"{copy.direction} {copy.bytes} B "
                             f"device={copy.device} stream={copy.stream} "
-                            f"{copy.source_memory}->{copy.destination_memory}"
+                            f"{copy.source_storage}->{copy.destination_storage}"
                         )
                     if not event.stack:
                         print("    stack: not captured")
