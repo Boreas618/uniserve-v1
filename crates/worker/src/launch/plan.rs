@@ -36,6 +36,9 @@ fn run(argv: &[String], python: &Path) -> crate::Result<()> {
     let planned = plan(&launch, python, source_world).map_err(|error| error.to_string());
     let succeeded = planned.is_ok();
     channel.send(&planned).map_err(transport)?;
+    // A manifest can exceed the socket's send buffer. Complete the queued
+    // frame before this short-lived rank closes its connection.
+    channel.flush().map_err(transport)?;
     if succeeded {
         Ok(())
     } else {
