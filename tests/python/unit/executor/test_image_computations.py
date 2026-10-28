@@ -301,7 +301,8 @@ def test_inline_latent_images_encode_into_their_rows(rank, stub):
     facts, pixels = _prepared(stub, "vae", _payload(32, 32, 5))
     calls = [
         {
-            **_call("latent_encoding"),
+            # The request's first latent encoding: its posterior draw 0.
+            **_call("latent_encoding", latent_draw=0),
             "image": {
                 "input": {
                     "inline": {
@@ -430,13 +431,20 @@ def test_a_trajectory_opens_steps_and_decodes_through_the_ledger(rank, stub):
         return [written["product"], written["bytes"]]
 
     prepared, _ = rank.run("image_decoding", [decode], tensors)
-    assert prepared[0]["image"]["bytes"] == 3 * 32 * 32
+    # The lent bytes are the image's RGB bytes, then its product's BF16
+    # values, the exact feedback input a migration carries.
+    count = 3 * 32 * 32
+    assert prepared[0]["image"]["bytes"] == 3 * count
     (decoded,) = stub.module.image_decoder.decode((first,), sizes=(size,))
     torch.testing.assert_close(
         written["product"], decoded.to(torch.bfloat16), rtol=0, atol=0
     )
     expected = quantize_image_hwc(decoded, value_range=(-1.0, 1.0))
-    assert torch.equal(written["bytes"], expected.reshape(-1))
+    assert torch.equal(written["bytes"][:count], expected.reshape(-1))
+    assert torch.equal(
+        written["bytes"][count:].view(torch.bfloat16),
+        written["product"].reshape(-1),
+    )
 
 
 def test_resident_images_decode_by_quantizing(rank):
