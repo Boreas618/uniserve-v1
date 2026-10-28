@@ -316,7 +316,24 @@ impl WorkerExecutor {
             .map(|(id, worker)| {
                 let pools = (0..)
                     .map_while(|rank| worker.worker_info(rank))
-                    .map(|info| (info.endpoint.host.clone(), info.latent_pool.clone()))
+                    .map(|info| {
+                        (
+                            info.endpoint.host.clone(),
+                            info.latent_pool.as_deref().cloned(),
+                        )
+                    })
+                    .collect();
+                (id.clone(), pools)
+            })
+            .collect();
+        // Each rank executing video encoder calls reports its host's encoder
+        // pool.
+        executor_info.rank_encoders = workers
+            .iter()
+            .map(|(id, worker)| {
+                let pools = (0..)
+                    .map_while(|rank| worker.worker_info(rank))
+                    .map(|info| (info.endpoint.host.clone(), info.encoder_pool.clone()))
                     .collect();
                 (id.clone(), pools)
             })

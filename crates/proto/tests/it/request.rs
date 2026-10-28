@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use proto::request::{
     ArtifactEvent, ArtifactMedia, CachePolicy, CfgRenorm, ConditionExtent, DiffusionRequest,
-    DiffusionSamplingParams, Event, FeedbackNextToken, FeedbackSource, FinishReason,
-    GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder,
-    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaKind,
-    MigrationCause, MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
+    DiffusionSamplingParams, EncoderInputs, Event, FeedbackImage, FeedbackNextToken,
+    FeedbackSource, FinishReason, GeneratedImage, GenerationConstraint, GenerationFeatures,
+    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageGenerationConfig,
+    ImageInput, ImageParams, ImagePixels, ImageTrigger, MediaKind, MigrationCause,
+    MultimodalInputs, PixelRange, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
     Request, RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory, wire,
 };
 
@@ -20,7 +21,7 @@ fn generation() -> GenerationRequest {
         negative_prompt_token_ids: vec![9],
         multimodal_inputs: MultimodalInputs {
             images: vec![ImageInput {
-                hash: 0xfeed,
+                digest: [0xfe; 32],
                 b64: "aW1hZ2U=".to_owned(),
                 position: 2,
                 num_positions: 6,
@@ -113,8 +114,28 @@ fn generation() -> GenerationRequest {
                 candidates: vec![30, 31],
             }],
         }],
-        generated_token_ids: Vec::new(),
+        generated_token_ids: vec![40, 41, 42],
         adapter: 0,
+        generated_images: vec![
+            GeneratedImage {
+                tokens: 1,
+                image: FeedbackImage::Pixels(Arc::new(pixels())),
+            },
+            GeneratedImage {
+                tokens: 3,
+                image: FeedbackImage::Png(Arc::from("cG5n")),
+            },
+        ],
+    }
+}
+
+/// The decoded image product of a 2 x 1 image.
+fn pixels() -> ImagePixels {
+    ImagePixels {
+        height: 2,
+        width: 1,
+        range: PixelRange::SignedUnit,
+        values: (0..12).collect(),
     }
 }
 
@@ -144,12 +165,22 @@ fn requests_come_back_from_their_messages_unchanged() {
                 height: 32,
             },
             // A resumed request names its trajectory, the steps an engine
-            // stored and the latent seed it continues with.
+            // stored, the latent seed it continues with and where the pages
+            // lie.
             trajectory: Trajectory {
                 id: 11,
                 denoised_steps: 4,
                 state_seed: Some(13),
+                stored_layout: b"{\"version\":1}".to_vec(),
             },
+            // The digests of what its encoders read, one per condition
+            // unit, a vision and an audio digest.
+            encoder_inputs: Some(Box::new(EncoderInputs {
+                text: [1; 32],
+                vision: Some([2; 32]),
+                video_units: vec![[3; 32], [4; 32]],
+                audio: Some([5; 32]),
+            })),
         }),
     ];
     for request in requests {
@@ -248,7 +279,17 @@ fn events_come_back_from_their_messages_unchanged() {
             width: 32,
             bytes: 10,
             pixels_png_b64: "cG5n".to_owned(),
+            feedback: None,
         },
+        Event::ImageDone {
+            image_id: 2,
+            height: 2,
+            width: 1,
+            bytes: 10,
+            pixels_png_b64: "cG5n".to_owned(),
+            feedback: Some(Arc::new(pixels())),
+        },
+        Event::ControlToken { id: 151_652 },
         Event::MediaProgress {
             phase: "denoising".to_owned(),
             completed_steps: 4,
@@ -280,6 +321,7 @@ fn events_come_back_from_their_messages_unchanged() {
         Event::Migratable {
             cause: MigrationCause::Drain,
             denoised_steps: 3,
+            stored_layout: vec![1, 2, 3],
         },
     ];
     for event in events {

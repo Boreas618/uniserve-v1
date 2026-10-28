@@ -140,6 +140,22 @@ pub enum Event {
         bytes: u64,
         /// Base64-encoded PNG payload.
         pixels_png_b64: String,
+        /// The decoded image product the request's feedback encoders read,
+        /// when it feeds the image back from the device
+        /// (`FeedbackSource::DeviceProduct`): the image's exact feedback
+        /// input, which the daemon keeps to submit a migrated request again
+        /// with it (`GeneratedImage`).
+        feedback: Option<Arc<super::ImagePixels>>,
+    },
+    /// A generated token the request's text does not include: one that opens
+    /// an image or closes a round, or one of a request that publishes no
+    /// text. It counts as generated. The daemon keeps it, in order with the
+    /// text tokens, to submit a migrated request again with every token it
+    /// generated (`GenerationRequest::generated_token_ids`); no client reads
+    /// it.
+    ControlToken {
+        /// Vocabulary token identity.
+        id: u32,
     },
     /// Reports actual media computation progress committed by the engine.
     ///
@@ -201,6 +217,10 @@ pub enum Event {
         /// engine stored in its host latent pools at the step boundary it
         /// was preempted at; zero when it stored none.
         denoised_steps: u32,
+        /// With stored steps, where the engine put the trajectory's pages
+        /// and how each stored rank laid its part out
+        /// (`Trajectory::stored_layout`); empty otherwise.
+        stored_layout: Vec<u8>,
     },
 }
 
@@ -308,19 +328,51 @@ pub struct DiffusionRequest {
     pub sampling: DiffusionSamplingParams,
     /// The request's latent trajectory across the engines that serve it.
     pub trajectory: Trajectory,
+    /// The digests of what each of its encoder computations reads, which
+    /// key their outputs in the host tier; `None` for a request whose
+    /// encoder outputs are neither stored nor found. Boxed, as the digests
+    /// are larger than the rest of the request.
+    #[serde(default)]
+    pub encoder_inputs: Option<Box<EncoderInputs>>,
+}
+
+/// The SHA-256 digests of what each encoder computation of a video request
+/// reads: the text encoding's (the presentation and the vision features'
+/// inputs), the vision encoding's, each visual condition unit's latent
+/// encoding's and the audio encoding's.
+///
+/// The daemon computes them from the request's facts (its presentation and
+/// the content and plan of each condition's media), so that requests whose
+/// encoders read the same inputs, the same request on another engine among
+/// them, find each other's outputs. An engine keys an encoder's output by
+/// these digests and the identity of what the encoder computes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncoderInputs {
+    /// The text encoding's inputs.
+    pub text: [u8; 32],
+    /// The vision encoding's inputs; `None` without a vision block.
+    pub vision: Option<[u8; 32]>,
+    /// Each visual condition unit's inputs, in encoding order: the units of
+    /// [`ConditionExtent::latent_units`], condition by condition.
+    pub video_units: Vec<[u8; 32]>,
+    /// The audio encoding's inputs; `None` without an audio track.
+    pub audio: Option<[u8; 32]>,
 }
 
 /// A video request's latent trajectory across the engines that serve it.
 ///
 /// An engine that preempts the request at a denoising-step boundary stores
-/// the trajectory in its host latent pools, keyed by `id`, the steps it
-/// took and the latent seed of what its denoising computes; the daemon
-/// submits the request again with those steps (`Event::Migratable`), and
-/// the engine that serves it next continues from them when its pools hold
-/// the trajectory under its own latent seed (or `state_seed`), and from
-/// noise otherwise. Either way it computes the same trajectory, since a
-/// trajectory's state at a step follows from the request alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// the trajectory in its host latent pools, each page keyed by `id`, the
+/// steps it took, the latent seed of what its denoising computes and the
+/// part of the samples the page holds; the daemon submits the request again
+/// with those steps and the engine's record of the stored layout
+/// (`Event::Migratable`), and the engine that serves it next continues from
+/// them when its pools hold the trajectory under its own latent seed (or
+/// `state_seed`), laying the pages out in its own ranks' pages whatever
+/// parallel configuration stored them, and from noise otherwise. Either way
+/// it computes the same trajectory, since a trajectory's state at a step
+/// follows from the request alone.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Trajectory {
     /// The identity that keys the stored trajectory: the daemon gives a
     /// request one when it first submits it and keeps it across its
@@ -334,6 +386,11 @@ pub struct Trajectory {
     /// numerics (a world change's `in_flight = keep`); `None` reads a
     /// trajectory of the serving world's own latent seed only.
     pub state_seed: Option<u64>,
+    /// Where the engine that stored the trajectory put its pages and how
+    /// each stored rank laid its part of the samples out, as that engine
+    /// recorded it; empty when `denoised_steps` is zero. Opaque to the
+    /// daemon.
+    pub stored_layout: Vec<u8>,
 }
 
 /// The sizes of one condition of a video request, which size the products of
@@ -389,6 +446,33 @@ impl DiffusionRequest {
             return Err(DiffusionRequestError::Conditions(
                 "the request names no task or carries no conditioning",
             ));
+        }
+        // The encoder inputs name what the request's encoders read: a unit
+        // digest for each visual condition unit, a vision digest when a
+        // condition occupies vision tokens, an audio digest when one has
+        // an audio track.
+        if let Some(inputs) = &self.encoder_inputs {
+            let units: usize = self
+                .conditions
+                .iter()
+                .map(|condition| condition.latent_units.len())
+                .sum();
+            let vision = self
+                .conditions
+                .iter()
+                .any(|condition| condition.vision_tokens > 0);
+            let audio = self
+                .conditions
+                .iter()
+                .any(|condition| condition.audio_rows > 0);
+            if inputs.video_units.len() != units
+                || inputs.vision.is_some() != vision
+                || inputs.audio.is_some() != audio
+            {
+                return Err(DiffusionRequestError::Conditions(
+                    "the encoder inputs do not name the request's encoders",
+                ));
+            }
         }
         Ok(())
     }

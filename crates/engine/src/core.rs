@@ -945,6 +945,14 @@ impl SchedulerHandle {
             config.world,
             &config.worker_process.host,
         );
+        // Ranks executing video encoders that map host encoder pools report
+        // them: a request's encoder outputs are stored and found there.
+        scheduler.enable_encoder_store(
+            &storage::socket::default_socket(),
+            &config.worker_process.deployment,
+            config.world,
+            &config.worker_process.host,
+        );
         Self::spawn(scheduler, config.worker_process.model, waker)
     }
 

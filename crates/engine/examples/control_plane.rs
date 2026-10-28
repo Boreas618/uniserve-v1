@@ -99,6 +99,7 @@ fn main() -> anyhow::Result<()> {
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
             adapter: 0,
+            generated_images: Vec::new(),
         };
         request.validate_resources(&limits)?;
         anyhow::Ok((id, request))

@@ -308,14 +308,15 @@ impl Scheduler {
     /// Ends every token request that resumes from its generated tokens as
     /// migratable, for `cause`.
     ///
-    /// A request resumes from its tokens when it generates text alone
-    /// (`GenerationRequest::is_migratable`) on a deployment that does not
-    /// generate in canvases. A queued one ends at once. A running one stops
-    /// scheduling, drops the decoder decisions it awaits, and ends once its
-    /// calls in flight drain, after every token it generated; a token those
-    /// calls produce is discarded, and the engine that serves next generates
-    /// it again. A request already finishing finishes. Media requests and the
-    /// token requests that do not resume go on.
+    /// A request resumes from the tokens and images it generated when it is
+    /// no readout (`GenerationRequest::is_migratable`), on a deployment that
+    /// does not generate in canvases. A queued one ends at once. A running
+    /// one stops scheduling, drops the decoder decisions it awaits, and ends
+    /// once its calls in flight drain, after every token and image it
+    /// generated, whatever it computes; a token or an image those calls
+    /// produce is discarded, and the engine that serves next generates it
+    /// again, as it generates an image the request had begun. A request
+    /// already finishing finishes. Video requests and readouts go on.
     pub(super) fn migrate_requests(&mut self, cause: MigrationCause) {
         if self.config.canvas.is_some() {
             return;
@@ -331,6 +332,7 @@ impl Scheduler {
                 let _ = st.output.events.event_tx.send(Event::Migratable {
                     cause,
                     denoised_steps: 0,
+                    stored_layout: Vec::new(),
                 });
             }
         }

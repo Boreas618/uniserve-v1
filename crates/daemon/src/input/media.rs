@@ -8,7 +8,7 @@
 //! generation and System One readouts (`image_fetch_config`), and video
 //! condition media (`media_config`). [`MediaConnector::fetch_images`]
 //! additionally validates each image into an [`ImageInput`] (the encoded
-//! file bytes, their header dimensions and a content hash).
+//! file bytes, their header dimensions and a content digest).
 //!
 //! A reference is one of:
 //!
@@ -56,7 +56,6 @@ use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use reqwest::{StatusCode, Url};
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
@@ -204,7 +203,7 @@ pub struct ImageInput {
     bytes: Bytes,
     width: u32,
     height: u32,
-    hash: u64,
+    digest: [u8; 32],
 }
 
 impl ImageInput {
@@ -225,12 +224,14 @@ impl ImageInput {
             .into_dimensions()
             .map_err(MediaError::Undecodable)?;
 
-        let hash = content_hash(&bytes);
+        let mut key = storage::key::Digest::new(b"media");
+        key.bytes(&bytes);
+        let digest = key.finish();
         Ok(Self {
             bytes,
             width,
             height,
-            hash,
+            digest,
         })
     }
 
@@ -249,27 +250,14 @@ impl ImageInput {
         self.height
     }
 
-    /// Stable content identity of the encoded bytes.
+    /// The content key of the encoded bytes.
     ///
-    /// Equal bytes always give equal hashes, whether the image arrived inline
-    /// or from a URL, so the value serves as the encoder-cache identity
-    /// `proto::request::ImageInput::hash` starts from.
-    pub fn hash(&self) -> u64 {
-        self.hash
+    /// Equal bytes always give equal digests, whether the image arrived
+    /// inline or from a URL, so the value starts the identity of the
+    /// image's encoder outputs (`proto::request::ImageInput::digest`).
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
     }
-}
-
-/// Returns the first eight bytes, little-endian, of the SHA-256 digest of `bytes`.
-///
-/// The encoder cache is shared across requests without an isolation key, so a
-/// collision would serve one client's image features for another client's
-/// image. A cryptographic digest keeps a crafted second image from reaching
-/// the same 64-bit identity, which a non-cryptographic hash does not.
-fn content_hash(bytes: &[u8]) -> u64 {
-    let digest = Sha256::digest(bytes);
-    let mut prefix = [0_u8; 8];
-    prefix.copy_from_slice(&digest[..8]);
-    u64::from_le_bytes(prefix)
 }
 
 /// Resolves media references under one source policy and size limits.
@@ -1292,7 +1280,7 @@ mod tests {
 
     /// A data URL resolves to its decoded bytes and header dimensions, and
     /// the same bytes fetched over http resolve to an equal image with the
-    /// same content hash, while different bytes hash differently.
+    /// same content digest, while different bytes digest differently.
     #[tokio::test]
     async fn fetched_and_inline_images_resolve_identically() {
         let png = encoded_image(ImageFormat::Png, 3, 2);
@@ -1311,7 +1299,7 @@ mod tests {
 
         let other = encoded_image(ImageFormat::Png, 2, 3);
         let other = fetch_image(&connector, data_url(&other)).await.unwrap();
-        assert_ne!(other.hash(), inline.hash());
+        assert_ne!(other.digest(), inline.digest());
     }
 
     /// Lists resolve in reference order and name the index of a reference

@@ -115,6 +115,16 @@ pub(crate) fn media_units(name: &str, units: u32) -> OutputInfo {
 /// encoder component encodes the media units the decoder produced, and the
 /// muxer encodes audio and assembles the artifact.
 pub(crate) fn video_worker(decoder_ranks: usize, host_task_capacity: u32) -> SimEngine {
+    video_worker_denoising_on(decoder_ranks, host_task_capacity, 1)
+}
+
+/// [`video_worker`] whose denoiser runs on the first `denoising_ranks`
+/// ranks, as a sequence-parallel denoiser does.
+pub(crate) fn video_worker_denoising_on(
+    decoder_ranks: usize,
+    host_task_capacity: u32,
+    denoising_ranks: usize,
+) -> SimEngine {
     let mut sim = SimEngine::new();
     // A deep executor queue keeps queue capacity from bounding which calls
     // are in flight together, leaving that to the occupancy rules under test.
@@ -188,7 +198,7 @@ pub(crate) fn video_worker(decoder_ranks: usize, host_task_capacity: u32) -> Sim
         ),
         component(
             "denoiser",
-            vec![0],
+            (0..denoising_ranks).collect(),
             false,
             vec![output("video_latents", None), output("audio_latents", None)],
         ),
@@ -254,5 +264,6 @@ pub(crate) fn video_request(id: u64, video_units: u32) -> Request {
             height: 16,
         },
         trajectory: Default::default(),
+        encoder_inputs: None,
     })
 }

@@ -28,6 +28,8 @@ from typing import Any, NamedTuple, cast
 
 import torch
 
+from uniserve.distributed.distribution import Segment, Span
+from uniserve.distributed.logical import Logical
 from uniserve.errors import SetupError
 from uniserve.loading.rank import capability
 from uniserve.media import image, video
@@ -84,6 +86,9 @@ REQUEST_PAGES = 8
 
 # Each modality's sample starts on this element boundary.
 SAMPLE_ALIGNMENT = 256
+
+# Bytes of one sample value in the latent pages: the banks are float32.
+_SAMPLE_BYTES = 4
 
 # Pixels per side of a latent patch: a canvas side is a multiple of it, and
 # one latent frame holds one denoiser row per patch
@@ -976,6 +981,59 @@ class SampleLayout:
             elements.append(state.elements)
             cursor += _aligned(state.elements)
         return cls(tuple(offsets), tuple(elements), -(-cursor // page_units))
+
+    def storage(self, fields: LayoutFields) -> dict[str, Any]:
+        """How a request slot's pages hold this rank's share of the samples.
+
+        The copy manifest library's description of one storage
+        (``storage::manifest::StorageLayout``), the slot's pages back to
+        back. Each modality's complete sample is a logical tensor,
+        ``<modality>_latents`` of ``[rows, width]``; the rank holds its rows
+        ``[start, stop)`` of it (``fields.samples``, the denoiser's
+        distribution of the sequence) and every channel, row-major float32
+        at its element offset of the pages. The storage ends with the last
+        value the rank holds, so the slot's later pages hold nothing of the
+        request; a modality the rank holds no row of has no field.
+        ``fields`` are the layout's this sample layout was made of.
+        """
+        described = []
+        end = 0
+        for (name, rows), offset, elements in zip(
+            fields.samples, self.offsets, self.elements, strict=True
+        ):
+            count = rows.stop - rows.start
+            if count * rows.width != elements:
+                raise SetupError(
+                    f"the {name} sample's rows disagree with its elements"
+                )
+            if count == 0:
+                continue
+            logical = Logical(
+                (rows.rows, rows.width),
+                ("row", "channel"),
+                (1, 0),
+                (
+                    (Segment(Span(rows.start, count), 0),),
+                    (Segment(Span(0, rows.width), 0),),
+                ),
+            )
+            described.append(
+                {
+                    "tensor": f"{name}_latents",
+                    # No checkpoint source loads it: the trajectory's
+                    # content keys its values.
+                    "source": "",
+                    "dtype": "float32",
+                    "element": _SAMPLE_BYTES,
+                    "offset": offset * _SAMPLE_BYTES,
+                    "shape": [count, rows.width],
+                    "strides": [rows.width, 1],
+                    "logical": logical.describe(),
+                    "encoding": {"kind": "affine"},
+                }
+            )
+            end = max(end, (offset + elements) * _SAMPLE_BYTES)
+        return {"bytes": end, "fields": described}
 
 
 @dataclass(frozen=True)

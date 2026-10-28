@@ -9,6 +9,14 @@
 pub(crate) mod storage;
 pub(crate) mod video;
 
+/// The digest of test image `id` (`ImageInput::digest`): its little-endian
+/// bytes, then zeros, so that images of distinct ids differ.
+pub(crate) fn image_digest(id: u64) -> [u8; 32] {
+    let mut digest = [0; 32];
+    digest[..8].copy_from_slice(&id.to_le_bytes());
+    digest
+}
+
 use engine::{Executor, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use ipc::{CallKind, ForwardMode, MediaCall};

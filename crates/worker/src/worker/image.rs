@@ -118,9 +118,47 @@ pub(crate) struct ImageManifest {
     /// Device bytes they allocate per request slot.
     #[serde(default)]
     pub(crate) slot_bytes: u64,
+    /// What each image encoder of the rank writes, by the name of its
+    /// output (`vision_features`, `latent_features`).
+    #[serde(default)]
+    pub(crate) encoders: BTreeMap<String, EncoderManifest>,
+}
+
+/// What an image encoder of the rank writes for one image, as the
+/// executor's manifest states it (`manifest["image"]["encoders"]`).
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct EncoderManifest {
+    /// The declared function and format identity of what computes the
+    /// features: the encoder's modules and the image transform its pixels
+    /// are prepared by. With the weights' values it keys the features in
+    /// the host encoder pool.
+    pub(crate) identity: String,
+    /// The bytes of one feature row.
+    pub(crate) row_bytes: u64,
+    /// Whether the features follow the request's image seed and the
+    /// encoding's posterior draw: a latent encoder that samples its
+    /// posterior.
+    pub(crate) draws: bool,
 }
 
 impl ImageManifest {
+    /// What each image encoder writes for one image, as the rank reports it
+    /// (`WorkerInfo::image_encoders`).
+    pub(crate) fn encoder_outputs(&self) -> BTreeMap<String, ipc::ImageEncoderOutput> {
+        self.encoders
+            .iter()
+            .map(|(name, encoder)| {
+                (
+                    name.clone(),
+                    ipc::ImageEncoderOutput {
+                        row_bytes: encoder.row_bytes,
+                        draws: encoder.draws,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Device bytes the image computations allocate for `request_slots` slots.
     pub(crate) fn reserved_bytes(&self, request_slots: usize) -> u64 {
         self.fixed_bytes

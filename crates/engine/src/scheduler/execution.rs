@@ -187,6 +187,10 @@ impl Scheduler {
         progressed |= self.poll_one_result();
         progressed |= self.poll_kv_offload();
         progressed |= self.poll_trajectories();
+        progressed |= self
+            .encoder_outputs
+            .as_mut()
+            .is_some_and(crate::encoder_outputs::EncoderStore::poll);
 
         progressed |= self.refill_executor();
         self.poll_resize();

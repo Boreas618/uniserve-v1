@@ -164,6 +164,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
                 height: 16,
             },
             trajectory: Default::default(),
+            encoder_inputs: None,
         }))
         .unwrap();
     let engine = thread::spawn(move || scheduler.run(commands));
@@ -663,6 +664,7 @@ fn reference_request(id: u64) -> Request {
             height: 16,
         },
         trajectory: Default::default(),
+        encoder_inputs: None,
     })
 }
 

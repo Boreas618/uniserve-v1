@@ -11,7 +11,8 @@ metadata and model facts alone, so they are known at preparation:
   denoising step advances it, both in the worker's latent ledger;
 - an image decoding reads a trajectory's committed latent (or a resident
   image) and stages the image's RGB bytes, writing its pixels as a product
-  when the call publishes one.
+  when the call publishes one, whose BF16 values it stages after the bytes
+  (the image's exact feedback input, which a migrated request carries).
 
 :class:`PlanEntry` is one call's answer in the preparation's JSON form: the
 generic ``reads``, ``writes`` and ``publication`` every prepared
@@ -128,8 +129,9 @@ class PlanEntry:
             leased on the computation's device.
         pixels: The call reads its inline image's host-prepared pixels.
         writes: The products it writes, in tensor order.
-        staging: Host bytes the call stages: a decoded image's RGB bytes,
-            lent from the batch's output lease.
+        staging: Host bytes the call stages, lent from the batch's output
+            lease: a decoded image's RGB bytes, then, for a decoding that
+            writes its image product, the product's BF16 values.
         latent: The call binds its trajectory in the latent ledger.
     """
 
@@ -264,8 +266,9 @@ def decoding_entry(
 
     A ``trajectory`` decoding reads its trajectory's committed latent from
     the ledger and, when it ``publishes``, writes the ``[3, height, width]``
-    pixels of ``value_range`` as its image product; any other decoding
-    quantizes the resident image it reads.
+    pixels of ``value_range`` as its image product, whose BF16 values it
+    stages after the RGB bytes; any other decoding quantizes the resident
+    image it reads.
     """
     writes: tuple[Write, ...] = ()
     if trajectory and publishes:
@@ -282,10 +285,12 @@ def decoding_entry(
                 },
             ),
         )
+    # RGB bytes, then two bytes per BF16 value of a published product.
+    staging = 3 * height * width * (3 if writes else 1)
     return PlanEntry(
         read=not trajectory,
         writes=writes,
-        staging=3 * height * width,
+        staging=staging,
         latent=trajectory,
     )
 

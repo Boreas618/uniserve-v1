@@ -368,12 +368,13 @@ fn text_input(token_ids: Vec<u32>) -> (Vec<u32>, MultimodalInputs) {
 ///
 /// The image sits at prompt-token position `before.len()`, the boundary
 /// between `before` and `after`, occupies `logical_positions` positions, and
-/// contributes `physical_tokens` cache tokens through a single ViT encode. `hash` is the image identity from which encoder-cache keys are
-/// derived; the payload is a placeholder.
+/// contributes `physical_tokens` cache tokens through a single ViT encode. `id` names the image's digest
+/// (`support::image_digest`), from which encoder-cache keys are derived; the
+/// payload is a placeholder.
 fn image_input(
     mut before: Vec<u32>,
     after: Vec<u32>,
-    hash: u64,
+    id: u64,
     logical_positions: u32,
     physical_tokens: u32,
 ) -> (Vec<u32>, MultimodalInputs) {
@@ -383,7 +384,7 @@ fn image_input(
         before,
         MultimodalInputs {
             images: vec![ImageInput {
-                hash,
+                digest: support::image_digest(id),
                 b64: "aW1hZ2U=".to_string(),
                 position,
                 num_positions: logical_positions,
@@ -471,6 +472,7 @@ fn generation_request(
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
+        generated_images: Vec::new(),
     };
     request
         .validate_resources(&limits)
@@ -2648,7 +2650,7 @@ fn admission_carries_the_request_input_image_count() {
 
     let (prompt_token_ids, mut inputs) = image_input(vec![1, 2], vec![3, 4], 0x91, 4, 17);
     let second = ImageInput {
-        hash: 0x92,
+        digest: support::image_digest(0x92),
         ..inputs.images[0].clone()
     };
     inputs.images.push(second);

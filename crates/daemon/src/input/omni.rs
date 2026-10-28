@@ -41,10 +41,10 @@ type OmniResult<T> = std::result::Result<T, TokenizeError>;
 /// Input image whose prompt position is resolved but whose encoder inputs are not.
 #[derive(Debug, Clone)]
 struct RenderedImage {
-    /// The resolved image. Its content hash starts the encoder-cache
-    /// identity: the profile's input-image salt and, in
-    /// `prepare_generation_resources`, the request's cache isolation key join
-    /// it.
+    /// The resolved image. Its content digest starts the identity of its
+    /// encoder outputs: the profile's input-image salt and, in
+    /// `prepare_generation_resources`, the request's cache isolation key
+    /// join it.
     image: crate::input::ImageInput,
     /// Prompt-token position with the meaning of `ImageInput::position`.
     position: u32,
@@ -144,7 +144,7 @@ pub(super) fn preprocess_omni(
     // image count, which then joins the image's encoder-cache identity.
     if let Some(salt) = profile.input_image_cache_salt(multimodal_inputs.images.len()) {
         for image in &mut multimodal_inputs.images {
-            image.hash = combine_cache_keys(image.hash, salt);
+            image.digest = fold_digest(&image.digest, PREPROCESSING, salt);
         }
     }
     let policy = profile.image_generation_for_dimensions(image.width, image.height)?;
@@ -236,7 +236,7 @@ fn render_chat(
 /// replaces `generation.sampling` with the model's sampling defaults under
 /// the request's controls, keeping its resolved seed, sets
 /// `max_und_tokens`, may clear `cache.read`, and rewrites each input image's
-/// `hash` into its cache-isolated form, so it must run exactly once per
+/// `digest` into its cache-isolated form, so it must run exactly once per
 /// request. On error `generation` may be partially updated; the caller
 /// discards it.
 ///
@@ -279,10 +279,13 @@ pub(super) fn prepare_generation_resources(
     // reads remain semantically valid for this request.
     let prompt_logprobs_requested = generation.sampling.prompt_logprobs_requested();
     generation.cache.read &= !prompt_logprobs_requested;
-    // Encoder-cache identity folds in the request's cache isolation key, so
-    // the same image in different cache partitions maps to different entries.
-    for image in &mut generation.multimodal_inputs.images {
-        image.hash = isolated_cache_key(image.hash, generation.cache.isolation_key);
+    // The identity of an image's encoder outputs folds in the request's
+    // cache isolation key, so the same image in different cache partitions
+    // maps to different entries.
+    if let Some(isolation_key) = generation.cache.isolation_key {
+        for image in &mut generation.multimodal_inputs.images {
+            image.digest = fold_digest(&image.digest, ISOLATION, isolation_key);
+        }
     }
 
     // Resolve conservative capacity before admission. Text output may shrink to
@@ -380,7 +383,7 @@ fn prepare_image_inputs(
             }
             let encoders = encoders_for_dimensions(image.width(), image.height(), image_count)?;
             Ok(ImageInput {
-                hash: image.hash(),
+                digest: image.digest(),
                 b64: base64::engine::general_purpose::STANDARD.encode(image.bytes()),
                 position,
                 num_positions,
@@ -498,21 +501,20 @@ fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     }
 }
 
-/// Builds a cache key isolated by request namespace and salt.
-///
-/// Returns `content_key` unchanged when the request has no isolation key, so
-/// unisolated requests share encoder-cache entries for identical image
-/// payloads.
-fn isolated_cache_key(content_key: u64, isolation_key: Option<u64>) -> u64 {
-    isolation_key.map_or(content_key, |isolation_key| {
-        combine_cache_keys(content_key, isolation_key)
-    })
-}
+/// What [`fold_digest`] folds into an image's digest: a request-dependent
+/// preprocessing parameter that changes the image's encoder outputs.
+const PREPROCESSING: &[u8] = b"uniserve-image-preprocessing/1\0";
 
-/// Mixes a value that changes an encoder product into its cache key.
-fn combine_cache_keys(key: u64, value: u64) -> u64 {
-    let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&key.to_le_bytes());
-    bytes[8..].copy_from_slice(&value.to_le_bytes());
-    crate::input::stable_hash(&bytes)
+/// What [`fold_digest`] folds into an image's digest: the request's cache
+/// isolation key, so that requests of other cache partitions share none of
+/// the image's encoder outputs. Unisolated requests share the outputs of
+/// identical image payloads.
+const ISOLATION: &[u8] = b"uniserve-image-isolation/1\0";
+
+/// The cache key of `digest` with the request property named by `label`.
+fn fold_digest(digest: &[u8; 32], label: &[u8], value: u64) -> [u8; 32] {
+    let mut folded = storage::key::Digest::new(label);
+    folded.bytes(digest);
+    folded.number(value);
+    folded.finish()
 }

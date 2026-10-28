@@ -320,6 +320,7 @@ impl Scheduler {
                 if let Some(st) = self.running.get_mut(&id) {
                     st.num_generated_tokens += 1;
                 }
+                self.emit_control(id, tok);
                 if burst_result {
                     return self.close_context_round(id, tok);
                 }
@@ -347,6 +348,7 @@ impl Scheduler {
                 .get(&id)
                 .is_some_and(|st| Self::direct_trigger_matches(st, tok));
             if direct_trigger && can_open_gen_branch && images_done < max_images {
+                self.emit_control(id, tok);
                 self.begin_image(id);
                 return;
             }
@@ -477,8 +479,18 @@ impl Scheduler {
                             .get(&id)
                             .is_some_and(|st| st.req.image_generation.sample_feedback_continuation);
 
-                        if let Some(st) = self.running.get_mut(&id) {
+                        // An image a context rebuild wrote is counted among
+                        // the request's images already; the rebuild goes on,
+                        // or the request resumes, sampling here when this
+                        // write sampled.
+                        if self.running.get(&id).is_some_and(|st| st.replay.is_some()) {
+                            if !self.resume_after_replay(id) {
+                                return;
+                            }
+                        } else if let Some(st) = self.running.get_mut(&id) {
                             st.num_generated_images += 1;
+                        }
+                        if let Some(st) = self.running.get_mut(&id) {
                             st.round_token_ids.clear();
                         }
 
@@ -516,6 +528,7 @@ impl Scheduler {
                             .get(&id)
                             .is_some_and(|state| Self::direct_trigger_matches(state, tok));
                         if direct_trigger && can_open_gen_branch && images_done < max_images {
+                            self.emit_control(id, tok);
                             self.begin_image(id);
                             return;
                         }
@@ -565,6 +578,13 @@ impl Scheduler {
                     st.num_ingested_images < st.req.multimodal_inputs.images.len()
                         || st.num_computed_prompt_tokens < st.req.prompt_token_ids.len() as u32
                 }) {
+                    return;
+                }
+
+                // A context rebuild that wrote its last prompt tokens resumes,
+                // unless an image follows them.
+                if self.running.get(&id).is_some_and(|st| st.replay.is_some()) {
+                    self.resume_after_replay(id);
                     return;
                 }
 
@@ -618,14 +638,14 @@ impl Scheduler {
                     return self.finish(id, FinishReason::Error);
                 }
 
-                // A description-lowered prefix may already end at a branch trigger.
-                if self.prefilled_gen_trigger(id) {
-                    self.begin_image(id);
-                    return;
-                }
-
-                // Immediate Gen-only profiles skip Und decode after context prep.
-                if starts_gen_after_context {
+                // A description-lowered prefix may already end at a branch
+                // trigger, and immediate Gen-only profiles skip Und decode
+                // after context prep: either opens an image, discarding the
+                // sampled token, which still counts as generated.
+                if self.prefilled_gen_trigger(id) || starts_gen_after_context {
+                    if let Some(&tok) = record.committed_tokens.last() {
+                        self.emit_control(id, tok);
+                    }
                     self.begin_image(id);
                     return;
                 }
@@ -651,6 +671,7 @@ impl Scheduler {
                     .get(&id)
                     .is_some_and(|st| Self::direct_trigger_matches(st, tok));
                 if direct_trigger && can_open_gen_branch && images_done < max_images {
+                    self.emit_control(id, tok);
                     self.begin_image(id);
                     return;
                 }
@@ -767,14 +788,52 @@ impl Scheduler {
             ) => {}
             CallKind::Media(MediaCall::ImageDecoding) => {
                 // Commit becomes visible before optional feedback state is prepared.
-                let image_id = self.running.get(&id).map_or(0, |st| st.image_id);
+                let Some((image_id, height, width)) = self
+                    .running
+                    .get(&id)
+                    .map(|st| (st.image_id, st.req.image.height, st.req.image.width))
+                else {
+                    return;
+                };
                 self.emit(id, Event::ImageCommit { image_id });
 
-                let image = media
-                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-                    .map(str::to_owned);
+                // A decoding that writes the request's feedback image product
+                // publishes its values after the PNG: the image's exact
+                // feedback input, a fact of the request the daemon keeps.
+                let mut image = None;
+                let mut feedback = None;
+                if let Some(value) = media {
+                    let Some(parsed) = ipc::parse_image_media(
+                        value.as_bytes(),
+                        height,
+                        width,
+                        call.image_output.is_some(),
+                    ) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    image = std::str::from_utf8(parsed.png_b64).ok().map(str::to_owned);
+                    feedback = parsed.feedback.map(Arc::new);
+                }
+                // What the image's feedback encoders read, which keys their
+                // outputs in the host encoder pools: the product's values, or
+                // the PNG for feedback that reads the artifact.
+                let feedback_digest = self.running.get(&id).and_then(|st| {
+                    let isolation = st.req.cache.isolation_key;
+                    let read = match st.req.image_generation.feedback_source.as_ref()? {
+                        crate::FeedbackSource::DeviceProduct => {
+                            crate::FeedbackImage::Pixels(Arc::clone(feedback.as_ref()?))
+                        }
+                        crate::FeedbackSource::ArtifactProduct => {
+                            crate::FeedbackImage::Png(image.as_deref()?.into())
+                        }
+                    };
+                    Some((
+                        image_id,
+                        super::encodings::generated_image(&read, isolation),
+                    ))
+                });
                 if let Some(image_b64) = image.clone() {
-                    let Some(event) = image_done_event(image_id, image_b64) else {
+                    let Some(event) = image_done_event(image_id, image_b64, feedback) else {
                         return self.finish(id, FinishReason::Error);
                     };
                     self.emit(id, event);
@@ -813,6 +872,7 @@ impl Scheduler {
                     // the encode and state-ingest stages consume it.
                     if let Some(st) = self.running.get_mut(&id) {
                         st.feedback_image_b64 = image;
+                        st.feedback_digest = feedback_digest;
                         st.feedback_encoder_index = 0;
                         st.feedback_source = source_product;
                         st.feedback_features = None;
@@ -841,11 +901,11 @@ impl Scheduler {
                         let Some((block, step, block_cache_key)) =
                             self.next_context_encode(id).and_then(|(block, step)| {
                                 let state = self.running.get(&id)?;
-                                let (image, _) = state.input_block(block)?;
-                                let key =
-                                    state.req.cache.write.then(|| {
-                                        encoder_cache_key(image.hash, block.encoder, step)
-                                    });
+                                let encoding = self.encoding(
+                                    &state.req,
+                                    super::encodings::Encoded::Input(block),
+                                )?;
+                                let key = state.req.cache.write.then(|| encoding.device_key());
                                 Some((block, step, key))
                             })
                         else {
@@ -950,7 +1010,11 @@ impl Scheduler {
                         if let Some(st) = self.running.get_mut(&id) {
                             st.transient_encoder_products.push(feature.clone());
                             st.feedback_features = Some(feature);
-                            st.phase = Phase::FeedbackState;
+                            // A context rebuild's encoding is written next by
+                            // the rebuild (`ReplayStage::Write`).
+                            if st.replay.is_none() {
+                                st.phase = Phase::FeedbackState;
+                            }
                         }
                     }
                 }
@@ -1101,6 +1165,49 @@ impl Scheduler {
         true
     }
 
+    /// Ends a migrated request's context rebuild once nothing of it is left
+    /// to write: the request resumes in the state it left
+    /// (`generation::continuation::Resume`). Returns whether the call just
+    /// accepted sampled the request's next token, which its caller resolves
+    /// as the feedback continuation; `false` while the rebuild goes on.
+    pub(super) fn resume_after_replay(&mut self, id: RequestId) -> bool {
+        let Some(st) = self.running.get_mut(&id) else {
+            return false;
+        };
+        let remains = st
+            .replay
+            .as_ref()
+            .is_some_and(|replay| !replay.images.is_empty())
+            || (st.num_computed_prompt_tokens as usize) < st.req.prompt_token_ids.len();
+        if remains {
+            return false;
+        }
+        let Some(replay) = st.replay.take() else {
+            return false;
+        };
+        tracing::info!(
+            request_id = id.0,
+            images = st.num_generated_images,
+            generated_tokens = st.num_generated_tokens,
+            resume = ?replay.resume,
+            "a migrated request rebuilt its context"
+        );
+        match replay.resume {
+            generation::continuation::Resume::Decode { token, .. } => {
+                st.next_token = token;
+                st.phase = Phase::DecodeUnd;
+                false
+            }
+            generation::continuation::Resume::FeedbackSample => true,
+            generation::continuation::Resume::Open { token } => {
+                st.next_token = token;
+                st.phase = Phase::DecodeUnd;
+                self.begin_image(id);
+                false
+            }
+        }
+    }
+
     /// Opens the next image-generation branch.
     ///
     /// Moves the request to `Phase::CloseCache` under a new `image_id` and checks
@@ -1173,6 +1280,14 @@ impl Scheduler {
         accepted
     }
 
+    /// Publishes a generated token the request's text does not include
+    /// (`Event::ControlToken`): it counts as generated, and the daemon keeps
+    /// it with the request's text tokens, in order, to submit a migrated
+    /// request again with every token it generated.
+    pub(super) fn emit_control(&mut self, id: RequestId, tok: u32) {
+        self.emit(id, Event::ControlToken { id: tok });
+    }
+
     /// Records an accepted text token and publishes it when the request emits text.
     ///
     /// A running request always records the token in `generated_token_ids`.
@@ -1185,6 +1300,7 @@ impl Scheduler {
         };
         st.generated_token_ids.push(tok);
         if !st.req.emits_text() {
+            self.emit_control(id, tok);
             return false;
         }
         let published = self.emit(id, Event::TextToken { id: tok, logprob });
@@ -1580,6 +1696,12 @@ impl Scheduler {
                 .reserved_encoder_entries
                 .saturating_sub(st.req.num_encoder_cache_entries());
 
+            // Its encodings' lookups in the host encoder pools end, those of
+            // its calls in flight once they complete.
+            if let Some(store) = self.encoder_outputs.as_mut() {
+                store.forget(RequestKey::new(self.engine_id, id, st.request_epoch));
+            }
+
             // Releasing the request's encoder pins may make cache products
             // physically reclaimable by their owning worker.
             let mut free_encoder_products = std::mem::take(&mut st.transient_encoder_products);
@@ -1608,6 +1730,7 @@ impl Scheduler {
                 TokenTerminal::Migratable(cause) => Event::Migratable {
                     cause,
                     denoised_steps: 0,
+                    stored_layout: Vec::new(),
                 },
             };
             let accepted = terminal_published || st.output.events.enqueue(event);

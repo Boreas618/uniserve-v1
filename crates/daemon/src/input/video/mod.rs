@@ -47,6 +47,7 @@
 //! `invalid_request_error`. Failures of the server's own resources (a missing
 //! `ffprobe`, scratch storage) are [`VideoInputError::Internal`].
 
+mod encodings;
 pub mod probe;
 
 use std::sync::Arc;
@@ -524,6 +525,22 @@ impl Presenter {
             text_tags: presentation.tags,
             conditions,
         };
+        // What the request's encoders read, keyed by the content of each
+        // condition's media, so that engines find the encoder outputs of
+        // requests that read the same.
+        let contents: Vec<[u8; 32]> = fetched
+            .media
+            .iter()
+            .map(|media| {
+                let mut key = storage::key::Digest::new(b"media");
+                key.bytes(&media.bytes);
+                key.finish()
+            })
+            .collect();
+        let encoder_inputs = encodings::encoder_inputs(&conditioning, &prompt_token_ids, &contents)
+            .map_err(|error| {
+                VideoInputError::Internal(format!("digesting the conditions failed: {error}"))
+            })?;
         let request = DiffusionRequest {
             request_id: RequestId::default(),
             task: plan.task.as_str().to_owned(),
@@ -548,6 +565,7 @@ impl Presenter {
             // The migrator gives the request its trajectory's identity when
             // it first submits it.
             trajectory: Trajectory::default(),
+            encoder_inputs: Some(Box::new(encoder_inputs)),
         };
         let video = ProcessedVideo {
             duration_seconds: plan.duration_seconds,
@@ -963,6 +981,40 @@ mod tests {
         assert_eq!(first.latent_units, [1008]);
         assert_eq!(last.latent_units, [1008]);
         assert!(first.vision.is_some() && last.vision.is_some());
+    }
+
+    /// Encoder cache inputs follow the media and prompt, independently of
+    /// the shared storage publication that carries them to a worker.
+    #[tokio::test]
+    async fn repeated_media_reuses_encoder_inputs_and_changed_media_does_not() {
+        let service = encoding_service(1, ReferenceConfig::new(&REFERENCE_LIMITS));
+        let input = |prompt: &str, height: u32| {
+            request(serde_json::json!({
+                "model": "minimax_h3",
+                "prompt": prompt,
+                "task": "ref2va",
+                "conditions": [{
+                    "type": "image",
+                    "uri": data_uri(&png(160, height)),
+                    "role": "reference",
+                }],
+                "target": {"short_edge": 768, "aspect_ratio": "1:1", "duration_seconds": 5.0},
+            }))
+        };
+        let mut inputs = Vec::new();
+        for (prompt, height) in [("a fox", 90), ("a fox", 90), ("a bear", 90), ("a fox", 91)] {
+            let (resolved, _, _media) = service
+                .process("encoding", &input(prompt, height), 1 << 16)
+                .await
+                .unwrap();
+            inputs.push(resolved.encoder_inputs.unwrap());
+        }
+        assert_eq!(inputs[0], inputs[1]);
+        assert_ne!(inputs[0].text, inputs[2].text);
+        assert_eq!(inputs[0].vision, inputs[2].vision);
+        assert_eq!(inputs[0].video_units, inputs[2].video_units);
+        assert_ne!(inputs[0].vision, inputs[3].vision);
+        assert_ne!(inputs[0].video_units, inputs[3].video_units);
     }
 
     /// The daemon prepares a reference request whatever rows its conditions

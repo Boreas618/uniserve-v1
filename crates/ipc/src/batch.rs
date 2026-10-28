@@ -92,16 +92,13 @@ impl PageCopy {
     }
 }
 
-/// One page of a video request's latent trajectory copied between its
-/// request slot's pages in a rank's latent banks and a slot of the rank's
-/// host latent pool, a page pool of the rank's host's Storage Server.
-///
-/// An offload ([`LatentOffload`]) copies page `page` of the bank holding
-/// the trajectory's committed step into the pool slot, which the engine
-/// reserved; a restore ([`LatentRestore`]) copies the pool slot, which the
-/// engine pinned, into page `page` of the bank the request's latent
-/// preparation initializes. A page is the bank's `[page_units]` float32
-/// values, the rank's own share of the trajectory.
+/// One page of a video request's latent trajectory copied from its request
+/// slot's pages in a rank's latent banks to a slot of the rank's host
+/// latent pool, a page pool of the rank's host's Storage Server
+/// ([`LatentOffload`]): page `page` of the bank holding the trajectory's
+/// committed step goes to the pool slot, which the engine reserved. A page
+/// is the bank's `[page_units]` float32 values, as many bytes as a pool
+/// page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentPageCopy {
     /// The rank of the worker group that copies the page.
@@ -128,33 +125,75 @@ pub struct LatentOffload {
 }
 
 /// The stored trajectory a resumed video request's latent preparation
-/// opens at: the call prepares the request as for step zero, then copies
-/// every page of `pages` into the bank it initializes, and commits the
-/// trajectory at step `steps`. The engine pinned the pool slots, on every
-/// rank of the denoiser, until the call's result.
+/// opens at: the call prepares the request as for step zero, then each
+/// rank copies the parts of the stored pages its own pages hold into the
+/// bank it initializes, as the copy manifest from the stored ranks' layouts
+/// to its own directs, and commits the trajectory at step `steps`. The
+/// engine pinned the pool slots until the call's result.
+///
+/// The stored ranks may have laid the samples out under another parallel
+/// configuration than the restoring ranks: every rank plans its copies
+/// from the sources it reads ([`LatentSource::readers`]) to its own pages,
+/// and pages laid out alike are copied whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentRestore {
     /// Denoising steps the stored trajectory took; positive.
     pub steps: u32,
-    pub pages: Vec<LatentPageCopy>,
+    /// The digest of what the stored values are, which keys every page
+    /// with the part of the samples it holds
+    /// (`storage::manifest::Storage::paged`): what computed the
+    /// trajectory, the trajectory and the steps it took.
+    pub content: [u8; 32],
+    /// The stored ranks' pages, in their ranks' order.
+    pub sources: Vec<LatentSource>,
+}
+
+/// One stored rank's pages of a trajectory a latent preparation restores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatentSource {
+    /// The restoring ranks that read these pages: the ranks on the host
+    /// whose Storage Server holds the pool.
+    pub readers: Vec<u32>,
+    /// The pool the pages lie in.
+    pub pool: LatentPoolRef,
+    /// The stored rank's request slot pages as one storage
+    /// (`storage::manifest::StorageLayout`, JSON): the part of each latent
+    /// sample it held and where its values lie in the pages.
+    pub layout: String,
+    /// The pool slot of each page of the slot, in page order, pinned.
+    pub slots: Vec<u64>,
+}
+
+/// A host latent pool, as a rank of any world on its host maps it again:
+/// its identity at the Storage Server and the shape and NUMA node a page
+/// pool request finds it by (`storage::protocol::Request::PagePool`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatentPoolRef {
+    pub pool: u64,
+    /// The pool's `PageShape::layout` digest.
+    pub shape: [u8; 32],
+    pub numa_node: Option<u32>,
+    pub page_bytes: u64,
 }
 
 impl LatentRestore {
-    /// Validates the restored step and the pages.
+    /// Validates the restored step and the sources.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.steps > 0 && !self.pages.is_empty(),
-            "a latent restore names no step or no page"
+            self.steps > 0 && !self.sources.is_empty(),
+            "a latent restore names no step or no source"
         );
-        let pages = self
-            .pages
-            .iter()
-            .map(|copy| (copy.rank, copy.page))
-            .collect::<HashSet<_>>();
-        ensure_valid!(
-            pages.len() == self.pages.len(),
-            "a latent restore copies one page of one rank twice"
-        );
+        for source in &self.sources {
+            ensure_valid!(
+                !source.slots.is_empty() && source.pool.page_bytes > 0,
+                "a latent restore's source names no page"
+            );
+            let readers = source.readers.iter().collect::<HashSet<_>>();
+            ensure_valid!(
+                readers.len() == source.readers.len(),
+                "a latent restore's source names a reader twice"
+            );
+        }
         Ok(())
     }
 }

@@ -58,6 +58,7 @@ __all__ = [
     "Conditioning",
     "Denoiser",
     "close_all",
+    "copy_runs",
     "keyframe_sets",
 ]
 
@@ -65,6 +66,33 @@ __all__ = [
 # capture, is never reported: startup captures before serving).
 EAGER = 0
 REPLAY = 1
+
+
+def copy_runs(
+    target: torch.Tensor,
+    stored: Sequence[torch.Tensor],
+    copies: Iterable[Sequence[int]],
+) -> None:
+    """Copy runs of bytes of stored pages into ``target``.
+
+    ``target`` and every ``stored`` page are flat ``uint8`` tensors; each
+    copy ``[page, offset, at, bytes]`` writes ``bytes`` bytes from byte
+    ``offset`` of ``stored[page]`` at byte ``at`` of ``target``, in the
+    current stream's order, without waiting on the host.
+
+    Raises:
+        ValueError: A copy reaches past its page or past ``target``.
+    """
+    for page, offset, at, length in copies:
+        source = stored[page]
+        if offset + length > source.numel() or at + length > target.numel():
+            raise ValueError(
+                f"a latent copy of {length} bytes reaches past its page or "
+                "its slot"
+            )
+        target[at : at + length].copy_(
+            source[offset : offset + length], non_blocking=True
+        )
 
 
 def size_values(size: VideoSize) -> tuple[list[int], list[int], list[int]]:
@@ -506,50 +534,46 @@ class Denoiser:
                     ],
                 )
 
+    def storage(self, layout: Layout) -> dict[str, Any]:
+        """How a request slot's pages hold this rank's share of the samples
+        of a request in ``layout``, as the copy manifest library reads it
+        (:meth:`SampleLayout.storage`).
+        """  # noqa: D205
+        prepared = self.layouts[layout]
+        return prepared.samples.storage(prepared.fields)
+
     def restore(
         self,
         slot: int,
         bank: int,
-        pages: Sequence[int],
+        copies: Iterable[Sequence[int]],
         stored: Sequence[torch.Tensor],
         predicate: torch.Tensor | None = None,
     ) -> None:
-        """Copy a stored trajectory's pages into a request's slot.
+        """Lay a stored trajectory's values out in a request's slot.
 
-        ``stored`` holds each page of ``pages`` (its index among the slot's
-        pages) as the ``[page_units]`` float32 host tensor of the host latent
-        pool, which the engine keeps pinned until the call's result: the
-        values of one bank page, contiguous as the worker offloaded them.
-        Each replaces that page of ``bank``, after :meth:`initialize` wrote
-        the request's noise there. A false ``predicate`` (the call's
-        ``uint8 [1]`` device predicate) leaves the bank as it was.
+        ``stored`` holds the ``uint8 [page_bytes]`` host tensors of the
+        stored pages the copies read, in the host latent pools, which the
+        engine keeps pinned until the call's result. The worker planned
+        ``copies`` from the stored ranks' layouts to this rank's own
+        (:meth:`storage`) with the copy manifest library: each ``[page,
+        offset, target, bytes]`` copies ``bytes`` bytes from byte ``offset``
+        of ``stored[page]`` to byte ``target`` of the slot's pages in
+        ``bank``, after :meth:`initialize` wrote the request's noise there.
+        A page this rank lays out as a stored rank did is one copy of the
+        whole page. A false ``predicate`` (the call's ``uint8 [1]`` device
+        predicate) leaves the bank as it was.
         """
-        span = self._slot_pages(slot)
-        target = self.banks[bank][span]
-        if len(pages) != len(stored) or len(pages) != target.shape[0]:
-            raise ValueError(
-                "a restored trajectory names every page of its slot once"
-            )
+        # The slot's pages lie back to back in the bank: one run of bytes.
+        target = self.banks[bank][self._slot_pages(slot)].view(-1)
+        target = target.view(torch.uint8)
         with torch.cuda.stream(self.stream):
-            for page, source in zip(pages, stored, strict=True):
-                # A bank page is contiguous, so its flat view is the run of
-                # values the host pool's page holds.
-                destination = target[page].view(-1)
-                if (
-                    source.dtype != destination.dtype
-                    or source.shape != destination.shape
-                ):
-                    raise ValueError(
-                        "a stored latent page differs from the slot's pages: "
-                        f"{source.dtype} {tuple(source.shape)} for "
-                        f"{destination.dtype} {tuple(destination.shape)}"
-                    )
-                if predicate is None:
-                    destination.copy_(source, non_blocking=True)
-                    continue
-                staged = torch.empty_like(destination)
-                staged.copy_(source, non_blocking=True)
-                destination.copy_(kept(predicate, staged, destination))
+            if predicate is None:
+                copy_runs(target, stored, copies)
+                return
+            staged = target.clone()
+            copy_runs(staged, stored, copies)
+            target.copy_(kept(predicate, staged, target))
 
     @property
     def conditions(self) -> bool:

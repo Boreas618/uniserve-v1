@@ -19,15 +19,16 @@ mod values;
 pub use convert::WireError;
 pub use dtype::{ModelDtype, ModelDtypeParseError};
 pub use event::{
-    ArtifactEvent, ArtifactMedia, ConditionExtent, DiffusionRequest, DiffusionRequestError, Event,
-    FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind, Request, StopReason,
-    Trajectory,
+    ArtifactEvent, ArtifactMedia, ConditionExtent, DiffusionRequest, DiffusionRequestError,
+    EncoderInputs, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind,
+    Request, StopReason, Trajectory,
 };
 pub use generation::{
-    CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,
-    GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
-    GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
-    ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot, encoder_cache_key,
+    CachePolicy, FeedbackImage, FeedbackNextToken, FeedbackSource, GeneratedImage,
+    GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
+    GenerationRequest, GenerationRequestError, GenerationResourceError, ImageEncoderInput,
+    ImageGenerationConfig, ImageInput, ImagePixels, ImageTrigger, MultimodalInputs, PixelRange,
+    ReadoutRow, ReadoutSlot,
 };
 pub use image::{CfgRenorm, CfgRenormParseError, ImageParams, ImageParamsError};
 pub use sampling::{SamplingParams, SamplingParamsError};

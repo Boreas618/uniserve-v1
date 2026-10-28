@@ -1013,6 +1013,9 @@ mod tests {
             cache_input: None,
             cache_output: None,
             latent_restore: None,
+            host_output: None,
+            latent_draw: None,
+            carried_image: None,
         }
     }
 

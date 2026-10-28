@@ -3,6 +3,7 @@
 
 pub(crate) mod allocation;
 mod buffer;
+pub(crate) mod encoders;
 pub(crate) mod latent;
 mod output;
 mod pinned_pool;

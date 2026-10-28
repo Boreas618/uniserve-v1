@@ -112,6 +112,7 @@ impl SimExecutor {
         let info = engine.info().clone();
         let placement = engine.placement.clone();
         let latent_pools = engine.latent_pools.clone();
+        let encoder_pools = engine.encoder_pools.clone();
         let results_on_wait = engine.results_on_wait;
         let depth = placement.queue_depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
@@ -156,7 +157,12 @@ impl SimExecutor {
                     rank_latents: if latent_pools.is_empty() {
                         BTreeMap::new()
                     } else {
-                        BTreeMap::from([(id, latent_pools)])
+                        BTreeMap::from([(id.clone(), latent_pools)])
+                    },
+                    rank_encoders: if encoder_pools.is_empty() {
+                        BTreeMap::new()
+                    } else {
+                        BTreeMap::from([(id, encoder_pools)])
                     },
                     ..ExecutorInfo::default()
                 }
@@ -572,6 +578,15 @@ struct SimRequestState {
     /// The generation canvas step the request's next canvas call must run:
     /// blocks stopped so far and steps run on the current block.
     canvas: ipc::CanvasStep,
+    /// The token the request's last sampling call sampled, which a decode
+    /// that relays its predecessor's token writes.
+    last_token: Option<u32>,
+    /// The image index the request's current trajectory was prepared for.
+    image_index: u32,
+    /// What each image or feature product the request holds was made from:
+    /// the digest of a decoded image's values, and for a feature, the
+    /// posterior draw a latent encoder sampled.
+    provenance: HashMap<TensorRef, (u64, Option<u32>)>,
 }
 
 impl SimRequestState {
@@ -611,6 +626,9 @@ impl SimRequestState {
             penalty_counts,
             state_call_id: ipc::CallId::new(0, 0),
             canvas: ipc::CanvasStep::default(),
+            last_token: None,
+            image_index: 0,
+            provenance: HashMap::new(),
         }
     }
 
@@ -879,6 +897,9 @@ pub struct SimEngine {
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
+    /// Permits for batches: each batch executes only after taking one, or
+    /// once the sender is dropped ([`SimEngine::pace`]).
+    pace: Option<Receiver<()>>,
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
@@ -889,6 +910,90 @@ pub struct SimEngine {
     /// The host latent pools of the simulated pool's ranks, with each
     /// rank's host (`ExecutorInfo::rank_latents`); empty without them.
     latent_pools: Vec<(String, Option<ipc::LatentPoolInfo>)>,
+    /// How each simulated denoising rank holds a request's samples, which
+    /// every video latent preparation reports (`CallOutput::latent_layouts`).
+    latent_layouts: Vec<ipc::RankLatentLayout>,
+    /// The host encoder pools of the simulated pool's ranks, with each
+    /// rank's host (`ExecutorInfo::rank_encoders`); empty without them.
+    encoder_pools: crate::executor::RankEncoderPools,
+
+    /// What each request's calls wrote into its context, shared with the
+    /// test that reads it ([`SimEngine::context_log`]).
+    context: ContextLog,
+}
+
+/// The permits of a paced simulator ([`SimEngine::pace`]).
+#[derive(Debug)]
+pub struct Pace(Sender<()>);
+
+impl Pace {
+    /// Lets the simulator execute one more batch.
+    pub fn step(&self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// One write a simulated request's call made to its context: the KV cache a
+/// worker holds for it, in write order. Two requests whose logs are equal
+/// hold the same context, whichever calls wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextWrite {
+    /// A token at a logical position: a prompt token, a decode's input or a
+    /// cache close.
+    Token { position: u32, token: u32 },
+    /// An input image's block of a context prefill or a latent block, at the
+    /// logical position its call starts at.
+    InputBlock { position: u32 },
+    /// A generated image's feedback feature at a logical position: the
+    /// digest of the decoded image values its encoder read, and the
+    /// posterior draw a latent encoder sampled.
+    Image {
+        position: u32,
+        image: u64,
+        draw: Option<u32>,
+    },
+}
+
+/// The context writes of every request a simulator served, by request
+/// identity and admission, kept after the request finishes.
+#[derive(Debug, Clone, Default)]
+pub struct ContextLog(std::sync::Arc<std::sync::Mutex<ContextWrites>>);
+
+/// Each request's admissions, by request identity: each admission's key and
+/// the writes of its calls, in order.
+type ContextWrites = HashMap<RequestId, Vec<(ipc::RequestKey, Vec<ContextWrite>)>>;
+
+impl ContextLog {
+    /// The writes the calls of each admission of request `id` made, in
+    /// admission order: a request the engine admits again, as a migrated
+    /// one, has a context of its own each time.
+    pub fn admissions(&self, id: RequestId) -> Vec<Vec<ContextWrite>> {
+        crate::lock(&self.0)
+            .get(&id)
+            .map(|admissions| {
+                admissions
+                    .iter()
+                    .map(|(_, writes)| writes.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The identities of the requests whose calls wrote a context.
+    pub fn requests(&self) -> Vec<RequestId> {
+        let mut requests: Vec<RequestId> = crate::lock(&self.0).keys().copied().collect();
+        requests.sort_by_key(|id| id.0);
+        requests
+    }
+
+    fn record(&self, key: ipc::RequestKey, writes: Vec<ContextWrite>) {
+        let mut log = crate::lock(&self.0);
+        let admissions = log.entry(key.request_id).or_default();
+        match admissions.last_mut() {
+            Some((admitted, existing)) if *admitted == key => existing.extend(writes),
+            _ => admissions.push((key, writes)),
+        }
+    }
 }
 
 impl SimEngine {
@@ -959,9 +1064,13 @@ impl SimEngine {
             canvas_sampling: None,
             speculation: None,
             predicated_release: None,
+            pace: None,
             requests: HashMap::new(),
             refused: HashMap::new(),
             latent_pools: Vec::new(),
+            latent_layouts: Vec::new(),
+            encoder_pools: Vec::new(),
+            context: ContextLog::default(),
         }
     }
 
@@ -1139,6 +1248,7 @@ impl SimEngine {
             media_output: None,
             cache_output: None,
             draft_token_ids: Vec::new(),
+            latent_layouts: Vec::new(),
         };
         set_cache_lengths(&mut record, request.cache_visible_len);
 
@@ -1473,9 +1583,20 @@ impl SimEngine {
                     } else {
                         DEFAULT_IMAGE_HW
                     };
-                    let png_base64 = synthetic_png_b64(width, height)?;
-                    record.media_output =
-                        Some(publish_media("uniserve-image-", png_base64.as_bytes())?);
+                    // A decoding that writes the request's feedback image
+                    // product publishes its values after the PNG, as a
+                    // worker does.
+                    let mut media = synthetic_png_b64(width, height)?.into_bytes();
+                    if call.image_output.is_some() {
+                        let values = synthetic_feedback_values(
+                            call.request_key.request_id,
+                            request.image_index,
+                            height,
+                            width,
+                        );
+                        ipc::append_feedback(&mut media, &values, ipc::PixelRange::SignedUnit);
+                    }
+                    record.media_output = Some(publish_media("uniserve-image-", &media)?);
                 }
             }
         }
@@ -1518,6 +1639,7 @@ impl SimEngine {
             media_output: None,
             cache_output: None,
             draft_token_ids: Vec::new(),
+            latent_layouts: Vec::new(),
         }
     }
 
@@ -1706,6 +1828,16 @@ impl SimEngine {
         release
     }
 
+    /// Paces the simulator: each batch executes only once the returned
+    /// [`Pace`] permits it, and every batch runs freely once it is dropped.
+    /// A test steps a request through its calls with it, to act at a chosen
+    /// point of the request's progress.
+    pub fn pace(&mut self) -> Pace {
+        let (permits, paced) = crossbeam_channel::unbounded();
+        self.pace = Some(paced);
+        Pace(permits)
+    }
+
     /// Refuses request `id` for `reason` at each of its media calls.
     pub fn refuse_request(&mut self, id: RequestId, reason: &str) {
         self.refused.insert(id, reason.to_owned());
@@ -1724,6 +1856,163 @@ impl SimEngine {
     pub fn set_latent_pools(&mut self, pools: Vec<(String, Option<ipc::LatentPoolInfo>)>) {
         self.latent_pools = pools;
     }
+
+    /// States how each simulated denoising rank's request slot pages hold a
+    /// request's samples, which every video latent preparation reports, as
+    /// the ranks' executors declare it for every request.
+    pub fn set_latent_layouts(&mut self, layouts: Vec<ipc::RankLatentLayout>) {
+        self.latent_layouts = layouts;
+    }
+
+    /// States the host encoder pool of each of the simulated pool's ranks,
+    /// with the rank's host, as ranks executing video encoder calls report
+    /// them. The simulator copies no bytes: an encoder call whose output it
+    /// reads from the pool completes as one that computes it.
+    pub fn set_encoder_pools(&mut self, pools: crate::executor::RankEncoderPools) {
+        self.encoder_pools = pools;
+    }
+
+    /// The log of what each request's calls write into its context, which
+    /// the simulator keeps filling once it runs.
+    pub fn context_log(&self) -> ContextLog {
+        self.context.clone()
+    }
+}
+
+/// The values of the decoded image product of request `request_id`'s image
+/// `image_index`: BF16 bytes `[3, height, width]` the simulator derives from
+/// the two, so an image restarted from noise decodes to the same values.
+fn synthetic_feedback_values(
+    request_id: RequestId,
+    image_index: u32,
+    height: u32,
+    width: u32,
+) -> Vec<u8> {
+    let bytes = ipc::ImagePixels::value_bytes(height, width) as usize;
+    let mut state = (request_id.0 << 32) ^ u64::from(image_index) ^ 0x9e37_79b9_7f4a_7c15;
+    (0..bytes)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
+/// A digest of image values, which the context log names an image by.
+fn digest(values: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    values.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// What `call`, which completed with `record`, wrote into `request`'s
+/// context, as a worker's KV cache holds it, and the provenance of the image
+/// products it made.
+fn context_writes(
+    call: &Call,
+    record: &CallOutput,
+    request: &mut SimRequestState,
+) -> Vec<ContextWrite> {
+    let position = call.coordinates.logical_position;
+    let mut writes = Vec::new();
+    match call.kind {
+        CallKind::Forward(ForwardMode::Prefill | ForwardMode::Decode) => {
+            let feature = call
+                .latent_feature_input
+                .as_ref()
+                .or(call.vision_inputs.first().map(|input| &input.feature));
+            let feedback = call.completion_output.is_some()
+                && (call.latent_feature_input.is_some() || !call.vision_inputs.is_empty());
+            if feedback {
+                let (image, draw) = feature
+                    .and_then(|feature| request.provenance.get(feature).copied())
+                    .unwrap_or((0, None));
+                writes.push(ContextWrite::Image {
+                    position,
+                    image,
+                    draw,
+                });
+            } else if call.latent_feature_input.is_some() {
+                writes.push(ContextWrite::InputBlock { position });
+            } else {
+                // Prompt tokens with the vision blocks between them, a
+                // decode's input or a cache close: an input left empty
+                // relays the predecessor's sampled token.
+                let tokens: Vec<u32> = if call.input_token_ids.is_empty()
+                    && call.kind == CallKind::Forward(ForwardMode::Decode)
+                {
+                    request.last_token.into_iter().collect()
+                } else {
+                    call.input_token_ids.clone()
+                };
+                let mut blocks = call.vision_inputs.iter().peekable();
+                for (index, token) in tokens.iter().enumerate() {
+                    while blocks
+                        .peek()
+                        .is_some_and(|block| block.offset as usize == index)
+                    {
+                        blocks.next();
+                        writes.push(ContextWrite::InputBlock {
+                            position: position + index as u32,
+                        });
+                    }
+                    writes.push(ContextWrite::Token {
+                        position: position + index as u32,
+                        token: *token,
+                    });
+                }
+                for _ in blocks {
+                    writes.push(ContextWrite::InputBlock {
+                        position: position + tokens.len() as u32,
+                    });
+                }
+            }
+        }
+        CallKind::Media(MediaCall::LatentPreparation) => {
+            if let Some(image_index) = call.image_index {
+                request.image_index = image_index;
+            }
+        }
+        CallKind::Media(MediaCall::ImageDecoding) => {
+            if let (Some(output), Some(image)) = (&call.image_output, request.image()) {
+                let (height, width) = if image.height > 0 && image.width > 0 {
+                    (image.height, image.width)
+                } else {
+                    DEFAULT_IMAGE_HW
+                };
+                let values = synthetic_feedback_values(
+                    call.request_key.request_id,
+                    request.image_index,
+                    height,
+                    width,
+                );
+                request
+                    .provenance
+                    .insert(output.clone(), (digest(&values), None));
+            }
+        }
+        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
+            let source = match (&call.image_input, &call.carried_image, &call.input_image) {
+                (Some(product), _, _) => request.provenance.get(product).map(|(image, _)| *image),
+                (_, Some(carried), _) => Some(digest(&carried.values)),
+                (_, _, Some(payload)) => Some(digest(payload.as_bytes())),
+                _ => None,
+            };
+            if let (Some(output), Some(image)) = (&call.encoder_output, source) {
+                request
+                    .provenance
+                    .insert(output.clone(), (image, call.latent_draw));
+            }
+        }
+        _ => {}
+    }
+    if let Some(&token) = record.committed_tokens.last() {
+        request.last_token = Some(token);
+    }
+    writes
 }
 
 /// Synthetic text token `index` of request `request_id`: the natural token
@@ -1824,6 +2113,12 @@ impl SimEngine {
     /// earlier calls, and whatever the failing call applied before the error
     /// keep their effects on request state.
     fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
+        // A paced simulator waits for its permit; a dropped sender frees it.
+        if let Some(pace) = &self.pace
+            && pace.recv().is_err()
+        {
+            self.pace = None;
+        }
         // `SimExecutor::submit` validated the batch.
         let batch_id = batch.id;
         let closed = batch
@@ -1871,6 +2166,7 @@ impl SimEngine {
         let worker_exec_us = speculation
             .map(|speculation| speculation.step_us(batch.requests.iter().map(|(call, _)| call)));
         let refused = &self.refused;
+        let latent_layouts = &self.latent_layouts;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
             let request = self
@@ -1944,8 +2240,22 @@ impl SimEngine {
                 completion.error_code = Some(ErrorCode::InputError);
                 completion.error_message = Some(reason.clone());
             }
+            // A video latent preparation reports how each denoising rank
+            // holds the request's samples, as every rank's completion does
+            // once the engine joined them.
+            if completion.status == CallStatus::Ok
+                && call.kind == CallKind::Media(MediaCall::LatentPreparation)
+            {
+                completion.latent_layouts = latent_layouts.clone();
+            }
             if completion.status == CallStatus::Ok && call.advances_state() {
                 request.state_call_id = call.call_id;
+            }
+            if completion.status == CallStatus::Ok {
+                self.context.record(
+                    call.request_key,
+                    context_writes(&call, &completion, request),
+                );
             }
             completions.push(completion);
         }
@@ -2070,6 +2380,9 @@ mod tests {
             predicate: None,
             image_index: None,
             latent_restore: None,
+            host_output: None,
+            latent_draw: None,
+            carried_image: None,
         };
         ExecutionBatch::new(
             batch_id,

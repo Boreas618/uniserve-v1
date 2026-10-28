@@ -286,7 +286,9 @@ impl Scheduler {
                 // does, until those host task pools have room.
                 let image_demand =
                     match call.kind {
-                        CallKind::Media(media_call) if call.input_image.is_some() => {
+                        CallKind::Media(media_call)
+                            if call.input_image.is_some() || call.carried_image.is_some() =>
+                        {
                             let Some(request_key) = self.running.get(&id).map(|state| {
                                 RequestKey::new(self.engine_id, id, state.request_epoch)
                             }) else {
@@ -426,6 +428,9 @@ impl Scheduler {
                         request: Box::new(admission),
                     });
                 }
+                // An image encoding reads or writes the output its request
+                // looked up in the host encoder pools.
+                self.attach_host_encoding(id, &mut call);
                 let prepared = self.prepare_generation_call(
                     call,
                     reserved_buffers,
@@ -626,6 +631,26 @@ impl Scheduler {
         }
         if let Some(variant) = self.pending_successor_code(id) {
             return Some(variant);
+        }
+        // A context rebuild's image calls (`Scheduler::next_replay_call`).
+        if let Some(image) = self
+            .num_scheduled_prompt_tokens(id)
+            .and_then(|scheduled| st.replay_image_due(scheduled))
+        {
+            return Some(match image.stage {
+                generation::continuation::ReplayStage::Encode(index) => CallKind::Media(
+                    st.req
+                        .image_generation
+                        .feedback_encoders
+                        .get(index)?
+                        .encoder
+                        .into(),
+                ),
+                generation::continuation::ReplayStage::Close
+                | generation::continuation::ReplayStage::Write(_) => {
+                    CallKind::Forward(ForwardMode::Prefill)
+                }
+            });
         }
         if st.phase == Phase::Prefill
             && let Some((_, step)) = self.next_context_encode(id)

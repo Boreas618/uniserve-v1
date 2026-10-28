@@ -57,7 +57,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 pub use layout::{Canonical, Encoding, Field, Logical, Piece, Segment, StorageLayout};
 pub use region::Span;
@@ -76,40 +75,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A SHA-256 digest of length-prefixed parts under a domain tag.
-pub(crate) struct Digest(Sha256);
-
-impl Digest {
-    pub(crate) fn new(tag: &[u8]) -> Self {
-        let mut digest = Self(Sha256::new());
-        digest.bytes(tag);
-        digest
-    }
-
-    pub(crate) fn bytes(&mut self, part: &[u8]) {
-        self.0.update((part.len() as u64).to_le_bytes());
-        self.0.update(part);
-    }
-
-    pub(crate) fn text(&mut self, part: &str) {
-        self.bytes(part.as_bytes());
-    }
-
-    pub(crate) fn number(&mut self, value: u64) {
-        self.0.update(value.to_le_bytes());
-    }
-
-    pub(crate) fn numbers(&mut self, values: &[u64]) {
-        self.number(values.len() as u64);
-        for value in values {
-            self.number(*value);
-        }
-    }
-
-    pub(crate) fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
-    }
-}
+use crate::key::Digest;
 
 /// One chunk of a storage: its bytes and the key its memory is retained
 /// under.
@@ -146,6 +112,40 @@ impl Storage {
                     key: layout.chunk_key(&window, fingerprint)?,
                     offset: window.start,
                     length: window.end - window.start,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { layout, chunks })
+    }
+
+    /// A storage of `layout` held in pages of `page_bytes` each, as a page
+    /// pool's slots hold it: the pages up to the one its last byte lies in,
+    /// every page a chunk keyed with `fingerprint`
+    /// ([`StorageLayout::chunk_key`]). A page's key thus names the logical
+    /// regions its bytes hold and where they lie in it, so a page that two
+    /// parallel configurations lay out alike has one key in both, and pages
+    /// that hold anything else have others. A layout whose bytes end with
+    /// the last byte a field holds leaves no page that holds nothing.
+    ///
+    /// Fails when the layout declares itself inconsistently or the pages
+    /// have no bytes, or when a field's source has no fingerprint.
+    pub fn paged(
+        layout: StorageLayout,
+        page_bytes: u64,
+        fingerprint: &dyn Fn(&str) -> Option<[u8; 32]>,
+    ) -> Result<Self> {
+        layout.validate()?;
+        if page_bytes == 0 {
+            return Err(Error::Invalid("pages of no bytes hold no storage".into()));
+        }
+        let pages = layout.bytes.div_ceil(page_bytes);
+        let chunks = (0..pages)
+            .map(|page| {
+                let window = page * page_bytes..(page + 1) * page_bytes;
+                Ok(Chunk {
+                    key: layout.chunk_key(&window, fingerprint)?,
+                    offset: window.start,
+                    length: page_bytes,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

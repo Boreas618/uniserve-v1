@@ -41,6 +41,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from uniserve import numerics
 from uniserve.errors import SetupError
 from uniserve.executor.predicates import split
 from uniserve.executor.text.protocol import GraphMode
@@ -107,6 +108,10 @@ _MAX_PAGE_UNITS = 64
 # Pixels of the largest image a computation bounds when neither the
 # configured image sizes nor an image denoiser's longest sequence bound it.
 _DEFAULT_MAX_PIXELS = 1024 * 1024
+
+# The output of each encoding computation's role, as the engine names it in
+# the encoder caches (``crates/engine/src/scheduler/encodings.rs``).
+_OUTPUTS = {VISION: "vision_features", LATENT: "latent_features"}
 
 
 def text_settings(loaded) -> str:
@@ -213,14 +218,11 @@ class _Request:
         params: Its image parameters, ``None`` for a request generating no
             image.
         negative: Its admitted negative tokens.
-        draws: Its latent encodings recorded so far: the posterior draw
-            index of its next one.
     """
 
     key: tuple[int, int, int]
     params: ImageParams | None
     negative: tuple[int, ...]
-    draws: int = 0
 
     @property
     def seed(self) -> int:
@@ -422,8 +424,9 @@ class ImageExecutor:
                 "resources": list(computation.resources),
             }
             if "image_decoding" in computation.kinds:
-                # Each call's decoded bytes beside its completion word.
-                pixels = 3 * self._max_pixels()
+                # Each call's decoded bytes beside its completion word: the
+                # RGB bytes and the image product's BF16 values.
+                pixels = 9 * self._max_pixels()
                 entry["output_words"] = self.max_calls * (1 + -(-pixels // 8))
             entries.append(entry)
         return entries
@@ -519,7 +522,81 @@ class ImageExecutor:
             "fixed_bytes": int(fixed),
             # Each slot's reference time of the solver update.
             "slot_bytes": 4 if latent is not None else 0,
+            "encoders": self._encoders(),
         }
+
+    def _encoders(self) -> dict[str, dict[str, Any]]:
+        """What each encoding computation of the rank writes for one image.
+
+        By its output's name: ``identity``, the declared function and
+        format identity of what computes the features (the modules that
+        encode, ``uniserve.numerics.identity``, and the image transform the
+        pixels are prepared by, which with the weights' values keys the
+        features in the host encoder pool), ``row_bytes``, the bytes of one
+        feature row, and ``draws``, whether the features follow the
+        request's image seed and the encoding's posterior draw (a latent
+        encoder that samples its posterior).
+        """
+        encoders: dict[str, dict[str, Any]] = {}
+        for computation in self.placed:
+            if computation.role == VISION:
+                module = self._module(
+                    computation, "patch_encoder", PatchEncoder
+                )
+                width, dtype = features(module)
+                # The whole tower and its connector compute the features.
+                modules = [numerics.identity(module)]
+                row_bytes = width * dtype.itemsize
+                draws = False
+                tower = "vit"
+            elif computation.role == LATENT:
+                module = self._module(
+                    computation, "patch_autoencoder", PatchAutoencoder
+                )
+                # An encoding runs the autoencoder's encoder and posterior,
+                # and normalizes and patchifies their sample as the
+                # autoencoder's function states; its decoder takes no part.
+                modules = [
+                    numerics.function(type(module)),
+                    numerics.identity(module.encoder),
+                    numerics.identity(module.posterior),
+                ]
+                row_bytes = (
+                    module.patch_size**2
+                    * module.latent_channels
+                    * module.latent_dtype.itemsize
+                )
+                draws = bool(module.samples_posterior)
+                tower = "vae"
+            else:
+                continue
+            encoders[_OUTPUTS[computation.role]] = {
+                "identity": self._identity(modules, tower),
+                "row_bytes": int(row_bytes),
+                "draws": draws,
+            }
+        return encoders
+
+    def _identity(self, modules: Sequence[str], tower: str) -> str:
+        """The identity of an encoding by ``modules`` (their identities)
+        of pixels the image policy prepares for ``tower``: what the
+        transform resizes and normalizes them to, and their dtype and alpha
+        policy. The storage layer combines this description with the input
+        content when naming cached outputs.
+        """  # noqa: D205
+        processor = self.loaded.image_processor
+        transform = (
+            None if processor is None else getattr(processor, tower, None)
+        )
+        return json.dumps(
+            [
+                *modules,
+                repr(transform),
+                repr(None if processor is None else processor.output_dtype),
+                "" if processor is None else str(processor.alpha),
+            ],
+            separators=(",", ":"),
+        )
 
     def _vision_bytes(self, computation: _Computation) -> tuple[int, int]:
         """A vision computation's largest feature product and buffer bytes.
@@ -1150,9 +1227,8 @@ class ImageExecutor:
     ) -> list[tuple[tuple[int, int, int], str]]:
         """Admit started requests (``NewRequest`` JSON); refuses none.
 
-        Each slot keeps its request's image parameters, admitted negative
-        tokens and posterior draw count; a reused slot forgets its earlier
-        request's trajectory.
+        Each slot keeps its request's image parameters and admitted negative
+        tokens; a reused slot forgets its earlier request's trajectory.
         """
         slots = []
         for request in requests:
@@ -1220,10 +1296,18 @@ class ImageExecutor:
         value = (entry.get("image") or {}).get("input")
         if not value:
             raise ValueError(
-                "an image encoding requires exactly one inline or resident "
-                "image"
+                "an image encoding requires exactly one inline, resident or "
+                "carried image"
             )
         return value
+
+    def _decoded(self, value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The description of a decoded image an encoding reads.
+
+        A resident image product, or the values of one a migrated request
+        carries, which the host staged; ``None`` for an inline input image.
+        """
+        return value.get("resident") or value.get("carried")
 
     def _resident_facts(
         self, tower: str, resident: Mapping[str, Any]
@@ -1261,10 +1345,11 @@ class ImageExecutor:
             resident = False
         else:
             height, width, rows, columns, *shape = self._resident_facts(
-                "vit", value["resident"]
+                "vit", self._decoded(value)
             )
             grid = None if rows == 0 else (rows, columns)
-            resident = True
+            # A carried image's values arrive as host-staged pixels.
+            resident = "resident" in value
         if grid is None:
             grid = _whole_grid(module, shape)
         return vision_entry(
@@ -1290,9 +1375,10 @@ class ImageExecutor:
             resident = False
         else:
             height, width, _, _, *shape = self._resident_facts(
-                "vae", value["resident"]
+                "vae", self._decoded(value)
             )
-            resident = True
+            # A carried image's values arrive as host-staged pixels.
+            resident = "resident" in value
         side = module.downsample
         return latent_entry(
             rows=(shape[-2] // side) * (shape[-1] // side),
@@ -1355,9 +1441,13 @@ class ImageExecutor:
         entries :meth:`prepare` returned. ``tensors`` holds the generic
         reads and writes of every call (none for image calls), then each
         call's image tensors in call order (its resident read, its prepared
-        pixels, each write, its lent bytes), then for a denoising batch the
-        ``int64 [5 + 2G, R]`` attention rows. Returns each call's graph
-        mode.
+        pixels, each write, its lent bytes, then for an encoding whose
+        features lie in the host encoder pool one ``uint8 [page_bytes]``
+        host tensor per copy its ``host["copies"]`` lists), then for a
+        denoising batch the ``int64 [5 + 2G, R]`` attention rows. An
+        encoding with ``host["import"]`` reads its features from those
+        pages instead of encoding; any other writes the features it encoded
+        to them. Returns each call's graph mode.
         """
         placed = self.placed[int(computation)]
         calls = step["calls"]
@@ -1375,6 +1465,8 @@ class ImageExecutor:
         bound: list[
             tuple[Mapping[str, Any], PlanEntry, list[torch.Tensor]]
         ] = []
+        # Each encoding's host encoder pool pages, by call index.
+        pages: dict[int, list[torch.Tensor]] = {}
         for entry, planned in zip(calls, prepared, strict=True):
             plan = PlanEntry.from_json(planned)
             if plan is None or entry["refused"] or not entry["active"]:
@@ -1382,8 +1474,30 @@ class ImageExecutor:
             count = plan.tensors
             bound.append((entry, plan, list(tensors[cursor : cursor + count])))
             cursor += count
+            host = entry.get("host")
+            if host is not None:
+                copied = len(host["copies"])
+                pages[int(entry["index"])] = list(
+                    tensors[cursor : cursor + copied]
+                )
+                cursor += copied
         rest = list(tensors[cursor:])
         modes = {int(entry["index"]): GraphMode.EAGER for entry in calls}
+        # The encodings whose features the host encoder pool holds read them
+        # instead of encoding.
+        if bound and str(bound[0][0]["call"]["kind"]) in (
+            "vision_encoding",
+            "latent_encoding",
+        ):
+            imported = set()
+            for entry, _, own in bound:
+                if (entry.get("host") or {}).get("import"):
+                    index = int(entry["index"])
+                    self._copy_host(placed, own[-1], pages[index], entry, False)
+                    imported.add(index)
+            bound = [
+                item for item in bound if int(item[0]["index"]) not in imported
+            ]
         if bound:
             kind = str(bound[0][0]["call"]["kind"])
             if kind == "vision_encoding":
@@ -1402,7 +1516,44 @@ class ImageExecutor:
                 self._decode(placed, bound, modes)
             else:
                 raise ValueError(f"{kind} is not an image model's call")
+        # The features an encoding wrote, on its stream after the encoding.
+        for entry, _, own in bound:
+            index = int(entry["index"])
+            if index in pages:
+                self._copy_host(placed, own[-1], pages[index], entry, True)
         return [int(modes[int(entry["index"])]) for entry in calls]
+
+    def _copy_host(
+        self,
+        computation: _Computation,
+        features: torch.Tensor,
+        pages: Sequence[torch.Tensor],
+        entry: Mapping[str, Any],
+        export: bool,
+    ) -> None:
+        """Copy an encoding's features between their product and the host
+        encoder pool's pages, on the stream of the computation that encodes
+        them, which orders an export after the encoding.
+
+        ``entry["host"]["copies"]`` holds, for each page of ``pages``, the
+        byte offset in the features, the byte offset in the page and the
+        bytes copied (``crates/worker/src/executor/image.rs::host_copies``).
+        ``export`` writes the features to the pages, otherwise they are
+        read from them.
+        """  # noqa: D205
+        if not features.is_contiguous():
+            raise ValueError("an encoding's features are not contiguous")
+        flat = features.view(-1).view(torch.uint8)
+        with torch.inference_mode(), torch.cuda.stream(computation.stream):
+            for page, (start, offset, length) in zip(
+                pages, entry["host"]["copies"], strict=True
+            ):
+                stored = page[offset : offset + length]
+                rows = flat[start : start + length]
+                if export:
+                    stored.copy_(rows, non_blocking=True)
+                else:
+                    rows.copy_(stored, non_blocking=True)
 
     def _resident_pixels(
         self,
@@ -1410,19 +1561,24 @@ class ImageExecutor:
         tower: Tower,
         image: torch.Tensor,
         entry: Mapping[str, Any],
+        device: torch.device,
     ) -> PreparedImage:
-        """A resident image prepared for ``tower``.
+        """A decoded image prepared for ``tower``.
 
-        It is prepared on the device ``computation`` runs on.
+        The image is a resident image product, or the values of one a
+        migrated request carries. It is prepared on ``device``, the device
+        ``computation`` runs on, where a carried image's host-staged values
+        are copied first, so that both take the same computation.
         """
-        resident = self._input(entry)["resident"]
+        decoded = self._decoded(self._input(entry))
+        assert decoded is not None
         with torch.inference_mode(), torch.cuda.stream(computation.stream):
             return prepare_tensor_image(
                 self.loaded.image_processor,
                 tower,
-                image,
-                device=image.device,
-                signed_unit=resident["value_range"] == "signed_unit",
+                image.to(device=device, non_blocking=True),
+                device=device,
+                signed_unit=decoded["value_range"] == "signed_unit",
             )
 
     def _encode_vision(self, computation, bound, modes) -> None:
@@ -1431,9 +1587,9 @@ class ImageExecutor:
         images = []
         for entry, plan, tensors in bound:
             source, out = tensors[0], tensors[-1]
-            if plan.read:
+            if self._decoded(self._input(entry)) is not None:
                 prepared = self._resident_pixels(
-                    computation, "vit", source, entry
+                    computation, "vit", source, entry, out.device
                 )
                 pixels, grid = prepared.pixels, prepared.grid_shape
             else:
@@ -1455,17 +1611,20 @@ class ImageExecutor:
         assert encoder is not None
         for entry, plan, tensors in bound:
             source, out = tensors[0], tensors[-1]
-            if plan.read:
+            if self._decoded(self._input(entry)) is not None:
                 pixels = self._resident_pixels(
-                    computation, "vae", source, entry
+                    computation, "vae", source, entry, out.device
                 ).pixels
             else:
                 pixels = source
             request = self._request(entry)
-            draw = request.draws
-            request.draws += 1
+            # The engine states the encoding's posterior draw: its ordinal
+            # among the request's latent encodings.
+            draw = entry["call"].get("latent_draw")
+            if draw is None:
+                raise ValueError("an image latent encoding names no draw")
             modes[int(entry["index"])] = encoder.encode(
-                pixels, out, seed=request.seed, draw=draw
+                pixels, out, seed=request.seed, draw=int(draw)
             )
 
     def _prepare_latents(self, computation, bound, modes, predicates) -> None:
@@ -1532,13 +1691,25 @@ class ImageExecutor:
                     torch.cuda.stream(computation.stream),
                 ):
                     banks.gather(latent.read, latent.pages, rows)
+                count = 3 * latent.height * latent.width
                 mode = decoder.decode(
                     rows[: latent.units],
                     latent.height,
                     latent.width,
                     product,
-                    out,
+                    out[:count],
                 )
+                if product is not None:
+                    # The product's values follow the RGB bytes: the
+                    # image's exact feedback input, which the worker
+                    # publishes after the PNG for a migration to carry.
+                    with (
+                        torch.inference_mode(),
+                        torch.cuda.stream(computation.stream),
+                    ):
+                        out[count : 3 * count].view(torch.bfloat16).copy_(
+                            product.reshape(-1), non_blocking=True
+                        )
             else:
                 resident = self._input(entry)["resident"]
                 mode = decoder.quantize(

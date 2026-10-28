@@ -541,6 +541,7 @@ impl InputProcessor {
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
             adapter: adapter.as_ref().map_or(0, |adapter| adapter.slot),
+            generated_images: Vec::new(),
         };
         let mut decode = sampling_params.decode_options();
 

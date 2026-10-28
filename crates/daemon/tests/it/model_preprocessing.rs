@@ -1000,7 +1000,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
 fn sensenova_image_cache_identity_follows_its_pixel_bound() {
     let (_directory, _tokenizer, processor) =
         resolved_model(ModelDescription::SenseNova, "neo_chat");
-    let first_image_hash = |count: usize| {
+    let first_image_digest = |count: usize| {
         let content = (0..count)
             .map(|_| {
                 serde_json::json!({
@@ -1017,12 +1017,12 @@ fn sensenova_image_cache_identity_follows_its_pixel_bound() {
             }))
             .unwrap();
         let (generation, _) = preprocess_image_chat(&processor, "image-bound", request);
-        generation.multimodal_inputs.images[0].hash
+        generation.multimodal_inputs.images[0].digest
     };
 
     // One to four input images keep the 2048x2048 bound; a fifth lowers it.
-    assert_eq!(first_image_hash(1), first_image_hash(4));
-    assert_ne!(first_image_hash(4), first_image_hash(5));
+    assert_eq!(first_image_digest(1), first_image_digest(4));
+    assert_ne!(first_image_digest(4), first_image_digest(5));
 }
 
 /// Bagel's learned latent position table covers 64 latent patches per side

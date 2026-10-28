@@ -73,7 +73,7 @@ mod freeq;
 pub(crate) mod manager;
 mod offload;
 
-pub(crate) use encoder_cache::EncoderCacheManager;
+pub(crate) use encoder_cache::{EncoderCacheManager, EncoderKey};
 use freeq::UnitMeta;
 pub use offload::HostCacheSize;
 pub(crate) use offload::{

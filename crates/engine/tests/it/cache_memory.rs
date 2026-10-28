@@ -352,6 +352,7 @@ fn request_of(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
         adapter: 0,
+        generated_images: Vec::new(),
     }
 }
 
@@ -1063,6 +1064,8 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
         pages: Vec::new(),
         held_units: 20,
         requests: 1,
+        reserved_units: 0,
+        reserving: 0,
     };
     let refused = handle
         .promote(parked.clone(), true, false)

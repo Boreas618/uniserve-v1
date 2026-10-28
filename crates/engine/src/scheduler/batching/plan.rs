@@ -77,6 +77,17 @@ impl Scheduler {
     ) -> Option<Call> {
         let canvas_rows = rows.canvas;
         let (logical_position, cache_visible_len) = self.scheduled_token_lengths(id)?;
+        // A migrated request rebuilding its context writes its next image
+        // once the prompt tokens before it are written.
+        let scheduled_prompt = self.num_scheduled_prompt_tokens(id)?;
+        if self
+            .running
+            .get(&id)?
+            .replay_image_due(scheduled_prompt)
+            .is_some()
+        {
+            return self.next_replay_call(id, cache_visible_len);
+        }
         let context_pending = self.running.get(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count < st.req.prompt_token_ids.len() as u32)
@@ -97,6 +108,7 @@ impl Scheduler {
         match phase {
             Phase::Prefill => {
                 let st = self.running.get(&id)?;
+                let samples = self.config.canvas.is_none() && st.replay.is_none();
                 let n = st.req.prompt_token_ids.len();
                 let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
                 // Chunked prefill with the clip rule: the chunk is bounded by
@@ -129,8 +141,6 @@ impl Scheduler {
                     return None;
                 }
                 let sampling_state = self.build_token_masks(id, 0, 0);
-
-                let generates_canvases = self.config.canvas.is_some();
                 self.plan_call(id, |_scheduler, request| {
                     generation::plan_prompt(
                         request,
@@ -139,7 +149,7 @@ impl Scheduler {
                         Vec::new(),
                         0,
                         sampling_state,
-                        generates_canvases,
+                        samples,
                     )
                     .map(|mut call| {
                         call.draft = draft;
@@ -294,7 +304,7 @@ impl Scheduler {
                     .get(encoder_index)?
                     .encoder
                     .into();
-                let source = (feedback.feedback_source
+                let resident = (feedback.feedback_source
                     == Some(crate::FeedbackSource::DeviceProduct))
                 .then(|| {
                     self.pending_output(id, |call| call.image_output.as_ref())
@@ -302,19 +312,50 @@ impl Scheduler {
                         .cloned()
                 })
                 .flatten();
-                let image_b64 = if source.is_none() {
-                    st.feedback_image_b64.clone().unwrap_or_default()
-                } else {
-                    String::new()
+                let source = match resident {
+                    Some(product) => generation::EncodeSource::Resident(product),
+                    None => generation::EncodeSource::Payload(
+                        st.feedback_image_b64.clone().unwrap_or_default(),
+                    ),
                 };
+                let draw = generation::latent_draw(
+                    &st.req,
+                    generation::LatentEncoding::Feedback {
+                        image_index: image_id,
+                        encoder: encoder_index,
+                    },
+                );
+                // The encoding of the image's values is looked up in the host
+                // encoder pools first, when the request knows them: an
+                // encoding queued behind the image's decoding, whose values
+                // have not reached the engine, is computed alone.
+                let digest = st
+                    .feedback_digest
+                    .filter(|(image, _)| *image == image_id)
+                    .map(|(_, digest)| digest);
+                let encoding = digest.and_then(|image| {
+                    self.encoding(
+                        &st.req,
+                        encodings::Encoded::Feedback {
+                            image_index: image_id,
+                            encoder: encoder_index,
+                            image: &image,
+                        },
+                    )
+                });
+                if let Some(encoding) = encoding
+                    && !self.encoding_ready(id, encoding)
+                {
+                    return None;
+                }
                 self.plan_call(id, |scheduler, request| {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
                         encoder,
-                        image_b64,
                         source,
                         true,
+                        Some(draw),
                     )
                 })
             }
@@ -519,11 +560,17 @@ impl Scheduler {
         }
 
         // Encode the next block the context needs. A product the encoder
-        // cache holds is pinned for the request instead, without a call.
+        // cache holds is pinned for the request instead, without a call;
+        // otherwise the encoding is looked up in the host encoder pools before
+        // its call is planned.
         while let Some((block, step)) = self.next_context_encode(id) {
             let state = self.running.get(&id)?;
             let (image, _) = state.input_block(block)?;
-            let cache_key = encoder_cache_key(image.hash, block.encoder, step);
+            let Some(encoding) = self.encoding(&state.req, encodings::Encoded::Input(block)) else {
+                self.invariant_broken("a queued input encoder has a valid cache capacity");
+                return None;
+            };
+            let cache_key = encoding.device_key();
             let image_b64 = image.b64.clone();
             let cached = if state.req.cache.read {
                 self.storage.encoder_cache.lookup_product(cache_key)
@@ -534,14 +581,20 @@ impl Scheduler {
                 // A cache miss schedules the encoder. Nothing else of the
                 // request is planned while it is in flight, so its completion
                 // finds the same block here.
+                if !self.encoding_ready(id, encoding) {
+                    return None;
+                }
+                let state = self.running.get(&id)?;
+                let draw =
+                    generation::latent_draw(&state.req, generation::LatentEncoding::Input(block));
                 return self.plan_call(id, |scheduler, request| {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
                         step.into(),
-                        image_b64,
-                        None,
+                        generation::EncodeSource::Payload(image_b64),
                         false,
+                        Some(draw),
                     )
                 });
             };
@@ -549,6 +602,9 @@ impl Scheduler {
             if product != cached_product {
                 return None;
             }
+            // A host lookup the request started before the cache held the
+            // product ends.
+            self.drop_host_encoding(id, encoding);
             // If request ownership disappeared during acquisition, release
             // the pin.
             let Some(state) = self.running.get_mut(&id) else {
@@ -573,7 +629,9 @@ impl Scheduler {
         let limit = budget.max(1).min(self.config.chunked_prefill_size);
         let (end, blocks, block_tokens) = {
             let state = self.running.get(&id)?;
-            let prompt_len = state.req.prompt_token_ids.len();
+            // A context rebuild writes its next image after the prompt
+            // tokens before it, with calls of its own.
+            let prompt_len = state.context_prompt_end();
             let mut end = cursor;
             let mut used = 0usize;
             let mut rows = 0usize;
@@ -647,7 +705,11 @@ impl Scheduler {
         }
 
         let sampling_state = self.build_token_masks(id, 0, 0);
-        let generates_canvases = self.config.canvas.is_some();
+        let samples = self.config.canvas.is_none()
+            && self
+                .running
+                .get(&id)
+                .is_some_and(|state| state.replay.is_none());
         self.plan_call(id, |_scheduler, request| {
             generation::plan_prompt(
                 request,
@@ -656,9 +718,118 @@ impl Scheduler {
                 blocks,
                 block_tokens,
                 sampling_state,
-                generates_canvases,
+                samples,
             )
         })
+    }
+
+    /// Plans the next call of a migrated request's context rebuild that
+    /// writes the generated image it reached (`generation::continuation`):
+    /// the cache close with the token the image's close wrote, the encoding
+    /// of the image the request carries by each feedback encoder, at the
+    /// posterior draw the image's encoding took, and the write of each
+    /// encoder's feature, which advances the logical position by the image's
+    /// feedback positions after the last. The last write of the last image
+    /// samples the request's next token when the request resumes there.
+    /// These are the calls the request fed the image back with, one at a
+    /// time: nothing else of the request is planned while one is in flight.
+    /// Returns `None` while one is, or when the cache capacity the close
+    /// needs is unavailable.
+    fn next_replay_call(&mut self, id: RequestId, cache_visible_len: u32) -> Option<Call> {
+        if self.inflight.has_pending_calls(id) {
+            return None;
+        }
+        let state = self.running.get(&id)?;
+        let replay = state.replay.as_ref()?;
+        let image = replay.images.front()?.clone();
+        let feedback = &state.req.image_generation;
+        match image.stage {
+            generation::continuation::ReplayStage::Close => {
+                let capacity_target = decode_capacity_target(cache_visible_len as usize, 0);
+                if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
+                    return None;
+                }
+                self.plan_call(id, |_scheduler, request| {
+                    generation::plan_close_cache(request, image.close_token, false)
+                })
+            }
+            generation::continuation::ReplayStage::Encode(index) => {
+                let encoder = feedback.feedback_encoders.get(index)?.encoder.into();
+                let source = match &image.image {
+                    crate::FeedbackImage::Pixels(pixels) => {
+                        generation::EncodeSource::Carried(Arc::clone(pixels))
+                    }
+                    crate::FeedbackImage::Png(png) => {
+                        generation::EncodeSource::Payload(png.to_string())
+                    }
+                };
+                let draw = generation::latent_draw(
+                    &state.req,
+                    generation::LatentEncoding::Feedback {
+                        image_index: image.image_index,
+                        encoder: index,
+                    },
+                );
+                // The carried image's encoding is looked up in the host
+                // encoder pools first: the engine that encoded it before
+                // stored it there.
+                let digest =
+                    encodings::generated_image(&image.image, state.req.cache.isolation_key);
+                let encoding = self.encoding(
+                    &state.req,
+                    encodings::Encoded::Feedback {
+                        image_index: image.image_index,
+                        encoder: index,
+                        image: &digest,
+                    },
+                );
+                if let Some(encoding) = encoding
+                    && !self.encoding_ready(id, encoding)
+                {
+                    return None;
+                }
+                self.plan_call(id, |scheduler, request| {
+                    generation::plan_encode(
+                        &scheduler.generation_limits,
+                        request,
+                        encoder,
+                        source,
+                        true,
+                        Some(draw),
+                    )
+                })
+            }
+            generation::continuation::ReplayStage::Write(index) => {
+                let encoder_input = *feedback.feedback_encoders.get(index)?;
+                // Only the last write of the request's last image samples,
+                // when the request resumes at its feedback continuation. The
+                // image is already counted among the request's images.
+                let samples = index + 1 == feedback.feedback_encoders.len()
+                    && replay.images.len() == 1
+                    && replay.resume == generation::continuation::Resume::FeedbackSample
+                    && feedback.sample_feedback_continuation;
+                let Some(feature) = state.feedback_features.clone() else {
+                    self.invariant_broken("a rebuilt image's encoded feature awaits its write");
+                    return None;
+                };
+                let sampling_state = if samples {
+                    self.build_token_masks(id, 0, 0)
+                } else {
+                    None
+                };
+                self.plan_call(id, |scheduler, request| {
+                    generation::plan_image_extend(
+                        &scheduler.generation_limits,
+                        request,
+                        encoder_input,
+                        feature,
+                        true,
+                        samples,
+                        sampling_state,
+                    )
+                })
+            }
+        }
     }
 
     /// Returns the next input-image block to encode before the context can

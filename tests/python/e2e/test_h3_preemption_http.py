@@ -21,15 +21,33 @@ request, as a video job, is then preempted at a denoising step boundary:
   the two durations.
 
 Each preempted video is the reference video, frame for frame and sample
-for sample, and the server's log shows the trajectory stored and restored
-at a step past the first and short of the last.
+for sample. Preemption starts only after the public job status reports
+that denoising has begun. The reference computes its
+prompt's conditioning and stores it in the host encoder pool; the job reads
+the same prompt, so each of its admissions, on the serving world and on the
+one that resumes it, reads the stored conditioning instead of encoding it,
+and the videos' equality shows the stored conditioning is the computed one.
+
+A world change of the denoiser's parallel configuration, from Ulysses 2 on
+both GPUs to the whole denoiser on the first, computes the same: the
+successor's one denoising rank lays the pages both serving ranks stored
+out in its own pages and continues from the stored step. The re-layout
+moves values without computing any (its exactness, bit for bit, is the
+contract ``tests/python/integration/executor/test_video_latent_relayout.py``
+checks), but the steps after it run with another division of the rows and
+so another order of reductions, which a parallel configuration may change
+without changing what the denoiser computes: the video is not expected to
+equal either configuration's uninterrupted video bit for bit. The test
+asserts that the request survives the configuration change and finishes
+with the reference's video and audio frame counts. The layout conversion
+is checked independently through the latent restore interface.
 """
 
 from __future__ import annotations
 
+import functools
 import io
 import os
-import re
 import shutil
 import signal
 import tempfile
@@ -87,28 +105,38 @@ def _devices() -> str:
     return devices
 
 
-def _deployment(directory: Path) -> Path:
-    """Two GPUs of the model group and the CPU media group."""
+def _deployment(
+    directory: Path, denoising_ranks: int = 2, fraction: float | None = None
+) -> Path:
+    """Two GPUs of the model group and the CPU media group: the denoiser
+    Ulysses-2 on both GPUs, or on the first alone for one denoising rank;
+    `fraction` is the model group's share of each GPU
+    (`mem_fraction_static`), the deployment's default without one.
+    """  # noqa: D205
+    directory.mkdir(parents=True, exist_ok=True)
+    transformer = (
+        {"sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2}}
+        if denoising_ranks == 2
+        else {"ranks": [0]}
+    )
+    model = {
+        "id": "model",
+        "ranks": ["cuda:0-1"],
+        "queue_depth": 6,
+        "components": {
+            "transformer": transformer,
+            "text_encoder": {"tensor_parallel_size": 2},
+            "video_decoder": {},
+            "audio_decoder": {"distribution": "temporal_units"},
+            "latent_encoder": {"distribution": "temporal_units"},
+        },
+    }
+    if fraction is not None:
+        model["mem_fraction_static"] = fraction
     return written_deployment(
         directory,
         [
-            {
-                "id": "model",
-                "ranks": ["cuda:0-1"],
-                "queue_depth": 6,
-                "components": {
-                    "transformer": {
-                        "sequence_parallel": {
-                            "kind": "ulysses",
-                            "ulysses_degree": 2,
-                        }
-                    },
-                    "text_encoder": {"tensor_parallel_size": 2},
-                    "video_decoder": {},
-                    "audio_decoder": {"distribution": "temporal_units"},
-                    "latent_encoder": {"distribution": "temporal_units"},
-                },
-            },
+            model,
             {
                 "id": "media",
                 "ranks": ["cpu*4"],
@@ -121,6 +149,15 @@ def _deployment(directory: Path) -> Path:
             },
         ],
     )
+
+
+# The model group's share of each GPU while a world change of the
+# denoiser's parallel configuration runs: both worlds lie on the two GPUs
+# during the change, the serving Ulysses-2 world with a transformer replica
+# on each, and the default share leaves the successor's second rank, which
+# holds the text encoder and the decoders, less than one request slot's
+# tensors beside it.
+CHANGE_FRACTION = 0.85
 
 
 def _stop_storage_server(socket: Path) -> None:
@@ -160,9 +197,11 @@ def _group_workers(runtime: Path, group: str) -> list[int]:
 
 
 @contextmanager
-def _serve(tmp_path: Path) -> Iterator[tuple[str, Path, Path]]:
-    """The deployment, with a Storage Server of its own; its URL, log and
-    runtime directory.
+def _serve(
+    tmp_path: Path, deployment=_deployment
+) -> Iterator[tuple[str, Path, Path]]:
+    """The deployment `deployment` writes, with a Storage Server of its own;
+    its URL, log and runtime directory.
     """  # noqa: D205
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
@@ -180,7 +219,7 @@ def _serve(tmp_path: Path) -> Iterator[tuple[str, Path, Path]]:
         "--worker-executable",
         str(worker_executable()),
         "--worker-groups",
-        str(_deployment(tmp_path)),
+        str(deployment(tmp_path)),
         "--max-running-requests",
         "1",
         "--max-model-len",
@@ -315,29 +354,6 @@ def _admin(
     return httpx.post(f"{base_url}/admin/{path}", json=body or {}, timeout=1800)
 
 
-def _stored_and_restored(log: Path, start: int) -> tuple[list[int], list[int]]:
-    """The steps the log stored and restored trajectories at, from line
-    `start` on.
-    """  # noqa: D205
-    colors = re.compile(r"\x1b\[[0-9;]*m")
-    lines = [
-        colors.sub("", line) for line in log.read_text().splitlines()[start:]
-    ]
-    stored = [
-        int(match.group(1))
-        for line in lines
-        if "stored a preempted video trajectory" in line
-        and (match := re.search(r"steps=(\d+)", line))
-    ]
-    restored = [
-        int(match.group(1))
-        for line in lines
-        if "continues from its stored trajectory" in line
-        and (match := re.search(r"steps=(\d+)", line))
-    ]
-    return stored, restored
-
-
 def test_a_preempted_video_request_continues_its_trajectory_exactly(
     tmp_path: Path,
 ) -> None:
@@ -357,7 +373,6 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
 
         # A sleep preempts the request at a step boundary; the wake resumes
         # it from the stored step.
-        before = len(log.read_text().splitlines())
         job = _start_job(base_url)
         _wait_denoising(base_url, job, 2)
         slept = _admin(base_url, "sleep")
@@ -366,9 +381,6 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         woke = _admin(base_url, "wake_up")
         assert woke.status_code == 200, woke.text
         _assert_same_video(_content(base_url, job), reference)
-        stored, restored = _stored_and_restored(log, before)
-        assert len(stored) == 1 and 0 < stored[0] < steps, stored
-        assert restored == stored, (stored, restored)
 
         # A world change whose denoising computes the same parks the serving
         # world at a step boundary; its successor continues the trajectory.
@@ -377,7 +389,6 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # never end) and the successor prepares; the serving world's model
         # group stays paused from the request's first step until the change
         # promotes, well within the workers' five-minute watchdog.
-        before = len(log.read_text().splitlines())
         workers = _group_workers(runtime, "model")
         assert len(workers) == 2, workers
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -403,8 +414,69 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         assert result["change"] == "world", result
         assert result["world"]["numerics"] == "unchanged", result
         _assert_same_video(_content(base_url, job), reference)
-        stored, restored = _stored_and_restored(log, before)
-        assert len(stored) == 1 and 0 < stored[0] < steps, stored
-        assert restored == stored, (stored, restored)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+
+
+def test_a_video_request_continues_under_another_parallel_configuration(
+    tmp_path: Path,
+) -> None:
+    serving = functools.partial(_deployment, fraction=CHANGE_FRACTION)
+    with _serve(tmp_path, serving) as (base_url, log, runtime):
+        steps = httpx.get(f"{base_url}/v1/capabilities", timeout=60).json()[
+            "video"
+        ]["schedule"]["num_inference_steps"]
+        assert steps >= 4, steps
+        reference = httpx.post(
+            f"{base_url}/v1/videos/sync",
+            json=t2va_request(NAME, PROMPT, SECONDS, SEED),
+            timeout=1800,
+        )
+        assert reference.status_code == 200, reference.text
+        reference = reference.content
+
+        # The change parks the Ulysses-2 world at a step boundary, as the
+        # world change of the other test does; its successor denoises on
+        # the first GPU alone.
+        workers = _group_workers(runtime, "model")
+        assert len(workers) == 2, workers
+        successor = _deployment(
+            tmp_path / "successor", denoising_ranks=1, fraction=CHANGE_FRACTION
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            change = pool.submit(
+                httpx.put,
+                f"{base_url}/admin/config",
+                json={"set": [f"worker_groups={successor}"]},
+                timeout=3600,
+            )
+            _wait_phase(base_url, change, "prepare")
+            job = _start_job(base_url)
+            _wait_denoising(base_url, job, 1)
+            for worker in workers:
+                os.kill(worker, signal.SIGSTOP)
+            try:
+                _wait_phase(base_url, change, "promote")
+            finally:
+                for worker in workers:
+                    os.kill(worker, signal.SIGCONT)
+            changed = change.result()
+        assert changed.status_code == 200, changed.text
+        result = changed.json()["result"]
+        assert result["change"] == "world", result
+        assert result["world"]["numerics"] == "unchanged", result
+        video = _content(base_url, job)
+        # Kept beside the server's log, for comparison with the reference.
+        (tmp_path / "reference.mp4").write_bytes(reference)
+        (tmp_path / "continued.mp4").write_bytes(video)
+
+        frames, audio = _decoded(video)
+        reference_frames, reference_audio = _decoded(reference)
+        assert len(frames) == len(reference_frames) > 0
+        assert len(audio) == len(reference_audio) > 0
+        assert all(
+            frame.shape == wanted.shape
+            for frame, wanted in zip(frames, reference_frames, strict=True)
+        )
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text

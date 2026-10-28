@@ -16,7 +16,9 @@
 //! - [`bind`], in the batch's last job, leases what each call reads (a
 //!   resident image), passes its prepared pixels, reserves its feature and
 //!   image products at their prepared shapes, lends its decoded bytes from
-//!   the batch's output lease and binds its trajectory in the latent ledger
+//!   the batch's output lease, passes the host encoder pool pages an
+//!   encoding reads its features from or writes them to ([`host_copies`])
+//!   and binds its trajectory in the latent ledger
 //!   ([`LatentLedger::bind_image`]); a denoising batch over the prefix cache
 //!   also reserves its rows' slots (the guidance prefixes) and passes its
 //!   attention rows ([`reserve_rows`]);
@@ -31,9 +33,11 @@
 //!
 //! Tensors the executor receives for a call, after the generic ones of every
 //! call (image calls have none), in call order: the resident image read, the
-//! prepared pixels, each prepared write, the lent bytes; then, for a
-//! denoising batch over the prefix cache, one `int64 [5 + 2G, R]` host
-//! tensor of its attention rows ([`reserve_rows`]).
+//! prepared pixels, each prepared write, the lent bytes, the host encoder
+//! pool pages of an encoding with a host output (one `uint8 [page_bytes]`
+//! host view per copy `calls[i].host` lists); then, for a denoising batch
+//! over the prefix cache, one `int64 [5 + 2G, R]` host tensor of its
+//! attention rows ([`reserve_rows`]).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -58,6 +62,7 @@ use crate::host::HostTask;
 use crate::host::image::{ImageResult, ImageTask, ImageWork};
 use crate::job::{Job, Recorder};
 use crate::memory::allocation::StorageView;
+use crate::memory::encoders::{self, EncoderHostPool};
 use crate::memory::{
     AttentionRow, Metadata, OutputPlacement, PrefixCache, ProductBuffer, ProductStore, ValueRange,
 };
@@ -109,6 +114,8 @@ pub(crate) fn describe(
     for (index, (call, state)) in plan.calls.iter().zip(calls).enumerate() {
         let input = if state.refused() || !state.active {
             Input::None
+        } else if let Some(image) = &call.carried_image {
+            Input::Carried(image.height, image.width, image.range)
         } else if call.input_image.is_some() {
             let image = inputs
                 .map(|inputs| inputs.image(index))
@@ -126,11 +133,6 @@ pub(crate) fn describe(
             .get(call.request_key.request_id.0)
             .map(|request| request.admission().input_images)
             .unwrap_or(0);
-        // The host prepared an inline image's pixels already: the executor
-        // reads its facts, not its payload.
-        if call.input_image.is_some() {
-            step["calls"][index]["call"]["input_image"] = serde_json::Value::Null;
-        }
         step["calls"][index]["image"] = described(input, input_images, &state.output.progress)?;
     }
     Ok(())
@@ -139,6 +141,10 @@ pub(crate) fn describe(
 /// A call's input image as [`describe`] states it.
 enum Input {
     None,
+    /// The decoded image product a migrated request carries: its height,
+    /// width and value range. The executor prepares its host-staged values
+    /// as it prepares a resident image.
+    Carried(u32, u32, ipc::PixelRange),
     /// An inline image's host-prepared facts.
     Inline(ImageFacts),
     /// A resident image product's value shape and metadata.
@@ -153,6 +159,15 @@ fn described(
 ) -> Result<serde_json::Value> {
     let input = match input {
         Input::None => serde_json::Value::Null,
+        Input::Carried(height, width, range) => serde_json::json!({"carried": {
+            "shape": [3, height, width],
+            "height": height,
+            "width": width,
+            "value_range": value_range_name(Some(match range {
+                ipc::PixelRange::Unit => ValueRange::Unit,
+                ipc::PixelRange::SignedUnit => ValueRange::SignedUnit,
+            })),
+        }}),
         Input::Inline(facts) => serde_json::json!({"inline": facts.to_json()}),
         Input::Resident(
             shape,
@@ -312,6 +327,9 @@ pub(crate) struct ImageCall {
     exports: Vec<PendingExport>,
     /// The bytes its decoded image is staged in, with its size.
     bytes: Option<(StorageView, u32, u32)>,
+    /// The value range of the feedback image product whose values the
+    /// staged bytes carry after the image's, when the call writes one.
+    feedback: Option<ipc::PixelRange>,
     /// The PNG encoding of its decoded image.
     encoding: Option<Arc<HostTask<ImageTask>>>,
     /// The slots of its guidance prefixes (rows on slots other than its
@@ -346,6 +364,8 @@ pub(crate) struct Owners<'a> {
     pub(crate) pages: Option<&'a mut Pages>,
     pub(crate) ledger: Option<&'a mut LatentLedger>,
     pub(crate) images: Option<&'a Images>,
+    /// The host encoder pool of a rank that maps one.
+    pub(crate) encoders: Option<&'a EncoderHostPool>,
 }
 
 impl Owners<'_> {
@@ -517,11 +537,33 @@ pub(crate) fn bind(
             let (height, width) =
                 size.ok_or_else(|| Error::Invalid("a decoded image's size is unknown".into()))?;
             let bytes = prepared.bytes;
-            if bytes != PIXEL_BYTES * u64::from(height) * u64::from(width) {
+            // A decoding that writes its feedback image product stages the
+            // product's values after the image's bytes.
+            let feedback = batch.calls[index]
+                .forward
+                .image
+                .writes
+                .iter()
+                .find(|write| write.field == Field::ImageOutput)
+                .and_then(|write| match write.metadata {
+                    Some(Metadata::Image {
+                        value_range: Some(range),
+                        ..
+                    }) => Some(match range {
+                        ValueRange::Unit => ipc::PixelRange::Unit,
+                        ValueRange::SignedUnit => ipc::PixelRange::SignedUnit,
+                    }),
+                    _ => None,
+                });
+            let raster = PIXEL_BYTES * u64::from(height) * u64::from(width);
+            let staged =
+                raster + feedback.map_or(0, |_| ipc::ImagePixels::value_bytes(height, width));
+            if bytes != staged {
                 return Err(Error::Interface(format!(
                     "a {height}x{width} image stages {bytes} bytes"
                 )));
             }
+            batch.calls[index].forward.image.feedback = feedback;
             if bytes > call.bounds.max_completion_bytes {
                 return Err(Error::Invalid(
                     "image pixels exceed the call's completion byte bound".into(),
@@ -539,6 +581,26 @@ pub(crate) fn bind(
             tensors.push(view.clone());
             batch.calls[index].forward.image.bytes = Some((view, height, width));
         }
+
+        // The pool pages an encoding reads its features from instead of
+        // encoding, or writes the features it encoded to.
+        if let Some(output) = &call.host_output
+            && active
+        {
+            let features = batch.calls[index]
+                .forward
+                .image
+                .writes
+                .iter()
+                .find(|write| write.field == Field::EncoderOutput)
+                .ok_or_else(|| {
+                    Error::Interface("an encoding with a host output writes no features".into())
+                })?;
+            let view = shaped(&features.write.view(), &features.shape)?;
+            let (pages, host) = host_copies(owners.encoders, output, &view)?;
+            tensors.extend(pages);
+            step["calls"][index]["host"] = host;
+        }
     }
 
     // A denoising batch's attention rows.
@@ -554,6 +616,83 @@ pub(crate) fn bind(
         tensors.push(columns);
     }
     Ok(tensors)
+}
+
+/// The pool pages an image encoding's features read or write and the copies
+/// between them (`Call::host_output`), as [`bind`] hands them to the
+/// executor: the views, and `{"import": bool, "copies": [[output, page
+/// offset, bytes], ...]}` with one copy per view, the byte offset in the
+/// features, the byte offset in the page and the bytes copied.
+///
+/// The features are the stored output whole: their rows, as the executor
+/// prepared them from the image, at most the rows the engine bounds the
+/// output by, which its pages hold. An import reads every row from the
+/// pages; an export writes every row to the pages the pool does not hold
+/// already.
+fn host_copies(
+    pool: Option<&EncoderHostPool>,
+    output: &ipc::HostOutput,
+    features: &StorageView,
+) -> Result<(Vec<StorageView>, serde_json::Value)> {
+    let pool = pool.ok_or_else(|| {
+        Error::Invalid("this rank maps no host encoder pool for the encoding's features".into())
+    })?;
+    if output.pool != pool.pool() {
+        return Err(Error::Invalid(format!(
+            "the encoding's features lie in encoder pool {}, not in this rank's pool {}",
+            output.pool,
+            pool.pool()
+        )));
+    }
+    output
+        .validate(Some(pool.page_bytes()))
+        .map_err(|error| Error::Invalid(format!("the encoding's host output: {error}")))?;
+    if !features.is_contiguous() {
+        return Err(Error::Invariant(
+            "an encoding's features are not contiguous".into(),
+        ));
+    }
+    let shape = features.shape();
+    let rows = shape
+        .first()
+        .and_then(|rows| u64::try_from(*rows).ok())
+        .ok_or_else(|| Error::Interface("an encoding's features have no rows".into()))?;
+    let row_bytes = shape[1..]
+        .iter()
+        .try_fold(features.dtype().bytes() as u64, |bytes, extent| {
+            u64::try_from(*extent).ok().map(|extent| bytes * extent)
+        })
+        .ok_or_else(|| Error::Interface("an encoding's features have a negative extent".into()))?;
+    if row_bytes != output.row_bytes {
+        return Err(Error::Interface(format!(
+            "the executor prepared feature rows of {row_bytes} bytes, the engine stores rows of {}",
+            output.row_bytes
+        )));
+    }
+    let [first, end] = output.rows;
+    if rows > u64::from(end - first) {
+        return Err(Error::Invalid(format!(
+            "the executor prepared {rows} feature rows of an encoding the engine bounds by {}",
+            end - first
+        )));
+    }
+    let mut views = Vec::new();
+    let mut copies = Vec::new();
+    for copy in encoders::page_copies(first, 0..rows, row_bytes, pool.page_bytes()) {
+        let slot = output.slots.get(copy.page).ok_or_else(|| {
+            Error::Invalid("an encoding's feature rows lie beyond its pages".into())
+        })?;
+        // A page the pool held already is left as it is.
+        let Some(slot) = slot else {
+            continue;
+        };
+        views.push(pool.view(*slot)?);
+        copies.push([copy.output, copy.offset, copy.bytes]);
+    }
+    Ok((
+        views,
+        serde_json::json!({ "import": output.import, "copies": copies }),
+    ))
 }
 
 /// Reserve the product `write` names of `call` in `target` memory: a
@@ -876,6 +1015,7 @@ pub(crate) fn publish(
                 height: *height,
                 width: *width,
                 maximum: usize::try_from(call.bounds.max_completion_bytes).unwrap_or(usize::MAX),
+                feedback: image.feedback,
             }))?;
         }
     }
@@ -1184,6 +1324,18 @@ mod tests {
         assert_eq!(
             resident["input"],
             serde_json::json!({"resident": {
+                "shape": [3, 64, 32], "height": 64, "width": 32, "value_range": "signed_unit"
+            }})
+        );
+        // A carried image is described as the product it was decoded as.
+        let carried = described(
+            Input::Carried(64, 32, ipc::PixelRange::SignedUnit),
+            0,
+            &progress,
+        )?;
+        assert_eq!(
+            carried["input"],
+            serde_json::json!({"carried": {
                 "shape": [3, 64, 32], "height": 64, "width": 32, "value_range": "signed_unit"
             }})
         );

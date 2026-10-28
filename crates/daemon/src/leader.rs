@@ -1011,8 +1011,10 @@ impl Leader {
 
     /// Has the serving engine give back its KV cache and CUDA graph memory
     /// and keep its weights, as vLLM's `sleep` does: new requests wait, the
-    /// token requests in flight are recomputed once it wakes, and the other
-    /// requests finish first. Returns what each worker reported.
+    /// token requests in flight, image-generating ones included, are
+    /// recomputed once it wakes, the video requests in flight continue from
+    /// their stored step, and readouts finish first. Returns what each
+    /// worker reported.
     ///
     /// # Errors
     ///
@@ -1608,6 +1610,7 @@ mod tests {
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
             adapter: 0,
+            generated_images: Vec::new(),
         }
         .into()
     }

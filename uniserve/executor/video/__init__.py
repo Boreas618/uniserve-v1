@@ -28,6 +28,7 @@ from typing import Any
 
 import torch
 
+from uniserve import numerics
 from uniserve.executor.predicates import split
 from uniserve.executor.video.decoder import (
     AudioDecoder,
@@ -355,27 +356,74 @@ class VideoExecutor:
             + (overlap_bytes(model, plan) if self.decoding else 0),
             "stores_latent": self.denoising,
             "latent_region": self._latent_region() if self.denoising else None,
+            "encoder_identities": self._encoder_identities(),
             "units": len(model.unit_frames(plan.max_frames)),
             "frame_counts": plan.frame_counts,
         }
 
-    def _latent_region(self) -> str:
-        """What this rank's latent pages mean besides the denoiser's numerics.
+    def _encoder_identities(self) -> dict[str, str]:
+        """What computes each encoder output this rank writes, by product.
 
-        A stored trajectory's pages are the rank's share of a request's
-        samples in the layout the plan admits the request to: the plan (its
-        canvases, frame counts, capacities and startup layouts), the slot's
-        pages and the rank's coordinates in the denoiser's mesh fix what
-        every value is. Lowercase hexadecimal SHA-256, which keys the
-        trajectories the rank stores in its host latent pool.
+        The declared function and format identity
+        (``uniserve.numerics.identity``) of the module that computes it: the
+        text encoder for the prompt's conditioning, its vision tower for the
+        vision features, the video and audio encoders for the condition
+        latents. With the weights' values it keys the output in the host
+        encoder pool, so another world computing the same finds it.
+        """
+        module = self.loaded.module
+
+        def identity(path: str) -> str:
+            return numerics.identity(
+                module.get_submodule(path) if path else module
+            )
+
+        identities = {}
+        text = self._component("text_encoder")
+        if text is not None:
+            path = text.paths["text_encoder"]
+            identities["conditioning"] = identity(path)
+            if "patch_encoder" in text.paths:
+                # The vision tower the text encoder's runner encodes patches
+                # with (``TextEncoders``).
+                identities["vision_features"] = identity(
+                    f"{path}.vision" if path else "vision"
+                )
+        latent = self._component("video_encoder")
+        if latent is not None:
+            identities["condition_video_latents"] = identity(
+                latent.paths["video_encoder"]
+            )
+            if "audio_encoder" in latent.paths:
+                identities["condition_audio_latents"] = identity(
+                    latent.paths["audio_encoder"]
+                )
+        return identities
+
+    def _latent_region(self) -> str:
+        """What determines this rank's share of every request's samples.
+
+        A request's samples on this rank are its rows of each modality in
+        the layout the plan admits the request to (:meth:`Denoiser.storage`):
+        the plan (its canvases, frame counts, capacities and startup
+        layouts), the slot's pages, the rank's coordinates in the denoiser's
+        mesh and the denoiser's division of a layout's rows among them,
+        which the rows it gives this rank of every startup layout state, fix
+        them. A rank of another world with the same digest holds the same
+        share of any trajectory, so the engine knows which stored pages it
+        reads without its layout. Lowercase hexadecimal SHA-256.
         """
         mesh = self.model.denoiser.mesh
+        shares = [
+            self.model.fields(layout).samples for layout in self.plan.startup()
+        ]
         digest = hashlib.sha256()
         for part in (
-            "uniserve-latent-region/1",
+            "uniserve-latent-region/2",
             repr(self.plan),
             repr(self.pages),
             repr((mesh.axes, mesh.shape, mesh.coordinate(mesh.rank))),
+            repr(shares),
         ):
             encoded = part.encode()
             digest.update(len(encoded).to_bytes(8, "little"))
@@ -794,10 +842,15 @@ class VideoExecutor:
         follow them all (:mod:`uniserve.executor.predicates`). A predicated
         call runs whatever its predicate holds: when it is false, latent
         preparation keeps the bank it would write and the slot's tables and
-        conditioning, and denoising writes the samples it read. A latent
-        preparation that restores a stored trajectory reads the stored
-        pages after its writes, one ``[page_units]`` float32 host tensor per
-        page its ``latent["restore"]`` lists.
+        conditioning, and denoising writes the samples it read. An encoder
+        call whose output lies in the host encoder pool reads or writes the
+        pool's pages after its writes, one ``uint8 [page_bytes]`` host
+        tensor per copy its ``host["copies"]`` lists: it reads its output
+        from them instead of encoding (``host["import"]``), or writes the
+        output it encoded to them. A latent preparation that restores a
+        stored trajectory reads the stored pages after its writes, one
+        ``uint8 [page_bytes]`` host tensor per page its
+        ``latent["restore"]["pages"]`` counts, which its copies read.
         Returns how each call's forward ran.
         """
         tensors, predicates = split(step["calls"], tensors)
@@ -806,8 +859,13 @@ class VideoExecutor:
         for entry, prepared in zip(
             step["calls"], step["prepared"], strict=True
         ):
-            restored = len((entry.get("latent") or {}).get("restore") or ())
-            count = len(prepared["reads"]) + len(prepared["writes"]) + restored
+            host = entry.get("host")
+            pages = len(host["copies"]) if host is not None else 0
+            restore = (entry.get("latent") or {}).get("restore")
+            restored = 0 if restore is None else int(restore["pages"])
+            reading = len(prepared["reads"])
+            writing = reading + len(prepared["writes"])
+            count = writing + pages + restored
             own = list(tensors[cursor : cursor + count])
             cursor += count
             if entry["refused"]:
@@ -817,12 +875,20 @@ class VideoExecutor:
             if not entry["active"] and kind not in _HOST_CALLS:
                 modes.append(EAGER)
                 continue
-            reads = own[: len(prepared["reads"])]
-            writes = own[len(prepared["reads"]) : len(own) - restored]
-            if restored:
+            reads = own[:reading]
+            writes = own[reading:writing]
+            if restore is not None:
                 # The stored pages follow the writes; only a latent
                 # preparation reads them.
-                entry = {**entry, "stored": own[len(own) - restored :]}
+                entry = {**entry, "stored": own[writing + pages :]}
+            if host is not None and host["import"]:
+                # The output is stored: every rank reads its rows instead of
+                # encoding them.
+                self._copy_host(
+                    kind, writes, own[writing : writing + pages], host, False
+                )
+                modes.append(EAGER)
+                continue
             run = getattr(self, f"_run_{kind}")
             predicate = predicates.get(int(entry["index"]))
             if kind in _PREDICATED_CALLS:
@@ -833,7 +899,57 @@ class VideoExecutor:
                 raise ValueError(f"a {kind} call carries no predicate")
             else:
                 modes.append(run(entry, step, prepared, reads, writes))
+            if host is not None:
+                self._copy_host(
+                    kind, writes, own[writing : writing + pages], host, True
+                )
         return modes
+
+    def _copy_host(
+        self,
+        kind: str,
+        writes: Sequence[torch.Tensor],
+        pages: Sequence[torch.Tensor],
+        host: Mapping[str, Any],
+        export: bool,
+    ) -> None:
+        """Copy an encoder call's output rows between its output and the
+        host encoder pool's pages, on the stream of the encoder that writes
+        the output, which orders them after the encoding.
+
+        ``host["copies"]`` holds, for each page of ``pages``, the byte offset
+        in the call's output, the byte offset in the page and the bytes
+        copied (``crates/worker/src/executor/products.rs::host_copies``).
+        ``export`` writes the output to the pages, otherwise the output is
+        read from them.
+        """  # noqa: D205
+        if len(writes) != 1:
+            raise ValueError(
+                "an encoder call with a host output writes one output"
+            )
+        runner = (
+            self.text
+            if kind in ("text_encoding", "vision_encoding")
+            else self.conditions
+        )
+        if runner is None:
+            raise ValueError(f"this rank runs no encoder of a {kind} call")
+        output = writes[0]
+        if not output.is_contiguous():
+            raise ValueError(
+                "an encoder output with a host output is contiguous"
+            )
+        flat = output.view(-1).view(torch.uint8)
+        with torch.cuda.stream(runner.stream):
+            for page, (start, offset, length) in zip(
+                pages, host["copies"], strict=True
+            ):
+                stored = page[offset : offset + length]
+                rows = flat[start : start + length]
+                if export:
+                    stored.copy_(rows, non_blocking=True)
+                else:
+                    rows.copy_(stored, non_blocking=True)
 
     # Text encoding.
 
@@ -1029,7 +1145,16 @@ class VideoExecutor:
         reads = list(range(1, len(inputs)))
         if self.denoiser.conditions:
             reads = [0, *reads]
-        return {"reads": reads, "writes": [], "publication": None}
+        return {
+            "reads": reads,
+            "writes": [],
+            "publication": None,
+            # How this rank's slot pages hold the request's samples, which
+            # its completion reports for the engine to key and record a
+            # stored trajectory by, and which a restore lays the stored
+            # values out in.
+            "latent_layout": self.denoiser.storage(record.admission.layout),
+        }
 
     def _run_latent_preparation(
         self, entry, step, prepared, reads, writes, predicate=None
@@ -1050,11 +1175,13 @@ class VideoExecutor:
         bank = int(entry["latent"]["write"])
         denoiser.initialize(layout, slot, bank, predicate)
         restore = entry["latent"].get("restore")
-        if restore:
+        if restore is not None:
+            # The stored values, laid out in this rank's pages by the copies
+            # the worker planned from the stored ranks' layouts.
             denoiser.restore(
                 slot,
                 bank,
-                [int(page) for page in restore],
+                [[int(value) for value in copy] for copy in restore["copies"]],
                 entry["stored"],
                 predicate,
             )

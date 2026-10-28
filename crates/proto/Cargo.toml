@@ -11,10 +11,10 @@ publish = false
 # and the request vocabulary both ends work with.
 [dependencies]
 bitflags.workspace = true
-fnv.workspace = true
 libc.workspace = true
 prost.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 

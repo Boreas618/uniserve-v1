@@ -57,6 +57,7 @@ mod batching;
 mod cache_memory;
 mod control;
 mod denoising;
+pub(crate) mod encodings;
 mod execution;
 pub(crate) mod generation;
 pub(crate) mod graph;
@@ -85,6 +86,7 @@ use crate::scheduler::generation::{
     is_prompt_extend,
 };
 
+use crate::RejectionKind;
 use crate::allocation::{
     BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
 };
@@ -94,7 +96,6 @@ use crate::{
     ArtifactEvent, DiffusionRequest, Event, FinishReason, GenerationRequest,
     GenerationRequestError, MediaKind, PositionLogprobs, Request,
 };
-use crate::{RejectionKind, encoder_cache_key};
 use crossbeam_channel::Receiver;
 use ipc::RequestId;
 use ipc::UnitId;
@@ -149,11 +150,17 @@ const PAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 /// prefill (`Scheduler::select_batch_kind`).
 const PREFILL_WINDOW_CREDITS: usize = 2;
 
-/// Builds an image-completion event from a base64 PNG payload.
+/// Builds an image-completion event from a base64 PNG payload and, when the
+/// request feeds the image back from the device, the decoded image product's
+/// values (`feedback`).
 ///
 /// Reads the dimensions and size through `png_artifact_info`; returns `None`
 /// when the payload has no PNG header with nonzero dimensions.
-fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<Event> {
+fn image_done_event(
+    image_id: u32,
+    pixels_png_b64: String,
+    feedback: Option<Arc<crate::ImagePixels>>,
+) -> Option<Event> {
     let metadata = png_artifact_info(&pixels_png_b64)?;
     Some(Event::ImageDone {
         image_id,
@@ -161,6 +168,7 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<Event> {
         width: metadata.width,
         bytes: metadata.bytes,
         pixels_png_b64,
+        feedback,
     })
 }
 
@@ -182,7 +190,7 @@ pub struct SpecialTokenIds {
 
 /// Request-held reference to a reusable encoder-cache entry.
 struct EncoderCachePin {
-    key: u64,
+    key: crate::kv_cache::EncoderKey,
     product: TensorRef,
 }
 
@@ -351,6 +359,11 @@ struct MediaFlowState {
     /// (`TerminalIntent::Migrate`); it leaves once they stored it or failed
     /// to.
     offloading: bool,
+    /// How each denoising rank's request slot pages hold the request's
+    /// samples, by rank, as its latent preparation reported them
+    /// (`CallOutput::latent_layouts`): a stored trajectory's pages are keyed
+    /// and recorded by them.
+    latent_layouts: BTreeMap<u32, String>,
 }
 
 /// What a video request's latent preparation opens its trajectory from.
@@ -387,8 +400,9 @@ enum DiffusionTerminal {
     Finished(FinishReason),
     /// The request leaves for the cause given, preempted at a denoising
     /// step boundary, with the steps of its trajectory the host latent
-    /// pools stored (zero for none); the daemon submits it again.
-    Migrated(MigrationCause, u32),
+    /// pools stored (zero for none) and the record of where they lie
+    /// (`Trajectory::stored_layout`); the daemon submits it again.
+    Migrated(MigrationCause, u32, Vec<u8>),
 }
 
 struct PendingMedia {
@@ -463,6 +477,9 @@ pub struct Scheduler {
     /// The host latent pools of the video denoiser, when they serve its
     /// worker group (`Scheduler::enable_trajectory_store`).
     trajectories: Option<crate::trajectories::TrajectoryStore>,
+    /// The host encoder pools of the video encoders, when they serve their
+    /// worker groups (`Scheduler::enable_encoder_store`).
+    encoder_outputs: Option<crate::encoder_outputs::EncoderStore>,
     /// Set once the scheduler closes its workers: it admits and schedules
     /// nothing more while it offloads its last pages to the host KV cache
     /// (`Scheduler::flush_offloads`).

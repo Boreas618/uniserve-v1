@@ -96,7 +96,20 @@ pub struct ExecutorInfo {
     /// leaves it empty, which stores no preempted trajectory, and a
     /// simulated executor states its own (`SimEngine::set_latent_pools`).
     pub rank_latents: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
+    /// For each pool, each rank's host encoder pool as the rank reported it,
+    /// and the rank's host, in rank order: the ranks that execute video
+    /// encoder calls report one, every other rank none
+    /// (`ipc::WorkerInfo::encoder_pool`).
+    ///
+    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// leaves it empty, which stores no encoder output, and a simulated
+    /// executor states its own (`SimEngine::set_encoder_pools`).
+    pub rank_encoders: BTreeMap<WorkerGroupId, RankEncoderPools>,
 }
+
+/// Each rank's host and its host encoder pool, as it reported it, in rank
+/// order (`ExecutorInfo::rank_encoders`).
+pub type RankEncoderPools = Vec<(String, Option<Box<ipc::EncoderPoolInfo>>)>;
 
 impl ExecutorInfo {
     /// Constructs capability information for multiple pools.
@@ -435,6 +448,25 @@ impl ExecutorInfo {
             .and_then(|info| info.captured_latents.clone());
         merged.image_unconditional_token_ids =
             flow.and_then(|info| info.image_unconditional_token_ids.clone());
+        // Each image encoder's output is the one the worker that serves its
+        // encoding states.
+        merged.image_encoders.clear();
+        for (call, name) in [
+            (
+                MediaCall::VisionEncoding,
+                crate::scheduler::encodings::VISION_FEATURES,
+            ),
+            (
+                MediaCall::LatentEncoding,
+                crate::scheduler::encodings::LATENT_FEATURES,
+            ),
+        ] {
+            if let Some(output) =
+                routed(CallKind::Media(call)).and_then(|info| info.image_encoders.get(name))
+            {
+                merged.image_encoders.insert(name.to_owned(), *output);
+            }
+        }
         merged.diffusion_lm_step_rows = self
             .workers
             .iter()

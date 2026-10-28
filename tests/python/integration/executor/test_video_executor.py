@@ -18,9 +18,10 @@ exactly, as the image executor's do, because a predicated call runs the
 same kernels on the same inputs and selects their result.
 
 A resumed request's latent preparation restores the trajectory stored at a
-step boundary, each page of its slot a float32 host page of the host latent
-pool: the steps that follow compute exactly what the uninterrupted
-trajectory computed from that step.
+step boundary from host pages of the host latent pool, with the copies the
+worker plans from the stored layout to the one the preparation declares
+(``latent_restore_copies``): the steps that follow compute exactly what the
+uninterrupted trajectory computed from that step.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from uniserve import worker as library
 from uniserve.bindings.workspace import Scratch
 from uniserve.executor.video import VideoExecutor
 from uniserve.loading.rank import Description, Loaded
@@ -252,12 +254,15 @@ class Worker:
         reads: list[torch.Tensor],
         predicate: bool | None,
         stored: list[torch.Tensor] = (),
+        restore=None,
     ) -> None:
         """Run one call of ``kind``, gated by a device predicate if given.
 
         The worker appends a restoring preparation's stored pages after its
         reads, and a predicated call's ``uint8 [1]`` predicate after the
-        batch's other tensors, naming its position in the call's entry.
+        batch's other tensors, naming its position in the call's entry. A
+        restoring preparation's ``restore`` gives its ``latent["restore"]``
+        from what the executor prepared, as the worker binds it.
         """
         entry = {
             "index": 0,
@@ -282,17 +287,56 @@ class Worker:
         step = {"calls": [entry]}
         step["prepared"] = self.executor.prepare(step)
         assert step["prepared"][0]["reads"] == list(range(len(reads)))
+        if restore is not None:
+            entry["latent"]["restore"] = restore(step["prepared"][0])
         self.executor.execute(step, tensors)
 
     def prepare_latents(self, slot, write, reads, predicate=None) -> None:
         self.run("latent_preparation", slot, {"write": write}, reads, predicate)
 
     def restore(self, slot, write, reads, stored, predicate=None) -> None:
-        """Prepare ``slot`` from ``reads`` and restore ``stored``, one host
-        page per page of the slot, into bank ``write``.
+        """Prepare ``slot`` from ``reads`` and restore ``stored``, the
+        slot's pages as the rank stored them (page-locked ``uint8
+        [page_bytes]`` pages of the host latent pool), into bank ``write``,
+        with the copies the worker plans from the stored layout, the one the
+        preparation declares, to itself: every page that holds samples
+        whole.
         """  # noqa: D205
-        latent = {"write": write, "restore": list(range(len(stored)))}
-        self.run("latent_preparation", slot, latent, reads, predicate, stored)
+        page_bytes = int(stored[0].numel())
+
+        def copies(prepared: dict) -> dict:
+            layout = {
+                "layout": prepared["latent_layout"],
+                "page_bytes": page_bytes,
+            }
+            request = {
+                "sources": [layout],
+                "target": layout,
+                "content": [0] * 32,
+            }
+            planned = json.loads(
+                str(
+                    library.library()["latent_restore_copies"](
+                        json.dumps(request)
+                    )
+                )
+            )
+            assert all(
+                (offset, length) == (0, page_bytes)
+                for _, _, offset, _, length in planned
+            )
+            return {
+                "pages": len(stored),
+                "copies": [
+                    [page, offset, at, length]
+                    for _, page, offset, at, length in planned
+                ],
+            }
+
+        latent = {"write": write}
+        self.run(
+            "latent_preparation", slot, latent, reads, predicate, stored, copies
+        )
 
     def denoise(self, slot, read, write, step, predicate=None) -> None:
         latent = {"read": read, "write": write, "step": step}
@@ -374,9 +418,10 @@ def test_a_restored_trajectory_continues_as_the_uninterrupted_one(worker, slot):
     assert not torch.equal(second, first)
 
     # The trajectory stored at its first step, as the host latent pool
-    # holds it: one page-locked ``[page_units]`` float32 page per page of
-    # the slot.
-    stored = [page.reshape(-1).cpu().pin_memory() for page in first]
+    # holds it: one page-locked page of bytes per page of the slot.
+    stored = [
+        page.reshape(-1).cpu().pin_memory().view(torch.uint8) for page in first
+    ]
     # A skipped restoring preparation keeps the bank it would write.
     worker.restore(slot, 0, own, stored, predicate=False)
     assert torch.equal(worker.bank(0, slot), second)

@@ -205,6 +205,14 @@ impl Scheduler {
                         // which a preemption stored short of the schedule.
                         let opened = state.denoising.open(record.step_index, None);
                         debug_assert!(opened, "a restored trajectory has a step left");
+                        // How each denoising rank holds the request's
+                        // samples, which a preemption keys and records the
+                        // stored trajectory by.
+                        state.latent_layouts = record
+                            .latent_layouts
+                            .iter()
+                            .map(|layout| (layout.rank, layout.layout.clone()))
+                            .collect();
                         consumed_products.extend(state.condition_video_latents.iter().cloned());
                         consumed_products.extend(state.condition_audio_latents.iter().cloned());
                     }
@@ -292,6 +300,11 @@ impl Scheduler {
         if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
             self.end_restore(id);
         }
+        // An encoder call that read or wrote its output in the host encoder
+        // pool completed.
+        if let Some(store) = self.encoder_outputs.as_mut() {
+            store.call_completed(call.request_key, call.call_id, valid);
+        }
 
         // Retire the request only once none of its calls remain in flight. A
         // failure outranks a finish, which outranks a closed output; a muxed
@@ -335,9 +348,13 @@ impl Scheduler {
         };
         self.running_order.retain(|candidate| *candidate != id);
         // The pins of its stored trajectory end, and a store not yet carried
-        // to its workers is aborted.
+        // to its workers is aborted; so do its encoder outputs' pins and
+        // reservations.
         if let Some(store) = self.trajectories.as_mut() {
             store.forget(id);
+        }
+        if let Some(store) = self.encoder_outputs.as_mut() {
+            store.forget(state.admission.request_key);
         }
         match event {
             DiffusionTerminal::Completed(artifact) => {
@@ -368,10 +385,11 @@ impl Scheduler {
                     images: 0,
                 });
             }
-            DiffusionTerminal::Migrated(cause, denoised_steps) => {
+            DiffusionTerminal::Migrated(cause, denoised_steps, stored_layout) => {
                 let _ = state.output.enqueue(Event::Migratable {
                     cause,
                     denoised_steps,
+                    stored_layout,
                 });
             }
         }
@@ -731,6 +749,15 @@ impl Scheduler {
                     }
                     InflightInput::Generation { image_cache } => image_cache,
                 };
+                // An image encoding that read or wrote its output in the host
+                // encoder pool completed: it succeeded only when it ran.
+                if let Some(store) = self.encoder_outputs.as_mut() {
+                    store.call_completed(
+                        record.request_key,
+                        call_id,
+                        record.status == CallStatus::Ok,
+                    );
+                }
 
                 // A request already finishing with an error discards the
                 // result's products.

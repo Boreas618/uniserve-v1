@@ -443,6 +443,7 @@ mod tests {
             width: 1,
             bytes: 3,
             pixels_png_b64: "cG5n".to_string(),
+            feedback: None,
         })
         .unwrap();
         assert!(

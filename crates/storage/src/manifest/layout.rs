@@ -655,7 +655,7 @@ impl StorageLayout {
         window: &Range<u64>,
         fingerprint: &dyn Fn(&str) -> Option<[u8; 32]>,
     ) -> Result<crate::Key> {
-        let mut digest = super::Digest::new(b"uniserve-weight-chunk");
+        let mut digest = crate::key::Digest::new(b"uniserve-weight-chunk");
         digest.number(window.end - window.start);
         for piece in self.pieces(window) {
             let index = match &piece {

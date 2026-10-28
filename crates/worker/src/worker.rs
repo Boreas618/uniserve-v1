@@ -60,6 +60,7 @@ use crate::executor::transfer::TransferRuntime;
 use crate::ffi::{Handle, Interpreter};
 use crate::job::{BLOCK_ON_TIMEOUT, JobQueue};
 use crate::memory::allocation::Storage;
+use crate::memory::encoders::{self, EncoderHostPool};
 use crate::memory::prefix_cache::host::{self, HostCacheSetup};
 use crate::memory::retained::Retained;
 use crate::memory::weights::{self, WeightKeys};
@@ -587,11 +588,105 @@ impl Worker {
                 Ok(reported)
             });
             match started {
-                Ok(reported) => info.latent_pool = Some(reported),
+                Ok(reported) => info.latent_pool = Some(Box::new(reported)),
                 Err(error) => tracing::warn!(
                     %error,
                     "no host latent pool: preempted video requests resume from noise"
                 ),
+            }
+        }
+        // A rank that executes video encoder calls maps its host's encoder
+        // pool, which a request's encoder outputs are written to and read
+        // from by every world that computes them the same; without one its
+        // encoders compute every output.
+        if let (Some(capacity), Some(fingerprints), Some(cuda), Some(computations)) = (
+            video_capacity.as_ref(),
+            fingerprints.as_ref(),
+            device.cuda(),
+            bound.computations.as_mut(),
+        ) && !capacity.manifest.encoder_identities.is_empty()
+        {
+            // An output's identity is that of what computes it with the
+            // weights' values, as the rank's cache pages are keyed.
+            let identities = capacity
+                .manifest
+                .encoder_identities
+                .iter()
+                .map(|(product, identity)| (product.clone(), fingerprints.pages(identity)))
+                .collect();
+            // The largest bytes of each encoder output a request writes,
+            // whichever component of the deployment writes it.
+            let largest: Vec<u64> = capacity
+                .manifest
+                .outputs
+                .values()
+                .flatten()
+                .filter(|output| encoders::OUTPUTS.contains(&output.name.as_str()))
+                .map(|output| {
+                    output
+                        .shape_bound
+                        .max_elements()
+                        .saturating_mul(output.dtype.element_bytes())
+                })
+                .collect();
+            let pages = encoders::pool_pages(&largest, info.request_slots as usize);
+            match EncoderHostPool::start(
+                &retained,
+                cuda,
+                pages,
+                identities,
+                launch.storage.tcp.as_deref(),
+            ) {
+                Ok((pool, reported)) => {
+                    computations.attach_encoders(pool);
+                    info.encoder_pool = Some(Box::new(reported));
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "no host encoder pool: video encoders compute every output"
+                ),
+            }
+        }
+        // A rank that executes an image model's encodings states what each
+        // of its encoders writes, and maps its host's encoder pool, which an
+        // image's features are written to and read from by every world that
+        // computes them the same; without one its encoders compute every
+        // encoding the engine's encoder cache does not hold.
+        if let Some(image) = manifest
+            .image
+            .as_ref()
+            .filter(|image| !image.encoders.is_empty())
+        {
+            info.image_encoders = Box::new(image.encoder_outputs());
+            if let (Some(fingerprints), Some(cuda), Some(computations)) = (
+                fingerprints.as_ref(),
+                device.cuda(),
+                bound.computations.as_mut(),
+            ) {
+                let identities = image
+                    .encoders
+                    .iter()
+                    .map(|(name, encoder)| (name.clone(), fingerprints.pages(&encoder.identity)))
+                    .collect();
+                // An image's features at their largest, of each encoder.
+                let largest = [image.vision_feature_bytes, image.latent_feature_bytes];
+                let pages = encoders::pool_pages(&largest, info.request_slots as usize);
+                match EncoderHostPool::start(
+                    &retained,
+                    cuda,
+                    pages,
+                    identities,
+                    launch.storage.tcp.as_deref(),
+                ) {
+                    Ok((pool, reported)) => {
+                        computations.attach_encoders(pool);
+                        info.encoder_pool = Some(Box::new(reported));
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "no host encoder pool: image encoders compute every encoding"
+                    ),
+                }
             }
         }
         let placement = GroupPlacement {

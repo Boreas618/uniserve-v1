@@ -198,3 +198,98 @@ impl Drop for SharedMedia {
         unsafe { libc::munmap(self.address, self.bytes) };
     }
 }
+
+/// The media an image decoding publishes: the image's base64 PNG, and, when
+/// the decoding writes its request's feedback image product
+/// (`Call::image_output`), that product's values after it (see
+/// [`append_feedback`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageMedia<'a> {
+    /// The base64 PNG the client receives.
+    pub png_b64: &'a [u8],
+    /// The feedback product's values, when the decoding wrote it.
+    pub feedback: Option<proto::request::ImagePixels>,
+}
+
+/// The byte naming a feedback product's value range in an image decoding's
+/// media.
+const fn range_byte(range: proto::request::PixelRange) -> u8 {
+    match range {
+        proto::request::PixelRange::Unit => 0,
+        proto::request::PixelRange::SignedUnit => 1,
+    }
+}
+
+/// Appends a feedback image product's `values` (BF16 `[3, height, width]`,
+/// row-major, little-endian) and its value `range` to the base64 PNG `media`
+/// of the image decoding that wrote it: the values, then one byte naming
+/// the range (0 for `[0, 1]`, 1 for `[-1, 1]`).
+pub fn append_feedback(media: &mut Vec<u8>, values: &[u8], range: proto::request::PixelRange) {
+    media.extend_from_slice(values);
+    media.push(range_byte(range));
+}
+
+/// Reads the media of an image decoding of a `height` x `width` image,
+/// which carries the feedback product's values after its PNG when
+/// `feedback` (the call wrote `Call::image_output`).
+///
+/// Returns `None` when the media is shorter than the values it must carry
+/// or names an unknown range.
+pub fn parse_image_media(
+    bytes: &[u8],
+    height: u32,
+    width: u32,
+    feedback: bool,
+) -> Option<ImageMedia<'_>> {
+    if !feedback {
+        return Some(ImageMedia {
+            png_b64: bytes,
+            feedback: None,
+        });
+    }
+    let values = usize::try_from(proto::request::ImagePixels::value_bytes(height, width)).ok()?;
+    let (range, rest) = bytes.split_last()?;
+    let png_end = rest.len().checked_sub(values)?;
+    let range = match *range {
+        0 => proto::request::PixelRange::Unit,
+        1 => proto::request::PixelRange::SignedUnit,
+        _ => return None,
+    };
+    Some(ImageMedia {
+        png_b64: &rest[..png_end],
+        feedback: Some(proto::request::ImagePixels {
+            height,
+            width,
+            range,
+            values: rest[png_end..].to_vec(),
+        }),
+    })
+}
+
+#[cfg(test)]
+mod image_media_tests {
+    use super::*;
+    use proto::request::PixelRange;
+
+    /// An image decoding's media round-trips its PNG and its feedback
+    /// product's values and range; media without feedback is the PNG alone,
+    /// and media too short for the values it must carry is refused.
+    #[test]
+    fn image_media_carries_the_feedback_product_after_the_png() {
+        let png = b"iVBORw0KGgo=".to_vec();
+        let values: Vec<u8> = (0..2 * 3 * 4 * 2).map(|value| value as u8).collect();
+        let mut media = png.clone();
+        append_feedback(&mut media, &values, PixelRange::SignedUnit);
+        let parsed = parse_image_media(&media, 2, 4, true).unwrap();
+        assert_eq!(parsed.png_b64, png.as_slice());
+        let feedback = parsed.feedback.unwrap();
+        assert_eq!(feedback.values, values);
+        assert_eq!(feedback.range, PixelRange::SignedUnit);
+        assert!(feedback.is_complete());
+
+        let plain = parse_image_media(&png, 2, 4, false).unwrap();
+        assert_eq!(plain.png_b64, png.as_slice());
+        assert!(plain.feedback.is_none());
+        assert!(parse_image_media(&png, 2, 4, true).is_none());
+    }
+}

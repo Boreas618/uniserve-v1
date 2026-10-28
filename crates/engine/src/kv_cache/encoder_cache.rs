@@ -1,15 +1,22 @@
-//! Reference-counted cache of worker-resident encoder products.
+//! Reference-counted cache of worker-resident encoder products: the device
+//! tier of image requests' encoder outputs, nearer than the host encoder
+//! pools (`crate::encoder_outputs`).
 //!
-//! Content-derived keys (`crate::encoder_cache_key`, over the image
-//! hash, the encoder's index in the image's encoders, and its encoding call)
-//! map to immutable product references. The scheduler owns this bookkeeping;
-//! the tensors themselves live in worker buffers. Requests pin the entries they read, unpinned
+//! Content-derived keys (`crate::scheduler::encodings::device_key`, over
+//! what the encoding read: the image's digest, the encoder's output and, for
+//! an encoder that samples, the request's draw) map to immutable product
+//! references. The scheduler owns this bookkeeping; the tensors themselves
+//! live in worker buffers. Requests pin the entries they read, unpinned
 //! entries participate in LRU eviction, and every operation that gives up
 //! worker storage returns the product so the scheduler can queue a `Free` for
 //! its buffer.
 
 use ipc::TensorRef;
 use std::collections::{BTreeMap, HashMap};
+
+/// The content key of an encoder product: the SHA-256 digest of what its
+/// encoding read and what it writes.
+pub(crate) type EncoderKey = [u8; 32];
 
 struct Entry {
     product: TensorRef,
@@ -43,22 +50,22 @@ pub(crate) struct EncoderCacheStats {
 /// `insert`, `evict_one`, `invalidate_buffers`, or `release` must have its
 /// worker buffer freed.
 pub(crate) struct EncoderCacheManager {
-    budget: usize,                // max cached entries
-    entries: HashMap<u64, Entry>, // content hash -> entry
+    budget: usize,                       // max cached entries
+    entries: HashMap<EncoderKey, Entry>, // content key -> entry
     // `invalidate_buffers` removes entries from lookup immediately, but a
     // worker-side tensor cannot be reclaimed while an in-flight request still
     // holds a reference. Those entries remain here until their final pin is
     // released. Inserting the identical product under the same hash, while no
     // active entry holds that hash, reactivates the retired entry with its
     // pins.
-    retired: HashMap<u64, Vec<Entry>>, // content hash -> pinned retired generations
+    retired: HashMap<EncoderKey, Vec<Entry>>, // content key -> pinned retired generations
     // Index of evictable (ref_cnt == 0) active entries ordered by LRU tick, so
     // the victim search is O(log n) instead of a scan of `entries`.
     // Invariant: a hash is in `evictable` keyed by its current `Entry::lru`
     // iff its `ref_cnt == 0`. Ticks are globally unique (monotonic
     // `next_tick`), so each entry occupies at most one key here. Retired
     // entries are never indexed.
-    evictable: BTreeMap<u64, u64>, // lru tick -> content hash
+    evictable: BTreeMap<u64, EncoderKey>, // lru tick -> content key
     tick: u64,
     pub(crate) stats: EncoderCacheStats,
 }
@@ -88,7 +95,7 @@ impl EncoderCacheManager {
     }
 
     /// Returns a resident output without changing LRU order or cache metrics.
-    pub(crate) fn peek_product(&self, hash: u64) -> Option<TensorRef> {
+    pub(crate) fn peek_product(&self, hash: EncoderKey) -> Option<TensorRef> {
         self.entries.get(&hash).map(|entry| entry.product.clone())
     }
 
@@ -130,7 +137,7 @@ impl EncoderCacheManager {
     ///
     /// Counts a query and, on a hit, a hit whose entry becomes most recent.
     /// Does not pin the entry; callers that consume it call `acquire`.
-    pub(crate) fn lookup_product(&mut self, hash: u64) -> Option<TensorRef> {
+    pub(crate) fn lookup_product(&mut self, hash: EncoderKey) -> Option<TensorRef> {
         self.stats.queries += 1;
         let tick = self.next_tick();
         if let Some(e) = self.entries.get_mut(&hash) {
@@ -186,7 +193,7 @@ impl EncoderCacheManager {
     /// `stats.over_budget_inserts`. Admission checks reserved encoder-cache
     /// entries against `budget` only for requests that reserve their worst
     /// case.
-    pub(crate) fn insert(&mut self, hash: u64, product: TensorRef) -> Option<TensorRef> {
+    pub(crate) fn insert(&mut self, hash: EncoderKey, product: TensorRef) -> Option<TensorRef> {
         if self.entries.contains_key(&hash) {
             let tick = self.next_tick();
             if let Some(existing) = self.entries.get_mut(&hash) {
@@ -257,7 +264,7 @@ impl EncoderCacheManager {
     ///
     /// Returns `None` without pinning when `hash` has no active entry. Does not
     /// count a query or hit.
-    pub(crate) fn acquire(&mut self, hash: u64) -> Option<TensorRef> {
+    pub(crate) fn acquire(&mut self, hash: EncoderKey) -> Option<TensorRef> {
         let tick = self.next_tick();
         let e = self.entries.get_mut(&hash)?;
         let old_lru = e.lru;
@@ -278,7 +285,7 @@ impl EncoderCacheManager {
     /// pinned a since-invalidated product releases the retired entry, not an
     /// active replacement under the same hash. Releasing a pin that no entry
     /// holds is a no-op returning `None`.
-    pub(crate) fn release(&mut self, hash: u64, product: &TensorRef) -> Option<TensorRef> {
+    pub(crate) fn release(&mut self, hash: EncoderKey, product: &TensorRef) -> Option<TensorRef> {
         if let Some(e) = self.entries.get_mut(&hash)
             && &e.product == product
             && e.ref_cnt > 0
@@ -334,8 +341,8 @@ mod tests {
     fn lookup_returns_the_exact_producer_reference() {
         let mut cache = EncoderCacheManager::new(4);
         let expected = product(100);
-        cache.insert(1, expected.clone());
-        assert_eq!(cache.lookup_product(1), Some(expected));
+        cache.insert([1; 32], expected.clone());
+        assert_eq!(cache.lookup_product([1; 32]), Some(expected));
         assert_eq!(cache.stats.queries, 1);
         assert_eq!(cache.stats.hits, 1);
     }
@@ -346,21 +353,21 @@ mod tests {
         let first = product(100);
         let second = product(200);
         let third = product(300);
-        cache.insert(1, first.clone());
-        cache.insert(2, second.clone());
-        cache.lookup_product(1);
-        assert_eq!(cache.insert(3, third), Some(second));
-        assert_eq!(cache.lookup_product(1), Some(first));
+        cache.insert([1; 32], first.clone());
+        cache.insert([2; 32], second.clone());
+        cache.lookup_product([1; 32]);
+        assert_eq!(cache.insert([3; 32], third), Some(second));
+        assert_eq!(cache.lookup_product([1; 32]), Some(first));
     }
 
     #[test]
     fn pinned_products_remain_exact_under_capacity_pressure() {
         let mut cache = EncoderCacheManager::new(1);
         let pinned = product(100);
-        cache.insert(1, pinned.clone());
-        assert_eq!(cache.acquire(1), Some(pinned.clone()));
-        cache.insert(2, product(200));
-        assert_eq!(cache.lookup_product(1), Some(pinned));
+        cache.insert([1; 32], pinned.clone());
+        assert_eq!(cache.acquire([1; 32]), Some(pinned.clone()));
+        cache.insert([2; 32], product(200));
+        assert_eq!(cache.lookup_product([1; 32]), Some(pinned));
         assert_eq!(cache.stats.over_budget_inserts, 1);
     }
 
@@ -374,19 +381,19 @@ mod tests {
         let pinned = product(100);
         let unpinned = product(200);
         let replacement = product(300);
-        cache.insert(1, pinned.clone());
-        cache.insert(2, unpinned.clone());
-        assert_eq!(cache.acquire(1), Some(pinned.clone()));
-        assert_eq!(cache.acquire(1), Some(pinned.clone()));
+        cache.insert([1; 32], pinned.clone());
+        cache.insert([2; 32], unpinned.clone());
+        assert_eq!(cache.acquire([1; 32]), Some(pinned.clone()));
+        assert_eq!(cache.acquire([1; 32]), Some(pinned.clone()));
         let lost = [pinned.buffer_id(), unpinned.buffer_id()]
             .into_iter()
             .collect();
         assert_eq!(cache.invalidate_buffers(&lost), vec![unpinned]);
-        assert_eq!(cache.lookup_product(1), None);
-        assert_eq!(cache.insert(1, replacement.clone()), None);
-        assert_eq!(cache.release(1, &pinned), None);
-        assert_eq!(cache.release(1, &pinned), Some(pinned.clone()));
-        assert_eq!(cache.release(1, &pinned), None);
-        assert_eq!(cache.lookup_product(1), Some(replacement));
+        assert_eq!(cache.lookup_product([1; 32]), None);
+        assert_eq!(cache.insert([1; 32], replacement.clone()), None);
+        assert_eq!(cache.release([1; 32], &pinned), None);
+        assert_eq!(cache.release([1; 32], &pinned), Some(pinned.clone()));
+        assert_eq!(cache.release([1; 32], &pinned), None);
+        assert_eq!(cache.lookup_product([1; 32]), Some(replacement));
     }
 }

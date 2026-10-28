@@ -7,7 +7,7 @@
 //!   the scheduler ends every request that resumes from its generated tokens
 //!   as migratable, ends every video request as migratable at its next
 //!   denoising step boundary once its trajectory is stored (`preemption`),
-//!   lets the others finish, and once nothing runs, offloads
+//!   lets its readouts finish, and once nothing runs, offloads
 //!   the pages it reserved for the host KV cache and executes nothing more.
 //!   It answers with its prefix cache index: every published page with its
 //!   units, which the successor reads from the planes it maps read-only.
@@ -65,6 +65,13 @@ pub struct ParkedCache {
     /// recomputing them computes again.
     pub held_units: u32,
     pub requests: u32,
+    /// Of `held_units`, the units of the migrating requests that reserved
+    /// their whole cache at admission (`RequestState::reserve_worstcase`,
+    /// a request with images), and how many they were: a successor
+    /// reserves their whole cache again, since it computes their context
+    /// anew, whether or not it recomputes the others.
+    pub reserved_units: u32,
+    pub reserving: u32,
 }
 
 /// A park waiting for the scheduler's requests to end.
@@ -72,6 +79,8 @@ pub(super) struct Parking {
     answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
     held_units: u32,
     requests: u32,
+    reserved_units: u32,
+    reserving: u32,
 }
 
 impl Scheduler {
@@ -90,20 +99,26 @@ impl Scheduler {
             return;
         }
         // What the requests that leave as migratable hold, before they let
-        // it go.
-        let migrating: Vec<u32> = self
+        // it go, and whether they reserved their whole cache at admission.
+        let migrating: Vec<(u32, bool)> = self
             .running
             .values()
             .filter(|state| state.req.is_migratable() && !state.terminal_intent.is_terminal())
             .map(|state| {
-                state.allocations.as_ref().map_or(0, |allocations| {
+                let units = state.allocations.as_ref().map_or(0, |allocations| {
                     allocations
                         .block_tables()
                         .iter()
                         .map(|table| table.unit_ids().len() as u32)
                         .sum()
-                })
+                });
+                (units, state.reserve_worstcase)
             })
+            .collect();
+        let reserved: Vec<u32> = migrating
+            .iter()
+            .filter(|(_, reserves)| *reserves)
+            .map(|(units, _)| *units)
             .collect();
         tracing::info!("parking: the requests that resume elsewhere end as migratable");
         self.migrate_requests(MigrationCause::Drain);
@@ -112,8 +127,10 @@ impl Scheduler {
         self.preempt_media(MigrationCause::Drain, |_| true);
         self.parking = Some(Parking {
             answer,
-            held_units: migrating.iter().sum(),
+            held_units: migrating.iter().map(|(units, _)| units).sum(),
             requests: migrating.len() as u32,
+            reserved_units: reserved.iter().sum(),
+            reserving: reserved.len() as u32,
         });
         self.poll_park();
     }
@@ -173,6 +190,8 @@ impl Scheduler {
             pages: index,
             held_units: parking.held_units,
             requests: parking.requests,
+            reserved_units: parking.reserved_units,
+            reserving: parking.reserving,
         }));
     }
 
@@ -202,8 +221,10 @@ impl Scheduler {
     ///
     /// Fails, changing nothing, when the world's KV cache limit in the
     /// trial cannot hold what the requests the predecessor hands over
-    /// compute: all the units they held when they `recompute` from their
-    /// tokens, beside a page each, the last they continue. The limit is the
+    /// compute: the whole cache a request reserved at admission (one with
+    /// images), which it reserves again, and of every other request all the
+    /// units it held when they `recompute` from their tokens, beside a page
+    /// each, the last they continue. The limit is the
     /// units its own segments hold free, and those of the segments it has
     /// yet to create that every device's memory ledger has room for: the
     /// quota less everything booked, the predecessor's kept memory
@@ -226,7 +247,17 @@ impl Scheduler {
             .iter()
             .map(|group| group.units_per_page as u32)
             .sum();
-        let needed = parked.requests * page_units + if recompute { parked.held_units } else { 0 };
+        // A request that reserved its whole cache at admission reserves it
+        // again, and its context, rebuilt anew, reads no page the
+        // predecessor published.
+        let others = parked.requests.saturating_sub(parked.reserving);
+        let needed = others * page_units
+            + parked.reserved_units
+            + if recompute {
+                parked.held_units.saturating_sub(parked.reserved_units)
+            } else {
+                0
+            };
         let own_free = cache.block_pool.free_units() as u32;
         let growable = match self.cache_memory()? {
             Some(reports) => {
@@ -250,8 +281,16 @@ impl Scheduler {
                 "the successor world's KV cache holds {free} free units within its memory \
                  ledgers until its commit ({own_free} in its own segments, {growable} in the \
                  segments the ledgers have room for), and the {} requests in flight need \
-                 {needed}{}",
+                 {needed}{}{}",
                 parked.requests,
+                if parked.reserving > 0 {
+                    format!(
+                        ", {} of them reserving their whole cache of {} units again",
+                        parked.reserving, parked.reserved_units
+                    )
+                } else {
+                    String::new()
+                },
                 if recompute {
                     ", recomputing the units they held"
                 } else {

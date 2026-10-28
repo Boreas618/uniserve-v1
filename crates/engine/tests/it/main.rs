@@ -6,6 +6,7 @@
 mod cache_memory;
 mod canvas;
 mod control_plane;
+mod encoder_outputs;
 mod image_ipc;
 mod media_occupancy;
 mod media_preemption;

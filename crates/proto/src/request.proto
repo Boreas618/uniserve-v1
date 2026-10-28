@@ -512,6 +512,11 @@ message GroupIndex {
   // and how many requests they were.
   uint32 held_units = 3;
   uint32 requests = 4;
+  // Of those, the units and the number of the requests that reserved their
+  // whole cache at admission (a request with images), which a successor
+  // reserves whole again: it computes their context anew.
+  uint32 reserved_units = 5;
+  uint32 reserving = 6;
 }
 
 // One published page: its cache group, its chained hash, its tokens and its
@@ -556,6 +561,38 @@ message GenerationRequest {
   // The LoRA adapter the request computes with: the slot of the workers'
   // adapter pool the daemon loaded it into, or 0 for the base model alone.
   uint32 adapter = 16;
+  // The images a migrated request generated on the engines that served it
+  // before, in order, each at its place among `generated_token_ids`; empty
+  // for a new request. The engine writes each into the request's context as
+  // its feedback encoders read it when it was generated.
+  repeated GeneratedImage generated_images = 17;
+}
+
+// An image a migrated request generated before: what its feedback encoders
+// read, after the first `tokens` of the request's generated tokens.
+message GeneratedImage {
+  uint32 tokens = 1;
+  oneof image {
+    // The decoded image product, which feedback reads on the device.
+    ImagePixels pixels = 2;
+    // The image's PNG, base64, which feedback reads as an artifact.
+    string png_b64 = 3;
+  }
+}
+
+// The values of a decoded image product, exported to the host: BF16 values
+// of shape [3, height, width], row-major and little-endian, in `range`.
+message ImagePixels {
+  uint32 height = 1;
+  uint32 width = 2;
+  PixelRange range = 3;
+  bytes values = 4;
+}
+
+// The interval a decoded image product's values lie in.
+enum PixelRange {
+  PIXEL_RANGE_UNIT = 0;
+  PIXEL_RANGE_SIGNED_UNIT = 1;
 }
 
 enum GenerationConstraint {
@@ -565,12 +602,16 @@ enum GenerationConstraint {
 }
 
 message ImageInput {
-  uint64 hash = 1;
+  // The SHA-256 digest of what the image's encoders read of the request
+  // (its bytes, a request-dependent preprocessing parameter, its cache
+  // partition), which keys their outputs.
+  bytes digest = 6;
   // The encoded image, base64.
   string b64 = 2;
   uint32 position = 3;
   uint32 num_positions = 4;
   repeated ImageEncoderInput encoders = 5;
+  reserved 1;
 }
 
 enum ImageEncoder {
@@ -721,6 +762,28 @@ message DiffusionRequest {
   // numerics (a world change's `in_flight = keep`); absent, the engine reads
   // a trajectory of its own latent seed only.
   optional uint64 state_seed = 8;
+  // The digests of what each encoder computation reads, which key its
+  // outputs in the host tier; absent, the engine stores and finds none.
+  optional EncoderInputs encoder_inputs = 9;
+  // Where the engine that stored the trajectory put its pages and how each
+  // stored rank laid its part of the samples out, as that engine recorded
+  // it, which an engine of another parallel configuration finds and lays
+  // the pages out by; empty when `denoised_steps` is zero. The daemon does
+  // not read it.
+  bytes stored_layout = 10;
+}
+
+// The SHA-256 digests of what each encoder computation of a video request
+// reads, which the daemon computes from the request's facts.
+message EncoderInputs {
+  // The text encoding's.
+  bytes text = 1;
+  // The vision encoding's; absent without a vision block.
+  optional bytes vision = 2;
+  // Each visual condition unit's, in encoding order.
+  repeated bytes video_units = 3;
+  // The audio encoding's; absent without an audio track.
+  optional bytes audio = 4;
 }
 
 message ConditionExtent {
@@ -762,7 +825,16 @@ message Event {
     Rejected rejected = 16;
     Failed error = 17;
     Migratable migratable = 18;
+    ControlToken control_token = 19;
   }
+}
+
+// A generated token the request's text does not include: one that opens an
+// image or closes a round, or one a request that publishes no text
+// generated. The daemon keeps it, in order with the text tokens, to submit
+// a migrated request again with every token it generated.
+message ControlToken {
+  uint32 id = 1;
 }
 
 // The request ends on this engine without finishing: every token it
@@ -775,6 +847,9 @@ message Migratable {
   // stored in its host latent pools at the step boundary it was preempted
   // at, which the daemon submits it again with; zero when it stored none.
   uint32 denoised_steps = 2;
+  // With stored steps, where the engine put the trajectory's pages and how
+  // each stored rank laid its part out (`DiffusionRequest.stored_layout`).
+  bytes stored_layout = 3;
 }
 
 enum MigrationCause {
@@ -844,6 +919,10 @@ message ImageDone {
   uint64 bytes = 4;
   // The PNG payload, base64.
   string png_b64 = 5;
+  // The decoded image product the request's feedback encoders read, when
+  // the request feeds the image back from the device: the daemon keeps it
+  // to submit a migrated request again with it.
+  optional ImagePixels feedback = 6;
 }
 
 message MediaProgress {

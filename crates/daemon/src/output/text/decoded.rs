@@ -552,6 +552,7 @@ pub async fn decoded_text_event_stream(
                 width,
                 bytes,
                 pixels_png_b64,
+                ..
             } => {
                 state.ensure_output_ready(&request_id, "a completed image")?;
                 state.pending_images.push(GeneratedImage {
@@ -628,11 +629,12 @@ pub async fn decoded_text_event_stream(
                 return Ok(());
             }
             // A request's events migrate with it (`crate::migration`), which
-            // carries a migratable end over to the next engine.
-            Event::Migratable { .. } => {
+            // carries a migratable end over to the next engine and keeps the
+            // control tokens a migration submits again.
+            Event::Migratable { .. } | Event::ControlToken { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
-                    message: "a migratable end reached the decoder".to_string(),
+                    message: "a migration's event reached the decoder".to_string(),
                 });
             }
             // Media artifacts belong to diffusion requests, and readout

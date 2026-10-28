@@ -151,20 +151,20 @@ pub struct PagePoolInfo {
 }
 
 /// The host latent pool of a video denoising rank: the Storage Server page
-/// pool its preempted trajectories are written to and restored from, one
-/// pool page per page of a request slot's latent banks.
+/// pool its preempted trajectories are written to, one pool page per page
+/// of a request slot's latent banks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentPoolInfo {
-    /// The pool's identity at the rank's host's Storage Server.
-    pub pool: u64,
+    /// The pool, as any rank of the deployment on the host maps it.
+    pub pool: crate::LatentPoolRef,
     /// The pages a request slot owns in the rank's latent banks, each a
-    /// pool page; an offload or restore copies every one of them.
+    /// pool page; an offload copies every one of them.
     pub slot_pages: u32,
-    /// The digest of what a page's bytes mean besides the denoiser's
-    /// numerics: the page geometry and element type, the video plan that
-    /// selects a request's layout, and the rank's share of the denoiser's
-    /// rows. The engine keys the rank's pages with it and the deployment's
-    /// latent seed.
+    /// The digest of what determines the rank's share of every request's
+    /// samples: the video plan that selects a request's layout, the slot's
+    /// pages, the rank's coordinate in the denoiser's mesh and its rows of
+    /// every layout startup prepares. A rank of another world with the same
+    /// share holds what this rank held of any trajectory.
     pub region: [u8; 32],
     /// The identity of what the rank's trajectories are computed with: the
     /// weights' values and the declared function and format identities of
@@ -174,6 +174,42 @@ pub struct LatentPoolInfo {
     /// Where an engine on another host reaches the pool's Storage Server
     /// (`StorageLaunch::tcp`).
     pub endpoint: Option<String>,
+}
+
+/// The host encoder pool of a rank that executes encoder calls (a video
+/// model's encoders, an image model's vision and latent encoders): the
+/// Storage Server page pool, shared by the deployment's ranks on its host in
+/// every world of the deployment, that holds encoder outputs keyed by what
+/// the encoder read and what computes it (`Call::host_output`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncoderPoolInfo {
+    /// The pool's identity at the rank's host's Storage Server.
+    pub pool: u64,
+    /// The bytes of one pool page; an output takes as many pages as its
+    /// bytes fill.
+    pub page_bytes: u64,
+    /// The identity of what computes each encoder output the rank writes,
+    /// by the product's name: the weights' values and the declared
+    /// function and format identities of the modules computing it
+    /// (`uniserve.numerics`).
+    pub identities: std::collections::BTreeMap<String, String>,
+    /// Where an engine on another host reaches the pool's Storage Server
+    /// (`StorageLaunch::tcp`).
+    pub endpoint: Option<String>,
+}
+
+/// What an image encoder writes for one image (`WorkerInfo::image_encoders`):
+/// one feature row per cache token of the block the features write, at
+/// most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageEncoderOutput {
+    /// The bytes of one feature row.
+    pub row_bytes: u64,
+    /// Whether the features follow the request's image seed and the
+    /// encoding's posterior draw (`Call::latent_draw`) besides the image:
+    /// a latent encoder that samples its posterior rather than taking its
+    /// mean.
+    pub draws: bool,
 }
 
 impl PrefixCacheInfo {
@@ -676,7 +712,18 @@ pub struct WorkerInfo {
     pub latent_pages: u32,
     /// The host latent pool of a video denoising rank whose host runs a
     /// Storage Server; `None` otherwise, and in the group's aggregate.
-    pub latent_pool: Option<LatentPoolInfo>,
+    /// Boxed, as it is larger than most of the report.
+    pub latent_pool: Option<Box<LatentPoolInfo>>,
+    /// The host encoder pool of a rank that executes encoder calls and
+    /// whose host runs a Storage Server; `None` otherwise, and in the
+    /// group's aggregate. Boxed, as it is larger than most of the report.
+    pub encoder_pool: Option<Box<EncoderPoolInfo>>,
+    /// What each image encoder of this rank writes for one image, by the
+    /// name of its output (`vision_features`, `latent_features`); empty on a
+    /// rank without one. Boxed, as the report is larger than the other
+    /// responses a worker sends.
+    #[serde(default)]
+    pub image_encoders: Box<std::collections::BTreeMap<String, ImageEncoderOutput>>,
     /// Bytes of the persistent buffer pool this rank backs, which the engine
     /// places this rank's buffers in: on a media rank the products of the
     /// components it executes and of the components that read them.
@@ -871,6 +918,8 @@ impl Default for WorkerInfo {
             latent_page_units: 0,
             latent_pages: 0,
             latent_pool: None,
+            encoder_pool: None,
+            image_encoders: Box::default(),
             buffer_pool_bytes: 0,
             encoder_cache_entries: 0,
             encoder_entry_bytes: 0,

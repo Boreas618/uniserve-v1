@@ -41,6 +41,7 @@ fn request(
         readout: Vec::new(),
         generated_token_ids: generated,
         adapter: 0,
+        generated_images: Vec::new(),
     }
 }
 
@@ -384,6 +385,7 @@ impl engine::Executor for FaultingExecutor {
 fn fail_while_generating(
     trial: bool,
     fault: Fault,
+    request: GenerationRequest,
 ) -> (Vec<u32>, Option<Event>, bool, Option<String>) {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
@@ -404,9 +406,7 @@ fn fail_while_generating(
     let thread = thread::spawn(move || scheduler.run(rx));
     let handle = CommandSender::new(tx);
 
-    let mut events = handle
-        .submit(request(1, Vec::new(), SamplingParams::default(), 100_000))
-        .unwrap();
+    let mut events = handle.submit(request).unwrap();
     let mut tokens = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     while tokens.len() < 4 && Instant::now() < deadline {
@@ -436,7 +436,11 @@ fn fail_while_generating(
 /// the loss as its first error.
 #[test]
 fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
-    let (tokens, terminal, stopped, failure) = fail_while_generating(true, Fault::Lost);
+    let (tokens, terminal, stopped, failure) = fail_while_generating(
+        true,
+        Fault::Lost,
+        request(1, Vec::new(), SamplingParams::default(), 100_000),
+    );
     assert!(stopped, "a lost worker stops a scheduler on trial");
     assert!(tokens.len() >= 4, "{tokens:?}");
     assert!(
@@ -453,13 +457,64 @@ fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
     assert!(failure.contains("worker process exited"), "{failure}");
 }
 
+/// An image-generating request leaves as migratable for a loss when the
+/// workers of a world on trial are lost, whatever it was computing, as a
+/// text request does: the daemon submits it again, with its tokens and
+/// images, to the previous world.
+#[test]
+fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost() {
+    let mut image_request = request(1, Vec::new(), SamplingParams::default(), 100_000);
+    image_request.constraint = GenerationConstraint::Default;
+    image_request.max_images = 3;
+    image_request.image = ImageParams {
+        steps: 6,
+        height: 32,
+        width: 32,
+        ..ImageParams::default()
+    };
+    image_request.image_generation = ImageGenerationConfig {
+        trigger: engine::ImageTrigger::Token {
+            token_id: engine::sim_text_token(RequestId(1), 2),
+        },
+        requires_text_for_image: false,
+        feedback_source: Some(engine::FeedbackSource::DeviceProduct),
+        feedback_encoders: vec![engine::ImageEncoderInput {
+            encoder: engine::ImageEncoder::Vision,
+            num_cache_tokens: None,
+            max_cache_tokens: Some(16),
+            height: None,
+            width: None,
+        }],
+        num_feedback_positions: 2,
+        feedback_next_token: engine::FeedbackNextToken::EndOfImage,
+        sample_feedback_continuation: true,
+    };
+    let (tokens, terminal, stopped, _) = fail_while_generating(true, Fault::Lost, image_request);
+    assert!(stopped, "a lost worker stops a scheduler on trial");
+    assert!(tokens.len() >= 4, "{tokens:?}");
+    assert!(
+        matches!(
+            terminal,
+            Some(Event::Migratable {
+                cause: MigrationCause::Loss,
+                ..
+            })
+        ),
+        "{terminal:?}"
+    );
+}
+
 /// Non-finite logits fail a world on trial as a whole: the scheduler stops
 /// and hands the request back as migratable, naming the batch and its
 /// requests as its first error. Outside a trial they fail the request
 /// alone, as any failed call does, and the scheduler serves on.
 #[test]
 fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
-    let (tokens, terminal, stopped, failure) = fail_while_generating(true, Fault::NonFinite);
+    let (tokens, terminal, stopped, failure) = fail_while_generating(
+        true,
+        Fault::NonFinite,
+        request(1, Vec::new(), SamplingParams::default(), 100_000),
+    );
     assert!(stopped, "non-finite logits stop a scheduler on trial");
     assert!(
         matches!(
@@ -478,7 +533,11 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
     );
     assert!(tokens.len() >= 4, "{tokens:?}");
 
-    let (_, terminal, stopped, failure) = fail_while_generating(false, Fault::NonFinite);
+    let (_, terminal, stopped, failure) = fail_while_generating(
+        false,
+        Fault::NonFinite,
+        request(1, Vec::new(), SamplingParams::default(), 100_000),
+    );
     assert!(!stopped, "a scheduler not on trial serves on");
     assert!(failure.is_none(), "{failure:?}");
     assert!(
@@ -490,7 +549,9 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
 /// A successor promotes only while the units its own cache holds free hold
 /// what the requests its predecessor hands over compute: a request that
 /// recomputes more units than are free refuses the promotion, with both
-/// counts; one continuing with the state it reached needs a page.
+/// counts, as does a request that reserved its whole cache at admission
+/// even when the others continue with the state they reached; one
+/// continuing with the state it reached needs a page.
 #[test]
 fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
     let mut sim = SimEngine::new();
@@ -512,6 +573,8 @@ fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
         pages: Vec::new(),
         held_units: 64,
         requests: 1,
+        reserved_units: 0,
+        reserving: 0,
     };
     let refused = handle
         .promote(parked.clone(), true, false)
@@ -520,6 +583,22 @@ fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
     let reason = refused.expect_err("15 free units cannot hold 65");
     assert!(
         reason.contains("15 free units") && reason.contains("need 65"),
+        "{reason}"
+    );
+    // A request that reserved its whole cache at admission (one with
+    // images) reserves it whole again, whether or not the others recompute.
+    let reserving = engine::ParkedCache {
+        reserved_units: 64,
+        reserving: 1,
+        ..parked.clone()
+    };
+    let reason = handle
+        .promote(reserving, false, false)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers")
+        .expect_err("15 free units cannot hold a whole reservation of 64");
+    assert!(
+        reason.contains("15 free units") && reason.contains("need 64"),
         "{reason}"
     );
     assert!(

@@ -312,7 +312,7 @@ def _serve(worker: _Worker) -> dict:
     pixels = torch.linspace(0, 1, 3 * 32 * 32, device=DEVICE)
     pixels = pixels.reshape(3, 32, 32).to(torch.bfloat16)
     encode = {
-        **_call("latent_encoding"),
+        **_call("latent_encoding", latent_draw=0),
         "image": {
             "input": {
                 "resident": {
@@ -352,12 +352,17 @@ def _serve(worker: _Worker) -> dict:
         "latent": {"read": 1, "write": 1, "step": 2, **LATENT},
     }
     product = torch.zeros((3, 32, 32), dtype=torch.bfloat16, device=DEVICE)
-    staged = torch.zeros(3 * 32 * 32, dtype=torch.uint8).pin_memory()
+    # The RGB bytes, then the product's BF16 values.
+    staged = torch.zeros(9 * 32 * 32, dtype=torch.uint8).pin_memory()
     results["modes"] += worker.run(
         "image_decoding", [decode], lambda entry, planned: [product, staged]
     )
     results["product"] = product.cpu()
     results["bytes"] = staged.clone()
+    # The staged values are the product's: the image's exact feedback
+    # input, which a migrated request carries.
+    values = staged[3 * 32 * 32 :].view(torch.bfloat16).reshape(3, 32, 32)
+    assert torch.equal(values, results["product"])
     return results
 
 
@@ -394,6 +399,42 @@ def test_served_batches_replay_warmup_captures_and_equal_eager(stub):
     for name in ("rows", "latent", "product", "bytes"):
         assert torch.equal(replayed[name], served[name]), name
     assert np.isfinite(replayed["latent"].float().numpy()).all()
+
+
+def test_a_carried_image_encodes_as_its_resident_product(stub):
+    """A carried image encodes as the product it was decoded as.
+
+    A migrated request's carried image, the decoded product's values the
+    host staged, encodes to the latent rows the product itself encodes to,
+    at the same posterior draw.
+    """
+    worker = _Worker(stub, graphs=False)
+    worker.warm()
+    _start(worker)
+    pixels = torch.linspace(-1, 1, 3 * 32 * 32, device=DEVICE)
+    pixels = pixels.reshape(3, 32, 32).to(torch.bfloat16)
+    image = {
+        "shape": [3, 32, 32],
+        "height": 32,
+        "width": 32,
+        "value_range": "signed_unit",
+    }
+    encoded = {}
+    for kind, source in (
+        ("resident", pixels),
+        ("carried", pixels.cpu().pin_memory()),
+    ):
+        encode = {
+            **_call("latent_encoding", latent_draw=3),
+            "image": {"input": {kind: image}, "input_images": 0},
+        }
+        rows = torch.zeros((4, 768), dtype=torch.bfloat16, device=DEVICE)
+        worker.run(
+            "latent_encoding", [encode], lambda entry, planned: [source, rows]
+        )
+        encoded[kind] = rows.cpu()
+    assert torch.equal(encoded["carried"], encoded["resident"])
+    assert encoded["resident"].abs().sum() > 0
 
 
 def test_a_false_predicate_leaves_the_trajectory_as_it_was(stub):

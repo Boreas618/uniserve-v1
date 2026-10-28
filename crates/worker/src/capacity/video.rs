@@ -59,6 +59,12 @@ pub(crate) struct VideoManifest {
     /// which keys the trajectories it stores in its host latent pool.
     #[serde(default)]
     pub(crate) latent_region: Option<String>,
+    /// What computes each encoder output this rank writes, by the
+    /// product's name: the modules' declared function and format
+    /// identities, which key the output in the host encoder pool with the
+    /// weights' values.
+    #[serde(default)]
+    pub(crate) encoder_identities: BTreeMap<String, String>,
     /// Media units of the longest admitted video.
     pub(crate) units: usize,
 }

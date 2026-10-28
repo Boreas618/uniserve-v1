@@ -196,6 +196,30 @@ impl Placement {
         self.component_target(executor, request, kind, component)
     }
 
+    /// Places `request`'s calls of `kind` on the replica that will execute
+    /// them, as `select_worker` places such a call of the protocol's default
+    /// component: the replica the request is placed on for the component
+    /// that serves them, or one chosen and recorded now, so that the call
+    /// planned later lands there. `None` when no eligible replica has
+    /// submission capacity.
+    pub(super) fn place(
+        &mut self,
+        executor: &dyn Executor,
+        info: &WorkerInfo,
+        request: RequestKey,
+        kind: CallKind,
+    ) -> Option<crate::WorkerGroupId> {
+        let (id, bound_component) = self.worker_target(executor, info, request, kind)?;
+        let target = (id.clone(), bound_component.to_owned());
+        let pinned = if decodes(kind) {
+            &mut self.decode_affinity
+        } else {
+            &mut self.affinity
+        };
+        pinned.insert((request, target.1), target.0.clone());
+        Some(target.0)
+    }
+
     /// Binds planned work to its configured component and records request residency.
     ///
     /// Returns `None`, recording nothing, when `component_target` finds no

@@ -7,42 +7,71 @@
 //! everything else: an Euler step has no solver history, and every random
 //! draw follows from the request's seed), which are derived state like a
 //! KV cache page. Each denoising rank whose host runs a Storage Server maps
-//! a host latent pool, a page pool of pages the size of one page of a
-//! request slot's latent banks (`ipc::LatentPoolInfo`), shared by the
-//! deployment's denoising ranks on that host's NUMA node and by every world
-//! of the deployment. The scheduler decides what moves:
+//! a host latent pool of its own, a page pool of pages the size of one page
+//! of a request slot's latent banks (`ipc::LatentPoolInfo`), which the same
+//! rank of every world of the deployment maps again. The scheduler decides
+//! what moves:
 //!
 //! - **Offload.** A preempted request whose calls completed at step `k`
-//!   (`0 < k <` its schedule) has every page of its slot reserved in every
-//!   denoising rank's pool under the page's key; the next batch to the
-//!   denoiser's worker group, one of latent offloads alone, copies the pages
-//!   of the committed bank into the reserved slots (`Batch::latent_offloads`),
-//!   and its output commits them, or aborts them when it failed. A page the
-//!   pool holds already (the same trajectory stored at the same step)
-//!   needs no copy. The request then leaves with `k` stored steps.
-//! - **Restore.** A resumed request that names stored steps has every page
-//!   key pinned in every rank's pool before its latent preparation is
-//!   offered. When every page of every rank is pinned, the preparation
-//!   copies them into the bank it initializes and commits the trajectory at
+//!   (`0 < k <` its schedule) has every page of its slot that holds its
+//!   samples reserved in its rank's pool under the page's key; the next
+//!   batch to the denoiser's worker group, one of latent offloads alone,
+//!   copies the pages of the committed bank into the reserved slots
+//!   (`Batch::latent_offloads`), and its output commits them, or aborts
+//!   them when it failed. A page the pool holds already (the same part of
+//!   the same trajectory at the same step) needs no copy. The request then
+//!   leaves with `k` stored steps and the record of where its pages lie and
+//!   how each rank laid its part out ([`Record`]).
+//! - **Restore.** A resumed request that names stored steps has the pages
+//!   of every stored rank its record names pinned before its latent
+//!   preparation is offered. When every page is pinned, every restoring
+//!   rank lays the stored values out in its own pages through the copy
+//!   manifest from the stored ranks' layouts to its own
+//!   (`worker::memory::latent::restore`), copying a page it lays out as a
+//!   stored rank did whole, and the preparation commits the trajectory at
 //!   the stored step (`Call::latent_restore`); when one is missing, it
 //!   starts from noise, which computes the same trajectory, and the pages
 //!   pinned are released. The pins end once the preparation's result is
-//!   accepted.
+//!   accepted. The same path serves a request resumed by ranks of the
+//!   parallel configuration that stored it and by ranks of another one.
 //!
-//! A page's key is `SHA-256("uniserve-latent-page" || content || trajectory
-//! || steps || page)`, its content `SHA-256("uniserve-latent-content" ||
-//! seed || region)`: the trajectory's identity (`Trajectory::id`), the steps
-//! it took, the page's index in the slot, the latent seed of what the
-//! deployment's denoising computes ([`latent_seed`]: the weights' values
-//! and the function and format identities of the denoising ranks' models)
-//! and the rank's region (the page geometry and element type, the video
-//! plan that selects a request's layout, and the rank's share of the
-//! denoiser's rows). A world whose denoising computes the same thing on the
-//! same ranks thus finds the trajectories another stored, and one that
-//! computes other numerics finds none, unless a world change keeps the
-//! state of the requests in flight (`Trajectory::state_seed`). Keys are
-//! never reused for other bytes, so a stale trajectory is never read: it
-//! leaves its pool least recently used first.
+//! # Keys
+//!
+//! A page's key is the copy manifest library's key of the page as a chunk
+//! of the rank's slot pages (`storage::manifest::Storage::paged`): the
+//! digest of the logical regions of the samples its bytes hold and where
+//! they lie in it, with the content of the values, `SHA-256(
+//! "uniserve-latent-content" || seed || trajectory || steps)`: the latent
+//! seed of what the deployment's denoising computes ([`latent_seed`]: the
+//! weights' values and the function and format identities of the denoising
+//! ranks' models), the trajectory's identity (`Trajectory::id`) and the
+//! steps it took. The key is injective, since every input that determines a
+//! page's values is in it, and minimal, since no input that does not is:
+//! neither the world, the mesh, the rank nor the parallel configuration
+//! that wrote the page, so a page two configurations lay out alike is one
+//! page of the pool, and a world that computes other numerics finds none,
+//! unless a world change keeps the state of the requests in flight
+//! (`Trajectory::state_seed`). Keys are never reused for other bytes, so a
+//! stale trajectory is never read: it leaves its pool least recently used
+//! first.
+//!
+//! # Finding the pages of another layout
+//!
+//! A key names the layout the page was written in, which a restoring rank of
+//! another parallel configuration does not know: the engine that stores a
+//! trajectory records, for every stored rank, its pool, the host the pool
+//! lies on and the rank's slot pages of the request as its executor
+//! declared them in its latent preparation's completion
+//! (`CallOutput::latent_layouts`). The record travels with the request's
+//! facts through the daemon (`Trajectory::stored_layout`), as the stored
+//! steps do; the engine that resumes the request computes the stored pages'
+//! keys from it, pins them in the pools it names and hands every restoring
+//! rank the stored ranks on its host (`LatentSource::readers`), which only
+//! a rank of that host can map. A restoring rank reads stored pages of its
+//! own host alone, so the restore hits only when each restoring rank's
+//! host holds what the rank needs: the pages of a stored rank whose share
+//! of every request is the rank's own (`LatentPoolInfo::region`), or else
+//! the whole of every stored sample.
 //!
 //! The store connects as a head of its engine's world, so the trajectories
 //! a world on trial stores are its own until its commit: a rollback discards
@@ -52,85 +81,210 @@
 //! Requests to the servers never block the scheduler: they are submitted,
 //! and their answers are taken by [`TrajectoryStore::poll`] at every step.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use ipc::{LatentOffload, LatentPageCopy, LatentPoolInfo, LatentRestore, RequestId, RequestKey};
+use ipc::{
+    LatentOffload, LatentPageCopy, LatentPoolInfo, LatentPoolRef, LatentRestore, LatentSource,
+    RequestId, RequestKey,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use storage::manifest::region::{Span, atoms};
+use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};
-use storage::{Client, Key, Role, Scope};
+use storage::{Key, Scope};
 
 use crate::executor::WorkerGroupId;
+use crate::host_tier::Servers;
+
+/// The version of [`Record`]: a record of another version names no pages.
+const RECORD_VERSION: u32 = 1;
 
 /// One denoising rank's host latent pool.
 #[derive(Clone)]
 struct RankPool {
-    /// The connection to the rank's host's server, in
-    /// `TrajectoryStore::clients`.
+    /// The connection to the rank's host's server
+    /// (`TrajectoryStore::servers`).
     client: usize,
     scope: Scope,
-    pool: u64,
-    /// The rank's region, which keys its pages with the latent seed.
+    pool: LatentPoolRef,
+    /// What determines the rank's share of every request's samples.
     region: [u8; 32],
-    /// The pages one request slot owns on the rank.
-    slot_pages: u32,
+    /// The rank's host, and where an engine on another host reaches its
+    /// server.
+    host: String,
+    endpoint: Option<String>,
 }
 
 /// One rank's report for [`TrajectoryStore::add_worker`].
 pub(crate) struct RankLatents<'a> {
-    /// Whether the rank runs on the engine's host.
-    pub local: bool,
+    /// The rank's host.
+    pub host: &'a str,
     pub pool: &'a LatentPoolInfo,
 }
 
+/// Where a stored trajectory's pages lie and what each stored rank's pages
+/// hold, as the engine that stored it records it with the request
+/// (`Trajectory::stored_layout`, JSON).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Record {
+    version: u32,
+    /// The stored ranks, in rank order.
+    ranks: Vec<StoredRank>,
+}
+
+/// One rank's part of a stored trajectory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StoredRank {
+    /// The host whose Storage Server holds the rank's pool, and where an
+    /// engine on another host reaches that server.
+    host: String,
+    endpoint: Option<String>,
+    pool: LatentPoolRef,
+    /// What determines the rank's share of every request's samples
+    /// (`LatentPoolInfo::region`).
+    region: [u8; 32],
+    /// The rank's slot pages of the request: the part of each sample it
+    /// held and where its values lie, which keys its pages.
+    layout: StorageLayout,
+}
+
+impl StoredRank {
+    /// The pages that hold the rank's part of the samples.
+    fn pages(&self) -> u64 {
+        self.layout.bytes.div_ceil(self.pool.page_bytes.max(1))
+    }
+}
+
 /// The latent seed of what a deployment's denoising computes, from the
-/// identities its denoising ranks report (`LatentPoolInfo::identity`), in
-/// rank order: the first eight bytes of the SHA-256 of the identities, so
-/// that every build derives the same seed from the same identities. Zero
-/// when no rank reports one.
+/// identities its denoising ranks report (`LatentPoolInfo::identity`): the
+/// first eight bytes of the SHA-256 of the distinct identities in order, so
+/// that every build derives the same seed from the same identities, and a
+/// parallel configuration of other ranks computing the same derives the
+/// same seed. Zero when no rank reports one.
 pub(crate) fn latent_seed<'a>(identities: impl IntoIterator<Item = &'a str>) -> u64 {
+    let distinct: std::collections::BTreeSet<&str> = identities.into_iter().collect();
+    if distinct.is_empty() {
+        return 0;
+    }
     let mut digest = Sha256::new();
     digest.update(b"uniserve-latent-seed\0");
-    let mut any = false;
-    for identity in identities {
-        any = true;
+    for identity in distinct {
         digest.update((identity.len() as u64).to_le_bytes());
         digest.update(identity.as_bytes());
-    }
-    if !any {
-        return 0;
     }
     let digest = digest.finalize();
     u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
 }
 
-/// The digest that seeds a rank's page keys: the latent seed of what
-/// computed the trajectory and the rank's region.
-fn content(seed: u64, region: &[u8; 32]) -> [u8; 32] {
+/// The digest of what a trajectory's values are after `steps` steps: what
+/// computed them (`seed`) and the trajectory.
+fn content(seed: u64, trajectory: u64, steps: u32) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"uniserve-latent-content\0");
     digest.update(seed.to_le_bytes());
-    digest.update(region);
+    digest.update(trajectory.to_le_bytes());
+    digest.update(steps.to_le_bytes());
     digest.finalize().into()
 }
 
-/// The key of page `page` of trajectory `trajectory` after `steps` steps
-/// on a rank of `content`.
-fn page_key(content: &[u8; 32], trajectory: u64, steps: u32, page: u32) -> Key {
-    let mut digest = Sha256::new();
-    digest.update(b"uniserve-latent-page\0");
-    digest.update(content);
-    digest.update(trajectory.to_le_bytes());
-    digest.update(steps.to_le_bytes());
-    digest.update(page.to_le_bytes());
-    Key(digest.finalize().into())
+/// The keys of the pages that hold a rank's part of a trajectory whose
+/// values are `content`, laid out in `layout` on pages of `page_bytes`:
+/// each page's key as a chunk of the rank's slot pages. `None` for a layout
+/// that does not describe itself consistently.
+fn page_keys(layout: &StorageLayout, page_bytes: u64, content: [u8; 32]) -> Option<Vec<Key>> {
+    let paged = PagedStorage::paged(layout.clone(), page_bytes, &|_| Some(content));
+    match paged {
+        Ok(paged) => Some(paged.chunks.iter().map(|chunk| chunk.key).collect()),
+        Err(error) => {
+            tracing::warn!(%error, "a rank's latent layout keys no page");
+            None
+        }
+    }
 }
 
-/// The keys of every page of a slot on `rank`.
-fn rank_keys(rank: &RankPool, seed: u64, trajectory: u64, steps: u32) -> Vec<Key> {
-    let content = content(seed, &rank.region);
-    (0..rank.slot_pages)
-        .map(|page| page_key(&content, trajectory, steps, page))
-        .collect()
+/// Whether the boxes `held` (one span per dimension each) hold every index
+/// of a tensor of `shape`.
+fn covers(shape: &[u64], held: &[Vec<Span>]) -> bool {
+    // Cut each dimension where a box's span starts or ends: every product
+    // of the pieces then lies wholly inside or outside each box.
+    let pieces: Vec<Vec<Span>> = shape
+        .iter()
+        .enumerate()
+        .map(|(dim, extent)| {
+            let spans: Vec<Span> = held.iter().map(|spans| spans[dim]).collect();
+            atoms(&Span::range(0, *extent), &spans)
+        })
+        .collect();
+    let mut choice = vec![0_usize; shape.len()];
+    loop {
+        let cell: Vec<Span> = choice
+            .iter()
+            .enumerate()
+            .map(|(dim, index)| pieces[dim][*index])
+            .collect();
+        let inside = held.iter().any(|spans| {
+            spans
+                .iter()
+                .zip(&cell)
+                .all(|(span, piece)| piece.within(span))
+        });
+        if !inside {
+            return false;
+        }
+        // The next product of pieces, the last dimension fastest.
+        let mut dim = shape.len();
+        loop {
+            if dim == 0 {
+                return true;
+            }
+            dim -= 1;
+            choice[dim] += 1;
+            if choice[dim] < pieces[dim].len() {
+                break;
+            }
+            choice[dim] = 0;
+        }
+    }
+}
+
+/// Whether the stored ranks `stored` hold every element of every sample
+/// any stored rank holds part of.
+fn hold_every_sample(stored: &[&StoredRank], all: &[StoredRank]) -> bool {
+    let mut tensors: BTreeMap<&str, (&[u64], Vec<Vec<Span>>)> = BTreeMap::new();
+    for rank in all {
+        for field in &rank.layout.fields {
+            tensors
+                .entry(field.tensor.as_str())
+                .or_insert((field.logical.shape.as_slice(), Vec::new()));
+        }
+    }
+    for rank in stored {
+        for field in &rank.layout.fields {
+            let Some((_, held)) = tensors.get_mut(field.tensor.as_str()) else {
+                continue;
+            };
+            // The local tensor holds the product of its dimensions'
+            // segments.
+            let mut boxes: Vec<Vec<Span>> = vec![Vec::new()];
+            for segments in &field.logical.segments {
+                boxes = boxes
+                    .into_iter()
+                    .flat_map(|prefix| {
+                        segments.iter().map(move |segment| {
+                            let mut spans = prefix.clone();
+                            spans.push(segment.span);
+                            spans
+                        })
+                    })
+                    .collect();
+            }
+            held.extend(boxes);
+        }
+    }
+    tensors
+        .values()
+        .all(|(shape, held)| !held.is_empty() && covers(shape, held))
 }
 
 /// What a submitted request is for.
@@ -139,11 +293,11 @@ enum Purpose {
     Reserve { request: RequestId, rank: usize },
     /// The commit of an offload's pages on one rank.
     Commit { request: RequestId },
-    /// The pin of a restore's pages on one rank.
-    Pin { request: RequestId, rank: usize },
+    /// The pin of a restore's pages of one stored rank.
+    Pin { request: RequestId, source: usize },
     /// A pin answered for a restore that ended meanwhile: whatever it
     /// pinned is released.
-    Orphan { rank: RankPool, keys: Vec<Key> },
+    Orphan { pin: Pinned, keys: Vec<Key> },
     /// A reservation answered for an offload that ended meanwhile: whatever
     /// it reserved is aborted.
     Abandoned { rank: RankPool, keys: Vec<Key> },
@@ -179,6 +333,8 @@ struct Offload {
     /// The pages each rank reserved, which the copies write and the commit
     /// or abort ends, by rank.
     reserved: Vec<Vec<(u32, u64)>>,
+    /// The record of the stored trajectory, which the request leaves with.
+    record: Record,
     stage: OffloadStage,
     /// Whether the request left while its copies were carried or
     /// committed: the offload settles its pool slots and is then dropped,
@@ -186,30 +342,48 @@ struct Offload {
     forgotten: bool,
 }
 
+/// A stored rank's pool, as a restore pins pages in it.
+#[derive(Clone)]
+struct Pinned {
+    client: usize,
+    pool: u64,
+    /// The scope the pages are pinned for: the first restoring rank that
+    /// reads them.
+    reader: Scope,
+}
+
+/// One stored rank's pages a restore pins.
+struct Source {
+    pinned: Pinned,
+    keys: Vec<Key>,
+    /// What the restoring ranks are told of them.
+    source: LatentSource,
+}
+
 /// Where a restore stands.
 #[derive(PartialEq, Eq)]
 enum RestoreStage {
-    /// Pins submitted; each rank's slots once it answered.
+    /// Pins submitted; each source's slots once it answered.
     Pinning(Vec<Option<Vec<Option<u64>>>>),
-    /// Every page of every rank is pinned.
+    /// Every page of every source is pinned.
     Hit(LatentRestore),
     /// A page is missing: the request starts from noise.
     Miss,
 }
 
 struct Restore {
-    worker: WorkerGroupId,
-    /// Every page's key, by rank.
-    keys: Vec<Vec<Key>>,
+    sources: Vec<Source>,
     steps: u32,
+    content: [u8; 32],
     stage: RestoreStage,
 }
 
 /// How a preempted request's offload ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Offloaded {
-    /// The trajectory is stored at this many steps.
-    Stored(u32),
+    /// The trajectory is stored at this many steps, with the record of
+    /// where its pages lie (`Trajectory::stored_layout`).
+    Stored(u32, Vec<u8>),
     /// The trajectory is not stored.
     Failed,
 }
@@ -225,74 +399,44 @@ pub(crate) enum Restored {
 
 /// The scheduler's side of the host latent pools.
 pub(crate) struct TrajectoryStore {
-    deployment: String,
-    /// The world of the scheduler's engine: the servers keep what a world
-    /// on trial commits its own until its commit.
-    world: u64,
-    /// The connections to the servers: the engine's host's first, then other
-    /// hosts' by the TCP address they were reached at.
-    clients: Vec<Client>,
-    remote: HashMap<String, usize>,
+    /// The connections to the pools' servers, with the purpose of every
+    /// request not yet answered.
+    servers: Servers<Purpose>,
+    /// The engine's host.
+    host: String,
     /// The denoising ranks of each worker group the store serves, in rank
     /// order.
     workers: HashMap<WorkerGroupId, Vec<RankPool>>,
     /// The latent seed of what the scheduler's denoising computes.
     seed: u64,
-    /// Requests submitted and not yet answered, by connection and request.
-    pending: HashMap<(usize, u64), Purpose>,
     offloads: HashMap<RequestId, Offload>,
     restores: HashMap<RequestId, Restore>,
 }
 
 impl TrajectoryStore {
-    /// Connect to this host's Storage Server, at `socket`, as a head of
-    /// `deployment` in `world`.
+    /// Connect to the Storage Server of `host`, the engine's, at `socket`,
+    /// as a head of `deployment` in `world`.
     pub(crate) fn connect(
         socket: &std::path::Path,
         deployment: &str,
         world: u64,
+        host: &str,
     ) -> anyhow::Result<Self> {
-        let client = Client::connect(
-            socket,
-            Role::Head {
-                deployment: deployment.to_owned(),
-                world,
-            },
-        )?;
         Ok(Self {
-            deployment: deployment.to_owned(),
-            world,
-            clients: vec![client],
-            remote: HashMap::new(),
+            servers: Servers::connect(socket, deployment, world, "host latent pools")?,
+            host: host.to_owned(),
             workers: HashMap::new(),
             seed: 0,
-            pending: HashMap::new(),
             offloads: HashMap::new(),
             restores: HashMap::new(),
         })
     }
 
-    /// The connection to a remote server at `address`, made when absent.
-    fn remote(&mut self, address: &str) -> Option<usize> {
-        if let Some(&client) = self.remote.get(address) {
-            return Some(client);
-        }
-        let role = Role::Head {
-            deployment: self.deployment.clone(),
-            world: self.world,
-        };
-        match Client::connect_tcp(address, role) {
-            Ok(client) => {
-                self.clients.push(client);
-                self.remote
-                    .insert(address.to_owned(), self.clients.len() - 1);
-                Some(self.clients.len() - 1)
-            }
-            Err(error) => {
-                tracing::warn!(address, %error, "the host latent pools cannot reach a storage server");
-                None
-            }
-        }
+    /// The connection to the server of a pool on `host`, reached at
+    /// `endpoint` from another host.
+    fn client_of(&mut self, host: &str, endpoint: Option<&str>) -> Option<usize> {
+        let local = host == self.host;
+        self.servers.client(local, endpoint)
     }
 
     /// Serve `worker`, whose denoising ranks (`ranks`, each with its rank
@@ -313,29 +457,20 @@ impl TrajectoryStore {
             if report.pool.slot_pages != slot_pages || slot_pages == 0 {
                 return false;
             }
-            let client = if report.local {
-                0
-            } else {
-                let Some(client) = report
-                    .pool
-                    .endpoint
-                    .as_deref()
-                    .and_then(|address| self.remote(address))
-                else {
-                    return false;
-                };
-                client
+            let Some(client) = self.client_of(report.host, report.pool.endpoint.as_deref()) else {
+                return false;
             };
             pools.push(RankPool {
                 client,
                 scope: Scope {
-                    deployment: self.deployment.clone(),
+                    deployment: self.servers.deployment().to_owned(),
                     group: worker.0.clone(),
                     rank: *rank,
                 },
                 pool: report.pool.pool,
                 region: report.pool.region,
-                slot_pages,
+                host: report.host.to_owned(),
+                endpoint: report.pool.endpoint.clone(),
             });
         }
         tracing::info!(
@@ -365,24 +500,14 @@ impl TrajectoryStore {
         self.workers.contains_key(worker)
     }
 
-    fn submit(&mut self, client: usize, request: &Request, purpose: Purpose) -> bool {
-        match self.clients[client].submit(request, &[]) {
-            Ok(id) => {
-                self.pending.insert((client, id), purpose);
-                true
-            }
-            Err(error) => {
-                tracing::warn!(%error, "a host latent pool request failed");
-                false
-            }
-        }
-    }
-
     /// Start storing `request`'s trajectory `trajectory` after `steps` steps
     /// in the pools of `worker`'s denoising ranks, whose committed bank
-    /// holds it (`request_key`'s slot). Returns `false`, starting nothing,
-    /// when the store does not serve `worker`; an offload a server could not
-    /// be asked for fails ([`Self::offloaded`]) once the others answered.
+    /// holds it (`request_key`'s slot) laid out as `layouts` state, each
+    /// rank's slot pages of the request by its rank index
+    /// (`CallOutput::latent_layouts`). Returns `false`, starting nothing,
+    /// when the store does not serve `worker` or a rank's layout is missing
+    /// or malformed; an offload a server could not be asked for fails
+    /// ([`Self::offloaded`]) once the others answered.
     pub(crate) fn offload(
         &mut self,
         request: RequestId,
@@ -390,23 +515,48 @@ impl TrajectoryStore {
         worker: &WorkerGroupId,
         trajectory: u64,
         steps: u32,
+        layouts: &BTreeMap<u32, String>,
     ) -> bool {
         let Some(ranks) = self.workers.get(worker).cloned() else {
             return false;
         };
-        let keys: Vec<Vec<Key>> = ranks
-            .iter()
-            .map(|rank| rank_keys(rank, self.seed, trajectory, steps))
-            .collect();
+        let content = content(self.seed, trajectory, steps);
+        let mut keys = Vec::with_capacity(ranks.len());
+        let mut stored = Vec::with_capacity(ranks.len());
+        for rank in &ranks {
+            let layout = layouts
+                .get(&rank.scope.rank)
+                .and_then(|layout| serde_json::from_str::<StorageLayout>(layout).ok());
+            let Some(layout) = layout else {
+                tracing::warn!(
+                    request = request.0,
+                    rank = rank.scope.rank,
+                    "a denoising rank stated no latent layout of the request: its trajectory is \
+                     not stored"
+                );
+                return false;
+            };
+            let Some(rank_keys) = page_keys(&layout, rank.pool.page_bytes, content) else {
+                return false;
+            };
+            keys.push(rank_keys);
+            stored.push(StoredRank {
+                host: rank.host.clone(),
+                endpoint: rank.endpoint.clone(),
+                pool: rank.pool,
+                region: rank.region,
+                layout,
+            });
+        }
         let mut submitted = 0;
         for (index, (rank, keys)) in ranks.iter().zip(&keys).enumerate() {
             let reserve = Request::Reserve {
-                pool: rank.pool,
+                pool: rank.pool.pool,
                 writer: rank.scope.clone(),
                 keys: keys.clone(),
                 window: None,
             };
-            if !self.submit(
+            if !self.servers.submit(
                 rank.client,
                 &reserve,
                 Purpose::Reserve {
@@ -424,6 +574,10 @@ impl TrajectoryStore {
             steps,
             keys,
             reserved: vec![Vec::new(); ranks.len()],
+            record: Record {
+                version: RECORD_VERSION,
+                ranks: stored,
+            },
             stage: OffloadStage::Reserving(vec![None; ranks.len()]),
             forgotten: false,
         };
@@ -458,7 +612,7 @@ impl TrajectoryStore {
                 let rank = &ranks[index];
                 reserved.iter().map(move |&(page, slot)| LatentPageCopy {
                     rank: rank.scope.rank,
-                    pool: rank.pool,
+                    pool: rank.pool.pool,
                     slot,
                     page,
                 })
@@ -486,18 +640,27 @@ impl TrajectoryStore {
     /// How `request`'s offload ended, once it did; the offload is then
     /// forgotten. `None` while it runs, and for a request without one.
     pub(crate) fn offloaded(&mut self, request: RequestId) -> Option<Offloaded> {
-        let outcome = match self.offloads.get(&request)?.stage {
-            OffloadStage::Stored => Offloaded::Stored(self.offloads[&request].steps),
-            OffloadStage::Failed if !self.answering(request) => Offloaded::Failed,
+        match self.offloads.get(&request)?.stage {
+            OffloadStage::Stored => {}
+            OffloadStage::Failed if !self.answering(request) => {
+                self.offloads.remove(&request);
+                return Some(Offloaded::Failed);
+            }
             _ => return None,
-        };
-        self.offloads.remove(&request);
-        Some(outcome)
+        }
+        let offload = self.offloads.remove(&request)?;
+        match serde_json::to_vec(&offload.record) {
+            Ok(record) => Some(Offloaded::Stored(offload.steps, record)),
+            Err(error) => {
+                tracing::warn!(%error, "a stored trajectory's record does not encode");
+                Some(Offloaded::Failed)
+            }
+        }
     }
 
     /// Whether a reservation of `request`'s offload has not been answered.
     fn answering(&self, request: RequestId) -> bool {
-        self.pending.values().any(|purpose| {
+        self.servers.pending().any(|purpose| {
             matches!(purpose, Purpose::Reserve { request: owner, .. } if *owner == request)
         })
     }
@@ -567,7 +730,7 @@ impl TrajectoryStore {
                 (
                     rank.client,
                     Request::Commit {
-                        pool: rank.pool,
+                        pool: rank.pool.pool,
                         keys,
                     },
                 )
@@ -575,7 +738,10 @@ impl TrajectoryStore {
             .collect();
         let mut answering = 0;
         for (client, commit) in commits {
-            if self.submit(client, &commit, Purpose::Commit { request }) {
+            if self
+                .servers
+                .submit(client, &commit, Purpose::Commit { request })
+            {
                 answering += 1;
             }
         }
@@ -605,13 +771,13 @@ impl TrajectoryStore {
                 continue;
             }
             let abort = Request::Abort {
-                pool: rank.pool,
+                pool: rank.pool.pool,
                 keys: reserved
                     .iter()
                     .map(|&(page, _)| keys[page as usize])
                     .collect(),
             };
-            self.submit(rank.client, &abort, Purpose::Settle);
+            self.servers.submit(rank.client, &abort, Purpose::Settle);
         }
     }
 
@@ -668,9 +834,12 @@ impl TrajectoryStore {
     }
 
     /// Pin `request`'s trajectory `trajectory` after `steps` steps, stored
-    /// under `state_seed` or the store's own seed, in the pools of
-    /// `worker`'s denoising ranks. Returns `false`, starting nothing, when
-    /// the store does not serve `worker`.
+    /// under `state_seed` or the store's own seed where `stored_layout` (the
+    /// storing engine's record, `Trajectory::stored_layout`) says, for the
+    /// denoising ranks of `worker` to lay out in their own pages. Returns
+    /// `false`, starting nothing, when the store does not serve `worker`; a
+    /// restore whose record names no pages, or whose pages lie where a
+    /// restoring rank that needs them cannot read them, resolves as a miss.
     pub(crate) fn restore(
         &mut self,
         request: RequestId,
@@ -678,33 +847,38 @@ impl TrajectoryStore {
         trajectory: u64,
         steps: u32,
         state_seed: Option<u64>,
+        stored_layout: &[u8],
     ) -> bool {
         let Some(ranks) = self.workers.get(worker).cloned() else {
             return false;
         };
-        let seed = state_seed.unwrap_or(self.seed);
-        let keys: Vec<Vec<Key>> = ranks
-            .iter()
-            .map(|rank| rank_keys(rank, seed, trajectory, steps))
-            .collect();
+        let content = content(state_seed.unwrap_or(self.seed), trajectory, steps);
         let mut restore = Restore {
-            worker: worker.clone(),
-            keys: keys.clone(),
+            sources: Vec::new(),
             steps,
-            stage: RestoreStage::Pinning(vec![None; ranks.len()]),
+            content,
+            stage: RestoreStage::Miss,
         };
-        for (index, (rank, keys)) in ranks.iter().zip(keys).enumerate() {
+        match self.sources(request, &ranks, content, stored_layout) {
+            Some(sources) => restore.sources = sources,
+            None => {
+                self.restores.insert(request, restore);
+                return true;
+            }
+        }
+        restore.stage = RestoreStage::Pinning(vec![None; restore.sources.len()]);
+        for (index, source) in restore.sources.iter().enumerate() {
             let pin = Request::Pin {
-                pool: rank.pool,
-                reader: rank.scope.clone(),
-                keys,
+                pool: source.pinned.pool,
+                reader: source.pinned.reader.clone(),
+                keys: source.keys.clone(),
             };
-            if !self.submit(
-                rank.client,
+            if !self.servers.submit(
+                source.pinned.client,
                 &pin,
                 Purpose::Pin {
                     request,
-                    rank: index,
+                    source: index,
                 },
             ) {
                 // A server that cannot be asked holds nothing for us; what
@@ -714,10 +888,87 @@ impl TrajectoryStore {
             }
         }
         if restore.stage == RestoreStage::Miss {
-            self.orphan_pins(request, &ranks, &restore.keys);
+            self.orphan_pins(request, &restore.sources);
         }
         self.restores.insert(request, restore);
         true
+    }
+
+    /// The stored ranks' pages `ranks`, the restoring ranks, read of the
+    /// trajectory `stored_layout` records with values `content`: each
+    /// stored rank on a restoring rank's host, with the keys of its pages
+    /// and the restoring ranks of that host as its readers. `None` when the
+    /// record names no pages, or a restoring rank's host holds less than
+    /// the rank needs (module documentation).
+    fn sources(
+        &mut self,
+        request: RequestId,
+        ranks: &[RankPool],
+        content: [u8; 32],
+        stored_layout: &[u8],
+    ) -> Option<Vec<Source>> {
+        let record = match serde_json::from_slice::<Record>(stored_layout) {
+            Ok(record) if record.version == RECORD_VERSION && !record.ranks.is_empty() => record,
+            _ => {
+                tracing::info!(
+                    request = request.0,
+                    "a resumed video request names no stored layout of this build"
+                );
+                return None;
+            }
+        };
+        // Every restoring rank reads the stored pages of its own host: the
+        // pages of a stored rank of its own share, or the whole samples.
+        for rank in ranks {
+            let local: Vec<&StoredRank> = record
+                .ranks
+                .iter()
+                .filter(|stored| stored.host == rank.host)
+                .collect();
+            let shares = local.iter().any(|stored| stored.region == rank.region);
+            if !shares && !hold_every_sample(&local, &record.ranks) {
+                tracing::info!(
+                    request = request.0,
+                    rank = rank.scope.rank,
+                    host = %rank.host,
+                    "a stored trajectory's pages are not on the host of a rank that needs them"
+                );
+                return None;
+            }
+        }
+        let mut sources = Vec::new();
+        for stored in &record.ranks {
+            let readers: Vec<&RankPool> = ranks
+                .iter()
+                .filter(|rank| rank.host == stored.host)
+                .collect();
+            let Some(first) = readers.first() else {
+                continue;
+            };
+            if stored.pages() == 0 {
+                continue;
+            }
+            let keys = page_keys(&stored.layout, stored.pool.page_bytes, content)?;
+            let Ok(layout) = serde_json::to_string(&stored.layout) else {
+                return None;
+            };
+            let client = self.client_of(&stored.host, stored.endpoint.as_deref())?;
+            sources.push(Source {
+                pinned: Pinned {
+                    client,
+                    pool: stored.pool.pool,
+                    reader: first.scope.clone(),
+                },
+                keys,
+                source: LatentSource {
+                    readers: readers.iter().map(|rank| rank.scope.rank).collect(),
+                    pool: stored.pool,
+                    layout,
+                    slots: Vec::new(),
+                },
+            });
+        }
+        (!sources.is_empty()).then_some(sources)
     }
 
     /// How `request`'s restore resolved; `None` while its pins are
@@ -736,44 +987,41 @@ impl TrajectoryStore {
         let Some(restore) = self.restores.remove(&request) else {
             return;
         };
-        let Some(ranks) = self.workers.get(&restore.worker).cloned() else {
-            return;
-        };
         match restore.stage {
             RestoreStage::Hit(_) => {
-                for (rank, keys) in ranks.iter().zip(restore.keys) {
-                    self.unpin(rank, keys);
+                for source in &restore.sources {
+                    self.unpin(&source.pinned, source.keys.clone());
                 }
             }
             RestoreStage::Pinning(answers) => {
-                // The ranks that answered release what they pinned now; the
-                // others release it when they answer.
-                for ((index, rank), answer) in ranks.iter().enumerate().zip(answers) {
+                // The sources that answered release what they pinned now;
+                // the others release it when they answer.
+                for (source, answer) in restore.sources.iter().zip(answers) {
                     if let Some(slots) = answer {
-                        self.unpin(rank, pinned(&restore.keys[index], &slots));
+                        self.unpin(&source.pinned, pinned(&source.keys, &slots));
                     }
                 }
-                self.orphan_pins(request, &ranks, &restore.keys);
+                self.orphan_pins(request, &restore.sources);
             }
             RestoreStage::Miss => {
-                self.orphan_pins(request, &ranks, &restore.keys);
+                self.orphan_pins(request, &restore.sources);
             }
         }
     }
 
     /// Turn the unanswered pins of `request` into orphans, which release
     /// what they pinned when they are answered.
-    fn orphan_pins(&mut self, request: RequestId, ranks: &[RankPool], keys: &[Vec<Key>]) {
-        for purpose in self.pending.values_mut() {
+    fn orphan_pins(&mut self, request: RequestId, sources: &[Source]) {
+        for purpose in self.servers.pending_mut() {
             if let Purpose::Pin {
                 request: owner,
-                rank,
+                source,
             } = purpose
                 && *owner == request
             {
                 *purpose = Purpose::Orphan {
-                    rank: ranks[*rank].clone(),
-                    keys: keys[*rank].clone(),
+                    pin: sources[*source].pinned.clone(),
+                    keys: sources[*source].keys.clone(),
                 };
             }
         }
@@ -803,7 +1051,7 @@ impl TrajectoryStore {
                 return;
             };
             let keys = offload.keys.clone();
-            for purpose in self.pending.values_mut() {
+            for purpose in self.servers.pending_mut() {
                 if let Purpose::Reserve {
                     request: owner,
                     rank,
@@ -821,87 +1069,72 @@ impl TrajectoryStore {
         }
     }
 
-    fn unpin(&mut self, rank: &RankPool, keys: Vec<Key>) {
+    fn unpin(&mut self, pin: &Pinned, keys: Vec<Key>) {
         if keys.is_empty() {
             return;
         }
         let unpin = Request::Unpin {
-            pool: rank.pool,
-            reader: rank.scope.clone(),
+            pool: pin.pool,
+            reader: pin.reader.clone(),
             keys,
         };
-        self.submit(rank.client, &unpin, Purpose::Settle);
+        self.servers.submit(pin.client, &unpin, Purpose::Settle);
     }
 
-    /// `rank` answered `request`'s pin with `slots`: once every rank
-    /// answered, the restore is a hit when every page is pinned, and a miss
-    /// otherwise, which releases the pages pinned.
-    fn pinned(&mut self, request: RequestId, rank: usize, slots: Vec<Option<u64>>) {
+    /// Source `source` answered `request`'s pin with `slots`: once every
+    /// source answered, the restore is a hit when every page is pinned, and
+    /// a miss otherwise, which releases the pages pinned.
+    fn pinned(&mut self, request: RequestId, source: usize, slots: Vec<Option<u64>>) {
         let Some(restore) = self.restores.get_mut(&request) else {
             return;
         };
         let RestoreStage::Pinning(answers) = &mut restore.stage else {
             return;
         };
-        answers[rank] = Some(slots);
+        answers[source] = Some(slots);
         if !answers.iter().all(Option::is_some) {
             return;
         }
         let answers: Vec<Vec<Option<u64>>> = answers.iter_mut().filter_map(Option::take).collect();
-        let Some(ranks) = self.workers.get(&restore.worker).cloned() else {
-            return;
-        };
-        let whole = answers
-            .iter()
-            .zip(&restore.keys)
-            .all(|(slots, keys)| slots.len() == keys.len() && slots.iter().all(Option::is_some));
+        let whole = answers.iter().zip(&restore.sources).all(|(slots, source)| {
+            slots.len() == source.keys.len() && slots.iter().all(Option::is_some)
+        });
         if whole {
-            let pages = answers
+            let sources = restore
+                .sources
                 .iter()
-                .zip(&ranks)
-                .flat_map(|(slots, rank)| {
-                    slots.iter().enumerate().filter_map(|(page, slot)| {
-                        slot.map(|slot| LatentPageCopy {
-                            rank: rank.scope.rank,
-                            pool: rank.pool,
-                            slot,
-                            page: page as u32,
-                        })
-                    })
+                .zip(&answers)
+                .map(|(source, slots)| LatentSource {
+                    slots: slots.iter().flatten().copied().collect(),
+                    ..source.source.clone()
                 })
                 .collect();
             restore.stage = RestoreStage::Hit(LatentRestore {
                 steps: restore.steps,
-                pages,
+                content: restore.content,
+                sources,
             });
             return;
         }
         restore.stage = RestoreStage::Miss;
-        let keys = restore.keys.clone();
-        for ((rank, slots), keys) in ranks.iter().zip(answers).zip(keys) {
-            self.unpin(rank, pinned(&keys, &slots));
+        let release: Vec<(Pinned, Vec<Key>)> = restore
+            .sources
+            .iter()
+            .zip(&answers)
+            .map(|(source, slots)| (source.pinned.clone(), pinned(&source.keys, slots)))
+            .collect();
+        for (pin, keys) in release {
+            self.unpin(&pin, keys);
         }
     }
 
     /// Take the servers' answers. Returns whether a restore or an offload
     /// moved on.
     pub(crate) fn poll(&mut self) -> bool {
-        for client in &mut self.clients {
-            if let Err(error) = client.pump() {
-                tracing::warn!(%error, "a host latent pool connection failed");
-            }
-        }
         let mut moved = false;
-        let ids: Vec<(usize, u64)> = self.pending.keys().copied().collect();
-        for id in ids {
-            let Some(answer) = self.clients[id.0].take(id.1) else {
-                continue;
-            };
-            let Some(purpose) = self.pending.remove(&id) else {
-                continue;
-            };
+        for (purpose, reply) in self.servers.answers() {
             moved = true;
-            match (purpose, answer.reply) {
+            match (purpose, reply) {
                 (Purpose::Reserve { request, rank }, reply) => {
                     let slots = match reply {
                         Reply::Reserved { slots } => slots,
@@ -928,7 +1161,7 @@ impl TrajectoryStore {
                         }
                     }
                 }
-                (Purpose::Pin { request, rank }, reply) => {
+                (Purpose::Pin { request, source }, reply) => {
                     let slots = match reply {
                         Reply::Pinned { slots } => slots,
                         other => {
@@ -936,11 +1169,11 @@ impl TrajectoryStore {
                             Vec::new()
                         }
                     };
-                    self.pinned(request, rank, slots);
+                    self.pinned(request, source, slots);
                 }
-                (Purpose::Orphan { rank, keys }, reply) => {
+                (Purpose::Orphan { pin, keys }, reply) => {
                     if let Reply::Pinned { slots } = reply {
-                        self.unpin(&rank, pinned(&keys, &slots));
+                        self.unpin(&pin, pinned(&keys, &slots));
                     }
                 }
                 (Purpose::Abandoned { rank, keys }, reply) => {
@@ -953,10 +1186,10 @@ impl TrajectoryStore {
                             .collect();
                         if !reserved.is_empty() {
                             let abort = Request::Abort {
-                                pool: rank.pool,
+                                pool: rank.pool.pool,
                                 keys: reserved,
                             };
-                            self.submit(rank.client, &abort, Purpose::Settle);
+                            self.servers.submit(rank.client, &abort, Purpose::Settle);
                         }
                     }
                 }
@@ -980,7 +1213,7 @@ impl TrajectoryStore {
 
     /// Whether a request to a server awaits its answer.
     pub(crate) fn waiting(&self) -> bool {
-        !self.pending.is_empty()
+        self.servers.waiting()
     }
 }
 
@@ -991,4 +1224,104 @@ fn pinned(keys: &[Key], slots: &[Option<u64>]) -> Vec<Key> {
         .filter(|(_, slot)| slot.is_some())
         .map(|(key, _)| *key)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two sequence-parallel ranks' rows of a 40-row sample, or one rank's.
+    fn ranks(shares: &[(u64, u64)], hosts: &[&str]) -> Vec<StoredRank> {
+        use storage::manifest::{Encoding, Field, Logical, Segment};
+        shares
+            .iter()
+            .zip(hosts)
+            .map(|(&(start, count), host)| StoredRank {
+                host: (*host).to_owned(),
+                endpoint: None,
+                pool: LatentPoolRef {
+                    pool: 1,
+                    shape: [0; 32],
+                    numa_node: None,
+                    page_bytes: 256,
+                },
+                region: [start as u8; 32],
+                layout: StorageLayout {
+                    bytes: count * 16,
+                    fields: vec![Field {
+                        tensor: "video_latents".into(),
+                        source: String::new(),
+                        dtype: "float32".into(),
+                        element: 4,
+                        offset: 0,
+                        shape: vec![count, 4],
+                        strides: vec![4, 1],
+                        logical: Logical {
+                            shape: vec![40, 4],
+                            dims: vec!["row".into(), "channel".into()],
+                            units: vec![1, 0],
+                            segments: vec![
+                                vec![Segment {
+                                    span: Span::range(start, count),
+                                    local: 0,
+                                }],
+                                vec![Segment {
+                                    span: Span::range(0, 4),
+                                    local: 0,
+                                }],
+                            ],
+                        },
+                        encoding: Encoding::Affine,
+                    }],
+                },
+            })
+            .collect()
+    }
+
+    /// The ranks of one host hold every sample when their rows cover it,
+    /// and not when another host holds some.
+    #[test]
+    fn a_host_holds_every_sample_when_its_ranks_cover_it() {
+        let both = ranks(&[(0, 22), (22, 18)], &["a", "a"]);
+        assert!(hold_every_sample(&both.iter().collect::<Vec<_>>(), &both));
+        let split = ranks(&[(0, 22), (22, 18)], &["a", "b"]);
+        let on_a: Vec<&StoredRank> = split.iter().filter(|rank| rank.host == "a").collect();
+        assert!(!hold_every_sample(&on_a, &split));
+        let overlapping = ranks(&[(0, 30), (10, 30)], &["a", "a"]);
+        assert!(hold_every_sample(
+            &overlapping.iter().collect::<Vec<_>>(),
+            &overlapping
+        ));
+    }
+
+    /// The latent seed of a configuration of other ranks computing the same
+    /// is the same; other numerics have another.
+    #[test]
+    fn the_latent_seed_follows_what_the_ranks_compute() {
+        assert_eq!(latent_seed(["a", "a"]), latent_seed(["a"]));
+        assert_ne!(latent_seed(["a"]), latent_seed(["b"]));
+        assert_eq!(latent_seed(std::iter::empty()), 0);
+    }
+
+    /// A record survives its encoding and keys a stored rank's pages by
+    /// what they hold: the first page of rows a rank of either
+    /// configuration lays out alike has one key.
+    #[test]
+    fn stored_pages_are_keyed_by_what_they_hold() {
+        let two = ranks(&[(0, 22), (22, 18)], &["a", "a"]);
+        let one = ranks(&[(0, 40)], &["a"]);
+        let content = content(7, 77, 3);
+        let first = page_keys(&two[0].layout, 256, content).unwrap();
+        let whole = page_keys(&one[0].layout, 256, content).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(whole.len(), 3);
+        assert_eq!(first[0], whole[0]);
+        assert_ne!(first[1], whole[1]);
+        let record = Record {
+            version: RECORD_VERSION,
+            ranks: two,
+        };
+        let encoded = serde_json::to_vec(&record).unwrap();
+        assert_eq!(serde_json::from_slice::<Record>(&encoded).unwrap(), record);
+    }
 }
