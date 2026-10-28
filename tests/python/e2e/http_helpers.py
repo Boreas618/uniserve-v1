@@ -46,6 +46,22 @@ def dedicated_experts(directory: Path) -> Path:
     return placement
 
 
+def granted_devices(count: int) -> str:
+    """The first `count` GPUs the GPU locks granted
+    (``UNISERVE_WORLD_DEVICES``), comma-separated; the first `count` GPUs
+    when no lock granted any.
+    """  # noqa: D205
+    granted = os.environ.get("UNISERVE_WORLD_DEVICES", "")
+    devices = (
+        granted.split(",")
+        if granted
+        else [str(index) for index in range(count)]
+    )
+    if len(devices) < count:
+        raise RuntimeError(f"{count} GPUs are needed, {granted!r} were granted")
+    return ",".join(devices[:count])
+
+
 def gpu_device() -> str:
     """The GPU a one-GPU server runs on (``UNISERVE_WORLD_DEVICE``, 0 by
     default), so that one-GPU cases run beside each other on other GPUs.

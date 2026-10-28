@@ -53,6 +53,7 @@ import pytest
 from tests.python.e2e.http_helpers import (
     dedicated_experts,
     find_free_port,
+    granted_devices,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -175,7 +176,7 @@ def _stream_through_a_kill(
     victim: str,
     *,
     options: tuple[str, ...] = (),
-    devices: str = "0",
+    devices: str | None = None,
     parked: str | None = None,
 ) -> tuple[list[str], dict, list[str], dict, list[str]]:
     """Stream the count, killing a `victim` process after the first tokens.
@@ -213,7 +214,10 @@ def _stream_through_a_kill(
         "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
         *options,
     ]
-    env = {"CUDA_VISIBLE_DEVICES": devices, "XDG_RUNTIME_DIR": str(runtime)}
+    env = {
+        "CUDA_VISIBLE_DEVICES": devices or granted_devices(1),
+        "XDG_RUNTIME_DIR": str(runtime),
+    }
     log = tmp_path / "server.log"
     streamed: list[str] = []
     usage = None
@@ -321,7 +325,7 @@ def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
             "--set",
             f"worker_config.standby_storage={standby_storage}",
         ),
-        devices="0,1",
+        devices=granted_devices(2),
         parked="the standby world of the failure domain is parked",
     )
 
