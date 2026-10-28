@@ -1951,6 +1951,13 @@ def test_a_change_across_hosts_continues_a_streaming_request(
             ledgers = _ledgers(_config(base_url))
             assert (serving["world"],) not in _worlds_of(ledgers, "weights")
 
+        # Rank assignment is part of the committed configuration. The
+        # direct start must load those same logical shards on each GPU.
+        direct_config = tmp_path / "committed.toml"
+        direct_config.write_text(_config(base_url)["config"])
+        target = ("--config", str(direct_config))
+        (changed_path / "weights.json").write_text(json.dumps(changed))
+
     lines = _log_lines(log) + _log_lines(changed_path / "follower.log")
     for line in lines:
         if "measured the links from another node's GPUs" in line or (
@@ -1979,6 +1986,7 @@ def test_a_change_across_hosts_continues_a_streaming_request(
             )
         )
         direct = _weight_digests(base_url)
+        (direct_path / "weights.json").write_text(json.dumps(direct))
     assert sorted(changed) == sorted(direct)
     for gpu, fields in direct.items():
         differing = sorted(
