@@ -965,12 +965,12 @@ impl Leader {
         info!(previous_world, "preparing a successor world");
         // While the successor prepares, its transfers yield to the serving
         // world's steps (`update_config.transfer_slowdown`).
-        let interference = update.transfer_slowdown.map(|slowdown| {
+        let interference = {
             let done = tokio_util::sync::CancellationToken::new();
             let throttling = crate::interference::Throttling::new(
                 &self.engines.observer,
                 previous_world,
-                slowdown,
+                update.transfer_slowdown,
                 Instant::now(),
                 eager_since,
             );
@@ -982,16 +982,15 @@ impl Leader {
                 done.clone(),
             ));
             (done, task)
-        });
+        };
         let start_spec = spec.clone();
         let prepared = tokio::task::spawn_blocking(move || control.start(start_spec, sink))
             .await
             .context("the successor's start did not complete")
             .and_then(|started| started.context("the successor world did not start"));
-        if let Some((done, task)) = interference {
-            done.cancel();
-            let _ = task.await;
-        }
+        let (done, task) = interference;
+        done.cancel();
+        let _ = task.await;
         let successor = match prepared {
             Ok(successor) => Arc::new(successor),
             Err(error) => {

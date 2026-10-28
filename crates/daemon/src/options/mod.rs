@@ -913,9 +913,9 @@ pub struct UpdateOptions {
     /// may take while the successor prepares, as a fraction (`0.1` for
     /// 10%), past which the leader halves the byte budgets of the links the
     /// change's transfers use, and restores them once the steps are back
-    /// within it; unset to leave the budgets whole. Steps are compared
-    /// within their batch-size range (`docs/configuration.md`).
-    pub transfer_slowdown: Option<f64>,
+    /// within it. Steps are compared within their batch-size range. The
+    /// default is the value measured on GB200 (`docs/configuration.md`).
+    pub transfer_slowdown: f64,
     /// Whether the serving world runs its forwards eagerly while the
     /// successor prepares, giving its CUDA graph memory to the successor's
     /// captures: the serving world steps slower meanwhile, and replays its
@@ -923,13 +923,19 @@ pub struct UpdateOptions {
     pub eager_prepare: bool,
 }
 
+/// The default `update_config.transfer_slowdown`: on GB200, above the
+/// serving steps' second-to-second variation without transfers and below
+/// the slowdowns copies at a link's whole budget cause
+/// (`docs/configuration.md`).
+pub const TRANSFER_SLOWDOWN: f64 = 0.1;
+
 impl Default for UpdateOptions {
     fn default() -> Self {
         Self {
             previous_world: PreviousWorld::Parked,
             rollback: RollbackOptions::default(),
             preempt_after: None,
-            transfer_slowdown: None,
+            transfer_slowdown: TRANSFER_SLOWDOWN,
             eager_prepare: false,
         }
     }
@@ -1068,12 +1074,11 @@ impl ServeConfig {
                 "invalid `speculative_config.refill_token_cost`: {cost} must not be negative"
             );
         }
-        if let Some(slowdown) = self.update_config.transfer_slowdown {
-            anyhow::ensure!(
-                slowdown.is_finite() && slowdown > 0.0,
-                "invalid `update_config.transfer_slowdown`: {slowdown} must be positive"
-            );
-        }
+        let slowdown = self.update_config.transfer_slowdown;
+        anyhow::ensure!(
+            slowdown.is_finite() && slowdown > 0.0,
+            "invalid `update_config.transfer_slowdown`: {slowdown} must be positive"
+        );
         let rollback = &self.update_config.rollback;
         if let Some(rate) = rollback.failure_rate {
             anyhow::ensure!(
