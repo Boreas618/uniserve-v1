@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import time
 from pathlib import Path
 
 import httpx
@@ -109,13 +110,23 @@ def test_expert_rebalancing_preserves_a_stream_and_its_world(
         world = _config(base_url)["slots"][0]["world"]
 
         # This bound leaves thousands of decode steps for the two transfers
-        # while keeping the reference independent of the changed world.
-        body = {**_body(name, stream=False), "max_completion_tokens": 4096}
+        # while keeping the reference independent of the changed world. A
+        # rank that streams its dense layers from host storage runs its steps
+        # eagerly and reads every layer over the host link: on GB200 its
+        # reference decoded 1024 tokens in 100.5 s, which leaves the
+        # transfers about as long.
+        tokens = 1024 if topology == "host" else 4096
+        body = {**_body(name, stream=False), "max_completion_tokens": tokens}
+        started = time.monotonic()
         response = httpx.post(
             f"{base_url}/v1/chat/completions", json=body, timeout=600
         )
         assert response.status_code == 200, response.text
         reference = response.json()
+        print(
+            f"{topology}: the reference decoded {tokens} tokens in "
+            f"{time.monotonic() - started:.1f} s"
+        )
         expected = [
             item["token"]
             for item in reference["choices"][0]["logprobs"]["content"]
