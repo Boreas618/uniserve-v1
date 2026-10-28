@@ -592,12 +592,10 @@ pub enum Command {
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Publishes the committed world's immutable pages on every claimed node.
     PublishWorld(crossbeam_channel::Sender<Result<(), String>>),
-    /// Ends the memory of other worlds on the nodes of the scheduler's
-    /// workers, discarding the pages the scheduler's world does not hit when
-    /// `discard_pages` (`Executor::retire`), and answers whether it did.
+    /// Ends the storage of other worlds on the nodes of the scheduler's
+    /// workers (`Executor::retire`), and answers whether it did.
     Retire {
         worlds: Vec<u64>,
-        discard_pages: bool,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Reads the memory ledgers of the nodes of the scheduler's workers
@@ -928,20 +926,11 @@ impl CommandSender {
         published
     }
 
-    /// Ends the memory of `worlds` on the nodes of the scheduler's workers,
-    /// discarding the pages the scheduler's world does not hit when
-    /// `discard_pages` (`Command::Retire`); the receiver gets whether it did.
-    pub fn retire(
-        &self,
-        worlds: Vec<u64>,
-        discard_pages: bool,
-    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+    /// Ends the storage of `worlds` on the nodes of the scheduler's workers
+    /// (`Command::Retire`); the receiver gets whether it did.
+    pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, retired) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Retire {
-            worlds,
-            discard_pages,
-            answer,
-        });
+        let _ = self.send(Command::Retire { worlds, answer });
         retired
     }
 

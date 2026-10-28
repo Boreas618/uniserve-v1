@@ -564,12 +564,6 @@ impl Pools {
         self.discard_where(deployment, |published| published == world);
     }
 
-    /// Discard every page of `deployment` that world `except` did not
-    /// publish ([`Pool::discard_where`]); returns how many.
-    pub(super) fn discard_except(&mut self, deployment: &str, except: u64) -> u64 {
-        self.discard_where(deployment, |published| published != except)
-    }
-
     fn discard_where(&mut self, deployment: &str, discarded: impl Fn(u64) -> bool) -> u64 {
         let mut pages = 0;
         for pool in self.pools.values_mut() {
@@ -1042,9 +1036,8 @@ impl Pool {
         self.leave(slot, key);
     }
 
-    /// Discard the pages published by the worlds `discarded` picks (a world
-    /// on trial that a rollback retires, or every world but a committed one
-    /// of other numerics): those nobody reads leave the pool, and no world
+    /// Discard the pages published by an uncommitted world that a rollback
+    /// retires: those nobody reads leave the pool, and no world
     /// reads the others, which leave it once their readers unpin them, nor
     /// the pages they reserved and commit later. Returns how many.
     pub(super) fn discard_where(&mut self, discarded: impl Fn(u64) -> bool) -> u64 {

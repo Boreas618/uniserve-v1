@@ -41,13 +41,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 /// over the node's host links.
 const MOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// The worlds a claim ends the memory of on a node.
+/// The worlds a claim ends the storage of on a node.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Retirement {
     pub(crate) worlds: Vec<u64>,
-    /// The claiming world hits none of the pages the others published: it
-    /// computes other numerics, so the node's page pools discard them.
-    pub(crate) discard_pages: bool,
 }
 
 /// The deployment's connection to its daemons, shared by its worker groups.
@@ -398,7 +395,6 @@ impl ProcessClient {
                     server_arguments,
                     world,
                     retire: retirement.worlds,
-                    discard_pages: retirement.discard_pages,
                 }),
                 MOVE_TIMEOUT,
             )

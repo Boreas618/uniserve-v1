@@ -117,9 +117,6 @@ impl ClaimHolder {
                 held.worlds.remove(world);
             }
             restore(&mut held.client, &claim.deployment, claim.world)?;
-            if claim.discard_pages {
-                discard_pages(&mut held.client, &claim.deployment, claim.world)?;
-            }
             held.worlds.insert(claim.world, scopes);
             tracing::info!(
                 deployment = %claim.deployment,
@@ -380,24 +377,6 @@ impl ClaimHolder {
             std::thread::sleep(RESTART_POLL);
         }
     }
-}
-
-/// Discards every page of `deployment`'s page pools that `world`, which
-/// computes other numerics than the worlds before it, did not publish
-/// (`Request::DiscardPages`).
-fn discard_pages(client: &mut storage::Client, deployment: &str, world: u64) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-
-    let pages = client
-        .discard_pages(world)
-        .with_context(|| format!("discarding the pages world {world} does not hit"))?;
-    tracing::info!(
-        deployment,
-        world,
-        pages,
-        "discarded the pages of the worlds of other numerics"
-    );
-    Ok(())
 }
 
 /// Returns `world`'s weights that an offload left in host memory to the

@@ -141,7 +141,7 @@ async fn restore(
         let restored = if parked.contains(&client.world()) {
             client.resume(retiring.clone()).await
         } else {
-            client.commit(retiring.clone(), false).await.map(drop)
+            client.commit(retiring.clone()).await.map(drop)
         };
         match restored {
             Ok(()) => match warming::restore(client, backup).await {
@@ -692,7 +692,7 @@ pub(crate) async fn decide_commit(registry: &Arc<Replicas>) -> Result<(), Update
     let trial = locked(&registry.group)
         .take()
         .context("no group is on trial")?;
-    begin_commit(registry, &current, worlds(&trial.previous), false);
+    begin_commit(registry, &current, worlds(&trial.previous));
     for retained in trial.retained {
         if let Previous::Parked(client) = retained {
             close(&client).await;

@@ -107,7 +107,6 @@ impl Claims {
                     // trial first, whose memory it needs.
                     crate::worker::processes::Retirement {
                         worlds: first.retire.clone(),
-                        discard_pages: false,
                     },
                     server_arguments.clone(),
                 )
@@ -159,15 +158,14 @@ impl Claims {
 
     /// Ends the memory of every world of `worlds` on each node of the
     /// deployment, claiming the engine's own scopes there again with them
-    /// retired: a tensor no other world retains is released. With
-    /// `discard_pages` (the engine's world computes other numerics) each
-    /// node's page pools discard the pages the engine's world did not
-    /// publish, which it never hits.
+    /// retired: a tensor no other world retains is released. Committed
+    /// pages stay in the nodes' page pools for any world whose keys reach
+    /// them, until ordinary eviction.
     ///
     /// # Errors
     ///
     /// Fails when a node's daemon or Storage Server refuses the claim.
-    pub(crate) fn retire(&self, worlds: &[u64], discard_pages: bool) -> anyhow::Result<()> {
+    pub(crate) fn retire(&self, worlds: &[u64]) -> anyhow::Result<()> {
         if worlds.is_empty() {
             return Ok(());
         }
@@ -180,7 +178,6 @@ impl Claims {
                     scopes.clone(),
                     crate::worker::processes::Retirement {
                         worlds: worlds.to_vec(),
-                        discard_pages,
                     },
                     self.server_arguments.clone(),
                 )
@@ -195,7 +192,6 @@ impl Claims {
             deployment = %self.deployment,
             world = self.world,
             ?worlds,
-            discard_pages,
             "retired worlds on every node of the deployment"
         );
         Ok(())

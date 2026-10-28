@@ -1530,9 +1530,9 @@ impl Executor for WorkerExecutor {
 
     /// Retires `worlds` through the deployment's claims, which every group
     /// shares.
-    fn retire(&mut self, worlds: &[u64], discard_pages: bool) -> anyhow::Result<()> {
+    fn retire(&mut self, worlds: &[u64]) -> anyhow::Result<()> {
         match self.workers.first() {
-            Some((_, group)) => group.claims().retire(worlds, discard_pages),
+            Some((_, group)) => group.claims().retire(worlds),
             None => Ok(()),
         }
     }

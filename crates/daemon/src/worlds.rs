@@ -72,7 +72,6 @@ use redistribution::Redistribution;
 pub(crate) struct Commit {
     worlds: Vec<u64>,
     retire: Vec<u64>,
-    discard_pages: bool,
     nodes: Option<Vec<String>>,
     pub(crate) pending: Vec<u64>,
 }
@@ -162,10 +161,6 @@ pub(crate) struct Trial {
     /// Why the previous world's weights stayed on the GPUs when the update
     /// asked to keep them in host memory: each node's refusal.
     pub(crate) host_refused: Option<String>,
-    /// Whether the world on trial keys its pages otherwise than the previous
-    /// world (another prefix seed): committed, it hits none of the pages the
-    /// previous world published, which the host KV caches then discard.
-    pub(crate) pages_change: bool,
     pub(crate) promoted: Instant,
     pub(crate) promoted_at: f64,
     /// The previous world's step time and throughput before the promotion.
@@ -1112,12 +1107,7 @@ fn resolve(
 
 /// Records the operator's decision before publication or retirement. A
 /// subsequent error can leave work pending, but cannot make rollback legal.
-fn begin_commit(
-    registry: &crate::leader::Replicas,
-    current: &[Arc<Replica>],
-    retire: Vec<u64>,
-    discard_pages: bool,
-) {
+fn begin_commit(registry: &crate::leader::Replicas, current: &[Arc<Replica>], retire: Vec<u64>) {
     let worlds: Vec<_> = current
         .iter()
         .map(|replica| locked(&replica.worlds).executing)
@@ -1135,7 +1125,6 @@ fn begin_commit(
         pending: worlds.clone(),
         worlds,
         retire,
-        discard_pages,
         nodes: None,
     });
 }
@@ -1188,7 +1177,7 @@ pub(crate) async fn complete_commit(
             }
         };
         client
-            .commit(decision.retire.clone(), decision.discard_pages)
+            .commit(decision.retire.clone())
             .await
             .map_err(|error| {
                 anyhow::anyhow!("commit is decided; world {world} remains pending: {error}")
@@ -2116,7 +2105,6 @@ impl Replica {
                 previous,
                 mode,
                 host_refused,
-                pages_change,
                 promoted: paused,
                 promoted_at: now(),
                 baseline,
@@ -2147,7 +2135,6 @@ impl Replica {
             registry,
             &[Arc::clone(self)],
             vec![trial.previous_world],
-            trial.pages_change,
         );
         if let Previous::Parked(previous) = trial.previous {
             close(&previous).await;

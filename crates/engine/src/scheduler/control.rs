@@ -126,14 +126,10 @@ impl Scheduler {
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(published);
             }
-            Command::Retire {
-                worlds,
-                discard_pages,
-                answer,
-            } => {
+            Command::Retire { worlds, answer } => {
                 let retired = self
                     .executor
-                    .retire(&worlds, discard_pages)
+                    .retire(&worlds)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(retired);
             }

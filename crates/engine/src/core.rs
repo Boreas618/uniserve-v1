@@ -1219,16 +1219,10 @@ impl SchedulerHandle {
         self.commands.cache_warm(operation, together)
     }
 
-    /// Ends the memory of `worlds` on the nodes of the scheduler's workers,
-    /// which the deployment's claims cover, discarding the pages the
-    /// scheduler's world does not hit when `discard_pages`; the receiver
-    /// gets whether it did.
-    pub fn retire(
-        &self,
-        worlds: Vec<u64>,
-        discard_pages: bool,
-    ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.retire(worlds, discard_pages)
+    /// Ends the storage of `worlds` on the nodes of the scheduler's workers,
+    /// which the deployment's claims cover; the receiver gets whether it did.
+    pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.retire(worlds)
     }
 
     /// Keeps the weights alone of `worlds` on the nodes of the scheduler's

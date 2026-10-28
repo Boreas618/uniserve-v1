@@ -511,28 +511,16 @@ impl EngineClient {
 
     /// Commits the engine's world: ends the memory of the worlds `retire`
     /// names (its predecessor, whose processes are gone) on its nodes, and
-    /// its workers take the predecessor's memory they mapped read-only. A
-    /// world of other numerics than its predecessor (`discard_pages`) hits
-    /// none of their pages, which every node's host KV cache discards.
+    /// its workers take the predecessor's storage they mapped read-only.
     /// Returns what each worker reported.
     ///
     /// # Errors
     ///
     /// Fails with the reason a worker did not commit, or when the engine
     /// ends first.
-    pub async fn commit(
-        &self,
-        retire: Vec<u64>,
-        discard_pages: bool,
-    ) -> Result<Vec<String>, String> {
+    pub async fn commit(&self, retire: Vec<u64>) -> Result<Vec<String>, String> {
         match self
-            .ask(|id| {
-                wire::engine_command::Kind::Commit(wire::Commit {
-                    id,
-                    retire,
-                    discard_pages,
-                })
-            })
+            .ask(|id| wire::engine_command::Kind::Commit(wire::Commit { id, retire }))
             .await?
         {
             Answered::Results(results) => Ok(results),
