@@ -72,6 +72,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -464,6 +465,10 @@ class Streaming:
     def mark(self) -> None:
         self.marked = len(self.tokens)
 
+    @property
+    def finished(self) -> bool:
+        return not self._thread.is_alive()
+
     def join(self) -> None:
         self._thread.join(timeout=1800)
         assert not self._thread.is_alive(), "the count did not end"
@@ -497,6 +502,28 @@ def _world_change(base_url: str, *assignments: str) -> dict:
     result = response.json()["result"]
     assert result["change"] == "world", result
     return result["world"]
+
+
+def _change_under_traffic(
+    base_url: str, name: str, streaming: Streaming, assignments: tuple[str, ...]
+) -> tuple[dict, list[Streaming]]:
+    """Keep one request running throughout preparation, retaining every result.
+
+    A finite request can finish while a successor warms. Start the next with
+    the same prompt and token limit so the test observes migration of a live
+    request regardless of the number of requests preparation spans.
+    """
+    streams = [streaming]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        change = executor.submit(_world_change, base_url, *assignments)
+        while not change.done():
+            if streams[-1].finished:
+                streams[-1].join()
+                streams.append(Streaming(base_url, name))
+            time.sleep(0.01)
+        report = change.result()
+    streams[-1].mark()
+    return report, streams
 
 
 def _planned_memory(base_url: str, *assignments: str) -> dict:
@@ -1541,8 +1568,10 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
-        report = _world_change(base_url, *assignments)
-        streaming.mark()
+        report, streams = _change_under_traffic(
+            base_url, name, streaming, assignments
+        )
+        streaming = streams[-1]
         assert report["parallel"] == "changed", report
         assert report["previous_world"] == serving["world"], report
         print(
@@ -1580,8 +1609,9 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         streaming.join()
         assert len(streaming.tokens) > streaming.marked
         reference, reference_usage = _ask(base_url, name)
-        assert streaming.tokens == reference
-        assert streaming.usage == reference_usage
+        for request in streams:
+            assert request.tokens == reference
+            assert request.usage == reference_usage
         changed = _weight_digests(base_url)
 
     direct_path = tmp_path / "direct"
@@ -1865,8 +1895,10 @@ def test_a_change_across_hosts_continues_a_streaming_request(
         )
         if moved_to is not None:
             _deployment_file(deployment, moved_to, ranks)
-        report = _world_change(base_url, *assignments)
-        streaming.mark()
+        report, streams = _change_under_traffic(
+            base_url, name, streaming, assignments
+        )
+        streaming = streams[-1]
         assert report["parallel"] == "changed", report
         assert report["previous_world"] == serving["world"], report
         print(
@@ -1882,8 +1914,9 @@ def test_a_change_across_hosts_continues_a_streaming_request(
         streaming.join()
         assert len(streaming.tokens) > streaming.marked
         reference, reference_usage = _ask(base_url, name)
-        assert streaming.tokens == reference
-        assert streaming.usage == reference_usage
+        for request in streams:
+            assert request.tokens == reference
+            assert request.usage == reference_usage
         changed = _weight_digests(base_url)
         if moved_to is not None:
             # The commit retired the previous world on the host it left: no
