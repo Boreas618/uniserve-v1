@@ -31,6 +31,7 @@ pub(crate) mod artifact;
 pub(crate) mod collectors;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -67,6 +68,10 @@ pub(crate) struct Session {
     writer: Option<Writer>,
     rows: Rows,
     collectors: Arc<Mutex<Collectors>>,
+    /// The collectors running ([`collectors::bit`]), read at every step
+    /// instead of the collectors' lock, which the sampler thread holds while
+    /// it drains the samplers.
+    running: Arc<AtomicU32>,
     /// Steps of the selected stages skipped before the window opened.
     skipped: u64,
     /// Steps the window took as they began, which bounds the window while
@@ -144,6 +149,7 @@ impl Session {
             ));
         }
         let (collectors, states) = Collectors::prepare(&request, device, rows.clone());
+        let running = collectors.running();
         let collectors = Arc::new(Mutex::new(collectors));
         let sampler = sampler(Arc::clone(&collectors))?;
         let answer = serde_json::json!({
@@ -160,6 +166,7 @@ impl Session {
                 writer: Some(writer),
                 rows,
                 collectors,
+                running,
                 skipped: 0,
                 taken: 0,
                 recorded: 0,
@@ -194,7 +201,7 @@ impl Session {
                 self.taken += 1;
             }
         }
-        let collecting = !lock(&self.collectors).is_empty();
+        let collecting = self.running.load(Ordering::Acquire) != 0;
         if collecting && taken != self.intended {
             self.pending
                 .push_back(if taken { Action::Arm } else { Action::Disarm });
@@ -232,9 +239,7 @@ impl Session {
                 self.intended = false;
             }
         } else if self.recorded.is_multiple_of(RANGE_CYCLE)
-            && lock(&self.collectors)
-                .names()
-                .contains(&Collector::RangeMetrics)
+            && self.running.load(Ordering::Acquire) & collectors::bit(Collector::RangeMetrics) != 0
         {
             self.pending.push_back(Action::CycleRanges);
         }
