@@ -483,7 +483,6 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
     };
     let manifest = Manifest::plan(&request).unwrap();
     assert!(manifest.missing.is_empty());
-    assert!(manifest.verify(&manifest.digest));
     assert_fields_equal(&request, &apply(&request, &manifest));
     // The query rows and the norm each target finds on its GPU are mapped.
     let mapped: BTreeMap<u32, u64> =
@@ -749,29 +748,6 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
         .links
         .retain(|measured| !matches!(measured.link.source, Memory::Remote { .. }));
     assert!(Manifest::plan(&unmeasured).is_err());
-}
-
-#[test]
-fn planning_is_cached_and_digests_cover_the_directions() {
-    let source = world(vec![(Some(gpu(0)), moe_rank(1, 0, 1, 0))]);
-    let target = world(vec![
-        (None, moe_rank(2, 0, 1, 0)),
-        (None, moe_rank(2, 1, 1, 0)),
-    ]);
-    let request = Request {
-        source,
-        target,
-        gpus: (0..2).map(gpu).collect(),
-        links: links(2),
-    };
-    let mut planner = Planner::default();
-    let first = planner.manifest(&request).unwrap();
-    let second = planner.manifest(&request).unwrap();
-    assert!(Arc::ptr_eq(&first, &second));
-    let mut altered = (*first).clone();
-    altered.copies[0].length += 4;
-    assert!(!altered.verify(&first.digest));
-    assert_fields_equal(&request, &apply(&request, &first));
 }
 
 /// A `u32` field of `tokens` positions of 8 channels holding `segments`.

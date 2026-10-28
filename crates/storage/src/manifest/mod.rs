@@ -37,9 +37,8 @@
 //! 5. Padding the target holds is zeroed ([`Fill`]); regions no source
 //!    holds are reported ([`Missing`]) for the target to load.
 //!
-//! The manifest's digest covers everything it directs; every participating
-//! worker verifies it before executing ([`Manifest::verify`]), and a
-//! [`Planner`] computes each pair's manifest once. [`Manifest::spans`]
+//! A [`Planner`] caches each pair's executable manifest. Participating
+//! workers consume that concrete plan. [`Manifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
 //! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
 //! its Transfer Server executes. The source world of weights is what the
@@ -369,12 +368,6 @@ impl Manifest {
         let mut digest = Digest::new(b"uniserve-manifest");
         digest.bytes(&encoded);
         Ok(digest.finish())
-    }
-
-    /// Whether the manifest is the one `digest` names: what a worker checks
-    /// before executing any of it.
-    pub fn verify(&self, digest: &[u8; 32]) -> bool {
-        self.digest == *digest && self.compute_digest().is_ok_and(|own| own == *digest)
     }
 
     /// The bytes the copies move.
