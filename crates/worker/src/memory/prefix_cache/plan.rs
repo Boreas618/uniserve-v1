@@ -340,6 +340,16 @@ impl CachePlan {
         self.groups.iter().any(|group| group.state)
     }
 
+    /// Writable units needed to advance one request: one page of every
+    /// K/V group and two state checkpoints. The input checkpoint stays
+    /// readable until the call writing its successor has completed.
+    pub(crate) fn progress_units(&self) -> u32 {
+        self.groups
+            .iter()
+            .map(|group| group.units_per_page * if group.state { 2 } else { 1 })
+            .sum()
+    }
+
     /// The units a token capacity of `tokens` takes: the whole pages of
     /// those tokens in every K/V group, and one checkpoint of the state
     /// group per request slot of `request_slots`, the latest each running
