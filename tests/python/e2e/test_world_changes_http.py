@@ -1566,6 +1566,33 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         log,
     ):
         (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        if change == "tp1-to-tp2":
+            # Physical free storage alone is insufficient: the new GPU
+            # must also hold the target's weights and runtime within its
+            # static fraction. Planning must leave the serving world live.
+            response = httpx.put(
+                f"{base_url}/admin/config",
+                json={
+                    "set": [*assignments, "mem_fraction_static=0.15"],
+                    "dry_run": True,
+                },
+                timeout=1800,
+            )
+            assert response.status_code == 200, response.text
+            plan = response.json()["result"]["plan"]["redistribution"]
+            assert plan["refusal"], plan
+            added = [gpu for gpu in plan["gpus"] if not gpu["serving"]]
+            assert added, plan
+            for gpu in added:
+                assert gpu["created_bytes"] < gpu["free_bytes"], gpu
+                budget = gpu["budget"]
+                required = sum(
+                    budget[key]
+                    for key in ("weights", "process", "graphs", "fixed")
+                )
+                required += max(budget["cache"], budget["cache_capacity"])
+                assert required > gpu["available_bytes"], gpu
+            assert _config(base_url)["slots"][0]["world"] == serving["world"]
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         report, streams = _change_under_traffic(

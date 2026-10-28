@@ -118,23 +118,26 @@ impl Scheduler {
         self.poll_park();
     }
 
-    /// The cache units the requests that would leave as migratable at a
-    /// park hold now: those a successor computing their state again takes
-    /// of its own.
-    pub(super) fn migrating_units(&self) -> u32 {
-        self.running
+    /// Source units and accepted prefix lengths of requests that can move.
+    /// The target sizes recomputation from these lengths at its own layout.
+    pub(super) fn migrating_cache(&self) -> (u32, Vec<u32>) {
+        let mut units = 0;
+        let mut tokens = Vec::new();
+        for state in self
+            .running
             .values()
             .filter(|state| state.req.is_migratable() && !state.terminal_intent.is_terminal())
-            .map(|state| {
-                state.allocations.as_ref().map_or(0, |allocations| {
-                    allocations
-                        .block_tables()
-                        .iter()
-                        .map(|table| table.unit_ids().len() as u32)
-                        .sum()
-                })
-            })
-            .sum()
+        {
+            units += state.allocations.as_ref().map_or(0, |allocations| {
+                allocations
+                    .block_tables()
+                    .iter()
+                    .map(|table| table.unit_ids().len() as u32)
+                    .sum::<u32>()
+            });
+            tokens.push(state.cache_visible_len);
+        }
+        (units, tokens)
     }
 
     /// Completes a park once no request is queued, runs or retires and no

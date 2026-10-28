@@ -544,11 +544,11 @@ fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
 async fn memory_plan(
     running: &EngineClient,
     successor: Successor,
-    created: &BTreeMap<storage::manifest::Gpu, u64>,
+    budgets: &BTreeMap<storage::manifest::Gpu, storage::manifest::weights::RankBudget>,
     previous_world: PreviousWorld,
 ) -> (serde_json::Value, Option<String>) {
     match running
-        .make_room(wire::CacheChange::Plan, successor, None, created)
+        .make_room(wire::CacheChange::Plan, successor, None, budgets)
         .await
     {
         Ok(results) => (memory_report(&results, previous_world, successor), None),
@@ -842,12 +842,11 @@ impl Leader {
         if let Some(planned) = &redistribution {
             target_spec.received_weights = planned.received.clone();
         }
-        // The weight chunks a planned successor creates on each GPU; one of
-        // another parallel configuration the daemon did not plan loads all
-        // of its weights.
-        let created = redistribution
+        // Target rank resources include the concrete weight copies. A
+        // successor with no reusable source weights loads its checkpoint.
+        let budgets = redistribution
             .as_ref()
-            .map(|planned| planned.created.clone())
+            .map(|planned| planned.budgets.clone())
             .unwrap_or_default();
         // A successor of another parallel configuration or another KV cache
         // encoding maps none of the serving world's cache, and one that
@@ -905,7 +904,7 @@ impl Leader {
         // successor, with the weights it creates, per GPU and host
         // (`specs/online-operations.md` §6.6).
         let memory = if world_changes && !in_place && unmapped.is_empty() {
-            Some(memory_plan(&running, successor, &created, update.previous_world).await)
+            Some(memory_plan(&running, successor, &budgets, update.previous_world).await)
         } else {
             None
         };
@@ -1021,7 +1020,7 @@ impl Leader {
                 request.in_flight,
                 successor,
                 redistributes,
-                &created,
+                &budgets,
                 redistribution,
             )
             .await?;
@@ -1033,7 +1032,7 @@ impl Leader {
     /// module). A successor of another parallel configuration
     /// (`redistributes`) maps none of the serving world's KV cache, and the
     /// requests in flight compute their state again on it; it creates the
-    /// weight chunks `created` states on each GPU, which the serving world's
+    /// resources `budgets` states on each GPU, which the serving world's
     /// cache makes room for.
     #[expect(
         clippy::too_many_arguments,
@@ -1051,7 +1050,7 @@ impl Leader {
         in_flight: InFlight,
         adds: Successor,
         redistributes: bool,
-        created: &BTreeMap<storage::manifest::Gpu, u64>,
+        budgets: &BTreeMap<storage::manifest::Gpu, storage::manifest::weights::RankBudget>,
         redistribution: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, UpdateError> {
         let started = Instant::now();
@@ -1083,7 +1082,7 @@ impl Leader {
                 wire::CacheChange::Shrink,
                 adds,
                 update.preempt_after,
-                created,
+                budgets,
             )
             .await
             .map_err(|error| {

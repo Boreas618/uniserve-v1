@@ -328,93 +328,15 @@ impl Worker {
             ),
             (None, None) => (None, (Vec::new(), None)),
         };
-        // Every later graph decision of the rank reads the resolved policy.
-        let host_component = components
-            .placed()
-            .iter()
-            .find(|placed| placed.config.weights == ComponentWeights::Host)
-            .map(|placed| placed.name.as_str());
-        plugin_graph_policy(&mut launch.execution).map_err(phase("load"))?;
-        let capturable =
-            graph_policy("auto", &model, host_component).is_ok_and(|policy| policy != "off");
-        launch.execution.graph_policy =
-            graph_policy(&launch.execution.graph_policy, &model, host_component)
-                .map_err(phase("load"))?;
-        let mut config = launch.execution.clone();
-        if model.video_decoder {
-            config = config
-                .for_media_slots(launch.ipc.queue_depth)
-                .map_err(phase("load"))?;
-        }
-        // How the computations over the prefix cache lay out a model's image
-        // features: a model without image capabilities places none.
-        let image_capable = [
-            Capability::ImageDenoiser,
-            Capability::PatchEncoder,
-            Capability::PatchAutoencoder,
-            Capability::ImageDecoder,
-        ]
-        .into_iter()
-        .any(|capability| model.declarations.has(capability));
-        let text_facts = if image_capable {
-            image::TextFacts::of(model.handle()).map_err(phase("load"))?
-        } else {
-            image::TextFacts::default()
-        };
-        // The executor's token computations are sized by the cache's layout, so
-        // the block size is resolved first, collectively over the worker group.
-        block_size(&mut config, &model, &world).map_err(phase("capacity"))?;
-        let cache = cache_plan(&launch, &config, &model).map_err(phase("capacity"))?;
-        // The rank's executor states what capacity planning sizes the rank by:
-        // a video model's slot layout, the storage of its computations over the
-        // prefix cache.
-        let video_denoiser = if model.video_decoder {
-            Some(
-                computations::placed_denoiser(&model.declarations, &config.deployment_components)
-                    .map_err(phase("load"))?,
-            )
-        } else {
-            None
-        };
-        let sections = computations::Sections {
-            video: video_denoiser
-                .as_deref()
-                .map(|denoiser| computations::video_settings(&config, denoiser)),
-            image: image::holds(&components, video_denoiser.is_some())
-                .then(|| image::settings(&config)),
-            pages: computations::page_settings(
-                &launch,
-                &config,
-                &components,
-                cache.as_ref(),
-                text_facts.image_processor,
-                text_facts.media_axes,
-            )
-            .map_err(phase("load"))?,
-            experts: computations::expert_settings(&launch),
-        };
-        let executor = computations::construct(
-            model.handle(),
-            &config,
-            &components,
-            &model.attention_backend,
-            sections,
-        )
-        .map_err(phase("load"))?;
-        let (executor, manifest) = match executor {
-            Some((executor, manifest)) => (Some(executor), manifest),
-            None => (None, computations::Manifest::default()),
-        };
-        let video = match (video_denoiser, &manifest.video) {
-            (Some(denoiser), Some(video)) => Some((denoiser, video.clone())),
-            (Some(_), None) => {
-                return Err(phase("load")(Error::Interface(
-                    "the executor's manifest states no video section".into(),
-                )));
-            }
-            (None, _) => None,
-        };
-
+        let Prepared {
+            mut config,
+            capturable,
+            text_facts,
+            cache,
+            executor,
+            manifest,
+            video,
+        } = prepare_model(&mut launch, &model, &world, &components).map_err(phase("capacity"))?;
         drop(loading);
 
         let devices: Vec<Device> = config.devices().collect();
@@ -1409,14 +1331,118 @@ fn expert_partition(launch: &WorkerLaunch, world: &World) -> Option<ExpertPartit
         })
 }
 
-/// Plans the weights of the rank `launch` describes before its world
-/// starts (`uniserve worker --plan`): the rank describes its model, builds
-/// its partition in a planning world ([`World::planning`]: the meshes its
-/// start binds, without process groups or peers), materializes its model
-/// without reading the checkpoint on its device and plans the storages its
-/// weights take, chunked and keyed exactly as its start retains them
-/// ([`WeightKeys::plan`]). It connects to no Storage Server and retains
-/// nothing; the device storage it held returns when the process exits.
+/// Numerical and executor facts shared by startup and resource planning.
+struct Prepared {
+    config: WorkerConfig,
+    capturable: bool,
+    text_facts: image::TextFacts,
+    cache: Option<crate::memory::CachePlan>,
+    executor: Option<Arc<crate::executor::python::PythonExecutor>>,
+    manifest: computations::Manifest,
+    video: Option<(String, crate::capacity::video::VideoManifest)>,
+}
+
+fn prepare_model(
+    launch: &mut WorkerLaunch,
+    model: &LoadedModel,
+    world: &World,
+    components: &Components,
+) -> Result<Prepared> {
+    // Every later graph decision of the rank reads the resolved policy.
+    let host_component = components
+        .placed()
+        .iter()
+        .find(|placed| placed.config.weights == ComponentWeights::Host)
+        .map(|placed| placed.name.as_str());
+    plugin_graph_policy(&mut launch.execution)?;
+    let capturable =
+        graph_policy("auto", model, host_component).is_ok_and(|policy| policy != "off");
+    launch.execution.graph_policy =
+        graph_policy(&launch.execution.graph_policy, model, host_component)?;
+    let mut config = launch.execution.clone();
+    if model.video_decoder {
+        config = config.for_media_slots(launch.ipc.queue_depth)?;
+    }
+    // How the computations over the prefix cache lay out a model's image
+    // features: a model without image capabilities places none.
+    let image_capable = [
+        Capability::ImageDenoiser,
+        Capability::PatchEncoder,
+        Capability::PatchAutoencoder,
+        Capability::ImageDecoder,
+    ]
+    .into_iter()
+    .any(|capability| model.declarations.has(capability));
+    let text_facts = if image_capable {
+        image::TextFacts::of(model.handle())?
+    } else {
+        image::TextFacts::default()
+    };
+    // The executor's token computations are sized by the cache's layout, so
+    // the block size is resolved first, collectively over the worker group.
+    block_size(&mut config, model, world)?;
+    let cache = cache_plan(launch, &config, model)?;
+    // The rank's executor states what capacity planning sizes the rank by:
+    // a video model's slot layout, the storage of its computations over the
+    // prefix cache.
+    let video_denoiser = if model.video_decoder {
+        Some(computations::placed_denoiser(
+            &model.declarations,
+            &config.deployment_components,
+        )?)
+    } else {
+        None
+    };
+    let sections = computations::Sections {
+        video: video_denoiser
+            .as_deref()
+            .map(|denoiser| computations::video_settings(&config, denoiser)),
+        image: image::holds(components, video_denoiser.is_some()).then(|| image::settings(&config)),
+        pages: computations::page_settings(
+            launch,
+            &config,
+            components,
+            cache.as_ref(),
+            text_facts.image_processor,
+            text_facts.media_axes,
+        )?,
+        experts: computations::expert_settings(launch),
+    };
+    let executor = computations::construct(
+        model.handle(),
+        &config,
+        components,
+        &model.attention_backend,
+        sections,
+    )?;
+    let (executor, manifest) = match executor {
+        Some((executor, manifest)) => (Some(executor), manifest),
+        None => (None, computations::Manifest::default()),
+    };
+    let video = match (video_denoiser, &manifest.video) {
+        (Some(denoiser), Some(video)) => Some((denoiser, video.clone())),
+        (Some(_), None) => {
+            return Err(Error::Interface(
+                "the executor's manifest states no video section".into(),
+            ));
+        }
+        (None, _) => None,
+    };
+
+    Ok(Prepared {
+        config,
+        capturable,
+        text_facts,
+        cache,
+        executor,
+        manifest,
+        video,
+    })
+}
+
+/// Plan the target rank's encoded weight layout and startup capacity on
+/// its assigned GPU. Planning retains no weights; its claim keeps source
+/// manifests visible until the complete response reaches the daemon.
 pub(crate) fn plan_rank(
     launch: &WorkerLaunch,
     source_world: u64,
@@ -1481,6 +1507,9 @@ pub(crate) fn plan_rank(
             gpu,
             total_bytes: device_storage.total,
             free_bytes: device_storage.free,
+            resident_bytes: 0,
+            device_quota: None,
+            budget: None,
             fingerprints: BTreeMap::new(),
             storages: None,
             sources: None,
@@ -1490,7 +1519,55 @@ pub(crate) fn plan_rank(
     let planned = keys.plan(&unread, &[], None)?;
     let storages = keys.planned_storages(&planned);
     drop(planned);
-    drop(unread);
+    let model = LoadedModel::from_handle(description, unread)?;
+    let mut target = launch.clone();
+    let Prepared {
+        mut config,
+        text_facts,
+        cache,
+        executor,
+        manifest,
+        video,
+        ..
+    } = prepare_model(&mut target, &model, &world, &components)?;
+    let quota = crate::capacity::device::quota(device_storage.total, config.mem_fraction_static);
+    // Capacity planning reads its numerical bounds from the target. The
+    // daemon subtracts retained resources and the actual newly created
+    // chunks after rank assignment, when those quantities are known.
+    config.pool_storage_bytes = Some(quota as usize);
+    let (capacity, _) = plan(
+        &target,
+        &mut config,
+        &model,
+        manifest.image.as_ref(),
+        text_facts.image_processor,
+        &world,
+        None,
+        &components,
+        cache,
+        manifest.pages.as_ref(),
+        video
+            .as_ref()
+            .map(|(name, manifest)| (name.as_str(), manifest.clone())),
+    )?;
+    let mut budget = storage::manifest::weights::RankBudget {
+        quota,
+        graphs: if config.graph_policy == "off" {
+            0
+        } else {
+            graph_storage_budget_bytes(device_storage.total as i64)
+        },
+        fixed: capacity
+            .fixed_device_bytes
+            .get(&device)
+            .copied()
+            .unwrap_or(0),
+        ..Default::default()
+    };
+    planning::cache_budget(&target, &config, &capacity, &mut budget)?;
+    drop(capacity);
+    drop(executor);
+    drop(model);
     Interpreter::import("gc.collect")?.call_values(&[])?;
     Interpreter::import("torch.cuda.empty_cache")?.call_values(&[])?;
     let retained = Retained::connect(
@@ -1499,6 +1576,18 @@ pub(crate) fn plan_rank(
         launch.execution.rank as u32,
         launch.generation,
     )?;
+    let device_budget = DeviceBudget::new(
+        Interpreter::import("torch.cuda.synchronize")?,
+        Interpreter::import("torch.cuda.empty_cache")?,
+        Arc::clone(&retained),
+        BTreeMap::new(),
+    )?;
+    budget.process = device_budget.process_bytes(cuda)?;
+    let (ledger, _) = retained.ledger(cuda)?;
+    // Transfer context may not have been created yet on a new target GPU.
+    let transfer = ledger
+        .transfer_context
+        .saturating_sub(ledger.bytes(|entry| entry.item == storage::Item::TransferContext));
     let mut sources = keys.sources(&retained, &launch.storage.peers, Some(source_world))?;
     if let Some(sources) = sources.as_mut() {
         keys.measure_sources(&retained, sources)?;
@@ -1507,6 +1596,9 @@ pub(crate) fn plan_rank(
         gpu,
         total_bytes: device_storage.total,
         free_bytes: device_storage.free,
+        resident_bytes: ledger.used() + transfer,
+        device_quota: ledger.quota,
+        budget: Some(budget),
         fingerprints: keys.fingerprint_digests(),
         storages,
         sources,

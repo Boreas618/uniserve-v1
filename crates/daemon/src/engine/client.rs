@@ -695,9 +695,8 @@ impl EngineClient {
 
     /// Plans (`Plan`) or makes (`Shrink`) the room a world succeeding the
     /// engine's on the same devices needs beside what they share, by
-    /// `change`: what the successor adds is `successor`, and the weight
-    /// chunks it creates on each GPU `created` (bytes by GPU UUID; a world of
-    /// another parallel configuration). A shrink recomputes the requests
+    /// `change`: what the successor adds is `successor`, with target rank
+    /// capacities and concrete transfer allocations in `budgets`. A shrink recomputes the requests
     /// that still hold the tail once `preempt_after` passed, when given.
     /// Returns each device's plan.
     ///
@@ -710,13 +709,29 @@ impl EngineClient {
         change: wire::CacheChange,
         successor: Successor,
         preempt_after: Option<Duration>,
-        created: &BTreeMap<[u8; 16], u64>,
+        budgets: &BTreeMap<[u8; 16], storage::manifest::weights::RankBudget>,
     ) -> Result<Vec<String>, String> {
-        let created_weights: Vec<wire::CreatedWeights> = created
+        let rank_budgets: Vec<wire::RankBudget> = budgets
             .iter()
-            .map(|(gpu, bytes)| wire::CreatedWeights {
+            .map(|(gpu, budget)| wire::RankBudget {
                 gpu: gpu.to_vec(),
-                bytes: *bytes,
+                weights: budget.weights,
+                quota: budget.quota,
+                process: budget.process,
+                graphs: budget.graphs,
+                fixed: budget.fixed,
+                cache: budget.cache,
+                cache_capacity: budget.cache_capacity,
+                pages: budget
+                    .pages
+                    .iter()
+                    .map(|page| wire::CachePageBudget {
+                        tokens: page.tokens,
+                        bytes: page.bytes,
+                        window: page.window,
+                        state: page.state,
+                    })
+                    .collect(),
             })
             .collect();
         self.ask(|id| {
@@ -728,7 +743,7 @@ impl EngineClient {
                 successor_loads_weights: successor.loads_weights,
                 successor_recomputes_cache: successor.recomputes_cache,
                 successor_captures_graphs: successor.captures_graphs,
-                created_weights,
+                rank_budgets,
                 ..wire::ResizeCache::default()
             })
         })
