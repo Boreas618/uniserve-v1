@@ -8,7 +8,8 @@
 //! specification and waits until the engine reports that it serves; the
 //! engine's process lives for as long as its control connection does.
 
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::collections::BTreeMap;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -46,6 +47,9 @@ pub struct EngineControl {
     /// The deployment the engines serve.
     deployment: String,
     next_engine: AtomicU64,
+    /// Engine handoffs can connect in any order. Reading and assigning
+    /// their greetings is serialized; each client keeps its buffered reader.
+    incoming: std::sync::Mutex<BTreeMap<u64, (Connection, Connection, wire::Hello)>>,
 }
 
 impl EngineControl {
@@ -75,6 +79,7 @@ impl EngineControl {
             host,
             deployment,
             next_engine: AtomicU64::new(1),
+            incoming: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -110,13 +115,7 @@ impl EngineControl {
             .context("the engine spec states no workers")?;
         let standby = spec.predecessor.is_some();
         let mut control = self.spawn(engine, &executable)?;
-        let stream = self.accept(engine, &mut control)?;
-        let mut reader = Connection::from_unix(stream.try_clone()?)?;
-        let mut writer = Connection::from_unix(stream)?;
-
-        let hello: wire::Hello = reader
-            .recv(CONNECT_TIMEOUT)?
-            .context("the engine process said no hello")?;
+        let (mut reader, mut writer, hello) = self.accept(engine, &mut control)?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
                 "the engine speaks major version {} and this daemon {}",
@@ -227,12 +226,7 @@ impl EngineControl {
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
         let world = served.world;
-        let stream = self.accept(engine, &mut control)?;
-        let mut reader = Connection::from_unix(stream.try_clone()?)?;
-        let mut writer = Connection::from_unix(stream)?;
-        let hello: wire::Hello = reader
-            .recv(CONNECT_TIMEOUT)?
-            .context("the engine said no hello")?;
+        let (mut reader, mut writer, hello) = self.accept(engine, &mut control)?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
                 "the engine speaks major version {} and this daemon {}",
@@ -286,7 +280,7 @@ impl EngineControl {
     /// Connects to the daemon's process socket and has it start engine
     /// `engine` as `executable` on this node; returns the control connection
     /// the process lives under.
-    fn spawn(&self, engine: u64, executable: &str) -> anyhow::Result<Connection> {
+    fn connect(&self) -> anyhow::Result<(Connection, Vec<process::Node>)> {
         let mut control = Connection::connect(&self.processes)
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.send(&process::Hello {
@@ -305,6 +299,89 @@ impl EngineControl {
             "the daemon refused the control connection: {}",
             welcome.refusal
         );
+
+        Ok((control, welcome.nodes))
+    }
+
+    /// Queries each daemon for its CUDA-visible devices with no compute or
+    /// graphics owner. These ordinals can be assigned to a successor without
+    /// displacing another serving world.
+    pub fn available_devices(&self) -> anyhow::Result<BTreeMap<String, Vec<u32>>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut devices = BTreeMap::new();
+        for (index, node) in nodes.into_iter().enumerate() {
+            connection.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::Devices(process::DeviceQuery {
+                        host: node.host.clone(),
+                    })),
+                })),
+            })?;
+            let answer: process::Downstream = connection
+                .recv(DAEMON_TIMEOUT)?
+                .context("the daemon did not report its available devices")?;
+            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
+                anyhow::bail!("the daemon did not answer its device query");
+            };
+            anyhow::ensure!(
+                answer.error.is_empty(),
+                "device inventory for {}: {}",
+                node.host,
+                answer.error
+            );
+            let Some(reply::Kind::Devices(inventory)) = answer.kind else {
+                anyhow::bail!("the daemon returned no device inventory");
+            };
+            devices.insert(node.host, inventory.available);
+        }
+        Ok(devices)
+    }
+
+    /// Publishes one commit decision at every deployment node. Publication
+    /// is atomic within each Storage Server and idempotent across retries;
+    /// the daemon retains its commit decision until every node has answered.
+    pub fn publish_worlds(
+        &self,
+        worlds: &[u64],
+        pending: &mut Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let (mut connection, nodes) = self.connect()?;
+        let pending =
+            pending.get_or_insert_with(|| nodes.into_iter().map(|node| node.host).collect());
+        while let Some(host) = pending.first().cloned() {
+            connection.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: 1,
+                    kind: Some(request::Kind::PublishWorlds(process::PublishWorlds {
+                        host: host.clone(),
+                        deployment: self.deployment.clone(),
+                        worlds: worlds.to_vec(),
+                    })),
+                })),
+            })?;
+            let answer: process::Downstream = connection
+                .recv(DAEMON_TIMEOUT)?
+                .context("the daemon did not report world publication")?;
+            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
+                anyhow::bail!("the daemon did not answer world publication");
+            };
+            anyhow::ensure!(
+                answer.error.is_empty(),
+                "publishing worlds at {host}: {}",
+                answer.error
+            );
+            anyhow::ensure!(
+                matches!(answer.kind, Some(reply::Kind::WorldsPublished(_))),
+                "the daemon returned no publication result"
+            );
+            pending.remove(0);
+        }
+        Ok(())
+    }
+
+    fn spawn(&self, engine: u64, executable: &str) -> anyhow::Result<Connection> {
+        let (mut control, _) = self.connect()?;
 
         let executable = executable.to_owned();
         control.send(&process::Upstream {
@@ -355,11 +432,32 @@ impl EngineControl {
 
     /// Accepts engine `engine`'s connection to the request socket, failing
     /// when its process exits first or does not connect in time.
-    fn accept(&self, engine: u64, control: &mut Connection) -> anyhow::Result<UnixStream> {
+    fn accept(
+        &self,
+        engine: u64,
+        control: &mut Connection,
+    ) -> anyhow::Result<(Connection, Connection, wire::Hello)> {
+        let mut incoming = self
+            .incoming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(connection) = incoming.remove(&engine) {
+            return Ok(connection);
+        }
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
             match self.requests.accept() {
-                Ok((stream, _)) => return Ok(stream),
+                Ok((stream, _)) => {
+                    let mut reader = Connection::from_unix(stream.try_clone()?)?;
+                    let writer = Connection::from_unix(stream)?;
+                    let hello: wire::Hello = reader
+                        .recv(CONNECT_TIMEOUT)?
+                        .context("the engine said no hello")?;
+                    if hello.engine == engine {
+                        return Ok((reader, writer, hello));
+                    }
+                    incoming.insert(hello.engine, (reader, writer, hello));
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error).context("accepting the engine's connection"),
             }
@@ -407,4 +505,88 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_resumes_after_a_node_refuses_the_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("processes.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // This process-protocol peer represents two remote storage nodes.
+        // One node cannot publish until the operator restores its storage.
+        let peer = std::thread::spawn(move || {
+            let mut published = BTreeMap::new();
+            for restored in [false, true] {
+                let mut connection = Connection::from_unix(listener.accept().unwrap().0).unwrap();
+                let _: process::Hello = connection.recv(Duration::from_secs(5)).unwrap().unwrap();
+                connection
+                    .send(&process::Welcome {
+                        nodes: ["rank-0", "rank-1"]
+                            .into_iter()
+                            .map(|host| process::Node {
+                                host: host.into(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                while let Ok(Some(message)) =
+                    connection.recv::<process::Upstream>(Duration::from_secs(5))
+                {
+                    let Some(upstream::Kind::Request(command)) = message.kind else {
+                        panic!("expected a request")
+                    };
+                    let Some(request::Kind::PublishWorlds(worlds)) = command.kind else {
+                        panic!("expected world publication")
+                    };
+                    let unavailable = worlds.host == "rank-1" && !restored;
+                    if !unavailable {
+                        published.insert(worlds.host, worlds.worlds);
+                    }
+                    connection
+                        .send(&process::Downstream {
+                            kind: Some(downstream::Kind::Reply(process::Reply {
+                                id: command.id,
+                                error: if unavailable {
+                                    "storage unavailable".into()
+                                } else {
+                                    String::new()
+                                },
+                                kind: (!unavailable).then_some(reply::Kind::WorldsPublished(
+                                    process::WorldsPublished {},
+                                )),
+                            })),
+                        })
+                        .unwrap();
+                }
+            }
+            published
+        });
+        let control = EngineControl::new(
+            &directory.path().join("requests.sock"),
+            format!("unix:{}", socket.display()),
+            "rank-0".into(),
+            "model".into(),
+        )
+        .unwrap();
+        let mut pending = None;
+        assert!(control.publish_worlds(&[3, 4], &mut pending).is_err());
+        assert_eq!(pending, Some(vec!["rank-1".to_owned()]));
+        // Handoff serializes the pending nodes with the irrevocable decision.
+        let mut handed = serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+        control.publish_worlds(&[3, 4], &mut handed).unwrap();
+        assert_eq!(handed, Some(Vec::new()));
+        assert_eq!(
+            peer.join().unwrap(),
+            BTreeMap::from([
+                ("rank-0".to_owned(), vec![3, 4]),
+                ("rank-1".to_owned(), vec![3, 4]),
+            ])
+        );
+    }
 }

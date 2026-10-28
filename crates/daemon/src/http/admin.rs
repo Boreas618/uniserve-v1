@@ -425,6 +425,8 @@ where
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigBody {
+    #[serde(default)]
+    replica: Option<usize>,
     /// The whole target configuration as TOML; the current one when unset.
     #[serde(default)]
     config: Option<String>,
@@ -470,6 +472,7 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
     let restarter = state.restarter.clone();
     run(&state.admin, "config", body.wait, async move {
         let request = ApplyRequest {
+            replica: body.replica,
             config: body.config,
             set: body.set,
             in_flight: body.in_flight,

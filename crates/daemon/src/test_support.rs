@@ -191,13 +191,13 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     EngineClient::over(
         daemon,
         info,
-        crate::leader::stats_sink(model_name, std::sync::Arc::default()),
+        crate::leader::stats_sink(model_name, std::sync::Arc::default(), 0),
     )
     .expect("a client")
 }
 
 /// The simulated model's facts.
-fn sim_model(parameters: ModelParameters) -> ModelConfig {
+pub(crate) fn sim_model(parameters: ModelParameters) -> ModelConfig {
     ModelConfig {
         parameters,
         sampling_defaults: SamplingDefaults::default(),
@@ -217,6 +217,19 @@ pub(crate) fn engine_over(
     cores: Vec<SchedulerHandle>,
     readout: Option<crate::input::readout::ReadoutEncoder>,
 ) -> Leader {
+    let model_name = cores[0].model_name().to_owned();
+    let client = std::sync::Arc::new(sim_client(cores));
+    leader_over(model, tokenizer, model_name, vec![client], readout)
+}
+
+/// Binds the public leader to independent engine connections.
+pub(crate) fn leader_over(
+    model: ModelConfig,
+    tokenizer: DynTokenizer,
+    model_name: String,
+    clients: Vec<std::sync::Arc<EngineClient>>,
+    readout: Option<crate::input::readout::ReadoutEncoder>,
+) -> Leader {
     let renderer = match &model.parameters {
         ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(MAX_VIDEO_SECONDS)),
         _ => RequestRenderer::Chat(
@@ -228,13 +241,11 @@ pub(crate) fn engine_over(
             .unwrap(),
         ),
     };
-    let model_name = cores[0].model_name().to_owned();
-    let client = sim_client(cores);
     let processor = InputProcessor::new(
         model,
         tokenizer,
         renderer,
-        client.info().limits.clone(),
+        clients[0].info().limits.clone(),
         false,
     )
     .unwrap();
@@ -249,7 +260,7 @@ pub(crate) fn engine_over(
     Leader::new(
         SERVED_MODEL.to_owned(),
         model_name,
-        client,
+        clients,
         processor,
         images,
         readout,

@@ -23,6 +23,8 @@ enum Serving {
     Holding,
     /// This engine serves submissions while it is ready.
     Engine(Arc<EngineClient>),
+    /// A group reshape transferred this replica's requests to these owners.
+    Successor(Arc<RequestHold>),
     /// No engine will serve; submissions fail with the reason.
     Closed(String),
 }
@@ -119,6 +121,7 @@ impl RequestHold {
         match &*self.serving.borrow() {
             Serving::Engine(client) => HoldState::Engine(client.state()),
             Serving::Holding => HoldState::Holding,
+            Serving::Successor(_) => HoldState::Holding,
             Serving::Closed(reason) => HoldState::Closed(reason.clone()),
         }
     }
@@ -126,6 +129,15 @@ impl RequestHold {
     /// Has `client`'s engine serve every held and later submission.
     pub fn serve(&self, client: Arc<EngineClient>) {
         self.serving.send_replace(Serving::Engine(client));
+    }
+
+    /// Transfers continuations to a successor replica. Existing HTTP
+    /// streams retain this hold, while each successor owns its later world
+    /// changes. The caller must avoid cycles and restore predecessor holds
+    /// before redirecting successors during rollback.
+    pub(crate) fn redirect(&self, successor: Arc<RequestHold>) {
+        self.serving.send_replace(Serving::Successor(successor));
+        self.paused.send_replace(false);
     }
 
     /// Holds later submissions until an engine serves again; the engine that
@@ -144,7 +156,7 @@ impl RequestHold {
     pub fn client(&self) -> Option<Arc<EngineClient>> {
         match &*self.serving.borrow() {
             Serving::Engine(client) => Some(Arc::clone(client)),
-            Serving::Holding | Serving::Closed(_) => None,
+            Serving::Holding | Serving::Closed(_) | Serving::Successor(_) => None,
         }
     }
 
@@ -176,6 +188,12 @@ impl RequestHold {
         &self,
         request: Request,
     ) -> Result<(EventStream, Option<u32>), SubmitError> {
+        self.ready().await?.submit(request).await
+    }
+
+    /// Waits for this replica to accept new requests. The deployment router
+    /// waits on all replicas when none is ready, without polling.
+    pub(crate) async fn ready(&self) -> Result<Arc<EngineClient>, SubmitError> {
         let mut serving = self.serving.subscribe();
         let mut paused = self.paused.subscribe();
         loop {
@@ -183,12 +201,21 @@ impl RequestHold {
             let current = serving.borrow_and_update().clone();
             match current {
                 Serving::Engine(client) if !held && client.state() == EngineState::Ready => {
-                    return client.submit(request).await;
+                    return Ok(client);
                 }
                 Serving::Closed(reason) => return Err(SubmitError::Unavailable(reason)),
+                Serving::Successor(successor) if !held => {
+                    tokio::select! {
+                        changed = serving.changed() => {
+                            changed.map_err(|_| SubmitError::Unavailable("the daemon stopped serving requests".into()))?;
+                        }
+                        ready = Box::pin(successor.ready()) => return ready,
+                    }
+                    continue;
+                }
                 // An engine that is not ready serves nothing until whoever
                 // watches it replaces it or closes the hold.
-                Serving::Engine(_) | Serving::Holding => {}
+                Serving::Engine(_) | Serving::Holding | Serving::Successor(_) => {}
             }
             let changed = tokio::select! {
                 changed = serving.changed() => changed,

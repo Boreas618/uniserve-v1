@@ -31,7 +31,7 @@ use ipc::{
     ComponentConfig, ComponentDistribution, ComponentWeights, ParallelConfig, SequenceParallel,
 };
 use ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 use crate::executor::WorkerGroupId;
@@ -42,7 +42,7 @@ const fn one() -> usize {
 }
 
 /// A deployment as its file states it, before its ranks are placed on hosts.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
     /// Worker groups in file order; a replicated group expands in place.
@@ -50,7 +50,7 @@ pub struct Deployment {
 }
 
 /// One `[[worker_groups]]` table.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GroupEntry {
     /// Group identity; replica `i` of a replicated group is `<id>-<i>`.
@@ -76,7 +76,7 @@ struct GroupEntry {
 
 /// One `[worker_groups.components.<name>]` table: a [`ComponentConfig`] whose
 /// parallel degrees are stated beside its membership.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ComponentEntry {
     /// Indices into one replica's ranks; every rank of the replica when
@@ -107,6 +107,31 @@ struct ComponentEntry {
 struct RankRange {
     host: Option<String>,
     devices: Vec<String>,
+}
+
+impl Serialize for RankRange {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "parsing creates nonempty repeated devices or an indexed range"
+    )]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let first = &self.devices[0];
+        let device = if self.devices.len() == 1 {
+            first.clone()
+        } else if self.devices.iter().all(|device| device == first) {
+            format!("{first}*{}", self.devices.len())
+        } else {
+            // Parsing constructs either repeated devices or a consecutive
+            // indexed range; snapshots use single-device entries.
+            let (_, last) = self.devices.last().unwrap().split_once(':').unwrap();
+            format!("{first}-{last}")
+        };
+        let rank = self
+            .host
+            .as_ref()
+            .map_or_else(|| device.clone(), |host| format!("{host}/{device}"));
+        serializer.serialize_str(&rank)
+    }
 }
 
 impl TryFrom<String> for RankRange {
@@ -154,6 +179,58 @@ impl TryFrom<String> for RankRange {
 }
 
 impl Deployment {
+    /// Encodes resolved worker groups as a deployment snapshot. Each rank
+    /// names its host and device explicitly; component membership and group
+    /// identities are preserved across independently launched replicas.
+    pub fn snapshot(groups: &[WorkerGroupConfig]) -> anyhow::Result<String> {
+        let deployment = Self {
+            worker_groups: groups
+                .iter()
+                .map(|group| GroupEntry {
+                    id: group.id.0.clone(),
+                    role: group.role,
+                    replicas: 1,
+                    ranks: group
+                        .ranks
+                        .iter()
+                        .map(|rank| RankRange {
+                            host: Some(rank.host.clone()),
+                            devices: vec![rank.device.clone()],
+                        })
+                        .collect(),
+                    queue_depth: group.queue_depth,
+                    mem_fraction_static: group.mem_fraction_static,
+                    components: group
+                        .components
+                        .iter()
+                        .map(|(name, component)| {
+                            (
+                                name.clone(),
+                                ComponentEntry {
+                                    ranks: Some(component.ranks.clone()),
+                                    tensor_parallel_size: component
+                                        .parallel_config
+                                        .tensor_parallel_size,
+                                    pipeline_parallel_size: component
+                                        .parallel_config
+                                        .pipeline_parallel_size,
+                                    sequence_parallel: component
+                                        .parallel_config
+                                        .sequence_parallel
+                                        .clone(),
+                                    distribution: component.distribution,
+                                    units_per_rank: component.units_per_rank,
+                                    weights: component.weights,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        Ok(toml::to_string(&deployment)?)
+    }
+
     /// Reads and parses the deployment file at `path`.
     ///
     /// The signature suits a command-line value parser; each failure names

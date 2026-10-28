@@ -219,6 +219,9 @@ async fn main() -> Result<()> {
                         "slots": config["slots"],
                         "update": config["update"],
                         "trial": config["trial"],
+                        "replicas": config["replicas"],
+                        "pending_replicas": config["pending_replicas"],
+                        "commit": config["commit"],
                         "unavailable": config["unavailable"],
                     }))?
                 );
@@ -266,19 +269,33 @@ async fn main() -> Result<()> {
                     );
                     return Ok(());
                 };
-                tokio::time::sleep(Duration::from_secs(seconds)).await;
-                let world = &result["world"]["world"];
-                let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-                if status["trial"]["world"] != *world {
-                    bail!(
-                        "{}: world {world} is no longer on trial (rolled back: {}); later nodes \
-                         are untouched",
-                        node.base,
-                        status["last"]
-                    );
+                let mut trial = result["world"].clone();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
+                    let worlds = if trial["worlds"].is_array() {
+                        "worlds"
+                    } else {
+                        "world"
+                    };
+                    if status["trial"].is_null() || status["trial"][worlds] != trial[worlds] {
+                        bail!(
+                            "{}: the trial ended before commit ({}); later nodes are untouched",
+                            node.base,
+                            status["last"]
+                        );
+                    }
+                    let committed = node.post("/admin/config/commit", &json!({})).await?;
+                    let result = &committed["result"];
+                    println!("{}: committed {result}", node.base);
+                    if let Some(error) = result.get("rollout_error") {
+                        bail!("{}: {error}; later nodes are untouched", node.base);
+                    }
+                    let Some(next) = result.get("next_trial") else {
+                        break;
+                    };
+                    trial = next.clone();
                 }
-                let committed = node.post("/admin/config/commit", &json!({})).await?;
-                println!("{}: committed {}", node.base, committed["result"]);
             }
             Ok(())
         }

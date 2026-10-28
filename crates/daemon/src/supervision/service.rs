@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node,
+    self, Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node,
     NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream, Welcome,
     downstream, event, from_member, hello, reply, request, to_member, upstream,
 };
@@ -188,10 +188,27 @@ impl Local {
             Some(request::Kind::Nodes(_)) => {
                 reply.error = "the leader answers for the deployment's nodes".to_owned();
             }
+            Some(request::Kind::Devices(_)) => match available_devices() {
+                Ok(available) => {
+                    reply.kind = Some(reply::Kind::Devices(process::DeviceInventory { available }))
+                }
+                Err(error) => reply.error = format!("{error:#}"),
+            },
             None => reply.error = "an empty request".to_owned(),
         }
         reply
     }
+}
+
+fn available_devices() -> anyhow::Result<Vec<u32>> {
+    let nvml = cuda::Nvml::init()?;
+    let mut available = Vec::new();
+    for ordinal in 0..cuda::DeviceId::count()? {
+        if nvml.is_idle(cuda::DeviceId(ordinal))? {
+            available.push(ordinal as u32);
+        }
+    }
+    Ok(available)
 }
 
 /// A member daemon as the leader holds it.
@@ -611,6 +628,7 @@ fn route(
         Some(request::Kind::Ledger(query)) => Some(query.host.as_str()),
         Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
         Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
+        Some(request::Kind::Devices(query)) => Some(query.host.as_str()),
         Some(request::Kind::PublishWorlds(publish)) => Some(publish.host.as_str()),
         Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
     };

@@ -34,7 +34,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState};
-use crate::leader::{Leader, UpdateError, locked};
+use crate::leader::{Leader, Replica, UpdateError, locked};
 use crate::worlds::Rates;
 
 /// The span before a session's start its baseline step time averages.
@@ -135,27 +135,71 @@ fn answers(results: &[String]) -> Vec<serde_json::Value> {
 }
 
 impl Leader {
+    pub async fn start_profile(
+        self: &Arc<Self>,
+        request: SessionRequest,
+    ) -> Result<serde_json::Value, UpdateError> {
+        let mut sessions = Vec::new();
+        for replica in self.replicas() {
+            sessions.push(replica.start_profile(request.clone()).await?);
+        }
+        let mut report = sessions[0].clone();
+        report["replicas"] = sessions.into();
+        Ok(report)
+    }
+
+    pub fn profile_status(&self) -> Option<serde_json::Value> {
+        let sessions: Vec<_> = self
+            .replicas()
+            .iter()
+            .filter_map(|replica| replica.profile_status())
+            .collect();
+        let mut report = serde_json::to_value(sessions.first()?).ok()?;
+        report["replicas"] = serde_json::to_value(sessions).ok()?;
+        Some(report)
+    }
+
+    pub async fn stop_profile(&self, reason: &str) -> Result<serde_json::Value, UpdateError> {
+        let mut reports = Vec::new();
+        for replica in self.replicas() {
+            if replica
+                .profile_status()
+                .is_some_and(|session| session.state == "running")
+            {
+                reports.push(replica.stop_profile(reason).await?);
+            }
+        }
+        if reports.is_empty() {
+            return Err(UpdateError::Refused("no profiling session runs".to_owned()));
+        }
+        let mut report = reports[0].clone();
+        report["replicas"] = reports.into();
+        Ok(report)
+    }
+}
+
+impl Replica {
     /// Start a session of `request` on the executing world.
     ///
     /// # Errors
     ///
     /// Refuses an invalid request and a session while one runs; fails when
     /// no engine serves or a worker cannot start it.
-    pub async fn start_profile(
+    pub(crate) async fn start_profile(
         self: &Arc<Self>,
         request: SessionRequest,
     ) -> Result<serde_json::Value, UpdateError> {
         request.validate().map_err(UpdateError::Refused)?;
         // Ranks that keep PC sampling enabled for their graphs refuse the
         // collectors CUPTI cannot run beside it.
-        let graph_pc_sampling = locked(&self.engines.served)
+        let graph_pc_sampling = locked(&self.served)
             .as_ref()
             .and_then(|spec| spec.profiling.as_ref())
             .is_some_and(|profiling| profiling.graph_pc_sampling);
         if graph_pc_sampling && let Some(reason) = request.refused_beside_graph_pc_sampling() {
             return Err(UpdateError::Refused(reason));
         }
-        let profiles = &self.engines.profiles;
+        let profiles = &self.profiles;
         if let Some(running) = locked(&profiles.session)
             .as_ref()
             .filter(|session| session.state == "running")
@@ -165,14 +209,14 @@ impl Leader {
                 running.id
             )));
         }
-        let client = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        let client = self.hold().client().ok_or(UpdateError::NoEngine)?;
         let world = client.world();
         let id = profiles
             .next
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let started_at = Instant::now();
-        let baseline = self.engines.observer.rates(
+        let baseline = self.observer.rates(
             world,
             started_at.checked_sub(BASELINE).unwrap_or(started_at),
             BASELINE,
@@ -258,12 +302,10 @@ impl Leader {
     }
 
     /// The running session, or the last that ended; `None` before any.
-    pub fn profile_status(&self) -> Option<Session> {
-        let mut session = locked(&self.engines.profiles.session).clone()?;
+    pub(crate) fn profile_status(&self) -> Option<Session> {
+        let mut session = locked(&self.profiles.session).clone()?;
         if session.state == "running" {
-            self.engines
-                .profiles
-                .progress(&mut session, &self.engines.observer);
+            self.profiles.progress(&mut session, &self.observer);
         }
         Some(session)
     }
@@ -273,14 +315,17 @@ impl Leader {
     /// # Errors
     ///
     /// Refuses when no session runs.
-    pub async fn stop_profile(&self, reason: &str) -> Result<serde_json::Value, UpdateError> {
-        let id = locked(&self.engines.profiles.session)
+    pub(crate) async fn stop_profile(
+        &self,
+        reason: &str,
+    ) -> Result<serde_json::Value, UpdateError> {
+        let id = locked(&self.profiles.session)
             .as_ref()
             .filter(|session| session.state == "running")
             .map(|session| session.id)
             .ok_or_else(|| UpdateError::Refused("no profiling session runs".to_owned()))?;
-        let client = self.migrator.hold().client();
-        end(&self.engines, client.as_deref(), id, reason, true).await;
+        let client = self.hold().client();
+        end(self, client.as_deref(), id, reason, true).await;
         Ok(serde_json::to_value(self.profile_status()).unwrap_or_default())
     }
 
@@ -348,21 +393,21 @@ async fn grow_back(client: &EngineClient, id: u64) {
 /// executing (a world change's promotion, a rollback) keeps its cache as
 /// the change left it.
 pub(crate) async fn end(
-    engines: &crate::leader::Engines,
+    replica: &crate::leader::Replica,
     client: Option<&EngineClient>,
     id: u64,
     reason: &str,
     grow: bool,
 ) {
     let (world, device_storage) = {
-        let mut session = locked(&engines.profiles.session);
+        let mut session = locked(&replica.profiles.session);
         let Some(running) = session
             .as_mut()
             .filter(|session| session.id == id && session.state == "running")
         else {
             return;
         };
-        engines.profiles.progress(running, &engines.observer);
+        replica.profiles.progress(running, &replica.observer);
         // Ending from here on: a second end finds it ended.
         running.state = "ending".to_owned();
         (running.world, running.device_storage)
@@ -390,7 +435,7 @@ pub(crate) async fn end(
             grow_back(client, id).await;
         }
     }
-    let mut session = locked(&engines.profiles.session);
+    let mut session = locked(&replica.profiles.session);
     if let Some(ended) = session.as_mut().filter(|session| session.id == id) {
         ended.state = "ended".to_owned();
         ended.ended = Some(now());
@@ -410,34 +455,33 @@ pub(crate) async fn end(
 /// End the running session, if any, because its world stops executing:
 /// before a successor's promotion parks it, or as a trial rolls back.
 pub(crate) async fn end_for_world(
-    engines: &crate::leader::Engines,
+    replica: &crate::leader::Replica,
     client: Option<&EngineClient>,
     reason: &str,
 ) {
-    let running = locked(&engines.profiles.session)
+    let running = locked(&replica.profiles.session)
         .as_ref()
         .filter(|session| session.state == "running")
         .map(|session| session.id);
     if let Some(id) = running {
-        end(engines, client, id, reason, false).await;
+        end(replica, client, id, reason, false).await;
     }
 }
 
 /// The session's task: ends it when its windows end, its seconds pass or
 /// its guard ends it, and runs the guard.
-async fn watch(leader: Arc<Leader>, id: u64, started: Instant) {
-    let engines = Arc::clone(&leader.engines);
+async fn watch(replica: Arc<Replica>, id: u64, started: Instant) {
     loop {
         tokio::time::sleep(POLL).await;
         let (request, collectors, overhead) = {
-            let mut session = locked(&engines.profiles.session);
+            let mut session = locked(&replica.profiles.session);
             let Some(running) = session
                 .as_mut()
                 .filter(|session| session.id == id && session.state == "running")
             else {
                 return;
             };
-            engines.profiles.progress(running, &engines.observer);
+            replica.profiles.progress(running, &replica.observer);
             let selected = running
                 .workers
                 .iter()
@@ -454,16 +498,16 @@ async fn watch(leader: Arc<Leader>, id: u64, started: Instant) {
                 )
             }
         };
-        let client = leader.migrator.hold().client();
+        let client = replica.hold.client();
         let Some(request) = request else {
-            end(&engines, client.as_deref(), id, "window", true).await;
+            end(&replica, client.as_deref(), id, "window", true).await;
             return;
         };
         if request
             .seconds
             .is_some_and(|seconds| started.elapsed().as_secs_f64() >= seconds)
         {
-            end(&engines, client.as_deref(), id, "seconds", true).await;
+            end(&replica, client.as_deref(), id, "seconds", true).await;
             return;
         }
         let (Some(max), Some(overhead)) = (request.max_slowdown, overhead) else {
@@ -472,22 +516,22 @@ async fn watch(leader: Arc<Leader>, id: u64, started: Instant) {
         if overhead.slowdown <= max {
             continue;
         }
-        let due = locked(&engines.profiles.acted)
+        let due = locked(&replica.profiles.acted)
             .is_none_or(|acted| acted.elapsed() >= GUARD_WINDOW)
             && started.elapsed() >= GUARD_WINDOW;
         if !due {
             continue;
         }
-        *locked(&engines.profiles.acted) = Some(Instant::now());
+        *locked(&replica.profiles.acted) = Some(Instant::now());
         let costliest = Collector::COSTLIEST_FIRST
             .into_iter()
             .find(|collector| collectors.contains(collector));
         let Some(collector) = costliest else {
-            record(&engines, id, "end", None, overhead.slowdown);
-            end(&engines, client.as_deref(), id, "quality of service", true).await;
+            record(&replica, id, "end", None, overhead.slowdown);
+            end(&replica, client.as_deref(), id, "quality of service", true).await;
             return;
         };
-        record(&engines, id, "release", Some(collector), overhead.slowdown);
+        record(&replica, id, "release", Some(collector), overhead.slowdown);
         let payload = serde_json::json!({
             "session": id,
             "collector": collector,
@@ -511,13 +555,13 @@ async fn watch(leader: Arc<Leader>, id: u64, started: Instant) {
 /// Record a guard action on session `id`, and stop counting `collector`
 /// as running.
 fn record(
-    engines: &crate::leader::Engines,
+    replica: &crate::leader::Replica,
     id: u64,
     action: &str,
     collector: Option<Collector>,
     slowdown: f64,
 ) {
-    let mut session = locked(&engines.profiles.session);
+    let mut session = locked(&replica.profiles.session);
     if let Some(running) = session.as_mut().filter(|session| session.id == id) {
         warn!(
             session = id,
