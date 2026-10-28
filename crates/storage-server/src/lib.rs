@@ -856,6 +856,9 @@ impl Server {
                     Request::Put { tensors, storages } => {
                         self.put(&holder, tensors, storages, descriptors)
                     }
+                    Request::AllocateHost { key, name, bytes } => {
+                        self.allocate_host(&holder, *key, name, *bytes)
+                    }
                     Request::Promote { keys } => self.promote(&holder, keys),
                     Request::Release { keys } => self.release(&holder, keys),
                     Request::Rekey { moves, at } => self.rekey(&holder, moves, at),
@@ -1143,7 +1146,7 @@ impl Server {
     }
 
     /// Refuse `bytes` of new host memory that the host cannot hold: its
-    /// available memory less the server's reserve and what the page pools
+    /// available memory less the server's reserve and what retained storage
     /// have yet to allocate.
     fn admit_host(&self, bytes: u64) -> Result<(), (ErrorKind, String)> {
         let host = self.host_memory().map_err(resource)?;
@@ -1153,9 +1156,9 @@ impl Server {
                 ErrorKind::Resource,
                 format!(
                     "{bytes} bytes of host memory exceed the {room} bytes the host can hold: \
-                     {} bytes available, less {} bytes the page pools have yet to allocate and \
+                    {} bytes available, less {} bytes retained storage has yet to allocate and \
                      the server's reserve of {} bytes",
-                    host.available, host.pools_unallocated, host.reserve
+                    host.available, host.unallocated, host.reserve
                 ),
             ));
         }
@@ -1171,7 +1174,7 @@ impl Server {
             return Err(());
         }
         let host = self.host_memory().map_err(|_| ())?;
-        if bytes > host.available.saturating_sub(host.pools_unallocated) {
+        if bytes > host.available.saturating_sub(host.unallocated) {
             return Err(());
         }
         Ok(())
@@ -1182,7 +1185,17 @@ impl Server {
         Ok(HostMemory {
             available: available_memory()?,
             reserve: self.host_reserve,
-            pools_unallocated: self.pages.unallocated(),
+            unallocated: self.pages.unallocated()
+                + self
+                    .storages
+                    .values()
+                    .filter(|storage| matches!(storage.record.placement, Placement::Host { .. }))
+                    .map(|storage| {
+                        let allocated = rustix::fs::fstat(&storage._descriptor)
+                            .map_or(0, |stat| (stat.st_blocks as u64).saturating_mul(512));
+                        storage.record.bytes.saturating_sub(allocated)
+                    })
+                    .sum::<u64>(),
         })
     }
 
@@ -1593,6 +1606,39 @@ impl Server {
             },
             storages.into_iter().map(Attachment::Storage).collect(),
         ))
+    }
+
+    fn allocate_host(
+        &mut self,
+        holder: &Holder,
+        key: Key,
+        name: &str,
+        bytes: u64,
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        self.admit_host(bytes)?;
+        let at = Placement::Host { numa_node: None };
+        let descriptor = pages::shared_memory("uniserve-storage", bytes, None).map_err(resource)?;
+        self.put(
+            holder,
+            &[TensorRecord {
+                key,
+                name: name.to_owned(),
+                storage: 0,
+                offset: 0,
+                dtype: "uint8".into(),
+                shape: vec![bytes],
+                strides: vec![1],
+                access: Access::Exclusive,
+            }],
+            &[StorageRecord {
+                placement: at,
+                bytes,
+                segment: None,
+                fabric: None,
+            }],
+            vec![descriptor],
+        )?;
+        self.get(holder, &[key], Mode::Write, &[at])
     }
 
     /// `put`: see [`Request::Put`].
@@ -2774,6 +2820,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::KeepWeights { .. } => "keep_weights",
         Request::Get { .. } => "get",
         Request::Put { .. } => "put",
+        Request::AllocateHost { .. } => "allocate_host",
         Request::Promote { .. } => "promote",
         Request::Release { .. } => "release",
         Request::Rekey { .. } => "rekey",

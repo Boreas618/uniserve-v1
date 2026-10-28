@@ -96,8 +96,9 @@ use serde::{Deserialize, Serialize};
 /// other numerics cannot hit (`DiscardPages`); 12 lets a process of another
 /// host read a small read-only tensor of bytes inline (`Read`); 13 makes
 /// publication of committed worlds explicit (`PublishWorlds`); 14 adds
-/// explicitly owned transfer sessions across successive copy rounds.
-pub const VERSION: u32 = 14;
+/// explicitly owned transfer sessions across successive copy rounds; 15
+/// admits host allocations before creating their retained backing.
+pub const VERSION: u32 = 15;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -483,15 +484,15 @@ pub fn gpu_name(gpu: &[u8; 16]) -> String {
 
 /// What a host's Storage Server admits of new host memory (page pools,
 /// staging, weights moved to the host): the host's available memory less
-/// the server's reserve and what its page pools have yet to allocate.
+/// the server's reserve and what its retained storage has yet to allocate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostMemory {
     /// The host's `MemAvailable`.
     pub available: u64,
     /// What the server leaves to the host's other processes.
     pub reserve: u64,
-    /// What the page pools have yet to allocate.
-    pub pools_unallocated: u64,
+    /// Unallocated bytes of page pools and retained host storages.
+    pub unallocated: u64,
 }
 
 impl HostMemory {
@@ -499,7 +500,7 @@ impl HostMemory {
     pub fn room(&self) -> u64 {
         self.available
             .saturating_sub(self.reserve)
-            .saturating_sub(self.pools_unallocated)
+            .saturating_sub(self.unallocated)
     }
 }
 
@@ -948,6 +949,10 @@ pub enum Request {
         #[serde(default)]
         at: Vec<Placement>,
     },
+    /// Allocate an exclusive byte tensor in host memory after host
+    /// admission. Returns its retained storage through `Got`, with write
+    /// ownership belonging to this worker and lifetime to its world.
+    AllocateHost { key: Key, name: String, bytes: u64 },
     /// Publish tensors whose bytes are written, over the storages this
     /// message carries. Read-only tensors become readable; exclusive ones
     /// keep the caller as their writer. A key names what a tensor's bytes

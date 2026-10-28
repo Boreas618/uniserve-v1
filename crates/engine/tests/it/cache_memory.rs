@@ -232,7 +232,7 @@ impl Executor for Segmented {
                 "scope": {"deployment": "model", "group": "model", "rank": 0},
                 "world": WORLD,
                 "ledger": workers.ledger(),
-                "host_memory": {"available": 1u64 << 40, "reserve": 10u64 << 30, "pools_unallocated": 0},
+                "host_memory": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
             }),
             "uniserve.release_cache" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;

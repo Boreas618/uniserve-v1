@@ -448,7 +448,7 @@ pub(super) fn refusal(plans: &[Preparing]) -> String {
             memory.room(),
             memory.available,
             memory.reserve,
-            memory.pools_unallocated,
+            memory.unallocated,
         ));
     }
     lines.join("\n")

@@ -336,6 +336,17 @@ impl Client {
     /// (every copy when empty).
     pub fn get(&mut self, keys: Vec<Key>, mode: Mode, at: Vec<Placement>) -> Result<Got> {
         let answer = Self::expect(self.call(&Request::Get { keys, mode, at }, &[])?)?;
+        Self::got(answer)
+    }
+
+    /// Allocate retained host storage only after the server admits its
+    /// entire size. The caller maps the returned writable descriptor.
+    pub fn allocate_host(&mut self, key: Key, name: String, bytes: u64) -> Result<Got> {
+        let answer = Self::expect(self.call(&Request::AllocateHost { key, name, bytes }, &[])?)?;
+        Self::got(answer)
+    }
+
+    fn got(answer: Answer) -> Result<Got> {
         match answer.reply {
             Reply::Got {
                 tensors,
