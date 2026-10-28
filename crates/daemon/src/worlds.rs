@@ -1642,11 +1642,6 @@ impl Replica {
         let started = Instant::now();
         let previous_world = running.world();
         let shared_devices = !devices(&served)?.is_disjoint(&devices(&spec)?);
-        // A profiling session belongs to the serving world: it ends, its
-        // files written, before the change withdraws any of the world's
-        // storage (its graph pools, its cache's tail), which CUPTI's node
-        // records of its graphs do not survive.
-        crate::profiling::end_for_world(self, Some(running), "world change").await;
         // The serving world gives its graph memory to the successor's
         // captures first, so the shrink that follows leaves it to the
         // successor.
@@ -1883,6 +1878,9 @@ impl Replica {
                 latent_seed: trajectories_change.then_some(before.latent_seed),
             }));
         }
+        // A profiling session belongs to the serving world: it ends, its
+        // files written, before the world parks.
+        crate::profiling::end_for_world(self, Some(running), "world change").await;
         let paused = Instant::now();
         hold.hold();
         let index = match running.park().await {
