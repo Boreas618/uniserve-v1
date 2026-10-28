@@ -863,7 +863,10 @@ class _DummyReader(Reader):
         )
         generator = torch.Generator(device="cpu").manual_seed(seed)
         value = torch.empty(raw.shape, dtype=torch.float32)
-        if raw.dtype.is_floating_point:
+        if not self.io.values:
+            # Only the layout matters; scale domains still read as one.
+            value.zero_()
+        elif raw.dtype.is_floating_point:
             value.normal_(0, 0.02, generator=generator)
         else:
             value.zero_()

@@ -1020,18 +1020,27 @@ class _Loader:
 
                     # Values are deterministic per parameter name so repeated
                     # dummy loads and shared aliases observe identical data.
-                    seed = int.from_bytes(
-                        hashlib.sha256(name.encode()).digest()[:8], "little"
-                    )
-                    generator = torch.Generator(device="cpu").manual_seed(seed)
-                    value = torch.empty(
-                        tuple(parameter.shape), dtype=dtype, device="cpu"
-                    )
-                    if dtype.is_floating_point:
-                        value.normal_(0, 0.02, generator=generator)
+                    if self.io.values:
+                        seed = int.from_bytes(
+                            hashlib.sha256(name.encode()).digest()[:8], "little"
+                        )
+                        generator = torch.Generator(device="cpu").manual_seed(
+                            seed
+                        )
+                        value = torch.empty(
+                            tuple(parameter.shape), dtype=dtype, device="cpu"
+                        )
+                        if dtype.is_floating_point:
+                            value.normal_(0, 0.02, generator=generator)
+                        else:
+                            value.zero_()
+                        value = value.to(device)
                     else:
-                        value.zero_()
-                    value = value.to(device)
+                        # Only the layout matters: the bytes stay as the
+                        # device allocator hands them out.
+                        value = torch.empty(
+                            tuple(parameter.shape), dtype=dtype, device=device
+                        )
                     if key in self._padding:
                         value[self._padding[key]].zero_()
                     if quantizer is not None:
