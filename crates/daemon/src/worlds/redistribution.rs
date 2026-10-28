@@ -75,7 +75,9 @@ pub(crate) async fn plan(
         world: target_world,
         ..target.clone()
     };
-    let launches = engine::launches::rank_launches(&planning)
+    // Only ranks on CUDA devices hold storage to plan; `plan_ranks` answers
+    // for these, in this order.
+    let launches = engine::launches::device_launches(&planning)
         .context("resolving the target world's launches")?;
     let schedulers = launches
         .iter()

@@ -106,9 +106,33 @@ pub fn rank_launches(spec: &EngineSpec) -> anyhow::Result<Vec<RankLaunch>> {
     Ok(launches)
 }
 
-/// Describes target weights and measures source links on each rank's actual
-/// node. Planning uses the same process ownership and registration as serving;
-/// closing this operation's process connection releases all planning ranks.
+/// The launches of the world `spec` states whose groups hold device
+/// storage: every rank of a group with a rank on a CUDA device, in
+/// [`rank_launches`]'s order. A group of CPU ranks alone (media codecs,
+/// muxers and readers) holds no weights or cache on a GPU, so it has nothing
+/// to plan or assign. A group is planned whole, since its ranks register
+/// with their engine by their rank in the group.
+///
+/// # Errors
+///
+/// Fails as [`rank_launches`] does.
+pub fn device_launches(spec: &EngineSpec) -> anyhow::Result<Vec<RankLaunch>> {
+    let launches = rank_launches(spec)?;
+    let groups: std::collections::BTreeSet<String> = launches
+        .iter()
+        .filter(|launch| launch.descriptor.device.starts_with("cuda:"))
+        .map(|launch| launch.group.clone())
+        .collect();
+    Ok(launches
+        .into_iter()
+        .filter(|launch| groups.contains(&launch.group))
+        .collect())
+}
+
+/// Describes target weights and measures source links on the actual node of
+/// each rank [`device_launches`] names, answering in that order. Planning
+/// uses the same process ownership and registration as serving; closing this
+/// operation's process connection releases all planning ranks.
 pub fn plan_ranks(
     spec: &EngineSpec,
     process_address: &str,
@@ -122,7 +146,7 @@ pub fn plan_ranks(
 
     let config = EngineConfig::from_spec(spec)?;
     let arguments = SchedulerHandle::group_arguments(&config)?.arguments;
-    let launches = rank_launches(spec)?;
+    let launches = device_launches(spec)?;
     let processes = processes::ProcessClient::connect(process_address, &spec.deployment)?;
     let claims = Claims::claim(&arguments, &processes)?;
     let registry =
