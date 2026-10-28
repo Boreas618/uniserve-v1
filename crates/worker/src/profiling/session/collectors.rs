@@ -507,13 +507,11 @@ fn stop(prepared: &mut Prepared, rows: &Rows) -> std::result::Result<(), String>
             graph_trace,
             ..
         } => {
-            // Dropping the timeline delivers what remains to the file; the
-            // graphs return to the process's standing tracing mode.
+            // Dropping the timeline delivers what remains to the file.
             if let Some(timeline) = running.take() {
                 drop(timeline);
-                let whole = timeline::standing() == timeline::GraphTrace::Whole;
                 graph_trace
-                    .call_values(&[tvm_ffi::Any::from(whole)])
+                    .call_values(&[tvm_ffi::Any::from(false)])
                     .map_err(|error| error.to_string())?;
             }
             Ok(())

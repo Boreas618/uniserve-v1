@@ -5,11 +5,7 @@
 //!
 //! A rank subscribes the process to CUPTI as it starts ([`subscribe`]),
 //! before loading modules and capturing graphs so that collectors observe
-//! their CUDA resource lifetimes, and makes whole-graph records its standing
-//! graph tracing mode then: a graph launch counts as one interval of its
-//! stream, and CUPTI instruments no graph node, which would not survive the
-//! rank withdrawing the storage its graphs address
-//! ([`cuda::cupti::timeline::trace_graphs_whole`]). The counters
+//! their CUDA resource lifetimes. The counters
 //! start once the rank serves ([`Counters::start`]) and stay on: they share
 //! the subscription with the session collectors. A profiler that holds
 //! CUPTI's one subscription (Nsight Systems) leaves the rank without them.
@@ -17,25 +13,15 @@
 use cuda::cupti::activity::StreamActivity;
 use cuda::cupti::blocking::BlockingWatch;
 
-/// Subscribe the process to CUPTI and trace its graphs whole; a failure
-/// (another CUPTI client holds the subscription) is logged, and the rank
-/// serves without CUPTI. Returns whether graphs are traced whole, the mode
-/// the rank's graph owners instantiate their executables in.
-pub(crate) fn subscribe() -> bool {
-    if let Err(error) = cuda::cupti::subscriber::subscribe() {
-        tracing::warn!(
+/// Subscribe the process to CUPTI; a failure (another CUPTI client holds
+/// the subscription) is logged, and the rank serves without CUPTI.
+pub(crate) fn subscribe() {
+    match cuda::cupti::subscriber::subscribe() {
+        Ok(()) => tracing::info!("CUPTI is subscribed ({})", cuda::cupti::library()),
+        Err(error) => tracing::warn!(
             "CUPTI is not subscribed, and no CUPTI counter or profiling session is \
              available: {error}"
-        );
-        return false;
-    }
-    tracing::info!("CUPTI is subscribed ({})", cuda::cupti::library());
-    match cuda::cupti::timeline::trace_graphs_whole() {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!("CUPTI does not trace graphs whole; it records their nodes: {error}");
-            false
-        }
+        ),
     }
 }
 

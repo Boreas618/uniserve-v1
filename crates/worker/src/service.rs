@@ -162,6 +162,7 @@ impl Parked {
             pool.restore()?;
         }
         if !pools.is_empty() {
+            renew_graphs()?;
             tracing::info!("the promoted standby worker restored its graph memory");
         }
         if let Some(world) = &world {
@@ -869,7 +870,10 @@ impl Service<'_> {
                     }
                     "uniserve.experts_ready" => serde_json::json!(weights.experts_ready(retained)?),
                     "uniserve.commit_experts" => {
+                        // The experts' storage is remapped at the addresses
+                        // the graphs captured.
                         weights.commit_experts(retained)?;
+                        renew_graphs()?;
                         serde_json::Value::Null
                     }
                     _ => {
@@ -1053,6 +1057,7 @@ impl Service<'_> {
                     for pool in &self.maintenance.graph_pools {
                         pool.restore()?;
                     }
+                    renew_graphs()?;
                     if let Some(executor) = executor {
                         executor.run_eager(false)?;
                     }
@@ -1069,6 +1074,7 @@ impl Service<'_> {
                 // none to give back.
                 if let Some(planes) = planes {
                     planes.release_segments(first, memory)?;
+                    renew_graphs()?;
                 }
                 serde_json::Value::Null
             }
@@ -1077,6 +1083,7 @@ impl Service<'_> {
                     .as_u64()
                     .and_then(|count| u32::try_from(count).ok());
                 restore(planes.as_ref(), memory, limit)?;
+                renew_graphs()?;
                 serde_json::Value::Null
             }
             "uniserve.adopt_cache" => {
@@ -1119,6 +1126,7 @@ impl Service<'_> {
                     .collect();
                 let stream = cuda::Stream::new(device)?;
                 planes.adopt_inherited(&storages, predecessor.num_units, &stream)?;
+                renew_graphs()?;
                 let keys: Vec<_> = mapped.iter().map(|(key, _)| *key).collect();
                 drop(storages);
                 drop(mapped);
@@ -1137,6 +1145,9 @@ impl Service<'_> {
                     (Some(planes), Some(retained)) => planes.take_inherited(retained)?,
                     _ => 0,
                 };
+                if taken > 0 {
+                    renew_graphs()?;
+                }
                 serde_json::json!({ "segments": taken })
             }
             "uniserve.sleep" => {
@@ -1165,6 +1176,7 @@ impl Service<'_> {
                         pool.restore()?;
                     }
                     restore(planes.as_ref(), memory, None)?;
+                    renew_graphs()?;
                     self.maintenance.asleep = false;
                     tracing::info!("the worker woke: its graph memory and cache are restored");
                 }
@@ -1203,6 +1215,7 @@ impl Service<'_> {
                     for pool in &self.maintenance.pools {
                         pool.restore()?;
                     }
+                    renew_graphs()?;
                     self.book_memory(true)?;
                 }
                 updated?
@@ -1417,6 +1430,7 @@ impl Service<'_> {
             for pool in &self.maintenance.pools {
                 pool.restore()?;
             }
+            renew_graphs()?;
             self.book_memory(true)?;
             return Err(Error::Unsupported(format!(
                 "keeping the requests in flight through the weight update loads the checkpoint \
@@ -1446,6 +1460,20 @@ impl Service<'_> {
         }
         Ok(())
     }
+}
+
+/// Has every captured graph instantiate its executable again before its
+/// next replay, once storage the rank's graphs address was unmapped or
+/// mapped again (graph pools, KV cache segments): CUPTI's per-node
+/// instrumentation of an executable does not survive the remapping, whose
+/// next launch then faults inside CUPTI (`uniserve.cuda_graph.renew_executables`).
+/// A rank CUPTI does not instrument keeps its executables.
+fn renew_graphs() -> crate::Result<()> {
+    if cuda::cupti::subscriber::subscribed() {
+        crate::ffi::Interpreter::import("uniserve.cuda_graph.renew_executables")?
+            .call_values(&[])?;
+    }
+    Ok(())
 }
 
 /// Creates the segments `planes` gave back again, through `memory`.

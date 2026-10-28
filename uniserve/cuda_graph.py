@@ -36,11 +36,14 @@ __all__ = [
 # reaches.
 _capturing: Capture | None = None
 
-# CUPTI instruments executables for the graph-trace mode enabled at
-# instantiation. Source graphs and their allocator pools stay unchanged. A
-# serving rank traces graphs whole as its standing mode and sets this before
-# it captures any graph; a node timeline switches it for its duration.
+# CUPTI instruments an executable when it is instantiated: for the
+# graph-trace mode then enabled, over the storage then mapped at its
+# graph's addresses. A change of either makes every captured graph replace
+# its executable before its next replay; source graphs and their allocator
+# pools stay unchanged.
 _whole_graph_trace = False
+# Counts the remappings of storage the rank's graphs address.
+_storage_remaps = 0
 
 
 def set_graph_trace(whole: bool) -> None:
@@ -53,6 +56,22 @@ def set_graph_trace(whole: bool) -> None:
     """
     global _whole_graph_trace
     _whole_graph_trace = whole
+
+
+def renew_executables() -> None:
+    """Instantiate every captured graph again before its next replay.
+
+    The worker calls this, while CUPTI is subscribed, after it unmapped or
+    mapped again storage its graphs address (graph pools, KV cache
+    segments). CUPTI's per-node instrumentation of an executable does not
+    survive that remapping: with ``nvidia-cuda-cupti`` 13.0.85 and driver
+    580.82.07 on GB200, the executable's next launch faults inside CUPTI in
+    ``cuGraphLaunch``. An executable instantiated after the remapping
+    replays correctly. The executables are replaced as
+    :func:`set_graph_trace` replaces them.
+    """
+    global _storage_remaps
+    _storage_remaps += 1
 
 
 # Caching-allocator option that lets a capture reuse a freed block another
@@ -172,7 +191,7 @@ class BreakableCUDAGraph:
         self._graphs = tuple(graphs)
         self._breaks = tuple(breaks)
         self._capture_stream = capture_stream
-        self._whole_graph_trace = _whole_graph_trace
+        self._instantiated = (_whole_graph_trace, _storage_remaps)
         self.output = output
 
     @property
@@ -192,13 +211,13 @@ class BreakableCUDAGraph:
         output (views into fixed buffers or the graph's pool, overwritten by
         the next replay).
         """
-        if self._whole_graph_trace != _whole_graph_trace:
+        if self._instantiated != (_whole_graph_trace, _storage_remaps):
             # CUDA retains pending launches when the old executable is
             # destroyed; no device synchronization or numerical capture
             # is needed. PyTorch retains the graph's generator offsets.
             for graph in self._graphs:
                 graph.instantiate()
-            self._whole_graph_trace = _whole_graph_trace
+            self._instantiated = (_whole_graph_trace, _storage_remaps)
         first, *rest = self._graphs
         first.replay()
         for work, graph in zip(self._breaks, rest, strict=True):
