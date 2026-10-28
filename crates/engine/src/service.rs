@@ -655,7 +655,7 @@ fn submit_all(
     let mut batches: HashMap<usize, Vec<(RequestId, Request, Credit)>> = HashMap::new();
     for message in submit.requests {
         let id = RequestId(message.id);
-        let mut request = match Request::from_wire(message) {
+        let request = match Request::from_wire(message) {
             Ok(request) => request,
             Err(error) => {
                 refuse(front, routing, id, error.to_string());
@@ -669,11 +669,6 @@ fn submit_all(
                 .and_then(|resume| crate::lock(&routing.cache_routes).remove(&resume)),
             Request::Diffusion(_) => None,
         };
-        if recovered.is_none()
-            && let Request::Generation(request) = &mut request
-        {
-            request.cache.resume = None;
-        }
         let Some(index) = recovered.or_else(|| routing.pick()) else {
             let (event, _) = Event::Error {
                 message: "the engine is unavailable after a worker failure".to_owned(),
@@ -785,8 +780,8 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
             let mut routes = crate::lock(&routing.cache_routes);
             for prefix in prefixes {
                 let resume = proto::request::CacheResume {
-                    world: prefix.world,
-                    request_id: prefix.request,
+                    world: prefix.resume.0,
+                    request_id: prefix.resume.1,
                 };
                 let next = routes.len() % routing.slots.len();
                 let slot = *routes.entry(resume).or_insert(next);
@@ -802,8 +797,8 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
             let routes = crate::lock(&routing.cache_routes);
             for prefix in prefixes {
                 let resume = proto::request::CacheResume {
-                    world: prefix.world,
-                    request_id: prefix.request,
+                    world: prefix.resume.0,
+                    request_id: prefix.resume.1,
                 };
                 if let Some(&slot) = routes.get(&resume) {
                     assigned[slot].push(prefix);

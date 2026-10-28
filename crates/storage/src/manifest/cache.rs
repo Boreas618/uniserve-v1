@@ -24,6 +24,11 @@ pub struct Page {
 pub struct Prefix {
     pub world: u64,
     pub request: u64,
+    /// Origin world and request of the private continuation. Unlike the
+    /// current source above, this survives successive world changes.
+    pub resume: (u64, u64),
+    /// The admitted request's logical extent, fixed across copy rounds.
+    pub capacity_tokens: u32,
     pub tokens: Vec<u32>,
     pub computed: u32,
     pub cached: u32,

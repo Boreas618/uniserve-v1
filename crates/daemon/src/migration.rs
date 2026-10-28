@@ -514,17 +514,21 @@ impl RequestEvents {
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         let mut continuation = request.continuation(&migration, kept);
         if let Request::Generation(generation) = &mut continuation {
-            generation.cache.resume = self.stream.cache_resume();
+            generation.cache.resume = generation.cache.resume.or(self.stream.cache_resume());
         }
         let (stream, _scheduler) = client
             .submit(continuation.clone())
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         // The next migration submits the request as submitted now.
-        if let (Request::Diffusion(submitted), Some(Resumable::Diffusion(request))) =
-            (&continuation, &mut self.request)
-        {
-            *request = submitted.clone();
+        match (&continuation, &mut self.request) {
+            (Request::Generation(submitted), Some(Resumable::Generation(request))) => {
+                request.cache = submitted.cache.clone();
+            }
+            (Request::Diffusion(submitted), Some(Resumable::Diffusion(request))) => {
+                *request = submitted.clone();
+            }
+            _ => {}
         }
         // The previous engine's stream ended with its migratable event.
         self.stream = stream;

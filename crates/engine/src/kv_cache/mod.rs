@@ -1430,6 +1430,7 @@ pub(crate) struct PrefixHit {
 #[derive(Debug, Default)]
 struct PrefixSelection {
     tokens: usize,
+    resume: Option<proto::request::CacheResume>,
     /// Per group, the group's first needed page and, for it and each later
     /// needed page in logical order, the page's first unit and whether the
     /// page is currently unreferenced. The draft cache's are its leading
@@ -1974,6 +1975,7 @@ impl PrefixCacheCoordinator {
         hashes: &[Vec<u64>],
         source: &WorkerEndpoint,
         resume: Option<proto::request::CacheResume>,
+        public: bool,
     ) -> PrefixSelection {
         let step = self.max_block_size();
         let limit = prompt.len().saturating_sub(1) / step * step;
@@ -2037,10 +2039,21 @@ impl PrefixCacheCoordinator {
                 Some((start, selected))
             })
             .collect::<Option<Vec<_>>>();
-        pages.map_or_else(PrefixSelection::default, |pages| PrefixSelection {
+        let private = pages.map_or_else(PrefixSelection::default, |pages| PrefixSelection {
             tokens,
+            resume,
             pages,
-        })
+        });
+        // A continuation keeps its origin through mapped worlds as well.
+        // Public pages remain eligible under the ordinary read policy;
+        // acquisition uses whichever complete prefix is longer.
+        if resume.is_some() && public {
+            let shared = self.select_prefix(pool, prompt, hashes, source, None, false);
+            if shared.tokens > private.tokens {
+                return shared;
+            }
+        }
+        private
     }
 
     /// Measures the longest reusable prompt prefix without acquiring page
@@ -2067,7 +2080,14 @@ impl PrefixCacheCoordinator {
             return PrefixHit::default();
         }
         let hashes = self.prefix_hashes(prompt, scope);
-        let selection = self.select_prefix(pool, prompt, &hashes, source, scope.resume);
+        let selection = self.select_prefix(
+            pool,
+            prompt,
+            &hashes,
+            source,
+            scope.resume,
+            self.prefix_enabled && cache_read && !has_images,
+        );
         let cached_free_units = selection
             .pages
             .iter()
@@ -2130,7 +2150,14 @@ impl PrefixCacheCoordinator {
             return Some(result);
         }
 
-        let selection = self.select_prefix(pool, prompt, &result.page_hashes, source, scope.resume);
+        let selection = self.select_prefix(
+            pool,
+            prompt,
+            &result.page_hashes,
+            source,
+            scope.resume,
+            self.prefix_enabled && cache_read && !has_images,
+        );
         let acquire = |group: usize, start: usize, pages: &[(UnitId, bool)]| {
             let shape = self.groups[group];
             pages
@@ -2147,7 +2174,7 @@ impl PrefixCacheCoordinator {
                         group as u32,
                         span,
                         source,
-                        scope.resume,
+                        selection.resume,
                     )
                 })
                 .collect::<Option<Vec<_>>>()
@@ -2380,6 +2407,46 @@ mod tests {
         assert_eq!(pool.free_units(), 7);
         assert!(pool.export().is_empty());
         assert!(pool.acquire_idle_from(1).is_empty());
+    }
+
+    #[test]
+    fn a_continuation_reuses_public_pages_only_under_its_read_policy() {
+        let pool = BlockPool::new(8, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let tokens = vec![1, 2, 3, 4, 5];
+        let _published = publish(&coordinator, &pool, &tokens, &source);
+        let scope = PrefixScope {
+            resume: Some(proto::request::CacheResume {
+                world: 3,
+                request_id: 7,
+            }),
+            ..Default::default()
+        };
+        for (read, images, expected) in [(true, false, 4), (false, false, 0), (true, true, 0)] {
+            assert_eq!(
+                coordinator
+                    .probe_prefix(&pool, &tokens, read, images, scope, &source)
+                    .cached_tokens,
+                expected,
+            );
+            let mut allocation = coordinator.empty();
+            assert_eq!(
+                coordinator
+                    .acquire_prefix(
+                        &pool,
+                        &mut allocation,
+                        &tokens,
+                        read,
+                        images,
+                        scope,
+                        &source
+                    )
+                    .unwrap()
+                    .cached_tokens,
+                expected,
+            );
+        }
     }
 
     fn full(block_size: usize, units_per_page: usize) -> GroupShape {

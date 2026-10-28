@@ -142,6 +142,11 @@ async fn rounds(
             .flat_map(|snapshot| &snapshot.prefixes)
             .map(|prefix| ((prefix.world, prefix.request), prefix.cached))
             .collect();
+        let resumes: HashMap<_, _> = coverage
+            .iter()
+            .flat_map(|snapshot| &snapshot.prefixes)
+            .map(|prefix| ((prefix.world, prefix.request), prefix.resume))
+            .collect();
         let mut live = Vec::new();
         report.tail_tokens = 0;
         report.warmed_requests = 0;
@@ -149,7 +154,9 @@ async fn rounds(
         for source in sources {
             for request in source.describe_requests().await? {
                 let identity = (source.world(), request.request_id);
-                live.push(identity);
+                if let Some(&resume) = resumes.get(&identity) {
+                    live.push(resume);
+                }
                 let warmed = (*cached.get(&identity).unwrap_or(&0)).min(request.tokens);
                 report.warmed_tokens += u64::from(warmed);
                 report.warmed_requests += u32::from(warmed > 0);
