@@ -1048,7 +1048,7 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
         .collect();
     let read = |key: Key| Ok::<_, ()>(manifests.get(&key).cloned());
 
-    let sources = weights::sources(&listing, "model", Some(1), &fingerprints, read)
+    let sources = weights::sources(&listing, "model", Some(&[1]), &fingerprints, read)
         .unwrap()
         .unwrap();
     let mut on_first = vec![held.clone(), partial.clone()];
@@ -1070,16 +1070,26 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
     );
     assert_eq!(sources.links, links(2));
 
+    // A coupled reshape can read multiple predecessor worlds. Storage
+    // described by the second world then becomes an eligible source too.
+    let combined = weights::sources(&listing, "model", Some(&[1, 2]), &fingerprints, read)
+        .unwrap()
+        .unwrap();
+    let mut expected = vec![held.clone(), partial, other];
+    expected.sort_by_key(|storage| serde_json::to_vec(storage).unwrap());
+    assert_eq!(combined.world.ranks[0].storages, expected);
+    assert_eq!(combined.world.ranks[1].storages, vec![held]);
+
     // Another deployment retains none of them, and without a Transfer
     // Server nothing is copied.
     assert!(
-        weights::sources(&listing, "other", Some(1), &fingerprints, read)
+        weights::sources(&listing, "other", Some(&[1]), &fingerprints, read)
             .unwrap()
             .is_none()
     );
     listing.transfer = None;
     assert!(
-        weights::sources(&listing, "model", Some(1), &fingerprints, read)
+        weights::sources(&listing, "model", Some(&[1]), &fingerprints, read)
             .unwrap()
             .is_none()
     );

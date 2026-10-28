@@ -316,7 +316,7 @@ impl EngineConfig {
                     Ok((
                         group.worker_group.clone(),
                         ipc::ReceivedWeights {
-                            world: group.world,
+                            worlds: group.worlds.clone(),
                             manifest: group.manifest.clone(),
                         },
                     ))

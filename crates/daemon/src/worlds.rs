@@ -813,7 +813,7 @@ impl Leader {
                     .get()
                     .ok_or(UpdateError::NoEngine)?
                     .next_engine(),
-                running.world(),
+                &[running.world()],
                 &target_spec,
                 !stated.contains("placement_config.devices"),
             )

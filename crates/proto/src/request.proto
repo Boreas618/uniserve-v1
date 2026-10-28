@@ -1068,11 +1068,11 @@ message EngineSpec {
   repeated ReceivedWeights received_weights = 22;
 }
 
-// The weights one worker group receives from another world of its host.
+// The weights one worker group receives from retained predecessor worlds.
 message ReceivedWeights {
   string worker_group = 1;
-  // The world whose retained weights are the copy manifest's sources.
-  uint64 world = 2;
+  // Predecessor worlds whose retained weights supply the copy plan.
+  repeated uint64 worlds = 2;
   // Serialized storage::manifest::weights::Transfer chosen by the daemon.
   bytes manifest = 3;
 }

@@ -35,7 +35,7 @@ pub(crate) struct Redistribution {
     pub(crate) refusal: Option<String>,
 }
 
-/// Plans the target world from the weights `served_world` retains across
+/// Plans the target world from the weights `served_worlds` retain across
 /// the deployment's nodes.
 /// `open` lets the daemon choose the ranks' device order; otherwise the
 /// target's order stands. Returns `None` when the successor receives no
@@ -51,7 +51,7 @@ pub(crate) async fn plan(
     manifests: &Mutex<manifest::Planner>,
     process_address: &str,
     target_world: u64,
-    served_world: u64,
+    served_worlds: &[u64],
     target: &wire::EngineSpec,
     open: bool,
 ) -> anyhow::Result<Option<Redistribution>> {
@@ -74,8 +74,9 @@ pub(crate) async fn plan(
     let launches = engine::launches::rank_launches(&planning)
         .context("resolving the target world's launches")?;
     let address = process_address.to_owned();
+    let source_worlds = served_worlds.to_vec();
     let planned = tokio::task::spawn_blocking(move || {
-        engine::launches::plan_ranks(&planning, &address, served_world)
+        engine::launches::plan_ranks(&planning, &address, &source_worlds)
     })
     .await
     .context("planning ranks did not complete")??;
@@ -192,7 +193,7 @@ pub(crate) async fn plan(
         })?;
         received.extend(groups.iter().map(|group| wire::ReceivedWeights {
             worker_group: (*group).to_owned(),
-            world: served_world,
+            worlds: served_worlds.to_vec(),
             manifest: encoded.clone(),
         }));
         for (position, &index) in members.iter().enumerate() {

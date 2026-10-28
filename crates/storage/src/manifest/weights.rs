@@ -193,11 +193,11 @@ pub struct Transfer {
     pub manifest: super::Manifest,
 }
 
-/// The weights world `world` of `deployment` retains on the host `listing`
+/// The weights the selected `worlds` of `deployment` retain on the host `listing`
 /// lists, for a rank whose checkpoint sources have the digests
 /// `fingerprints` (hex, by source name, as a manifest states them).
 ///
-/// Every manifest the world retains names storages; a storage on a device
+/// Every manifest the selected worlds retain names storages; a storage on a device
 /// whose fields' sources all have this rank's digests holds bytes the rank
 /// may need, on every GPU where the world retains all of its chunks. Each
 /// GPU is one source rank, its storages once each in the order of their
@@ -212,7 +212,7 @@ pub struct Transfer {
 pub fn sources<E>(
     listing: &Listing,
     deployment: &str,
-    world: Option<u64>,
+    worlds: Option<&[u64]>,
     fingerprints: &BTreeMap<String, String>,
     mut read: impl FnMut(Key) -> Result<Option<String>, E>,
 ) -> Result<Option<Sources>, E> {
@@ -228,7 +228,7 @@ pub fn sources<E>(
         tensor.access == Access::ReadOnly
             && tensor.retainers.iter().any(|retainer| {
                 retainer.scope.deployment == deployment
-                    && world.is_none_or(|world| retainer.world == world)
+                    && worlds.is_none_or(|worlds| worlds.contains(&retainer.world))
             })
     };
     // The GPUs holding each chunk, and the manifests.

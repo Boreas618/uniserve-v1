@@ -105,7 +105,7 @@ pub fn rank_launches(spec: &EngineSpec) -> anyhow::Result<Vec<RankLaunch>> {
 pub fn plan_ranks(
     spec: &EngineSpec,
     process_address: &str,
-    source_world: u64,
+    source_worlds: &[u64],
 ) -> anyhow::Result<Vec<storage::manifest::weights::PlannedRank>> {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
@@ -179,7 +179,7 @@ pub fn plan_ranks(
             let mut descriptor = launch.descriptor.clone();
             descriptor.storage = claims.launch(&launch.host)?;
             channel.send(&descriptor)?;
-            channel.send(&source_world)?;
+            channel.send(&source_worlds)?;
             channels.insert((group.clone(), rank as u32), channel);
         }
     }

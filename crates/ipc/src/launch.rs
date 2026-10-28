@@ -230,8 +230,8 @@ pub struct LaunchDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReceivedWeights {
-    /// The world whose retained weights are the copy manifest's sources.
-    pub world: u64,
+    /// The predecessor worlds whose retained weights supply the copy plan.
+    pub worlds: Vec<u64>,
     /// Serialized storage::manifest::weights::Transfer selected by the daemon.
     pub manifest: Vec<u8>,
 }
