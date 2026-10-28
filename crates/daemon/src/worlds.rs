@@ -175,6 +175,10 @@ pub struct Progress {
     pub started: f64,
     /// The world being prepared, once it starts.
     pub world: Option<u64>,
+    /// What the change does otherwise than its options ask: a preparation
+    /// whose transfers start without a baseline of some scheduler's steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The deployment's worlds as the leader tracks them.
@@ -956,6 +960,34 @@ impl Leader {
             segments,
         });
 
+        // A serving world that switched to eager forwards steps slower than
+        // its graphs did, so the successor starts once its eager steps make
+        // the transfers' baseline, or its schedulers without one prove idle
+        // (`crate::interference`).
+        let baseline_wait = match eager_since {
+            Some(since) => {
+                self.progress("baseline", None);
+                let waiting = Instant::now();
+                let idle = crate::interference::eager_baseline(
+                    &self.engines.observer,
+                    previous_world,
+                    running.info().schedulers,
+                    since,
+                )
+                .await;
+                if !idle.is_empty() {
+                    self.progress_note(format!(
+                        "the serving world's schedulers {idle:?} ran no step for {:?} after \
+                         their switch to eager forwards: the successor's transfers start \
+                         without a baseline of their steps",
+                        crate::interference::IDLE
+                    ));
+                }
+                Some(waiting.elapsed())
+            }
+            None => None,
+        };
+
         self.progress("prepare", None);
         let control = Arc::clone(self.engines.control.get().ok_or(UpdateError::NoEngine)?);
         let sink = stats_sink(
@@ -990,7 +1022,7 @@ impl Leader {
             .and_then(|started| started.context("the successor world did not start"));
         let (done, task) = interference;
         done.cancel();
-        let _ = task.await;
+        let throttled = task.await.unwrap_or_default();
         let successor = match prepared {
             Ok(successor) => Arc::new(successor),
             Err(error) => {
@@ -1188,6 +1220,9 @@ impl Leader {
             "world": world,
             "previous_world": previous_world,
             "prepare_seconds": prepare.as_secs_f64(),
+            "eager_baseline_seconds": baseline_wait.map(|wait| wait.as_secs_f64()),
+            "transfer_halvings": throttled.halvings,
+            "transfer_restorations": throttled.restorations,
             "park_seconds": parked.as_secs_f64(),
             "pause_seconds": pause.as_secs_f64(),
             "previous_world_kept": mode,
@@ -1417,11 +1452,20 @@ impl Leader {
             .progress
             .as_ref()
             .map_or_else(now, |progress| progress.started);
+        let previous = worlds.progress.as_ref();
         worlds.progress = Some(Progress {
             phase: phase.to_owned(),
             started,
-            world: world.or(worlds.progress.as_ref().and_then(|progress| progress.world)),
+            world: world.or(previous.and_then(|progress| progress.world)),
+            note: previous.and_then(|progress| progress.note.clone()),
         });
+    }
+
+    /// Notes `note` on the change in progress, for its later phases too.
+    fn progress_note(&self, note: String) {
+        if let Some(progress) = locked(&self.engines.worlds).progress.as_mut() {
+            progress.note = Some(note);
+        }
     }
 
     fn progress_done(&self) {

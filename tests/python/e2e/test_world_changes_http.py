@@ -769,9 +769,20 @@ def test_a_serving_world_gives_its_graph_memory_to_a_preparing_successor(
         eager = _forwards(base_url, "eager")
 
         # The serving world decodes the count eagerly while the successor
-        # prepares in its graph memory.
-        _world_change(base_url, CHANGE, "update_config.eager_prepare=true")
+        # prepares in its graph memory, once its eager steps made the
+        # baseline its successor's transfers yield to.
+        report = _world_change(
+            base_url, CHANGE, "update_config.eager_prepare=true"
+        )
         assert _forwards(base_url, "eager") > eager
+        assert report["eager_baseline_seconds"] is not None, report
+        print(
+            f"{topology}: eager baseline "
+            f"{report['eager_baseline_seconds']:.1f} s, "
+            f"preparation {report['prepare_seconds']:.1f} s, "
+            f"transfer halvings {report['transfer_halvings']}, "
+            f"restorations {report['transfer_restorations']}"
+        )
 
         # Resumed, the previous world replays its graphs again.
         rolled = _admin(
@@ -1396,7 +1407,9 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         print(
             f"{change}: promotion pause {report['pause_seconds']:.3f} s "
             f"(park {report['park_seconds']:.3f} s, "
-            f"preparation {report['prepare_seconds']:.1f} s)"
+            f"preparation {report['prepare_seconds']:.1f} s, "
+            f"transfer halvings {report['transfer_halvings']}, "
+            f"restorations {report['transfer_restorations']})"
         )
         streaming.wait_for(streaming.marked + 64)
         committed = _admin(base_url, "config/commit")
