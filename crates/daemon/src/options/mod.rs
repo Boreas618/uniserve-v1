@@ -919,8 +919,12 @@ impl Default for ProfilingOptions {
     }
 }
 
-/// The components probed by default: each model's transformer layer.
-pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*.TransformerLayer"];
+/// The components probed by default: each model's decoder stack (its
+/// `Transformer` component), one instance per step. Each probe costs a
+/// kernel launch in every replay, about a microsecond on GB200 even when
+/// switched off, so probing every layer exceeds the always-on budget
+/// (`docs/profiling.md`).
+pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*.Transformer"];
 
 /// How the deployment moves to a new configuration in another world
 /// (`update_config`, `PUT /admin/config`): what of the previous world its

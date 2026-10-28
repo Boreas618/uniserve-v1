@@ -250,7 +250,7 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `fence_probes` | `true` | Whether the probes record; a change switches every worker's probes in place, at the engine's next step boundary |
-| `fence_components` | `["*.TransformerLayer"]` | Name patterns (`*` matches any run) of the components whose module instances carry probes, a component being the `<component>` of the function its module class declares (`uniserve/numerics.py`); the probes are captured into a world's CUDA graphs, so a change takes a new world. Empty for no probe |
+| `fence_components` | `["*.Transformer"]` (each model's decoder stack, within the always-on budget `docs/profiling.md` states) | Name patterns (`*` matches any run) of the components whose module instances carry probes, a component being the `<component>` of the function its module class declares (`uniserve/numerics.py`); the probes are captured into a world's CUDA graphs, so a change takes a new world. Empty for no probe |
 
 ### `logging_config`
 
