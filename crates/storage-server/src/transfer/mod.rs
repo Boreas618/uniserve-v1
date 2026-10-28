@@ -162,6 +162,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         answers: HashMap::new(),
         exposing: HashMap::new(),
         exposures: HashMap::new(),
+        sessions: HashMap::new(),
         leases: HashMap::new(),
         replies: Vec::new(),
     };
@@ -340,6 +341,8 @@ struct Served {
     /// Exposures to other hosts, by the server's register request, with the
     /// holds on the GPUs of their device allocations.
     exposures: HashMap<u64, Vec<Hold>>,
+    /// Explicit operation scopes keep contexts between successive tasks.
+    sessions: HashMap<u64, Vec<Hold>>,
     /// The exposures of other hosts each running task READs, which end
     /// with it.
     leases: HashMap<u64, Vec<Lease>>,
@@ -443,6 +446,34 @@ impl Served {
                 priority,
                 moves,
             } => self.transfer(task, priority, &moves),
+            Event::TransferSession { session, gpus } => {
+                if gpus.is_empty() {
+                    if let Some(holds) = self.sessions.remove(&session) {
+                        self.helpers.spawn(move || {
+                            drop(holds);
+                            None
+                        });
+                    }
+                } else {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "the server admits sessions from this process's measured GPU inventory"
+                    )]
+                    let holds = gpus
+                        .iter()
+                        .map(|uuid| {
+                            let gpu = self
+                                .gpus
+                                .by_uuid(*uuid)
+                                .expect("the server admits only measured local GPUs");
+                            self.contexts
+                                .hold(gpu.device)
+                                .expect("every discovered GPU has a context slot")
+                        })
+                        .collect();
+                    self.sessions.insert(session, holds);
+                }
+            }
             Event::Cancel { task } => match self.exposing.get_mut(&task) {
                 // Its pieces are not queued yet: it ends, cancelled, once
                 // the other hosts answered.

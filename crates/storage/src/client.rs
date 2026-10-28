@@ -434,6 +434,23 @@ impl Client {
         }
     }
 
+    /// Hold transfer contexts between tasks until `close_transfer` or
+    /// connection closure. Each operation owns its separate session.
+    pub fn open_transfer(&mut self, gpus: Vec<[u8; 16]>) -> Result<u64> {
+        match Self::expect(self.call(&Request::OpenTransfer { gpus }, &[])?)?.reply {
+            Reply::TransferOpened { session } => Ok(session),
+            other => Err(unexpected("open transfer", &other)),
+        }
+    }
+
+    /// Release a session; existing tasks retain their own physical holds.
+    pub fn close_transfer(&mut self, session: u64) -> Result<()> {
+        match Self::expect(self.call(&Request::CloseTransfer { session }, &[])?)?.reply {
+            Reply::TransferClosed => Ok(()),
+            other => Err(unexpected("close transfer", &other)),
+        }
+    }
+
     /// See [`Request::Cancel`]. Returns how many tasks were cancelled.
     pub fn cancel(&mut self, tasks: Vec<u64>, update: Option<u64>) -> Result<u64> {
         match Self::expect(self.call(&Request::Cancel { tasks, update }, &[])?)?.reply {

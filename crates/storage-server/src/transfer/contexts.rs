@@ -11,6 +11,9 @@
 //!   task holds the GPUs it reads, writes or runs on; a GPU lane holds its
 //!   GPU while its thread runs; an exposure to another host holds the GPU of
 //!   each device allocation it exposes, until that host ends it.
+//!   An explicit transfer session also holds its operation's GPUs between
+//!   tasks, until its client closes the session or disconnects. Opening a
+//!   session alone neither starts nor books a CUDA context.
 //! - The first use of a GPU under its holds starts a [`Session`]
 //!   ([`Slot::retain`]): the context is booked in every memory ledger of the
 //!   GPU, at the bytes the Transfer Server measured it at when it started,

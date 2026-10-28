@@ -726,7 +726,11 @@ impl Server {
                 outcome
             }
             (
-                Request::Transfer { .. } | Request::Cancel { .. } | Request::Throttle { .. },
+                Request::Transfer { .. }
+                | Request::OpenTransfer { .. }
+                | Request::CloseTransfer { .. }
+                | Request::Cancel { .. }
+                | Request::Throttle { .. },
                 role,
             ) => self.transfer_request(id, request, &role),
             (
@@ -2791,6 +2795,8 @@ fn request_name(request: &Request) -> &'static str {
         Request::Book { .. } => "book",
         Request::Ledger { .. } => "ledger",
         Request::Transfer { .. } => "transfer",
+        Request::OpenTransfer { .. } => "open_transfer",
+        Request::CloseTransfer { .. } => "close_transfer",
         Request::Cancel { .. } => "cancel",
         Request::Throttle { .. } => "throttle",
         Request::Measured { .. } => "measured",

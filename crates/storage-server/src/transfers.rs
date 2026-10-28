@@ -90,6 +90,8 @@ pub(super) struct Transfers {
     pub(super) client: Option<ClientId>,
     pub(super) tasks: BTreeMap<u64, Task>,
     next_task: u64,
+    sessions: BTreeMap<u64, ClientId>,
+    next_session: u64,
     /// The allocations the connected Transfer Server was given.
     given: BTreeSet<Allocation>,
     /// What it measured: every link of this host when it started, and the
@@ -112,6 +114,8 @@ impl Transfers {
             client: None,
             tasks: BTreeMap::new(),
             next_task: 1,
+            sessions: BTreeMap::new(),
+            next_session: 1,
             given: BTreeSet::new(),
             links: Vec::new(),
             contexts: Vec::new(),
@@ -218,6 +222,43 @@ impl Server {
             } => {
                 let task = self.submit(id, &deployment, spans, *priority, *update)?;
                 Ok(Outcome::Reply(Reply::Transferring { task }, Vec::new()))
+            }
+            Request::OpenTransfer { gpus } => {
+                let transfer = self
+                    .transfers
+                    .client
+                    .ok_or_else(|| (ErrorKind::Unavailable, "no Transfer Server runs".into()))?;
+                if gpus.iter().any(|gpu| {
+                    !self
+                        .transfers
+                        .contexts
+                        .iter()
+                        .any(|context| context.gpu == *gpu)
+                }) {
+                    return Err(invalid("a transfer session requires local GPUs"));
+                }
+                let session = self.transfers.next_session;
+                self.transfers.next_session += 1;
+                self.transfers.sessions.insert(session, id);
+                self.events.push((
+                    transfer,
+                    Event::TransferSession {
+                        session,
+                        gpus: gpus.clone(),
+                    },
+                    Vec::new(),
+                ));
+                Ok(Outcome::Reply(
+                    Reply::TransferOpened { session },
+                    Vec::new(),
+                ))
+            }
+            Request::CloseTransfer { session } => {
+                if self.transfers.sessions.get(session) != Some(&id) {
+                    return Err(invalid("the connection owns no such transfer session"));
+                }
+                self.close_transfer(*session);
+                Ok(Outcome::Reply(Reply::TransferClosed, Vec::new()))
             }
             Request::Cancel { tasks, update } => {
                 let selected: BTreeSet<u64> = tasks.iter().copied().collect();
@@ -905,9 +946,33 @@ impl Server {
         }
     }
 
+    fn close_transfer(&mut self, session: u64) {
+        self.transfers.sessions.remove(&session);
+        if let Some(transfer) = self.transfers.client {
+            self.events.push((
+                transfer,
+                Event::TransferSession {
+                    session,
+                    gpus: Vec::new(),
+                },
+                Vec::new(),
+            ));
+        }
+    }
+
     /// A client's connection closed: the tasks it submitted are cancelled,
     /// since nobody waits for them any more.
     pub(super) fn transfer_client_gone(&mut self, id: ClientId) {
+        let sessions: Vec<_> = self
+            .transfers
+            .sessions
+            .iter()
+            .filter(|(_, owner)| **owner == id)
+            .map(|(&session, _)| session)
+            .collect();
+        for session in sessions {
+            self.close_transfer(session);
+        }
         // A peer that left waits for no exposure, and reads none any more:
         // the registrations its exposures held go.
         self.transfers
@@ -941,6 +1006,7 @@ impl Server {
         self.transfers.given.clear();
         self.transfers.links.clear();
         self.transfers.contexts.clear();
+        self.transfers.sessions.clear();
         let failed = TransferEnd::Failed {
             message: "the Transfer Server ended".into(),
         };
