@@ -726,15 +726,14 @@ impl Service<'_> {
                     .map_or(0, crate::memory::PrefixCache::scratch_lent);
                 // The head segment a successor creates beside its
                 // predecessor's: the sentinel, the scratch of a warmup like
-                // this rank's and one page of every group, in whole granules.
+                // this rank's and the writable pages needed to advance a
+                // request, in whole granules.
                 let head_bytes = match (planes.as_ref(), device) {
                     (Some(planes), Some(device)) => {
                         let plan = planes.plan();
                         let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
-                        let page_units: u32 =
-                            plan.groups.iter().map(|group| group.units_per_page).sum();
                         u64::from(crate::memory::PlaneLayout::whole_granules(
-                            1 + scratch + page_units,
+                            1 + scratch + plan.progress_units(),
                             plan.plane_bytes,
                             granularity,
                         )) * planes.unit_bytes()

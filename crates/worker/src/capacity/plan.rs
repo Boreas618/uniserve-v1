@@ -508,7 +508,6 @@ impl TokenLayout {
             .iter()
             .map(|segment| segment.units)
             .sum();
-        let page_units: u32 = cache.groups.iter().map(|group| group.units_per_page).sum();
         let full = match (config.max_total_tokens, config.pool_storage_full_bytes) {
             (Some(tokens), _) => {
                 cache.token_units(tokens as u64, config.max_request_pool_size as u64)
@@ -520,7 +519,7 @@ impl TokenLayout {
         let full = u32::try_from(agreed[0].max(0))
             .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
         let head = PlaneLayout::whole_granules(
-            1 + predecessor.scratch_units + page_units,
+            1 + predecessor.scratch_units + cache.progress_units(),
             cache.plane_bytes,
             granularity,
         );
