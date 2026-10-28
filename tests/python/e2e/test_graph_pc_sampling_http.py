@@ -1,6 +1,6 @@
 """PC sampling of a deployment's CUDA graphs.
 
-Qwen3 serves on one GPU (``UNISERVE_PROFILING_DEVICE``, default 0) with
+Qwen3 serves on one GPU (``UNISERVE_WORLD_DEVICE``, default 0) with
 ``profiling_config.graph_pc_sampling``: every worker enables PC sampling
 before it captures its graphs, so a session's PC samples name the kernels
 the graphs launch, which a timeline in node mode records inside graphs.

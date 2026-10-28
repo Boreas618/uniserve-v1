@@ -1,6 +1,6 @@
 """Helpers of the profiling end-to-end tests.
 
-A Qwen3 deployment on one GPU (``UNISERVE_PROFILING_DEVICE``, default 0)
+A Qwen3 deployment on one GPU (``UNISERVE_WORLD_DEVICE``, default 0)
 with a Storage Server of the test's own, decode load from streaming
 requests, and the session calls of ``/admin/profile``.
 """
@@ -22,6 +22,7 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    gpu_device,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -83,9 +84,7 @@ def serve(tmp_path: Path, options: Sequence[str]) -> Iterator[str]:
     for option in options:
         command += ["--set", option]
     environment = {
-        "CUDA_VISIBLE_DEVICES": os.environ.get(
-            "UNISERVE_PROFILING_DEVICE", "0"
-        ),
+        "CUDA_VISIBLE_DEVICES": gpu_device(),
         "XDG_RUNTIME_DIR": str(runtime),
     }
     try:

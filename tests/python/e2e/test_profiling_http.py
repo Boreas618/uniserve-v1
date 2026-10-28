@@ -1,6 +1,6 @@
 """Online profiling of a serving deployment through the admin API.
 
-Qwen3 serves on one GPU (``UNISERVE_PROFILING_DEVICE``, default 0), with a
+Qwen3 serves on one GPU (``UNISERVE_WORLD_DEVICE``, default 0), with a
 Storage Server of the test's own in a runtime directory the test creates
 (``tempfile``'s directory, ``TMPDIR`` when set):
 

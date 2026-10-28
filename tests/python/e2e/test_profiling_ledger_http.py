@@ -1,6 +1,6 @@
 """A profiling session's device storage in its GPU's storage ledger.
 
-Qwen3 serves on one GPU (``UNISERVE_PROFILING_DEVICE``, default 0) with its
+Qwen3 serves on one GPU (``UNISERVE_WORLD_DEVICE``, default 0) with its
 KV cache sized by the deployment's quota. A ``range_metrics`` session whose
 pass takes more device storage than the ledger has room for first has the
 KV cache give back tail segments for it; the worker's process item books
