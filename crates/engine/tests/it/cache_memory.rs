@@ -685,6 +685,7 @@ fn a_target_rank_reserves_its_own_capacity_within_its_quota() {
                 fixed: 500,
                 cache: 1_000,
                 cache_capacity: 2_000,
+                cache_segment: 0,
                 pages: Vec::new(),
                 in_flight: None,
             },

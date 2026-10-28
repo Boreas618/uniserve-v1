@@ -169,7 +169,7 @@ impl PlaneLayout {
         tail_units: u32,
         plane_bytes: u64,
         granularity: u64,
-        predecessor: &ipc::PredecessorCache,
+        predecessor: Option<&ipc::PredecessorCache>,
     ) -> Result<Self> {
         let granule = granule_units(plane_bytes, granularity).unwrap_or(1);
         if head_units == 0 || !head_units.is_multiple_of(granule) {
@@ -186,11 +186,16 @@ impl PlaneLayout {
             inherited: false,
             create: true,
         }];
-        segments.extend(predecessor.segments.iter().map(|segment| LaidSegment {
-            segment: *segment,
-            inherited: true,
-            create: false,
-        }));
+        segments.extend(
+            predecessor
+                .into_iter()
+                .flat_map(|predecessor| &predecessor.segments)
+                .map(|segment| LaidSegment {
+                    segment: *segment,
+                    inherited: true,
+                    create: false,
+                }),
+        );
         if let Some((count, units)) = segment_layout(tail_units, plane_bytes, granularity) {
             segments.extend((0..count).map(|index| LaidSegment {
                 segment: ipc::CacheSegment {

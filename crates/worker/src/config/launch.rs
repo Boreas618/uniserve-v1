@@ -411,6 +411,13 @@ fn execution(
         max_total_tokens: descriptor.max_total_tokens.map(|tokens| tokens as usize),
         world: descriptor.storage.world,
         predecessor: descriptor.predecessor.clone(),
+        stage_cache: descriptor.stage_cache,
+        cache_keys: descriptor
+            .cache_keys
+            .iter()
+            .copied()
+            .map(storage::Key)
+            .collect(),
         segments: descriptor.segments.clone(),
         attention_backend: descriptor.attention_backend.clone(),
         max_batch_calls: descriptor.max_batch_calls as usize,

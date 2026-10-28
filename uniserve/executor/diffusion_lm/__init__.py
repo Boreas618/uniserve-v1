@@ -67,7 +67,7 @@ from .buffers import Banks, BankShape, Columns, Dimensions
 from .calls import Seeds
 from .computation import DiffusionLMComputation
 from .shapes import SLOT_BUCKETS
-from .warmup import Phase, phases
+from .warmup import Phase, phases, scratch_lengths
 
 __all__ = ["DiffusionLMExecutor"]
 
@@ -204,10 +204,13 @@ class DiffusionLMExecutor:
         slot.
         """
         computations = []
+        warmup_lengths = []
         fixed = slot_bytes = 0
         for component in self.components:
             facts = self.facts[component.name]
             bounds = self._bounds(facts, self.max_batch_calls, None)
+            if bounds.graphs or bounds.denoise is not None:
+                warmup_lengths.append(list(scratch_lengths(bounds.shapes())))
             fixed += self._dimensions(bounds, facts).bytes()
             denoising = bounds.denoise
             if denoising is not None:
@@ -240,6 +243,7 @@ class DiffusionLMExecutor:
                 "call_fields": list(CALL_FIELD_NAMES),
                 "fixed_bytes": int(fixed),
                 "slot_bytes": int(slot_bytes),
+                "warmup_lengths": warmup_lengths,
             },
         }
 

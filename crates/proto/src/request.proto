@@ -425,6 +425,8 @@ message RankBudget {
   // Complete reservation supplied by multi-world request routing. Absent
   // when the engine should size its own accepted request prefixes.
   optional uint64 in_flight = 10;
+  // Bytes of one target cache tail segment, its physical allocation unit.
+  uint64 cache_segment = 11;
 }
 
 // Target cache page storage, after layer/head partitioning and encoding.
@@ -1117,6 +1119,11 @@ message EngineSpec {
   repeated ReceivedWeights received_weights = 22;
   // Runtime expert distribution; shape-changing updates start another world.
   map<string, ExpertOrder> expert_order = 23;
+  // Prepare a cache-transfer target with writable warmup storage and a
+  // reserved virtual pool whose remaining segments are populated on demand.
+  bool stage_cache = 24;
+  // Existing Host cache keys retained by this world for a trial rollback.
+  repeated bytes cache_keys = 25;
 }
 
 // Logical expert IDs in global physical-slot order for one numerical layer.

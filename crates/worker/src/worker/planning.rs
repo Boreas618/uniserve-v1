@@ -83,25 +83,31 @@ pub(super) fn cache_budget(
     let Some(cache) = plan.cache.as_ref() else {
         return Ok(());
     };
-    let units = 1 + cache.progress_units();
-    let units = match config.device {
-        Device::Cuda(device) => crate::memory::prefix_cache::planes::PlaneLayout::whole_granules(
-            units,
-            cache.plane_bytes,
-            HandleType::Descriptor.granularity(device)? as u64,
+    let full = plan
+        .info
+        .prefix_cache
+        .as_ref()
+        .map_or(0, |cache| cache.num_units);
+    let (units, segment, capacity) = match &plan.planes {
+        Some(layout) => (
+            layout.segments[0].segment.units,
+            layout.tail_segment_units().unwrap_or(0),
+            layout.units(),
         ),
-        Device::Cpu => units,
+        None => (1 + plan.warmup_units + cache.progress_units(), full, full),
     };
     let columns = PrefixCache::import_workers(plan.info.max_unresolved_calls as usize)
         + COMPUTATION_COLUMNS
         + usize::from(launch.storage.host_kv_cache);
     let unit_bytes = cache.unit_bytes + columns as u64 * UnitColumn::bytes(1);
-    budget.cache = u64::from(units) * unit_bytes;
+    // Value planes grow by segment; flags, scales and unit index columns
+    // are allocated for the entire virtual capacity at startup.
+    let value_bytes = 2 * cache.columns as u64 * cache.plane_bytes;
+    let metadata_bytes = unit_bytes - value_bytes;
+    budget.cache = u64::from(units) * value_bytes + u64::from(capacity) * metadata_bytes;
+    budget.cache_segment = u64::from(segment) * value_bytes;
     budget.cache_capacity = if config.max_total_tokens.is_some() {
-        plan.info
-            .prefix_cache
-            .as_ref()
-            .map_or(0, |cache| u64::from(cache.num_units) * unit_bytes)
+        u64::from(capacity) * unit_bytes
     } else {
         budget.cache
     };
@@ -111,7 +117,7 @@ pub(super) fn cache_budget(
         .filter(|group| !group.draft)
         .map(|group| storage::manifest::weights::CachePage {
             tokens: group.block_size,
-            bytes: u64::from(group.units_per_page) * unit_bytes,
+            bytes: u64::from(group.units_per_page) * value_bytes,
             window: group.window,
             state: group.state,
         })
@@ -340,6 +346,7 @@ pub(super) fn plan(
         // The buffers of the computations over the prefix cache and their
         // request slots' state.
         if let Some(pages) = pages {
+            layout.reserve_warmup(pages.warmup_units);
             layout.reserve(
                 config.device,
                 pages.reserved_bytes(layout.info().request_slots as usize),

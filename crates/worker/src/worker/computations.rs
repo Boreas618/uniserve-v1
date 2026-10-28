@@ -271,6 +271,9 @@ pub(crate) struct PageManifest {
     pub(crate) fixed_bytes: u64,
     /// Device bytes they allocate per request slot.
     pub(crate) slot_bytes: u64,
+    /// Maximum scratch units lent by one of the executor's warmup phases,
+    /// excluding the sentinel. Its layouts also size a staged pool's head.
+    pub(crate) warmup_units: u32,
 }
 
 impl PageManifest {
@@ -565,7 +568,12 @@ pub(crate) fn bind(start: Binding<'_>) -> Result<Bound> {
             let prefix_cache = prefix_cache.ok_or_else(|| {
                 Error::Invalid("computations over the prefix cache require a prefix cache".into())
             })?;
-            let (json, pages) = bind_pages(prefix_cache, computation, config, &mut values)?;
+            let warmup_units = manifest
+                .pages
+                .as_ref()
+                .map_or(0, |pages| pages.warmup_units);
+            let (json, pages) =
+                bind_pages(prefix_cache, computation, config, warmup_units, &mut values)?;
             (json, Some(pages))
         }
         None => (serde_json::Value::Null, None),
@@ -798,6 +806,7 @@ fn bind_pages(
     prefix_cache: &PrefixCache,
     computation: &Computation,
     config: &WorkerConfig,
+    warmup_units: u32,
     values: &mut Vec<Argument>,
 ) -> Result<(serde_json::Value, Pages)> {
     values.push(Argument::Handle(prefix_cache.pool()?));
@@ -808,6 +817,7 @@ fn bind_pages(
     }
     let json = serde_json::json!({
         "units": prefix_cache.planes().num_units(),
+        "warmup_units": warmup_units.min(prefix_cache.planes().num_units().saturating_sub(1)),
         "tables": tables,
     });
     let pages = Pages::new(

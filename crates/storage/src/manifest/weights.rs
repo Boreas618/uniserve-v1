@@ -80,6 +80,8 @@ pub struct RankBudget {
     pub fixed: u64,
     pub cache: u64,
     pub cache_capacity: u64,
+    /// Bytes of one target cache tail segment, its physical allocation unit.
+    pub cache_segment: u64,
     pub weights: u64,
     pub pages: Vec<CachePage>,
     /// A complete cross-world request reservation, when the caller routes
@@ -87,8 +89,9 @@ pub struct RankBudget {
     pub in_flight: Option<u64>,
 }
 
-/// Storage of a target cache group's logical page, including its resident
-/// layers, heads, numerical encoding and per-unit index columns.
+/// Value storage added by a target cache group's logical page, including its
+/// resident layers, heads and numerical encoding. Full-pool metadata and unit
+/// index columns are already charged to the startup cache budget.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachePage {
     pub tokens: u32,

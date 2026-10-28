@@ -10,6 +10,7 @@ four tokens over a pool of 96 units.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from uniserve.executor.text.buffers import PageGroup, TextBounds
 from uniserve.executor.text.context import VisionBlock
@@ -48,13 +49,14 @@ def _one(tokens):
     return [None]
 
 
-def test_prefill_phases_capture_the_largest_footprint_first():
+@pytest.mark.parametrize("units", [None, UNITS])
+def test_prefill_phases_capture_the_largest_footprint_first(units):
     bounds = _bounds()
     layouts = prefill_layouts(
         bounds.shapes(),
         pages=bounds.pages,
         row_tokens=48,
-        units=UNITS,
+        units=units,
         capacities=lambda tokens: [2 * tokens, tokens],
     )
     # One row bucket of five rows (four live and the padding sequence) at
@@ -62,11 +64,7 @@ def test_prefill_phases_capture_the_largest_footprint_first():
     shapes = sorted(
         bounds.prefill, key=lambda shape: shape.token_bucket, reverse=True
     )
-    assert [layout.lengths for layout in layouts] == [
-        tuple(shape.scratch_lengths(48, bounds.pages, UNITS))
-        for shape in shapes
-    ]
-    assert layouts[0].lengths == (32, 32)
+    assert [layout.lengths for layout in layouts] == [(32, 32), (32,), (16,)]
     for layout, shape in zip(layouts, shapes):
         # One step per capacity, largest first, over the scratch rows.
         assert [step.capacity for step in layout.steps] == [

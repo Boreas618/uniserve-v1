@@ -1414,6 +1414,8 @@ impl ServeConfig {
             model_facts: None,
             world: 0,
             predecessor: None,
+            stage_cache: false,
+            cache_keys: Vec::new(),
             segments: Vec::new(),
             retire: Vec::new(),
             speculation: (self.speculative_config.num_draft_tokens > 0).then_some(

@@ -152,6 +152,11 @@ pub struct LaunchDescriptor {
     /// succeeds, whose segments the rank maps read-only behind a head
     /// segment of its own; `None` for a world that succeeds none.
     pub predecessor: Option<crate::PredecessorCache>,
+    /// Map the writable warmup head of a cache-transfer target and reserve
+    /// virtual addresses for the remaining pool segments.
+    pub stage_cache: bool,
+    /// Existing Host cache keys retained by the world for trial rollback.
+    pub cache_keys: Vec<[u8; 32]>,
     /// The exact KV cache segments the rank's planes are made of: those of
     /// the worker a standby rank group's worker stands by for, or those a
     /// world's rank held before its relaunch; `None` lays the planes out

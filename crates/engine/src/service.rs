@@ -830,6 +830,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
                                 fixed: weights.fixed,
                                 cache: weights.cache,
                                 cache_capacity: weights.cache_capacity,
+                                cache_segment: weights.cache_segment,
                                 in_flight: weights.in_flight,
                                 pages: weights
                                     .pages

@@ -92,6 +92,8 @@ __all__ = [
     "WarmForward",
     "framed_prefix",
     "split_rows",
+    "warm_forwards",
+    "warmup_lengths",
 ]
 
 # Fields of the worker's forward columns before the page columns: call
@@ -760,6 +762,55 @@ class WarmForward:
     def attention(self) -> list[list[int]]:
         """The rows' attention rows ``[slot, prefix, query]``."""
         return [[slot, prefix, tokens] for slot, prefix, tokens in self.rows]
+
+
+def warm_forwards(
+    family: str, limits: RowLimits, shapes: RowShapes | None, slots: int
+) -> list[WarmForward]:
+    """Lay out every warmup bucket of a denoiser family before binding.
+
+    Steps read ``WARM_PREFIX`` tokens; conditions write from position zero.
+    Graphs use every bucket in capture order. Eager execution uses the
+    shortest admitted row to select the family's kernels.
+    """
+    if shapes is None:
+        buckets = [RowShape(limits.min_row_tokens, 1)]
+        lengths: list[list[int] | None] = [[limits.min_row_tokens]]
+    else:
+        buckets = shapes.capture_order()
+        lengths = [split_rows(shape, limits, shapes) for shape in buckets]
+    forwards = []
+    for shape, split in zip(buckets, lengths, strict=True):
+        if split is None:
+            raise ValueError(f"{family}: no forward selects bucket {shape}")
+        forwards.append(
+            WarmForward(
+                family,
+                shape,
+                tuple(
+                    (
+                        1 + index % max(slots, 1),
+                        0 if family == "condition" else WARM_PREFIX,
+                        tokens,
+                    )
+                    for index, tokens in enumerate(split)
+                ),
+            )
+        )
+    return forwards
+
+
+def warmup_lengths(
+    forwards: Sequence[WarmForward], *, writes: bool
+) -> list[int]:
+    """The scratch tables read or written by one family's warmup phase."""
+    rows = [row for forward in forwards for row in forward.rows]
+    used = max((slot for slot, _, _ in rows), default=0)
+    length = max(
+        (prefix + (tokens if writes else 0) for _, prefix, tokens in rows),
+        default=0,
+    )
+    return [length] * used
 
 
 def split_rows(
@@ -1456,43 +1507,19 @@ class Denoiser:
         position zero, each on a scratch slot of its own where the slots
         allow.
         """
-        families = [("step", self.steps, False)]
-        if self.conditioning is not None:
-            families.append(("condition", self.conditioning, True))
-        result: list[list[WarmForward]] = [[], []]
-        for position, (name, family, writes) in enumerate(families):
-            limits = family.limits
-            if family.shapes is None:
-                buckets = [RowShape(limits.min_row_tokens, 1)]
-                lengths: list[list[int] | None] = [[limits.min_row_tokens]]
-            else:
-                buckets = family.shapes.capture_order()
-                lengths = [
-                    split_rows(shape, limits, family.shapes)
-                    for shape in buckets
-                ]
-            forwards = []
-            for shape, split in zip(buckets, lengths, strict=True):
-                if split is None:
-                    raise ValueError(
-                        f"{family.owner}: no forward selects bucket {shape}"
-                    )
-                forwards.append(
-                    WarmForward(
-                        name,
-                        shape,
-                        tuple(
-                            (
-                                1 + index % max(slots, 1),
-                                0 if writes else WARM_PREFIX,
-                                tokens,
-                            )
-                            for index, tokens in enumerate(split)
-                        ),
-                    )
-                )
-            result[position] = forwards
-        steps, conditions = result
+        steps = warm_forwards(
+            "step", self.steps.limits, self.steps.shapes, slots
+        )
+        conditions = (
+            []
+            if self.conditioning is None
+            else warm_forwards(
+                "condition",
+                self.conditioning.limits,
+                self.conditioning.shapes,
+                slots,
+            )
+        )
         return steps, conditions
 
     def warm(self, forward: WarmForward, pages: np.ndarray) -> GraphMode:

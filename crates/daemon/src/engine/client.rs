@@ -774,6 +774,7 @@ impl EngineClient {
                 fixed: budget.fixed,
                 cache: budget.cache,
                 cache_capacity: budget.cache_capacity,
+                cache_segment: budget.cache_segment,
                 in_flight: budget.in_flight,
                 pages: budget
                     .pages
