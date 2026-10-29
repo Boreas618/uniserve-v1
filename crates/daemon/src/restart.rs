@@ -5,7 +5,9 @@
 //! `POST /admin/restart` starts the successor (`uniserve serve --takeover
 //! FD`) with one end of a socket pair at that descriptor. They talk over it:
 //!
-//! 1. The daemon sends its options (`Prepare`). The successor loads the
+//! 1. The daemon sends its options (`Prepare`). The successor restarts
+//!    this node's Storage Server in place when it speaks an earlier protocol
+//!    than the successor's build (`supervision::restart_earlier`), loads the
 //!    model's files and binds a request socket of its own, which it answers
 //!    with (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
@@ -546,6 +548,18 @@ async fn prepared_successor(
     prepare: Prepare,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    // This node's Storage Server goes first: a successor of a later build
+    // replaces a server of an earlier protocol before it takes the
+    // deployment over, and a failure leaves the daemon serving as it was.
+    let socket = storage::socket::default_socket();
+    if socket.exists() {
+        let executable = std::env::current_exe().context("locating this daemon's executable")?;
+        tokio::task::spawn_blocking(move || {
+            crate::supervision::restart_earlier(&executable, &socket)
+        })
+        .await
+        .context("the storage server's protocol check did not complete")??;
+    }
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);

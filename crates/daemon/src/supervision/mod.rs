@@ -17,6 +17,8 @@
 //! its sockets, connections, processes and claims.
 
 mod claims;
+
+pub(crate) use claims::restart_earlier;
 mod service;
 mod supervisor;
 
