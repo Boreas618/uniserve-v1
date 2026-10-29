@@ -104,6 +104,12 @@ pub(super) struct Inflight {
     pub(super) pending_batches: HashMap<u64, PendingBatch>,
     /// `Finish` and `Free` commands awaiting a batch to carry them.
     pub(super) pending_commands: VecDeque<BatchCommand>,
+    /// Requests a worker refused whose calls were still in flight: their
+    /// later calls, submitted before the refusal arrived, fail for want of
+    /// the refused call's products, and such a failure is the refusal's,
+    /// not a worker fault (`Scheduler::on_executor_error`). A request
+    /// leaves once none of its calls is in flight.
+    pub(super) refused: HashSet<RequestKey>,
 }
 
 impl Inflight {
@@ -118,6 +124,7 @@ impl Inflight {
             pending_finishes: HashMap::new(),
             pending_batches: HashMap::new(),
             pending_commands: VecDeque::new(),
+            refused: HashSet::new(),
         }
     }
 
