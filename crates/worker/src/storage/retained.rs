@@ -802,12 +802,53 @@ impl ExclusiveStorage for &Retained {
             .get(keys, mode, Vec::new())
             .map_err(|error| storage_error("taking exclusive storages", error))?;
         if standby && let Some(missing) = got.missing.first() {
-            let name = keyed
+            let Some(((name, _, gpu), spec)) = keyed
                 .iter()
-                .find(|(_, key, _)| key == missing)
-                .map_or("an exclusive storage", |(name, _, _)| name.as_str());
+                .zip(specs)
+                .find(|((_, key, _), _)| key == missing)
+            else {
+                return Err(Error::Interface(
+                    "the storage server named a storage nobody asked for".into(),
+                ));
+            };
+            // What the scope holds under that name, so that the error names
+            // the part of the shape that differs.
+            let held: Vec<String> = state
+                .client
+                .list()
+                .map(|listing| {
+                    listing
+                        .tensors
+                        .iter()
+                        .filter(|tensor| &tensor.name == name)
+                        .filter_map(|tensor| {
+                            let worlds: Vec<u64> = tensor
+                                .retainers
+                                .iter()
+                                .filter(|retainer| retainer.scope == retained.scope)
+                                .map(|retainer| retainer.world)
+                                .collect();
+                            (!worlds.is_empty()).then(|| {
+                                format!(
+                                    "{} bytes on {:?} in worlds {worlds:?}",
+                                    tensor.storage_bytes, tensor.placement
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             return Err(Error::Invalid(format!(
-                "the standby worker found no {name} of its predecessor's shape"
+                "the standby worker found no {name} of its predecessor's shape: it asks for \
+                 {} bytes on GPU {} in world {}, and its scope holds {}",
+                spec.bytes,
+                ::storage::protocol::gpu_name(gpu),
+                retained.world,
+                if held.is_empty() {
+                    "none".to_owned()
+                } else {
+                    held.join("; ")
+                }
             )));
         }
         if !got.missing.is_empty() {
@@ -1023,6 +1064,7 @@ impl Retained {
     ) -> Result<()> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(spec.device)?;
+        let mut given = BTreeSet::new();
         for &index in indices {
             storage.release_segment(index)?;
             let key = self.segment_key(spec.name, &spec.parts[index], &gpu);
@@ -1031,14 +1073,9 @@ impl Retained {
             state
                 .inherited
                 .retain(|(inherited, _, _)| *inherited != key);
+            given.insert(key);
         }
-        let used: Vec<Key> = state.used.iter().copied().collect();
-        let at = state.locations();
-        state
-            .client
-            .retain(used, at)
-            .map_err(|error| storage_error("giving back segments", error))?;
-        Ok(())
+        self.release_keys(&mut state, &given, "giving back segments")
     }
 
     /// Creates the parts `indices` again, as the worker's world's own
@@ -1131,12 +1168,38 @@ impl Retained {
         for key in keys {
             state.used.remove(key);
         }
-        let used: Vec<Key> = state.used.iter().copied().collect();
+        let forgotten = keys.iter().copied().collect();
+        self.release_keys(
+            &mut state,
+            &forgotten,
+            "forgetting the predecessor's storages",
+        )
+    }
+
+    /// Ends the world's retention of `keys` alone. The server's retention is
+    /// the scope's in the world, which every worker of the scope shares: a
+    /// standby maps its predecessor's storages under it, and the worker's own
+    /// owners take theirs later in its startup, so every other storage the
+    /// scope retains stays.
+    fn release_keys(&self, state: &mut State, keys: &BTreeSet<Key>, doing: &str) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let listing = state
+            .client
+            .list()
+            .map_err(|error| storage_error("listing the storage server", error))?;
+        let keep: Vec<Key> = listing
+            .tensors
+            .iter()
+            .filter(|tensor| self.retains(tensor) && !keys.contains(&tensor.key))
+            .map(|tensor| tensor.key)
+            .collect();
         let at = state.locations();
         state
             .client
-            .retain(used, at)
-            .map_err(|error| storage_error("forgetting the predecessor's storages", error))?;
+            .retain(keep, at)
+            .map_err(|error| storage_error(doing, error))?;
         Ok(())
     }
 
