@@ -53,6 +53,8 @@ message FromEngine {
     Parked parked = 7;
     CacheDescribed cache_described = 8;
     RequestsDescribed requests_described = 9;
+    // TCP artifact bytes, sent contiguously before their Artifact event.
+    ArtifactPart artifact_part = 10;
   }
 }
 
@@ -1017,6 +1019,13 @@ message Artifact {
   MediaKind media_kind = 1;
   string content_type = 2;
   uint64 bytes = 3;
+}
+
+// One bounded part of an artifact transferred between hosts. Every part
+// states the complete length; the following Artifact event consumes it.
+message ArtifactPart {
+  uint64 size = 1;
+  bytes data = 2;
 }
 
 enum MediaKind {

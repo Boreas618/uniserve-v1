@@ -119,7 +119,18 @@ impl Daemon {
         };
 
         let (address, thread) = if options.node_rank == 0 {
-            let address = format!("unix:{}", options.socket.display());
+            let (joins, members) = join_members(&options)?;
+            let leader_address = leader_address(&options, &members);
+            // Engines may run on any joined node. A deployment with a
+            // network address exposes process control on that interface;
+            // single-host deployments retain their Unix socket.
+            let (address, socket) = match leader_address {
+                Some(ip) => (std::net::SocketAddr::new(ip, 0).to_string(), None),
+                None => (
+                    format!("unix:{}", options.socket.display()),
+                    Some(options.socket.clone()),
+                ),
+            };
             if let Some(parent) = options.socket.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating {}", parent.display()))?;
@@ -128,8 +139,7 @@ impl Daemon {
             let _ = std::fs::remove_file(&options.socket);
             let listener = Listener::bind(&address)
                 .with_context(|| format!("binding the process socket {address}"))?;
-            let (joins, members) = join_members(&options)?;
-            let leader_address = leader_address(&options, &members);
+            let address = listener.address().to_owned();
             // While nodes may join, their processes reach this node's
             // Storage Server too: their Transfer Servers read its storage.
             let local = local(&options, leader_address, joins.is_some())?;
@@ -138,7 +148,7 @@ impl Daemon {
                 .name("daemon".into())
                 .spawn(move || service::serve_leader(&host, local, listener, joins, members, &stop))
                 .context("starting the daemon's service")?;
-            (Some((address, options.socket.clone())), thread)
+            (Some((address, socket)), thread)
         } else {
             let leader = join_leader(&options)?;
             let address = leader.local_ip();
@@ -152,7 +162,7 @@ impl Daemon {
         let (address, socket) = address.unzip();
         Ok(Self {
             address,
-            socket,
+            socket: socket.flatten(),
             requested,
             handoff,
             wake,
@@ -169,7 +179,7 @@ impl Daemon {
     /// Fails when the service thread cannot start.
     pub(crate) fn resume(
         host: String,
-        address: Option<(String, PathBuf)>,
+        address: Option<(String, Option<PathBuf>)>,
         handed: HandedService,
         descriptors: Vec<OwnedFd>,
     ) -> anyhow::Result<Self> {
@@ -189,7 +199,7 @@ impl Daemon {
         let (address, socket) = address.unzip();
         Ok(Self {
             address,
-            socket,
+            socket: socket.flatten(),
             requested,
             handoff,
             wake,
@@ -439,13 +449,19 @@ mod tests {
     /// started.
     #[test]
     fn a_resumed_service_answers_the_connections_it_was_handed() {
+        for network in [false, true] {
+            resumed_service(network);
+        }
+    }
+
+    fn resumed_service(network: bool) {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("process.sock");
         let mut daemon = Daemon::start(DaemonOptions {
             nnodes: 1,
             node_rank: 0,
             host: "localhost".to_owned(),
-            dist_init_addr: None,
+            dist_init_addr: network.then(|| "127.0.0.1:0".to_owned()),
             socket: socket.clone(),
             executable: PathBuf::from("uniserve"),
             join_timeout: Duration::from_secs(5),
@@ -485,11 +501,11 @@ mod tests {
         let (handed, descriptors) = daemon.hand_over().unwrap();
         // The handed-over daemon ends nothing and leaves its socket.
         drop(daemon);
-        assert!(socket.exists());
+        assert_eq!(socket.exists(), !network);
         assert!(Path::new(&format!("/proc/{}", spawned.pid)).exists());
         let mut successor = Daemon::resume(
             "localhost".to_owned(),
-            Some((address, socket.clone())),
+            Some((address, (!network).then_some(socket.clone()))),
             handed,
             descriptors,
         )

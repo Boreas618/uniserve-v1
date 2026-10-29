@@ -26,7 +26,7 @@ pub mod request;
 mod shared_memory;
 
 pub use connection::{Connection, Error, Handed, Listener, Result};
-pub use media::{MappedMedia, MediaLocator, MediaSource};
+pub use media::{MappedMedia, MediaLocator, MediaReceiver, MediaSource};
 pub use shared_memory::SharedMemory;
 
 /// The messages of the process interface (`process.proto`).
@@ -42,8 +42,9 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 
 /// The interfaces' minor version: the additions this build knows. Minor 1
 /// adds the leader's answer of the nodes it knows now (`NodesQuery`). Minor 2
-/// adds explicit publication of committed worlds' immutable pages.
-pub const PROTOCOL_MINOR: u32 = 2;
+/// adds explicit publication of committed worlds' immutable pages. Minor 3
+/// carries generated artifacts over TCP in bounded parts.
+pub const PROTOCOL_MINOR: u32 = 3;
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled

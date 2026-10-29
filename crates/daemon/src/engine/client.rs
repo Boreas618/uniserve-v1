@@ -18,7 +18,7 @@ use std::time::Duration;
 use proto::report::SchedulerStats;
 use proto::request::wire::{self, from_engine, to_engine};
 use proto::request::{EVENT_WINDOW, Event, GenerationLimits, Request, RequestId};
-use proto::{Connection, MappedMedia};
+use proto::{Connection, MappedMedia, MediaReceiver};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// How long a read of the engine's frames waits before it rechecks whether
@@ -982,6 +982,7 @@ impl Answered {
 /// Files the engine's frames until its connection closes, then ends every
 /// request still in flight.
 fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
+    let mut artifact_transfer: Option<MediaReceiver> = None;
     loop {
         let message = match reader.try_recv::<wire::FromEngine>() {
             Ok(Some(message)) => message,
@@ -998,11 +999,35 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             }
         };
         match message.kind {
+            Some(from_engine::Kind::ArtifactPart(part)) => {
+                let received = (|| -> std::io::Result<()> {
+                    let transfer = match artifact_transfer.as_mut() {
+                        Some(transfer) => transfer,
+                        None => artifact_transfer.insert(MediaReceiver::new(part.size)?),
+                    };
+                    transfer.append(part.size, &part.data)
+                })();
+                if let Err(error) = received {
+                    tracing::error!(%error, "receiving an artifact failed");
+                    break;
+                }
+            }
             Some(from_engine::Kind::Event(event)) => {
-                // An artifact's bytes come as the descriptor beside its
-                // frame.
-                let media = match &event.kind {
-                    Some(wire::event::Kind::Artifact(artifact)) => reader
+                // Local artifacts carry a descriptor; remote artifacts
+                // follow the bounded parts written into their host storage.
+                let media = match (&event.kind, artifact_transfer.take()) {
+                    (Some(wire::event::Kind::Artifact(artifact)), Some(transfer)) => {
+                        match transfer.finish(artifact.bytes) {
+                            Ok(media) => {
+                                Some(Arc::new(media) as Arc<dyn proto::request::ArtifactMedia>)
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "receiving an artifact failed");
+                                break;
+                            }
+                        }
+                    }
+                    (Some(wire::event::Kind::Artifact(artifact)), None) => reader
                         .take_descriptor()
                         .and_then(|descriptor| {
                             MappedMedia::map(descriptor, artifact.bytes)
@@ -1012,7 +1037,11 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                                 .ok()
                         })
                         .map(|media| Arc::new(media) as Arc<dyn proto::request::ArtifactMedia>),
-                    _ => None,
+                    (_, Some(_)) => {
+                        tracing::error!("artifact parts were not followed by their event");
+                        break;
+                    }
+                    (_, None) => None,
                 };
                 match Event::from_wire(event, media) {
                     Ok((id, event)) => file(shared, id, event),

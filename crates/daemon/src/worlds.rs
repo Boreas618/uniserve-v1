@@ -528,19 +528,16 @@ fn parallel_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool
     };
     let mesh = |spec: &wire::EngineSpec| spec.workers.as_ref().map(|workers| workers.mesh.clone());
     let pages = |spec: &wire::EngineSpec| spec.kv_cache.as_ref().map(|cache| cache.block_size);
-    ranks(served) != ranks(target)
+    served.host != target.host
+        || ranks(served) != ranks(target)
         || mesh(served) != mesh(target)
         || pages(served) != pages(target)
         || served.experts != target.experts
 }
 
-/// What a world change keeps of the serving world's derived state, by the
-/// parts of the engine spec that decide each one's keys: the weights and
-/// the KV cache the successor maps. Names the parts that differ. A change
-/// of the parallel configuration ([`parallel_change`]) is not among them:
-/// it redistributes both.
+/// Changes outside a successor's current process-control contract. Rank
+/// resources and numerical layouts are planned by the target world.
 fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'static str> {
-    let parallel = parallel_change(served, target);
     let mut parts = Vec::new();
     let mut differs = |name: &'static str, same: bool| {
         if !same {
@@ -548,26 +545,6 @@ fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'stat
         }
     };
     differs("the deployment", served.deployment == target.deployment);
-    differs("the host", served.host == target.host);
-    // The queue depth and storage fraction of the same ranks.
-    let sizing = |spec: &wire::EngineSpec| {
-        spec.placement.as_ref().map(|placement| {
-            (
-                placement.queue_depth,
-                placement.mem_fraction_static.to_bits(),
-            )
-        })
-    };
-    differs(
-        "the placement",
-        parallel || sizing(served) == sizing(target),
-    );
-    differs("the product transport", served.transfer == target.transfer);
-    // The KV cache but its page size, which a parallel change covers, and
-    // its encoding, which the successor computes again in a cache of its own
-    // (`kv_encoding_changes`).
-    differs("the KV cache", same_kv_cache_layout(served, target));
-    differs("the video options", served.video == target.video);
     parts
 }
 
@@ -626,17 +603,23 @@ fn kv_encoding_changes(served: &wire::EngineSpec, target: &wire::EngineSpec) -> 
     kv_encoding(served) != kv_encoding(target)
 }
 
-/// Whether two specs' KV caches are the same but for their dtype and their
-/// page size, which a successor that maps none of the cache lays out anew.
-fn same_kv_cache_layout(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
-    let layout = |spec: &wire::EngineSpec| {
-        spec.kv_cache.clone().map(|kv| wire::KvCache {
-            dtype: String::new(),
-            block_size: None,
-            ..kv
-        })
-    };
-    layout(served) == layout(target)
+/// Changes that need the target ranks' capacity plan even when their
+/// numerical tensor regions stay on the same devices. A different quota,
+/// queue, cache or media configuration must not inherit a budget measured
+/// for the serving world's resources.
+fn resource_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
+    served.placement != target.placement
+        || served.transfer != target.transfer
+        || served.kv_cache != target.kv_cache
+        || served.video != target.video
+}
+
+/// A successor with another capacity lays out its own segments. Importing
+/// the source's full segments could exceed a smaller target capacity;
+/// warming copies only the accepted prefixes into the target's own pool.
+fn cache_capacity_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
+    let tokens = |spec: &wire::EngineSpec| spec.kv_cache.as_ref().and_then(|kv| kv.max_tokens);
+    tokens(served) != tokens(target)
 }
 
 /// Whether a world succeeding the one `running` executes, which adds
@@ -1318,6 +1301,7 @@ impl Replica {
             && target.tensor_parallel_size == current.tensor_parallel_size
             && target.data_parallel_size == current.data_parallel_size
             && target.placement_config.worker_hosts == current.placement_config.worker_hosts
+            && target_spec.host == served.host
         {
             retain_devices(&served, &mut target_spec)
                 .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
@@ -1354,11 +1338,13 @@ impl Replica {
         let unmapped = differing(&served, &target_spec);
         let reloaded = reloads(&served, &target_spec);
         let mut redistributes = parallel_change(&served, &target_spec);
-        // A change of the parallel configuration plans what each GPU of the
-        // successor maps, receives and creates of the weights, and, unless
-        // the update states it, the ranks' device order (§4.7). The order
-        // the daemon chose is the target configuration's.
-        let redistribution = if world_changes && redistributes && unmapped.is_empty() {
+        // Plan the target's own resources whenever ranks, quotas or pools
+        // change. Only a change of parallel ranks may choose a device order;
+        // a quota or queue adjustment keeps the declared assignment.
+        let redistribution = if world_changes
+            && (redistributes || resource_change(&served, &target_spec))
+            && unmapped.is_empty()
+        {
             let requests = running
                 .describe_requests()
                 .await
@@ -1375,13 +1361,13 @@ impl Replica {
                     .next_engine(),
                 &[running.world()],
                 &target_spec,
-                !stated.contains("placement_config.devices"),
+                redistributes && !stated.contains("placement_config.devices"),
                 &requests,
             )
             .await
             .map_err(|error| {
                 UpdateError::Refused(format!(
-                    "the change of the parallel configuration cannot be planned: {error:#}"
+                    "the target world's resources cannot be planned: {error:#}"
                 ))
             })?;
             if let Some(planned) = planned.as_ref().filter(|planned| planned.chosen) {
@@ -1396,7 +1382,7 @@ impl Replica {
                 world_changes = comparable(&served) != comparable(&target_spec);
                 redistributes = parallel_change(&served, &target_spec);
             }
-            planned.filter(|_| world_changes && redistributes)
+            planned.filter(|_| world_changes)
         } else {
             None
         };
@@ -1421,6 +1407,7 @@ impl Replica {
             loads_weights: !reloaded.is_empty() || (redistributes && redistribution.is_none()),
             unmapped_cache: redistributes
                 || kv_encoding_changes(&served, &target_spec)
+                || cache_capacity_change(&served, &target_spec)
                 || (!reloaded.is_empty() && request.in_flight == InFlight::Recompute),
             host_cache: false,
             eager_source: update.eager_prepare,
@@ -2802,92 +2789,6 @@ mod tests {
             &comparable(&target),
             Some(&capacity)
         ));
-    }
-
-    /// A world change carries over a change of the build, and one of the
-    /// weights' sources (the successor loads them) or of the KV cache's
-    /// encoding (the successor maps none of it), apart from a parallel
-    /// change; a change of the KV cache's size is not carried over.
-    #[test]
-    fn a_change_reloads_weights_and_recomputes_the_cache_it_cannot_read() {
-        let served = wire::EngineSpec {
-            model: "a".into(),
-            kv_cache: Some(wire::KvCache::default()),
-            workers: Some(wire::Workers {
-                executable: "old".into(),
-                dtype: "bfloat16".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let mut target = served.clone();
-        if let Some(workers) = target.workers.as_mut() {
-            workers.executable = "new".into();
-        }
-        assert!(differing(&served, &target).is_empty());
-        assert!(reloads(&served, &target).is_empty());
-        assert!(!kv_encoding_changes(&served, &target));
-
-        target.model = "b".into();
-        assert!(differing(&served, &target).is_empty());
-        assert_eq!(reloads(&served, &target), vec!["the model"]);
-        assert!(!kv_encoding_changes(&served, &target));
-
-        // The cache follows the compute dtype unless it states its own.
-        if let Some(workers) = target.workers.as_mut() {
-            workers.dtype = "float16".into();
-        }
-        assert!(kv_encoding_changes(&served, &target));
-        if let Some(kv) = target.kv_cache.as_mut() {
-            kv.dtype = "fp8_e4m3".into();
-        }
-        assert!(differing(&served, &target).is_empty());
-        assert!(kv_encoding_changes(&served, &target));
-
-        // The page size is a parallel change; the cache's size is not
-        // carried over.
-        if let Some(kv) = target.kv_cache.as_mut() {
-            kv.block_size = Some(32);
-        }
-        assert!(differing(&served, &target).is_empty());
-        assert!(parallel_change(&served, &target));
-        if let Some(kv) = target.kv_cache.as_mut() {
-            kv.max_tokens = Some(1024);
-        }
-        assert_eq!(differing(&served, &target), vec!["the KV cache"]);
-    }
-
-    /// Another parallel configuration redistributes the weights and the KV
-    /// cache rather than being refused; the sizing of the same ranks is
-    /// still refused.
-    #[test]
-    fn a_parallel_configuration_change_redistributes() {
-        let served = wire::EngineSpec {
-            placement: Some(wire::Placement {
-                tensor_parallel_size: 2,
-                data_parallel_size: 2,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let mut target = served.clone();
-        if let Some(placement) = target.placement.as_mut() {
-            placement.tensor_parallel_size = 1;
-            placement.data_parallel_size = 4;
-        }
-        target.experts = Some(wire::Experts {
-            expert_parallel: true,
-            ..Default::default()
-        });
-        assert!(parallel_change(&served, &target));
-        assert!(differing(&served, &target).is_empty());
-
-        let mut sized = served.clone();
-        if let Some(placement) = sized.placement.as_mut() {
-            placement.mem_fraction_static = 0.5;
-        }
-        assert!(!parallel_change(&served, &sized));
-        assert_eq!(differing(&served, &sized), vec!["the placement"]);
     }
 
     /// The resolved deployment carries the ranks it read even when the

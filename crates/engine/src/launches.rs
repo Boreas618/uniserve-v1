@@ -149,9 +149,16 @@ pub fn plan_ranks(
     let launches = device_launches(spec)?;
     let processes = processes::ProcessClient::connect(process_address, &spec.deployment)?;
     let claims = Claims::claim(&arguments, &processes)?;
+    // Planning runs in the leader daemon, even when the target engine
+    // will run elsewhere. Its registry must advertise the leader's host.
+    let coordinator = processes::lock(&processes)?
+        .hosts()
+        .into_iter()
+        .next()
+        .context("the deployment has no leader node")?;
     let registry =
-        registry::WorkerRegistry::bind(launches.iter().any(|rank| rank.host != spec.host))?;
-    let reachable = processes::lock(&processes)?.address(&spec.host)?;
+        registry::WorkerRegistry::bind(launches.iter().any(|rank| rank.host != coordinator))?;
+    let reachable = processes::lock(&processes)?.address(&coordinator)?;
     let mut generations = BTreeMap::new();
     for launch in &launches {
         let generation = match generations.entry(launch.group.clone()) {
@@ -160,7 +167,7 @@ pub fn plan_ranks(
                 *entry.insert(registry::lock(&registry)?.begin_launch(&launch.group))
             }
         };
-        let address = registry::lock(&registry)?.address(if launch.host == spec.host {
+        let address = registry::lock(&registry)?.address(if launch.host == coordinator {
             None
         } else {
             reachable

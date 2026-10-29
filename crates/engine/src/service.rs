@@ -452,16 +452,9 @@ fn connect_front(
     attachment: &Attachment,
     state: i32,
 ) -> anyhow::Result<(Connection, Connection)> {
-    let path = address
-        .strip_prefix("unix:")
-        .with_context(|| format!("the request socket {address} is not a Unix socket"))?;
-    let stream = UnixStream::connect(path)
+    let mut reader = Connection::connect(address)
         .with_context(|| format!("connecting to the daemon's request socket {address}"))?;
-    let writer = stream
-        .try_clone()
-        .context("sharing the daemon's connection")?;
-    let mut reader = Connection::from_unix(stream)?;
-    let mut writer = Connection::from_unix(writer)?;
+    let mut writer = reader.writer()?;
     writer.send(&wire::Hello {
         major: proto::PROTOCOL_MAJOR,
         minor: proto::PROTOCOL_MINOR,
@@ -1671,7 +1664,25 @@ fn write_frames(
     outgoing: &crossbeam_channel::Receiver<Frame>,
 ) -> anyhow::Result<()> {
     for frame in outgoing {
-        let descriptor = frame.media.as_ref().and_then(|media| media.descriptor());
+        let descriptor = frame
+            .media
+            .as_ref()
+            .filter(|_| writer.peer_ip().is_none())
+            .and_then(|media| media.descriptor());
+        if descriptor.is_none()
+            && let Some(media) = &frame.media
+        {
+            // Bound frame size independently of clip length. The receiver
+            // writes each part into the artifact's final host storage.
+            for data in media.bytes().chunks(1 << 20) {
+                writer.send(&wire::FromEngine {
+                    kind: Some(from_engine::Kind::ArtifactPart(wire::ArtifactPart {
+                        size: media.bytes().len() as u64,
+                        data: data.to_vec(),
+                    })),
+                })?;
+            }
+        }
         match descriptor {
             Some(descriptor) => writer.send_with_descriptor(&frame.message, descriptor),
             None => writer.send(&frame.message),
@@ -1685,7 +1696,7 @@ fn write_frames(
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runs one engine process: connects to the leader daemon's request socket
-/// at `requests` (`unix:<path>`) as engine `engine`, takes the spec the
+/// at `requests` (`unix:<path>` or `host:port`) as engine `engine`, takes the spec the
 /// daemon welcomes it with, starts the deployment's workers through the
 /// daemons' process socket at `processes` and its schedulers, reports
 /// itself ready, and serves the daemon's requests until it shuts the engine
@@ -1700,16 +1711,9 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 /// does not resolve, the workers or schedulers do not start, or the
 /// connection fails.
 pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Result<()> {
-    let path = requests
-        .strip_prefix("unix:")
-        .with_context(|| format!("the request socket {requests} is not a Unix socket"))?;
-    let stream = UnixStream::connect(path)
+    let mut reader = Connection::connect(requests)
         .with_context(|| format!("connecting to the daemon's request socket {requests}"))?;
-    let writer = stream
-        .try_clone()
-        .context("sharing the daemon's connection")?;
-    let mut reader = Connection::from_unix(stream)?;
-    let mut writer = Connection::from_unix(writer)?;
+    let mut writer = reader.writer()?;
 
     writer.send(&wire::Hello {
         major: proto::PROTOCOL_MAJOR,
@@ -1728,6 +1732,10 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
     let spec = welcome
         .spec
         .context("the daemon's welcome carries no engine spec")?;
+    anyhow::ensure!(
+        reader.peer_ip().is_none() || welcome.minor >= 3,
+        "a network request connection needs artifact transport protocol minor 3"
+    );
     tracing::info!(engine, deployment = %spec.deployment, daemon = %welcome.build, "the daemon welcomed the engine");
 
     let state = |state: wire::EngineState, info: Option<wire::EngineInfo>, error: String| {
