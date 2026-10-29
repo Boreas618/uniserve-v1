@@ -234,7 +234,8 @@ impl WorkerGroup {
         let promoted = crate::worker::process::promote_all(
             &mut standby.workers,
             self.process_args.watchdog_timeout,
-        );
+        )
+        .and_then(|()| self.map_replacement_host_cache(&mut standby.workers));
         Some(match promoted {
             Ok(()) => {
                 for worker in &mut standby.workers {

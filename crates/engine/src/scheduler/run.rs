@@ -425,8 +425,7 @@ impl Scheduler {
             tokens = tokens.min(held);
         }
         tracing::info!(asked, tokens, "sized the world's host KV cache");
-        let payload = serde_json::json!({ "tokens": tokens }).to_string();
-        for (worker, results) in self.executor.hook_groups("uniserve.host_cache", &payload)? {
+        for (worker, results) in self.executor.map_host_cache(tokens)? {
             let Some(ranks) = rank_caches.get_mut(&worker) else {
                 continue;
             };

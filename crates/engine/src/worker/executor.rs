@@ -998,6 +998,33 @@ impl WorkerExecutor {
     pub fn command_waker(&self) -> CommandWaker {
         self.command_wake.waker()
     }
+
+    /// Runs `action` on every group, the groups together, and returns each
+    /// group's identity with its ranks' results.
+    fn groups_together<F>(&mut self, action: F) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>>
+    where
+        F: Fn(&mut WorkerGroup) -> anyhow::Result<Vec<String>> + Sync,
+    {
+        std::thread::scope(|scope| {
+            let running = self
+                .workers
+                .iter_mut()
+                .map(|worker| {
+                    let id = worker.0.clone();
+                    let action = &action;
+                    scope.spawn(move || action(&mut worker.1).map(|results| (id, results)))
+                })
+                .collect::<Vec<_>>();
+            running
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("worker hook thread panicked"))?
+                })
+                .collect()
+        })
+    }
 }
 
 impl Executor for WorkerExecutor {
@@ -1592,24 +1619,14 @@ impl Executor for WorkerExecutor {
         name: &str,
         payload: &str,
     ) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>> {
-        std::thread::scope(|scope| {
-            let running = self
-                .workers
-                .iter_mut()
-                .map(|worker| {
-                    let id = worker.0.clone();
-                    scope.spawn(move || worker.1.hook(name, payload).map(|results| (id, results)))
-                })
-                .collect::<Vec<_>>();
-            running
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("worker hook thread panicked"))?
-                })
-                .collect()
-        })
+        self.groups_together(|group| group.hook(name, payload))
+    }
+
+    /// Maps the host KV cache on every group, the groups together
+    /// (`WorkerGroup::map_host_cache`), and returns each group's identity
+    /// with its ranks' pools.
+    fn map_host_cache(&mut self, tokens: u64) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>> {
+        self.groups_together(|group| group.map_host_cache(tokens))
     }
 
     /// Commits every group's world together (`WorkerGroup::commit`), and
