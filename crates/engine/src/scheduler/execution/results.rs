@@ -915,7 +915,7 @@ impl Scheduler {
                 // no later reader needs.
                 if progress_result.is_some() && matches!(call.kind, CallKind::Forward(_)) {
                     self.record_draft(id, &call, &record);
-                    self.advance_request_cache(id);
+                    self.advance_request_cache(id, false);
                 }
 
                 // Apply accepted progress directly; the output decoder separately

@@ -48,7 +48,8 @@ pub struct BlockTable {
 
 /// Physical units newly acquired for one installed block table.
 ///
-/// The worker resets every listed unit before a call reads or writes it.
+/// The worker resets each unit, or copies its immutable source, before a
+/// call reads or writes it. Copy sources remain leased through completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheUnitAllocation {
     /// Scheduler-assigned request-state row receiving the units.
@@ -57,6 +58,9 @@ pub struct CacheUnitAllocation {
     pub group_id: u32,
     /// Newly allocated physical unit identifiers.
     pub unit_ids: Vec<UnitId>,
+    /// `(source, destination)` pairs within this cache pool. Destinations
+    /// are newly allocated units; sources may be inherited read-only units.
+    pub copies: Vec<(UnitId, UnitId)>,
 }
 
 /// One page copied between a rank's cache units and a slot of its host
@@ -234,6 +238,16 @@ impl CacheUnitAllocation {
         ensure_valid!(
             !self.unit_ids.is_empty() && distinct_units(&self.unit_ids),
             "cache-unit allocation is empty, repeats a unit, or carries unit zero"
+        );
+        let mut destinations = HashSet::new();
+        ensure_valid!(
+            self.copies.iter().all(|(source, destination)| {
+                source.0 > 0
+                    && !self.unit_ids.contains(source)
+                    && self.unit_ids.contains(destination)
+                    && destinations.insert(*destination)
+            }),
+            "cache-unit copies require distinct new destinations and immutable sources"
         );
         Ok(())
     }

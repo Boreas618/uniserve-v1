@@ -762,6 +762,13 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         streaming.wait_for(EARLY_TOKENS)
         # A dry run plans the change on every GPU's ledger and changes
         # nothing: the successor fits beside the serving world.
+        _wait_until(
+            lambda: _prefix_counter(base_url, "queries") > 0,
+            30,
+            "the original request's cache query was not reported",
+        )
+        queries_before = _prefix_counter(base_url, "queries")
+        hits_before = _prefix_hits(base_url)
         storage = _planned_storage(base_url, CHANGE)
         assert storage["feasible"] is True, storage
         assert storage["gpus"] and storage["hosts"], storage
@@ -811,6 +818,16 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         # The operator commits while the count streams on the successor,
         # which writes new pages only to its own segments until then.
         streaming.wait_for(streaming.marked + 64)
+        _wait_until(
+            lambda: _prefix_counter(base_url, "queries") > queries_before,
+            30,
+            "the resumed request's cache query was not reported",
+        )
+        # All computed tokens, including the final partial page, are
+        # reusable. Admission leaves only the last emitted token to run.
+        reused = _prefix_hits(base_url) - hits_before
+        queried = _prefix_counter(base_url, "queries") - queries_before
+        assert reused == queried > 0, (reused, queried)
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
         assert committed.json()["result"]["world"] == world

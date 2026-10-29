@@ -1088,6 +1088,54 @@ impl CachePlanes {
         Ok(self.values[field].address() + self.cell(column, unit) * self.plan.plane_bytes)
     }
 
+    /// Copy immutable units, including initialization flags and FP8 scales,
+    /// into fresh writable units on the caller's computation stream.
+    pub(crate) fn copy_units(
+        &self,
+        copies: &[(ipc::UnitId, ipc::UnitId)],
+        issue: impl Issue,
+    ) -> Result<()> {
+        // These sources are retained device views. Read them on the
+        // computation stream; DuringCall is for ephemeral host payloads
+        // that the job recorder owns before it submits the work.
+        let mut batch = CopyBatch::new(SourceOrder::Stream);
+        let inherited = self.inherited();
+        for &(from, to) in copies {
+            self.require_unit(from.0)?;
+            self.require_unit(to.0)?;
+            if from.0 == 0 || to.0 == 0 || from == to || inherited.contains(&to.0) {
+                return Err(Error::Invalid(
+                    "cache unit copies require a writable new destination".into(),
+                ));
+            }
+            for column in 0..self.plan.columns {
+                for field in 0..2 {
+                    batch.push(
+                        self.plane_address(field, column, to.0)?,
+                        self.plane_address(field, column, from.0)?,
+                        self.plan.plane_bytes as usize,
+                    );
+                    batch.push(
+                        self.initialized[field].address() + self.cell(column, to.0),
+                        self.initialized[field].address() + self.cell(column, from.0),
+                        1,
+                    );
+                    if let Some(scales) = &self.scales {
+                        batch.push(
+                            scales[field].address() + self.cell(column, to.0) * 4,
+                            scales[field].address() + self.cell(column, from.0) * 4,
+                            4,
+                        );
+                    }
+                }
+            }
+        }
+        // SAFETY: every range was bounded above. The scheduler leases the
+        // immutable sources and exclusive destinations through completion;
+        // the forward reading and appending follows on this same stream.
+        unsafe { issue.copy(&batch) }
+    }
+
     /// The address of one unit's FP8 scale of `field` in `column`.
     pub(crate) fn scale_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         Ok(self.scale(field, column, unit)?.address())

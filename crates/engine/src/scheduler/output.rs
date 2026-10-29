@@ -1628,6 +1628,15 @@ impl Scheduler {
     /// Publishes `terminal` and releases every resource owned by one token
     /// request; see `finish_with`.
     fn retire_token_request(&mut self, id: RequestId, terminal: TokenTerminal) {
+        if matches!(terminal, TokenTerminal::Migratable(..))
+            && self.config.canvas.is_none()
+            && self
+                .running
+                .get(&id)
+                .is_some_and(|state| state.worker_registered && state.caches_generated_text())
+        {
+            self.advance_request_cache(id, true);
+        }
         let reason = match &terminal {
             TokenTerminal::Finished { reason, .. } => Some(reason.clone()),
             TokenTerminal::Migratable(..) => None,
@@ -1796,7 +1805,9 @@ impl Scheduler {
     /// later calls read no history before the accepted extent minus the
     /// window. A request without its prefill worker or prefix cache breaks a
     /// scheduler invariant.
-    pub(super) fn advance_request_cache(&mut self, id: RequestId) {
+    /// `immutable` also publishes the last partial page, and requires all
+    /// writes of this request to have drained permanently.
+    pub(super) fn advance_request_cache(&mut self, id: RequestId, immutable: bool) {
         // A canvas deployment's requests write blocks, not their generated
         // tokens in order.
         let tokens_in_order = self.config.canvas.is_none();
@@ -1890,6 +1901,7 @@ impl Scheduler {
 
         let mut reserved = Vec::new();
         let advanced = state.prefix_cache_mut().is_some_and(|allocation| {
+            allocation.complete_copies();
             let published_now = prefix_cache.coordinator.publish_computed(
                 &prefix_cache.block_pool,
                 allocation,
@@ -1902,6 +1914,17 @@ impl Scheduler {
                 &source,
                 scope.resume,
             );
+            if immutable {
+                prefix_cache.coordinator.publish_tails(
+                    &prefix_cache.block_pool,
+                    allocation,
+                    tokens,
+                    computed,
+                    scope,
+                    cache_write,
+                    &source,
+                );
+            }
             if published_now
                 && cache_write
                 && let Some((kv_offload, worker)) = kv_offload.as_ref()

@@ -1477,12 +1477,48 @@ pub(crate) struct CacheAllocation {
     /// the serial of its first unit, so a dispatch can name the units
     /// allocated after a watermark.
     allocated_units: u64,
+    /// Immutable source pages retained until the first forward over their
+    /// private copies completes. The destination belongs to `tables`.
+    copies: Vec<(usize, usize, PageRef)>,
 }
 
 impl CacheAllocation {
     /// Returns the serial of the next freshly allocated unit.
     pub(crate) fn allocated_units(&self) -> u64 {
         self.allocated_units
+    }
+
+    /// Release immutable sources after the first forward's device work,
+    /// including its initial unit copies, has completed.
+    pub(crate) fn complete_copies(&mut self) {
+        self.copies.clear();
+    }
+
+    /// Copies accompanying the fresh units declared since `serial`.
+    pub(crate) fn copies(&self, group: usize, serial: u64) -> Vec<(UnitId, UnitId)> {
+        self.copies
+            .iter()
+            .filter(|(owner, _, _)| *owner == group)
+            .filter_map(|(_, page, source)| {
+                let table = &self.tables[group];
+                // A deeper host hit can move a sliding window past the
+                // local tail before its first forward is submitted.
+                let offset = page.checked_sub(table.start_page)?;
+                let entry = table.pages.get(offset)?;
+                let target = entry
+                    .page
+                    .as_ref()
+                    .filter(|_| entry.serial.is_some_and(|value| value >= serial))?;
+                Some((source, target))
+            })
+            .flat_map(|(source, target)| {
+                source
+                    .units()
+                    .iter()
+                    .copied()
+                    .zip(target.units().iter().copied())
+            })
+            .collect()
     }
 
     /// Forces every table to be declared again at the next dispatch.
@@ -1502,8 +1538,8 @@ pub(crate) struct PrefixLookup {
     /// completes, and extends them over the tokens the request generates.
     /// Empty when prefix caching does not apply to the request.
     pub(crate) page_hashes: Vec<Vec<u64>>,
-    /// Leading prompt tokens acquired from the prefix cache; a multiple of
-    /// the largest block size.
+    /// Leading prompt tokens acquired from the prefix cache. A final
+    /// partial page is copied before the resumed computation appends to it.
     pub(crate) cached_tokens: usize,
     /// Leading prompt tokens whose draft cache was acquired from the prefix
     /// cache with them; at most `cached_tokens`, zero without a draft
@@ -1514,8 +1550,8 @@ pub(crate) struct PrefixLookup {
 /// Read-only prefix-cache probe result across every cache group.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PrefixHit {
-    /// Leading prompt tokens every group can reuse; a multiple of the
-    /// largest block size.
+    /// Leading prompt tokens every required group can reuse, including a
+    /// stored partial tail when the group's computation permits it.
     pub(crate) cached_tokens: usize,
     /// Units of the pages a hit would acquire that the free queue holds:
     /// unreferenced and allocatable, which an inherited unit never is.
@@ -1535,6 +1571,17 @@ struct PrefixSelection {
     /// page is currently unreferenced. The draft cache's are its leading
     /// pages the prefix holds, which may be fewer than the prefix's.
     pages: Vec<(usize, Vec<(UnitId, bool)>)>,
+    /// A final immutable partial page per group. Admission copies it into
+    /// fresh writable units; it never appends into the cached source.
+    tails: Vec<Option<TailPage>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TailPage {
+    head: UnitId,
+    cached: bool,
+    hash: u64,
+    tokens: usize,
 }
 
 /// The namespace a request's prefix pages are hashed in: its isolation key
@@ -1644,6 +1691,7 @@ impl PrefixCacheCoordinator {
                 .map(|(group, shape)| BlockTable::new(group, *shape))
                 .collect(),
             allocated_units: 0,
+            copies: Vec::new(),
         }
     }
 
@@ -1692,11 +1740,10 @@ impl PrefixCacheCoordinator {
     /// Returns the units a request that will reuse a `prefix_tokens`-long
     /// cached prefix allocates to hold `total_tokens` tokens.
     ///
-    /// The prefix is a multiple of every block size, and acquisition takes its
-    /// pages (a full group's whole prefix, a sliding group's window, a state
-    /// group's checkpoint) from the cache, so each group allocates only the
-    /// pages after it: a state group the checkpoint at the last boundary
-    /// the first call reaches.
+    /// Complete prefix pages are shared. A partial tail needs a fresh copy,
+    /// so the first allocated page starts at the floor of the prefix's page
+    /// index. A state group allocates the checkpoint at the last boundary
+    /// reached by the first call.
     pub(crate) fn units_after_prefix(&self, prefix_tokens: usize, total_tokens: usize) -> usize {
         self.groups
             .iter()
@@ -2067,10 +2114,9 @@ impl PrefixCacheCoordinator {
     /// Finds the longest prompt prefix every group can reuse from the
     /// device cache.
     ///
-    /// The prefix length is a multiple of the largest block size and leaves
-    /// at least one prompt token to compute, so prefill still produces the
-    /// first sampled token's logits. It is the deepest such boundary every
-    /// group's manager accepts with the pages the pool holds
+    /// The prefix leaves at least one prompt token to compute, so prefill
+    /// still produces the first sampled token's logits. Complete pages first
+    /// select the deepest boundary every group's manager accepts with the pages the pool holds
     /// ([`manager::deepest_boundary`]): a full-attention group needs every
     /// page before it, a sliding-window group only the pages intersecting
     /// its window before it.
@@ -2080,9 +2126,10 @@ impl PrefixCacheCoordinator {
         prompt: &[u32],
         hashes: &[Vec<u64>],
         source: &WorkerEndpoint,
-        resume: Option<proto::request::CacheResume>,
+        scope: PrefixScope,
         public: bool,
     ) -> PrefixSelection {
+        let resume = scope.resume;
         let step = self.max_block_size();
         let limit = prompt.len().saturating_sub(1) / step * step;
 
@@ -2093,7 +2140,8 @@ impl PrefixCacheCoordinator {
             .iter()
             .enumerate()
             .map(|(group, shape)| {
-                let pages = (limit / shape.block_size).min(hashes[group].len());
+                let pages =
+                    (prompt.len().saturating_sub(1) / shape.block_size).min(hashes[group].len());
                 (0..pages)
                     .map(|page| {
                         let start = page * shape.block_size;
@@ -2145,16 +2193,97 @@ impl PrefixCacheCoordinator {
                 Some((start, selected))
             })
             .collect::<Option<Vec<_>>>();
-        let private = pages.map_or_else(PrefixSelection::default, |pages| PrefixSelection {
+        let mut private = pages.map_or_else(PrefixSelection::default, |pages| PrefixSelection {
             tokens,
             resume,
             pages,
+            tails: vec![None; self.groups.len()],
         });
+        // Complete pages remain shared. Beyond their common boundary, all
+        // required groups must supply the same token extent; recurrent state
+        // still ends only at an actual checkpoint boundary.
+        let root = scope.state_seed.unwrap_or(self.hash_seed);
+        let seed = scope
+            .isolation_key
+            .map_or(root, |key| root ^ key.rotate_left(17));
+        let upper = prompt.len().saturating_sub(1).min(tokens + step - 1);
+        for end in (tokens + 1..=upper).rev() {
+            let mut tails = vec![None; self.groups.len()];
+            let valid = required.iter().enumerate().all(|(index, &group)| {
+                let shape = self.groups[group];
+                let full = end / shape.block_size;
+                let rest = end % shape.block_size;
+                if shape.state && rest != 0 {
+                    return false;
+                }
+                let start = shape.first_needed_page(end).min(full);
+                let misses = &misses[index];
+                if full >= misses.len() || misses[full] != misses[start] {
+                    return false;
+                }
+                if rest == 0 {
+                    return true;
+                }
+                let parent = full.checked_sub(1).map_or(seed, |page| hashes[group][page]);
+                let span = &prompt[full * shape.block_size..end];
+                let hash = block_hash(parent, group as u32, TEXT_MODALITY_TAG, span);
+                let Some((head, cached)) = pool.lookup(hash, group as u32, span, source, resume)
+                else {
+                    return false;
+                };
+                tails[group] = Some(TailPage {
+                    head,
+                    cached,
+                    hash,
+                    tokens: rest,
+                });
+                true
+            });
+            if !valid {
+                continue;
+            }
+            private.pages = self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(group, shape)| {
+                    let full = end / shape.block_size;
+                    if shape.draft {
+                        return (
+                            0,
+                            hits[group]
+                                .iter()
+                                .take(full)
+                                .map_while(|hit| *hit)
+                                .collect(),
+                        );
+                    }
+                    let start = shape.first_needed_page(end).min(full);
+                    (
+                        start,
+                        hits[group][start..full].iter().flatten().copied().collect(),
+                    )
+                })
+                .collect();
+            private.tokens = end;
+            private.tails = tails;
+            break;
+        }
         // A continuation keeps its origin through mapped worlds as well.
         // Public pages remain eligible under the ordinary read policy;
         // acquisition uses whichever complete prefix is longer.
         if resume.is_some() && public {
-            let shared = self.select_prefix(pool, prompt, hashes, source, None, false);
+            let shared = self.select_prefix(
+                pool,
+                prompt,
+                hashes,
+                source,
+                PrefixScope {
+                    resume: None,
+                    ..scope
+                },
+                false,
+            );
             if shared.tokens > private.tokens {
                 return shared;
             }
@@ -2191,7 +2320,7 @@ impl PrefixCacheCoordinator {
             prompt,
             &hashes,
             source,
-            scope.resume,
+            scope,
             self.prefix_enabled && cache_read && !has_images,
         );
         let cached_free_units = selection
@@ -2201,7 +2330,14 @@ impl PrefixCacheCoordinator {
             .map(|((_, pages), shape)| {
                 pages.iter().filter(|(_, cached)| *cached).count() * shape.units_per_page
             })
-            .sum();
+            .sum::<usize>()
+            + selection
+                .tails
+                .iter()
+                .zip(&self.groups)
+                .filter(|(tail, _)| tail.is_some_and(|tail| tail.cached))
+                .map(|(_, shape)| shape.units_per_page)
+                .sum::<usize>();
         PrefixHit {
             cached_tokens: selection.tokens,
             cached_free_units,
@@ -2261,7 +2397,7 @@ impl PrefixCacheCoordinator {
             prompt,
             &result.page_hashes,
             source,
-            scope.resume,
+            scope,
             self.prefix_enabled && cache_read && !has_images,
         );
         let acquire = |group: usize, start: usize, pages: &[(UnitId, bool)]| {
@@ -2305,9 +2441,39 @@ impl PrefixCacheCoordinator {
             return Some(result);
         };
 
+        let tails = selection
+            .tails
+            .iter()
+            .enumerate()
+            .map(|(group, tail)| {
+                let Some(tail) = tail else {
+                    return Some(None);
+                };
+                let shape = self.groups[group];
+                let first = selection.tokens / shape.block_size * shape.block_size;
+                let source_page = pool.acquire(
+                    tail.head,
+                    tail.hash,
+                    group as u32,
+                    &prompt[first..first + tail.tokens],
+                    source,
+                    selection.resume,
+                )?;
+                let target = pool.allocate(1, shape.units_per_page)?.pop()?;
+                Some(Some((source_page, target)))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(tails) = tails else {
+            return Some(result);
+        };
+
         let source = Arc::new(source.clone());
-        for (group, (table, (start, references))) in
-            allocation.tables.iter_mut().zip(acquired).enumerate()
+        for (group, ((table, (start, references)), tail)) in allocation
+            .tables
+            .iter_mut()
+            .zip(acquired)
+            .zip(tails)
+            .enumerate()
         {
             if let Some(resume) = scope.resume {
                 for (offset, reference) in references.iter().enumerate() {
@@ -2333,9 +2499,71 @@ impl PrefixCacheCoordinator {
                     page: Some(page),
                     serial: None,
                 }));
+            if let Some((source, target)) = tail {
+                let page = table.end_page();
+                let serial = allocation.allocated_units;
+                allocation.allocated_units += target.units().len() as u64;
+                table.pages.push_back(TablePage {
+                    page: Some(target),
+                    serial: Some(serial),
+                });
+                allocation.copies.push((group, page, source));
+            }
         }
         result.cached_tokens = selection.tokens;
         Some(result)
+    }
+
+    /// Publish immutable partial pages after the request's writes have
+    /// drained. Ordinary preemption and world promotion use the same
+    /// continuation lookup; consumers copy these pages before appending.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one drained request's cache publication"
+    )]
+    pub(crate) fn publish_tails(
+        &self,
+        pool: &BlockPool,
+        allocation: &CacheAllocation,
+        tokens: CachedTokens<'_>,
+        computed: usize,
+        scope: PrefixScope,
+        public: bool,
+        source: &Arc<WorkerEndpoint>,
+    ) {
+        if (!public && scope.resume.is_none()) || !self.matches(allocation) {
+            return;
+        }
+        let computed = computed.min(tokens.len());
+        let mut hashes = vec![Vec::new(); self.groups.len()];
+        self.extend_hashes(&mut hashes, tokens, scope);
+        let root = scope.state_seed.unwrap_or(self.hash_seed);
+        let seed = scope
+            .isolation_key
+            .map_or(root, |key| root ^ key.rotate_left(17));
+        for (group, table) in allocation.tables.iter().enumerate() {
+            let shape = table.shape;
+            // Request-slot checkpoints and speculative draft state have
+            // their own completed-boundary rules, unchanged here.
+            if shape.state || shape.draft || computed.is_multiple_of(shape.block_size) {
+                continue;
+            }
+            let page = computed / shape.block_size;
+            let Some(reference) = table.page(page) else {
+                continue;
+            };
+            let parent = page
+                .checked_sub(1)
+                .map_or(seed, |index| hashes[group][index]);
+            let span = tokens.span(page * shape.block_size..computed);
+            let hash = block_hash(parent, group as u32, TEXT_MODALITY_TAG, &span);
+            if public && self.prefix_enabled {
+                pool.publish(reference, group as u32, hash, &span, source, None);
+            }
+            if let Some(resume) = scope.resume {
+                pool.publish(reference, group as u32, hash, &span, source, Some(resume));
+            }
+        }
     }
 
     /// Publishes the complete computed pages of every group into the prefix
@@ -2765,6 +2993,109 @@ mod tests {
             kv_head_offset: 0,
             head_dim: 1,
         })
+    }
+
+    #[test]
+    fn a_preempted_partial_page_resumes_in_writable_units() {
+        for (shape, inherited) in [
+            (full(64, 1), false),
+            (full(64, 1), true),
+            (sliding(64, 1, 128), false),
+            (sliding(64, 1, 128), true),
+        ] {
+            let pool = BlockPool::new(128, 0);
+            let coordinator = PrefixCacheCoordinator::new(vec![shape]);
+            let source = endpoint();
+            let tokens: Vec<u32> = (0..145).collect();
+            let scope = PrefixScope {
+                resume: Some(proto::request::CacheResume {
+                    world: 1,
+                    request_id: 9,
+                }),
+                ..Default::default()
+            };
+            let allocation = publish(&coordinator, &pool, &tokens, &source);
+            let hashes = coordinator.prefix_hashes(&tokens, scope);
+            assert!(coordinator.publish_computed(
+                &pool,
+                &allocation,
+                CachedTokens::prompt(&tokens),
+                &hashes,
+                tokens.len(),
+                0,
+                &mut Vec::new(),
+                false,
+                &source,
+                scope.resume,
+            ));
+            coordinator.publish_tails(
+                &pool,
+                &allocation,
+                CachedTokens::prompt(&tokens),
+                tokens.len(),
+                scope,
+                false,
+                &source,
+            );
+            let original = allocation.tables[0].unit_ids();
+            drop(allocation);
+            let (pool, offset) = if inherited {
+                let successor = BlockPool::new(256, 0);
+                successor.inherit(128..256);
+                successor.import(&pool.export(), 128, &source);
+                (successor, 128)
+            } else {
+                (pool, 0)
+            };
+            let mut prompt = tokens;
+            prompt.push(145);
+            let free = pool.free_units();
+            let mut resumed = coordinator.empty();
+            let hit = coordinator
+                .acquire_prefix(&pool, &mut resumed, &prompt, false, false, scope, &source)
+                .unwrap();
+            assert_eq!(hit.cached_tokens, 145);
+            let units = resumed.tables[0].unit_ids();
+            assert_eq!(
+                units[..2],
+                original[..2]
+                    .iter()
+                    .map(|unit| UnitId(unit.0 + offset))
+                    .collect::<Vec<_>>()
+            );
+            assert_ne!(units[2], UnitId(original[2].0 + offset));
+            if inherited {
+                assert!(units[2].0 < 128);
+                assert_eq!(pool.free_units(), free - 1);
+            }
+            // The numerical consumer receives the immutable source and its
+            // private destination together with the newly assigned units.
+            assert_eq!(
+                resumed.copies(0, 0),
+                vec![(UnitId(original[2].0 + offset), units[2])]
+            );
+            let foreign = PrefixScope {
+                resume: Some(proto::request::CacheResume {
+                    world: 1,
+                    request_id: 10,
+                }),
+                ..scope
+            };
+            assert_eq!(
+                coordinator
+                    .probe_prefix(&pool, &prompt, false, false, foreign, &source)
+                    .cached_tokens,
+                0
+            );
+            if shape.window.is_some() {
+                // Host admission can advance beyond the local partial
+                // page. No copy may name a destination it released.
+                assert!(coordinator.release_window(&mut resumed, 512, None));
+                assert!(resumed.copies(0, 0).is_empty());
+            }
+            resumed.complete_copies();
+            assert!(resumed.copies(0, 0).is_empty());
+        }
     }
 
     /// Prefills `prompt` into fresh tables and publishes every complete page.

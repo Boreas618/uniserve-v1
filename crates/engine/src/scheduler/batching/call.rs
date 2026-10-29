@@ -259,7 +259,14 @@ impl Scheduler {
             } else {
                 (fresh_count > 0).then(|| declared.saturating_sub(fresh_count))
             };
-            for table in &mut allocation.tables {
+            let copies: Vec<_> = (0..allocation.tables.len())
+                .map(|group| {
+                    fresh_since
+                        .map(|serial| allocation.copies(group, serial))
+                        .unwrap_or_default()
+                })
+                .collect();
+            for (table, copies) in allocation.tables.iter_mut().zip(copies) {
                 let fresh = fresh_since
                     .map(|serial| table.fresh_units(serial))
                     .unwrap_or_default();
@@ -279,6 +286,7 @@ impl Scheduler {
                         request_pool_idx,
                         group_id: table.group_id() as u32,
                         unit_ids: fresh,
+                        copies,
                     });
                 }
             }
@@ -449,6 +457,7 @@ impl Scheduler {
                                 request_pool_idx: prefix.request_pool_idx(),
                                 group_id,
                                 unit_ids: units,
+                                copies: Vec::new(),
                             });
                         }
                     }
