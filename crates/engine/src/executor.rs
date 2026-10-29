@@ -1571,6 +1571,18 @@ pub trait Executor: Send {
         let _ = payload;
         anyhow::bail!("this executor runs no worker hook ({name})")
     }
+    /// Maps the host KV cache's page pools on every worker's ranks, each
+    /// holding `tokens` tokens of every cache group (`uniserve.host_cache`),
+    /// while none runs a batch, and returns each worker group's identity
+    /// with its ranks' pools (JSON, `null` for a rank that copies no pages),
+    /// in rank order. Ranks that later replace lost ones map the same pools
+    /// before they serve. The default refuses: the executor has no workers.
+    fn map_host_cache(
+        &mut self,
+        tokens: u64,
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+        anyhow::bail!("this executor maps no host KV cache ({tokens} tokens)")
+    }
     /// Runs the worker hook `name` with `payload` on every worker while
     /// none runs a batch, and returns each worker's result. The default
     /// refuses: the executor has no workers to run hooks on.

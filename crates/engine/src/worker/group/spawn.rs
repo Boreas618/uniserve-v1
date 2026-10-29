@@ -609,6 +609,7 @@ impl WorkerGroup {
             failure_wake,
             awaiting: None,
             standby: None,
+            host_cache: None,
         })
     }
 }

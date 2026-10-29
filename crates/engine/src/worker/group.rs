@@ -115,6 +115,19 @@ pub struct WorkerGroup {
     /// The rank group standing by to replace this one when it fails
     /// (`worker_config.standby`), while it starts or parks.
     standby: Option<standby::Standby>,
+    /// The host KV cache the group's ranks mapped (`map_host_cache`), which
+    /// ranks that replace lost ones map in turn; `None` until the engine
+    /// sized it, and for a world without one.
+    host_cache: Option<HostCacheMapping>,
+}
+
+/// The host KV cache a group's ranks mapped (`WorkerGroup::map_host_cache`).
+struct HostCacheMapping {
+    /// The `uniserve.host_cache` payload, which states the tokens every
+    /// rank of the world holds.
+    payload: String,
+    /// Each rank's page pools as it reported them, in rank order.
+    pools: Vec<String>,
 }
 
 /// A call's identity across request epochs: engine identifier, request
@@ -412,7 +425,7 @@ impl WorkerGroup {
         };
         let installed = replacement
             .map_err(|message| anyhow::anyhow!("the failure domain's relaunch failed: {message}"))
-            .and_then(|workers| {
+            .and_then(|mut workers| {
                 anyhow::ensure!(
                     workers.len() == expected.len(),
                     "replacement rank count changed"
@@ -420,6 +433,7 @@ impl WorkerGroup {
                 for (rank, (before, after)) in expected.iter().zip(&workers).enumerate() {
                     validate_replacement_info(before, after.info(), rank)?;
                 }
+                self.map_replacement_host_cache(&mut workers)?;
                 Ok(workers)
             });
         self.awaiting = None;
@@ -457,6 +471,44 @@ impl WorkerGroup {
                 .into())
             }
         }
+    }
+
+    /// Maps the host KV cache's page pools on the group's serving ranks,
+    /// each holding `tokens` tokens of every cache group
+    /// (`uniserve.host_cache`), and returns each rank's pools (JSON, `null`
+    /// for a rank that copies no pages), in rank order. The group keeps the
+    /// mapping, which ranks that replace lost ones repeat.
+    pub(crate) fn map_host_cache(&mut self, tokens: u64) -> anyhow::Result<Vec<String>> {
+        let payload = serde_json::json!({ "tokens": tokens }).to_string();
+        let pools = self.hook("uniserve.host_cache", &payload)?;
+        self.host_cache = Some(HostCacheMapping {
+            payload,
+            pools: pools.clone(),
+        });
+        Ok(pools)
+    }
+
+    /// Maps the host KV cache on `workers`, which replace the group's lost
+    /// ranks, as the lost ranks mapped it, before they serve. The pools are
+    /// the deployment's, so each replacement maps the pool its predecessor
+    /// did: the engine's loads and offloads address those pools, whose
+    /// pages outlive the lost ranks.
+    fn map_replacement_host_cache(&self, workers: &mut [WorkerProcess]) -> anyhow::Result<()> {
+        let Some(mapping) = &self.host_cache else {
+            return Ok(());
+        };
+        let pools = crate::worker::process::hook_all(
+            workers,
+            "uniserve.host_cache",
+            &mapping.payload,
+            self.process_args.watchdog_timeout,
+        )?;
+        anyhow::ensure!(
+            pools == mapping.pools,
+            "the replacement ranks mapped host KV cache pools {pools:?}, not the lost ranks' {:?}",
+            mapping.pools
+        );
+        Ok(())
     }
 
     /// Installs a capability-compatible replacement rank group and resets rank-local state.
