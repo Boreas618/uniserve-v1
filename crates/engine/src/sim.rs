@@ -516,7 +516,11 @@ impl Executor for SimExecutor {
             "uniserve.profile_release" => serde_json::json!({ "rank": 0, "released": false }),
             "uniserve.fence_switch" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;
-                serde_json::json!({ "probes": false, "enabled": payload["enabled"] })
+                serde_json::json!({
+                    "probes": false,
+                    "enabled": payload["enabled"],
+                    "off": payload["off"],
+                })
             }
             "load_lora_adapter" | "unload_lora_adapter" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;

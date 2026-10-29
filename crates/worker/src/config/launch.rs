@@ -184,6 +184,9 @@ pub struct FenceOptions {
     /// Name patterns of the components whose module instances carry probes;
     /// no probe when empty.
     pub components: Vec<String>,
+    /// Name patterns of the probed components whose probes are off while
+    /// the switch is on.
+    pub off: Vec<String>,
 }
 
 impl WorkerLaunch {
@@ -277,6 +280,7 @@ pub fn resolve(
         fences: FenceOptions {
             enabled: descriptor.fence_probes,
             components: descriptor.fence_components.clone(),
+            off: descriptor.fence_probes_off.clone(),
         },
         graph_pc_sampling: descriptor.graph_pc_sampling,
         received: descriptor.received_weights.clone(),

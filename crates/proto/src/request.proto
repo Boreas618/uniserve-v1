@@ -1173,6 +1173,10 @@ message Profiling {
   // session's PC samples of graph kernels are attributed; sessions of PM
   // sampling, range metrics and whole-graph timelines are then refused.
   bool graph_pc_sampling = 3;
+  // The probed components whose probes are off while the switch is on, as
+  // name patterns (`*` matches any run): a component's probes cost more
+  // than the always-on budget. Switched in place, as `fence_probes` is.
+  repeated string fence_probes_off = 4;
 }
 
 // What an engine that succeeds another maps of it.

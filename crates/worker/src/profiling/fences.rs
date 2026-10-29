@@ -318,8 +318,9 @@ static FENCES: OnceLock<Arc<Fences>> = OnceLock::new();
 
 impl Fences {
     /// Install the probes of `instances` on `devices`, every switch word on
-    /// as `enabled` says, as the process's fences. Every probe the library
-    /// launches from here on reaches them.
+    /// as `enabled` says but those of the components `off` names, as the
+    /// process's fences. Every probe the library launches from here on
+    /// reaches them.
     ///
     /// # Errors
     ///
@@ -329,6 +330,7 @@ impl Fences {
         devices: &[DeviceId],
         instances: Vec<Instance>,
         enabled: bool,
+        off: &[String],
     ) -> Result<Arc<Self>> {
         let mut components: Vec<String> = Vec::new();
         let mut instance_components = Vec::with_capacity(instances.len());
@@ -364,7 +366,7 @@ impl Fences {
             histograms: Mutex::new(BTreeMap::new()),
             tap: Mutex::new(None),
         });
-        fences.switch(enabled)?;
+        fences.switch(enabled, off)?;
         FENCES
             .set(Arc::clone(&fences))
             .map_err(|_| Error::State("the process installed fence probes already"))?;
@@ -381,25 +383,28 @@ impl Fences {
         &self.instances
     }
 
-    /// The probed components, by component index from 1.
-    /// Turn every probe on or off: the master word and every component's
-    /// word, written on each device's control stream. Probes already
-    /// queued read whichever value reaches them.
-    pub(crate) fn switch(&self, enabled: bool) -> Result<()> {
+    /// Turn the probes on or off: the master word as `enabled` says, and
+    /// every component's word with it but those of the components matching
+    /// a pattern of `off` (`*` matches any run), which stay off. Written on
+    /// each device's control stream; probes already queued read whichever
+    /// value reaches them. Returns the probed components switched off.
+    pub(crate) fn switch(&self, enabled: bool, off: &[String]) -> Result<Vec<String>> {
+        let (words, switched_off) = switch_words(&self.components, enabled, off);
         for device in &self.devices {
-            let words = 1 + self.components.len();
-            // SAFETY: the switch holds `words` words, and lives as long as
-            // the fences, past the fill.
-            unsafe {
-                cuda::memset_d32(
-                    device.switches.address(),
-                    u32::from(enabled),
-                    words,
-                    &device.control,
-                )?;
+            for (index, &word) in words.iter().enumerate() {
+                // SAFETY: the switch holds `1 + components` words, and lives
+                // as long as the fences, past the fill.
+                unsafe {
+                    cuda::memset_d32(
+                        device.switches.address() + 4 * index as u64,
+                        word,
+                        1,
+                        &device.control,
+                    )?;
+                }
             }
         }
-        Ok(())
+        Ok(switched_off)
     }
 
     /// The step cell of the stream of handle `stream`: the one it was bound
@@ -928,9 +933,49 @@ fn fence_probe(stream: i64, device: i64, probe: i64) -> tvm_ffi::Result<()> {
 
 tvm_ffi::tvm_ffi_dll_export_typed_func!(fence_probe, fence_probe);
 
+/// The switch words of `components` (by component index from 1): the
+/// master word, on as `enabled` says, then each component's, on with it
+/// unless the component matches a pattern of `off`; and the components
+/// matched.
+fn switch_words(components: &[String], enabled: bool, off: &[String]) -> (Vec<u32>, Vec<String>) {
+    let mut words = vec![u32::from(enabled)];
+    let mut switched_off = Vec::new();
+    for component in components {
+        let excluded = off.iter().any(|pattern| matches(pattern, component));
+        if excluded {
+            switched_off.push(component.clone());
+        }
+        words.push(u32::from(enabled && !excluded));
+    }
+    (words, switched_off)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The master word follows the switch; a component's word follows it
+    /// unless a pattern of the off list names the component, whose probes
+    /// stay off while the others record.
+    #[test]
+    fn a_component_named_off_stays_off_while_the_others_record() {
+        let components = [
+            "models.qwen3.transformer.Attention".to_owned(),
+            "models.qwen3.transformer.Transformer".to_owned(),
+        ];
+        assert_eq!(
+            switch_words(&components, true, &["*Attention".to_owned()]),
+            (vec![1, 0, 1], vec![components[0].clone()])
+        );
+        assert_eq!(
+            switch_words(&components, true, &[]),
+            (vec![1, 1, 1], Vec::new())
+        );
+        assert_eq!(
+            switch_words(&components, false, &["*Attention".to_owned()]),
+            (vec![0, 0, 0], vec![components[0].clone()])
+        );
+    }
 
     #[test]
     fn a_pattern_star_matches_any_run() {
@@ -986,7 +1031,7 @@ mod device_tests {
                 component: "models.m.Attention".into(),
             },
         ];
-        let fences = Fences::install(&[device], instances, true)?;
+        let fences = Fences::install(&[device], instances, true, &[])?;
         let tapped: Arc<Mutex<Vec<FenceRecord>>> = Arc::default();
         fences.tap(Tap {
             components: vec!["*.Attention".into()],
@@ -1061,7 +1106,7 @@ mod device_tests {
         assert!(tapped.windows(2).all(|pair| pair[0].time <= pair[1].time));
 
         // Switched off, a probe returns at once; a marker too.
-        fences.switch(false)?;
+        fences.switch(false, &[])?;
         stream.synchronize()?;
         fences.mark(&stream, 8, "decode", true)?;
         // SAFETY: as above.

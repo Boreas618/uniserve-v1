@@ -227,6 +227,10 @@ pub struct LaunchDescriptor {
     /// patterns; none when empty.
     #[serde(default)]
     pub fence_components: Vec<String>,
+    /// The probed components whose probes are off while the switch is on,
+    /// as name patterns.
+    #[serde(default)]
+    pub fence_probes_off: Vec<String>,
     /// Whether the worker enables PC sampling before it captures its CUDA
     /// graphs and keeps it enabled for its life.
     #[serde(default)]

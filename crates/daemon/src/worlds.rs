@@ -386,6 +386,7 @@ fn switches_probes_only(served: &wire::EngineSpec, target: &wire::EngineSpec) ->
     let mut switched = comparable(served);
     if let (Some(served), Some(target)) = (switched.profiling.as_mut(), target.profiling.as_ref()) {
         served.fence_probes = target.fence_probes;
+        served.fence_probes_off.clone_from(&target.fence_probes_off);
     }
     switched == comparable(target)
 }
@@ -1540,16 +1541,25 @@ impl Replica {
                 .profiling
                 .as_ref()
                 .is_some_and(|profiling| profiling.fence_probes);
+            let off = target_spec
+                .profiling
+                .as_ref()
+                .map(|profiling| profiling.fence_probes_off.clone())
+                .unwrap_or_default();
             running
                 .hook(
                     "uniserve.fence_switch",
-                    &serde_json::json!({ "enabled": enabled }).to_string(),
+                    &serde_json::json!({ "enabled": enabled, "off": off }).to_string(),
                 )
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!("the workers did not switch the probes: {error}")
                 })?;
-            info!(enabled, "the workers switched the fence probes in place");
+            info!(
+                enabled,
+                ?off,
+                "the workers switched the fence probes in place"
+            );
             let mut spec = served;
             spec.profiling = target_spec.profiling;
             *locked(&self.served) = Some(spec);
@@ -2731,6 +2741,7 @@ mod tests {
         let served = spec(wire::Profiling {
             fence_probes: true,
             fence_components: vec!["*.Transformer".to_owned()],
+            fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
         });
         let switched = spec(wire::Profiling {
@@ -2738,6 +2749,12 @@ mod tests {
             ..served.profiling.clone().unwrap()
         });
         assert!(switches_probes_only(&served, &switched));
+        // A component's probes switch off in place too.
+        let thinned = spec(wire::Profiling {
+            fence_probes_off: vec!["*.Attention".to_owned()],
+            ..served.profiling.clone().unwrap()
+        });
+        assert!(switches_probes_only(&served, &thinned));
         for world in [
             wire::Profiling {
                 graph_pc_sampling: true,
