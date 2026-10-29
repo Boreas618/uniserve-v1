@@ -192,6 +192,10 @@ pub struct ServeConfig {
     /// This node's host name; its daemon runs the ranks placed on this
     /// host, and a deployment rank entry without a host names it.
     pub host_identity: String,
+    /// Host running the engine and ranks whose configuration omits a host.
+    /// Unset uses this node's identity. The engine can move to another
+    /// joined node through a world change; the daemon's identity stays local.
+    pub engine_host: Option<String>,
     /// Nodes of the deployment, each running one `uniserve serve`.
     pub nnodes: NonZeroU32,
     /// This node's rank among `nnodes`. The leader, rank 0, serves the API
@@ -241,6 +245,7 @@ impl Default for ServeConfig {
             data_parallel_size: NonZeroUsize::MIN,
             worker_groups: None,
             host_identity: "localhost".to_owned(),
+            engine_host: None,
             nnodes: NonZeroU32::MIN,
             node_rank: 0,
             dist_init_addr: None,
@@ -1309,7 +1314,11 @@ impl ServeConfig {
             // A deployment is what one leader serves under its served name.
             deployment: self.served_model_name().to_owned(),
             model: self.model().to_owned(),
-            host: self.host_identity.clone(),
+            host: self
+                .engine_host
+                .as_ref()
+                .unwrap_or(&self.host_identity)
+                .clone(),
             placement: Some(wire::Placement {
                 worker_groups: text(&self.worker_groups),
                 worker_groups_content: self

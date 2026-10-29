@@ -33,10 +33,10 @@ pub(crate) struct Cli {
 /// Where an engine process reaches the daemon that started it.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineArgs {
-    /// The leader daemon's request socket, `unix:<path>`.
+    /// The leader daemon's request socket, `unix:<path>` or `host:port`.
     #[arg(long)]
     pub requests: String,
-    /// The leader daemon's process socket, `unix:<path>`, through which the
+    /// The leader daemon's process socket, `unix:<path>` or `host:port`, through which the
     /// engine starts its workers.
     #[arg(long)]
     pub processes: String,

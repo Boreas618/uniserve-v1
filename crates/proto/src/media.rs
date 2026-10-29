@@ -89,6 +89,60 @@ impl PartialEq for MediaSource {
 
 impl Eq for MediaSource {}
 
+/// An artifact arriving in bounded network frames. Bytes go directly into
+/// shared host storage, without keeping a second complete payload in a Vec.
+/// Dropping an incomplete transfer releases its storage.
+pub struct MediaReceiver {
+    _storage: SharedMemory,
+    file: std::fs::File,
+    size: u64,
+    written: u64,
+}
+
+impl MediaReceiver {
+    /// Reserve the artifact's declared length before accepting any parts.
+    pub fn new(size: u64) -> io::Result<Self> {
+        let length = usize::try_from(size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact size exceeds address space",
+            )
+        })?;
+        let (storage, file) = SharedMemory::create(length)?;
+        Ok(Self {
+            _storage: storage,
+            file,
+            size,
+            written: 0,
+        })
+    }
+
+    /// Append one part, preserving the declared length across all parts.
+    pub fn append(&mut self, size: u64, data: &[u8]) -> io::Result<()> {
+        if size != self.size || data.len() as u64 > self.size - self.written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact parts exceed or change their declared length",
+            ));
+        }
+        self.file.write_all(data)?;
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    /// Publish the complete artifact as an immutable mapping. A truncated
+    /// transfer or an event declaring another size is an error.
+    pub fn finish(self, size: u64) -> io::Result<MappedMedia> {
+        if size != self.size || self.written != self.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact transfer is incomplete or its event changes the length",
+            ));
+        }
+        MappedMedia::map(self.file.into(), size)
+    }
+}
+
 /// The first `bytes` bytes of a shared-memory object another process
 /// published and passed by descriptor, mapped read-only for as long as this
 /// value lives.

@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use proto::request::{ArtifactMedia as _, wire};
-use proto::{Connection, MappedMedia};
+use proto::{Connection, Listener, MappedMedia, MediaReceiver};
 
 /// An anonymous shared-memory file holding `bytes`.
 fn storage(bytes: &[u8]) -> OwnedFd {
@@ -56,4 +56,43 @@ fn a_frame_carries_its_descriptor_and_the_receiver_maps_the_bytes() {
 
     // A mapping is never longer than the object it maps.
     assert!(MappedMedia::map(storage(b"short"), 64).is_err());
+}
+
+#[test]
+fn a_network_artifact_preserves_its_bytes_across_parts() {
+    let listener = Listener::bind("127.0.0.1:0").unwrap();
+    let mut sender = Connection::connect(listener.address()).unwrap();
+    let mut receiver = listener.try_accept().unwrap().unwrap();
+    let mut responses = receiver.writer().unwrap();
+    let bytes: Vec<_> = (0..4096).map(|index| (index % 251) as u8).collect();
+    for data in bytes.chunks(137) {
+        sender
+            .send(&wire::ArtifactPart {
+                size: bytes.len() as u64,
+                data: data.to_vec(),
+            })
+            .unwrap();
+    }
+    let mut transfer = MediaReceiver::new(bytes.len() as u64).unwrap();
+    let mut received = 0;
+    while received < bytes.len() {
+        let part: wire::ArtifactPart = receiver.recv(Duration::from_secs(5)).unwrap().unwrap();
+        transfer.append(part.size, &part.data).unwrap();
+        received += part.data.len();
+    }
+    let mapped = transfer.finish(bytes.len() as u64).unwrap();
+    assert_eq!(mapped.bytes(), bytes);
+    responses
+        .send(&wire::Artifact {
+            content_type: "video/mp4".into(),
+            bytes: received as u64,
+            ..Default::default()
+        })
+        .unwrap();
+    let answer: wire::Artifact = sender.recv(Duration::from_secs(5)).unwrap().unwrap();
+    assert_eq!(answer.bytes, bytes.len() as u64);
+
+    let mut truncated = MediaReceiver::new(bytes.len() as u64).unwrap();
+    truncated.append(bytes.len() as u64, &bytes[..137]).unwrap();
+    assert!(truncated.finish(bytes.len() as u64).is_err());
 }

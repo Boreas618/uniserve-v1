@@ -9,15 +9,14 @@
 //! engine's process lives for as long as its control connection does.
 
 use std::collections::BTreeMap;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use proto::Connection;
 use proto::process::{self, downstream, event, hello, reply, request, upstream};
 use proto::request::wire;
+use proto::{Connection, Listener};
 
 use crate::engine::client::{EngineClient, EngineState, StatsSink};
 
@@ -37,7 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Starts the engine processes of one deployment.
 pub struct EngineControl {
     /// The request socket engine processes connect back to.
-    requests: UnixListener,
+    requests: Listener,
     request_address: String,
     socket: PathBuf,
     /// The daemon's process socket.
@@ -68,12 +67,18 @@ impl EngineControl {
     ) -> anyhow::Result<Self> {
         // A socket a stopped daemon left behind is replaced.
         let _ = std::fs::remove_file(socket);
-        let requests = UnixListener::bind(socket)
+        let address = if processes.starts_with("unix:") {
+            format!("unix:{}", socket.display())
+        } else {
+            let endpoint: std::net::SocketAddr = processes.parse()?;
+            std::net::SocketAddr::new(endpoint.ip(), 0).to_string()
+        };
+        let requests = Listener::bind(&address)
             .with_context(|| format!("binding the request socket {}", socket.display()))?;
-        requests.set_nonblocking(true)?;
+        let request_address = requests.address().to_owned();
         Ok(Self {
             requests,
-            request_address: format!("unix:{}", socket.display()),
+            request_address,
             socket: socket.to_path_buf(),
             processes,
             host,
@@ -114,7 +119,7 @@ impl EngineControl {
             .map(|workers| workers.executable.clone())
             .context("the engine spec states no workers")?;
         let standby = spec.predecessor.is_some();
-        let mut control = self.spawn(engine, &executable)?;
+        let mut control = self.spawn(engine, &executable, &spec.host)?;
         let (mut reader, mut writer, hello) = self.accept(engine, Some(&mut control))?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
@@ -426,15 +431,23 @@ impl EngineControl {
         Ok(())
     }
 
-    fn spawn(&self, engine: u64, executable: &str) -> anyhow::Result<Connection> {
-        let (mut control, _) = self.connect()?;
+    fn spawn(&self, engine: u64, executable: &str, host: &str) -> anyhow::Result<Connection> {
+        let (mut control, nodes) = self.connect()?;
+        anyhow::ensure!(
+            nodes.iter().any(|node| node.host == host),
+            "engine host {host} has not joined the deployment"
+        );
+        anyhow::ensure!(
+            host == self.host || !self.processes.starts_with("unix:"),
+            "a remote engine needs the deployment's network control address"
+        );
 
         let executable = executable.to_owned();
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
                 kind: Some(request::Kind::Spawn(process::Spawn {
-                    host: self.host.clone(),
+                    host: host.to_owned(),
                     group: ENGINE_GROUP.to_owned(),
                     rank: 0,
                     generation: engine,
@@ -492,10 +505,9 @@ impl EngineControl {
         }
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
-            match self.requests.accept() {
-                Ok((stream, _)) => {
-                    let mut reader = Connection::from_unix(stream.try_clone()?)?;
-                    let writer = Connection::from_unix(stream)?;
+            match self.requests.try_accept() {
+                Ok(Some(mut reader)) => {
+                    let writer = reader.writer()?;
                     let hello: wire::Hello = reader
                         .recv(CONNECT_TIMEOUT)?
                         .context("the engine said no hello")?;
@@ -504,7 +516,7 @@ impl EngineControl {
                     }
                     incoming.insert(hello.engine, (reader, writer, hello));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(None) => {}
                 Err(error) => return Err(error).context("accepting the engine's connection"),
             }
             if let Some(control) = control.as_deref_mut() {
@@ -557,6 +569,8 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixListener;
+
     use super::*;
 
     #[test]

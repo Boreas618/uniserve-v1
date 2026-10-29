@@ -638,8 +638,7 @@ async fn prepared_successor(
     let socket = prepare
         .processes
         .strip_prefix("unix:")
-        .map(std::path::PathBuf::from)
-        .context("the daemon's process socket is not a Unix socket")?;
+        .map(std::path::PathBuf::from);
     let daemon = Daemon::resume(
         config.host_identity.clone(),
         Some((prepare.processes.clone(), socket)),

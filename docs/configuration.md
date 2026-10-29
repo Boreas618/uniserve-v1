@@ -91,9 +91,10 @@ retention = "30m"
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
 | `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups; requests go to the scheduler with the fewest in flight. With `worker_groups`, the file's model groups form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
-| `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks placed on this host, and a deployment rank entry without a host names it |
+| `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks assigned to this host |
+| `engine_host` | This node's identity | The joined node that runs the engine and any ranks without an explicit host. Changing it starts a successor world there while the HTTP daemon remains on its node |
 | `nnodes` | `1` | Nodes of the deployment, each running one `uniserve serve` |
-| `node_rank` | `0` | This node's rank. The leader, rank 0, serves the API and runs the engine, and requires `model`; every other node runs only its daemon, which joins the leader's |
+| `node_rank` | `0` | This node's rank. The leader, rank 0, serves the API and requires `model`; the other node daemons join it and launch engines or workers assigned to their hosts |
 | `dist_init_addr` | Unset | The leader's `HOST:PORT`, which the other nodes' daemons join at and the leader binds on every interface; required with several nodes |
 
 ### `server_config`

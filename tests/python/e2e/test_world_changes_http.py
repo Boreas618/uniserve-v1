@@ -881,6 +881,49 @@ def _host_hits_of(
     return hits, _prefix_counter(base_url, "host_hits") - host
 
 
+def test_a_resource_change_continues_requests_with_a_smaller_cache(
+    tmp_path: Path,
+):
+    """Quotas, queue depth and cache capacity change through a world."""
+    name = "qwen3-resource-change"
+    assignments = (
+        "mem_fraction_static=0.8",
+        "placement_config.queue_depth=3",
+        "kv_cache_config.max_tokens=32768",
+        "kv_cache_config.host_gib=8",
+    )
+    # The cache also holds graph scratch units. Both capacities must fit
+    # the full count beside those units throughout successor preparation.
+    with _serve(
+        tmp_path,
+        name,
+        options=("--set", "kv_cache_config.max_tokens=65536"),
+    ) as (base_url, _):
+        before = _config(base_url)
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        report, streams = _change_under_traffic(
+            base_url, name, streaming, assignments
+        )
+        assert report["previous_world"] == before["slots"][0]["world"]
+        assert report["storage"]["feasible"] is True, report
+        assert report["numerics"] == "unchanged", report
+        assert report["kv_cache"] == "warmed", report
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        configured = tomllib.loads(_config(base_url)["config"])
+        assert configured["mem_fraction_static"] == 0.8
+        assert configured["placement_config"]["queue_depth"] == 3
+        assert configured["kv_cache_config"]["max_tokens"] == 32768
+        assert configured["kv_cache_config"]["host_gib"] == 8
+        for stream in streams:
+            stream.join()
+        reference, usage = _ask(base_url, name)
+        for stream in streams:
+            assert stream.tokens == reference
+            assert stream.usage == usage
+
+
 def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
     name = "qwen3-same-keys"
     with _serve(tmp_path, name) as (base_url, _):
@@ -2129,10 +2172,13 @@ def _follower(
     environment = " ".join(
         f"{name}={shlex.quote(value)}" for name, value in variables.items()
     )
+    launcher = os.environ.get("UNISERVE_FOLLOWER_LAUNCHER")
+    command_prefix = f"{shlex.quote(launcher)} " if launcher else ""
     remote = (
         f"mkdir -m 700 {runtime} && cd {shlex.quote(str(Path.cwd()))} && "
         f"echo follower pid $$ && exec env {environment} "
-        f"{shlex.quote(str(require_uniserve_binary()))} serve --nnodes 2 "
+        f"{command_prefix}{shlex.quote(str(require_uniserve_binary()))} "
+        "serve --nnodes 2 "
         f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
         f"--worker-executable {shlex.quote(str(worker_executable()))}"
     )
@@ -2224,6 +2270,15 @@ def _deployment_file(path: Path, host: str, ranks: int) -> Path:
 # assignments, and the options of a direct start of the result, with the
 # host a deployment file moves to.
 HOST_CHANGES = {
+    # The engine and its implicit worker host move together; the HTTP
+    # daemon keeps its node identity and its request streams.
+    "engine-moves-to-another-host": (
+        (),
+        ('engine_host="rank-1"',),
+        ("--set", 'engine_host="rank-1"'),
+        None,
+        1,
+    ),
     # One GPU's deployment moves to one GPU of the second host: the
     # deployment file names that GPU instead, at the same path.
     "one-gpu-moves-to-another-host": ((), (), (), "rank-1", 1),

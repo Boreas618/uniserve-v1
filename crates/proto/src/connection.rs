@@ -138,6 +138,21 @@ impl Connection {
         Self::from_stream(Stream::Unix(stream))
     }
 
+    /// Borrows this connection's socket through a separate sending handle.
+    /// The original remains the sole reader and retains all buffered frames
+    /// and received descriptors. Concurrent sends require caller ordering.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket handle cannot be duplicated or configured.
+    pub fn writer(&self) -> Result<Self> {
+        let stream = match &self.stream {
+            Stream::Unix(stream) => Stream::Unix(stream.try_clone().map_err(io("duplicating"))?),
+            Stream::Tcp(stream) => Stream::Tcp(stream.try_clone().map_err(io("duplicating"))?),
+        };
+        Self::from_stream(stream)
+    }
+
     fn from_stream(stream: Stream) -> Result<Self> {
         match &stream {
             Stream::Unix(stream) => stream.set_nonblocking(true),
