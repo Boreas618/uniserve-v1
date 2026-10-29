@@ -913,6 +913,11 @@ pub struct ProfilingOptions {
     /// instances carry probes in the CUDA graphs a world captures; a change
     /// takes a new world. Empty for no probe.
     pub fence_components: Vec<String>,
+    /// Name patterns (`*` matches any run) of the probed components whose
+    /// probes are off while `fence_probes` is on: the components whose
+    /// probes cost more than the always-on budget. Changed in place, at the
+    /// engine's next step boundary, as `fence_probes` is.
+    pub fence_probes_off: Vec<String>,
     /// Whether every worker enables CUPTI's PC sampling before it captures
     /// its CUDA graphs and keeps it enabled, stopped between sessions, so
     /// that sessions attribute the samples of graph kernels. CUPTI then
@@ -930,6 +935,7 @@ impl Default for ProfilingOptions {
                 .iter()
                 .map(|&pattern| pattern.to_owned())
                 .collect(),
+            fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
         }
     }
@@ -1434,6 +1440,7 @@ impl ServeConfig {
             profiling: Some(wire::Profiling {
                 fence_probes: self.profiling_config.fence_probes,
                 fence_components: self.profiling_config.fence_components.clone(),
+                fence_probes_off: self.profiling_config.fence_probes_off.clone(),
                 graph_pc_sampling: self.profiling_config.graph_pc_sampling,
             }),
             received_weights: Vec::new(),

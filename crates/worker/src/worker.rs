@@ -1391,10 +1391,16 @@ fn attach_fences(launch: &WorkerLaunch, model: &LoadedModel) -> Result<()> {
         serde_json::from_str(attached.as_str())
             .map_err(|error| Error::Interface(format!("attach_fences: {error}")))?;
     let count = instances.len();
-    crate::profiling::fences::Fences::install(&devices, instances, launch.fences.enabled)?;
+    crate::profiling::fences::Fences::install(
+        &devices,
+        instances,
+        launch.fences.enabled,
+        &launch.fences.off,
+    )?;
     tracing::info!(
         instances = count,
         enabled = launch.fences.enabled,
+        off = ?launch.fences.off,
         "attached fence probes"
     );
     Ok(())

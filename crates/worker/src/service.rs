@@ -668,8 +668,9 @@ impl Service<'_> {
     ///   it and answers what its file holds;
     /// - `uniserve.profile_release` (`{"session": id, "collector": name,
     ///   "reason": text}`): turns one collector of it off;
-    /// - `uniserve.fence_switch` (`{"enabled": bool}`): turns the fence
-    ///   probes on or off (`crate::profiling::fences`).
+    /// - `uniserve.fence_switch` (`{"enabled": bool, "off": [pattern]}`):
+    ///   turns the fence probes on or off, those of the components `off`
+    ///   names off in any case (`crate::profiling::fences`).
     fn built_in(&mut self, name: &str, payload: &str) -> crate::Result<String> {
         let payload: serde_json::Value = if payload.is_empty() {
             serde_json::Value::Null
@@ -1287,14 +1288,20 @@ impl Service<'_> {
                 let enabled = payload["enabled"]
                     .as_bool()
                     .ok_or_else(|| Error::Invalid("fence_switch states no enabled".into()))?;
-                let switched = match crate::profiling::fences::Fences::installed() {
-                    Some(fences) => {
-                        fences.switch(enabled)?;
-                        true
-                    }
-                    None => false,
+                let off: Vec<String> = match payload.get("off") {
+                    Some(off) if !off.is_null() => serde_json::from_value(off.clone())
+                        .map_err(|error| Error::Invalid(format!("fence_switch off: {error}")))?,
+                    _ => Vec::new(),
                 };
-                serde_json::json!({ "probes": switched, "enabled": enabled })
+                let switched = match crate::profiling::fences::Fences::installed() {
+                    Some(fences) => Some(fences.switch(enabled, &off)?),
+                    None => None,
+                };
+                serde_json::json!({
+                    "probes": switched.is_some(),
+                    "enabled": enabled,
+                    "off": switched.unwrap_or_default(),
+                })
             }
             other => {
                 return Err(Error::Unsupported(format!(

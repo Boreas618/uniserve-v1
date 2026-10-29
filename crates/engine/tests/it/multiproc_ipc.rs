@@ -2847,6 +2847,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         flashinfer_disable_split_kv: false,
         fence_probes: false,
         fence_components: Vec::new(),
+        fence_probes_off: Vec::new(),
         graph_pc_sampling: false,
     }
 }
