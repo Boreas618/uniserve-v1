@@ -1258,7 +1258,9 @@ def _weights_of(base_url: str) -> set[tuple[int, ...]]:
 @pytest.mark.parametrize(
     ("previous_world", "end"),
     [
-        ("parked", "commit"),
+        # The successor serves without the predecessor's weights of the
+        # changed files: they are loaded, not mapped.
+        pytest.param("parked", "commit", marks=pytest.mark.missing_state),
         ("parked", "rollback"),
         ("weights", "rollback"),
         ("host", "rollback"),
