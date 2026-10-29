@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::Serialize;
 use storage::manifest::cache::{self, Operation, Snapshot};
 use storage::manifest::{Binding, Encoding, Manifest, Request, World};
-use storage::protocol::{LinkBandwidth, Placement, Region};
+use storage::protocol::{LinkBandwidth, Placement, Priority, Region};
 
 use crate::engine::client::EngineClient;
 
@@ -194,13 +194,13 @@ async fn rounds(
                     .cloned()
                     .collect();
                 let backup = source.cache_warm(Operation::Stage { prefixes }).await?;
-                match copy(source, &snapshots, &backup).await? {
+                match copy(source, &snapshots, &backup, Priority::Warming).await? {
                     CopyResult::Complete(bytes) => report.copied_bytes += bytes,
                     CopyResult::Recompute(reason) => return Err(reason),
                 }
             }
         }
-        match copy(target, &snapshots, &targets).await? {
+        match copy(target, &snapshots, &targets, Priority::Warming).await? {
             CopyResult::Complete(bytes) => report.copied_bytes += bytes,
             CopyResult::Recompute(reason) if !keep => {
                 report.recompute = Some(reason);
@@ -402,7 +402,7 @@ pub(super) async fn materialize(target: &Arc<EngineClient>) -> Result<(), String
         prefixes: Vec::new(),
         page_tokens: 1,
     };
-    match copy(target, &[source], &destinations).await? {
+    match copy(target, &[source], &destinations, Priority::Promotion).await? {
         CopyResult::Complete(_) => {}
         CopyResult::Recompute(reason) => return Err(reason),
     }
@@ -451,7 +451,7 @@ pub(super) async fn restore(target: &Arc<EngineClient>, backup: &[Snapshot]) -> 
             host: false,
         })
         .await?;
-    match copy(target, backup, &destinations).await? {
+    match copy(target, backup, &destinations, Priority::Promotion).await? {
         CopyResult::Complete(_) => {}
         CopyResult::Recompute(reason) => return Err(reason),
     }
@@ -468,10 +468,13 @@ enum CopyResult {
     Recompute(String),
 }
 
+/// Copy the pages of `sources` into `targets` through the Transfer Servers of
+/// `target`'s ranks at `priority`, and wait until every rank's task ended.
 async fn copy(
     target: &EngineClient,
     sources: &[Snapshot],
     targets: &[Snapshot],
+    priority: Priority,
 ) -> Result<CopyResult, String> {
     let nodes: BTreeMap<_, _> = sources
         .iter()
@@ -634,7 +637,8 @@ async fn copy(
             spans,
         })
         .collect();
-    let payload = serde_json::to_string(&copies).map_err(|error| error.to_string())?;
+    let payload = serde_json::to_string(&cache::Transfer { priority, copies })
+        .map_err(|error| error.to_string())?;
     target.hook("uniserve.cache_transfer", &payload).await?;
     loop {
         let done = target

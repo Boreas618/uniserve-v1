@@ -1,7 +1,7 @@
 //! Transfer Server tasks borrowing scheduler-owned cache pages.
 
-use ::storage::manifest::cache::Copy;
-use ::storage::protocol::{Priority, TransferEnd};
+use ::storage::manifest::cache::Transfer;
+use ::storage::protocol::TransferEnd;
 
 use crate::storage::retained::Retained;
 use crate::{Error, Result};
@@ -41,11 +41,13 @@ impl Copies {
         Ok(())
     }
 
-    pub(crate) fn start(&mut self, retained: &Retained, copies: Vec<Copy>) -> Result<()> {
+    /// Submit this rank's spans of `transfer` as one task at its priority.
+    pub(crate) fn start(&mut self, retained: &Retained, transfer: Transfer) -> Result<()> {
         if self.task.is_some() {
             return Err(Error::State("the previous cache transfer still runs"));
         }
-        let spans: Vec<_> = copies
+        let spans: Vec<_> = transfer
+            .copies
             .into_iter()
             .filter(|copy| {
                 copy.worker_group == retained.scope().group && copy.rank == retained.scope().rank
@@ -53,7 +55,7 @@ impl Copies {
             .flat_map(|copy| copy.spans)
             .collect();
         if !spans.is_empty() {
-            self.task = Some(retained.transfer(spans, Priority::Warming, retained.world())?);
+            self.task = Some(retained.transfer(spans, transfer.priority, retained.world())?);
         }
         Ok(())
     }

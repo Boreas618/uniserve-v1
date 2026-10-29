@@ -709,12 +709,12 @@ impl Service<'_> {
                 serde_json::Value::Null
             }
             "uniserve.cache_transfer" => {
-                let copies = serde_json::from_value(payload)
+                let transfer = serde_json::from_value(payload)
                     .map_err(|error| Error::Invalid(format!("cache transfer: {error}")))?;
                 let retained = retained
                     .as_deref()
                     .ok_or(Error::State("cache transfers require retained storage"))?;
-                self.maintenance.cache_copies.start(retained, copies)?;
+                self.maintenance.cache_copies.start(retained, transfer)?;
                 serde_json::Value::Null
             }
             "uniserve.cache_poll" => {
