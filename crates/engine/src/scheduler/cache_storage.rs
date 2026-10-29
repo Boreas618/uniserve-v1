@@ -532,6 +532,11 @@ impl Scheduler {
     ) -> Result<Preparation, String> {
         let (in_flight_units, prefixes) = self.migrating_cache();
         let in_flight_tokens: Vec<u32> = prefixes.iter().map(|prefix| prefix.tokens).collect();
+        let partial_units = if successor.unmapped_cache {
+            0
+        } else {
+            self.partial_tail_units()
+        };
         let Some(StorageReports {
             cache: reports,
             beside,
@@ -574,6 +579,7 @@ impl Scheduler {
             plan.idle_cached_tail = self.storage.cache().map_or(0, |cache| {
                 u64::from(cache.block_pool.cached_from(report.first_unit(kept))) * report.unit_bytes
             });
+            plan.partial_tail_kv = u64::from(partial_units) * report.unit_bytes;
             keep = keep.min(kept);
             plans.push(plan);
         }

@@ -749,7 +749,9 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
     name = "qwen3-world-change"
     with _serve(tmp_path, name, devices, options) as (base_url, log):
         before = _config(base_url)
-        (serving,) = [slot for slot in before["slots"] if slot]
+        (serving,) = [
+            slot for slot in before["slots"] if slot["state"] != "empty"
+        ]
         assert serving["state"] == "executing", before
         engines_before = _pids(log, "Engine")
         # Every GPU's ledger books the serving world alone, within its
@@ -835,7 +837,7 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         assert status["trial"] is None, status
         assert status["slots"] == [
             {"world": world, "state": "executing"},
-            None,
+            {"world": None, "state": "empty"},
         ], status
         graphs = tomllib.loads(status["config"])["cuda_graph_config"]
         assert graphs["decode_batch_sizes"] == [1, 2, 4, 8, 16], graphs
@@ -925,7 +927,8 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
         assert report["previous_world"] == before["slots"][0]["world"]
         assert report["storage"]["feasible"] is True, report
         assert report["numerics"] == "unchanged", report
-        assert report["kv_cache"] == "warmed", report
+        kv_pages = report["derived_state"]["kv_pages"]
+        assert kv_pages["treatment"] == "moved", report
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
         configured = tomllib.loads(_config(base_url)["config"])
@@ -974,10 +977,8 @@ def test_a_change_of_the_executable_alone_invalidates_nothing(
                 '"nn.linear.VocabParallelHead/2"\n',
             )
         report = _world_change(base_url, CHANGE)
-        assert (report["numerics"], report["weights"]) == (
-            "unchanged",
-            "mapped",
-        ), report
+        weights = report["derived_state"]["weights"]["treatment"]
+        assert (report["numerics"], weights) == ("unchanged", "mapped"), report
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
 
@@ -1001,7 +1002,11 @@ def test_an_operator_rollback_resumes_the_previous_world(
     name = "qwen3-world-rollback"
     with _serve(tmp_path, name) as (base_url, log):
         cached = _chat(base_url, name, CACHED_PROMPT)
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         (engine_before,) = _pids(log, "Engine")
 
         streaming = Streaming(base_url, name)
@@ -1245,7 +1250,11 @@ def test_a_world_of_other_numerics_continues_the_requests_in_flight(
     }
     with _serve(tmp_path, name, env=environment) as (base_url, log):
         cached = _chat(base_url, name, CACHED_PROMPT)
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
 
@@ -1364,7 +1373,11 @@ def test_a_change_of_model_files_loads_the_successors_weights(
     )
     with _serve(tmp_path, name, options=WEIGHTS_SHARE) as (base_url, _log):
         original = _chat(base_url, name, CACHED_PROMPT)
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         previous = serving["world"]
         assert _weights_of(base_url) == {(previous,)}
         streaming = Streaming(base_url, name)
@@ -1384,7 +1397,15 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         report = _world_change(base_url, *change)
         streaming.mark()
         world = report["world"]
-        assert (report["weights"], report["kv_cache"]) == ("loaded", "mapped")
+        # The successor reads its weights from the other files, and the
+        # requests in flight continue on the pages of the serving world's
+        # numerics, which it maps.
+        state = report["derived_state"]
+        treatments = (
+            state["weights"]["treatment"],
+            state["kv_pages"]["treatment"],
+        )
+        assert treatments == ("recomputed", "continued"), report
         assert report["numerics"] == "changed", report
         assert report["previous_world_kept"] == previous_world, report
         print(
@@ -1556,7 +1577,11 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         original = _chat(base_url, name, cached)
         if host_cache != "host":
             _chat(base_url, name, SECOND_FILL_PROMPT)
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         previous = serving["world"]
         held = _segments_of(base_url, previous)
         assert held > 1
@@ -1568,7 +1593,13 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         )
         assert planned.status_code == 200, planned.text
         plan = planned.json()["result"]["plan"]
-        assert plan["kv_cache"] == "recomputed", plan
+        # Before the successor starts the plan states both outcomes: the
+        # requests continue from warm copies under the same numerics, and
+        # compute their state again under other numerics.
+        assert plan["derived_state"]["kv_pages"] == {
+            "treatment": "moved",
+            "when_numerics_change": "recomputed",
+        }, plan
         for gpu in plan["storage"]["gpus"]:
             steps = gpu["steps"]
             assert steps["trial"]["unmapped_kv_segments"] > 0, gpu
@@ -1581,7 +1612,8 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         )
         assert response.status_code == 200, response.text
         report = response.json()["result"]["world"]
-        assert report["kv_cache"] == "recomputed", report
+        kv_pages = report["derived_state"]["kv_pages"]
+        assert kv_pages["treatment"] == "recomputed", report
         # The preparation gave back the tail past what the successor's
         # weights left; the trial evicts what stayed past the first segment.
         kept = min(gpu["segments_kept"] for gpu in report["storage"]["gpus"])
@@ -1625,7 +1657,11 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
     environment = _plugin(tmp_path / "plugins", "fault", FAULT_PLUGIN)
     with _serve(tmp_path, name, env=environment) as (base_url, log):
         cached = _chat(base_url, name, CACHED_PROMPT)
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         engines_before = _pids(log, "Engine")
 
         streaming = Streaming(base_url, name)
@@ -1739,7 +1775,11 @@ def test_a_fault_rolls_back_to_the_weights_kept_in_host_storage(
         log,
     ):
         original = _chat(base_url, name, CACHED_PROMPT)
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         previous = serving["world"]
         engines_before = _pids(log, "Engine")
 
@@ -1812,7 +1852,11 @@ def test_a_regression_of_the_world_on_trial_rolls_it_back(
     environment = _plugin(tmp_path / "plugins", "fault", FAULT_PLUGIN)
     with _serve(tmp_path, name, env=environment) as (base_url, _log):
         cached = _chat(base_url, name, CACHED_PROMPT)
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         # The stream steps the previous world over the window before the
         # promotion, and the world on trial during it.
         streaming = Streaming(base_url, name)
@@ -2050,7 +2094,8 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
         )
         streaming = streams[-1]
         assert report["parallel"] == "changed", report
-        assert report["kv_cache"] == "warmed", report
+        kv_pages = report["derived_state"]["kv_pages"]
+        assert kv_pages["treatment"] == "moved", report
         warming = report["cache_warming"]
         warming = warming if isinstance(warming, list) else [warming]
         assert sum(round_["copied_bytes"] for round_ in warming) > 0
@@ -2393,7 +2438,11 @@ def test_a_change_across_hosts_continues_a_streaming_request(
                 env=environment,
             )
         )
-        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        (serving,) = [
+            slot
+            for slot in _config(base_url)["slots"]
+            if slot["state"] != "empty"
+        ]
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         # The second host joins the deployment while it serves.

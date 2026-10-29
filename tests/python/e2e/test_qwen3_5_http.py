@@ -490,7 +490,8 @@ def test_repartitioned_recurrent_pages_resume_a_streaming_request(
             response = change.result()
         assert response.status_code == 200, response.text
         report = response.json()["result"]["world"]
-        assert report["kv_cache"] == "warmed", report
+        kv_pages = report["derived_state"]["kv_pages"]
+        assert kv_pages["treatment"] == "moved", report
         warming = report["cache_warming"]
         assert warming["staged"], report
         assert warming["warmed_requests"] > 0, warming

@@ -71,6 +71,10 @@ pub struct SimExecutor {
     /// Where the throttles of the deployment's transfers go while a test
     /// observes them: `true` for a halving, `false` for a restoration.
     throttles: Option<Sender<bool>>,
+    /// The storage reports of the deployment's nodes a test has the
+    /// executor answer with (`Executor::ledgers`), as node daemons report
+    /// them; none when unset.
+    ledgers: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     /// The simulator thread; `None` once the executor is closed.
     handle: Option<JoinHandle<()>>,
     /// Requests admitted by a submitted batch whose `Finish` has not been
@@ -176,6 +180,7 @@ impl SimExecutor {
             results_on_wait,
             observer: None,
             throttles: None,
+            ledgers: None,
             handle: Some(handle),
             admissions: HashSet::new(),
             products: HashSet::new(),
@@ -202,6 +207,17 @@ impl SimExecutor {
         let (sender, receiver) = crossbeam_channel::unbounded();
         self.throttles = Some(sender);
         receiver
+    }
+
+    /// Has the executor report, as the deployment's nodes' storage reports
+    /// (`Executor::ledgers`), whatever the returned list holds when the
+    /// engine reads them: a test writes each node's JSON (`{"host",
+    /// "ledgers", "host_storage", "transfers"}`) as it means the nodes'
+    /// Storage Servers to answer.
+    pub fn report_ledgers(&mut self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let ledgers = std::sync::Arc::default();
+        self.ledgers = Some(std::sync::Arc::clone(&ledgers));
+        ledgers
     }
 
     /// Returns a waker that interrupts executor polling after command enqueue.
@@ -350,6 +366,17 @@ impl Executor for SimExecutor {
             let _ = throttles.send(halve);
         }
         Ok(Vec::new())
+    }
+
+    /// The storage reports a test set (`Self::report_ledgers`); none
+    /// otherwise.
+    fn ledgers(&mut self) -> Result<Vec<String>, crate::executor::ExecutorError> {
+        Ok(self.ledgers.as_ref().map_or_else(Vec::new, |ledgers| {
+            ledgers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }))
     }
 
     /// Returns the worker metadata.
