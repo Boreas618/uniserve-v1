@@ -1,0 +1,18 @@
+#!/bin/bash
+# A `uniserve` executable whose workers run under compute-sanitizer's
+# memcheck, for the e2e servers' `--worker-executable`
+# (UNISERVE_WORKER_EXECUTABLE): each worker writes its memory errors to
+# $SANITIZER_LOGS and exits with status 86 on one. The engine and the
+# Storage Server, which compute nothing on a GPU and daemonize, run as they
+# are. $UNISERVE_MEMCHECK_TARGET names the `uniserve` executable to run;
+# $COMPUTE_SANITIZER, the sanitizer (`compute-sanitizer` on PATH by
+# default).
+set -u
+target=${UNISERVE_MEMCHECK_TARGET:?the uniserve executable the workers run}
+if [ "${1:-}" != worker ]; then
+  exec "$target" "$@"
+fi
+exec "${COMPUTE_SANITIZER:-compute-sanitizer}" --tool memcheck \
+  --target-processes all --error-exitcode 86 \
+  --log-file "${SANITIZER_LOGS:?the directory of the memcheck logs}/memcheck-%p.log" \
+  "$target" "$@"

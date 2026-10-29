@@ -284,6 +284,7 @@ def test_attached_images_are_read_in_order(served, count):
     assert added >= soft + 2 * count
 
 
+@pytest.mark.missing_state
 def test_distinct_images_beyond_the_encoder_cache_are_read(served):
     """Every image of a stream longer than the encoder cache is read.
 

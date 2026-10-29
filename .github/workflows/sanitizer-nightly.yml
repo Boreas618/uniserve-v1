@@ -1,0 +1,38 @@
+name: Nightly compute-sanitizer
+
+# Every optional derived state has a test of the serving path without it
+# (`missing_state`); these run with every worker under compute-sanitizer's
+# memcheck, so that code assuming a state is present fails here first.
+
+on:
+  schedule:
+    - cron: "43 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  missing-state:
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e ".[test,gpu]"
+      - run: cargo build -p uniserve
+      - run: mkdir -p sanitizer-logs
+      - run: >-
+          SANITIZER_LOGS=$PWD/sanitizer-logs
+          UNISERVE_RUN_GPU_E2E=1
+          UNISERVE_WORKER_EXECUTABLE=$PWD/tests/python/sanitizer/memcheck-worker
+          UNISERVE_MEMCHECK_TARGET=$(python -c 'import os, sys; print(os.path.join(os.path.dirname(sys.executable), "uniserve"))')
+          UNISERVE_E2E_SET="mem_fraction_static=0.6 worker_config.watchdog_timeout=2h"
+          UNISERVE_E2E_TIME_SCALE=20
+          python -m pytest -m "e2e and gpu and missing_state"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: memcheck-logs
+          path: sanitizer-logs/
