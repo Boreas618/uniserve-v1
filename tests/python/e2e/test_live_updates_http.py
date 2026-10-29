@@ -1267,7 +1267,9 @@ def test_a_weight_update_answers_as_the_new_checkpoint_does(
         assert answers(base_url) == expected
         # A world change's successor binds the weights the source left.
         report = _change_world(base_url, CHANGE)
-        assert report["weights"] == "mapped", report
+        assert report["derived_state"]["weights"]["treatment"] == "mapped", (
+            report
+        )
         assert answers(base_url) == expected
         back = _admin(base_url, "update_weights", {"model_path": _checkpoint()})
         assert back.status_code == 200, back.text

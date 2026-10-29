@@ -202,6 +202,9 @@ pub(crate) struct Throttling {
     /// Where the previous decision stopped reading.
     read: Instant,
     halved: bool,
+    /// The largest step-to-baseline ratio of the latest interval whose
+    /// reports had a baseline.
+    ratio: Option<f64>,
 }
 
 impl Throttling {
@@ -229,6 +232,7 @@ impl Throttling {
             baseline: Baseline::of(observer, world, from, preparing),
             read: preparing,
             halved: false,
+            ratio: None,
         }
     }
 
@@ -254,6 +258,7 @@ impl Throttling {
         });
         self.read = now;
         let ratio = slowest?;
+        self.ratio = Some(ratio);
         if ratio > 1.0 + self.slowdown {
             self.halved = true;
             Some((Decision::Halve, ratio))
@@ -273,24 +278,48 @@ impl Throttling {
 }
 
 /// The throttles one preparation sent, which its change reports.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Throttled {
     pub(crate) halvings: u32,
     pub(crate) restorations: u32,
+}
+
+/// The serving world's steps against their baseline while a successor
+/// prepares, as the control last read them, which `GET /admin/config`
+/// reports of the change in progress.
+#[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize)]
+pub(crate) struct StepTime {
+    /// The largest ratio of a scheduler's step time to its baseline of the
+    /// same batch size among the reports of the latest interval that had a
+    /// baseline; `None` before any had.
+    pub(crate) ratio: Option<f64>,
+    /// The slowdown tolerated (`update_config.transfer_slowdown`): a step
+    /// may take `1 + slowdown` times its baseline.
+    pub(crate) slowdown: f64,
+    /// Whether the transfers' link budgets stand halved.
+    pub(crate) halved: bool,
+    #[serde(flatten)]
+    pub(crate) throttled: Throttled,
 }
 
 /// Runs `throttling` every `interval` until `done`, sending its decisions
 /// through `running`, the serving engine, and restores the budgets at the
 /// end when they stand halved; returns the throttles the engine passed on.
 /// A throttle the engine cannot pass on is logged: the preparation goes on,
-/// at the budgets the Transfer Servers keep.
+/// at the budgets the Transfer Servers keep. After each interval `steps`
+/// holds the serving world's steps against their baseline as read.
 pub(crate) async fn control(
     running: Arc<EngineClient>,
     mut observed: Vec<(Arc<Observer>, Throttling)>,
     interval: Duration,
     done: CancellationToken,
+    steps: Arc<std::sync::Mutex<StepTime>>,
 ) -> Throttled {
     let mut throttled = Throttled::default();
+    crate::leader::locked(&steps).slowdown = observed
+        .iter()
+        .map(|(_, throttling)| throttling.slowdown)
+        .fold(0.0, f64::max);
     let mut ticks = tokio::time::interval(interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick completes at once.
@@ -342,6 +371,16 @@ pub(crate) async fn control(
                 Err(error) => warn!(?decision, %error, "the transfers' budgets did not change"),
             }
         }
+        let mut read = crate::leader::locked(&steps);
+        if let Some(ratio) = observed
+            .iter()
+            .filter_map(|(_, throttling)| throttling.ratio)
+            .reduce(f64::max)
+        {
+            read.ratio = Some(ratio);
+        }
+        read.halved = observed.iter().any(|(_, throttling)| throttling.halved());
+        read.throttled = throttled;
     }
     if observed.iter().any(|(_, throttling)| throttling.halved()) {
         match running.throttle_transfers(false).await {
@@ -507,11 +546,13 @@ mod tests {
         let throttling = Throttling::new(&observer, 1, 0.2, Instant::now(), None);
         let interval = Duration::from_millis(100);
         let done = CancellationToken::new();
+        let steps = Arc::new(std::sync::Mutex::new(StepTime::default()));
         let control = tokio::spawn(control(
             Arc::clone(&running),
             vec![(Arc::clone(&observer), throttling)],
             interval,
             done.clone(),
+            Arc::clone(&steps),
         ));
         let next = |wait: Duration| throttles.recv_timeout(wait).ok();
 
@@ -519,9 +560,18 @@ mod tests {
         observer.record(1, 0, &report(11_000, 25, 32));
         assert_eq!(next(interval * 5), None);
 
-        // Steps 50% longer halve the budgets each interval they last.
+        // Steps 50% longer halve the budgets each interval they last, which
+        // the change in progress reports.
         observer.record(1, 0, &report(15_000, 25, 32));
         assert_eq!(next(Duration::from_secs(10)), Some(true));
+        tokio::time::sleep(interval * 2).await;
+        let read = *crate::leader::locked(&steps);
+        assert!(
+            read.ratio.is_some_and(|ratio| (ratio - 1.5).abs() < 1e-9),
+            "{read:?}"
+        );
+        assert!(read.halved, "{read:?}");
+        assert!((read.slowdown - 0.2).abs() < 1e-12, "{read:?}");
         observer.record(1, 0, &report(15_000, 25, 32));
         assert_eq!(next(Duration::from_secs(10)), Some(true));
 

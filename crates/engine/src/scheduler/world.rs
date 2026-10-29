@@ -169,6 +169,39 @@ impl Scheduler {
         (units, tokens)
     }
 
+    /// The units of the last pages of the requests that can move which hold
+    /// fewer tokens than a page: what a successor that maps this cache
+    /// copies into units of its own at its promotion, before the requests
+    /// append to them (`specs/online-operations.md` §4.5.1). Recurrent
+    /// checkpoints lie on page boundaries alone and the draft cache is
+    /// refilled, so neither group has such a page.
+    pub(super) fn partial_tail_units(&self) -> u32 {
+        let Some(cache) = self.storage.cache() else {
+            return 0;
+        };
+        let groups = cache.coordinator.groups();
+        let mut units = 0;
+        for state in self
+            .running
+            .values()
+            .filter(|state| state.req.is_migratable() && !state.terminal_intent.is_terminal())
+        {
+            let Some(allocations) = state.allocations.as_ref() else {
+                continue;
+            };
+            let tokens = state.cache_visible_len as usize;
+            for (table, shape) in allocations.block_tables().iter().zip(groups) {
+                if shape.draft || shape.state || tokens.is_multiple_of(shape.block_size) {
+                    continue;
+                }
+                units += table
+                    .page(tokens / shape.block_size)
+                    .map_or(0, |page| page.units().len() as u32);
+            }
+        }
+        units
+    }
+
     /// Completes a park once no request is queued, runs or retires and no
     /// batch is in flight.
     pub(super) fn poll_park(&mut self) {

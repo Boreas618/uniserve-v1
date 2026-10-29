@@ -48,6 +48,9 @@ impl Trial {
             "seconds": self.promoted.elapsed().as_secs_f64(),
             "promoted_at": self.promoted_at,
             "pause_seconds": self.pause.as_secs_f64(),
+            "thresholds": self.thresholds,
+            "requests_ended": crate::leader::outcomes().0.saturating_sub(self.outcomes.0),
+            "requests_failed": crate::leader::outcomes().1.saturating_sub(self.outcomes.1),
             "baseline": self.baseline,
         })
     }
@@ -297,9 +300,47 @@ pub(crate) async fn apply(
         spec.stage_cache = adds.host_cache;
     }
     update.eager_prepare = adds.eager_source;
+    // Every decision the group change executes, made once: every successor
+    // holds other regions of the weights, receives them and lays out its
+    // own cache, and every predecessor gives back its cache's tail.
+    let served = locked(&previous[0].served)
+        .clone()
+        .ok_or(UpdateError::NoEngine)?;
+    let change = WorldChange {
+        successor: adds,
+        redistributes: true,
+        shrinks: true,
+        reencodes_cache: specs.iter().any(|spec| kv_encoding_changes(&served, spec)),
+        in_flight: request.in_flight,
+        previous_world: update.previous_world,
+        serving_drafts: served.speculation.is_some(),
+        successor_drafts: specs.iter().any(|spec| spec.speculation.is_some()),
+    };
+    let copies = PlannedCopies::new(
+        Some(&admission),
+        &budgets,
+        &hosts,
+        &plans.iter().collect::<Vec<_>>(),
+    );
+    let in_flight_requests: usize = serving.iter().map(|client| client.in_flight()).sum();
+    let tail_tokens = update
+        .cache_tail_tokens
+        .map(std::num::NonZeroU32::get)
+        .or_else(|| {
+            Some(
+                specs
+                    .iter()
+                    .filter_map(|spec| spec.kv_cache.as_ref().and_then(|cache| cache.block_size))
+                    .max()
+                    .unwrap_or(64),
+            )
+        });
     let plan = serde_json::json!({
         "previous_worlds": source_worlds,
         "replicas": specs.len(),
+        "steps": copies.steps(&change),
+        "derived_state": change.derived_state(Observed::default()),
+        "promotion_backfill": copies.backfill(&change, in_flight_requests, tail_tokens),
         "redistribution": plans,
         "storage": admission,
         "feasible": refusals.is_empty(),
@@ -324,15 +365,22 @@ pub(crate) async fn apply(
     let mut parked = Vec::new();
     let mut interference = None;
     let mut warmed = Vec::new();
+    // What the deployment's transfers had copied on every node as the
+    // change begins: each predecessor's status reports what it moved since.
+    let moved_from = transfer_totals(&serving[0]).await;
+    // Whether any successor computes other numerics than its sources.
+    let mut successors = Numerics::SAME;
     let result: anyhow::Result<()> = async {
         for (replica, client) in previous.iter().zip(&serving) {
-            replica.progress("prepare", None);
+            replica.progress(change.steps(Numerics::SAME)[0], None);
+            replica.progress_edit(|progress| progress.moved_from.clone_from(&moved_from));
             if update.eager_prepare {
                 client
                     .hook("uniserve.eager", r#"{"eager":true}"#)
                     .await
                     .map_err(anyhow::Error::msg)?;
             }
+            replica.progress(Step::Shrink, None);
             client
                 .make_room(
                     wire::CacheChange::Shrink,
@@ -346,6 +394,7 @@ pub(crate) async fn apply(
         let eager_since = update.eager_prepare.then(Instant::now);
         if let Some(since) = eager_since {
             for (replica, client) in previous.iter().zip(&serving) {
+                replica.progress(Step::Baseline, None);
                 let idle = crate::interference::eager_baseline(
                     &replica.observer,
                     client.world(),
@@ -375,11 +424,21 @@ pub(crate) async fn apply(
             })
             .collect();
         let done = tokio_util::sync::CancellationToken::new();
+        let steps = Arc::new(std::sync::Mutex::new(
+            crate::interference::StepTime::default(),
+        ));
+        // Each predecessor's continuations go to the successor of its
+        // ordinal among the specs, which takes that spec's world.
+        for (index, replica) in previous.iter().enumerate() {
+            replica.progress(Step::Prepare, Some(specs[index % specs.len()].world));
+            replica.progress_edit(|progress| progress.steps = Some(Arc::clone(&steps)));
+        }
         let task = tokio::spawn(crate::interference::control(
             Arc::clone(&serving[0]),
             observed,
             crate::interference::INTERVAL,
             done.clone(),
+            steps,
         ));
         interference = Some((done, task));
         let mut starting = Vec::new();
@@ -417,12 +476,23 @@ pub(crate) async fn apply(
                 .filter(|(index, _)| index % candidates.len() == ordinal)
                 .map(|(_, client)| Arc::clone(client))
                 .collect();
-            let changed = sources
-                .iter()
-                .any(|source| source.info().prefix_seeds != candidate.info().prefix_seeds);
+            let numerics = Numerics {
+                pages: sources
+                    .iter()
+                    .any(|source| source.info().prefix_seeds != candidate.info().prefix_seeds),
+                trajectories: sources
+                    .iter()
+                    .any(|source| source.info().latent_seed != candidate.info().latent_seed),
+            };
+            successors.pages |= numerics.pages;
+            successors.trajectories |= numerics.trajectories;
+            if change.warms(numerics) {
+                for replica in &previous {
+                    replica.progress(Step::WarmCache, None);
+                }
+            }
             warming.push(async move {
-                let recompute = changed && request.in_flight == InFlight::Recompute;
-                if recompute && !adds.host_cache {
+                if !change.warms(numerics) {
                     Ok(warming::Report {
                         recompute: Some("the update recomputes in-flight state".into()),
                         ..warming::Report::default()
@@ -431,13 +501,7 @@ pub(crate) async fn apply(
                     warming::prepare(
                         &sources,
                         candidate,
-                        if recompute {
-                            warming::Reuse::Recompute
-                        } else if changed {
-                            warming::Reuse::Keep
-                        } else {
-                            warming::Reuse::Exact
-                        },
+                        change.reuse(numerics),
                         update.cache_tail_tokens.map(std::num::NonZeroU32::get),
                         update.cache_prefill_tokens.map(std::num::NonZeroU32::get),
                         adds.host_cache,
@@ -479,7 +543,8 @@ pub(crate) async fn apply(
     let mut park_time = Duration::ZERO;
     let paused = previous.iter().all(|replica| replica.hold.is_paused());
     for (index, replica) in previous.iter().enumerate() {
-        replica.progress("promote", None);
+        replica.progress(Step::Park, None);
+        replica.progress_edit(|progress| progress.paused = Some(promoted));
         let before = serving[index].info();
         let after = candidates[index % candidates.len()].info();
         if request.in_flight == InFlight::Keep {
@@ -666,8 +731,25 @@ pub(crate) async fn apply(
         "park_seconds": park_time.as_secs_f64(),
         "parallel": "changed",
         "redistribution": plans,
+        "steps": change
+            .steps(successors)
+            .iter()
+            .map(|step| match step {
+                Step::KeepPrevious => {
+                    serde_json::json!({ "step": step.name(), "previous_world": mode })
+                }
+                _ => serde_json::json!({ "step": step.name() }),
+            })
+            .collect::<Vec<_>>(),
+        "derived_state": change.derived_state(Observed {
+            numerics: Some(successors),
+            converted: Some(
+                warmed
+                    .iter()
+                    .all(|report| report.recompute.is_none() || change.recomputes(successors)),
+            ),
+        }),
         "cache_warming": warmed,
-        "kv_cache": if warmed.iter().any(|report| report.recompute.is_some()) { "recomputed" } else { "warmed" },
         "previous_world_kept": mode,
         "transfer_halvings": throttled.halvings,
         "transfer_restorations": throttled.restorations,

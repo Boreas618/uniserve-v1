@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use storage::manifest::cache::{self, Operation, Snapshot};
-use storage::manifest::{Binding, Encoding, Manifest, Request, World};
+use storage::manifest::{Binding, Encoding, LinkLoad, Manifest, Request, World};
 use storage::protocol::{LinkBandwidth, Placement, Priority, Region};
 
 use crate::engine::client::EngineClient;
@@ -30,6 +30,10 @@ pub(super) struct Report {
     pub warmed_tokens: u64,
     pub recompute: Option<String>,
     pub staged: bool,
+    /// What the rounds' copies moved over each link, as their cache
+    /// manifests planned them.
+    #[serde(skip)]
+    pub links: Vec<LinkLoad>,
     #[serde(skip)]
     pub backup: Vec<Snapshot>,
     /// Whether the warming opened copy sessions on its owners' ranks, which
@@ -195,13 +199,19 @@ async fn rounds(
                     .collect();
                 let backup = source.cache_warm(Operation::Stage { prefixes }).await?;
                 match copy(source, &snapshots, &backup, Priority::Warming).await? {
-                    CopyResult::Complete(bytes) => report.copied_bytes += bytes,
+                    CopyResult::Complete(bytes, links) => {
+                        report.copied_bytes += bytes;
+                        report.links.extend(links);
+                    }
                     CopyResult::Recompute(reason) => return Err(reason),
                 }
             }
         }
         match copy(target, &snapshots, &targets, Priority::Warming).await? {
-            CopyResult::Complete(bytes) => report.copied_bytes += bytes,
+            CopyResult::Complete(bytes, links) => {
+                report.copied_bytes += bytes;
+                report.links.extend(links);
+            }
             CopyResult::Recompute(reason) if !keep => {
                 report.recompute = Some(reason);
                 if !host {
@@ -387,7 +397,8 @@ pub(super) fn keys(snapshots: &[Snapshot]) -> Vec<Vec<u8>> {
 
 /// Load the successor's staged layout after the predecessors evicted their
 /// copied tails. Publication follows physical copy completion on every rank.
-pub(super) async fn materialize(target: &Arc<EngineClient>) -> Result<(), String> {
+/// Returns what the copies moved over each link.
+pub(super) async fn materialize(target: &Arc<EngineClient>) -> Result<Vec<LinkLoad>, String> {
     target
         .resize_cache(proto::request::wire::CacheChange::Grow)
         .await?;
@@ -402,15 +413,15 @@ pub(super) async fn materialize(target: &Arc<EngineClient>) -> Result<(), String
         prefixes: Vec::new(),
         page_tokens: 1,
     };
-    match copy(target, &[source], &destinations, Priority::Promotion).await? {
-        CopyResult::Complete(_) => {}
+    let links = match copy(target, &[source], &destinations, Priority::Promotion).await? {
+        CopyResult::Complete(_, links) => links,
         CopyResult::Recompute(reason) => return Err(reason),
-    }
+    };
     target
         .cache_warm(Operation::Publish { host: false })
         .await?;
     target.hook("uniserve.cache_unstage", "[]").await?;
-    Ok(())
+    Ok(links)
 }
 
 async fn staged(target: &Arc<EngineClient>) -> Result<Vec<cache::Rank>, String> {
@@ -452,7 +463,7 @@ pub(super) async fn restore(target: &Arc<EngineClient>, backup: &[Snapshot]) -> 
         })
         .await?;
     match copy(target, backup, &destinations, Priority::Promotion).await? {
-        CopyResult::Complete(_) => {}
+        CopyResult::Complete(..) => {}
         CopyResult::Recompute(reason) => return Err(reason),
     }
     target
@@ -464,7 +475,8 @@ pub(super) async fn restore(target: &Arc<EngineClient>, backup: &[Snapshot]) -> 
 }
 
 enum CopyResult {
-    Complete(u64),
+    /// The copies ended: the bytes they moved, and over each link.
+    Complete(u64, Vec<LinkLoad>),
     Recompute(String),
 }
 
@@ -552,6 +564,7 @@ async fn copy(
         .collect();
     let mut copies: BTreeMap<(String, u32), Vec<storage::protocol::Span>> = BTreeMap::new();
     let mut bytes = 0;
+    let mut loads = Vec::new();
     for view in views {
         let mut ranks: Vec<storage::manifest::Rank> = Vec::new();
         let mut owners = HashMap::new();
@@ -620,6 +633,7 @@ async fn copy(
             return Err("cache conversion requires a registered numerical converter".into());
         }
         bytes += manifest.copied_bytes();
+        loads.extend(manifest.links.iter().cloned());
         for span in manifest.bind(&request, &request.source).spans() {
             let span = span.map_err(|error| error.to_string())?;
             let Region::Tensor { key, .. } = &span.destination else {
@@ -650,7 +664,7 @@ async fn copy(
             .into_iter()
             .all(|done| done);
         if done {
-            return Ok(CopyResult::Complete(bytes));
+            return Ok(CopyResult::Complete(bytes, loads));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

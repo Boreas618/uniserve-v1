@@ -176,6 +176,16 @@ pub(super) struct Preparing {
     pub(super) in_flight_kv: u64,
     /// Old and successor layouts copied to host storage for promotion and rollback.
     pub(super) host_staging: u64,
+    /// The bytes the requests in flight take in the successor's layout on
+    /// this GPU (their target reservation) when it maps none of this cache:
+    /// what warming copies into the successor, or into host storage when
+    /// staged, and what a staged promotion loads back. Zero for a successor
+    /// that maps the cache.
+    pub(super) in_flight_target: u64,
+    /// The bytes of the requests' last pages that hold fewer tokens than a
+    /// page, which a successor that maps this cache copies into units of
+    /// its own on this GPU at its promotion before the requests append.
+    pub(super) partial_tail_kv: u64,
     /// Target cache storage that must fit after the parked source evicts its tail.
     pub(super) trial_cache: u64,
     /// How long such a promotion waits for that copy at the host link's
@@ -431,6 +441,13 @@ pub(super) fn preparing(
         idle_cached_tail: 0,
         in_flight_kv,
         host_staging,
+        in_flight_target: if adds.unmapped_cache {
+            reservation.bytes
+        } else {
+            0
+        },
+        // The caller counts the requests' partial last pages.
+        partial_tail_kv: 0,
         trial_cache,
         promotion_stall_ms,
         staging_frees,
