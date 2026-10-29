@@ -508,7 +508,7 @@ impl Worker {
                 // The host KV cache's copies run on a copy stream of the
                 // cache's device, beside the forwards on the primary stream.
                 let copy = streams
-                    .create_copy(cuda)
+                    .copy(cuda)
                     .and_then(|copy| Ok(copy.stream()?.clone()))
                     .map_err(phase("streams"))?;
                 reported.host_token_bytes = host::token_bytes(prefix_cache.plan());
@@ -621,7 +621,7 @@ impl Worker {
                 launch.storage.tcp.as_deref(),
             )
             .and_then(|(pool, reported)| {
-                let copy = streams.create_copy(cuda)?.stream()?.clone();
+                let copy = streams.copy(cuda)?.stream()?.clone();
                 ledger.attach_host(pool, copy, cuda);
                 Ok(reported)
             });

@@ -103,7 +103,7 @@ impl Drop for CUDAStream {
 }
 
 /// Every stream of a rank: its primary device's full-device stream, the copy
-/// stream of a rank whose prefix cache copies pages through the host KV cache,
+/// stream of a rank that copies KV or latent pages through host storage,
 /// each device's preparation stream for startup work, the full-device streams
 /// of its other devices, the module streams the executor's components run
 /// beside the primary stream on, and the expert microbatch streams forked from
@@ -115,8 +115,8 @@ pub(crate) struct Streams {
     /// device: every batch's work is issued on it or on a stream forked from
     /// it.
     primary: Option<CUDAStream>,
-    /// The stream a batch's page copies through the host KV cache run on,
-    /// beside the primary stream, on the cache's device.
+    /// KV and latent page copies share this stream beside numerical work.
+    /// Both pools belong to the rank's primary device.
     copy: Option<CUDAStream>,
     /// The full-device streams of the rank's other CUDA devices.
     devices: Vec<CUDAStream>,
@@ -157,13 +157,20 @@ impl Streams {
         Ok(streams)
     }
 
-    /// Create the copy stream, a full-device stream of `device`, the device of
-    /// the prefix cache that maps a host page pool. Returns it.
-    pub(crate) fn create_copy(&mut self, device: DeviceId) -> Result<&CUDAStream> {
-        if self.copy.is_some() {
-            return Err(Error::State("the rank's copy stream is already created"));
+    /// Borrow the rank's copy stream, creating it for the first host pool.
+    /// The rank owns its lifetime; each pool shares the stream handle.
+    pub(crate) fn copy(&mut self, device: DeviceId) -> Result<&CUDAStream> {
+        if self.copy.is_none() {
+            self.copy = Some(CUDAStream::create(device)?);
         }
-        Ok(self.copy.insert(CUDAStream::create(device)?))
+        let copy = self
+            .copy
+            .as_ref()
+            .ok_or(Error::State("the rank has no copy stream"))?;
+        if copy.device() != device {
+            return Err(Error::State("host pools must share the rank's copy device"));
+        }
+        Ok(copy)
     }
 
     /// The primary and the copy stream, by the names the rank reports their
