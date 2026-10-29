@@ -215,8 +215,10 @@ def fingerprints(
     The manifest identity describes tensor shapes and representations. A
     tensor's value identity describes its checkpoint inputs, slices, dtype,
     quantization and explicitly declared derivations. Kernel providers enter
-    only encoded tensors' storage identities. Model numerical configuration
-    that changes no loading input changes no retained weight key.
+    the exact manifest identity; tensor source keys stay independent of
+    provider layout so the manifest can convert their encoded fields. Model
+    numerical configuration that changes no loading input changes no retained
+    weight key.
 
     Construction and assignment compilation use meta tensors; checkpoint
     readers supply metadata without materializing parameter payloads.
@@ -411,8 +413,12 @@ def fingerprints(
                 if isinstance(owner, ExpertLinear):
                     storage.append(expert_kernels)
             if key in active:
-                stored[name] = digest("tensor-storage", storage)
-                layouts.append((name, representation))
+                # Provider selection chooses a layout, not new numerical
+                # values. Exact manifest lookup includes that choice; the
+                # redistribution planner can still match its source values
+                # and convert the declared encoding without reading files.
+                stored[name] = digest("tensor-storage", value)
+                layouts.append((name, representation, storage[1:]))
         tensor_values = {
             id(tensor): values[name] for name, tensor in named.items()
         }
@@ -670,6 +676,7 @@ def field_parts(
                     "shape": list(form[1]),
                     "strides": _strides(form[1]),
                     "logical": form[2].describe(),
+                    "parameters": entry.representation,
                 },
             },
         }

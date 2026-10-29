@@ -713,7 +713,10 @@ def load_model(
     # Worker hooks reach the modules a rank loaded (``uniserve.hooks``).
     from uniserve import hooks
 
-    hooks.register_model(loaded.module)
+    # Admin hooks use the same checkpoint module paths as expert orders and
+    # retained manifests, including on dedicated expert ranks. The callable
+    # subset's ModuleList indices are not model identities.
+    hooks.register_model(loaded.root)
     return loaded
 
 

@@ -263,25 +263,13 @@ impl WeightKeys {
         let planned = started.elapsed();
         let own_rank = rank as u32;
 
-        // The tensors of regions no source holds, and of fields that move
-        // only through a conversion of their encoding, are read.
-        let mut missing: BTreeSet<String> = manifest
+        // Only numerical regions absent from every source need the checkpoint.
+        let missing: BTreeSet<String> = manifest
             .missing
             .iter()
             .filter(|missing| missing.rank == own_rank)
             .map(|missing| tensor_of(&missing.tensor).to_owned())
             .collect();
-        for decode in &manifest.decodes {
-            let staging = &manifest.stagings[decode.staging as usize];
-            if staging.rank == own_rank {
-                missing.extend(
-                    decode
-                        .fields
-                        .iter()
-                        .map(|(_, field)| tensor_of(field).to_owned()),
-                );
-            }
-        }
 
         // Map the chunks a source holds on this GPU, create the rest.
         let mapped: BTreeSet<(u32, u32)> = manifest
@@ -380,9 +368,8 @@ impl WeightKeys {
         zero_created(&mapped_storages, &writable, device)?;
         let zeroed = started.elapsed();
 
-        // The copies into this rank's storages, as one transfer task;
-        // copies through staging spaces move encoded fields, which the rank
-        // reads instead.
+        // Affine copies stay asynchronous. Canonical groups are converted
+        // separately with bounded scratch on this rank's preparation stream.
         let mut copies = manifest.clone();
         copies.copies.retain(|copy| {
             copy.target.rank == own_rank
@@ -444,6 +431,21 @@ impl WeightKeys {
         drop(receiving_records);
         retained.use_keys(shared.iter().copied().chain(receiving.values().copied()));
         let registered = started.elapsed();
+        let conversions = super::conversion::Conversions {
+            retained,
+            request: &request,
+            manifest: &manifest,
+            sources: &sources.world,
+            rank: own_rank,
+            device,
+        };
+        let converted_bytes = match conversions.execute(&mapped_storages, &receiving) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                retained.forget(&receiving.values().copied().collect::<Vec<_>>())?;
+                return Err(error);
+            }
+        };
         let task = if spans.is_empty() {
             None
         } else {
@@ -461,6 +463,7 @@ impl WeightKeys {
             mapped = shared.len(),
             created = created.len(),
             copied_bytes = bytes,
+            converted_bytes,
             spans = spans_count,
             missing = missing.len(),
             digest = %super::hex(&manifest.digest),

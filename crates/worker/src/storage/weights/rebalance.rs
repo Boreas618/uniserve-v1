@@ -57,7 +57,7 @@ impl WeightKeys {
         };
         let manifest = ::storage::manifest::Manifest::plan(&request)
             .map_err(|error| Error::Interface(error.to_string()))?;
-        if !manifest.missing.is_empty() || !manifest.decodes.is_empty() {
+        if !manifest.missing.is_empty() {
             return Err(Error::State(
                 "expert source manifests must cover every requested weight",
             ));

@@ -49,6 +49,8 @@ pub struct PlannedRank {
     pub gpu: Gpu,
     pub total_bytes: u64,
     pub free_bytes: u64,
+    /// Allocation unit for retained conversion scratch on this GPU.
+    pub allocation_granularity: u64,
     /// Resident deployment storage and the Transfer Server context needed
     /// beside this rank, measured from the device ledger.
     pub resident_bytes: u64,
