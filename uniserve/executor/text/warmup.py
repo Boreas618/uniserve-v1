@@ -582,7 +582,9 @@ def finish(computations: Sequence[TextComputation]) -> None:
                             ScoreKey(buckets[place], tops[position])
                         )
             if runner.shapes.verify:
-                reporting = task_buckets(dims.tokens)
+                # A verification reports at most a row per candidate row it
+                # projects: each task's current token and drafts.
+                reporting = task_buckets(dims.logit_rows())
                 for place in reversed(range(len(reporting))):
                     for position in reversed(range(len(tops))):
                         if (
