@@ -30,6 +30,25 @@ impl Scheduler {
                     failure.refusals.contains_key(request)
                         || self.inflight.refused.contains(request)
                 });
+            // The batches the failure struck, before their retirement below
+            // forgets them: the batch it names, or else every batch in flight
+            // that holds a call of the requests it names.
+            let mut struck: Vec<u64> = match execution.and_then(|value| value.batch_id) {
+                Some(batch) => vec![batch],
+                None => self
+                    .inflight
+                    .pending_batches
+                    .iter()
+                    .filter(|(_, batch)| {
+                        batch
+                            .calls
+                            .iter()
+                            .any(|(request, _)| failure.requests.contains(request))
+                    })
+                    .map(|(id, _)| *id)
+                    .collect(),
+            };
+            struck.sort_unstable();
             if code == Some(ipc::ErrorCode::InvariantViolation) {
                 self.fail(format!(
                     "a worker's control-plane invariant failed: {error:#}"
@@ -60,19 +79,24 @@ impl Scheduler {
             // A world on trial is not repaired: a worker fault, rather than a
             // request its workers rejected, fails it as a whole, and the
             // daemon rolls back to the previous world.
+            // The failure names the batch it struck and its requests, which
+            // the rollback keeps with its reason for diagnosis.
             if self.trial && !refused && code != Some(ipc::ErrorCode::InputError) {
+                let requests: Vec<u64> = failure
+                    .requests
+                    .iter()
+                    .map(|request| request.request_id.0)
+                    .collect();
                 self.fail(match (code, execution.and_then(|value| value.batch_id)) {
                     (Some(ipc::ErrorCode::NumericalFault), Some(batch)) => {
-                        let requests: Vec<u64> = failure
-                            .requests
-                            .iter()
-                            .map(|request| request.request_id.0)
-                            .collect();
                         format!(
                             "batch {batch} computed non-finite logits for requests {requests:?}"
                         )
                     }
-                    _ => format!("a worker failed during the world's trial: {error:#}"),
+                    _ => format!(
+                        "a worker failed during the world's trial in batches {struck:?} of \
+                         requests {requests:?}: {error:#}"
+                    ),
                 });
                 return;
             }
