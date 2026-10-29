@@ -52,13 +52,12 @@ pub struct PrefixCacheInfo {
     pub inherited_start: u32,
     #[serde(default)]
     pub inherited_units: u32,
-    /// The identity of the model the rank computes the pages with and of
-    /// what its forwards compute (the weights' fingerprint and
-    /// `uniserve.numerics.identity`), which roots the prefix hash chains of
-    /// its pages: the pages of a world whose identity differs are not this
-    /// world's. Empty for a rank that reports none.
+    /// Upstream numerical component identities of each cache group, in
+    /// group order. Each string names its resident layers and their loading
+    /// inputs. Pipeline stages union these components; an unrelated group
+    /// or a downstream output head changes none of a group's keys.
     #[serde(default)]
-    pub identity: String,
+    pub identities: Vec<String>,
     /// The bytes one token of the rank's pages takes in the host KV cache,
     /// over every cache group (a group's page bytes over its block size,
     /// rounded up); zero for a rank that copies no page through it. The
@@ -73,6 +72,25 @@ pub struct PrefixCacheInfo {
 }
 
 impl PrefixCacheInfo {
+    /// One stable prefix-chain root per cache group. Empty declarations
+    /// denote unkeyed pools of protocol consumers without models.
+    pub fn seeds(&self) -> Vec<u64> {
+        use sha2::{Digest, Sha256};
+        (0..self.groups.len())
+            .map(|group| {
+                self.identities
+                    .get(group)
+                    .filter(|value| !value.is_empty())
+                    .map_or(0, |identity| {
+                        let digest = Sha256::digest(identity.as_bytes());
+                        let mut seed = [0; 8];
+                        seed.copy_from_slice(&digest[..8]);
+                        u64::from_le_bytes(seed)
+                    })
+            })
+            .collect()
+    }
+
     /// The units below the first segment given back: every unit of planes
     /// not split.
     pub fn allocatable_units(&self) -> u32 {
@@ -290,6 +308,10 @@ impl PrefixCacheInfo {
             "worker info declare an incomplete cache unit pool"
         );
         ensure_valid!(
+            self.identities.is_empty() || self.identities.len() == self.groups.len(),
+            "worker cache identities must cover every group"
+        );
+        ensure_valid!(
             self.scratch_units < self.num_units - 1,
             "worker scratch units leave no cache unit to allocate"
         );
@@ -368,13 +390,17 @@ impl PrefixCacheInfo {
             scratch_units: self.scratch_units.max(other.scratch_units),
             // The stages compute the pages together: every stage's identity
             // roots them.
-            identity: if self.identity == other.identity {
-                self.identity.clone()
-            } else {
-                let mut identities = [self.identity.as_str(), other.identity.as_str()];
-                identities.sort_unstable();
-                identities.join("+")
-            },
+            identities: (0..self.groups.len())
+                .map(|group| {
+                    let mut components = std::collections::BTreeSet::new();
+                    for pool in [self, other] {
+                        if let Some(identity) = pool.identities.get(group) {
+                            components.extend(identity.split('|'));
+                        }
+                    }
+                    components.into_iter().collect::<Vec<_>>().join("|")
+                })
+                .collect(),
             // Stages whose planes split alike give storage back together;
             // planes split otherwise hold every unit and give back none.
             segments: if self.segments == other.segments {
@@ -914,7 +940,7 @@ impl Default for WorkerInfo {
                 held_segments: 0,
                 inherited_start: 0,
                 inherited_units: 0,
-                identity: String::new(),
+                identities: Vec::new(),
                 host_token_bytes: 0,
                 storage_endpoint: None,
             }),

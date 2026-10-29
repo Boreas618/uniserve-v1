@@ -44,12 +44,12 @@ pub struct RequestHold {
 /// The state the requests migrating out of world `world` continue with,
 /// although the world that serves next computes other numerics: a world
 /// change's `in_flight = keep`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Kept {
     pub world: u64,
-    /// The prefix seed of the pages a token request continues with
-    /// (`CachePolicy::state_seed`), when the worlds' pages differ.
-    pub prefix_seed: Option<u64>,
+    /// The prefix seeds of the pages a token request continues with
+    /// (`CachePolicy::state_seeds`), when the worlds' pages differ.
+    pub prefix_seeds: Option<Vec<u64>>,
     /// The latent seed of the trajectories a request continues with
     /// (`Trajectory::state_seed`: a video request's, or the image a token
     /// request had begun), when the worlds' trajectories differ.
@@ -104,6 +104,7 @@ impl RequestHold {
         self.kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
             .filter(|kept| kept.world == world)
     }
 

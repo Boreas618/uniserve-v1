@@ -1787,13 +1787,20 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
             .unwrap_or(u32::MAX),
         }),
         segments: describe(&schedulers)?,
-        prefix_seed: crate::kv_cache::prefix_seed(
-            first
-                .info()
-                .prefix_cache
-                .as_ref()
-                .map_or("", |cache| cache.identity.as_str()),
-        ),
+        prefix_seeds: first
+            .info()
+            .prefix_cache
+            .as_ref()
+            .map_or_else(Vec::new, |cache| {
+                cache
+                    .seeds()
+                    .into_iter()
+                    .zip(&cache.groups)
+                    .filter_map(|(seed, group)| {
+                        (!matches!(group.kind, ipc::CacheGroupKind::Draft)).then_some(seed)
+                    })
+                    .collect()
+            }),
         latent_seed: first.latent_seed(),
     };
     // Standby and serving engines share one control channel. Standby

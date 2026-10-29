@@ -118,10 +118,12 @@ message EngineInfo {
   // The KV cache segments of each worker group, which an engine that
   // succeeds this one on the same devices maps.
   repeated CacheSegments segments = 7;
-  // The root of the prefix hash chains of the pages the engine's workers
+  reserved 8;
+  reserved "prefix_seed";
+  // The roots of the prefix hash chains of the pages the engine's workers
   // compute: equal between worlds whose models and numerics agree, whose
   // pages a successor reuses.
-  uint64 prefix_seed = 8;
+  repeated uint64 prefix_seeds = 10;
   // The seed of the keys of the latent trajectories the engine's denoiser
   // (a video model's, or an image model's) stores at preemption: equal
   // between worlds whose denoising computes the same, which continue each
@@ -775,9 +777,11 @@ message CachePolicy {
   bool read = 1;
   bool write = 2;
   optional uint64 isolation_key = 3;
-  // The prefix seed of the world whose state a migrated request continues
+  reserved 4;
+  reserved "state_seed";
+  // The prefix seeds of the world whose state a migrated request continues
   // with (a world change's `in_flight = keep`).
-  optional uint64 state_seed = 4;
+  repeated uint64 state_seeds = 6;
   CacheResume resume = 5;
 }
 

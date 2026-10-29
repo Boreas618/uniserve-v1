@@ -941,9 +941,19 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
             assert stream.usage == usage
 
 
-def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
+@pytest.mark.parametrize("component", ["capture", "output-head"])
+def test_a_change_of_the_executable_alone_invalidates_nothing(
+    tmp_path: Path, component: str
+):
     name = "qwen3-same-keys"
-    with _serve(tmp_path, name) as (base_url, _):
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    environment = {
+        "PYTHONPATH": os.pathsep.join(
+            [str(plugins), *filter(None, [os.environ.get("PYTHONPATH")])]
+        )
+    }
+    with _serve(tmp_path, name, env=environment) as (base_url, _):
         # The prompt's pages are computed once and then found cached, on the
         # device and, once pushed out of it, in the host KV cache.
         answer = _chat(base_url, name, CACHED_PROMPT)
@@ -952,9 +962,17 @@ def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
         host_before = _host_hits_of(base_url, name, CACHED_PROMPT, 0)
         assert host_before[1] > 0, host_before
 
-        # A world capturing other batch sizes computes the same functions in
-        # the same formats: it maps every retained weight and keeps every
-        # page key.
+        # A head's function revision affects logits, downstream of every
+        # cache write. Neither it nor graph capture changes these page keys.
+        if component == "output-head":
+            _plugin(
+                plugins,
+                "head_revision",
+                "from uniserve.nn.linear import VocabParallelHead\n\n"
+                "def register(registry):\n"
+                "    VocabParallelHead.function = "
+                '"nn.linear.VocabParallelHead/2"\n',
+            )
         report = _world_change(base_url, CHANGE)
         assert (report["numerics"], report["weights"]) == (
             "unchanged",

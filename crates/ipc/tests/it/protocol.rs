@@ -1645,14 +1645,19 @@ fn worker_info_rejects_inconsistent_cache_groups() {
 /// and must agree on every group's page shape.
 #[test]
 fn cache_stages_merge_into_the_narrowest_pool() {
-    let first = full_caps().prefix_cache.unwrap();
+    let mut first = full_caps().prefix_cache.unwrap();
+    first.identities = vec!["layer-0:function-1".into(), "layer-1:function-1".into()];
     let mut second = first.clone();
     second.num_units = 1024;
     second.groups[0].layer_ids = vec![28, 29];
+    second.identities[0] = "layer-28:function-1|layer-29:function-1".into();
     let merged = first.merge(&second).unwrap();
     assert_eq!(merged.num_units, 1024);
     assert_eq!(merged.groups[0].layer_ids.len(), 16);
     assert_eq!(merged.groups[1].layer_ids, first.groups[1].layer_ids);
+    assert_eq!(merged.seeds(), second.merge(&first).unwrap().seeds());
+    assert_ne!(merged.seeds()[0], first.seeds()[0]);
+    assert_eq!(merged.seeds()[1], first.seeds()[1]);
 
     second.groups[1].units_per_page = 3;
     assert!(first.merge(&second).is_err());

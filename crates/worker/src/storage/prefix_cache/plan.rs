@@ -340,7 +340,7 @@ impl CachePlan {
             inherited_start: 0,
             inherited_units: 0,
             // The worker reports its identity once it loaded the model.
-            identity: String::new(),
+            identities: Vec::new(),
             // The rank reports what its host KV cache takes once the engine
             // copies its pages through one.
             host_token_bytes: 0,

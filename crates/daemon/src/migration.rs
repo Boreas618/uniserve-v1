@@ -174,8 +174,8 @@ impl Resumable {
                 continuation.sampling.n_prompt_logprobs = 0;
                 // It reads the state it reached and publishes later pages
                 // only to its private continuation: they are neither world's.
-                if let Some(seed) = kept.and_then(|kept| kept.prefix_seed) {
-                    continuation.cache.state_seed = Some(seed);
+                if let Some(seeds) = kept.as_ref().and_then(|kept| kept.prefix_seeds.as_ref()) {
+                    continuation.cache.state_seeds = seeds.clone();
                     continuation.cache.write = false;
                 }
                 stored(
@@ -815,7 +815,7 @@ mod tests {
         );
         let kept = Kept {
             world: 1,
-            prefix_seed: None,
+            prefix_seeds: None,
             latent_seed: Some(11),
         };
         assert_eq!(

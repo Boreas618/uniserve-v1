@@ -2003,7 +2003,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
             read,
             write,
             isolation_key: Some(isolation_key),
-            state_seed: None,
+            state_seeds: Vec::new(),
             resume: None,
         };
         let mut events = handle.submit(request).expect("submit cache request");

@@ -16,10 +16,11 @@ the weights, cache pages and encoder outputs it derived:
 - A module's format is that of the tensors it holds itself: each
   parameter's and buffer's element type, or a quantized tensor's encoding
   and the layout its kernels read.
-- A module's identity digests its function, its format and its children's
-  identities in registration order. A model's identity keys what its
-  forwards compute, such as its KV cache pages; the identity of its weight
-  loading (:func:`loading`) keys its retained weights.
+- A module's identity digests its function, declared mathematical
+  arguments, tensor formats and children's identities. Cache-writing
+  phases additionally identify their upstream computations and individual
+  tensor loading inputs; downstream heads contribute no cache dependency.
+  Weight loading (:func:`loading`) independently keys retained weights.
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ import functools
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 from importlib import metadata
 
 import torch
@@ -121,30 +124,158 @@ def module_format(module: nn.Module) -> list[tuple[str, dict[str, object]]]:
     ]
 
 
-def identity(module: nn.Module) -> str:
+def parameters(module: nn.Module) -> dict[str, object]:
+    """Declared mathematical arguments, excluding execution resources.
+
+    A component names its scalar or immutable configuration attributes in
+    ``function_parameters``. Those values are part of its function, just as
+    its revision is. Tensor values are supplied separately by the loader.
+    """
+    return {
+        name: getattr(module, name)
+        for name in getattr(module, "function_parameters", ())
+    }
+
+
+def canonical(value):
+    """A stable JSON value for immutable numerical arguments."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return canonical(asdict(value))
+    if isinstance(value, Enum):
+        return f"{type(value).__qualname__}.{value.name}"
+    if isinstance(value, Mapping):
+        return {str(key): canonical(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [canonical(item) for item in value]
+    if isinstance(value, (torch.dtype, torch.device)):
+        return str(value)
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    raise TypeError(f"not a numerical argument: {type(value).__qualname__}")
+
+
+def identity(
+    module: nn.Module,
+    *,
+    values: Mapping[int, str] | None = None,
+    select: tuple[str, ...] | None = None,
+) -> str:
     """The digest of what ``module`` computes: its function, its format and
     its children's identities, in registration order, as lowercase
     hexadecimal SHA-256.
 
+    ``values`` supplies each tensor's loading identity by object identity.
+    ``select`` restricts the computation to named child paths or tensors;
+    intermediate components still contribute their function declarations.
+    A cache-writing phase uses this to exclude downstream computations.
+
     Raises:
         SetupError: A module of the tree declares no function.
     """  # noqa: D205
-    memo: dict[int, str] = {}
+    memo: dict[tuple[int, tuple[str, ...] | None], str] = {}
 
-    def visit(node: nn.Module) -> str:
-        known = memo.get(id(node))
+    def visit(node: nn.Module, selected: tuple[str, ...] | None) -> str:
+        key = (id(node), selected)
+        known = memo.get(key)
         if known is not None:
             return known
         digest = hashlib.sha256()
         _hash(digest, function(type(node)))
-        _hash(digest, json.dumps(module_format(node), sort_keys=True))
-        for name, child in node.named_children():
+        arguments = parameters(node)
+        if selected is not None:
+            arguments = {
+                name: value
+                for name, value in arguments.items()
+                if name in selected
+            }
+        _hash(digest, json.dumps(canonical(arguments), sort_keys=True))
+        for name, tensor in (
+            *node.named_parameters(recurse=False),
+            *node.named_buffers(recurse=False),
+        ):
+            if selected is not None and name not in selected:
+                continue
             _hash(digest, name)
-            _hash(digest, visit(child))
-        memo[id(node)] = digest.hexdigest()
-        return memo[id(node)]
+            _hash(digest, json.dumps(tensor_format(tensor), sort_keys=True))
+            if values is not None:
+                _hash(digest, values[id(tensor)])
+        for name, child in node.named_children():
+            paths = None
+            if selected is not None and name not in selected:
+                paths = tuple(
+                    path[len(name) + 1 :]
+                    for path in selected
+                    if path.startswith(f"{name}.")
+                )
+                if not paths:
+                    continue
+            _hash(digest, name)
+            _hash(digest, visit(child, paths))
+        memo[key] = digest.hexdigest()
+        return memo[key]
 
-    return visit(module)
+    return visit(module, select)
+
+
+def cache_identities(
+    module: nn.Module, values: Mapping[int, str] | None = None
+) -> dict[str, str]:
+    """Keys of cache writes, before parallel binding prunes the model.
+
+    Each decoder layer reads the embedding and every preceding layer. Its
+    cache-writing phase declares only the computation before that write.
+    The final norm and vocabulary projection therefore cannot invalidate
+    target K/V; draft state additionally depends on the final hidden state
+    and its own numerical modules.
+    """
+    from uniserve.models import CausalLM, Drafter, TransformerDecoder
+
+    result = {}
+    for decoder in module.modules():
+        if not isinstance(decoder, TransformerDecoder):
+            continue
+        upstream = hashlib.sha256()
+        for model in module.modules():
+            if isinstance(model, CausalLM) and model.backbone is decoder:
+                _hash(
+                    upstream,
+                    identity(
+                        model, values=values, select=tuple(parameters(model))
+                    ),
+                )
+        _hash(
+            upstream,
+            identity(
+                decoder,
+                values=values,
+                select=("embedding", *parameters(decoder)),
+            ),
+        )
+        for layer in decoder.layers.values():
+            selected = getattr(layer, "cache_dependencies", None)
+            if selected is None:
+                raise SetupError(
+                    f"{type(layer).__qualname__} declares no cache_dependencies"
+                )
+            current = upstream.copy()
+            _hash(current, identity(layer, values=values, select=selected))
+            for child in layer.modules():
+                name = getattr(child, "cache_name", None)
+                if name is not None and hasattr(child, "cache_state"):
+                    result[name] = current.hexdigest()
+            _hash(upstream, identity(layer, values=values))
+        if decoder.norm is not None:
+            _hash(upstream, identity(decoder.norm, values=values))
+        for model in module.modules():
+            if not isinstance(model, CausalLM) or model.backbone is not decoder:
+                continue
+            for drafter in model.modules():
+                if isinstance(drafter, Drafter):
+                    draft = upstream.copy()
+                    _hash(draft, identity(drafter, values=values))
+                    for name in drafter.cache_config.layers:
+                        result[name] = draft.hexdigest()
+    return result
 
 
 def loading(encodings: Iterable[str]) -> str:

@@ -2008,7 +2008,7 @@ mod tests {
             held_segments: 0,
             inherited_start: 0,
             inherited_units: 0,
-            identity: String::new(),
+            identities: Vec::new(),
             host_token_bytes: 0,
             storage_endpoint: None,
         }

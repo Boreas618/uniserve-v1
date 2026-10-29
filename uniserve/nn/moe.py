@@ -33,6 +33,7 @@ class TopK(nn.Module):
     """
 
     function = "nn.moe.TopK/1"
+    function_parameters = ("k", "renormalize")
 
     def __init__(self, k: int, *, renormalize: bool = True) -> None:
         super().__init__()
@@ -134,6 +135,7 @@ class FusedMoE(nn.Module):
     """
 
     function = "nn.moe.FusedMoE/1"
+    function_parameters = ("activation",)
 
     def __init__(
         self,

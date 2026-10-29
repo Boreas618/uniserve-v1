@@ -193,6 +193,14 @@ class GatedDeltaNet(nn.Module):
     """
 
     function = "nn.gated_delta.GatedDeltaNet/1"
+    function_parameters = (
+        "num_key_heads",
+        "num_value_heads",
+        "key_dim",
+        "value_dim",
+        "kernel",
+        "state_dtype",
+    )
 
     # The tensor-operation implementation of the chunked rule runs a host
     # loop over every chunk of a prompt forward, launching too many kernels

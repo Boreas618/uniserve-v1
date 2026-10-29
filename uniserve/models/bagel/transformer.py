@@ -32,6 +32,7 @@ class TransformerLayer(MoTLayer):
     """
 
     function = "models.bagel.transformer.TransformerLayer/1"
+    cache_dependencies = ("input_norms", "projections", "rotary")
 
     def __init__(self, config: TransformerConfig, index: int):
         hidden, dim = config.hidden_size, config.head_dim

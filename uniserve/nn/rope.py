@@ -166,6 +166,23 @@ class RotaryEmbedding(nn.Module):
 
     function = "nn.rope.RotaryEmbedding/1"
 
+    @property
+    def function_parameters(self) -> tuple[str, ...]:
+        """Only scaled recipes read the configured context bound."""
+        common = (
+            "dim",
+            "theta",
+            "sections",
+            "scaling",
+            "attention_scale",
+            "keep_freq_range",
+        )
+        return (
+            common
+            if self.scaling is None
+            else (*common, "_maximum", "_partial", "_head_dim")
+        )
+
     # Registered when ``sections`` selects multimodal positions.
     frequency_axes: torch.Tensor
 

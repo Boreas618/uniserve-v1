@@ -188,6 +188,15 @@ class TransformerLayer(nn.Module):
     """
 
     function = "models.qwen3_5.transformer.TransformerLayer/1"
+    # Either mixer writes state; the output norm and MLP are downstream.
+    cache_dependencies = (
+        "input_norm",
+        "attention.qkv",
+        "attention.key_norm",
+        "attention.rotary",
+        "linear_attention.projection",
+        "linear_attention.mixer",
+    )
 
     def __init__(self, config: Config, linear: bool, cache_name: str | None):
         super().__init__()

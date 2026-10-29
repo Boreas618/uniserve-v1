@@ -97,6 +97,7 @@ class AxialQKVProjection(QKVProjection):
     """
 
     function = "nn.attention.projection.AxialQKVProjection/1"
+    function_parameters = ("axis_dims", "rotations")
 
     def __init__(
         self, projection, query_norm, key_norm, *, axis_dims, rotations

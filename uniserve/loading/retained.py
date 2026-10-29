@@ -265,11 +265,7 @@ def fingerprints(
     }
     # Pipeline pruning can leave a different alias of a tied parameter.
     # Every resident alias must resolve to the same loading identity.
-    named = {
-        name: tensor
-        for name, tensor in tensors(model, aliases=True)
-        if id(tensor) in active
-    }
+    named = dict(tensors(model, aliases=True))
     inputs: dict[int, list[Any]] = {}
     encodings: dict[int, set[str]] = {}
     derived: dict[int, Any] = {}
@@ -291,11 +287,9 @@ def fingerprints(
     try:
         with ExitStack() as stack:
             for component in declared:
-                if component.module not in selected and not any(
-                    id(tensor) in active
-                    for _, tensor in tensors(component.module)
-                ):
-                    continue
+                # State on a later pipeline stage depends on the earlier
+                # stages' computations and weights. Read all metadata;
+                # only resident tensors enter the retained-weight manifest.
                 if io.mode != "dummy" or component.derivations:
                     reader = readers.get(component.source)
                     if reader is None:
@@ -416,18 +410,17 @@ def fingerprints(
                 owner, _ = compiler._owners[key]
                 if isinstance(owner, ExpertLinear):
                     storage.append(expert_kernels)
-            stored[name] = digest("tensor-storage", storage)
-            layouts.append((name, representation))
+            if key in active:
+                stored[name] = digest("tensor-storage", storage)
+                layouts.append((name, representation))
+        tensor_values = {
+            id(tensor): values[name] for name, tensor in named.items()
+        }
         return {
             "structure": digest("weight-layout", layouts),
             "tensors": stored,
-            "values": digest(
-                "model-values",
-                source.model_class,
-                source.model,
-                source.weights,
-                values,
-            ),
+            "values": digest("model-values", source.model, values),
+            "cache": numerics.cache_identities(model, tensor_values),
         }
     finally:
         compiler.close()

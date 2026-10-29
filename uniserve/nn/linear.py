@@ -736,6 +736,7 @@ class VocabParallelEmbedding(nn.Module):
     """Embed owned vocabulary IDs, masking padding before a numerical sum."""
 
     function = "nn.linear.VocabParallelEmbedding/1"
+    function_parameters = ("padding_idx",)
 
     # Recorded by parallelize_ once the layer is bound to its partition.
     _parallel_mesh: DeviceMesh
@@ -814,6 +815,7 @@ class VocabParallelHead(ColumnParallelLinear):
     """  # noqa: D205
 
     function = "nn.linear.VocabParallelHead/1"
+    function_parameters = ("softcap",)
 
     def __init__(
         self,

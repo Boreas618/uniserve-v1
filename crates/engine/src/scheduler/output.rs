@@ -1858,7 +1858,8 @@ impl Scheduler {
         let cache_write =
             state.req.cache.write && !state.has_context_images() && !state.rebuilds_images();
         let isolation_key = state.req.cache.isolation_key;
-        let scope = crate::kv_cache::PrefixScope::of(&state.req.cache);
+        let cache_policy = state.req.cache.clone();
+        let scope = crate::kv_cache::PrefixScope::of(&cache_policy);
         // Past its prompt, the cache of a request that generates text alone
         // holds the tokens it generated here (a migrated request's earlier
         // ones end its prompt), each written by the decode that reads it:

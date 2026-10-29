@@ -94,7 +94,7 @@ pub(crate) fn token_bytes(plan: &CachePlan) -> u64 {
 }
 
 /// The digest of the byte layout of `group`'s pages: the page encoding,
-/// the cache dtype and every group's shape, and the group itself. It
+/// the cache dtype and this group's shape and logical layers. It
 /// identifies the group's page pool (`PageShape::layout`).
 fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
     let mut digest = Sha256::new();
@@ -102,8 +102,9 @@ fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.update(PAGE_ENCODING.to_le_bytes());
     digest.update([u8::from(plan.quantized)]);
     digest.update(plan.plane_bytes.to_le_bytes());
-    digest.update((plan.groups.len() as u64).to_le_bytes());
-    for entry in &plan.groups {
+    digest.update(plan.columns.to_le_bytes());
+    {
+        let entry = &plan.groups[group];
         digest.update(entry.window.unwrap_or(0).to_le_bytes());
         digest.update(entry.block_size.to_le_bytes());
         digest.update((entry.layer_ids.len() as u64).to_le_bytes());
@@ -121,12 +122,11 @@ fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
             digest.update(entry.units_per_page.to_le_bytes());
         }
     }
-    digest.update((group as u64).to_le_bytes());
     digest.finalize().into()
 }
 
-/// The digest of what determines the values of `group`'s pages: the model
-/// fingerprint and the pages' layout. It seeds the group's page keys.
+/// The digest of what determines a group's pages: its upstream component
+/// fingerprints and its own page layout. It seeds the group's page keys.
 fn content(fingerprint: &str, layout: &[u8; 32]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"uniserve-page-content\0");
@@ -138,17 +138,17 @@ fn content(fingerprint: &str, layout: &[u8; 32]) -> [u8; 32] {
 
 /// The key seed of each of `plan`'s groups' page pools for a model of
 /// `fingerprint` (`HostKvCache::start` reports them).
-pub(crate) fn page_contents(plan: &CachePlan, fingerprint: &str) -> Vec<[u8; 32]> {
+pub(crate) fn page_contents(plan: &CachePlan, fingerprints: &[String]) -> Vec<[u8; 32]> {
     (0..plan.groups.len())
-        .map(|group| content(fingerprint, &layout(plan, group)))
+        .map(|group| content(&fingerprints[group], &layout(plan, group)))
         .collect()
 }
 
 /// What a rank whose pages the engine copies through the host KV cache
 /// keeps until the engine sizes it (`uniserve.host_cache`).
 pub(crate) struct HostCacheSetup {
-    /// The pages' key digest (`Fingerprints::pages`).
-    pub(crate) fingerprint: String,
+    /// Each group's upstream component identities.
+    pub(crate) fingerprint: Vec<String>,
     /// Where an engine on another host reaches the host's Storage Server.
     pub(crate) endpoint: Option<String>,
     /// The cache's device.
@@ -197,7 +197,7 @@ impl HostKvCache {
         retained: &Retained,
         plan: &CachePlan,
         device: DeviceId,
-        fingerprint: &str,
+        fingerprints: &[String],
         endpoint: Option<&str>,
         tokens: u64,
     ) -> Result<(Self, Vec<PagePoolInfo>)> {
@@ -205,7 +205,7 @@ impl HostKvCache {
         let mut infos = Vec::new();
         for (index, group) in plan.groups.iter().enumerate() {
             let layout = layout(plan, index);
-            let content = content(fingerprint, &layout);
+            let content = content(&fingerprints[index], &layout);
             // The pool lies on the host NUMA node closest to the device, so
             // the copies between them cross no inter-node link.
             let numa_node = device

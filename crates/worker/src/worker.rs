@@ -479,19 +479,29 @@ impl Worker {
 
         let storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
             .map_err(phase("storage"))?;
-        // The engine copies the cache's pages through the host KV cache when
-        // it says so; pages are keyed by the whole model's fingerprint and
-        // the identity of what its forwards compute.
+        // Media pools currently combine their numerical identity with the
+        // model's loading inputs.
         let model_fingerprint = fingerprints
             .as_ref()
             .map(|fingerprints| fingerprints.pages(&identity));
-        // The engine roots the prefix hash chains of the rank's pages at the
-        // same identity, so a world computing other numerics, or with other
-        // weights, hits none of them.
-        if let Some(reported) = info.prefix_cache.as_mut() {
-            reported.identity = model_fingerprint
-                .clone()
-                .unwrap_or_else(|| identity.clone());
+        // Cache groups depend on their own upstream computations. An output
+        // head or an optional drafter cannot invalidate target pages.
+        if let (Some(reported), Some(cache)) =
+            (info.prefix_cache.as_mut(), storage.prefix_cache.as_ref())
+        {
+            reported.identities = match &fingerprints {
+                Some(fingerprints) => fingerprints.cache_groups(cache.plan())?,
+                None => {
+                    let declared: tvm_ffi::String =
+                        Interpreter::import("uniserve.loading.rank.cache_identity")?
+                            .call_values(&[model.handle().to_any()])?
+                            .try_into()
+                            .map_err(|error| Error::numerical("cache_identity", &error))?;
+                    let components = serde_json::from_str(declared.as_str())
+                        .map_err(|error| Error::Interface(error.to_string()))?;
+                    weights::cache_groups(&components, cache.plan())?
+                }
+            };
         }
         // The engine sizes the host KV cache of every rank of the world at
         // one token count once each reported what a token of its pages
@@ -499,7 +509,9 @@ impl Worker {
         // (`uniserve.host_cache`).
         let host_cache = match (
             launch.storage.host_kv_cache,
-            model_fingerprint.clone(),
+            info.prefix_cache
+                .as_ref()
+                .map(|cache| cache.identities.clone()),
             storage.prefix_cache.as_ref(),
             device.cuda(),
             info.prefix_cache.as_mut(),

@@ -17,6 +17,7 @@ class RMSNorm(nn.Module):
     """
 
     function = "nn.norm.RMSNorm/1"
+    function_parameters = ("eps",)
 
     def __init__(
         self,
@@ -67,6 +68,7 @@ class GemmaRMSNorm(nn.Module):
     """
 
     function = "nn.norm.GemmaRMSNorm/1"
+    function_parameters = ("eps",)
 
     def __init__(
         self,
@@ -109,6 +111,7 @@ class GatedRMSNorm(nn.Module):
     """
 
     function = "nn.norm.GatedRMSNorm/1"
+    function_parameters = ("eps",)
 
     def __init__(
         self,

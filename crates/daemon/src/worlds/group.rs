@@ -419,7 +419,7 @@ pub(crate) async fn apply(
                 .collect();
             let changed = sources
                 .iter()
-                .any(|source| source.info().prefix_seed != candidate.info().prefix_seed);
+                .any(|source| source.info().prefix_seeds != candidate.info().prefix_seeds);
             warming.push(async move {
                 let recompute = changed && request.in_flight == InFlight::Recompute;
                 if recompute && !adds.host_cache {
@@ -485,8 +485,8 @@ pub(crate) async fn apply(
         if request.in_flight == InFlight::Keep {
             replica.hold.keep(Some(Kept {
                 world: serving[index].world(),
-                prefix_seed: (before.prefix_seed != after.prefix_seed)
-                    .then_some(before.prefix_seed),
+                prefix_seeds: (before.prefix_seeds != after.prefix_seeds)
+                    .then(|| before.prefix_seeds.clone()),
                 latent_seed: (before.latent_seed != after.latent_seed)
                     .then_some(before.latent_seed),
             }));

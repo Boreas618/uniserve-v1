@@ -383,7 +383,7 @@ impl WeightUpdate {
         self.launch = launch;
         let contents: Vec<String> = match (plan, &fingerprints) {
             (Some(plan), Some(fingerprints)) if host_cache => {
-                page_contents(plan, &fingerprints.pages(&self.identity))
+                page_contents(plan, &fingerprints.cache_groups(plan)?)
                     .iter()
                     .map(|content| content.iter().map(|byte| format!("{byte:02x}")).collect())
                     .collect()
@@ -391,10 +391,16 @@ impl WeightUpdate {
             _ => Vec::new(),
         };
         // The identity that roots the device pages' hash chains from now on.
+        let identities = match (plan, &fingerprints) {
+            (Some(plan), Some(fingerprints)) => fingerprints.cache_groups(plan)?,
+            _ => Vec::new(),
+        };
         let identity = fingerprints
             .as_ref()
             .map(|fingerprints| fingerprints.pages(&self.identity));
-        Ok(serde_json::json!({ "group": group, "page_contents": contents, "identity": identity }))
+        Ok(
+            serde_json::json!({ "group": group, "page_contents": contents, "identities": identities, "identity": identity }),
+        )
     }
 }
 

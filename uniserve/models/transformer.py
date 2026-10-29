@@ -123,6 +123,11 @@ class TransformerDecoder(nn.Module):
     """
 
     function = "models.transformer.TransformerDecoder/1"
+    function_parameters = (
+        "embedding_scale",
+        "separate_residual",
+        "_default_route",
+    )
 
     # Pipeline binding drops the embedding outside the first stage and the
     # output norm outside the last one.

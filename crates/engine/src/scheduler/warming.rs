@@ -253,11 +253,11 @@ impl Scheduler {
                 computed: state.cache_visible_len,
                 cached: 0,
                 isolation_key: state.req.cache.isolation_key,
-                state_seed: state
-                    .req
-                    .cache
-                    .state_seed
-                    .unwrap_or(cache.coordinator.seed()),
+                state_seeds: if state.req.cache.state_seeds.is_empty() {
+                    cache.coordinator.seeds().to_vec()
+                } else {
+                    state.req.cache.state_seeds.clone()
+                },
                 pages: Vec::new(),
             };
             for (group, (table, shape)) in allocation
@@ -325,7 +325,7 @@ impl Scheduler {
             };
             let scope = PrefixScope {
                 isolation_key: prefix.isolation_key,
-                state_seed: keep.then_some(prefix.state_seed),
+                state_seeds: if keep { &prefix.state_seeds } else { &[] },
                 resume: Some(resume),
             };
             let mut hashes = vec![Vec::new(); cache.coordinator.groups().len()];
@@ -415,7 +415,7 @@ impl Scheduler {
                 };
                 let scope = PrefixScope {
                     isolation_key: prefix.isolation_key,
-                    state_seed: keep.then_some(prefix.state_seed),
+                    state_seeds: if keep { &prefix.state_seeds } else { &[] },
                     resume: Some(resume),
                 };
                 prefix.cached = self
