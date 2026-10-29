@@ -13,6 +13,7 @@ from tokenizers import Tokenizer
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    granted_devices,
     png_size_from_b64,
     post_sse,
     require_uniserve_binary,
@@ -29,10 +30,11 @@ pytestmark = [
 ]
 
 MODEL_ENV = "UNISERVE_SENSENOVA_MODEL"
-# Comma-separated CUDA devices the server ranks use, one rank per device.
+# Comma-separated CUDA devices the server ranks use, one rank per device;
+# the first two the GPU locks granted by default.
 DEVICES_ENV = "UNISERVE_SENSENOVA_DEVICES"
 # Two comma-separated CUDA devices: the rank's device and the generation
-# tower's.
+# tower's; the first two the GPU locks granted by default.
 TOWER_DEVICES_ENV = "UNISERVE_SENSENOVA_TOWER_DEVICES"
 SERVED_MODEL = "SenseNova-U1"
 IMAGE_SIZE = (2048, 1152)
@@ -77,7 +79,7 @@ def production_server(
         pytest.fail(str(error))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    devices = devices or os.environ.get(DEVICES_ENV, "0,1")
+    devices = devices or os.environ.get(DEVICES_ENV) or granted_devices(2)
     args = [
         str(binary),
         "serve",
@@ -299,8 +301,8 @@ def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
     and prompt scoring must equal those of the same rank on one device.
     """
     model = active_model()
-    devices = os.environ.get(TOWER_DEVICES_ENV)
-    if not devices or len(devices.split(",")) != 2:
+    devices = os.environ.get(TOWER_DEVICES_ENV) or granted_devices(2)
+    if len(devices.split(",")) != 2:
         pytest.fail(f"{TOWER_DEVICES_ENV} must name two CUDA devices")
     input_image_url = f"data:image/png;base64,{tiny_input_png_b64()}"
 
