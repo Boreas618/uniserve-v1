@@ -146,7 +146,7 @@ def test_dummy_loading_without_values_gives_the_same_layout(tmp_path, tied):
 @pytest.mark.parametrize("extra", (False, True))
 @pytest.mark.parametrize("mode", ("layered", "dummy"))
 @pytest.mark.parametrize("format", ("safetensors", "pt"))
-def test_post_load_can_derive_constants_without_hiding_unused_sources(
+def test_derived_constants_account_for_their_checkpoint_inputs(
     tmp_path, extra, mode, format
 ):
     class Shifted(nn.Module):
@@ -159,7 +159,7 @@ def test_post_load_can_derive_constants_without_hiding_unused_sources(
             return self.projection(value) + self.offset
 
     def mapping(model):
-        def post_load(reader):
+        def derive(reader):
             model.offset = reader.get("offset").read().square()
 
         return (
@@ -172,7 +172,15 @@ def test_post_load_can_derive_constants_without_hiding_unused_sources(
                     ),
                 ),
                 frozenset({"projection.weight"}),
-                post_load=post_load,
+                derivations=(
+                    weights.Derivation(
+                        "tests.squared_offset/1",
+                        ("offset",),
+                        ("offset",),
+                        {},
+                        derive,
+                    ),
+                ),
             ),
         )
 
@@ -655,7 +663,53 @@ def test_a_load_binds_retained_tensors_and_reads_only_the_rest(tmp_path):
     assert result.origins[id(model.second.weight)] == "primary"
 
 
-def test_a_tensor_derived_after_loading_reads_its_whole_mapping(tmp_path):
+def test_merged_projections_reuse_retained_branches(tmp_path):
+    def construct(width):
+        return MergedColumnParallelLinear(
+            width, {"first": width, "second": width}, bias=False
+        )
+
+    def mapping(model):
+        return (
+            weights.ModuleMapping(
+                model,
+                "primary",
+                lambda reader: tuple(
+                    weights.Assignment(branch.weight, reader.get(name))
+                    for name, branch in model.projections.items()
+                ),
+                frozenset(name for name, _ in model.named_parameters()),
+            ),
+        )
+
+    save_file(
+        {"first": torch.eye(4), "second": torch.eye(4) * 2},
+        tmp_path / "model.safetensors",
+    )
+    io = loading.Config()
+    kept = torch.full((4, 4), 3.0)
+    result = loading.load_model(
+        construct,
+        4,
+        checkpoint=(checkpoint.Config().resolve(tmp_path, io=io),),
+        mapping=mapping,
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        io=io,
+        retained=Retained({"p:projections.first.weight": kept}),
+        load=frozenset({"p:projections.second.weight"}),
+    )
+    output = result.model(torch.eye(4))
+    torch.testing.assert_close(output["first"], kept.T, rtol=0, atol=0)
+    torch.testing.assert_close(
+        output["second"], torch.eye(4) * 2, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("missing", ["b:offset", "p:projection.weight"])
+def test_deriving_a_tensor_preserves_unrelated_retained_values(
+    tmp_path, missing
+):
     class Shifted(nn.Module):
         def __init__(self, width):
             super().__init__()
@@ -663,7 +717,7 @@ def test_a_tensor_derived_after_loading_reads_its_whole_mapping(tmp_path):
             self.register_buffer("offset", torch.empty(width))
 
     def mapping(model):
-        def post_load(reader):
+        def derive(reader):
             model.offset = reader.get("offset").read().square()
 
         return (
@@ -676,7 +730,15 @@ def test_a_tensor_derived_after_loading_reads_its_whole_mapping(tmp_path):
                     ),
                 ),
                 frozenset({"projection.weight"}),
-                post_load=post_load,
+                derivations=(
+                    weights.Derivation(
+                        "tests.squared_offset/1",
+                        ("offset",),
+                        ("offset",),
+                        {},
+                        derive,
+                    ),
+                ),
             ),
         )
 
@@ -686,8 +748,10 @@ def test_a_tensor_derived_after_loading_reads_its_whole_mapping(tmp_path):
         {"weight": matrix, "offset": offset}, tmp_path / "model.safetensors"
     )
     io = loading.Config()
-    # Only the derived offset is missing, but deriving it reads its whole
-    # mapping: the stale retained projection is read again.
+    # Retained values identify which tensors were reused. Either the
+    # checkpoint projection or the derived offset can independently miss.
+    kept_projection = torch.zeros(4, 4)
+    kept_offset = torch.ones(4)
     result = loading.load_model(
         Shifted,
         4,
@@ -696,11 +760,19 @@ def test_a_tensor_derived_after_loading_reads_its_whole_mapping(tmp_path):
         device="cpu",
         weights=weights.Config(dtype=torch.float32),
         io=io,
-        retained=Retained({"p:projection.weight": torch.zeros(4, 4)}),
-        load=frozenset({"b:offset"}),
+        retained=Retained(
+            {"p:projection.weight": kept_projection, "b:offset": kept_offset}
+        ),
+        load=frozenset({missing}),
     )
 
     torch.testing.assert_close(
-        result.model.projection.weight, matrix, rtol=0, atol=0
+        result.model.projection.weight,
+        matrix if missing == "p:projection.weight" else kept_projection,
+        rtol=0,
+        atol=0,
     )
-    torch.testing.assert_close(result.model.offset, offset.square())
+    torch.testing.assert_close(
+        result.model.offset,
+        offset.square() if missing == "b:offset" else kept_offset,
+    )

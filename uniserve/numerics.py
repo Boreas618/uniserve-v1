@@ -10,11 +10,9 @@ the weights, cache pages and encoder outputs it derived:
   name and a revision that changes whenever what the component computes
   changes, and only then. Fusing kernels, tiling, selecting another kernel
   or another reduction order is an implementation of the same function and
-  keeps its revision. A model package declares the revision of its
-  checkpoint loading the same way (``LOADING`` of the package), as the
-  quantizers do per format (``uniserve.quantization.quantizer.FUNCTIONS``)
-  and the loader for what it does to every tensor (``uniserve.loading.
-  LOADING``).
+  keeps its revision. Checkpoint derivations declare their own functions
+  and inputs (``uniserve.loading.weights.Derivation``); assignment and
+  quantization revisions belong to their shared implementations.
 - A module's format is that of the tensors it holds itself: each
   parameter's and buffer's element type, or a quantized tensor's encoding
   and the layout its kernels read.
@@ -28,7 +26,6 @@ from __future__ import annotations
 
 import functools
 import hashlib
-import importlib
 import json
 import re
 from collections.abc import Iterable
@@ -150,27 +147,20 @@ def identity(module: nn.Module) -> str:
     return visit(module)
 
 
-def loading(model_class: type, encodings: Iterable[str]) -> str:
-    """The digest of how a model's weights are derived from its checkpoint:
-    the loading its package declares, the loader's, and the quantizer of
-    each encoding the model loads, as lowercase hexadecimal SHA-256.
+def loading(encodings: Iterable[str]) -> str:
+    """The shared assignment and quantization functions of one weight.
+
+    Checkpoint selection and rectangular assignments are explicit inputs to
+    its key. Additional mathematical transforms declare their own revisions
+    and inputs through ``uniserve.loading.weights.Derivation``.
 
     Raises:
-        SetupError: The model's package, or the quantizer of an encoding,
-            declares no revision.
+        SetupError: The quantizer of an encoding declares no revision.
     """  # noqa: D205
     from uniserve.quantization.quantizer import FUNCTIONS
 
-    package = _package(model_class)
-    declared = getattr(importlib.import_module(package), "LOADING", None)
-    if not isinstance(declared, str) or "/" not in declared:
-        raise SetupError(
-            f"model package {package} declares no LOADING revision of its "
-            "checkpoint loading"
-        )
     digest = hashlib.sha256()
     _hash(digest, "uniserve-weight-loading")
-    _hash(digest, declared)
     _hash(digest, LOADER)
     for encoding in sorted(set(encodings)):
         quantizer = FUNCTIONS.get(encoding)
@@ -178,16 +168,6 @@ def loading(model_class: type, encodings: Iterable[str]) -> str:
             raise SetupError(f"no quantizer declares the encoding {encoding}")
         _hash(digest, quantizer)
     return digest.hexdigest()
-
-
-def _package(model_class: type) -> str:
-    """The model package ``model_class`` belongs to: ``uniserve.models.<name>``
-    for a built-in model, a plugin's top-level package otherwise.
-    """  # noqa: D205
-    parts = model_class.__module__.split(".")
-    if parts[:2] == ["uniserve", "models"] and len(parts) > 2:
-        return ".".join(parts[:3])
-    return parts[0]
 
 
 def _hash(digest, value: str) -> None:

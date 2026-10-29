@@ -18,11 +18,6 @@ from .weights import (
     precisions,
 )
 
-# The revision of how this package derives its parameters from its
-# checkpoint: its tensor mappings, fusions and conversions
-# (`uniserve.numerics.loading`).
-LOADING = "models.qwen3/1"
-
 # Qwen3 is text-only: the loading contract reads ``None`` as no image
 # preprocessing and no flow prompt.
 image_processor = None

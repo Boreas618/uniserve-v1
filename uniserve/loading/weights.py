@@ -79,6 +79,45 @@ class Assignment:
 
 
 @dataclass(frozen=True, slots=True)
+class Derivation:
+    """Compute named checkpoint-derived tensors after parameter loading.
+
+    ``targets`` are parameter or buffer paths relative to the mapping's
+    module. ``sources`` names every checkpoint tensor the computation reads;
+    ``parameters`` contains its other immutable numerical inputs. The
+    function revision changes when the mathematical transform changes.
+    ``apply`` writes exactly these targets while the source reader is open.
+    These declarations also key the tensors independently of other loading
+    transforms and of unrelated model configuration.
+    """
+
+    function: str
+    targets: tuple[str, ...]
+    sources: tuple[str, ...]
+    parameters: Mapping[str, object]
+    apply: Callable[[checkpoint.Reader], None]
+
+    def __post_init__(self):
+        if "/" not in self.function or not self.targets:
+            raise ValueError("a derivation declares its function and targets")
+        object.__setattr__(
+            self, "parameters", MappingProxyType(dict(self.parameters))
+        )
+
+    def tensors(self, module: nn.Module) -> tuple[torch.Tensor, ...]:
+        """The registered tensors written by this derivation."""
+        result = []
+        for target in self.targets:
+            path, _, name = target.rpartition(".")
+            owner = module.get_submodule(path)
+            tensor = owner._parameters.get(name, owner._buffers.get(name))
+            if tensor is None:
+                raise ValueError(f"derivation target {target} is not a tensor")
+            result.append(tensor)
+        return tuple(result)
+
+
+@dataclass(frozen=True, slots=True)
 class ModuleMapping:
     """Map one checkpoint source onto a resident numerical module.
 
@@ -86,8 +125,8 @@ class ModuleMapping:
     unused checkpoint tensors and nonresident_prefixes the name prefixes of
     whole groups of them (a layer outside this pipeline stage, the half of a
     VAE this module does not evaluate); both include entries belonging to
-    absent PP layers. post_load may compute derived constants while the
-    source reader is open.
+    absent PP layers. ``derivations`` compute named tensors while the source
+    reader is open, declaring the inputs that determine each one's values.
     """
 
     module: nn.Module
@@ -96,7 +135,7 @@ class ModuleMapping:
     required: frozenset[str]
     optional: frozenset[str] = frozenset()
     nonresident: frozenset[str] = frozenset()
-    post_load: Callable[[checkpoint.Reader], None] | None = None
+    derivations: tuple[Derivation, ...] = ()
     nonresident_prefixes: tuple[str, ...] = ()
 
     def skips(self, names: Iterable[str]) -> set[str]:
@@ -740,8 +779,7 @@ class _Loader:
 
     def load(self) -> tuple[Report, ...]:
         if self.io.mode == "dummy" and not any(
-            module_mapping.post_load is not None
-            for module_mapping in self.mappings
+            module_mapping.derivations for module_mapping in self.mappings
         ):
             return self._dummy()
         if len({source.name for source in self.sources}) != len(self.sources):
@@ -773,6 +811,11 @@ class _Loader:
                     self._used[module_mapping.source].update(
                         _source_names(assignment.source)
                     )
+                for derivation in module_mapping.derivations:
+                    for name in derivation.sources:
+                        self._used[module_mapping.source].update(
+                            _source_names(reader.get(name))
+                        )
         # Nonresident declarations select logical weights. Their serialized
         # encodings include scale fields just as resident assignments do;
         # account for those fields without reading their payloads.
@@ -796,8 +839,8 @@ class _Loader:
             self._materialize(key, assignments)
 
         for module_mapping in self.mappings:
-            if module_mapping.post_load is not None:
-                module_mapping.post_load(self._readers[module_mapping.source])
+            for derivation in module_mapping.derivations:
+                derivation.apply(self._readers[module_mapping.source])
         # Auxiliary source values used to derive constants need not be mapped
         # onto Parameters. Account for actual reads while the reader is open;
         # merely enumerating source metadata does not consume a tensor.

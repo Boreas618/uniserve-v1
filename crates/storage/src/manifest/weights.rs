@@ -3,9 +3,8 @@
 //! A rank that retains its weights at its host's Storage Server retains,
 //! beside its chunks, a manifest: host bytes of JSON text under the name
 //! [`NAME`] that state the manifest's [`VERSION`], the digest of what
-//! determines the bytes of each checkpoint source's tensors
-//! (`fingerprints`, by source name, the empty name for the tensors no
-//! source loads), the rank's tensors as its library describes them, and
+//! determines each tensor's bytes (`fingerprints`, by tensor name),
+//! the rank's tensors as its library describes them, and
 //! its storages ([`RetainedStorage`]): each one's device among the rank's
 //! devices, layout and chunks. The worker writes it; a world that receives
 //! weights and the daemon that plans its preparation read the storages of
@@ -27,7 +26,7 @@ pub const NAME: &str = "weights manifest";
 
 /// The version of the manifest the worker writes and reads; a manifest of
 /// another version names no storage.
-pub const VERSION: u64 = 6;
+pub const VERSION: u64 = 7;
 
 /// One retained storage of a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +56,8 @@ pub struct PlannedRank {
     /// Target numerical capacity, independent of the source rank's layout.
     pub budget: Option<RankBudget>,
     /// The digest of what determines the bytes of the rank's tensors, by
-    /// checkpoint source, in hex as a manifest states them: the storages it
-    /// receives are of sources with the same digests ([`sources`]).
+    /// tensor name, in hex as a manifest states them: received fields have
+    /// the same digests ([`sources`]).
     pub fingerprints: BTreeMap<String, String>,
     /// The storages its weights take on its GPU, chunked and keyed as the
     /// rank retains them; `None` for a rank that does not receive its
@@ -221,7 +220,7 @@ pub struct Transfer {
 
 /// The weights the selected `worlds` of `deployment` retain on the host `listing`
 /// lists, for a rank whose checkpoint sources have the digests
-/// `fingerprints` (hex, by source name, as a manifest states them).
+/// `fingerprints` (hex, by tensor name, as a manifest states them).
 ///
 /// Every manifest the selected worlds retain names storages; a storage on a device
 /// whose fields' sources all have this rank's digests holds bytes the rank
@@ -286,13 +285,21 @@ pub fn sources<E>(
             continue;
         }
         for storage in &manifest.storages {
-            // Only the fields of sources with the rank's digests hold the
-            // bytes it needs.
-            let same = storage.device.is_some()
-                && storage.storage.layout.fields.iter().all(|field| {
-                    manifest.fingerprints.get(&field.source) == fingerprints.get(&field.source)
-                });
-            if !same {
+            if storage.device.is_none() {
+                continue;
+            }
+            // Packed storage can hold independently keyed tensors. Keep
+            // each matching field available to the transfer planner; the
+            // chunks still name the original backing bytes.
+            let mut source = storage.storage.clone();
+            source.layout.fields.retain(|field| {
+                field.tensor.rsplit_once('/').is_some_and(|(tensor, _)| {
+                    fingerprints
+                        .get(tensor)
+                        .is_some_and(|wanted| manifest.fingerprints.get(tensor) == Some(wanted))
+                })
+            });
+            if source.layout.fields.is_empty() {
                 continue;
             }
             let mut gpus: Option<BTreeSet<Gpu>> = None;
@@ -308,13 +315,12 @@ pub fn sources<E>(
                 clippy::expect_used,
                 reason = "storage contains only JSON-compatible values"
             )]
-            let identity =
-                serde_json::to_vec(&storage.storage).expect("storage contains JSON values");
+            let identity = serde_json::to_vec(&source).expect("storage contains JSON values");
             for gpu in gpus.unwrap_or_default() {
                 by_gpu
                     .entry(gpu)
                     .or_default()
-                    .insert(identity.clone(), storage.storage.clone());
+                    .insert(identity.clone(), source.clone());
             }
         }
     }

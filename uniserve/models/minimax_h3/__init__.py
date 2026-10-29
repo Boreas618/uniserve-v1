@@ -45,11 +45,6 @@ from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import StepProjection, Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
 
-# The revision of how this package derives its parameters from its
-# checkpoint: its tensor mappings, fusions and conversions
-# (`uniserve.numerics.loading`).
-LOADING = "models.minimax_h3/1"
-
 # The model loader reads these package attributes. H3 accepts no image inputs
 # and runs without classifier-free guidance, so it supplies neither an image
 # processor nor guidance prompt framing.

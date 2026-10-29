@@ -13,11 +13,6 @@ from .encoder import TextEncoder, VisionEncoder
 from .positions import rope_index
 from .vision import Attention, PatchMerger, TransformerLayer, VisionTower
 
-# The revision of how this package derives its parameters from its
-# checkpoint: its tensor mappings, fusions and conversions
-# (`uniserve.numerics.loading`).
-LOADING = "models.qwen3_vl/1"
-
 __all__ = [
     "Attention",
     "PatchMerger",

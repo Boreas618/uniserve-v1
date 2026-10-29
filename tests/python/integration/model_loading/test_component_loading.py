@@ -67,7 +67,15 @@ def _mapping(model):
             "decode",
             lambda reader: assign(model.decoder, reader),
             frozenset({"weight"}),
-            post_load=normalize,
+            derivations=(
+                weights.Derivation(
+                    "tests.decoder_scale/1",
+                    ("scale",),
+                    ("scale",),
+                    {},
+                    normalize,
+                ),
+            ),
         ),
     )
 

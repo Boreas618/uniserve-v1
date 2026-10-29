@@ -300,7 +300,7 @@ class StepProjection(nn.Module):
 
     def __init__(self, steps: int, in_features: int, out_features: int):
         super().__init__()
-        # Placeholders the post-load hook replaces with the fused heads.
+        # Placeholders the loading derivations fill with the fused heads.
         self.register_buffer(
             "weight",
             torch.empty(
@@ -388,7 +388,7 @@ class Transformer(nn.Module):
         # [layer, entry, 3 token tags x 6 vectors x hidden] per transformer
         # layer and [entry, shift + scale] for the final output norm, with
         # the [step, group] entries each step reads. The empty tensors are
-        # placeholders that the post-load hook weights._prepare_adaln_cache
+        # placeholders that the loading derivation weights._prepare_adaln_cache
         # replaces.
         self.adaln_cache = AdaLNCache(
             torch.empty(

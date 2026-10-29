@@ -648,8 +648,7 @@ impl StorageLayout {
 
     /// The key of the chunk `window`: the digest of what each of its pieces
     /// holds and where in the chunk it lies. `fingerprint` gives the
-    /// digest of what determines a checkpoint source's bytes (`""` for the
-    /// tensors no source loads).
+    /// digest of the tensor owning a field, including its loading inputs.
     pub fn chunk_key(
         &self,
         window: &Range<u64>,
@@ -664,10 +663,10 @@ impl StorageLayout {
                 | Piece::Encoded { field, .. } => *field,
             };
             let field = &self.fields[index];
-            let source = fingerprint(&field.source).ok_or_else(|| {
+            let source = fingerprint(&field.tensor).ok_or_else(|| {
                 Error::Invalid(format!(
-                    "field {} is loaded from checkpoint source {:?}, which has no fingerprint",
-                    field.tensor, field.source
+                    "field {} has no tensor loading fingerprint",
+                    field.tensor
                 ))
             })?;
             digest.text(&field.tensor);

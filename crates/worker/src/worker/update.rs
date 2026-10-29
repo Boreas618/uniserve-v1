@@ -376,9 +376,7 @@ impl WeightUpdate {
         let fingerprints = LoadedModel::fingerprint(&description, &launch)?;
         if let (Some(keys), Some(fingerprints)) = (&self.keys, &fingerprints) {
             let renamed = keys.under(fingerprints);
-            let moves = keys.moves(&renamed, retained)?;
-            let moved = moves.len();
-            retained.rekey(moves)?;
+            let moved = keys.rename(&renamed, retained)?;
             tracing::info!(moved, "renamed the retained weights after the checkpoint");
             self.keys = Some(renamed);
         }

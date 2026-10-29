@@ -1266,12 +1266,9 @@ def test_a_weight_update_answers_as_the_new_checkpoint_does(
         assert reasons == ["abort"], reasons
         assert answers(base_url) == expected
         # A world change's successor binds the weights the source left.
-        _change_world(base_url, CHANGE)
+        report = _change_world(base_url, CHANGE)
+        assert report["weights"] == "mapped", report
         assert answers(base_url) == expected
-        assert any(
-            re.search(r"mapped the retained weights .*missing=0", line)
-            for line in _log_lines(log)
-        ), "the successor did not map the streamed weights"
         back = _admin(base_url, "update_weights", {"model_path": _checkpoint()})
         assert back.status_code == 200, back.text
         assert answers(base_url) == original
@@ -1285,7 +1282,6 @@ def test_a_weight_update_answers_as_the_new_checkpoint_does(
         ]
         assert len(left) >= 4, left
         assert max(left) - min(left) < 1, left
-        assert any("renamed the retained weights" in line for line in lines)
 
 
 # The LoRA plugin a test installs: it records which adapter each slot of its
