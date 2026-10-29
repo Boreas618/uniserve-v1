@@ -634,11 +634,14 @@ impl Retained {
     pub(crate) fn ledger(&self, device: DeviceId) -> Result<(GpuLedger, ::storage::HostStorage)> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
-        let (ledgers, host) = state
+        let read = state
             .client
             .ledger(vec![gpu])
             .map_err(|error| storage_error("reading the storage ledger", error))?;
-        Ok((Self::of_deployment(&self.scope, gpu, ledgers), host))
+        Ok((
+            Self::of_deployment(&self.scope, gpu, read.ledgers),
+            read.host,
+        ))
     }
 
     /// Books `items` of the worker on the GPU of `device` of `total` bytes,

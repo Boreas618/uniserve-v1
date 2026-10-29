@@ -81,8 +81,10 @@ use serde::{Deserialize, Serialize};
 
 /// Wire contract negotiated when a Storage Server client connects. Committed
 /// pages stay reusable by content key until ordinary eviction; only a
-/// world's uncommitted publications are discarded when it retires.
-pub const VERSION: u32 = 17;
+/// world's uncommitted publications are discarded when it retires. A
+/// [`Reply::Ledger`] answering a [`Request::Ledger`] carries what the
+/// deployment's transfer tasks copied ([`TransferTotal`]).
+pub const VERSION: u32 = 18;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -1265,10 +1267,13 @@ pub enum Reply {
     },
     Finished,
     /// The ledgers a `Book` or a `Ledger` names, and what the host admits
-    /// of new host storage.
+    /// of new host storage; for a `Ledger`, also what the transfer tasks of
+    /// the asking deployment copied, by priority (none for a `Book`).
     Ledger {
         ledgers: Vec<GpuLedger>,
         host: HostStorage,
+        #[serde(default)]
+        transfers: Vec<TransferTotal>,
     },
     /// The task a [`Request::Transfer`] submitted.
     Transferring {
@@ -1359,6 +1364,21 @@ pub struct ListedTask {
     pub copied: u64,
     /// Whether it is being cancelled.
     pub cancelled: bool,
+}
+
+/// What the transfer tasks of one deployment at one priority copied on a
+/// host since its Storage Server started (a hot restart hands the totals
+/// over): the tasks the deployment's heads and workers submitted and the
+/// weight moves the server made for it, ended or running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferTotal {
+    pub priority: Priority,
+    /// The bytes of every span of the tasks submitted.
+    pub bytes: u64,
+    /// The bytes of them copied so far: those of every task that ended,
+    /// cancelled or failed ones included, and the progress the running
+    /// ones reported.
+    pub copied: u64,
 }
 
 /// One page pool in a [`Listing`].

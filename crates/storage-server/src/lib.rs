@@ -795,10 +795,15 @@ impl Server {
                     Role::Transfer | Role::Peer | Role::Operator | Role::Connector => None,
                 };
                 let ledgers = self.ledgers_of(gpus, deployment.as_deref());
+                let transfers = deployment
+                    .as_deref()
+                    .map(|deployment| self.transfers.totals(deployment))
+                    .unwrap_or_default();
                 Ok(Outcome::Reply(
                     Reply::Ledger {
                         ledgers,
                         host: self.host_storage().map_err(resource)?,
+                        transfers,
                     },
                     Vec::new(),
                 ))
@@ -1277,6 +1282,7 @@ impl Server {
             Reply::Ledger {
                 ledgers: after,
                 host: self.host_storage().map_err(resource)?,
+                transfers: Vec::new(),
             },
             Vec::new(),
         ))
