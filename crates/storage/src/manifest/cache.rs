@@ -84,6 +84,18 @@ pub struct Copy {
     pub spans: Vec<crate::protocol::Span>,
 }
 
+/// One round of cache copies, as the daemon hands it to every rank: the
+/// spans each owner submits as one Transfer Server task, at `priority`.
+/// The promotion's backfill and a rollback's restore run at
+/// [`crate::protocol::Priority::Promotion`], since the pause waits for them;
+/// the rounds that warm a successor while the serving world runs, at
+/// [`crate::protocol::Priority::Warming`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transfer {
+    pub priority: crate::protocol::Priority,
+    pub copies: Vec<Copy>,
+}
+
 /// A cache warming round. Leases remain held until `Release`; `Publish`
 /// is legal only after all copies into reserved target pages have completed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
