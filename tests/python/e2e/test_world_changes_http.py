@@ -1348,13 +1348,13 @@ def test_a_change_of_model_files_loads_the_successors_weights(
     tmp_path: Path, previous_world: str, end: str
 ):
     """A world change to other model files of the same model loads the
-    successor's weights from them beside the serving world's, which the
-    successor does not map; the count streaming meanwhile continues on the
-    state it reached. The successor answers with its weights. A commit
-    leaves its weights alone on the GPU; a rollback answers as before on the
-    previous world: parked, started again on the weights it kept on the GPU,
-    or on the weights it kept in host storage, which return to the GPU
-    first.
+    successor's changed weights from them beside the serving world's and
+    maps the tensors both checkpoints hold alike; the count streaming
+    meanwhile continues on the state it reached. The successor answers with
+    its weights. A commit leaves its weights alone on the GPU; a rollback
+    answers as before on the previous world: parked, started again on the
+    weights it kept on the GPU, or on the weights it kept in host storage,
+    which return to the GPU first.
     """  # noqa: D205
     name = "qwen3-world-weights"
     updated = _updated_checkpoint()
@@ -1393,14 +1393,16 @@ def test_a_change_of_model_files_loads_the_successors_weights(
             f"preparation {report['prepare_seconds']:.1f} s"
         )
 
-        # The successor answers with its own weights. The previous world
-        # keeps its weights on the GPU, or in host storage, which leaves the
-        # GPU's ledger with the successor's alone.
+        # The successor answers with its own weights. Both worlds hold the
+        # tensors the checkpoints share; the previous world keeps its other
+        # weights on the GPU, or in host storage, which leaves no weights of
+        # the previous world alone in the GPU's ledger.
         changed = _chat(base_url, name, CACHED_PROMPT)
         assert changed != original, "the checkpoints answer alike"
+        shared = {(previous, world)}
         if previous_world == "host":
             assert report["moved_to_host_bytes"] > 0, report
-            assert _weights_of(base_url) == {(world,)}
+            assert _weights_of(base_url) - shared == {(world,)}
             (kept,) = [
                 slot
                 for slot in _config(base_url)["slots"]
@@ -1408,7 +1410,7 @@ def test_a_change_of_model_files_loads_the_successors_weights(
             ]
             assert kept["state"] == "host", kept
         else:
-            assert _weights_of(base_url) == {(previous,), (world,)}
+            assert _weights_of(base_url) - shared == {(previous,), (world,)}
         streaming.wait_for(streaming.marked + 32)
 
         if end == "commit":
