@@ -182,6 +182,17 @@ pub(super) struct Preparing {
     /// measured bandwidth, in milliseconds; `None` before the Transfer
     /// Server measured the link.
     pub(super) promotion_stall_ms: Option<u64>,
+    /// What staging the successor's warm copies in host storage (step 3)
+    /// frees of the GPU, whether or not the plan stages them: the device
+    /// storage those copies take beside the serving world otherwise. Zero
+    /// for a successor that maps the serving world's cache, which warms no
+    /// copies.
+    pub(super) staging_frees: u64,
+    /// How long a promotion that staged them waits to load them back at the
+    /// host link's measured bandwidth, in milliseconds, whether or not the
+    /// plan stages them; `None` before the Transfer Server measured the
+    /// link.
+    pub(super) staging_stall_ms: Option<u64>,
     /// Whether the limit holds the segments the serving world cannot give
     /// back.
     pub(super) feasible: bool,
@@ -346,16 +357,25 @@ pub(super) fn preparing(
     } else {
         0
     };
-    let promotion_stall_ms = ledger
+    // What step 3 frees and costs, reported for every plan whose successor
+    // warms copies of a cache it does not map; the plan's own figures above
+    // count them only when it stages them.
+    let staging_frees = if adds.unmapped_cache {
+        reservation.mapped
+    } else {
+        0
+    };
+    let bandwidth = ledger
         .host_link_bytes_per_second
-        .filter(|&bandwidth| bandwidth > 0)
-        .map(|bandwidth| {
-            if adds.host_cache {
-                reservation.bytes.saturating_mul(1000).div_ceil(bandwidth)
-            } else {
-                0
-            }
-        });
+        .filter(|&bandwidth| bandwidth > 0);
+    let staging_stall_ms = bandwidth.map(|bandwidth| {
+        if adds.unmapped_cache {
+            reservation.bytes.saturating_mul(1000).div_ceil(bandwidth)
+        } else {
+            0
+        }
+    });
+    let promotion_stall_ms = staging_stall_ms.map(|stall| if adds.host_cache { stall } else { 0 });
     // Planning accounts for the graph pool that the owner will release.
     // After the eager switch, the live ledger already reports zero here.
     let released_graphs = if adds.eager_source {
@@ -413,6 +433,8 @@ pub(super) fn preparing(
         host_staging,
         trial_cache,
         promotion_stall_ms,
+        staging_frees,
+        staging_stall_ms,
         feasible: (kv_floor + trial_cache) as i64 <= kv_limit,
         entries: ledger.entries.iter().map(LedgerEntry::describe).collect(),
         host_storage: report.host_storage,

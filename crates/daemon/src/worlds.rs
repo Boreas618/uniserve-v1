@@ -848,7 +848,8 @@ async fn storage_report(
 /// What each step of `specs/online-operations.md` §6.5 frees on the GPU of
 /// the plan `gpu` (`ledger::Preparing` of the engine), in bytes, and the
 /// promotion stall of moving the requests' KV cache in flight through host
-/// storage (step 3), for a successor that adds `successor` and a previous
+/// storage (step 3), whether or not the plan takes each step, for a
+/// successor that adds `successor` and a previous
 /// world kept as `previous_world`. In the preparing phase: the idle cached
 /// pages of the tail the serving world gives back (step 1), the rest of
 /// that tail (step 2), the warm copies a successor that recomputes the
@@ -877,7 +878,7 @@ fn steps(
         "preparation": {
             "idle_prefix_pages": idle,
             "kv_tail": tail.saturating_sub(idle),
-            "warm_copies": bytes(&gpu["trial_cache"]),
+            "warm_copies": bytes(&gpu["staging_frees"]),
             "graph_pool": bytes(&serving["graph_pool"]),
         },
         "trial": {
@@ -900,7 +901,7 @@ fn steps(
                     + unmapped
             },
         },
-        "promotion_stall_ms": gpu["promotion_stall_ms"],
+        "promotion_stall_ms": gpu["staging_stall_ms"],
     })
 }
 

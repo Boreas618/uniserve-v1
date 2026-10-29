@@ -1312,6 +1312,13 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
     );
     assert_eq!(recomputed["in_flight_kv"], in_flight);
     assert_eq!(recomputed["promotion_stall_ms"], 0);
+    // A plan that does not stage still states what staging would free and
+    // cost (`specs/online-operations.md` §6.5 step 3).
+    assert_eq!(recomputed["staging_frees"], in_flight, "{recomputed}");
+    assert_eq!(
+        recomputed["staging_stall_ms"],
+        (in_flight * 1000).div_ceil(HOST_LINK)
+    );
     let staged = plan_of(Successor {
         loads_weights: true,
         unmapped_cache: true,
