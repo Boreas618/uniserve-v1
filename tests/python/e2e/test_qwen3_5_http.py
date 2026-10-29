@@ -54,6 +54,7 @@ import pytest
 from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
+    scaled,
     server_process,
     worker_executable,
 )
@@ -191,7 +192,7 @@ def _log_lines(log: Path) -> list[str]:
 
 
 def _wait_until(predicate, timeout_s: float, what: str) -> None:
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + scaled(timeout_s)
     while time.monotonic() < deadline:
         if predicate():
             return
@@ -231,7 +232,7 @@ def _generate(base_url: str, name: str, prompt: str, tokens: int) -> dict:
     response = httpx.post(
         f"{base_url}/v1/chat/completions",
         json=_body(name, prompt, tokens),
-        timeout=1800,
+        timeout=scaled(1800),
     )
     response.raise_for_status()
     answer = response.json()
@@ -403,7 +404,7 @@ class _Streaming:
                 "POST",
                 f"{base_url}/v1/chat/completions",
                 json=_body(name, COUNT_PROMPT, COUNT_TOKENS, stream=True),
-                timeout=1800,
+                timeout=scaled(1800),
             ) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
@@ -441,7 +442,7 @@ class _Streaming:
         return not self._thread.is_alive()
 
     def join(self) -> None:
-        self._thread.join(timeout=1800)
+        self._thread.join(timeout=scaled(1800))
         assert not self._thread.is_alive(), "the request did not end"
         assert self.error is None, f"the stream failed: {self.error!r}"
 
@@ -473,7 +474,7 @@ def test_repartitioned_recurrent_pages_resume_a_streaming_request(
                         f"update_config.previous_world={retention}",
                     ]
                 },
-                timeout=1800,
+                timeout=scaled(1800),
             )
             while not change.done():
                 if streams[-1].finished:
@@ -498,7 +499,7 @@ def test_repartitioned_recurrent_pages_resume_a_streaming_request(
         hits = _prefix_hits(base_url)
         assert hits >= warming["warmed_tokens"]
         finished = httpx.post(
-            f"{base_url}/admin/config/{finish}", json={}, timeout=1800
+            f"{base_url}/admin/config/{finish}", json={}, timeout=scaled(1800)
         )
         assert finished.status_code == 200, finished.text
         streams[-1].join()
@@ -525,7 +526,7 @@ def test_a_world_change_resumes_a_request_from_its_checkpoint(
         response = httpx.put(
             f"{base_url}/admin/config",
             json={"set": [CHANGE]},
-            timeout=1800,
+            timeout=scaled(1800),
         )
         assert response.status_code == 200, response.text
         result = response.json()["result"]
@@ -538,7 +539,7 @@ def test_a_world_change_resumes_a_request_from_its_checkpoint(
         resumed = _prefix_hits(base_url) - hits
         assert resumed >= 256, resumed
         committed = httpx.post(
-            f"{base_url}/admin/config/commit", json={}, timeout=1800
+            f"{base_url}/admin/config/commit", json={}, timeout=scaled(1800)
         )
         assert committed.status_code == 200, committed.text
         alone = _generate(base_url, name, COUNT_PROMPT, COUNT_TOKENS)
@@ -612,7 +613,7 @@ def test_a_world_change_turns_speculation_on_for_a_streaming_request(
         response = httpx.put(
             f"{base_url}/admin/config",
             json={"set": [DRAFTS]},
-            timeout=1800,
+            timeout=scaled(1800),
         )
         assert response.status_code == 200, response.text
         result = response.json()["result"]
@@ -622,7 +623,7 @@ def test_a_world_change_turns_speculation_on_for_a_streaming_request(
         drafted = _metric(base_url, DRAFTED)
         accepted = _metric(base_url, ACCEPTED)
         committed = httpx.post(
-            f"{base_url}/admin/config/commit", json={}, timeout=1800
+            f"{base_url}/admin/config/commit", json={}, timeout=scaled(1800)
         )
         assert committed.status_code == 200, committed.text
 

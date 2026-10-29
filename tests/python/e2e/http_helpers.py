@@ -28,6 +28,21 @@ from uniserve_eval.transport.sse import iter_sse_events
 # than the host has.
 HOST_CACHE_GIB = 16
 
+# Options every test server adds to its own, as `PATH=VALUE` assignments
+# separated by whitespace (``UNISERVE_E2E_SET``), and the factor every wait
+# of a test is stretched by (``UNISERVE_E2E_TIME_SCALE``): a run whose
+# workers run under a tool, such as compute-sanitizer, leaves the tool
+# device storage and lets the workers' jobs and the tests' waits take
+# longer.
+E2E_SET = os.environ.get("UNISERVE_E2E_SET", "").split()
+TIME_SCALE = float(os.environ.get("UNISERVE_E2E_TIME_SCALE", "1"))
+
+
+def scaled(seconds: float) -> float:
+    """`seconds` stretched by `TIME_SCALE`."""
+    return seconds * TIME_SCALE
+
+
 # Attention on the first GPU and the routed experts on the second, exchanging
 # tokens through an expert transport: two worker groups of one expert world.
 DEDICATED_EXPERTS = """
@@ -112,7 +127,7 @@ def worker_executable() -> Path:
 def wait_health(
     base_url: str, process: subprocess.Popen[str], timeout_s: float
 ) -> None:
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + scaled(timeout_s)
     last_error: str | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -141,11 +156,15 @@ def start_server(
     """Start `args` in a session of its own, its output to `log_path`.
 
     A `serve` command that sizes no host KV cache
-    (``kv_cache_config.host_*``) holds `HOST_CACHE_GIB` of it.
+    (``kv_cache_config.host_*``) holds `HOST_CACHE_GIB` of it, and every
+    `serve` command adds `E2E_SET`.
     """
     sized = any("kv_cache_config.host_" in arg for arg in args)
     if "serve" in args and not sized:
         args = [*args, "--set", f"kv_cache_config.host_gib={HOST_CACHE_GIB}"]
+    if "serve" in args:
+        for assignment in E2E_SET:
+            args = [*args, "--set", assignment]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w", encoding="utf-8")
     merged_env = os.environ.copy()
