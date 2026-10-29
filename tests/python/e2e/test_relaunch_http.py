@@ -262,6 +262,9 @@ def _stream_through_a_kill(
             reference_usage = answer["usage"]
     finally:
         _stop_storage_server(runtime / "uniserve" / "storage.sock")
+        storage_log = runtime / "uniserve" / "storage-server.log"
+        if storage_log.is_file():
+            shutil.copy(storage_log, tmp_path / "storage-server.log")
         shutil.rmtree(runtime, ignore_errors=True)
     return streamed, usage, reference, reference_usage, _log_lines(log)
 
