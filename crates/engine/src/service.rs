@@ -1196,11 +1196,17 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
         tracing::info!("the engine parks already");
     }
     tracing::info!("the engine parks");
+    // A scheduler that stopped on a fatal failure answers no park: it handed
+    // its requests back, or ended them, as it stopped, and its thread then
+    // closes its workers, which the park does not wait for.
     let answers: Vec<_> = routing
         .slots
         .iter()
         .enumerate()
-        .map(|(index, slot)| (index, slot.handle.cache_group(), slot.handle.park()))
+        .map(|(index, slot)| {
+            let answer = (!slot.handle.is_dead()).then(|| slot.handle.park());
+            (index, slot.handle.cache_group(), answer)
+        })
         .collect();
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
@@ -1209,6 +1215,12 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
             let mut index = Vec::new();
             let mut error = String::new();
             for (slot_index, group, answer) in answers {
+                let Some(answer) = answer else {
+                    if error.is_empty() {
+                        error = "a scheduler stopped".to_owned();
+                    }
+                    continue;
+                };
                 match answer.recv() {
                     Ok(Ok(parked)) => {
                         for resume in parked.pages.iter().filter_map(|page| page.resume) {
