@@ -21,6 +21,13 @@ from PIL import Image
 
 from uniserve_eval.transport.sse import iter_sse_events
 
+# The host KV cache a test's world holds unless the test sizes it itself.
+# Every test runs its own Storage Server, which budgets the host's available
+# storage as if it were the host's only one, so concurrent tests sized by
+# `kv_cache_config.host_ratio` alone would together commit more host storage
+# than the host has.
+HOST_CACHE_GIB = 16
+
 # Attention on the first GPU and the routed experts on the second, exchanging
 # tokens through an expert transport: two worker groups of one expert world.
 DEDICATED_EXPERTS = """
@@ -131,6 +138,14 @@ def wait_health(
 def start_server(
     args: list[str], log_path: Path, env: dict[str, str] | None = None
 ) -> subprocess.Popen[str]:
+    """Start `args` in a session of its own, its output to `log_path`.
+
+    A `serve` command that sizes no host KV cache
+    (``kv_cache_config.host_*``) holds `HOST_CACHE_GIB` of it.
+    """
+    sized = any("kv_cache_config.host_" in arg for arg in args)
+    if "serve" in args and not sized:
+        args = [*args, "--set", f"kv_cache_config.host_gib={HOST_CACHE_GIB}"]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w", encoding="utf-8")
     merged_env = os.environ.copy()
