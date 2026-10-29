@@ -671,10 +671,7 @@ fn a_refused_request_fails_alone_on_trial_with_its_calls_in_flight() {
     assert!(!stopped, "a refusal does not stop a scheduler on trial");
     assert!(failure.is_none(), "{failure:?}");
     assert!(
-        matches!(
-            terminal,
-            Some(Event::Error { .. } | Event::Rejected { .. })
-        ),
+        matches!(terminal, Some(Event::Error { .. } | Event::Rejected { .. })),
         "{terminal:?}"
     );
 }
