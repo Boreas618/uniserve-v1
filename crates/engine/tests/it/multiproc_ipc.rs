@@ -1573,6 +1573,7 @@ fn token_batch(
             request_pool_idx,
             group_id: 0,
             unit_ids: vec![unit],
+            copies: Vec::new(),
         }]
     } else {
         Vec::new()
@@ -4008,6 +4009,7 @@ fn a_request_continues_on_the_worker_that_installed_its_cache() -> anyhow::Resul
         request_pool_idx: 1,
         group_id: 0,
         unit_ids: vec![UnitId(5)],
+        copies: Vec::new(),
     }];
     executor.submit(place(target, "target", Vec::new()))?;
     let installation = poll_logical(&mut executor)?.context("cache install did not complete")?;
@@ -4183,6 +4185,7 @@ mod trajectory {
             request_pool_idx: slot,
             group_id: 0,
             unit_ids: vec![unit],
+            copies: Vec::new(),
         }];
         batch.forward = ForwardBatch {
             call_indices: vec![0],
@@ -4742,6 +4745,7 @@ fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Re
         request_pool_idx: 1,
         group_id: 0,
         unit_ids: vec![UnitId(6)],
+        copies: Vec::new(),
     }];
     executor.submit(place(target, "target", Vec::new()))?;
     let installation = poll_logical(&mut executor)?.context("cache install did not complete")?;
@@ -4885,6 +4889,7 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
         request_pool_idx: 1,
         group_id: 0,
         unit_ids: vec![UnitId(7)],
+        copies: Vec::new(),
     }];
     executor.submit(place(target, "target", Vec::new()))?;
     let installed = poll_logical(&mut executor)?.context("cache install did not complete")?;

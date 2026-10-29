@@ -350,6 +350,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 request_pool_idx,
                 group_id: 0,
                 unit_ids,
+                copies: Vec::new(),
             });
             run.forward.push(
                 call_index as u32,
@@ -729,8 +730,13 @@ fn windowed_block_table_round_trips_its_start_page_and_units() {
         request_pool_idx: slot,
         group_id: 1,
         unit_ids: vec![UnitId(9), UnitId(10)],
+        copies: vec![(UnitId(5), UnitId(9))],
     });
     assert_eq!(execute_round_trip(run.clone()), run);
+
+    let mut writes_source = run.clone();
+    writes_source.new_cache_units[1].copies = vec![(UnitId(10), UnitId(9))];
+    assert!(writes_source.validate().is_err());
 
     let mut outside = run.clone();
     outside.new_cache_units[1].unit_ids = vec![UnitId(11)];

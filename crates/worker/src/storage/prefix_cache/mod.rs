@@ -296,6 +296,24 @@ impl PrefixCache {
         &self.planes
     }
 
+    /// Copy leased immutable units before a batch starts using their new
+    /// writable pages. Destination units have no outstanding device access.
+    pub(crate) fn copy_units(
+        &mut self,
+        copies: &[(ipc::UnitId, ipc::UnitId)],
+        issue: crate::job::Recorder<'_>,
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let spans: Vec<_> = copies
+            .iter()
+            .map(|(_, target)| (target.0, 0, self.plan().unit_tokens()))
+            .collect();
+        self.accesses.require_reusable(&spans)?;
+        self.planes.copy_units(copies, issue)
+    }
+
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         self.planes.plan()
     }

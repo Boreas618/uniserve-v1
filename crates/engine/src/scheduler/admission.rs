@@ -1781,11 +1781,9 @@ fn acquire_cached_prefix(
         )
         .ok_or("an admitted request's block tables cover every cache group")?;
 
-    // Queries count the tokens eligible for reuse under the same rule as the
-    // prefix selection: a multiple of the largest block size that leaves at
-    // least one prompt token to compute, so prefill produces logits.
-    let step = coordinator.max_block_size();
-    let query_tokens = prompt.len().saturating_sub(1) / step * step;
+    // A stored partial page can cover any prefix while leaving the final
+    // prompt token to compute the logits. Count that same lookup extent.
+    let query_tokens = prompt.len().saturating_sub(1);
     stats
         .prefix
         .query_tokens

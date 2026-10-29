@@ -128,17 +128,27 @@ impl Pages {
             .iter()
             .flat_map(|copy| copy.units.iter().map(|unit| unit.0))
             .collect();
+        let copies: Vec<_> = plan
+            .new_cache_units
+            .iter()
+            .filter(|allocation| holds(allocation.request_pool_idx))
+            .flat_map(|allocation| allocation.copies.iter().copied())
+            // A deeper host hit supplies the entire destination page,
+            // including the partial prefix, before the forward starts.
+            .filter(|(_, target)| !loaded.contains(&target.0))
+            .collect();
+        let copied: HashSet<_> = copies.iter().map(|(_, target)| target.0).collect();
         let units: Vec<u32> = plan
             .new_cache_units
             .iter()
             .filter(|allocation| holds(allocation.request_pool_idx))
             .flat_map(|allocation| allocation.unit_ids.iter().map(|unit| unit.0))
-            .filter(|unit| !loaded.contains(unit))
+            .filter(|unit| !loaded.contains(unit) && !copied.contains(unit))
             .collect();
-        if units.is_empty() {
-            return Ok(());
+        if !units.is_empty() {
+            prefix_cache.recycle(&units, &self.column, issue)?;
         }
-        prefix_cache.recycle(&units, &self.column, issue)
+        prefix_cache.copy_units(&copies, issue)
     }
 }
 

@@ -511,7 +511,7 @@ impl Scheduler {
                 );
             }
         }
-        self.advance_request_cache(id);
+        self.advance_request_cache(id, false);
     }
 
     /// Releases the draft cache of running requests with no call in flight,
