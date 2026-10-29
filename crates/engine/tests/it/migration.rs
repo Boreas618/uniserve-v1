@@ -295,6 +295,9 @@ enum Fault {
     /// Every call reports non-finite logits, as a worker whose forward
     /// produced a NaN does (`ErrorCode::NumericalFault`).
     NonFinite,
+    /// Every call fails on the device, as a worker whose forward hit an
+    /// illegal memory access reports it (`ErrorCode::ComputeError`).
+    Compute,
     /// The worker refuses the request's next calls as invalid input
     /// (`ErrorCode::InputError`); the calls of the batch after them, which
     /// read the refused calls' products, fail for want of them
@@ -367,6 +370,7 @@ impl engine::Executor for FaultingExecutor {
         };
         let code = match fault {
             Some(Fault::NonFinite) => ipc::ErrorCode::NumericalFault,
+            Some(Fault::Compute) => ipc::ErrorCode::ComputeError,
             Some(Fault::Refused) if failed == 0 && !report.results.is_empty() => {
                 match self.held.take() {
                     // The refusing batch waits for the batch after it.
@@ -592,6 +596,25 @@ fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost(
         ),
         "{terminal:?}"
     );
+}
+
+/// A worker fault fails a world on trial as a whole, and its first error
+/// names the batch the fault struck and that batch's requests, which the
+/// rollback keeps for diagnosis.
+#[test]
+fn a_worker_fault_on_trial_names_its_batch_and_requests() {
+    let Faulted {
+        stopped, failure, ..
+    } = fail_while_generating(
+        true,
+        Fault::Compute,
+        request(1, Vec::new(), SamplingParams::default(), 100_000),
+    );
+    assert!(stopped, "a worker fault stops a scheduler on trial");
+    let failure = failure.expect("the scheduler reports its first error");
+    assert!(failure.contains("in batches ["), "{failure}");
+    assert!(!failure.contains("in batches []"), "{failure}");
+    assert!(failure.contains("of requests [1]"), "{failure}");
 }
 
 /// Non-finite logits fail a world on trial as a whole: the scheduler stops
