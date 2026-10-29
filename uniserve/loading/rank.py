@@ -345,19 +345,27 @@ def _resolve(
         modules=frozenset(str(path) for path in modules),
         exclude_modules=frozenset(str(path) for path in exclude_modules),
     )
-    if weights:
-        stream = plugins.weight_source(str(weights))
-        identity = str(stream.identity())
-        source = replace(
-            source,
-            checkpoint=tuple(
-                replace(checkpoint, files=(), stream=stream, identity=identity)
-                for checkpoint in source.checkpoint
-            ),
-        )
+    source = _streamed(source, weights)
     options = json.loads(str(quantization))
     chosen = weight_config(source, options, str(model_dtype))
     return Resolved(replace(source, weights=chosen), description)
+
+
+def _streamed(source, weights: str | None):
+    """``source`` with its checkpoints read from the weight source
+    ``weights`` (``scheme://...``) in place of their files, if any.
+    """  # noqa: D205
+    if not weights:
+        return source
+    stream = plugins.weight_source(str(weights))
+    identity = str(stream.identity())
+    return replace(
+        source,
+        checkpoint=tuple(
+            replace(checkpoint, files=(), stream=stream, identity=identity)
+            for checkpoint in source.checkpoint
+        ),
+    )
 
 
 def _expert_kernels(
@@ -425,14 +433,36 @@ def fingerprint(
     if isinstance(resolved, Description):
         return ""
     kernels = _expert_kernels(_text(expert_exchange), int(attention_ranks))
+    # Tensor values and cache identities cover every component of the
+    # model, whether this rank holds it or not, so every rank keys them
+    # alike: a rank narrowed to some components also reads the checkpoint
+    # metadata of the others, resolved as a rank holding them resolves them.
+    # Only the rank's own tensors enter its retained-weight manifest.
+    source = resolved.source
+    held = {checkpoint.name: checkpoint for checkpoint in source.checkpoint}
+    whole = _checkpoints(description, _text(weights))
+    if any(checkpoint.name not in held for checkpoint in whole):
+        source = replace(
+            source,
+            checkpoint=tuple(
+                held.get(checkpoint.name, checkpoint) for checkpoint in whole
+            ),
+        )
     return json.dumps(
-        retention.fingerprints(
-            resolved.source,
-            description.io,
-            kernels,
-        ),
+        retention.fingerprints(source, description.io, kernels),
         sort_keys=True,
     )
+
+
+def _checkpoints(description: Description, weights: str | None) -> tuple:
+    """Every checkpoint source of the described model, of every component.
+
+    Resolved as for a rank that loads the whole model: a Hub snapshot
+    fetches their files.
+    """
+    assert description.path is not None
+    source = registry.read_config(description.path, io=description.io)
+    return _streamed(source, weights).checkpoint
 
 
 def load_model(
