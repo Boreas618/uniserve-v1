@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
     ErrorKind, Event, Link, LinkEnd, PageShape, Priority, Region, Reply, Request, Span, Throttle,
-    TransferEnd,
+    TransferEnd, TransferTotal,
 };
 use ::storage::{Access, Client, Role};
 use storage_server::Launch;
@@ -298,6 +298,25 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
     );
     assert!(transfer.contexts.is_empty());
     assert!(transfer.tasks.is_empty());
+
+    // The deployment's ledger read counts what its ended tasks copied, by
+    // priority, highest first.
+    let transfers = head.ledger(Vec::new()).unwrap().transfers;
+    assert_eq!(
+        transfers,
+        vec![
+            TransferTotal {
+                priority: Priority::Warming,
+                bytes: 40,
+                copied: 40,
+            },
+            TransferTotal {
+                priority: Priority::Background,
+                bytes: 16,
+                copied: 16,
+            },
+        ]
+    );
 }
 
 #[test]
@@ -998,7 +1017,7 @@ pub(crate) mod device {
     /// The Transfer Server's context as the deployment's ledger of `gpu`
     /// books it, if it does.
     fn booked_context(client: &mut ::storage::Client, gpu: [u8; 16]) -> Option<u64> {
-        let (ledgers, _) = client.ledger(vec![gpu]).unwrap();
+        let ledgers = client.ledger(vec![gpu]).unwrap().ledgers;
         ledgers
             .iter()
             .flat_map(|ledger| &ledger.entries)
@@ -1068,7 +1087,7 @@ pub(crate) mod device {
         assert_eq!(booked_context(&mut head, gpu), None);
         // The ledger states the bandwidth from host storage to the GPU the
         // Transfer Server measured.
-        let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
+        let ledgers = head.ledger(vec![gpu]).unwrap().ledgers;
         assert!(!ledgers.is_empty());
         assert!(
             ledgers.iter().all(|ledger| ledger
@@ -1203,7 +1222,7 @@ pub(crate) mod device {
             ),
             other => panic!("a task without room for the context ended {other:?}"),
         }
-        let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
+        let ledgers = head.ledger(vec![gpu]).unwrap().ledgers;
         let ledger = &ledgers[0];
         assert!(
             ledger
@@ -1219,7 +1238,7 @@ pub(crate) mod device {
     /// The weights booked on `gpu` in `head`'s ledger of it: each entry's
     /// worlds and bytes, sorted.
     fn weights_on(head: &mut ::storage::Client, gpu: [u8; 16]) -> Vec<(Vec<u64>, u64)> {
-        let (ledgers, _) = head.ledger(vec![gpu]).unwrap();
+        let ledgers = head.ledger(vec![gpu]).unwrap().ledgers;
         let mut weights: Vec<(Vec<u64>, u64)> = ledgers
             .iter()
             .flat_map(|ledger| &ledger.entries)

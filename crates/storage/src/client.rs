@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::protocol::{
     Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage, Item, Key, Link,
     Listing, Mode, Placement, Priority, Region, Registered, Reply, Request, Role, Scope,
-    ServerMessage, Span, StorageRecord, TensorRecord, Throttle, VERSION, Welcome,
+    ServerMessage, Span, StorageRecord, TensorRecord, Throttle, TransferTotal, VERSION, Welcome,
 };
 use crate::transport::Connection;
 
@@ -570,14 +570,35 @@ impl Client {
         }
     }
 
-    /// See [`Request::Ledger`]: the ledgers of `gpus` (every GPU when empty)
-    /// and what the host admits of new host storage.
-    pub fn ledger(&mut self, gpus: Vec<[u8; 16]>) -> Result<(Vec<GpuLedger>, HostStorage)> {
+    /// See [`Request::Ledger`]: the ledgers of `gpus` (every GPU when empty),
+    /// what the host admits of new host storage, and what the transfer
+    /// tasks of the client's deployment copied.
+    pub fn ledger(&mut self, gpus: Vec<[u8; 16]>) -> Result<Ledgers> {
         match Self::expect(self.call(&Request::Ledger { gpus }, &[])?)?.reply {
-            Reply::Ledger { ledgers, host } => Ok((ledgers, host)),
+            Reply::Ledger {
+                ledgers,
+                host,
+                transfers,
+            } => Ok(Ledgers {
+                ledgers,
+                host,
+                transfers,
+            }),
             other => Err(unexpected("ledger", &other)),
         }
     }
+}
+
+/// What a [`Request::Ledger`] answers ([`Client::ledger`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ledgers {
+    /// The ledgers of the GPUs asked for.
+    pub ledgers: Vec<GpuLedger>,
+    /// What the host admits of new host storage.
+    pub host: HostStorage,
+    /// What the transfer tasks of the client's deployment copied on the
+    /// host, by priority; empty from a server of protocol 17 or earlier.
+    pub transfers: Vec<TransferTotal>,
 }
 
 fn unexpected(request: &str, reply: &Reply) -> Error {

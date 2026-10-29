@@ -317,9 +317,11 @@ impl ClaimHolder {
     }
 
     /// The storage ledgers this node's Storage Server keeps for
-    /// `deployment`, one per GPU of the node it uses, and what the host
-    /// admits of new host storage, as JSON (`{"ledgers": [...],
-    /// "host_storage": {...}}`), read over the claim this daemon holds.
+    /// `deployment`, one per GPU of the node it uses, what the host admits
+    /// of new host storage, and what the deployment's transfer tasks copied
+    /// on the host by priority, as JSON (`{"ledgers": [...],
+    /// "host_storage": {...}, "transfers": [...]}`), read over the claim
+    /// this daemon holds.
     ///
     /// # Errors
     ///
@@ -332,11 +334,16 @@ impl ClaimHolder {
             .held
             .get_mut(deployment)
             .with_context(|| format!("this node holds no claim of deployment {deployment}"))?;
-        let (ledgers, host) = held
+        let read = held
             .client
             .ledger(Vec::new())
             .with_context(|| format!("reading the storage ledgers of deployment {deployment}"))?;
-        Ok(serde_json::json!({ "ledgers": ledgers, "host_storage": host }).to_string())
+        Ok(serde_json::json!({
+            "ledgers": read.ledgers,
+            "host_storage": read.host,
+            "transfers": read.transfers,
+        })
+        .to_string())
     }
 }
 

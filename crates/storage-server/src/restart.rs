@@ -100,6 +100,10 @@ struct HandedServer {
     /// ledgers, whose clients book again when they next book.
     #[serde(default)]
     ledgers: Ledgers,
+    /// What each deployment's transfer tasks copied, by priority; empty
+    /// from a predecessor that counted none.
+    #[serde(default)]
+    transfer_totals: Vec<(String, Vec<::storage::protocol::TransferTotal>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -372,6 +376,7 @@ impl Server {
             host_reserve: self.host_reserve,
             relaunch: std::mem::take(&mut self.relaunch),
             ledgers: std::mem::take(&mut self.ledgers),
+            transfer_totals: self.transfers.handed_totals(),
         };
 
         let Pending {
@@ -652,7 +657,11 @@ impl Server {
             host_reserve: handed.host_reserve,
             ledgers: handed.ledgers,
             kv_storage: KvStorage::new(connector),
-            transfers: Transfers::new(transfer),
+            transfers: {
+                let mut transfers = Transfers::new(transfer);
+                transfers.resume_totals(handed.transfer_totals);
+                transfers
+            },
             moves: crate::moves::Moves::default(),
             events: Vec::new(),
             relaunch: handed.relaunch,
@@ -876,7 +885,7 @@ mod tests {
         );
         // The ledger goes on too: its quota and the worker's booking, which
         // the successor holds against a booking past the quota.
-        let (ledgers, _) = worker.ledger(vec![gpu]).unwrap();
+        let ledgers = worker.ledger(vec![gpu]).unwrap().ledgers;
         assert_eq!(ledgers.len(), 1);
         assert_eq!((ledgers[0].quota, ledgers[0].used()), (Some(700), 300));
         let refused = worker.book(gpu, 1000, None, vec![(Item::Staging, 401)]);

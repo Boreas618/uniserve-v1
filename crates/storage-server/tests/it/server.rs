@@ -1882,7 +1882,7 @@ fn segment(world: u64, ordinal: u32) -> Option<::storage::Segment> {
 
 /// The deployment's ledger of [`GPU`] as `client` reads it.
 pub(crate) fn ledger(client: &mut Client) -> ::storage::GpuLedger {
-    let (ledgers, _) = client.ledger(vec![GPU]).unwrap();
+    let ledgers = client.ledger(vec![GPU]).unwrap().ledgers;
     assert_eq!(ledgers.len(), 1, "{ledgers:?}");
     ledgers.into_iter().next().unwrap()
 }

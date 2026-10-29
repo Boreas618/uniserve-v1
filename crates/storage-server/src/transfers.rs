@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ::storage::protocol::{
     Access, Allocation, ContextBytes, ErrorKind, Event, FabricExport, FabricHandle, Link,
     LinkBandwidth, LinkEnd, ListedTask, ListedTransfer, Move, Placement, Priority, Region,
-    Registered, Reply, Role, Span, Throttle, TransferEnd,
+    Registered, Reply, Role, Span, Throttle, TransferEnd, TransferTotal,
 };
 
 use crate::child::{Launch, Supervised};
@@ -105,6 +105,19 @@ pub(super) struct Transfers {
     /// Exposures registered and not ended, by that number, with the peer
     /// that holds each.
     live: BTreeMap<u64, ClientId>,
+    /// What each deployment's tasks copied since the server started, by
+    /// priority (indexed by [`Priority::rank`]): the bytes of the tasks
+    /// submitted, and the bytes copied of them as the Transfer Server
+    /// reported its progress. A hot restart hands them over, so a world
+    /// change's head reads how much its update moved across restarts.
+    totals: BTreeMap<String, [Total; 3]>,
+}
+
+/// The bytes one deployment's tasks of one priority submitted and copied.
+#[derive(Debug, Clone, Copy, Default)]
+struct Total {
+    bytes: u64,
+    copied: u64,
 }
 
 impl Transfers {
@@ -122,7 +135,54 @@ impl Transfers {
             exposures: BTreeMap::new(),
             next_registration: 1,
             live: BTreeMap::new(),
+            totals: BTreeMap::new(),
         }
+    }
+
+    /// What `deployment`'s tasks copied, by priority, highest first; the
+    /// priorities it submitted no task of are left out.
+    pub(super) fn totals(&self, deployment: &str) -> Vec<TransferTotal> {
+        let Some(totals) = self.totals.get(deployment) else {
+            return Vec::new();
+        };
+        Priority::ORDER
+            .iter()
+            .zip(totals)
+            .filter(|(_, total)| total.bytes > 0)
+            .map(|(&priority, total)| TransferTotal {
+                priority,
+                bytes: total.bytes,
+                copied: total.copied,
+            })
+            .collect()
+    }
+
+    /// Every deployment's totals, as a hot restart hands them over.
+    pub(super) fn handed_totals(&self) -> Vec<(String, Vec<TransferTotal>)> {
+        self.totals
+            .keys()
+            .map(|deployment| (deployment.clone(), self.totals(deployment)))
+            .collect()
+    }
+
+    /// Takes over the totals a predecessor handed over.
+    pub(super) fn resume_totals(&mut self, handed: Vec<(String, Vec<TransferTotal>)>) {
+        for (deployment, totals) in handed {
+            let entry = self.totals.entry(deployment).or_default();
+            for total in totals {
+                entry[total.priority.rank()] = Total {
+                    bytes: total.bytes,
+                    copied: total.copied,
+                };
+            }
+        }
+    }
+
+    /// Records task `task` and counts its bytes in its deployment's total.
+    fn insert(&mut self, task: u64, entry: Task) {
+        self.totals.entry(entry.deployment.clone()).or_default()[entry.priority.rank()].bytes +=
+            entry.bytes;
+        self.tasks.insert(task, entry);
     }
 }
 
@@ -629,7 +689,7 @@ impl Server {
         }
         let task = self.transfers.next_task;
         self.transfers.next_task += 1;
-        self.transfers.tasks.insert(
+        self.transfers.insert(
             task,
             Task {
                 owner: Owner::Client(client),
@@ -707,7 +767,7 @@ impl Server {
 
         let task = self.transfers.next_task;
         self.transfers.next_task += 1;
-        self.transfers.tasks.insert(
+        self.transfers.insert(
             task,
             Task {
                 owner: Owner::Move { number, index },
@@ -928,8 +988,14 @@ impl Server {
         let Some(entry) = self.transfers.tasks.get_mut(&task) else {
             return;
         };
+        // Each report states the task's bytes copied so far: its total
+        // grows by what the task copied since its previous report.
+        let grown = bytes.saturating_sub(entry.copied);
         entry.copied = bytes;
         let owner = entry.owner;
+        if let Some(totals) = self.transfers.totals.get_mut(&entry.deployment) {
+            totals[entry.priority.rank()].copied += grown;
+        }
         if end.is_some() {
             self.transfers.tasks.remove(&task);
         }
