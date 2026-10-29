@@ -23,14 +23,15 @@ uninterrupted as the reference. The same request is then preempted:
   cache the request reserves again. A request generates its images in
   seconds while a successor prepares for tens of them, so the request
   starts once the successor prepares, and the serving world's workers are
-  paused (``SIGSTOP``) once the client receives its first image and resumed
+  paused (``SIGSTOP``) once denoising has reached its second image and resumed
   once the change promotes: the park then lands where
   the paused calls end, and the successor continues the request.
 
-Each run has its own cache salt. The test waits until the client receives
-its first image before initiating preemption. It checks that the stream
+Each run has its own cache salt. The test uses the public completed-media-call
+counter to interrupt during the second image: completed images in this chat
+stream are buffered until the next text token. It checks that the stream
 continues with two images, the same usage and finish reason, and preserves
-the already delivered image:
+the image completed before preemption:
 
 - for SenseNova, its whole stream is the reference's, byte for byte: the
   request decodes no text between its images and its input image keeps its
@@ -48,6 +49,7 @@ the already delivered image:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -58,7 +60,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Queue
 from typing import Any
 
 import httpx
@@ -77,8 +78,6 @@ from uniserve_eval.transport.sse import iter_sse_events
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
 
-# Denoising steps leave enough time after receiving the first image to
-# preempt the request while it generates its second image.
 STEPS = 24
 
 
@@ -267,9 +266,7 @@ class Streamed:
     seconds: float
 
 
-def _stream(
-    base_url: str, payload: dict[str, Any], received: Queue[str] | None = None
-) -> Streamed:
+def _stream(base_url: str, payload: dict[str, Any]) -> Streamed:
     started = time.monotonic()
     events = []
     with httpx.stream(
@@ -281,12 +278,6 @@ def _stream(
         response.raise_for_status()
         for event in iter_sse_events(response.iter_lines()):
             events.append(event)
-            if received is not None:
-                for choice in event.get("choices") or []:
-                    for image in (choice.get("delta") or {}).get(
-                        "images"
-                    ) or []:
-                        received.put(image["image_url"]["url"])
     seconds = time.monotonic() - started
     assert events[-1]["type"] == "sse_done", events[-1]
     text, images, reasons, usage = [], [], [], None
@@ -304,6 +295,52 @@ def _stream(
                 reasons.append(choice["finish_reason"])
     assert usage is not None, events
     return Streamed("".join(text), images, reasons, usage, seconds)
+
+
+def _completed_media_calls(client: httpx.Client) -> int:
+    """Completed flow calls reported independently of worker probe buffers."""
+    response = client.get("/metrics")
+    response.raise_for_status()
+    return sum(
+        int(float(value))
+        for labels, value in re.findall(
+            r"^uniserve:scheduler_domain_calls_total\{([^}]*)\} (\S+)$",
+            response.text,
+            re.MULTILINE,
+        )
+        if 'domain="flow"' in labels and 'kind="completed"' in labels
+    )
+
+
+def _wait_second_image(base_url: str, streamed: Future, before: int) -> None:
+    """Wait for the second image to denoise before chat output arrives."""
+    deadline = time.monotonic() + scaled(600)
+    with httpx.Client(base_url=base_url, timeout=scaled(30)) as client:
+        while time.monotonic() < deadline:
+            if streamed.done():
+                streamed.result()
+                pytest.fail("the request ended before its preemption")
+            completed = _completed_media_calls(client) - before
+            # Each image prepares its latent, denoises, then decodes. Text
+            # and feedback encoders belong to the separate prefill counter.
+            # Wait past the second preparation and leave its final step
+            # outstanding when the interruption starts.
+            if completed > STEPS + 3:
+                assert completed < 2 * (STEPS + 2) - 1, (
+                    "both images already denoised"
+                )
+                return
+            time.sleep(0.02)
+    raise TimeoutError("the request did not reach its second image")
+
+
+def _settled_steps(base_url: str) -> int:
+    """Read the idle scheduler's counter after its reporting interval."""
+    # The scheduler reports even when no request is active. Probe samples
+    # instead travel with later batch results and cannot supply a baseline.
+    time.sleep(2.1)
+    with httpx.Client(base_url=base_url, timeout=scaled(30)) as client:
+        return _completed_media_calls(client)
 
 
 def _admin(
@@ -414,16 +451,14 @@ def test_a_preempted_image_request_continues_exactly(
         # A sleep while the request generates its second image: the request
         # leaves with its first image and continues once the engine wakes.
         streamed: Future
-        received: Queue[str] = Queue()
+        before = _settled_steps(base_url)
         with ThreadPoolExecutor(max_workers=1) as pool:
             streamed = pool.submit(
                 _stream,
                 base_url,
                 _request(setup, image_start, "sleep"),
-                received,
             )
-            assert received.get(timeout=scaled(600)) == reference.images[0]
-            assert not streamed.done(), "the request ended before the sleep"
+            _wait_second_image(base_url, streamed, before)
             slept = _admin(base_url, "sleep")
             assert slept.status_code == 200, slept.text
             woke = _admin(base_url, "wake_up")
@@ -433,16 +468,14 @@ def test_a_preempted_image_request_continues_exactly(
 
         # Losing the worker leaves no stored trajectory for this request.
         # Recovery must compute its unfinished image from the request facts.
-        received = Queue()
+        before = _settled_steps(base_url)
         with ThreadPoolExecutor(max_workers=1) as pool:
             streamed = pool.submit(
                 _stream,
                 base_url,
                 _request(setup, image_start, "worker-loss"),
-                received,
             )
-            assert received.get(timeout=scaled(600)) == reference.images[0]
-            assert not streamed.done(), "the request ended before worker loss"
+            _wait_second_image(base_url, streamed, before)
             workers = _workers(runtime)
             assert len(workers) == 1, workers
             worker = workers[0]
@@ -456,10 +489,10 @@ def test_a_preempted_image_request_continues_exactly(
         _assert_continued(recovered_stream, reference, 1, setup)
 
         # A world change whose numerics are unchanged, the serving world's
-        # workers paused once the request ran for most of the reference's
-        # time and resumed once the change promotes, well within the
+        # workers paused while the second image denoises and resumed once
+        # the change promotes, well within the
         # workers' five-minute watchdog.
-        received = Queue()
+        before = _settled_steps(base_url)
         workers = _workers(runtime)
         assert workers, "the serving world's workers"
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -479,10 +512,8 @@ def test_a_preempted_image_request_continues_exactly(
                 _stream,
                 base_url,
                 _request(setup, image_start, "world"),
-                received,
             )
-            assert received.get(timeout=scaled(600)) == reference.images[0]
-            assert not streamed.done(), "the request ended before promotion"
+            _wait_second_image(base_url, streamed, before)
             for worker in workers:
                 os.kill(worker, signal.SIGSTOP)
             try:
