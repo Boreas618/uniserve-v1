@@ -19,8 +19,9 @@
 //! rollback claims, and its workers then map its weights where they were.
 //!
 //! A server of an earlier protocol than this build's is restarted with this
-//! daemon's executable before the deployment is claimed: the successor goes
-//! on with every connection and every allocation it holds.
+//! daemon's executable before the deployment is claimed, or taken over by a
+//! hot restart ([`restart_earlier`]): the successor goes on with every
+//! connection and every allocation it holds.
 
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
@@ -134,7 +135,7 @@ impl ClaimHolder {
         }
         storage::socket::ensure(&self.executable, &socket, START_TIMEOUT, &arguments)
             .context("starting this node's storage server")?;
-        self.restart_earlier(&socket)?;
+        restart_earlier(&self.executable, &socket)?;
         let mut client = storage::Client::connect(
             &socket,
             storage::Role::Head {
@@ -337,45 +338,52 @@ impl ClaimHolder {
             .with_context(|| format!("reading the storage ledgers of deployment {deployment}"))?;
         Ok(serde_json::json!({ "ledgers": ledgers, "host_storage": host }).to_string())
     }
+}
 
-    /// Restarts the server at `socket` with this daemon's executable when it
-    /// speaks an earlier protocol than this build, which needs this build's,
-    /// and waits until the successor serves: it goes on with every
-    /// connection and allocation, so no deployment of the host notices.
-    fn restart_earlier(&self, socket: &std::path::Path) -> anyhow::Result<()> {
-        use anyhow::Context as _;
+/// Restarts the server at `socket` with `executable` (this build's) when it
+/// speaks an earlier protocol than this build, which needs this build's,
+/// and waits until the successor serves: it goes on with every connection
+/// and allocation, so no deployment of the host notices. A daemon of this
+/// build calls it before it claims a deployment, and before it takes a
+/// deployment over from a daemon of an earlier build, so that every update
+/// replaces the Storage Server before the daemon and the daemon before the
+/// world (`specs/online-operations.md` §4.4).
+pub(crate) fn restart_earlier(
+    executable: &std::path::Path,
+    socket: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
 
-        let mut operator = storage::Client::connect_operator(socket)
-            .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
-        if operator.version() >= storage::protocol::VERSION {
+    let mut operator = storage::Client::connect_operator(socket)
+        .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
+    if operator.version() >= storage::protocol::VERSION {
+        return Ok(());
+    }
+    let earlier = operator.version();
+    let pid = operator
+        .restart(Some(executable.to_string_lossy().into_owned()))
+        .context("restarting a storage server of an earlier protocol")?;
+    tracing::info!(
+        earlier,
+        version = storage::protocol::VERSION,
+        pid,
+        "restarting the storage server, which speaks an earlier protocol"
+    );
+    drop(operator);
+    let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
+    loop {
+        if let Ok(client) = storage::Client::connect_operator(socket)
+            && client.version() >= storage::protocol::VERSION
+        {
             return Ok(());
         }
-        let earlier = operator.version();
-        let pid = operator
-            .restart(Some(self.executable.to_string_lossy().into_owned()))
-            .context("restarting a storage server of an earlier protocol")?;
-        tracing::info!(
-            earlier,
-            version = storage::protocol::VERSION,
-            pid,
-            "restarting the storage server, which speaks an earlier protocol"
-        );
-        drop(operator);
-        let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
-        loop {
-            if let Ok(client) = storage::Client::connect_operator(socket)
-                && client.version() >= storage::protocol::VERSION
-            {
-                return Ok(());
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "the storage server did not serve protocol {} within {RESTART_TIMEOUT:?} of its \
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the storage server did not serve protocol {} within {RESTART_TIMEOUT:?} of its \
                  restart",
-                storage::protocol::VERSION
-            );
-            std::thread::sleep(RESTART_POLL);
-        }
+            storage::protocol::VERSION
+        );
+        std::thread::sleep(RESTART_POLL);
     }
 }
 
