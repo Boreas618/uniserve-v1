@@ -23,6 +23,7 @@ from .shapes import PrefillVariant
 __all__ = [
     "CommitKey",
     "DecodeKey",
+    "DraftKey",
     "Graph",
     "GraphKey",
     "GraphTable",
@@ -30,6 +31,8 @@ __all__ = [
     "PromptKey",
     "ScoreKey",
     "SelectKey",
+    "VerifiedKey",
+    "VerifyKey",
 ]
 
 
@@ -52,6 +55,37 @@ class PrefillKey:
     tokens: int
     outputs: bool
     variant: PrefillVariant
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyKey:
+    """A verification of a row bucket: ``prefill`` of its rows and ``verify``
+    of their tasks in one graph, including recurrent state acceptance.
+
+    ``rows`` is the verification rows the bucket holds (it evaluates one
+    padding row more); ``sorts`` whether the general sampler sorts whole
+    vocabulary rows.
+    """  # noqa: D205
+
+    rows: int
+    sorts: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DraftKey:
+    """A drafter pass over a verification row bucket."""
+
+    rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedKey:
+    """``score_verified`` of a bucket of a verification's reported rows and
+    a top width.
+    """  # noqa: D205
+
+    rows: int
+    top: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +125,17 @@ class PromptKey:
     top: int
 
 
-GraphKey = DecodeKey | PrefillKey | CommitKey | SelectKey | ScoreKey | PromptKey
+GraphKey = (
+    DecodeKey
+    | PrefillKey
+    | VerifyKey
+    | DraftKey
+    | CommitKey
+    | SelectKey
+    | ScoreKey
+    | PromptKey
+    | VerifiedKey
+)
 
 
 class Graph(Protocol):

@@ -37,7 +37,7 @@ score, padded to whole calls:
 | ``commit`` (field-major) | int64 | ``[8, R]`` |
 | ``slot_writes`` (:class:`SlotWrite` pairs) | int64 | ``[4, R]`` |
 | ``relays`` (:class:`Relay` pairs) | int64 | ``[8, R]`` |
-| ``logits`` | model | ``[R, local vocab]`` |
+| ``logits`` | model | ``[R * (1 + D), local vocab]`` |
 | ``completion`` | int64 | ``[4, R]`` |
 | ``continuation``, ``transition`` | uint8 | ``[R]`` |
 | ``tagged``, ``points``, ``scored`` | int64 | ``[R]`` |
@@ -47,8 +47,12 @@ score, padded to whole calls:
 | ``input_embeddings`` (multimodal) | model | ``[T, hidden]`` |
 | ``embedding_mask`` (multimodal) | uint8 | ``[T]`` |
 
-A runner that drafts (``D`` draft tokens a call proposes at most, the
-deployment's draft limit) adds the columns of its draft pass
+``D`` is the draft tokens a call proposes at most (the deployment's draft
+limit), zero for a runner that does not draft: the logits of a
+verification's every position (current tokens and drafts) share this
+storage with the first ``R`` rows a decode, prefill or selection reads.
+A runner that drafts adds
+the columns of its draft pass
 (:meth:`~uniserve.runner.causal_lm.CausalLMRunner.draft`), whose chained
 steps' windows hold ``Wd = 2 * D * R`` tokens at most:
 
@@ -111,6 +115,8 @@ from .shapes import (
     TextShapes,
     prefill_row_buckets,
     prefill_shapes,
+    verification_tokens,
+    window_tokens,
 )
 
 __all__ = [
@@ -249,13 +255,19 @@ class TextBounds:
 
     Attributes:
         rows: Row capacity of the columns: a batch's rows, or a wider
-            prefill or decode bucket.
+            prefill, decode or verification bucket.
         tokens: Token capacity of the columns.
         groups: The prefix cache groups, in group order.
         tables: The numerical block tables, group-major.
         widths: Pages per table every graph addresses.
         decode: The decode row buckets, in configured order.
         prefill: The prefill captures.
+        verify: The verification row buckets: the decode row buckets of a
+            computation that drafts.
+        drafts: Draft tokens a call proposes at most, the most a
+            verification row carries; zero for a computation that does not
+            speculate.
+        prompts: Prompt forwards are captured.
     """
 
     rows: int
@@ -265,6 +277,9 @@ class TextBounds:
     widths: tuple[int, ...]
     decode: tuple[int, ...]
     prefill: tuple[PrefillShape, ...]
+    verify: tuple[int, ...] = ()
+    drafts: int = 0
+    prompts: bool = True
 
     @classmethod
     def derive(
@@ -281,6 +296,8 @@ class TextBounds:
         prefill_token_sizes: Sequence[int],
         prefill_outputs: bool,
         media_axes: int | None,
+        drafts: int = 0,
+        prompts: bool = True,
     ) -> TextBounds:
         """Derive the bounds.
 
@@ -300,6 +317,11 @@ class TextBounds:
             media_axes: The rotary axes of prompts placing vision blocks,
                 for a model that places them: their prefills are captured
                 as a variant of their own.
+            drafts: Draft tokens a call proposes at most; a computation
+                that drafts captures its verifications in the decode row
+                buckets.
+            prompts: Prompt forwards are captured under graphs; without,
+                they are served eagerly and no prefill bucket is captured.
 
         Raises:
             ValueError: No cache group.
@@ -342,7 +364,7 @@ class TextBounds:
         if media_axes is not None:
             variants.append(PrefillVariant.media(int(media_axes)))
         prefill: list[PrefillShape] = []
-        if graphs:
+        if graphs and prompts:
             pages = [
                 (group.block_size, group.units_per_page) for group in groups
             ]
@@ -355,10 +377,24 @@ class TextBounds:
                 bool(prefill_outputs),
                 None if units is None else (pages, units - 1),
             )
+        # A computation that drafts verifies in the decode row buckets: a
+        # verification batch, like a decode batch, holds a page of every
+        # group per row. Its graph evaluates a padding row more, every
+        # row's current token and drafts, and the drafter's windows: each
+        # proposer's drafts and its further proposals.
+        drafts = int(drafts)
+        verify = tuple(sorted(decode)) if graphs and drafts else ()
+        verify_tokens = [
+            max(verification_tokens(size, drafts), window_tokens(size, drafts))
+            for size in verify
+        ]
         rows = max(
-            [max_rows] + [shape.row_bucket for shape in prefill] + list(decode)
+            [max_rows]
+            + [shape.row_bucket for shape in prefill]
+            + list(decode)
+            + [size + 1 for size in verify]
         )
-        tokens = max([tokens] + list(decode))
+        tokens = max([tokens] + list(decode) + verify_tokens)
         return cls(
             rows=rows,
             tokens=tokens,
@@ -367,6 +403,9 @@ class TextBounds:
             widths=tuple(widths),
             decode=tuple(decode),
             prefill=tuple(prefill),
+            verify=verify,
+            drafts=drafts,
+            prompts=bool(prompts),
         )
 
     @property
@@ -383,7 +422,13 @@ class TextBounds:
 
     def shapes(self) -> TextShapes:
         """Return the computation's graph catalogs."""
-        return TextShapes(self.decode, self.prefill)
+        return TextShapes(
+            self.decode,
+            self.prefill,
+            verify=self.verify,
+            drafts=self.drafts,
+            prompts=self.prompts,
+        )
 
     def dimensions(
         self,
@@ -443,6 +488,14 @@ class Dimensions:
         """Return the row gather's column words."""
         return (ROW_SECTIONS + self.tables) * (self.rows + 1) + self.tokens
 
+    def logit_rows(self) -> int:
+        """Return the candidate logits rows a forward projects at most.
+
+        A row's last position each, or a verification's every position:
+        its rows' current tokens and drafts.
+        """
+        return self.rows * (1 + self.drafts)
+
     def logprob_words(self) -> int:
         """Return the logprob words a forward may report."""
         return logprob_capacity(self.tokens)
@@ -492,7 +545,7 @@ class Dimensions:
             ("commit", torch.int64, (COMMIT_FIELDS, rows)),
             ("slot_writes", torch.int64, (2 * len(SlotWrite), rows)),
             ("relays", torch.int64, (2 * len(Relay), rows)),
-            ("logits", self.dtype, (rows, self.local_vocab)),
+            ("logits", self.dtype, (self.logit_rows(), self.local_vocab)),
             ("completion", torch.int64, (COMPLETION_FIELDS, rows)),
             ("continuation", torch.uint8, (rows,)),
             ("transition", torch.uint8, (rows,)),

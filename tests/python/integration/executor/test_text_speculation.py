@@ -28,6 +28,7 @@ that keeps a draft cache, the padding sentinel for one that lacks it.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -110,9 +111,12 @@ class Outcome:
 class Worker:
     """The worker's half of one speculating text computation."""
 
-    def __init__(self, root) -> None:
-        device = torch.device("cuda", torch.cuda.current_device())
+    def __init__(self, root, graphs: bool) -> None:
+        device = torch.device(
+            "cuda", int(os.environ.get("UNISERVE_WORLD_DEVICE", "0"))
+        )
         self.device = device
+        self.graphs = graphs
         self.model = models.load_model(
             models.read_config(root),
             device=device,
@@ -186,7 +190,7 @@ class Worker:
                         component="text",
                         streams=(self.stream,),
                         scratches=(Scratch(),),
-                        pools=None,
+                        pools=(torch.cuda.MemPool(),) if graphs else None,
                         relay_tokens=torch.zeros(
                             MAX_CALLS, dtype=torch.int64, device=device
                         ),
@@ -198,10 +202,12 @@ class Worker:
                 ),
             )
         )
+        if graphs:
+            self.warm()
 
     def _settings(self) -> dict:
         return {
-            "graphs": False,
+            "graphs": self.graphs,
             "model_dtype": "float32",
             "components": [
                 {
@@ -215,7 +221,7 @@ class Worker:
                 "max_batch_calls": MAX_CALLS,
                 "max_batch_tokens": MAX_TOKENS,
                 "max_model_len": MAX_LEN,
-                "decode_graph_batch_sizes": [],
+                "decode_graph_batch_sizes": [1, 2, 4] if self.graphs else [],
                 "prefill_graph_token_sizes": [],
                 "prefill_outputs": True,
                 "draft_tokens": DRAFTS,
@@ -282,6 +288,34 @@ class Worker:
         return result
 
     # Batches.
+
+    def warm(self) -> None:
+        """Run the executor's public warmup phases with their scratch pages."""
+        for index, phase in enumerate(self.executor.warmup_phases()):
+            lengths = phase["lengths"]
+            for slot, length in enumerate(lengths, 1):
+                self.install(slot, length, True)
+            pages = [
+                torch.tensor(
+                    [
+                        self.pages(slot, prefix, query)
+                        for slot, prefix, query in step
+                    ],
+                    dtype=torch.int64,
+                ).T.contiguous()
+                for step in phase["steps"]
+            ]
+            try:
+                self.executor.warmup_phase(index, *pages)
+            finally:
+                self.stream.synchronize()
+                for slot in range(1, len(lengths) + 1):
+                    units = self.units.pop(slot) + (self.drafts.pop(slot) or [])
+                    self.pool.zero_units(units)
+                    self.free.extend(units)
+                    self.unit_tables[:, slot].zero_()
+        self.executor.warmup_finish()
+        self.executor.seal()
 
     def start(self, requests, sampling=GREEDY) -> None:
         refused = self.executor.start(
@@ -515,11 +549,15 @@ def checkpoint(tmp_path_factory):
     return root, reference
 
 
-@pytest.fixture
-def worker(checkpoint):
-    worker = Worker(checkpoint[0])
-    yield worker
-    worker.close()
+@pytest.fixture(params=[False, True], ids=["eager", "graphs"])
+def worker(checkpoint, request):
+    device = int(os.environ.get("UNISERVE_WORLD_DEVICE", "0"))
+    with torch.cuda.device(device):
+        worker = Worker(checkpoint[0], request.param)
+        try:
+            yield worker
+        finally:
+            worker.close()
 
 
 PROMPTS = {

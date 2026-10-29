@@ -938,18 +938,31 @@ def uncaptured(loaded: Loaded) -> str:
     when it captures them all.
 
     Serving captures a call of the attention provider when the provider
-    says so (``uniserve.backends.attention.Backend.captures``), and a
-    module's calls unless its class says otherwise (``captures = False``,
-    an implementation whose forward runs a host loop too long to capture).
+    says so (``uniserve.backends.attention.Backend.captures``); a module
+    whose prompt forwards it does not capture is :func:`uncaptured_prompts`'
+    concern.
     """  # noqa: D205
     if not loaded.attention.captures:
         return (
             f"the {loaded.attention_backend} attention provider's calls are "
             "not captured"
         )
+    return ""
+
+
+def uncaptured_prompts(loaded: Loaded) -> str:
+    """Why serving does not capture the loaded model's prompt forwards, or
+    ``""`` when it captures them.
+
+    A module class whose step forwards (decodes and verifications) serving
+    captures but whose prompt forwards it does not says so
+    (``captures_prompts = False``, an implementation whose prompt forward
+    runs a host loop over its chunks): serving runs the model's prompt
+    forwards eagerly and replays the graphs of its step forwards.
+    """  # noqa: D205
     for module in loaded.module.modules():
-        if getattr(type(module), "captures", True) is False:
-            return f"{type(module).function}'s calls are not captured"
+        if getattr(type(module), "captures_prompts", True) is False:
+            return f"{type(module).function}'s prompt forwards are not captured"
     return ""
 
 
