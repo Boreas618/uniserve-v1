@@ -176,6 +176,8 @@ pub struct SchedulerMetrics {
     pub prefix_cache_queries: Family<EngineLabels, U64Counter>,
     /// Prefix-cache hit tokens.
     pub prefix_cache_hits: Family<EngineLabels, U64Counter>,
+    /// The prefix-cache hit tokens loaded from the host KV cache.
+    pub prefix_cache_host_hits: Family<EngineLabels, U64Counter>,
 
     // Worker-local forward/kernel counters.
     /// Attention kernel launches.
@@ -357,6 +359,12 @@ impl SchedulerMetrics {
             "uniserve:prefix_cache_hits",
             "Prefix cache hits, in terms of number of cached tokens.",
             prefix_cache_hits.clone(),
+        );
+        let prefix_cache_host_hits: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:prefix_cache_host_hits",
+            "The prefix cache hits loaded from the host KV cache, in tokens.",
+            prefix_cache_host_hits.clone(),
         );
         let worker_attention_launches: Family<EngineLabels, U64Counter> = Default::default();
         registry.register(
@@ -622,6 +630,7 @@ impl SchedulerMetrics {
             scheduler_domain_time_us,
             prefix_cache_queries,
             prefix_cache_hits,
+            prefix_cache_host_hits,
             worker_attention_launches,
             worker_attention_us,
             worker_attention_backend_counts,

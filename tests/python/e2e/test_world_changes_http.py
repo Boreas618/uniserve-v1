@@ -22,7 +22,8 @@ the same request alone, with the same usage.
 - A change of the executable alone, whose functions and formats stay the
   same, invalidates nothing: after the commit the successor maps every
   retained weight, a cached prompt finds as many tokens cached as before
-  the change, and the Storage Server shoots down no writer.
+  the change, on the device and, once fill prompts pushed its pages out of
+  it, in the host KV cache, and the Storage Server shoots down no writer.
 - An operator's rollback resumes the previous world, parked or started
   again on the weights it kept (``update_config.previous_world``); the
   stream continues on it, and the configuration is marked unavailable:
@@ -860,13 +861,36 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
     assert streaming.usage == reference_usage
 
 
+# Distinct prompts whose pages together outgrow the device KV cache (32768
+# tokens), pushing out the pages of a prompt asked before them, which the
+# host KV cache keeps.
+EVICTING_FILLS = 6
+
+
+def _host_hits_of(
+    base_url: str, name: str, prompt: str, first: int
+) -> tuple[float, float]:
+    """The prompt tokens a query of `prompt` finds cached once fill prompts
+    numbered from `first` pushed its pages out of the device KV cache, and
+    those of them loaded from the host KV cache.
+    """  # noqa: D205
+    for index in range(first, first + EVICTING_FILLS):
+        _chat(base_url, name, f"{index}: {FILL_PROMPT}", tokens=1)
+    host = _prefix_counter(base_url, "host_hits")
+    _, hits = _hits_of(base_url, name, prompt)
+    return hits, _prefix_counter(base_url, "host_hits") - host
+
+
 def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
     name = "qwen3-same-keys"
     with _serve(tmp_path, name) as (base_url, _):
-        # The prompt's pages are computed once and then found cached.
+        # The prompt's pages are computed once and then found cached, on the
+        # device and, once pushed out of it, in the host KV cache.
         answer = _chat(base_url, name, CACHED_PROMPT)
         cached_answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
         assert cached_answer == answer and hits > 0, (cached_answer, hits)
+        host_before = _host_hits_of(base_url, name, CACHED_PROMPT, 0)
+        assert host_before[1] > 0, host_before
 
         # A world capturing other batch sizes computes the same functions in
         # the same formats: it maps every retained weight and keeps every
@@ -880,8 +904,12 @@ def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
         assert committed.status_code == 200, committed.text
 
         # The committed world finds as many of the prompt's tokens cached,
-        # and answers it as before.
+        # on the device and in the host KV cache, and answers it as before.
         assert _hits_of(base_url, name, CACHED_PROMPT) == (answer, hits)
+        host_after = _host_hits_of(
+            base_url, name, CACHED_PROMPT, EVICTING_FILLS
+        )
+        assert host_after == host_before, (host_after, host_before)
 
     # No writer of the deployment's storage was ended to pass its access on.
     storage_log = (tmp_path / "storage-server.log").read_text()
