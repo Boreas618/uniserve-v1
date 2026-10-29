@@ -17,11 +17,19 @@ impl Scheduler {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
             let execution = failure.execution.as_ref();
             let code = execution.and_then(|value| value.code);
-            let refused = !failure.refusals.is_empty()
-                && failure
-                    .requests
-                    .iter()
-                    .all(|request| failure.refusals.contains_key(request));
+            // Requests refused earlier keep their place while a call of
+            // theirs is in flight.
+            let pending = &self.inflight.pending_calls;
+            self.inflight
+                .refused
+                .retain(|request| pending.contains_key(&request.request_id));
+            // A failure is a refusal when every request it names was refused,
+            // by this report or by an earlier one whose consequence it is.
+            let refused = !failure.requests.is_empty()
+                && failure.requests.iter().all(|request| {
+                    failure.refusals.contains_key(request)
+                        || self.inflight.refused.contains(request)
+                });
             if code == Some(ipc::ErrorCode::InvariantViolation) {
                 self.fail(format!(
                     "a worker's control-plane invariant failed: {error:#}"
@@ -39,6 +47,16 @@ impl Scheduler {
                 tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
             self.fail_after_worker_failure(failure);
+            if refused {
+                let pending = &self.inflight.pending_calls;
+                let in_flight = failure
+                    .refusals
+                    .keys()
+                    .filter(|request| pending.contains_key(&request.request_id))
+                    .copied()
+                    .collect::<Vec<_>>();
+                self.inflight.refused.extend(in_flight);
+            }
             // A world on trial is not repaired: a worker fault, rather than a
             // request its workers rejected, fails it as a whole, and the
             // daemon rolls back to the previous world.

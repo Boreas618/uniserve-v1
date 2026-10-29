@@ -295,6 +295,11 @@ enum Fault {
     /// Every call reports non-finite logits, as a worker whose forward
     /// produced a NaN does (`ErrorCode::NumericalFault`).
     NonFinite,
+    /// The worker refuses the request's next calls as invalid input
+    /// (`ErrorCode::InputError`); the calls of the batch after them, which
+    /// read the refused calls' products, fail for want of them
+    /// (`ErrorCode::InvalidDescriptor`), refusing nothing themselves.
+    Refused,
 }
 
 /// The simulator's workers, which fail as `fault` states from the moment it
@@ -306,6 +311,13 @@ struct FaultingExecutor {
     inner: SimExecutor,
     fault: std::sync::Arc<std::sync::Mutex<Option<Fault>>>,
     queued: Option<engine::BatchResult>,
+    /// The batches a `Refused` fault failed: the refusing one, then the
+    /// dependent one. The fault ends after both.
+    refused_batches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The report a `Refused` fault holds back: the refusing batch's until
+    /// the batch after it reports, so that the scheduler submitted that one
+    /// before it knew of the refusal, then the dependent batch's.
+    held: Option<engine::BatchResult>,
 }
 
 impl engine::Executor for FaultingExecutor {
@@ -340,18 +352,69 @@ impl engine::Executor for FaultingExecutor {
         if fault == Some(Fault::Lost) {
             return Err(anyhow::anyhow!("worker process exited"));
         }
+        let failed = self
+            .refused_batches
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if fault == Some(Fault::Refused) && failed == 1 {
+            // The dependent batch's report, held since the refusal.
+            if let Some(held) = self.held.take() {
+                return self.fail(held, ipc::ErrorCode::InvalidDescriptor);
+            }
+        }
         let report = self.inner.poll(timeout)?;
-        let Some(mut report) = report else {
+        let Some(report) = report else {
             return Ok(None);
         };
-        if fault != Some(Fault::NonFinite) {
-            return Ok(Some(report));
+        let code = match fault {
+            Some(Fault::NonFinite) => ipc::ErrorCode::NumericalFault,
+            Some(Fault::Refused) if failed == 0 && !report.results.is_empty() => {
+                match self.held.take() {
+                    // The refusing batch waits for the batch after it.
+                    None => {
+                        self.held = Some(report);
+                        return Ok(None);
+                    }
+                    Some(refusing) => {
+                        self.held = Some(report);
+                        return self.fail(refusing, ipc::ErrorCode::InputError);
+                    }
+                }
+            }
+            _ => return Ok(Some(report)),
+        };
+        self.fail(report, code)
+    }
+
+    fn close(&mut self) -> Result<(), engine::ExecutorError> {
+        self.inner.close()
+    }
+}
+
+impl FaultingExecutor {
+    /// Fails every call of `report` with `code` as workers report it: the
+    /// failure of the work that depends on its calls now, naming the
+    /// requests refused when `code` refuses input, and the report itself at
+    /// the next poll.
+    fn fail(
+        &mut self,
+        mut report: engine::BatchResult,
+        code: ipc::ErrorCode,
+    ) -> Result<Option<engine::BatchResult>, engine::ExecutorError> {
+        if *self.fault.lock().unwrap() == Some(Fault::Refused) {
+            self.refused_batches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         for result in &mut report.results {
             result.output.status = ipc::CallStatus::Error;
-            result.output.error_code = Some(ipc::ErrorCode::NumericalFault);
+            result.output.error_code = Some(code);
             result.output.committed_tokens.clear();
         }
+        let refusals = report
+            .results
+            .iter()
+            .filter(|_| code == ipc::ErrorCode::InputError)
+            .map(|result| (result.output.request_key, "invalid input".to_owned()))
+            .collect();
         let failure = engine::WorkerFailure {
             worker_id: engine::WorkerGroupId("sim".to_owned()),
             endpoints: Vec::new(),
@@ -360,7 +423,7 @@ impl engine::Executor for FaultingExecutor {
                 .iter()
                 .map(|result| result.output.request_key)
                 .collect(),
-            refusals: Default::default(),
+            refusals,
             retired: Vec::new(),
             buffers: Vec::new(),
             execution: engine::WorkerExecError::non_finite(
@@ -372,29 +435,40 @@ impl engine::Executor for FaultingExecutor {
         self.queued = Some(report);
         Err(failure.into())
     }
+}
 
-    fn close(&mut self) -> Result<(), engine::ExecutorError> {
-        self.inner.close()
-    }
+/// What a request run by `fail_while_generating` came to.
+struct Faulted {
+    /// The tokens the request delivered.
+    tokens: Vec<u32>,
+    /// Its terminal event.
+    terminal: Option<Event>,
+    /// Whether the scheduler stopped on a fatal failure.
+    stopped: bool,
+    /// That failure's first error.
+    failure: Option<String>,
+    /// The batches a `Refused` fault failed.
+    refused_batches: usize,
 }
 
 /// Runs a request on a scheduler, on trial or not, until it generated a few
-/// tokens, then fails its workers with `fault`. Returns the tokens the
-/// request delivered, its terminal event, whether the scheduler stopped on
-/// a fatal failure, and that failure's first error.
-fn fail_while_generating(
-    trial: bool,
-    fault: Fault,
-    request: GenerationRequest,
-) -> (Vec<u32>, Option<Event>, bool, Option<String>) {
+/// tokens, then fails its workers with `fault`.
+fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) -> Faulted {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
+    // A refusal arrives while the request's next batch is in flight.
+    if fault == Fault::Refused {
+        sim.set_queue_depth(2);
+    }
     let faults = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let refused_batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut scheduler = support::scheduler_with(
         Box::new(FaultingExecutor {
             inner: SimExecutor::new(sim),
             fault: std::sync::Arc::clone(&faults),
             queued: None,
+            refused_batches: std::sync::Arc::clone(&refused_batches),
+            held: None,
         }),
         SimEngine::special_tokens(),
         SchedulerConfig::default(),
@@ -421,13 +495,18 @@ fn fail_while_generating(
 
     let (after, terminal) = drain(&mut events);
     tokens.extend(after);
-    let stopped = if trial {
-        thread.join().unwrap()
-    } else {
+    // A scheduler on trial that a fault stopped has ended its loop.
+    if !(trial && failure.get().is_some()) {
         handle.shutdown();
-        thread.join().unwrap()
-    };
-    (tokens, terminal, stopped, failure.get().cloned())
+    }
+    let stopped = thread.join().unwrap();
+    Faulted {
+        tokens,
+        terminal,
+        stopped,
+        failure: failure.get().cloned(),
+        refused_batches: refused_batches.load(std::sync::atomic::Ordering::SeqCst),
+    }
 }
 
 /// A world on trial is not repaired: a lost worker stops its scheduler,
@@ -436,7 +515,13 @@ fn fail_while_generating(
 /// the loss as its first error.
 #[test]
 fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
-    let (tokens, terminal, stopped, failure) = fail_while_generating(
+    let Faulted {
+        tokens,
+        terminal,
+        stopped,
+        failure,
+        ..
+    } = fail_while_generating(
         true,
         Fault::Lost,
         request(1, Vec::new(), SamplingParams::default(), 100_000),
@@ -489,7 +574,12 @@ fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost(
         feedback_next_token: engine::FeedbackNextToken::EndOfImage,
         sample_feedback_continuation: true,
     };
-    let (tokens, terminal, stopped, _) = fail_while_generating(true, Fault::Lost, image_request);
+    let Faulted {
+        tokens,
+        terminal,
+        stopped,
+        ..
+    } = fail_while_generating(true, Fault::Lost, image_request);
     assert!(stopped, "a lost worker stops a scheduler on trial");
     assert!(tokens.len() >= 4, "{tokens:?}");
     assert!(
@@ -510,7 +600,13 @@ fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost(
 /// alone, as any failed call does, and the scheduler serves on.
 #[test]
 fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
-    let (tokens, terminal, stopped, failure) = fail_while_generating(
+    let Faulted {
+        tokens,
+        terminal,
+        stopped,
+        failure,
+        ..
+    } = fail_while_generating(
         true,
         Fault::NonFinite,
         request(1, Vec::new(), SamplingParams::default(), 100_000),
@@ -533,7 +629,12 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
     );
     assert!(tokens.len() >= 4, "{tokens:?}");
 
-    let (_, terminal, stopped, failure) = fail_while_generating(
+    let Faulted {
+        terminal,
+        stopped,
+        failure,
+        ..
+    } = fail_while_generating(
         false,
         Fault::NonFinite,
         request(1, Vec::new(), SamplingParams::default(), 100_000),
@@ -542,6 +643,38 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
     assert!(failure.is_none(), "{failure:?}");
     assert!(
         matches!(terminal, Some(Event::Error { .. })),
+        "{terminal:?}"
+    );
+}
+
+/// A request a worker refuses as invalid input fails alone, on trial too:
+/// the calls of it already in flight then fail for want of the refused
+/// calls' products, and that failure is the refusal's, not a worker
+/// fault, so the world on trial serves on.
+#[test]
+fn a_refused_request_fails_alone_on_trial_with_its_calls_in_flight() {
+    let Faulted {
+        terminal,
+        stopped,
+        failure,
+        refused_batches,
+        ..
+    } = fail_while_generating(
+        true,
+        Fault::Refused,
+        request(1, Vec::new(), SamplingParams::default(), 100_000),
+    );
+    assert_eq!(
+        refused_batches, 2,
+        "the refusal and the failure of the batch after it"
+    );
+    assert!(!stopped, "a refusal does not stop a scheduler on trial");
+    assert!(failure.is_none(), "{failure:?}");
+    assert!(
+        matches!(
+            terminal,
+            Some(Event::Error { .. } | Event::Rejected { .. })
+        ),
         "{terminal:?}"
     );
 }
