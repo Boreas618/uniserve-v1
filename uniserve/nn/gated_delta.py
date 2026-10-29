@@ -23,6 +23,16 @@ whatever drafts followed them. A forward whose rows keep no state
 (:func:`uniserve.prefix_cache.slots.kept`, a request's earlier tokens
 evaluated again) leaves their slots unchanged and writes only their
 checkpoints.
+
+Serving captures the layer's step forwards in CUDA graphs: a decode (one
+token per row, of distinct requests) and a verification (each row's tokens
+one recurrence step at a time, as many steps as the verification's longest
+row may hold). A captured forward reads no host length: every row looks up
+the checkpoint its prefix may restore and the boundary its tokens may
+reach on the device, and a verification runs its bound's steps whatever
+its rows' lengths. Prompt forwards, whose chunked rule loops over every
+chunk on the host, are served eagerly (:attr:`GatedDeltaNet.
+captures_prompts`).
 """
 
 from __future__ import annotations
@@ -184,10 +194,12 @@ class GatedDeltaNet(nn.Module):
 
     function = "nn.gated_delta.GatedDeltaNet/1"
 
-    # The tensor-operation implementation runs a host loop over every chunk
-    # of a forward, launching too many kernels for serving to capture its
-    # calls; an implementation of fused kernels captures them.
-    captures = False
+    # The tensor-operation implementation of the chunked rule runs a host
+    # loop over every chunk of a prompt forward, launching too many kernels
+    # for serving to capture prompt forwards; its step forwards (decodes and
+    # verifications) launch a bounded number of kernels per token and are
+    # captured (``uniserve.loading.rank.uncaptured_prompts``).
+    captures_prompts = False
 
     def __init__(
         self,
@@ -303,13 +315,25 @@ class GatedDeltaNet(nn.Module):
                 verification,
             )
 
+        # A captured forward is a decode: its host lengths are those of the
+        # capture, not of the forwards that replay it, so it decides
+        # nothing from them but that its rows are single tokens of distinct
+        # requests, which every decode replaying it holds.
+        captured = mixed.is_cuda and torch.cuda.is_current_stream_capturing()
+        single = _single(attention)
+        if captured and not single:
+            raise RuntimeError(
+                "a gated delta layer captures decodes and verifications only; "
+                "its prompt forwards are served eagerly"
+            )
+
         # Each row's state at its prefix: its checkpoint, its slot's state,
         # or zero for a request's first forward. Without a cache binding
         # (a standalone call) every row starts its sequence.
         if stateful:
             checkpoints = binding.checkpoints
             restores = writes = checkpoints is not None
-            host = _host_lengths(attention)
+            host = None if captured else _host_lengths(attention)
             if checkpoints is not None and host is not None:
                 # Most forwards cross no page boundary (a decode step does
                 # once every interval): skip the checkpoint lookups then.
@@ -332,7 +356,7 @@ class GatedDeltaNet(nn.Module):
             boundary = units = None
         marks = torch.full_like(prefixes, -1) if boundary is None else boundary
 
-        if _single(attention):
+        if single:
             # One token per row, of distinct requests: the recurrence once
             # per row.
             output, final_window, last = self._steps(
@@ -454,13 +478,15 @@ class GatedDeltaNet(nn.Module):
         """Evaluate verification rows and defer their slots' advance.
 
         Each row's tokens run one recurrence step at a time from its state
-        at its prefix; the slots and checkpoints stay as they were. The
-        verification's acceptance then advances each slot over its accepted
-        tokens (:meth:`_accept`), reading this forward's inputs, which it
-        keeps until then.
+        at its prefix, the verification's bound of steps
+        (:attr:`~uniserve.prefix_cache.slots.Verification.steps`) for every
+        row; the slots and checkpoints stay as they were. The verification's
+        acceptance then advances each slot over its accepted tokens
+        (:meth:`_accept`), reading this forward's inputs, which it keeps
+        until then.
         """
         lengths = offsets[1:] - offsets[:-1]
-        steps = _steps_bound(attention, mixed.shape[0])
+        steps = verification.steps
         initial = recurrent.resume(binding, attention, rows)
         output, _, _, _, _ = self._advance(
             mixed,
@@ -696,9 +722,10 @@ def _host_lengths(
     """Each row's prefix and query lengths from the forward's host mirrors,
     ``None`` without them.
 
-    The layer's calls are never captured (``GatedDeltaNet.captures``), so
-    the mirrors hold the lengths of the call that runs, not of a captured
-    call another call replays.
+    The mirrors hold the lengths of the call that runs only when it runs
+    eagerly: a captured forward's are its capture's, which the forwards
+    replaying it do not share, so a captured forward decides nothing from
+    them but what every replay shares (:meth:`GatedDeltaNet.forward`).
     """  # noqa: D205
     queries = attention.queries
     for entry in attention.entries.values():
@@ -709,16 +736,6 @@ def _host_lengths(
             return None
         return prefixes.host, queries.host
     return None
-
-
-def _steps_bound(attention: AttentionBatch, tokens: int) -> int:
-    """The most tokens any row of ``attention`` holds: from the host
-    mirrors of the lengths, else ``tokens``, the forward's.
-    """  # noqa: D205
-    host = _host_lengths(attention)
-    if host is None:
-        return tokens
-    return max(host[1], default=0)
 
 
 def _crossings(

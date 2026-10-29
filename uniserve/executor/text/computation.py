@@ -102,7 +102,9 @@ from .sampling import (
     OwnSelection,
     RowSampling,
     SampleTask,
+    SamplingControls,
     SamplingMetadata,
+    SamplingParams,
     SamplingState,
     controls_for_call,
     own_selection,
@@ -1491,6 +1493,30 @@ class TextComputation:
             row_sampling=row_sampling,
             embeddings=list(embeddings),
         )
+        if kind == CallKind.VERIFY:
+            starts = np.cumsum(rows.query) - rows.query
+            invocation.sampling = SamplingMetadata.build(
+                [
+                    SampleTask(
+                        params=SamplingParams(
+                            temperature=1.0,
+                            top_p=0.9 if row_sampling is not None else 1.0,
+                        ),
+                        controls=SamplingControls(
+                            allowed=[None] * int(query),
+                            draft_token_ids=(0,) * (int(query) - 1),
+                        ),
+                        draws=np.full(int(query), 0.5, dtype=np.float32),
+                        slot=int(slot),
+                        row=int(first),
+                        gated=False,
+                    )
+                    for slot, query, first in zip(rows.slot, rows.query, starts)
+                ],
+                runner.dims.vocab,
+                runner.dims.rows,
+                runner.dims.logprob_words(),
+            )
         plan = runner.plan(invocation)
         runner.stage(plan, invocation)
         item = _Planned(
@@ -1504,6 +1530,7 @@ class TextComputation:
         )
         if self.union is None:
             item.mode, item.capture = runner.forward(plan, capacity)
+            runner.select(plan, invocation)
             if item.capture is not None:
                 item.capture()
         else:
@@ -1514,6 +1541,25 @@ class TextComputation:
             self.union.step(forwards, plan.tokens, self.group, capacity)
             if item.capture is not None:
                 item.capture()
+        if kind == CallKind.VERIFY and runner.drafts():
+            starts = np.cumsum(rows.query) - rows.query
+            count, tokens = len(rows), int(rows.query.sum())
+            runner.draft(
+                plan,
+                DraftRows(
+                    slots=rows.slot.astype(np.int64),
+                    prefixes=rows.prefix.astype(np.int64),
+                    queries=rows.query.astype(np.int64),
+                    pages=invocation.counts,
+                    tokens=np.zeros(tokens, dtype=np.int64),
+                    hidden_rows=np.arange(tokens, dtype=np.int64),
+                    pairs=np.stack([starts, np.arange(count)]),
+                    proposers=np.arange(count, dtype=np.int64),
+                    bases=np.zeros(count, dtype=np.int64),
+                    tasks=np.arange(count, dtype=np.int64),
+                    proposals=runner.dims.drafts,
+                ),
+            )
         return Executed(
             item.mode, plan.live_tokens, plan.tokens - plan.live_tokens
         )

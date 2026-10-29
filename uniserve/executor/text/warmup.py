@@ -62,7 +62,7 @@ from .context import (
     placed_rows,
     text_row,
 )
-from .graphs import PromptKey, ScoreKey, SelectKey
+from .graphs import PromptKey, ScoreKey, SelectKey, VerifiedKey
 from .protocol import CallKind
 from .rows import Rows, TokenSelection
 from .sampling import RowSampling, least_top, logprob_words
@@ -80,6 +80,7 @@ __all__ = [
     "phases",
     "prefill_layouts",
     "top_buckets",
+    "verification_layouts",
 ]
 
 # The samplers a selection graph may serve: the top-k one, and the general
@@ -296,6 +297,39 @@ def decode_layouts(
     return layouts
 
 
+def verification_layouts(
+    shapes: TextShapes, *, capacities: Capacities
+) -> list[Layout]:
+    """Capture every verification bucket and both general sampler paths.
+
+    The rows begin at position zero, so their recurrent state is initialized
+    by the forward itself. Scratch pages also cover the drafter's chained
+    proposals, which run after acceptance on the same stream.
+    """
+    width = 1 + shapes.drafts
+    return [
+        Layout(
+            lengths=(2 * shapes.drafts + 1,) * size,
+            steps=tuple(
+                Step(
+                    host_rows(
+                        list(range(1, size + 1)),
+                        [np.zeros(width, dtype=np.int64)] * size,
+                        prefix=0,
+                        selection=TokenSelection.ALL_LOGITS,
+                    ),
+                    CallKind.VERIFY,
+                    capacity,
+                    sampled,
+                )
+                for capacity in capacities(shapes.verification_tokens(size))
+                for sampled in (False, True)
+            ),
+        )
+        for size in reversed(shapes.verify)
+    ]
+
+
 def context_layout(
     injection: Injection, *, spatial: bool, prefill_outputs: bool
 ) -> Layout:
@@ -399,6 +433,10 @@ def phases(
                 runner.shapes,
                 prefill_outputs=computation.prefill_outputs,
                 capacities=capacities,
+            ):
+                add(computation, microbatch, layout)
+            for layout in verification_layouts(
+                runner.shapes, capacities=capacities
             ):
                 add(computation, microbatch, layout)
     for computation in computations:
@@ -543,6 +581,19 @@ def finish(computations: Sequence[TextComputation]) -> None:
                         runner.capture_alone(
                             ScoreKey(buckets[place], tops[position])
                         )
+            if runner.shapes.verify:
+                reporting = task_buckets(dims.tokens)
+                for place in reversed(range(len(reporting))):
+                    for position in reversed(range(len(tops))):
+                        if (
+                            logprob_words(
+                                least(reporting, place), least(tops, position)
+                            )
+                            <= words
+                        ):
+                            runner.capture_alone(
+                                VerifiedKey(reporting[place], tops[position])
+                            )
             for top in reversed(tops):
                 if (
                     computation.prefill_outputs

@@ -1203,10 +1203,13 @@ class PaddedSelection:
     """A forward's selection inputs padded to its task bucket.
 
     Padding tasks select greedily over logits row 0 in slot 0 with neutral
-    parameters, every token allowed, and their results are not read. A
-    verification, which selects eagerly, is not padded. The reporting
-    tasks pad to their bucket with rows of task 0 and count -1, which
-    report nothing. Field shapes follow :class:`SamplingMetadata`, flat.
+    parameters, every token allowed, and their results are not read. An
+    eager verification is not padded; a captured one pads its tasks to its
+    bucket's rows and every task's candidate rows to the bucket's width,
+    each task's rows past its own repeating its first and its drafts past
+    its own -1. The reporting tasks pad to their bucket with rows of task 0
+    and count -1, which report nothing. Field shapes follow
+    :class:`SamplingMetadata`, flat.
     """
 
     tasks: int
@@ -1230,16 +1233,51 @@ def _pad(values: np.ndarray, fill: Any, count: int) -> np.ndarray:
     return np.concatenate([flat, np.full(count, fill, dtype=flat.dtype)])
 
 
-def pad_selection(metadata: SamplingMetadata, capacity: int) -> PaddedSelection:
+def _widen(values: np.ndarray, tasks: int, width: int, to: int) -> np.ndarray:
+    # Each task's ``width`` candidate entries, then copies of its first up
+    # to ``to``: ``[tasks * width, ...]`` to ``[tasks * to, ...]``.
+    values = np.asarray(values)
+    trailing = values.shape[1:]
+    own = np.arange(to)
+    own[own >= width] = 0
+    widened = values.reshape(tasks, width, *trailing)[:, own]
+    return widened.reshape(tasks * to, *trailing)
+
+
+def pad_selection(
+    metadata: SamplingMetadata,
+    capacity: int,
+    verification: tuple[int, int] | None = None,
+) -> PaddedSelection:
     """Pad ``metadata``'s inputs on a binding of ``capacity`` rows.
 
-    Single-row tasks pad to their task bucket (:func:`task_bucket`); a
-    verification's tasks are not padded.
+    Single-row tasks pad to their task bucket (:func:`task_bucket`); an
+    eager verification's tasks are not padded, and a captured one's pad to
+    ``verification``'s ``(tasks, width)``: its bucket's rows and every
+    row's current token and drafts.
     """
     width = metadata.width
     tasks = (
         task_bucket(metadata.tasks, capacity) if width == 1 else metadata.tasks
     )
+    rows = metadata.rows
+    draws = metadata.draws
+    params = metadata.params
+    mask_rows = metadata.mask_rows
+    drafts = metadata.drafts
+    if verification is not None:
+        tasks, wide = verification
+        if tasks < metadata.tasks or wide < width:
+            raise AssertionError("a verification exceeds its graph bucket")
+        live = metadata.tasks
+        rows = _widen(rows, live, width, wide)
+        draws = _widen(draws, live, width, wide)
+        params = _widen(params, live, width, wide)
+        mask_rows = _widen(mask_rows, live, width, wide)
+        widened = np.full((live, wide - 1), -1, dtype=np.int64)
+        widened[:, : width - 1] = np.asarray(drafts).reshape(live, width - 1)
+        drafts = widened
+        width = wide
     extra = tasks - metadata.tasks
     bucket_rows, _ = metadata.logprob_bucket
     reporting = len(metadata.logprob_tasks)
@@ -1250,18 +1288,21 @@ def pad_selection(metadata: SamplingMetadata, capacity: int) -> PaddedSelection:
     )
     return PaddedSelection(
         tasks=tasks,
-        rows=_pad(metadata.rows, 0, extra * width),
+        rows=_pad(rows, 0, extra * width),
         paths=_pad(metadata.paths, GREEDY, extra),
-        draws=_pad(metadata.draws, 0.0, extra * width),
+        draws=_pad(draws, 0.0, extra * width),
         params=np.concatenate(
-            [metadata.params, np.tile(NEUTRAL, (extra * width, 1))]
+            [
+                np.asarray(params).reshape(-1, PARAMETER_COLUMNS),
+                np.tile(NEUTRAL, (extra * width, 1)),
+            ]
         ),
         slots=_pad(metadata.slots, 0, extra),
         gates=_pad(metadata.gates, 0, extra),
-        mask_rows=_pad(metadata.mask_rows, -1, extra * width),
+        mask_rows=_pad(mask_rows, -1, extra * width),
         biased=_pad(metadata.biased, 0, extra),
         force=_pad(metadata.force, 0, extra),
-        drafts=_pad(metadata.drafts, -1, extra * (width - 1)),
+        drafts=_pad(drafts, -1, extra * (width - 1)),
         terminal=_pad(metadata.terminal, 0, extra),
         logprob_tasks=_pad(metadata.logprob_tasks, 0, bucket_rows - reporting),
         logprob_counts=_pad(

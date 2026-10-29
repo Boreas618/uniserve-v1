@@ -1506,6 +1506,13 @@ fn prepare_model(
         graph_policy("auto", model, host_component).is_ok_and(|policy| policy != "off");
     launch.execution.graph_policy =
         graph_policy(&launch.execution.graph_policy, model, host_component)?;
+    if launch.execution.graph_policy != "off" && !model.uncaptured_prompts.is_empty() {
+        tracing::info!(
+            "graph policy {} serves prompt forwards eagerly: {}",
+            launch.execution.graph_policy,
+            model.uncaptured_prompts
+        );
+    }
     let mut config = launch.execution.clone();
     if model.video_decoder {
         config = config.for_media_slots(launch.ipc.queue_depth)?;
@@ -1915,13 +1922,16 @@ fn endpoint(host: &str) -> WorkerEndpoint {
 
 /// The graph policy a rank serves with.
 ///
-/// `auto` captures CUDA graphs when serving captures every call of the
-/// loaded model, its attention provider's
-/// (`uniserve.backends.attention.Backend.captures`) and its modules'
-/// (`uniserve.loading.rank.uncaptured`), and otherwise serves every call
-/// eagerly; `full` requires that capture; `off` never captures. Every rank
-/// of a group loads the same model and provider, so the group resolves one
-/// policy and captures the same shapes.
+/// `auto` captures CUDA graphs when serving captures the calls of the
+/// loaded model's attention provider
+/// (`uniserve.backends.attention.Backend.captures`,
+/// `uniserve.loading.rank.uncaptured`), and otherwise serves every call
+/// eagerly; a model whose modules' prompt forwards serving does not capture
+/// (`uniserve.loading.rank.uncaptured_prompts`) serves those eagerly beside
+/// its captured step forwards. `full` requires that every call is
+/// captured; `off` never captures. Every rank of a group loads the same
+/// model and provider, so the group resolves one policy and captures the
+/// same shapes.
 ///
 /// A rank holding `host_component`, a component that keeps its weights in
 /// host storage, requires `off`: its layers' weight copies are scheduled by
@@ -1938,14 +1948,23 @@ fn graph_policy(
             "component {name} keeps its weights in host storage, which requires cuda_graph_config.policy=off"
         )));
     }
-    if model.uncaptured.is_empty() || configured == "off" {
+    if configured == "off" {
         return Ok(configured.to_owned());
     }
-    if configured == "full" {
+    // The first reason serving does not capture some call: every call's,
+    // or the prompt forwards'.
+    let uncaptured = [&model.uncaptured, &model.uncaptured_prompts]
+        .into_iter()
+        .find(|reason| !reason.is_empty());
+    if configured == "full"
+        && let Some(reason) = uncaptured
+    {
         return Err(Error::Unsupported(format!(
-            "graph policy full requires a model whose calls serving captures: {}",
-            model.uncaptured
+            "graph policy full requires a model whose calls serving captures: {reason}"
         )));
+    }
+    if model.uncaptured.is_empty() {
+        return Ok(configured.to_owned());
     }
     tracing::info!(
         "graph policy auto serves every call eagerly: {}",

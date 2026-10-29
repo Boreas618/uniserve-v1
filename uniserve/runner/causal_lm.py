@@ -35,8 +35,9 @@ everywhere. The tensors of one forward are parameters of its method.
   :meth:`CausalLMRunner.verify` projects every position of a verification
   forward, selects with speculative acceptance and advances the per-request
   states of the layers kept per request slot over each row's accepted
-  tokens (:class:`uniserve.prefix_cache.slots.Verification`); it runs
-  eagerly.
+  tokens (:class:`uniserve.prefix_cache.slots.Verification`), and
+  :meth:`CausalLMRunner.score_verified` reports the logprobs of the
+  positions its tasks may commit.
 - :meth:`CausalLMRunner.draft` runs the model's drafter
   (:class:`uniserve.models.Drafter`) after a forward, in a deployment whose
   cache pool keeps the draft group: over rows of positions the forward
@@ -45,7 +46,14 @@ everywhere. The tensors of one forward are parameters of its method.
   it selects their first draft token greedily, then runs one chained step
   per further draft token. A position that depends on a verification's
   acceptance is a device index, never a host value, so the pass queues
-  work without waiting for the device. It runs eagerly.
+  work without waiting for the device.
+
+A verification's ``prefill`` and ``verify`` share one captured graph;
+its ``draft`` follows on the same stream in a graph of the same row bucket.
+Every value that changes between forwards is tensor content.
+:meth:`CausalLMRunner.plan_draft` builds the drafter's attention plans before
+launch, as :meth:`CausalLMRunner.plan_prefill` builds the forward's.
+Its logprobs use the ``score_verified`` graph of their reporting bucket.
 
 A prefill row that writes no cache (a request's earlier tokens evaluated
 again, from a checkpoint, to fill its draft cache) keeps no per-request
@@ -286,8 +294,9 @@ class CausalLMRunner:
             self._units = int(cache.num_units)
         # The verification forward whose per-request states its selection
         # advances (:meth:`prefill` with ``verification``, then
-        # :meth:`verify`).
+        # :meth:`verify`), and the rows it evaluated, padding included.
         self._verification: request_slots.Verification | None = None
+        self._verification_rows = 0
         self._rows = int(rows)
         self._verified_lengths = verified_lengths
         self._future_input_tokens = future_input_tokens
@@ -335,7 +344,6 @@ class CausalLMRunner:
                         self._draft_table + self._draft_group.units_per_page,
                     )
                 )
-
             # The tokens and positions a decode gathers from the slot state.
             self._decode_ids = torch.ones(
                 rows, dtype=torch.int64, device=placed
@@ -351,6 +359,10 @@ class CausalLMRunner:
             self._token_adapters = torch.zeros(
                 tokens, dtype=torch.int64, device=placed
             )
+
+        # Target, drafter and chained proposal plans need separate stable
+        # table addresses, including when their shapes happen to coincide.
+        self._draft_tables: list[torch.Tensor | None] = [None, None]
 
     # Facts.
 
@@ -739,9 +751,12 @@ class CausalLMRunner:
             hidden: ``[T, hidden]`` output, every token's hidden state.
             logits: ``[R, local vocab]`` output, each row's last-position
                 logits.
-            verification: Whether the rows are a verification's: the
-                layers kept per request slot leave their slots as they were
-                until :meth:`verify` accepts each row's tokens.
+            verification: Zero, or the rows are a verification's, of at
+                most ``verification`` tokens each (the bound of a captured
+                verification's rows, a step bound for the layers that
+                evaluate them token by token): the layers kept per request
+                slot leave their slots as they were until :meth:`verify`
+                accepts each row's tokens.
 
         A row that writes no cache keeps no per-request state. The host
         mirrors serve an eager forward and the capture; a launched graph
@@ -792,8 +807,11 @@ class CausalLMRunner:
             stride = self._rows + 1
             kept = row_columns[3 * stride : 3 * stride + rows] != 0
             self._verification = (
-                request_slots.Verification() if int(verification) else None
+                request_slots.Verification(int(verification))
+                if int(verification)
+                else None
             )
+            self._verification_rows = rows
             with (
                 self._context.expert_step(int(expert_capacity)),
                 adapters.selected(token_adapters),
@@ -1074,11 +1092,9 @@ class CausalLMRunner:
         width: int,
         candidates: int,
         sorts: int,
-        top: int,
-        reported: int,
-        dump: int,
         hidden: torch.Tensor,
         logit_rows: torch.Tensor,
+        logits: torch.Tensor,
         rows: torch.Tensor,
         draws: torch.Tensor,
         params: torch.Tensor,
@@ -1091,24 +1107,26 @@ class CausalLMRunner:
         transitions: torch.Tensor,
         drafts: torch.Tensor,
         terminal: torch.Tensor,
-        logprob_rows: torch.Tensor,
         completion: torch.Tensor,
         continuation: torch.Tensor,
         tagged: torch.Tensor,
         points: torch.Tensor,
         transition: torch.Tensor,
         scored: torch.Tensor,
-        logprobs: torch.Tensor,
     ) -> None:
         """Verify the draft tokens of a verification forward.
 
         A verification row evaluates its request's next token followed by
         draft tokens. This projects the ``count`` token positions
         ``logit_rows`` of the forward's ``hidden`` states, one candidate row
-        per position, and selects each of ``tasks`` tasks' tokens with the
-        general sampler and speculative acceptance: the accepted draft
-        prefix and the token after it. Every task has ``width`` candidate
-        rows (its drafts plus one, padded by repeating its first row).
+        per position, into the first ``count`` rows of ``logits`` (``[N,
+        local vocab]``, which :meth:`score_verified` scores), and selects
+        each of ``tasks`` tasks' tokens with the general sampler and
+        speculative acceptance: the accepted draft prefix and the token
+        after it. Every task has ``width`` candidate rows (its drafts plus
+        one, padded by repeating its first row). Task ``t`` is the
+        forward's row ``t``; a captured verification's tasks and rows pad
+        to its bucket, and the forward's rows past its tasks are padding.
 
         Args:
             rows: ``[T * W]`` int64, each candidate row's projected row.
@@ -1116,29 +1134,18 @@ class CausalLMRunner:
                 own.
             terminal: ``[T]`` int64, the one-based length of a task's draft
                 prefix ending at its first finish token, or zero.
-            top, reported, dump: Top tokens and the rows reporting
-                logprobs; their words are packed into ``logprobs`` and the
-                words no row reports go to word ``dump``.
-            logprob_rows: ``[3, reported]`` int64, each reported row's
-                task, candidate row and top count. A task reports a row
-                per position it may commit, its current token's and each
-                draft's: row ``j`` scores the token the task commits there,
-                its ``j``-th draft while it accepts it, else its selection,
-                under the logits of candidate row ``j``, so the rows of the
-                tokens it commits score each of them where it was selected.
 
         The other arguments are those of :meth:`select`, with draws,
         parameters and mask rows per candidate row. Once selected, each
         task's row advances its per-request states over its current token
         and accepted drafts, when the forward was a verification
-        (:meth:`prefill`); an invalid or inactive task's states stay.
+        (:meth:`prefill`); an invalid or inactive task's states stay, as do
+        the padding rows'.
         """
-        tasks, width = int(tasks), int(width)
+        tasks, width, count = int(tasks), int(width), int(count)
         with torch.inference_mode(), self._context.activate():
             projected = self._gathered(
-                self._project(
-                    hidden, logit_rows[: int(count)], int(count), None
-                )
+                self._project(hidden, logit_rows[:count], count, logits[:count])
             )
             controls = self._controls(
                 tasks,
@@ -1180,43 +1187,115 @@ class CausalLMRunner:
             verification, self._verification = self._verification, None
             if verification is not None:
                 # A task is its verification row: the row's current token
-                # and accepted drafts enter its request's state.
+                # and accepted drafts enter its request's state. The
+                # forward's padding rows past the tasks accept none.
                 counts = torch.where(
                     selection.valid & selection.active,
                     selection.accepted.to(torch.int64) + 1,
                     0,
                 )
-                verification.accept(counts)
-            reported = int(reported)
-            if reported:
-                chosen = logprob_rows[0, :reported]
-                offsets = logprob_rows[1, :reported]
-                selected = selection.tokens.index_select(0, chosen).to(
-                    torch.int64
-                )
-                targets = selected
-                if width > 1:
-                    # A position before the accepted count commits its
-                    # draft; the first after them, the selection.
-                    accepted = selection.accepted.index_select(0, chosen).to(
-                        torch.int64
+                padding = self._verification_rows - tasks
+                if padding < 0:
+                    raise AssertionError(
+                        "a verification selects more tasks than its rows"
                     )
-                    drafted = drafts.index_select(
-                        0, chosen * (width - 1) + offsets.clamp(max=width - 2)
-                    )
-                    targets = torch.where(offsets < accepted, drafted, selected)
-                scatter_logprobs(
-                    projected.float(),
-                    rows.index_select(0, chosen * width + offsets),
-                    targets,
-                    self._task_layout(logprob_rows[2, :reported]),
-                    int(top),
-                    logprobs,
-                    int(dump),
+                verification.accept(
+                    torch.cat((counts, counts.new_zeros(padding)))
                 )
+
+    def score_verified(
+        self,
+        rows: int,
+        top: int,
+        width: int,
+        dump: int,
+        logits: torch.Tensor,
+        candidates: torch.Tensor,
+        drafts: torch.Tensor,
+        reported: torch.Tensor,
+        completion: torch.Tensor,
+        logprobs: torch.Tensor,
+    ) -> None:
+        """Report the logprobs of the positions a :meth:`verify` may commit.
+
+        A reporting task reports a row per position it may commit, its
+        current token's and each draft's: row ``j`` scores the token the
+        task commits there, its ``j``-th draft while it accepts it, else
+        its selection, under the logits of candidate row ``j``, so the rows
+        of the tokens it commits score each of them where it was selected.
+        The rows' words are packed compactly into the first words of
+        ``logprobs`` (:func:`~uniserve.sampling.logprobs.scatter_logprobs`).
+        The method is captured per bucket of reported rows and top width.
+
+        Args:
+            rows: Reported rows, padding included.
+            top: Top tokens scored per row, at least each row's count.
+            width: Candidate rows per task of the verification.
+            dump: The word of ``logprobs`` padding scores into.
+            logits: ``[N, local vocab]`` the candidate logits the
+                verification projected.
+            candidates: ``[T * W]`` int64, each candidate row's projected
+                row.
+            drafts: ``[T * (W - 1)]`` int64 the tasks' draft tokens.
+            reported: ``[3, rows]`` int64, each reported row's task,
+                candidate row within its task and top count, -1 for
+                padding.
+            completion: ``[5, R]`` int64, the verification's selections.
+            logprobs: ``[L]`` int64 output.
+        """
+        rows, width = int(rows), int(width)
+        with torch.inference_mode(), self._context.activate():
+            chosen = reported[0, :rows]
+            offsets = reported[1, :rows]
+            targets = completion[2].index_select(0, chosen)
+            if width > 1:
+                # A position before the accepted count commits its draft;
+                # the first after them, the selection.
+                accepted = completion[3].index_select(0, chosen)
+                drafted = drafts.index_select(
+                    0, chosen * (width - 1) + offsets.clamp(max=width - 2)
+                )
+                targets = torch.where(offsets < accepted, drafted, targets)
+            # Only the reported rows' logits are gathered across the
+            # tensor-parallel ranks.
+            scored = candidates.index_select(0, chosen * width + offsets)
+            scatter_logprobs(
+                self._gathered(logits.index_select(0, scored)).float(),
+                torch.arange(rows, device=scored.device),
+                targets,
+                self._task_layout(reported[2, :rows]),
+                int(top),
+                logprobs,
+                int(dump),
+            )
+
+    def _draft_blocks(self, pass_: int, rows: int, blocks: int) -> torch.Tensor:
+        """The drafter's table of pass ``pass_`` (0: a forward's positions,
+        1: the chained steps' windows), ``[rows, blocks]`` int32.
+
+        The table is a contiguous view of storage of every runner row's
+        widest pass, which grows to the widest pass it serves; a pass of
+        graph widths, which the eager run before a capture is, never makes
+        it grow again, so captured passes keep reading it at its address.
+
+        Raises:
+            RuntimeError: A captured pass would grow the storage.
+        """  # noqa: D205
+        storage = self._draft_tables[pass_]
+        if storage is None or storage.numel() < self._rows * blocks:
+            if capturing(self._device):
+                raise RuntimeError(
+                    "the drafter's tables grow before the passes captured"
+                )
+            storage = torch.zeros(
+                self._rows * blocks, dtype=torch.int32, device=self._device
+            )
+            self._draft_tables[pass_] = storage
+        return storage[: rows * blocks].view(rows, blocks)
 
     def _draft_attention(
         self,
+        pass_: int,
         rows: int,
         tokens: int,
         widths: Sequence[int],
@@ -1230,7 +1309,8 @@ class CausalLMRunner:
         The engine's draft table names one unit per page, whose span of
         columns holds the page's token blocks (``uniserve.prefix_cache.
         units``); the drafter's layers read block ``j * units + u`` for
-        block ``j`` of unit ``u``. A position on a page the table holds no
+        block ``j`` of unit ``u``, from the table of pass ``pass_``
+        (:meth:`_draft_blocks`). A position on a page the table holds no
         units for (the padding sentinel) writes nothing, nor does a token
         ``writes`` (bool ``[tokens]``) clears.
         """
@@ -1243,7 +1323,10 @@ class CausalLMRunner:
         span, block, page = int(group.span), int(group.block), group.block_size
         units = metadata.block_tables[table, :rows, :width].to(torch.int64)
         columns = torch.arange(span, device=units.device) * self._units
-        blocks = (units.unsqueeze(-1) + columns).reshape(rows, width * span)
+        blocks = self._draft_blocks(pass_, rows, width * span)
+        blocks.copy_(
+            (units.unsqueeze(-1) + columns).reshape(rows, width * span)
+        )
         slots = metadata.slot_mapping[table, :tokens]
         unit = slots.div(page, rounding_mode="floor")
         offset = slots - unit * page
@@ -1265,7 +1348,7 @@ class CausalLMRunner:
         entry = PagedInput(
             query,
             prefix,
-            BlockTable(blocks.to(torch.int32), block),
+            BlockTable(blocks, block),
             mapped,
             (True,) * rows,
         )
@@ -1278,6 +1361,47 @@ class CausalLMRunner:
         values = self._project(states, indices, count, None)
         _, tokens = greedy(values, self._vocab)
         out.copy_(tokens)
+
+    def plan_draft(
+        self,
+        rows: int,
+        tokens: int,
+        widths: Sequence[int],
+        queries: Sequence[int],
+        prefixes: Sequence[int],
+        windows: int,
+        window_queries: Sequence[int],
+        window_prefixes: Sequence[int],
+        row_columns: torch.Tensor,
+        window_columns: torch.Tensor,
+    ) -> None:
+        """Plan the drafter's attention launches of the next captured pass.
+
+        The counterpart of :meth:`plan_prefill` for :meth:`draft`, whose
+        arguments these are: the pass over the forward's positions and, with
+        ``windows``, its chained steps' windows each bind their plans, which
+        the captured pass reads.
+        """
+        if self._drafter is None:
+            raise AssertionError("the runner's pool keeps no draft cache")
+        with torch.inference_mode(), self._context.activate():
+            self._context.bind_attention(
+                self._draft_attention(
+                    0, rows, tokens, widths, queries, prefixes, row_columns
+                )
+            )
+            if windows:
+                self._context.bind_attention(
+                    self._draft_attention(
+                        1,
+                        len(window_queries),
+                        windows,
+                        widths,
+                        window_queries,
+                        window_prefixes,
+                        window_columns,
+                    )
+                )
 
     def draft(
         self,
@@ -1334,9 +1458,17 @@ class CausalLMRunner:
         and keeps the drafter's output, and writes the draft cache entry, of
         the window's token ``window_tokens[p]`` advanced by its accepted
         drafts and ``s - 1`` alone; ``window_owners[t]`` is the proposer of
-        window token ``t``. Every length is a host value and every
-        position that depends on a selection a device index, so the pass
-        never waits for the device.
+        window token ``t``. The windows are ``len(window_queries)`` rows:
+        one per proposer, then rows that write nothing (a captured pass's
+        padding). Every length is a host value and every position that
+        depends on a selection a device index, so the pass never waits for
+        the device.
+
+        A captured pass is a verification's (:class:`~uniserve.executor.
+        text.graphs.VerifyKey`): its counts are its bucket's and its rows,
+        pairs, proposers and windows padded to them; the host lengths serve
+        the eager run and the capture, and :meth:`plan_draft` plans the
+        attention of every launch.
 
         Args:
             proposals: ``int64 [R, K]`` output, each proposer's drafts in
@@ -1356,8 +1488,10 @@ class CausalLMRunner:
                     0, index, completion[2].index_select(0, taken[1])
                 )
             attention = self._draft_attention(
-                rows, tokens, widths, queries, prefixes, row_columns
+                0, rows, tokens, widths, queries, prefixes, row_columns
             )
+            # Under capture the binding selects the plans built before it
+            # (:meth:`plan_draft`), whose lengths these are.
             self._context.bind_attention(attention)
             states = drafter(
                 self._model.embed_input_ids(input_ids[:tokens]),
@@ -1384,7 +1518,8 @@ class CausalLMRunner:
                     windows, dtype=torch.bool, device=last.device
                 ).index_fill_(0, taken, True)
                 attention = self._draft_attention(
-                    proposers,
+                    1,
+                    len(window_queries),
                     windows,
                     widths,
                     window_queries,

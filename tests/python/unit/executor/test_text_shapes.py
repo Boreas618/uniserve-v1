@@ -9,6 +9,7 @@ import pytest
 from uniserve.executor.text.shapes import (
     PrefillShape,
     PrefillVariant,
+    Selected,
     TextForward,
     TextShapes,
     bucket,
@@ -81,7 +82,9 @@ def test_decode_keeps_configured_order_and_never_uses_prefill_capacity():
     # computes (rows placing vision blocks, outputs other than the last
     # logits), selects none.
     shapes = TextShapes([8, 4, 16], [_prefill(32, 64, TEXT, True)])
-    assert shapes.select(replace(DECODE, queries=[1] * 3, tokens=3)) == (
+    assert shapes.select(
+        replace(DECODE, queries=[1] * 3, tokens=3)
+    ) == Selected(
         8,
         8,
         True,
@@ -106,8 +109,8 @@ def test_prefill_selects_padding_capacity_and_matching_numerical_semantics():
         ],
     )
     two_rows = replace(PREFILL, queries=[2, 3], tokens=5)
-    assert shapes.select(two_rows) == (4, 64, False, True)
-    assert shapes.select(replace(two_rows, cache_only=True)) == (
+    assert shapes.select(two_rows) == Selected(4, 64, False, True)
+    assert shapes.select(replace(two_rows, cache_only=True)) == Selected(
         4,
         16,
         False,
@@ -115,10 +118,10 @@ def test_prefill_selects_padding_capacity_and_matching_numerical_semantics():
     )
     assert shapes.select(
         replace(two_rows, variant=PrefillVariant.media(3))
-    ) == (4, 32, False, True)
+    ) == Selected(4, 32, False, True)
     assert shapes.select(
         replace(PREFILL, queries=[1] * 4, tokens=4, last_logits=True)
-    ) == (8, 16, False, True)
+    ) == Selected(8, 16, False, True)
 
     # A variant no shape was captured for, rows beyond every bucket and an
     # empty row select none.
@@ -136,7 +139,7 @@ def test_prefill_selects_padding_capacity_and_matching_numerical_semantics():
     output_only = TextShapes([], [_prefill(2, 16, TEXT, True)])
     assert output_only.select(
         replace(PREFILL, queries=[2], tokens=2, cache_only=True)
-    ) == (2, 16, False, True)
+    ) == Selected(2, 16, False, True)
     cache_only = TextShapes([], [_prefill(2, 16, TEXT, False)])
     assert (
         cache_only.select(
@@ -176,6 +179,44 @@ def test_every_batch_within_the_bounds_selects_a_bucket():
                 and selected.rows > count
                 and selected.tokens >= tokens
             ), (count, tokens)
+
+
+def test_verification_buckets_hold_every_admitted_draft_length():
+    drafts = 3
+    shapes = TextShapes(
+        [1, 2, 4, 8, 16, 32, 64, 128],
+        [],
+        verify=[1, 2, 4, 8, 16, 32, 64, 128],
+        drafts=drafts,
+        prompts=False,
+    )
+    for count in range(1, 129):
+        for longest in range(1, drafts + 2):
+            # Requests lacking draft state participate with one token.
+            lengths = [1 + index % longest for index in range(count)]
+            selected = shapes.select(
+                replace(
+                    PREFILL,
+                    queries=lengths,
+                    tokens=sum(lengths),
+                    verification=True,
+                )
+            )
+            assert selected is not None
+            assert selected.verification
+            assert selected.rows > count
+            assert selected.tokens > sum(lengths)
+    assert (
+        shapes.select(
+            replace(
+                PREFILL,
+                queries=[drafts + 2],
+                tokens=drafts + 2,
+                verification=True,
+            )
+        )
+        is None
+    )
 
 
 def test_prefill_row_buckets_reach_one_past_the_largest_batch():

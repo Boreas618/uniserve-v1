@@ -340,7 +340,8 @@ def test_a_verification_keeps_the_state_of_the_tokens_it_accepts(session):
         request.grow(PROMPT, {boundary})
         _forward(model, context, [(request, tokens[:PROMPT], 0)])
         request.grow(PROMPT + 4, set())
-        verification = slots.Verification()
+        # The row holds the next token and three drafts.
+        verification = slots.Verification(steps=4)
         (logits,) = _forward(
             model,
             context,

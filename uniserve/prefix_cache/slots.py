@@ -49,9 +49,18 @@ class Verification:
     (:meth:`defer`). Once the forward's selections are known, the caller
     accepts each row's token count (:meth:`accept`) before the runner's
     next forward, whose metadata the advances read.
+
+    Args:
+        steps: The most tokens any row of the forward holds. A layer that
+            evaluates the rows one token at a time runs this many steps,
+            whatever the rows' host lengths: a captured verification
+            serves rows of every length up to it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, steps: int) -> None:
+        if steps < 1:
+            raise ValueError("a verification row holds at least one token")
+        self.steps = int(steps)
         self._advances: list[Callable[[torch.Tensor], None]] = []
 
     def defer(self, advance: Callable[[torch.Tensor], None]) -> None:

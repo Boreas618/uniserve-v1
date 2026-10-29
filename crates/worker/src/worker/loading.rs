@@ -121,9 +121,12 @@ pub(crate) struct LoadedModel {
     /// The attention backend the model was loaded with.
     pub(crate) attention_backend: String,
     /// Why serving does not capture the model's calls in CUDA graphs: its
-    /// attention provider's or one of its modules'; empty when it captures
-    /// them all.
+    /// attention provider's; empty when it captures them all.
     pub(crate) uncaptured: String,
+    /// Why serving does not capture the model's prompt forwards, which it
+    /// then serves eagerly beside the captured step forwards (decodes and
+    /// verifications): one of its modules'; empty when it captures them.
+    pub(crate) uncaptured_prompts: String,
 }
 
 /// The module paths a rank loads and those left unloaded below them:
@@ -242,12 +245,16 @@ impl LoadedModel {
                 .call_as(&[handle.view()])?;
         let uncaptured: tvm_ffi::String =
             Interpreter::import(&format!("{LOADING}.uncaptured"))?.call_as(&[handle.view()])?;
+        let uncaptured_prompts: tvm_ffi::String =
+            Interpreter::import(&format!("{LOADING}.uncaptured_prompts"))?
+                .call_as(&[handle.view()])?;
         Ok(Self {
             handle,
             declarations: description.declarations,
             video_decoder: description.video_decoder,
             attention_backend: backend.as_str().to_owned(),
             uncaptured: uncaptured.as_str().to_owned(),
+            uncaptured_prompts: uncaptured_prompts.as_str().to_owned(),
         })
     }
 

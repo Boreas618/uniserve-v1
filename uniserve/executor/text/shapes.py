@@ -3,17 +3,26 @@
 A captured text graph holds a fixed numerical shape. Decode graphs hold a
 row bucket of one-token rows; prefill graphs hold a row and a token bucket of
 one numerical variant (:class:`PrefillVariant`), with outputs or writing the
-prefix cache only (:class:`PrefillShape`). :class:`TextShapes` selects the
-smallest captured bucket that holds a forward (:class:`TextForward`).
+prefix cache only (:class:`PrefillShape`); verification graphs hold a decode
+row bucket of rows of up to ``1 + D`` tokens each, ``D`` the deployment's
+draft limit (:meth:`TextShapes.verification_tokens`). :class:`TextShapes`
+selects the smallest captured bucket that holds a forward
+(:class:`TextForward`).
 
 Every bucket has room for padding. A decode bucket pads with inert
 one-token rows of slot 0. A prefill bucket adds one sequence holding every
 padding token, then empty sequences, so a row bucket of ``n`` rows holds
-forwards of fewer than ``n`` rows (:func:`prefill_row_buckets`).
+forwards of fewer than ``n`` rows (:func:`prefill_row_buckets`). A
+verification bucket of ``n`` rows holds forwards of at most ``n`` rows of
+any lengths up to ``1 + D``: it evaluates ``n + 1`` rows, the last holding
+the padding tokens, and ``n * (1 + D) + 1`` tokens.
 
 The catalogs hold every batch the worker admits, so a computation with
 graphs refuses a forward no captured bucket holds; graph selection depends
-only on call metadata, so every rank of a group selects the same graph.
+only on call metadata, so every rank of a group selects the same graph. A
+computation whose model does not capture its prompt forwards
+(``uniserve.loading.rank.uncaptured_prompts``) catalogs no prefill bucket
+and serves every prompt forward eagerly (:attr:`TextShapes.prompts`).
 """
 
 from __future__ import annotations
@@ -36,6 +45,8 @@ __all__ = [
     "prefill_shapes",
     "prefill_units",
     "task_buckets",
+    "verification_tokens",
+    "window_tokens",
 ]
 
 T = TypeVar("T")
@@ -73,6 +84,25 @@ def capture_order(
     # Python's sort is stable: equal footprints keep the configured order.
     ordered.sort(key=footprint, reverse=True)
     return ordered
+
+
+def verification_tokens(rows: int, drafts: int) -> int:
+    """Return the tokens of a verification bucket of ``rows`` rows of up to
+    ``drafts`` drafts each (:meth:`TextShapes.verification_tokens`).
+    """  # noqa: D205
+    return rows * (1 + drafts) + 1
+
+
+def window_tokens(rows: int, drafts: int) -> int:
+    """Return the tokens of the drafter's windows in a verification bucket
+    of ``rows`` rows of up to ``drafts`` drafts each.
+
+    A proposer's window holds its drafts and its further proposals, at most
+    ``2 * drafts - 1`` positions, and one more keeps the padding row from
+    holding a single token (:meth:`TextShapes.verification_tokens`); none
+    without further proposals.
+    """  # noqa: D205
+    return rows * (2 * drafts - 1) + 1 if drafts > 1 else 0
 
 
 def task_buckets(rows: int) -> list[int]:
@@ -329,6 +359,8 @@ class TextForward:
         variant: The numerical variant the rows need.
         last_logits: Only each row's last logits are computed.
         cache_only: The forward only writes the prefix cache.
+        verification: The forward is a verification: each row its
+            request's current token and drafts.
     """
 
     queries: Sequence[int] | np.ndarray
@@ -337,23 +369,27 @@ class TextForward:
     variant: PrefillVariant
     last_logits: bool
     cache_only: bool
+    verification: bool = False
 
 
 class Selected(NamedTuple):
     """A captured bucket holding a forward.
 
     Attributes:
-        rows: The bucket's rows.
+        rows: The bucket's rows, padding included.
         tokens: The bucket's tokens (its rows for a decode bucket).
         decode: The bucket is a decode graph.
         outputs: The prefill graph computes hidden outputs (true for a
-            decode graph).
+            decode or verification graph).
+        verification: The bucket is a verification graph, of one row more
+            than the verification rows it holds.
     """
 
     rows: int
     tokens: int
     decode: bool
     outputs: bool
+    verification: bool = False
 
 
 class TextShapes:
@@ -362,26 +398,56 @@ class TextShapes:
     Args:
         decode: The decode row buckets, in configured order.
         prefill: The prefill captures.
+        verify: The verification row buckets: the decode row buckets of a
+            deployment that speculates, none otherwise.
+        drafts: The most draft tokens a verification row holds, ``D``.
+        prompts: Prompt forwards are captured; without, the computation
+            catalogs no prefill bucket and serves them eagerly.
     """
 
     def __init__(
-        self, decode: Sequence[int], prefill: Sequence[PrefillShape]
+        self,
+        decode: Sequence[int],
+        prefill: Sequence[PrefillShape],
+        verify: Sequence[int] = (),
+        drafts: int = 0,
+        prompts: bool = True,
     ) -> None:
         self.decode = tuple(decode)
         self.prefill = tuple(prefill)
+        self.verify = tuple(sorted(set(verify)))
+        self.drafts = int(drafts)
+        self.prompts = bool(prompts)
+        if self.verify and self.drafts < 1:
+            raise ValueError("verification buckets hold rows with drafts")
+        if self.prefill and not self.prompts:
+            raise ValueError("uncaptured prompt forwards have no bucket")
         self._cache_only = any(not shape.outputs for shape in self.prefill)
         self._outputs = any(shape.outputs for shape in self.prefill)
+
+    def verification_tokens(self, rows: int) -> int:
+        """Return the tokens of the verification bucket of ``rows`` rows:
+        each row's current token and up to ``D`` drafts, and one more.
+
+        The one more keeps the padding row from holding a single token
+        beside rows of one token each: a host-planned attention provider
+        plans such a batch as a decode, which the capture of the bucket
+        (rows of every length) is not.
+        """  # noqa: D205
+        return verification_tokens(rows, self.drafts)
 
     def select(self, forward: TextForward) -> Selected | None:
         """Return the smallest captured bucket holding ``forward``, if any.
 
         A decode of one-token rows takes the first configured decode size
         that holds its rows, in configured order, and never a prefill
-        bucket; it needs the text variant and last logits. A prefill takes
-        the least ``(row bucket, token bucket)`` of its variant with a
-        padding row to spare and room for its tokens. A cache-only prefill
-        uses a graph computing outputs only when no cache-only family was
-        captured.
+        bucket; it needs the text variant and last logits. A verification
+        takes the least verification bucket holding its rows, each of one
+        to ``1 + D`` tokens, of the text variant, and never another bucket.
+        A prefill takes the least ``(row bucket, token bucket)`` of its
+        variant with a padding row to spare and room for its tokens. A
+        cache-only prefill uses a graph computing outputs only when no
+        cache-only family was captured.
 
         Raises:
             ValueError: The forward has no row.
@@ -390,6 +456,19 @@ class TextShapes:
         rows = len(queries)
         if rows == 0:
             raise ValueError("text graphs require a nonempty query batch")
+        if forward.verification:
+            if (
+                forward.variant != PrefillVariant.TEXT
+                or np.any(queries < 1)
+                or np.any(queries > 1 + self.drafts)
+            ):
+                return None
+            size = next((size for size in self.verify if size >= rows), None)
+            if size is None or forward.tokens > self.verification_tokens(size):
+                return None
+            return Selected(
+                size + 1, self.verification_tokens(size), False, True, True
+            )
         if forward.decode and np.all(queries == 1):
             if (
                 forward.variant != PrefillVariant.TEXT

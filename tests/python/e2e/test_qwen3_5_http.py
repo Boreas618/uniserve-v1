@@ -331,6 +331,7 @@ def _close(served: dict, reference: dict, prompt: str) -> int:
     return min(len(served["tokens"]), len(reference["tokens"]))
 
 
+@pytest.mark.missing_state
 def test_greedy_decoding_follows_transformers(tmp_path: Path):
     name = "qwen3_5-reference"
     with _serve(tmp_path, name) as (base_url, _):
@@ -596,6 +597,7 @@ def test_speculation_generates_the_greedy_tokens_of_decoding(tmp_path: Path):
     assert accepted > 0
 
 
+@pytest.mark.missing_state
 def test_a_world_change_turns_speculation_on_for_a_streaming_request(
     tmp_path: Path,
 ):

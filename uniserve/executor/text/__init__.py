@@ -52,7 +52,14 @@ from .protocol import CALL_FIELD_NAMES, COMPLETION_FIELDS
 from .runner import TextRunner
 from .sampling import logprob_capacity
 from .state import NewRequest, RequestTable, SlotState
-from .warmup import Phase, decode_layouts, finish, phases, prefill_layouts
+from .warmup import (
+    Phase,
+    decode_layouts,
+    finish,
+    phases,
+    prefill_layouts,
+    verification_layouts,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -189,6 +196,10 @@ class TextExecutor:
             int(size) for size in pages["prefill_graph_token_sizes"]
         ]
         self.drafts = int(pages.get("draft_tokens", 0))
+        self.prompts = all(
+            getattr(type(module), "captures_prompts", True)
+            for module in loaded.model.modules()
+        )
         self.prefill_outputs = bool(pages["prefill_outputs"]) or bool(
             self.drafts
         )
@@ -226,6 +237,8 @@ class TextExecutor:
             prefill_token_sizes=self.prefill_sizes,
             prefill_outputs=self.prefill_outputs,
             media_axes=self.media_axes,
+            drafts=self.drafts,
+            prompts=self.prompts,
         )
 
     # The manifest.
@@ -243,16 +256,20 @@ class TextExecutor:
         """
         bounds = self._bounds(self.max_batch_calls, None)
         shapes = bounds.shapes()
-        layouts = prefill_layouts(
-            shapes,
-            pages=bounds.pages,
-            row_tokens=min(self.max_model_len, self.max_batch_tokens),
-            units=None,
-            capacities=lambda _: [None],
-        ) + decode_layouts(
-            shapes,
-            prefill_outputs=self.prefill_outputs,
-            capacities=lambda _: [None],
+        layouts = (
+            prefill_layouts(
+                shapes,
+                pages=bounds.pages,
+                row_tokens=min(self.max_model_len, self.max_batch_tokens),
+                units=None,
+                capacities=lambda _: [None],
+            )
+            + decode_layouts(
+                shapes,
+                prefill_outputs=self.prefill_outputs,
+                capacities=lambda _: [None],
+            )
+            + verification_layouts(shapes, capacities=lambda _: [None])
         )
         dims = bounds.dimensions(
             vocab=self.vocab,
