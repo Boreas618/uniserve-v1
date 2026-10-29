@@ -238,6 +238,28 @@ impl WeightKeys {
                 Transfer { request, manifest }
             }
         };
+        // Before any rank maps, creates or copies a chunk, every rank holds
+        // the same manifest: its digest covers everything it directs, so a
+        // manifest altered on its way, or one a rank computed from other
+        // inputs than the others, is refused on every rank.
+        let digest = manifest
+            .compute_digest()
+            .map_err(|error| Error::Interface(error.to_string()))?;
+        if digest != manifest.digest {
+            return Err(Error::Interface(format!(
+                "the weight manifest states digest {} but directs {}",
+                super::hex(&manifest.digest),
+                super::hex(&digest)
+            )));
+        }
+        let digests = agreement.all_gather_bytes(&digest)?;
+        if let Some(other) = digests.iter().find(|other| other.as_slice() != digest) {
+            let other: String = other.iter().map(|byte| format!("{byte:02x}")).collect();
+            return Err(Error::Interface(format!(
+                "the ranks that receive together hold different weight manifests: {} and {other}",
+                super::hex(&digest),
+            )));
+        }
         let planned = started.elapsed();
         let own_rank = rank as u32;
 
