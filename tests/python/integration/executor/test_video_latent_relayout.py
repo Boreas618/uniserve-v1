@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from uniserve import worker
-from uniserve.executor.video.denoiser import copy_runs
+from uniserve.executor.trajectories import copy_runs
 from uniserve.executor.video.plan import (
     REQUEST_PAGES,
     SAMPLE_ALIGNMENT,

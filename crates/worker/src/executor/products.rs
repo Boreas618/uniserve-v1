@@ -578,7 +578,11 @@ pub(crate) fn bind_prepared(
                         Error::Interface(format!("a request's latent layout: {error}"))
                     })?;
                     let bound = ledger.bind_restore(slot, call, restore, owners.rank, layout)?;
-                    (bound.banks, bound.update, Some((bound.pages, bound.copies)))
+                    (
+                        bound.banks,
+                        bound.update,
+                        Some((bound.stored.pages, bound.stored.copies)),
+                    )
                 }
                 _ => {
                     let (banks, update) = ledger.bind(slot, call, kind)?;

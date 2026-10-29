@@ -70,7 +70,7 @@ use crate::storage::encoders::{self, EncoderHostPool};
 use crate::storage::prefix_cache::host::{self, HostCacheSetup};
 use crate::storage::retained::Retained;
 use crate::storage::weights::{self, WeightKeys};
-use crate::storage::{LatentHostPool, SlotPages};
+use crate::storage::{LatentHostPool, WHOLE_IMAGE};
 use crate::stream::Scratches;
 use crate::stream::Streams;
 use crate::transfer::TransportKind;
@@ -587,33 +587,35 @@ impl Worker {
             info.diffusion_lm_step_rows = bound.step_rows;
             info
         };
-        // A video denoising rank maps a host latent pool, which a preempted
+        // A denoising rank maps a host latent pool, which a preempted
         // request's trajectory is written to and a resumed one's restored
-        // from; without one its preempted requests resume from noise.
+        // from; without one its preempted requests resume from noise. A
+        // video rank's executor states its share of a request's samples; a
+        // rank of an image denoiser holds whole latents.
         let mut bound = bound;
+        let region = match &video_capacity {
+            Some(capacity) => capacity.manifest.latent_region.as_deref(),
+            None => Some(WHOLE_IMAGE),
+        };
+        let longest_image = manifest
+            .image
+            .as_ref()
+            .and_then(|image| image.latent.as_ref())
+            .map(|latent| latent.rows as u64);
         if let (Some(ledger), Some(region), Some(identity), Some(cuda)) = (
             bound
                 .computations
                 .as_mut()
                 .and_then(|computations| computations.ledger_mut()),
-            video_capacity
-                .as_ref()
-                .and_then(|capacity| capacity.manifest.latent_region.as_deref()),
+            region,
             model_fingerprint.as_deref(),
             device.cuda(),
-        ) && let Some(slot_pages) = ledger.slot_pages()
+        ) && let Some(pages) = ledger.host_pages(longest_image).map_err(phase("storage"))?
         {
-            let slots = SlotPages {
-                page_units: u32::try_from(ledger.page_units()).map_err(|_| {
-                    phase("storage")(Error::Invalid("a latent page exceeds its range".into()))
-                })?,
-                pages: slot_pages,
-                slots: info.request_slots as usize,
-            };
             let started = LatentHostPool::start(
                 &retained,
                 cuda,
-                slots,
+                pages,
                 identity,
                 region,
                 launch.storage.tcp.as_deref(),
@@ -627,7 +629,7 @@ impl Worker {
                 Ok(reported) => info.latent_pool = Some(Box::new(reported)),
                 Err(error) => tracing::warn!(
                     %error,
-                    "no host latent pool: preempted video requests resume from noise"
+                    "no host latent pool: preempted image and video requests resume from noise"
                 ),
             }
         }

@@ -452,8 +452,9 @@ pub struct Call {
     /// What the call does for its request's draft cache; the default, for
     /// a deployment that does not speculate, does nothing.
     pub draft: DraftWork,
-    /// The stored trajectory a resumed video request's latent preparation
-    /// opens at, instead of step zero; absent for every other call.
+    /// The stored trajectory a resumed request's latent preparation opens
+    /// at, instead of step zero: a video request's, or the image a token
+    /// request had begun; absent for every other call.
     pub latent_restore: Option<LatentRestore>,
     /// The host encoder pool pages an encoder call (a video request's, or
     /// an image encoding) reads its output from instead of computing it, or
@@ -910,13 +911,13 @@ impl Call {
             self.image_index.is_some() == prepares_image && self.image_index != Some(0),
             "exactly an image latent preparation names a positive image index"
         );
-        // Only a video latent preparation, whose rank holds the slot's
-        // pages, opens a stored trajectory.
+        // Only a latent preparation, which opens a trajectory, opens a
+        // stored one.
         if let Some(restore) = &self.latent_restore {
             restore.validate()?;
             ensure_valid!(
-                self.kind == CallKind::Media(MediaCall::LatentPreparation) && !prepares_image,
-                "only a video latent preparation restores a stored trajectory"
+                self.kind == CallKind::Media(MediaCall::LatentPreparation),
+                "only a latent preparation restores a stored trajectory"
             );
         }
         // Only an encoder call that writes one output has its output in the

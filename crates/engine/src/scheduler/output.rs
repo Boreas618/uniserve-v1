@@ -38,8 +38,11 @@ enum TokenTerminal {
         reason: FinishReason,
         stop_reason: Option<crate::StopReason>,
     },
-    /// It leaves for another engine, for the cause given.
-    Migratable(MigrationCause),
+    /// It leaves for another engine, for the cause given, with the steps
+    /// of the trajectory of the image it was generating that the host
+    /// latent pools stored (zero for none) and the record of where they lie
+    /// (`Trajectory::stored_layout`).
+    Migratable(MigrationCause, u32, Vec<u8>),
 }
 
 /// Builds the terminal `Finished` event of a token request with its final
@@ -738,43 +741,8 @@ impl Scheduler {
             CallKind::Media(MediaCall::Denoising) => {
                 // Publish the newly committed step exactly once. A denoising
                 // call covers one step, so the steps completed before it are
-                // one fewer than the reported total. Step numbers saturate at
-                // `u16::MAX` to fit the event fields.
-                let Some(st) = self.running.get(&id) else {
-                    return;
-                };
-                let (image_id, h, w, steps, prev_sd) = {
-                    let prev = record.step_index.saturating_sub(1).min(u32::from(u16::MAX)) as u16;
-                    (
-                        st.image_id,
-                        st.req.image.height,
-                        st.req.image.width,
-                        st.req.image.steps,
-                        prev,
-                    )
-                };
-
-                let sd = self
-                    .running
-                    .get(&id)
-                    .map_or(0, |s| s.denoising.completed())
-                    .min(u32::from(u16::MAX)) as u16;
-
-                if prev_sd == 0 && sd >= 1 {
-                    self.emit(
-                        id,
-                        Event::ImageBegin {
-                            image_id,
-                            height: h,
-                            width: w,
-                            steps,
-                        },
-                    );
-                }
-
-                for step in prev_sd.saturating_add(1)..=sd {
-                    self.emit(id, Event::ImageStep { image_id, step });
-                }
+                // one fewer than the reported total.
+                self.emit_image_steps(id, record.step_index.saturating_sub(1));
 
                 // The host planner enters commit after the configured step count;
                 // worker completion flags do not determine diffusion termination.
@@ -1208,6 +1176,34 @@ impl Scheduler {
         }
     }
 
+    /// Publishes the steps of request `id`'s current image its trajectory
+    /// completed after the first `previous`: the image's start when it had
+    /// completed none, then each step. Step numbers saturate at `u16::MAX`
+    /// to fit the event fields.
+    pub(super) fn emit_image_steps(&mut self, id: RequestId, previous: u32) {
+        let Some(st) = self.running.get(&id) else {
+            return;
+        };
+        let image_id = st.image_id;
+        let (height, width, steps) = (st.req.image.height, st.req.image.width, st.req.image.steps);
+        let previous = previous.min(u32::from(u16::MAX)) as u16;
+        let completed = st.denoising.completed().min(u32::from(u16::MAX)) as u16;
+        if previous == 0 && completed >= 1 {
+            self.emit(
+                id,
+                Event::ImageBegin {
+                    image_id,
+                    height,
+                    width,
+                    steps,
+                },
+            );
+        }
+        for step in previous.saturating_add(1)..=completed {
+            self.emit(id, Event::ImageStep { image_id, step });
+        }
+    }
+
     /// Opens the next image-generation branch.
     ///
     /// Moves the request to `Phase::CloseCache` under a new `image_id` and checks
@@ -1609,9 +1605,24 @@ impl Scheduler {
     }
 
     /// Ends a token request as migratable for `cause`, releasing what it
-    /// owns as `finish_with` does; its terminal event is `Migratable`.
+    /// owns as `finish_with` does; its terminal event is `Migratable`,
+    /// naming no stored trajectory.
     pub(super) fn migrate_request(&mut self, id: RequestId, cause: MigrationCause) {
-        self.retire_token_request(id, TokenTerminal::Migratable(cause));
+        self.retire_token_request(id, TokenTerminal::Migratable(cause, 0, Vec::new()));
+    }
+
+    /// Ends a token request as migratable for `cause`, as `migrate_request`
+    /// does, naming the `steps` of the trajectory of the image it was
+    /// generating that the host latent pools stored and the record of where
+    /// they lie.
+    pub(super) fn migrate_stored(
+        &mut self,
+        id: RequestId,
+        cause: MigrationCause,
+        steps: u32,
+        stored_layout: Vec<u8>,
+    ) {
+        self.retire_token_request(id, TokenTerminal::Migratable(cause, steps, stored_layout));
     }
 
     /// Publishes `terminal` and releases every resource owned by one token
@@ -1619,7 +1630,7 @@ impl Scheduler {
     fn retire_token_request(&mut self, id: RequestId, terminal: TokenTerminal) {
         let reason = match &terminal {
             TokenTerminal::Finished { reason, .. } => Some(reason.clone()),
-            TokenTerminal::Migratable(_) => None,
+            TokenTerminal::Migratable(..) => None,
         };
         let terminal_published = self
             .inflight
@@ -1703,9 +1714,14 @@ impl Scheduler {
                 .saturating_sub(st.req.num_encoder_cache_entries());
 
             // Its encodings' lookups in the host encoder pools end, those of
-            // its calls in flight once they complete.
+            // its calls in flight once they complete; so do the pins of the
+            // stored trajectory its image restores, and a store of its
+            // image's trajectory not yet carried to its workers is aborted.
             if let Some(store) = self.encoder_outputs.as_mut() {
                 store.forget(RequestKey::new(self.engine_id, id, st.request_epoch));
+            }
+            if let Some(store) = self.trajectories.as_mut() {
+                store.forget(id);
             }
 
             // Releasing the request's encoder pins may make cache products
@@ -1733,11 +1749,13 @@ impl Scheduler {
                     reason,
                     stop_reason,
                 } => terminal_event(&st, reason, stop_reason),
-                TokenTerminal::Migratable(cause) => Event::Migratable {
-                    cause,
-                    denoised_steps: 0,
-                    stored_layout: Vec::new(),
-                },
+                TokenTerminal::Migratable(cause, denoised_steps, stored_layout) => {
+                    Event::Migratable {
+                        cause,
+                        denoised_steps,
+                        stored_layout,
+                    }
+                }
             };
             let accepted = terminal_published || st.output.events.enqueue(event);
             if accepted {

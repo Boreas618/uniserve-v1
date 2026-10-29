@@ -11,8 +11,11 @@ uninterrupted as the reference. The same request is then preempted:
   migratable, the daemon keeps its tokens (the image starts among them) and
   the decoded values of its first image, and once the engine wakes the
   request continues: the engine rebuilds its context by feeding the carried
-  image back through the model's feedback encoder, and generates the second
-  image again from noise;
+  image back through the model's feedback encoder, and continues the second
+  image from its stored denoising step;
+- by the loss of a worker while it generates its second image: no latent
+  trajectory can be stored from the lost worker, so the resumed request
+  computes that image from its seeded noise;
 - by a world change whose numerics are unchanged (a change of the workers'
   watchdog), whose previous world is kept as its weights alone
   (``update_config.previous_world``), so that the successor's KV cache
@@ -47,6 +50,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import subprocess
 import tempfile
 import time
 from collections.abc import Iterator
@@ -391,7 +395,10 @@ def _assert_continued(
 
 
 @pytest.mark.timeout(scaled(3600))
-@pytest.mark.parametrize("model", ["bagel", "sensenova"])
+@pytest.mark.parametrize(
+    "model",
+    ["bagel", pytest.param("sensenova", marks=pytest.mark.missing_state)],
+)
 def test_a_preempted_image_request_continues_exactly(
     tmp_path: Path, model: str
 ) -> None:
@@ -423,6 +430,30 @@ def test_a_preempted_image_request_continues_exactly(
             assert woke.status_code == 200, woke.text
             slept_stream = streamed.result()
         _assert_continued(slept_stream, reference, 1, setup)
+
+        # Losing the worker leaves no stored trajectory for this request.
+        # Recovery must compute its unfinished image from the request facts.
+        received = Queue()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            streamed = pool.submit(
+                _stream,
+                base_url,
+                _request(setup, image_start, "worker-loss"),
+                received,
+            )
+            assert received.get(timeout=scaled(600)) == reference.images[0]
+            assert not streamed.done(), "the request ended before worker loss"
+            workers = _workers(runtime)
+            assert len(workers) == 1, workers
+            worker = workers[0]
+            subprocess.run(
+                ["ps", "-o", "pid,ppid,args", "--forest", "-p", str(worker)],
+                check=True,
+            )
+            assert worker in _workers(runtime), "the worker already exited"
+            os.kill(worker, signal.SIGKILL)
+            recovered_stream = streamed.result()
+        _assert_continued(recovered_stream, reference, 1, setup)
 
         # A world change whose numerics are unchanged, the serving world's
         # workers paused once the request ran for most of the reference's

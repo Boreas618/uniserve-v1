@@ -226,7 +226,7 @@ impl Scheduler {
         // A resumed request's preparation waits until its stored
         // trajectory's pages are pinned, or found missing.
         if !state.latent_preparation_scheduled {
-            if state.restoring == Restoring::Pinning {
+            if state.host_trajectory.restoring == Restoring::Pinning {
                 return Vec::new();
             }
             return vec![MediaCall::LatentPreparation];
@@ -1035,7 +1035,7 @@ impl Scheduler {
 
         // A resumed request's preparation opens the stored trajectory its
         // restore pinned.
-        let latent_restore = match &state.restoring {
+        let latent_restore = match &state.host_trajectory.restoring {
             Restoring::Ready(restore) if media_call == MediaCall::LatentPreparation => {
                 restore.clone()
             }
@@ -1136,7 +1136,7 @@ impl Scheduler {
             }
             MediaCall::LatentPreparation => {
                 state.latent_preparation_scheduled = true;
-                state.restoring = Restoring::Planned;
+                state.host_trajectory.restoring = Restoring::Planned;
             }
             // Submitted steps are derived from the pending denoising calls.
             MediaCall::Denoising => {}

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ImageEncoder, ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingParamsError,
+    Trajectory,
 };
 
 /// Output constraint applied to the default generation paradigm.
@@ -973,6 +974,15 @@ pub struct GenerationRequest {
     /// against `max_images`, in its image numbering and in its usage.
     #[serde(default)]
     pub generated_images: Vec<GeneratedImage>,
+    /// The latent trajectory of the image a migrated request had begun and
+    /// not finished, which an engine that preempted it at a denoising-step
+    /// boundary stored (`Trajectory::denoised_steps`): the engine that
+    /// continues it opens that image from the stored step when its host
+    /// latent pools hold it, and from noise otherwise. Its identity keys
+    /// every image trajectory of the request; a request without one (zero)
+    /// stores none.
+    #[serde(default)]
+    pub trajectory: Trajectory,
 }
 
 impl GenerationRequest {
@@ -1544,6 +1554,7 @@ mod tests {
             generated_token_ids: Vec::new(),
             adapter: 4,
             generated_images: Vec::new(),
+            trajectory: Default::default(),
         }
     }
 

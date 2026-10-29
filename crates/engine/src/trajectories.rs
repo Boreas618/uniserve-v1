@@ -1,20 +1,22 @@
-//! The host tier of video requests' latent trajectories, as the scheduler
-//! drives it.
+//! The host tier of latent trajectories, as the scheduler drives it: a
+//! video request's, and the trajectory of each image a token request
+//! generates (BAGEL, SenseNova).
 //!
-//! A video request is preempted and resumed at denoising-step boundaries:
-//! its trajectory's state at a step boundary is the samples of the bank
+//! A request is preempted and resumed at denoising-step boundaries: its
+//! trajectory's state at a step boundary is the samples of the bank
 //! holding the committed step (the step count and the request's facts fix
-//! everything else: an Euler step has no solver history, and every random
-//! draw follows from the request's seed), which are derived state like a
-//! KV cache page. Each denoising rank whose host runs a Storage Server maps
-//! a host latent pool of its own, a page pool of pages the size of one page
-//! of a request slot's latent banks (`ipc::LatentPoolInfo`), which the same
-//! rank of every world of the deployment maps again. The scheduler decides
-//! what moves:
+//! everything else: an Euler step has no solver history, every random draw
+//! follows from the request's seed, and an image's conditioning is its
+//! request's context, which the engine that resumes it rebuilds from its
+//! facts), which are derived state like a KV cache page. Each denoising
+//! rank whose host runs a Storage Server maps a host latent pool of its
+//! own, a page pool of pages the size of one page of its latent banks
+//! (`ipc::LatentPoolInfo`), which the same rank of every world of the
+//! deployment maps again. The scheduler decides what moves:
 //!
 //! - **Offload.** A preempted request whose calls completed at step `k`
-//!   (`0 < k <` its schedule) has every page of its slot that holds its
-//!   samples reserved in its rank's pool under the page's key; the next
+//!   (`0 < k <` its schedule) has every page of its trajectory that holds
+//!   its samples reserved in its rank's pool under the page's key; the next
 //!   batch to the denoiser's worker group, one of latent offloads alone,
 //!   copies the pages of the committed bank into the reserved slots
 //!   (`Batch::latent_offloads`), and its output commits them, or aborts
@@ -38,14 +40,16 @@
 //! # Keys
 //!
 //! A page's key is the copy manifest library's key of the page as a chunk
-//! of the rank's slot pages (`storage::manifest::Storage::paged`): the
-//! digest of the logical regions of the samples its bytes hold and where
-//! they lie in it, with the content of the values, `SHA-256(
+//! of the rank's pages of the trajectory
+//! (`storage::manifest::Storage::paged`): the digest of the logical regions
+//! of the samples its bytes hold and where they lie in it, with the content
+//! of the values, `SHA-256(
 //! "uniserve-latent-content" || seed || trajectory || steps)`: the latent
 //! seed of what the deployment's denoising computes ([`latent_seed`]: the
 //! weights' values and the function and format identities of the denoising
-//! ranks' models), the trajectory's identity (`Trajectory::id`) and the
-//! steps it took. The key is injective, since every input that determines a
+//! ranks' models), the trajectory's identity (`Trajectory::id` for a video
+//! request, [`image_trajectory`] for a token request's image) and the steps
+//! it took. The key is injective, since every input that determines a
 //! page's values is in it, and minimal, since no input that does not is:
 //! neither the world, the mesh, the rank nor the parallel configuration
 //! that wrote the page, so a page two configurations lay out alike is one
@@ -60,9 +64,10 @@
 //! A key names the layout the page was written in, which a restoring rank of
 //! another parallel configuration does not know: the engine that stores a
 //! trajectory records, for every stored rank, its pool, the host the pool
-//! lies on and the rank's slot pages of the request as its executor
-//! declared them in its latent preparation's completion
-//! (`CallOutput::latent_layouts`). The record travels with the request's
+//! lies on and the rank's pages of the trajectory as its latent
+//! preparation's completion declared them (`CallOutput::latent_layouts`: a
+//! video executor's statement of its slot pages, an image rank's whole
+//! latent rows). The record travels with the request's
 //! facts through the daemon (`Trajectory::stored_layout`), as the stored
 //! steps do; the engine that resumes the request computes the stored pages'
 //! keys from it, pins them in the pools it names and hands every restoring
@@ -99,6 +104,20 @@ use crate::host_tier::Servers;
 
 /// The version of [`Record`]: a record of another version names no pages.
 const RECORD_VERSION: u32 = 1;
+
+/// The identity that keys the trajectory of image `image_index` (from one)
+/// of a token request whose trajectory identity is `trajectory`
+/// (`GenerationRequest::trajectory`): each image of the request has a
+/// trajectory of its own, which its index among the request's images, a
+/// fact of the request, tells apart.
+pub(crate) fn image_trajectory(trajectory: u64, image_index: u32) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"uniserve-image-trajectory\0");
+    digest.update(trajectory.to_le_bytes());
+    digest.update(image_index.to_le_bytes());
+    let digest = digest.finalize();
+    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
+}
 
 /// One denoising rank's host latent pool.
 #[derive(Clone)]
@@ -144,8 +163,8 @@ struct StoredRank {
     /// What determines the rank's share of every request's samples
     /// (`LatentPoolInfo::region`).
     region: [u8; 32],
-    /// The rank's slot pages of the request: the part of each sample it
-    /// held and where its values lie, which keys its pages.
+    /// The rank's pages of the trajectory: the part of each sample it held
+    /// and where its values lie, which keys its pages.
     layout: StorageLayout,
 }
 
@@ -190,8 +209,8 @@ fn content(seed: u64, trajectory: u64, steps: u32) -> [u8; 32] {
 
 /// The keys of the pages that hold a rank's part of a trajectory whose
 /// values are `content`, laid out in `layout` on pages of `page_bytes`:
-/// each page's key as a chunk of the rank's slot pages. `None` for a layout
-/// that does not describe itself consistently.
+/// each page's key as a chunk of the rank's pages of the trajectory. `None`
+/// for a layout that does not describe itself consistently.
 fn page_keys(layout: &StorageLayout, page_bytes: u64, content: [u8; 32]) -> Option<Vec<Key>> {
     let paged = PagedStorage::paged(layout.clone(), page_bytes, &|_| Some(content));
     match paged {
@@ -440,9 +459,9 @@ impl TrajectoryStore {
     }
 
     /// Serve `worker`, whose denoising ranks (`ranks`, each with its rank
-    /// index in the group) report host latent pools of equal slot pages,
-    /// when every one's server is reachable. Returns whether the store
-    /// serves it.
+    /// index in the group) report host latent pools of equal trajectory
+    /// pages, when every one's server is reachable. Returns whether the
+    /// store serves it.
     pub(crate) fn add_worker(
         &mut self,
         worker: &WorkerGroupId,
@@ -451,10 +470,10 @@ impl TrajectoryStore {
         let Some((_, first)) = ranks.first() else {
             return false;
         };
-        let slot_pages = first.pool.slot_pages;
+        let trajectory_pages = first.pool.trajectory_pages;
         let mut pools = Vec::with_capacity(ranks.len());
         for (rank, report) in ranks {
-            if report.pool.slot_pages != slot_pages || slot_pages == 0 {
+            if report.pool.trajectory_pages != trajectory_pages || trajectory_pages == 0 {
                 return false;
             }
             let Some(client) = self.client_of(report.host, report.pool.endpoint.as_deref()) else {
@@ -476,7 +495,7 @@ impl TrajectoryStore {
         tracing::info!(
             worker = %worker.0,
             ranks = pools.len(),
-            slot_pages,
+            trajectory_pages,
             "the host latent pools serve the worker group"
         );
         self.workers.insert(worker.clone(), pools);
@@ -503,7 +522,7 @@ impl TrajectoryStore {
     /// Start storing `request`'s trajectory `trajectory` after `steps` steps
     /// in the pools of `worker`'s denoising ranks, whose committed bank
     /// holds it (`request_key`'s slot) laid out as `layouts` state, each
-    /// rank's slot pages of the request by its rank index
+    /// rank's pages of the trajectory by its rank index
     /// (`CallOutput::latent_layouts`). Returns `false`, starting nothing,
     /// when the store does not serve `worker` or a rank's layout is missing
     /// or malformed; an offload a server could not be asked for fails
@@ -912,7 +931,7 @@ impl TrajectoryStore {
             _ => {
                 tracing::info!(
                     request = request.0,
-                    "a resumed video request names no stored layout of this build"
+                    "a resumed request names no stored trajectory layout of this build"
                 );
                 return None;
             }

@@ -92,13 +92,13 @@ impl PageCopy {
     }
 }
 
-/// One page of a video request's latent trajectory copied from its request
-/// slot's pages in a rank's latent banks to a slot of the rank's host
-/// latent pool, a page pool of the rank's host's Storage Server
-/// ([`LatentOffload`]): page `page` of the bank holding the trajectory's
-/// committed step goes to the pool slot, which the engine reserved. A page
-/// is the bank's `[page_units]` float32 values, as many bytes as a pool
-/// page.
+/// One page of a latent trajectory copied from a rank's latent banks to a
+/// slot of the rank's host latent pool, a page pool of the rank's host's
+/// Storage Server ([`LatentOffload`]): page `page` of the trajectory's
+/// pages in the bank holding its committed step goes to the pool slot,
+/// which the engine reserved. A video trajectory's pages are its request
+/// slot's; an image trajectory's are the pages its calls name, in logical
+/// order. A pool page holds as many bytes as a bank page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentPageCopy {
     /// The rank of the worker group that copies the page.
@@ -107,29 +107,31 @@ pub struct LatentPageCopy {
     pub pool: u64,
     /// The pool slot.
     pub slot: u64,
-    /// The page's index among the request slot's pages, from zero.
+    /// The page's index among the trajectory's pages, from zero.
     pub page: u32,
 }
 
-/// A preempted video request's trajectory, written from the bank holding
-/// its committed step into the host latent pools of its denoising ranks
-/// (one [`LatentPageCopy`] per page of the request slot and rank). The
-/// request's calls have completed, so the committed step is final; the
-/// rank's output for the batch reports the copies complete, and the
-/// engine then commits the pool slots.
+/// A preempted request's trajectory (a video request's, or the image a
+/// token request was denoising), written from the bank holding its
+/// committed step into the host latent pools of its denoising ranks (one
+/// [`LatentPageCopy`] per page of the trajectory and rank). The request's
+/// calls have completed, so the committed step is final; the rank's output
+/// for the batch reports the copies complete, and the engine then commits
+/// the pool slots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentOffload {
-    /// The request whose slot's trajectory is written.
+    /// The request whose trajectory, in its slot, is written.
     pub request_key: RequestKey,
     pub pages: Vec<LatentPageCopy>,
 }
 
-/// The stored trajectory a resumed video request's latent preparation
-/// opens at: the call prepares the request as for step zero, then each
-/// rank copies the parts of the stored pages its own pages hold into the
-/// bank it initializes, as the copy manifest from the stored ranks' layouts
-/// to its own directs, and commits the trajectory at step `steps`. The
-/// engine pinned the pool slots until the call's result.
+/// The stored trajectory a resumed request's latent preparation opens at
+/// (a video request's, or the image a token request had begun): the call
+/// prepares the trajectory as for step zero, then each rank copies the
+/// parts of the stored pages its own pages hold into the bank it
+/// initializes, as the copy manifest from the stored ranks' layouts to its
+/// own directs, and commits the trajectory at step `steps`. The engine
+/// pinned the pool slots until the call's result.
 ///
 /// The stored ranks may have laid the samples out under another parallel
 /// configuration than the restoring ranks: every rank plans its copies
@@ -156,11 +158,11 @@ pub struct LatentSource {
     pub readers: Vec<u32>,
     /// The pool the pages lie in.
     pub pool: LatentPoolRef,
-    /// The stored rank's request slot pages as one storage
+    /// The stored rank's pages of the trajectory as one storage
     /// (`storage::manifest::StorageLayout`, JSON): the part of each latent
     /// sample it held and where its values lie in the pages.
     pub layout: String,
-    /// The pool slot of each page of the slot, in page order, pinned.
+    /// The pool slot of each stored page, in page order, pinned.
     pub slots: Vec<u64>,
 }
 

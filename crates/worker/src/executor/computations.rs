@@ -859,6 +859,7 @@ fn record_last(
             ledger: computations.ledger.as_mut(),
             images: computations.images.as_ref(),
             encoders: computations.encoders.as_ref(),
+            rank: parts.rank as u32,
         };
         if images {
             let tensors = image::bind(

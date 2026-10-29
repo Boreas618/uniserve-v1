@@ -120,10 +120,10 @@ message EngineInfo {
   // compute: equal between worlds whose models and numerics agree, whose
   // pages a successor reuses.
   uint64 prefix_seed = 8;
-  // The seed of the keys of the latent trajectories the engine's video
-  // denoiser stores at preemption: equal between worlds whose denoising
-  // computes the same, which continue each other's trajectories exactly;
-  // zero for an engine without a video denoiser.
+  // The seed of the keys of the latent trajectories the engine's denoiser
+  // (a video model's, or an image model's) stores at preemption: equal
+  // between worlds whose denoising computes the same, which continue each
+  // other's trajectories exactly; zero for an engine that stores none.
   uint64 latent_seed = 9;
 }
 
@@ -625,6 +625,35 @@ message GenerationRequest {
   // for a new request. The engine writes each into the request's context as
   // its feedback encoders read it when it was generated.
   repeated GeneratedImage generated_images = 17;
+  // The latent trajectory of the image a migrated request had begun and not
+  // finished, which an engine stored when it preempted the request; its
+  // identity keys every image trajectory of the request.
+  Trajectory trajectory = 18;
+}
+
+// A request's latent trajectory across the engines that serve it: a video
+// request's, or the image a token request had begun and not finished.
+message Trajectory {
+  // The identity that keys the trajectory an engine stores when it preempts
+  // the request: the daemon gives a request one when it first submits it
+  // and keeps it across its migrations.
+  uint64 id = 1;
+  // The denoising steps of the trajectory an engine stored when it
+  // preempted the request; zero for a request that starts from noise. The
+  // engine that serves it continues from that step when its store holds the
+  // trajectory, and from noise otherwise.
+  uint32 denoised_steps = 2;
+  // The latent seed of the world whose stored trajectory the request
+  // continues although the serving world's denoising computes other
+  // numerics (a world change's `in_flight = keep`); absent, the engine reads
+  // a trajectory of its own latent seed only.
+  optional uint64 state_seed = 3;
+  // Where the engine that stored the trajectory put its pages and how each
+  // stored rank laid its part of the samples out, as that engine recorded
+  // it, which an engine of another parallel configuration finds and lays
+  // the pages out by; empty when `denoised_steps` is zero. The daemon does
+  // not read it.
+  bytes stored_layout = 4;
 }
 
 // An image a migrated request generated before: what its feedback encoders
@@ -812,29 +841,16 @@ message DiffusionRequest {
   bytes conditioning = 3;
   repeated ConditionExtent conditions = 4;
   DiffusionSamplingParams sampling = 5;
-  // The identity of the request's latent trajectory, which keys the
-  // trajectory an engine stores when it preempts the request: the daemon
-  // gives a request one when it first submits it and keeps it across its
-  // migrations.
+  // The request's trajectory identity, preserved across engine migrations.
   uint64 trajectory = 6;
-  // The denoising steps of the trajectory an engine stored when it
-  // preempted the request; zero for a request that starts from noise. The
-  // engine that serves it continues from that step when its store holds
-  // the trajectory, and from noise otherwise.
+  // The stored denoising step; zero starts the trajectory from noise.
   uint32 denoised_steps = 7;
-  // The latent seed of the world whose stored trajectory the request
-  // continues although the serving world's denoising computes other
-  // numerics (a world change's `in_flight = keep`); absent, the engine reads
-  // a trajectory of its own latent seed only.
+  // The source world's latent seed for in_flight=keep across numerics.
   optional uint64 state_seed = 8;
   // The digests of what each encoder computation reads, which key its
   // outputs in the host tier; absent, the engine stores and finds none.
   optional EncoderInputs encoder_inputs = 9;
-  // Where the engine that stored the trajectory put its pages and how each
-  // stored rank laid its part of the samples out, as that engine recorded
-  // it, which an engine of another parallel configuration finds and lays
-  // the pages out by; empty when `denoised_steps` is zero. The daemon does
-  // not read it.
+  // The stored ranks' page locations and numerical layouts, read by engines.
   bytes stored_layout = 10;
 }
 

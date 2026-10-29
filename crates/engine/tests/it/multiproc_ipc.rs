@@ -1952,6 +1952,7 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
             generated_token_ids: Vec::new(),
             adapter: 0,
             generated_images: Vec::new(),
+            trajectory: Default::default(),
         }))?;
         std::fs::write(directory.path().join("release"), "")?;
         runtime.block_on(async {
@@ -2033,6 +2034,7 @@ fn greedy_text(id: u64, generated: Vec<u32>, max_und_tokens: usize) -> Request {
         generated_token_ids: generated,
         adapter: 0,
         generated_images: Vec::new(),
+        trajectory: Default::default(),
     })
 }
 
@@ -2099,6 +2101,7 @@ fn a_cache_layer_kept_per_request_resumes_from_its_checkpoints() -> anyhow::Resu
                 generated_token_ids: Vec::new(),
                 adapter: 0,
                 generated_images: Vec::new(),
+                trajectory: Default::default(),
             }))?;
             let (tokens, terminal) = tokens_until_terminal(&mut events)?;
             anyhow::ensure!(
@@ -2165,6 +2168,7 @@ fn a_prefill_group_hands_its_requests_to_a_decode_group() -> anyhow::Result<()> 
                     generated_token_ids: Vec::new(),
                     adapter: 0,
                     generated_images: Vec::new(),
+                    trajectory: Default::default(),
                 }))?);
             }
             let mut generated = Vec::new();

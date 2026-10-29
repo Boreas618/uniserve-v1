@@ -4,7 +4,8 @@ The denoiser computation of an image model (BAGEL, SenseNova) runs three
 kinds of work on its stream:
 
 - a latent preparation opens a request's trajectory and writes its seeded
-  initial latent into the worker's latent ledger;
+  initial latent into the worker's latent ledger, or the latent of the
+  stored step a resumed request continues from;
 - a denoising step advances every stepping trajectory of a batch by one
   solver step: its guidance branches' rows are packed into one forward per
   bucket (:class:`RowFamily`), whose predictions the solver combines with
@@ -49,6 +50,7 @@ from uniserve.executor.predicates import kept
 from uniserve.executor.text.context import ConditionRow
 from uniserve.executor.text.graphs import GraphTable
 from uniserve.executor.text.protocol import GraphMode
+from uniserve.executor.trajectories import copy_runs
 from uniserve.media import image
 from uniserve.models import LatentInput, TextSize
 from uniserve.nn.attention.gather import row_columns_size
@@ -1215,17 +1217,26 @@ class Denoiser:
         image_index: int,
         latent: LatentBinding,
         predicate: torch.Tensor | None = None,
+        restore: tuple[Sequence[Sequence[int]], Sequence[torch.Tensor]]
+        | None = None,
     ) -> GraphMode:
         """Open a trajectory and write its seeded initial latent.
 
         The image's noise comes from the request's seed and ``image_index``,
         the index the engine assigned the image; the initial latent fills
         the trajectory's pages of the bank the ledger bound, zero past its
-        rows. A false ``predicate`` (the call's ``uint8 [1]`` device
-        predicate) leaves those pages as they were.
+        rows. A resumed request's image continues from the step an engine
+        stored (``latent.step``): ``restore`` holds the copies the worker
+        planned, each ``[page, offset, target, bytes]``, and the ``uint8
+        [page_bytes]`` host tensors of the stored pages they read, which lay
+        the stored values out in the trajectory's pages back to back in
+        their logical order over the noise. A false ``predicate`` (the
+        call's ``uint8 [1]`` device predicate) leaves those pages as they
+        were.
 
         Raises:
-            ValueError: The ledger's binding disagrees with the image.
+            ValueError: The ledger's binding disagrees with the image, or a
+                copy reaches past its page or the trajectory's pages.
         """
         network, layout = self.network, self.layout
         self.trajectory(slot, key, params, negative)
@@ -1256,6 +1267,11 @@ class Denoiser:
                 constants={},
                 workspace={},
             )
+            if restore is not None:
+                # The workspace holds the trajectory's padded rows in its
+                # pages' logical order, which the copies' targets address.
+                copies, stored = restore
+                copy_runs(out.view(-1).view(torch.uint8), stored, copies)
             if predicate is not None:
                 previous = torch.empty_like(out)
                 self.banks.gather(latent.write, latent.pages, previous)

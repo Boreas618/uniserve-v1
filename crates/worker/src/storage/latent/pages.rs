@@ -115,18 +115,24 @@ impl LatentUpdate {
         })
     }
 
-    /// The initialization `initial` of a slot-local trajectory, committing
-    /// the stored trajectory a resumed request's latent preparation copied
-    /// in at `step` instead of noise at step zero. A slot-local trajectory's
-    /// generation is one past its step, as its denoising calls advance it.
-    pub(crate) fn restored(initial: Self, step: i64) -> Result<Self> {
+    /// The initialization `initial` of a trajectory, committing the stored
+    /// trajectory a resumed request's latent preparation copied in at `step`
+    /// instead of noise at step zero. A `slot_local` (video) trajectory's
+    /// generation is one past its step, as its denoising calls advance it;
+    /// an image trajectory keeps the generation its preparation's latent
+    /// product names, which its next denoising call reads.
+    pub(crate) fn restored(initial: Self, step: i64, slot_local: bool) -> Result<Self> {
         if initial.expected_generation != 0 || initial.release || step < 1 {
             return Err(Error::Invalid(
                 "a trajectory is restored by its initialization at a positive step".into(),
             ));
         }
         Ok(Self {
-            generation: step + 1,
+            generation: if slot_local {
+                step + 1
+            } else {
+                initial.generation
+            },
             step_index: step,
             restored: true,
             ..initial
@@ -320,6 +326,12 @@ impl LatentPool {
     /// The bank holding the slot's committed step.
     pub(crate) fn committed_bank(&self, slot: usize) -> u8 {
         self.slots[slot].bank
+    }
+
+    /// The pages the slot's committed trajectory lies in, in logical order;
+    /// none for an empty slot.
+    pub(crate) fn committed_pages(&self, slot: usize) -> &[usize] {
+        &self.slots[slot].pages
     }
 
     /// Prepare an export before the backend constructs its numerical views.

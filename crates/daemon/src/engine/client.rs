@@ -66,9 +66,10 @@ pub struct EngineInfo {
     /// The root of the prefix hash chains of the pages the engine's workers
     /// compute: equal between worlds whose models and numerics agree.
     pub prefix_seed: u64,
-    /// The seed of the keys of the video trajectories the engine stores at
-    /// preemption: equal between worlds whose denoising computes the same;
-    /// zero without a video denoiser or host latent pools.
+    /// The seed of the keys of the trajectories the engine stores at
+    /// preemption (a video request's, or an image's): equal between worlds
+    /// whose denoising computes the same; zero without a denoiser or host
+    /// latent pools.
     pub latent_seed: u64,
 }
 
@@ -1122,7 +1123,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
     // Every request still in flight leaves with the lost engine as
     // migratable: the daemon submits one that resumes from its generated
     // tokens, or a video request, to the engine that serves next, and fails
-    // any other. A video request's trajectory was stored nowhere new.
+    // any other. No trajectory was stored anywhere new.
     let pending: Vec<(RequestId, Pending)> = lock(&shared.requests).drain().collect();
     for (_, mut request) in pending {
         if let Some(answer) = request.accepted.take() {

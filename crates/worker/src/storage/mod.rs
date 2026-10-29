@@ -30,8 +30,8 @@ pub use products::{
 pub use retained::{Exclusive, ExclusiveSpec, ExclusiveStorage, LocalStorage};
 
 pub(crate) use latent::{
-    LatentExport, LatentHostPool, LatentImport, LatentPool, LatentUpdate, SlotPages,
-    TrajectoryVersion,
+    BankPages, LatentExport, LatentHostPool, LatentImport, LatentPool, LatentUpdate,
+    TrajectoryVersion, WHOLE_IMAGE,
 };
 pub(crate) use output::{OutputLease, OutputPool};
 pub use pinned_pool::PinnedPool;

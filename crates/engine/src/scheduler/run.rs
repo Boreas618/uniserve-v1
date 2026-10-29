@@ -457,15 +457,17 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Stores the trajectories of preempted video requests in the host
-    /// latent pools of the denoiser's worker group, reached through the
-    /// Storage Server at `socket` for the ranks on `host` (the engine's)
-    /// and over the TCP address another host's rank reports, when every
-    /// rank that executes the denoiser reports one
-    /// (`ExecutorInfo::rank_latents`), as a head of `deployment` in
-    /// `world`, whose trajectories the servers keep its own while it is on
-    /// trial. Without them a preempted request continues from noise
-    /// wherever it resumes.
+    /// Stores the trajectories of preempted requests (a video request's,
+    /// and the image a token request is generating) in the host latent
+    /// pools of the denoiser's worker group, reached through the Storage
+    /// Server at `socket` for the ranks on `host` (the engine's) and over
+    /// the TCP address another host's rank reports, when every rank that
+    /// executes the denoiser reports one (`ExecutorInfo::rank_latents`), as
+    /// a head of `deployment` in `world`, whose trajectories the servers
+    /// keep its own while it is on trial. The denoiser is the component
+    /// that serves denoising calls, or the protocol's default component of
+    /// a model that routes none. Without them a preempted request continues
+    /// from noise wherever it resumes.
     pub fn enable_trajectory_store(
         &mut self,
         socket: &std::path::Path,
@@ -473,14 +475,12 @@ impl Scheduler {
         world: u64,
         host: &str,
     ) {
-        let Some(component) = self
+        let component = self
             .info
             .media_components
             .get(&MediaCall::Denoising)
             .cloned()
-        else {
-            return;
-        };
+            .unwrap_or_else(|| DEFAULT_COMPONENT.to_owned());
         let info = self.executor.info();
         let mut denoisers = Vec::new();
         for (worker, ranks) in &info.rank_latents {
@@ -510,18 +510,17 @@ impl Scheduler {
         if denoisers.is_empty() {
             return;
         }
-        let mut store = match crate::trajectories::TrajectoryStore::connect(
-            socket, deployment, world, host,
-        ) {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "preempted video trajectories are not stored: the storage server is unreachable"
-                );
-                return;
-            }
-        };
+        let mut store =
+            match crate::trajectories::TrajectoryStore::connect(socket, deployment, world, host) {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "preempted trajectories are not stored: the storage server is unreachable"
+                    );
+                    return;
+                }
+            };
         let mut served = false;
         let mut identities = Vec::new();
         for (worker, reports) in &denoisers {
@@ -598,8 +597,8 @@ impl Scheduler {
         }
     }
 
-    /// The latent seed of what the scheduler's video denoising computes,
-    /// which keys the trajectories it stores; zero when it stores none.
+    /// The latent seed of what the scheduler's denoising computes, which
+    /// keys the trajectories it stores; zero when it stores none.
     pub fn latent_seed(&self) -> u64 {
         self.trajectories
             .as_ref()

@@ -345,10 +345,14 @@ impl Scheduler {
     /// does not generate in canvases. A queued one ends at once. A running
     /// one stops scheduling, drops the decoder decisions it awaits, and ends
     /// once its calls in flight drain, after every token and image it
-    /// generated, whatever it computes; a token or an image those calls
-    /// produce is discarded, and the engine that serves next generates it
-    /// again, as it generates an image the request had begun. A request
-    /// already finishing finishes. Video requests and readouts go on.
+    /// generated, whatever it computes; tokens those calls produce are
+    /// discarded, and the engine that serves next generates them again.
+    /// A completed image is published before migration because its decoding
+    /// releases the latent trajectory. The denoising steps of an image it had
+    /// begun advance its trajectory, which is stored in the host latent
+    /// pools before the request leaves (`Scheduler::retire_preempted_token`)
+    /// and which the engine that serves next continues. A request already
+    /// finishing finishes. Video requests and readouts go on.
     pub(super) fn migrate_requests(&mut self, cause: MigrationCause) {
         if self.config.canvas.is_some() {
             return;

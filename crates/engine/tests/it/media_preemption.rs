@@ -226,6 +226,18 @@ impl Denoiser {
         if let Some(denoiser) = info.video_denoiser.as_mut() {
             denoiser.denoise_steps = STEPS;
         }
+        Self::with_sim(server, pool, identity, gate, shares, config, sim)
+    }
+
+    fn with_sim(
+        server: &StorageServer,
+        pool: u64,
+        identity: &str,
+        gate: Option<Arc<Gate>>,
+        shares: &[(u64, u64)],
+        config: SchedulerConfig,
+        mut sim: SimEngine,
+    ) -> Self {
         // Every rank maps the one pool; each rank's share determines its
         // pages, and its region names the share.
         sim.set_latent_pools(
@@ -236,7 +248,7 @@ impl Denoiser {
                         HOST.to_owned(),
                         Some(LatentPoolInfo {
                             pool: pool_ref(pool),
-                            slot_pages: SLOT_PAGES,
+                            trajectory_pages: SLOT_PAGES,
                             region: [start as u8, count as u8, shares.len() as u8, 0]
                                 .repeat(8)
                                 .try_into()
@@ -380,6 +392,123 @@ fn completed(events: &[Event]) -> bool {
         .iter()
         .any(|event| matches!(event, Event::Artifact(_)))
         && matches!(events.last(), Some(Event::Finished { .. }))
+}
+
+/// The request interface carries an unfinished image's stored step across
+/// migration. Its resumed event stream starts after that step; without the
+/// optional pages it runs the full schedule and still delivers one image.
+#[test]
+fn an_image_resumes_after_its_stored_step_and_recomputes_missing_pages() {
+    use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
+
+    let (server, pool) = server();
+    let gate = Arc::new(Gate::default());
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().latent_page_units = (PAGE_UNITS / WIDTH) as u32;
+    let serving = Denoiser::with_sim(
+        &server,
+        pool,
+        IDENTITY,
+        Some(Arc::clone(&gate)),
+        ONE_RANK,
+        SchedulerConfig::default(),
+        sim,
+    );
+    let mut request = GenerationRequest {
+        request_id: RequestId(1),
+        prompt_token_ids: vec![5, 8, 13],
+        multimodal_inputs: Default::default(),
+        negative_prompt_token_ids: Vec::new(),
+        constraint: GenerationConstraint::GenOnly,
+        sampling: ipc::SamplingParams::default(),
+        image: ipc::ImageParams {
+            width: 64,
+            height: 192,
+            steps: STEPS as u16,
+            ..Default::default()
+        },
+        max_images: 1,
+        max_und_tokens: 0,
+        include_stop_token: false,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        cache: Default::default(),
+        image_generation: ImageGenerationConfig {
+            requires_text_for_image: false,
+            ..Default::default()
+        },
+        readout: Vec::new(),
+        generated_token_ids: Vec::new(),
+        adapter: 0,
+        generated_images: Vec::new(),
+        trajectory: Trajectory {
+            id: TRAJECTORY,
+            ..Default::default()
+        },
+    };
+    let mut events = serving.handle.submit(request.clone()).unwrap();
+    gate.wait_reached();
+    let parked = serving.handle.park();
+    gate.open();
+    let before = until_terminal(&mut events);
+    let stored = left_with(&before, MigrationCause::Drain, TRAJECTORY);
+    assert!((BEFORE_PREEMPTION..STEPS).contains(&stored.denoised_steps));
+    parked
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    serving
+        .handle
+        .resume()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+
+    for event in before {
+        match event {
+            Event::TextToken { id, .. } | Event::ControlToken { id } => {
+                request.generated_token_ids.push(id);
+            }
+            Event::TextTokens { ids } => request.generated_token_ids.extend(ids),
+            _ => {}
+        }
+    }
+    for missing in [false, true] {
+        request.request_id = RequestId(if missing { 3 } else { 2 });
+        request.trajectory = stored.clone();
+        if missing {
+            // This trajectory's identity has no published pages in the pool.
+            request.trajectory.id += 1;
+        }
+        let mut events = serving.handle.submit(request.clone()).unwrap();
+        let resumed = until_terminal(&mut events);
+        let steps: Vec<_> = resumed
+            .iter()
+            .filter_map(|event| match event {
+                Event::ImageStep { image_id: 1, step } => Some(u32::from(*step)),
+                _ => None,
+            })
+            .collect();
+        let first = if missing {
+            1
+        } else {
+            stored.denoised_steps + 1
+        };
+        assert_eq!(steps, (first..=STEPS).collect::<Vec<_>>());
+        assert_eq!(
+            resumed
+                .iter()
+                .filter(|event| matches!(event, Event::ImageDone { image_id: 1, .. }))
+                .count(),
+            1
+        );
+        assert!(
+            matches!(resumed.last(), Some(Event::Finished { images: 1, .. })),
+            "{resumed:?}"
+        );
+    }
+    serving.stop();
 }
 
 /// What the workers were asked of a request's admissions, each in order of

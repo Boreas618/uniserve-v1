@@ -251,15 +251,20 @@ impl Scheduler {
                 })
             }
             Phase::LatentPreparation => {
+                // The image a migrated request had begun opens at its stored
+                // step once its pages are pinned (`Scheduler::image_restore`).
+                let restore = self.image_restore(id)?;
                 let conditioning = self.cache_conditioning(id)?;
                 self.plan_call(id, |scheduler, request| {
-                    generation::plan_diffusion_prepare(
+                    let mut call = generation::plan_diffusion_prepare(
                         &scheduler.generation_limits,
                         scheduler.latent_dtype,
                         request,
                         image_id,
                         conditioning,
-                    )
+                    )?;
+                    call.latent_restore = restore;
+                    Ok(call)
                 })
             }
             Phase::Denoising => {
