@@ -19,6 +19,10 @@ the same request alone, with the same usage.
   deployment runs on one GPU, as two schedulers sharing their experts
   (``--data-parallel-size 2`` with expert parallelism), or as attention and
   expert workers exchanging through DeepEP.
+- A change of the executable alone, whose functions and formats stay the
+  same, invalidates nothing: after the commit the successor maps every
+  retained weight, a cached prompt finds as many tokens cached as before
+  the change, and the Storage Server shoots down no writer.
 - An operator's rollback resumes the previous world, parked or started
   again on the weights it kept (``update_config.previous_world``); the
   stream continues on it, and the configuration is marked unavailable:
@@ -30,7 +34,9 @@ the same request alone, with the same usage.
   API reaches, the one on trial, so the production code has no test path.
   No request is lost or repeated: the stream continues on the previous
   world, which reads its KV cache as it left it and answers a cached prompt
-  as before.
+  as before. A previous world kept in host storage, after a successor that
+  loaded other model files, returns its weights to the GPU and serves the
+  stream on.
 
 - A change of the parallel configuration on four GPUs (two replicas of
   tensor parallelism 2 becoming four expert-parallel schedulers, and two
@@ -127,13 +133,19 @@ import os
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import globaltimer
 
 CONTROL = {}
 
 
 @triton.jit
-def _gate(spin, offset, scale, out):
+def _gate(spin, delay, offset, scale, out):
     while tl.load(spin, volatile=True) != 0:
+        pass
+    # Every forward takes `delay` nanoseconds longer.
+    wait = tl.load(delay, volatile=True)
+    start = globaltimer()
+    while globaltimer() - start < wait:
         pass
     tl.store(out, tl.load(scale + tl.load(offset)))
 
@@ -144,12 +156,14 @@ def register(registry):
     registry.hook("fault_stall", stall)
     registry.hook("fault_illegal_access", illegal_access)
     registry.hook("fault_non_finite", non_finite)
+    registry.hook("fault_slow", slow)
 
 
 def arm(models, device):
     cuda = torch.device("cuda", device)
     CONTROL.update(
         spin=torch.zeros(1, dtype=torch.int32, device=cuda),
+        delay=torch.zeros(1, dtype=torch.int64, device=cuda),
         offset=torch.zeros(1, dtype=torch.int64, device=cuda),
         scale=torch.ones(1, dtype=torch.float32, device=cuda),
         out=torch.ones(1, dtype=torch.float32, device=cuda),
@@ -164,8 +178,8 @@ def arm(models, device):
 def _gated(module, args, output):
     if not (isinstance(output, torch.Tensor) and output.is_floating_point()):
         return output
-    words = (CONTROL[key] for key in ("spin", "offset", "scale", "out"))
-    _gate[(1,)](*words)
+    words = ("spin", "delay", "offset", "scale", "out")
+    _gate[(1,)](*(CONTROL[word] for word in words))
     return output * CONTROL["out"].to(output.dtype)
 
 
@@ -191,6 +205,12 @@ def illegal_access(payload, models):
 
 def non_finite(payload, models):
     return _set("scale", float("nan"))
+
+
+def slow(payload, models):
+    # 50 ms more for every forward: several times a decode step.
+    return _set("delay", 50_000_000)
+
 """
 
 
@@ -840,6 +860,34 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
     assert streaming.usage == reference_usage
 
 
+def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
+    name = "qwen3-same-keys"
+    with _serve(tmp_path, name) as (base_url, _):
+        # The prompt's pages are computed once and then found cached.
+        answer = _chat(base_url, name, CACHED_PROMPT)
+        cached_answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
+        assert cached_answer == answer and hits > 0, (cached_answer, hits)
+
+        # A world capturing other batch sizes computes the same functions in
+        # the same formats: it maps every retained weight and keeps every
+        # page key.
+        report = _world_change(base_url, CHANGE)
+        assert (report["numerics"], report["weights"]) == (
+            "unchanged",
+            "mapped",
+        ), report
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+
+        # The committed world finds as many of the prompt's tokens cached,
+        # and answers it as before.
+        assert _hits_of(base_url, name, CACHED_PROMPT) == (answer, hits)
+
+    # No writer of the deployment's storage was ended to pass its access on.
+    storage_log = (tmp_path / "storage-server.log").read_text()
+    assert "shooting down a previous writer" not in storage_log
+
+
 @pytest.mark.parametrize("previous_world", ["parked", "weights"])
 def test_an_operator_rollback_resumes_the_previous_world(
     tmp_path: Path, previous_world: str
@@ -1464,23 +1512,7 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
     tmp_path: Path, fault: str, previous_world: str
 ):
     name = "qwen3-world-fault"
-    plugins = tmp_path / "plugins"
-    package = plugins / "uniserve_fault_plugin"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text(FAULT_PLUGIN)
-    metadata = plugins / "uniserve_fault_plugin-1.0.dist-info"
-    metadata.mkdir()
-    (metadata / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: uniserve-fault-plugin\nVersion: 1.0\n"
-    )
-    (metadata / "entry_points.txt").write_text(
-        "[uniserve.plugins]\nfaults = uniserve_fault_plugin:register\n"
-    )
-    environment = {
-        "PYTHONPATH": os.pathsep.join(
-            [str(plugins), *filter(None, [os.environ.get("PYTHONPATH")])]
-        )
-    }
+    environment = _plugin(tmp_path / "plugins", "fault", FAULT_PLUGIN)
     with _serve(tmp_path, name, env=environment) as (base_url, log):
         cached = _chat(base_url, name, CACHED_PROMPT)
         (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
@@ -1494,45 +1526,19 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
             f"update_config.previous_world={previous_world}",
             *FAULTS[fault],
         )
-        world = report["world"]
-        # The successor generates before the fault.
-        streaming.wait_for(len(streaming.tokens) + 16)
-
-        if fault == "engine_exit":
-            (engine,) = _pids(log, "Engine") - engines_before
-            os.kill(engine, signal.SIGKILL)
-        else:
-            armed = _admin(base_url, f"hooks/fault_{fault}")
-            if fault != "worker_exit":
-                assert armed.status_code == 200, armed.text
-        streaming.mark()
-
-        def rolled_back() -> bool:
-            last = _config(base_url)["last"] or {}
-            return last.get("rolled_back") == world
-
-        _wait_until(rolled_back, 600, "the world on trial was not rolled back")
-        status = _config(base_url)
+        status = _fault_rolls_back(
+            base_url, log, streaming, engines_before, fault, report
+        )
         print(
             f"{fault} on trial, {previous_world}: promotion pause "
             f"{report['pause_seconds']:.3f} s, rollback pause "
             f"{status['last']['pause_seconds']:.3f} s; "
             f"{status['last']['reason']}"
         )
-        assert status["trial"] is None, status
         assert status["slots"][0] == {
             "world": serving["world"],
             "state": "executing",
         }, status
-        (unavailable,) = status["unavailable"]
-        assert unavailable["world"] == world, unavailable
-        # The configuration is marked with the fault's first error.
-        cause = {
-            "non_finite": "non-finite logits",
-            "illegal_access": "illegal memory access",
-            "stall": "stalled",
-        }.get(fault, f"world {world}")
-        assert cause in unavailable["reason"], unavailable
 
         # No request is lost or repeated, and the previous world reads its
         # KV cache as it left it.
@@ -1555,6 +1561,179 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
     lines = _log_lines(log)
     assert any("rolling back" in line for line in lines)
     assert any("the previous world serves again" in line for line in lines)
+
+
+def _fault_rolls_back(
+    base_url: str,
+    log: Path,
+    streaming: Streaming,
+    engines_before: set[int],
+    fault: str,
+    report: dict,
+) -> dict:
+    """Arms `fault` in the world on trial `report` promoted, once it
+    generated for `streaming`, and waits for the deployment to roll it back
+    by itself. Returns the deployment's status then: no trial, and the
+    configuration unavailable with the fault's first error.
+    """  # noqa: D205
+    world = report["world"]
+    # The successor generates before the fault.
+    streaming.wait_for(len(streaming.tokens) + 16)
+
+    if fault == "engine_exit":
+        (engine,) = _pids(log, "Engine") - engines_before
+        os.kill(engine, signal.SIGKILL)
+    else:
+        armed = _admin(base_url, f"hooks/fault_{fault}")
+        if fault != "worker_exit":
+            assert armed.status_code == 200, armed.text
+    streaming.mark()
+
+    def rolled_back() -> bool:
+        last = _config(base_url)["last"] or {}
+        return last.get("rolled_back") == world
+
+    _wait_until(rolled_back, 600, "the world on trial was not rolled back")
+    status = _config(base_url)
+    assert status["trial"] is None, status
+    (unavailable,) = status["unavailable"]
+    assert unavailable["world"] == world, unavailable
+    # The configuration is marked with the fault's first error.
+    cause = {
+        "non_finite": "non-finite logits",
+        "illegal_access": "illegal memory access",
+        "stall": "stalled",
+    }.get(fault, f"world {world}")
+    assert cause in unavailable["reason"], unavailable
+    return status
+
+
+@pytest.mark.parametrize("fault", list(FAULTS))
+def test_a_fault_rolls_back_to_the_weights_kept_in_host_storage(
+    tmp_path: Path, fault: str
+):
+    """A successor loading other model files moves the previous world's
+    weights, which it does not map, into host storage
+    (``update_config.previous_world=host``). A fault of the successor rolls
+    the deployment back by itself: the weights return to the GPU, the stream
+    continues on the previous world, and it answers a cached prompt as
+    before.
+    """  # noqa: D205
+    name = "qwen3-host-fault"
+    environment = _plugin(tmp_path / "plugins", "fault", FAULT_PLUGIN)
+    with _serve(tmp_path, name, options=WEIGHTS_SHARE, env=environment) as (
+        base_url,
+        log,
+    ):
+        original = _chat(base_url, name, CACHED_PROMPT)
+        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        previous = serving["world"]
+        engines_before = _pids(log, "Engine")
+
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        report = _world_change(
+            base_url,
+            f"model={_updated_checkpoint()}",
+            "update_config.previous_world=host",
+            *FAULTS[fault],
+        )
+        assert report["previous_world_kept"] == "host", report
+        assert report["moved_to_host_bytes"] > 0, report
+        status = _fault_rolls_back(
+            base_url, log, streaming, engines_before, fault, report
+        )
+        print(
+            f"{fault} on trial, host: promotion pause "
+            f"{report['pause_seconds']:.3f} s, rollback pause "
+            f"{status['last']['pause_seconds']:.3f} s; "
+            f"{status['last']['reason']}"
+        )
+        assert status["slots"][0] == {
+            "world": previous,
+            "state": "executing",
+        }, status
+
+        # The stream goes on, on the previous world, whose weights alone are
+        # on the GPU again and which answers as it did.
+        streaming.join()
+        assert len(streaming.tokens) > streaming.marked
+        assert _weights_of(base_url) == {(previous,)}
+        assert _chat(base_url, name, CACHED_PROMPT) == original
+
+
+# The rollback thresholds of each regression the world on trial shows, and
+# what the rollback's reason names. Step time and throughput are averaged
+# over a window before the promotion and during the trial.
+REGRESSIONS = {
+    "step_time": (
+        (
+            "update_config.rollback.step_time_regression=0.5",
+            'update_config.rollback.window="10s"',
+        ),
+        "steps take",
+    ),
+    "throughput": (
+        (
+            "update_config.rollback.throughput_regression=0.3",
+            'update_config.rollback.window="10s"',
+        ),
+        "tokens/s",
+    ),
+}
+REGRESSION_WINDOW = 10
+
+
+@pytest.mark.parametrize("regression", list(REGRESSIONS))
+def test_a_regression_of_the_world_on_trial_rolls_it_back(
+    tmp_path: Path, regression: str
+):
+    """The deployment rolls a world on trial back by itself once its steps
+    take longer, or its throughput falls further, over the window than the
+    configured regression admits (``update_config.rollback``) against the
+    previous world's before the promotion. The previous world serves on, and
+    a stream continues on it unchanged.
+    """  # noqa: D205
+    thresholds, cause = REGRESSIONS[regression]
+    name = "qwen3-world-regression"
+    environment = _plugin(tmp_path / "plugins", "fault", FAULT_PLUGIN)
+    with _serve(tmp_path, name, env=environment) as (base_url, _log):
+        cached = _chat(base_url, name, CACHED_PROMPT)
+        (serving,) = [slot for slot in _config(base_url)["slots"] if slot]
+        # The stream steps the previous world over the window before the
+        # promotion, and the world on trial during it.
+        streaming = Streaming(base_url, name)
+        streaming.wait_for(EARLY_TOKENS)
+        time.sleep(REGRESSION_WINDOW)
+        report = _world_change(base_url, CHANGE, *thresholds)
+        world = report["world"]
+        streaming.wait_for(len(streaming.tokens) + 16)
+        armed = _admin(base_url, "hooks/fault_slow")
+        assert armed.status_code == 200, armed.text
+        streaming.mark()
+
+        def rolled_back() -> bool:
+            last = _config(base_url)["last"] or {}
+            return last.get("rolled_back") == world
+
+        _wait_until(rolled_back, 600, "the world on trial was not rolled back")
+        status = _config(base_url)
+        print(f"{regression}: {status['last']['reason']}")
+        assert status["trial"] is None, status
+        assert status["slots"][0] == {
+            "world": serving["world"],
+            "state": "executing",
+        }, status
+        assert cause in status["last"]["reason"], status["last"]
+        (unavailable,) = status["unavailable"]
+        assert unavailable["world"] == world, unavailable
+
+        streaming.join()
+        assert len(streaming.tokens) > streaming.marked
+        reference, reference_usage = _ask(base_url, name)
+        assert streaming.tokens == reference
+        assert streaming.usage == reference_usage
+        assert _chat(base_url, name, CACHED_PROMPT) == cached
 
 
 # The plugin that digests every weight field a world's workers hold on
