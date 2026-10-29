@@ -1915,7 +1915,16 @@ impl Replica {
             index
         };
         let mut evicted: Option<serde_json::Value> = None;
+        // The pause's parts after the park, each measured where it ends:
+        // the parked world's pending prefills and the eviction of its cache
+        // segments, the successor's loading of the copies staged in host
+        // storage (both only when the warm copies were staged there), and
+        // the successor's promotion.
+        let mut evicting = Duration::ZERO;
+        let mut materializing = Duration::ZERO;
+        let mut promoting = Duration::ZERO;
         let promotion: anyhow::Result<()> = async {
+            let step = Instant::now();
             warming::resume_prefill(std::slice::from_ref(running))
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -1927,11 +1936,18 @@ impl Replica {
                 evicted = results
                     .iter()
                     .find_map(|result| serde_json::from_str(result).ok());
+                evicting = step.elapsed();
+                let step = Instant::now();
                 warming::materialize(&successor)
                     .await
                     .map_err(anyhow::Error::msg)?;
+                materializing = step.elapsed();
+            } else {
+                evicting = step.elapsed();
             }
+            let step = Instant::now();
             successor.promote(index, recompute, grows).await?;
+            promoting = step.elapsed();
             Ok(())
         }
         .await;
@@ -1961,6 +1977,9 @@ impl Replica {
             previous_world,
             pause_ms = pause.as_millis() as u64,
             park_ms = parked.as_millis() as u64,
+            evict_ms = evicting.as_millis() as u64,
+            materialize_ms = materializing.as_millis() as u64,
+            promote_ms = promoting.as_millis() as u64,
             "the successor world serves on trial"
         );
         crate::leader::reload_adapters(self, &successor).await;
@@ -2085,6 +2104,9 @@ impl Replica {
             "transfer_halvings": throttled.halvings,
             "transfer_restorations": throttled.restorations,
             "park_seconds": parked.as_secs_f64(),
+            "evict_seconds": evicting.as_secs_f64(),
+            "materialize_seconds": materializing.as_secs_f64(),
+            "promote_seconds": promoting.as_secs_f64(),
             "pause_seconds": pause.as_secs_f64(),
             "previous_world_kept": mode,
             "host_refused": host_refused,
