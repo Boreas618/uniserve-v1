@@ -1455,7 +1455,9 @@ class TextRunner:
                         rows, top = metadata.logprob_bucket
                         rows = len(metadata.logprob_tasks)
                         if captured:
-                            rows = task_bucket(rows, self.dims.tokens)
+                            # The buckets startup captured, up to the
+                            # candidate rows a verification projects.
+                            rows = task_bucket(rows, self.dims.logit_rows())
                         key = VerifiedKey(rows, top)
                         self._alone(key, self._verified_call(key, width))
                 else:

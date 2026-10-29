@@ -81,7 +81,8 @@ class DraftKey:
 @dataclass(frozen=True, slots=True)
 class VerifiedKey:
     """``score_verified`` of a bucket of a verification's reported rows and
-    a top width.
+    a top width. Reported rows are candidate rows, so a bucket holds at
+    most ``Dimensions.logit_rows`` of them.
     """  # noqa: D205
 
     rows: int

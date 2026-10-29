@@ -103,6 +103,11 @@ COUNT_PROMPT = (
 COUNT_TOKENS = 1200
 EARLY_TOKENS = 320
 CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
+# The share of the GPU a deployment whose world changes on one GPU serves
+# with: the successor's process, its graph share and its head segment fit
+# beside the serving world's weights, process, graphs and the KV cache it
+# keeps.
+SUCCESSOR_SHARE = "mem_fraction_static=0.9"
 # The draft tokens a speculating deployment verifies per request and step.
 DRAFTS = "speculative_config.num_draft_tokens=3"
 # The prompts and length of the comparison with and without speculation.
@@ -520,7 +525,7 @@ def test_a_world_change_resumes_a_request_from_its_checkpoint(
     tmp_path: Path,
 ):
     name = "qwen3_5-world-change"
-    with _serve(tmp_path, name) as (base_url, log):
+    with _serve(tmp_path, name, (SUCCESSOR_SHARE,)) as (base_url, log):
         streaming = _Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         hits = _prefix_hits(base_url)
@@ -608,7 +613,7 @@ def test_a_world_change_turns_speculation_on_for_a_streaming_request(
     with its logprobs.
     """  # noqa: D205
     name = "qwen3_5-speculation-change"
-    with _serve(tmp_path, name) as (base_url, log):
+    with _serve(tmp_path, name, (SUCCESSOR_SHARE,)) as (base_url, log):
         alone = _generate(base_url, name, COUNT_PROMPT, COUNT_TOKENS)
         streaming = _Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
