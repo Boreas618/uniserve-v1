@@ -12,12 +12,14 @@
 //! - `watch`: follows each node's event log until interrupted (attach and
 //!   detach).
 //! - `config`: each node's configuration, worlds and trial.
-//! - `apply`: changes each node's configuration (`PUT /admin/config`), one
-//!   node after another, stopping at the first that fails: an idle node
-//!   (`uniserve serve` without a model) brings the deployment up, a serving
-//!   one changes it in place or in a new world on trial, which
-//!   `--commit-after` commits once it served that long and before the next
-//!   node changes, so that every other node serves meanwhile.
+//! - `apply`: changes each node's configuration (`PUT /admin/config`): an
+//!   idle node (`uniserve serve` without a model) brings the deployment
+//!   up, a serving one changes it in place or in a new world on trial,
+//!   which `--commit-after` commits once it served that long. Each node is
+//!   one service's leader: the manager decides the order of their updates
+//!   from the GPUs and hosts they share and the storage their plans
+//!   require ([`updates`]), so that two services that share a GPU never
+//!   prepare at once.
 //! - `commit`, `rollback`: end each node's trial.
 //! - `shutdown`: brings each node's deployment down, releasing its storage
 //!   unless `--keep-storage`.
@@ -32,6 +34,8 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
+
+mod updates;
 
 /// The manager's command line.
 #[derive(Debug, Parser)]
@@ -63,9 +67,10 @@ enum Command {
     },
     /// Each node's configuration, worlds and trial.
     Config,
-    /// Change each node's configuration in turn, stopping at the first that
-    /// fails: an idle node brings the deployment up, a serving one changes
-    /// it in place or in a new world on trial.
+    /// Change each node's configuration: an idle node brings the
+    /// deployment up, a serving one changes it in place or in a new world
+    /// on trial. Nodes whose services share a GPU update one after another,
+    /// each once its plan fits; a failure stops the nodes not started.
     Apply {
         /// The whole TOML configuration, as `uniserve serve --config` reads
         /// it; each node's current one when unset.
@@ -78,16 +83,18 @@ enum Command {
         /// they reached (`keep`) or compute it again (`recompute`).
         #[arg(long, default_value = "keep")]
         in_flight: String,
-        /// Report each node's plan and change nothing.
+        /// Report each node's plan and the order the manager decides, and
+        /// change nothing.
         #[arg(long)]
         dry_run: bool,
         /// Apply a configuration a rollback marked unavailable.
         #[arg(long)]
         force: bool,
         /// Commit a node's new world once it served on trial this many
-        /// seconds, before the next node changes; a node whose trial rolled
-        /// back meanwhile stops the roll. Without it, the first node that
-        /// changes world stays on trial and the roll stops there.
+        /// seconds, before a node that shares a GPU with it changes; a
+        /// trial that rolled back meanwhile stops the nodes not started.
+        /// Without it, each new world stays on trial for the operator, and
+        /// the nodes that share its GPUs wait.
         #[arg(long)]
         commit_after: Option<u64>,
     },
@@ -119,6 +126,7 @@ enum Command {
 }
 
 /// One node's admin API.
+#[derive(Clone)]
 struct Node {
     base: String,
     http: reqwest::Client,
@@ -243,61 +251,22 @@ async fn main() -> Result<()> {
                 ),
                 None => None,
             };
-            let body = json!({
-                "config": config,
-                "set": set,
-                "in_flight": in_flight,
-                "dry_run": dry_run,
-                "force": force,
-                "wait": true,
-            });
-            for node in &nodes {
-                println!("{}: applying", node.base);
-                let answer = node.put("/admin/config", &body).await.with_context(|| {
-                    format!("{} did not change; later nodes are untouched", node.base)
-                })?;
-                let result = &answer["result"];
-                println!("{}: {}", node.base, result);
-                if result["change"] != json!("world") {
-                    continue;
-                }
-                let Some(seconds) = commit_after else {
-                    println!(
-                        "{}: on trial; commit it (`commit`) or roll it back before the next node \
-                         changes",
-                        node.base
-                    );
-                    return Ok(());
-                };
-                let mut trial = result["world"].clone();
-                loop {
-                    tokio::time::sleep(Duration::from_secs(seconds)).await;
-                    let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-                    let worlds = if trial["worlds"].is_array() {
-                        "worlds"
-                    } else {
-                        "world"
-                    };
-                    if status["trial"].is_null() || status["trial"][worlds] != trial[worlds] {
-                        bail!(
-                            "{}: the trial ended before commit ({}); later nodes are untouched",
-                            node.base,
-                            status["last"]
-                        );
-                    }
-                    let committed = node.post("/admin/config/commit", &json!({})).await?;
-                    let result = &committed["result"];
-                    println!("{}: committed {result}", node.base);
-                    if let Some(error) = result.get("rollout_error") {
-                        bail!("{}: {error}; later nodes are untouched", node.base);
-                    }
-                    let Some(next) = result.get("next_trial") else {
-                        break;
-                    };
-                    trial = next.clone();
-                }
+            let options = updates::Options {
+                body: json!({
+                    "config": config,
+                    "set": set,
+                    "in_flight": in_flight,
+                    "force": force,
+                    "wait": true,
+                }),
+                commit_after: commit_after.map(Duration::from_secs),
+                poll: Duration::from_secs(1),
+            };
+            if dry_run {
+                updates::plan(&nodes, &options).await
+            } else {
+                updates::apply(&nodes, &options).await
             }
-            Ok(())
         }
         Command::Commit => {
             for node in &nodes {

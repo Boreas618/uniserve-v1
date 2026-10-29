@@ -20,5 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
+[dev-dependencies]
+# Simulated daemons' admin APIs, which the update ordering is tested against.
+axum.workspace = true
+
 [lints]
 workspace = true
