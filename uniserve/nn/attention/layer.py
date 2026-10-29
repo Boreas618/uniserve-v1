@@ -46,6 +46,13 @@ class Attention(nn.Module):
     """
 
     function = "nn.attention.layer.Attention/1"
+    function_parameters = (
+        "num_heads",
+        "num_kv_heads",
+        "head_dim",
+        "scale",
+        "window",
+    )
 
     # Recorded by parallelize_ once the layer is bound to its partition.
     _parallel_mesh: DeviceMesh

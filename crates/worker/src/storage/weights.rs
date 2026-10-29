@@ -107,6 +107,43 @@ pub(crate) struct Fingerprints {
     /// What determines the weights' values, regardless of the layouts their
     /// bytes take: it keys what forwards compute from them.
     pub values: String,
+    /// Each cache layer's upstream computation and checkpoint inputs,
+    /// described before parallel binding removes nonresident modules.
+    pub cache: BTreeMap<String, String>,
+}
+
+impl Fingerprints {
+    /// Upstream component keys for each physical group of cache layers.
+    /// Grouping combines only resident layers; host page layouts add their
+    /// head regions, encoding and page dimensions separately.
+    pub(crate) fn cache_groups(&self, plan: &crate::storage::CachePlan) -> Result<Vec<String>> {
+        cache_groups(&self.cache, plan)
+    }
+}
+
+pub(crate) fn cache_groups(
+    cache: &BTreeMap<String, String>,
+    plan: &crate::storage::CachePlan,
+) -> Result<Vec<String>> {
+    plan.groups
+        .iter()
+        .map(|group| {
+            let mut identities = group
+                .layers
+                .iter()
+                .map(|layer| {
+                    let identity = cache.get(layer).ok_or_else(|| {
+                        Error::Interface(format!(
+                            "cache layer {layer} declares no upstream identity"
+                        ))
+                    })?;
+                    Ok(format!("{layer}:{identity}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            identities.sort();
+            Ok(identities.join("|"))
+        })
+        .collect()
 }
 
 impl Fingerprints {

@@ -391,6 +391,13 @@ def identity(loaded: Loaded) -> str:
     return numerics.identity(loaded.root)
 
 
+def cache_identity(loaded: Loaded) -> str:
+    """Cache-component identities of a model without checkpoint weights."""
+    return json.dumps(
+        numerics.cache_identities(loaded.description.model), sort_keys=True
+    )
+
+
 def fingerprint(
     description: Description,
     modules: Sequence[str],

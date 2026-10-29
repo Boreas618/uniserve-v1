@@ -1585,21 +1585,21 @@ struct TailPage {
 }
 
 /// The namespace a request's prefix pages are hashed in: its isolation key
-/// (`CachePolicy::isolation_key`), and the seed of the world whose state it
-/// continues with (`CachePolicy::state_seed`) in place of the pool's own.
+/// (`CachePolicy::isolation_key`), and the seeds of the world whose state it
+/// continues with (`CachePolicy::state_seeds`) in place of the pool's own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PrefixScope {
+pub(crate) struct PrefixScope<'a> {
     pub(crate) isolation_key: Option<u64>,
-    pub(crate) state_seed: Option<u64>,
+    pub(crate) state_seeds: &'a [u64],
     pub(crate) resume: Option<proto::request::CacheResume>,
 }
 
-impl PrefixScope {
+impl<'a> PrefixScope<'a> {
     /// The scope `cache` states.
-    pub(crate) fn of(cache: &proto::request::CachePolicy) -> Self {
+    pub(crate) fn of(cache: &'a proto::request::CachePolicy) -> Self {
         Self {
             isolation_key: cache.isolation_key,
-            state_seed: cache.state_seed,
+            state_seeds: &cache.state_seeds,
             resume: cache.resume,
         }
     }
@@ -1628,9 +1628,8 @@ pub(crate) fn prefix_seed(identity: &str) -> u64 {
 pub(crate) struct PrefixCacheCoordinator {
     groups: Vec<GroupShape>,
     prefix_enabled: bool,
-    /// Root of every hash chain: the seed of what the pool's workers compute
-    /// (`prefix_seed`); an isolation key is mixed into it.
-    hash_seed: u64,
+    /// Root of each group's hash chain; an isolation key is mixed into it.
+    hash_seeds: Vec<u64>,
 }
 
 impl PrefixCacheCoordinator {
@@ -1638,20 +1637,34 @@ impl PrefixCacheCoordinator {
     /// enabled and a zero chain seed.
     pub(crate) fn new(groups: Vec<GroupShape>) -> Self {
         Self {
+            hash_seeds: vec![0; groups.len()],
             groups,
             prefix_enabled: true,
-            hash_seed: 0,
         }
     }
 
-    /// Roots the hash chains of the pages hashed from now on at `seed`, the
-    /// seed of what the pool's workers compute (`prefix_seed`).
-    pub(crate) fn set_seed(&mut self, seed: u64) {
-        self.hash_seed = seed;
+    /// Root subsequent page hashes at each group's upstream computation.
+    pub(crate) fn set_seeds(&mut self, seeds: Vec<u64>) {
+        assert_eq!(seeds.len(), self.groups.len());
+        self.hash_seeds = seeds;
     }
 
-    pub(crate) fn seed(&self) -> u64 {
-        self.hash_seed
+    pub(crate) fn seeds(&self) -> &[u64] {
+        &self.hash_seeds
+    }
+
+    fn group_seed(&self, group: usize, scope: PrefixScope<'_>) -> u64 {
+        // A predecessor without speculation has no draft group. Its
+        // required state retains its roots; new optional draft state starts
+        // under the serving computation's own key when refilled.
+        let root = scope
+            .state_seeds
+            .get(group)
+            .copied()
+            .unwrap_or(self.hash_seeds[group]);
+        scope
+            .isolation_key
+            .map_or(root, |key| root ^ key.rotate_left(17))
     }
 
     /// Returns the cache groups in table order.
@@ -2093,11 +2106,8 @@ impl PrefixCacheCoordinator {
         tokens: CachedTokens<'_>,
         scope: PrefixScope,
     ) {
-        let root = scope.state_seed.unwrap_or(self.hash_seed);
-        let seed = scope
-            .isolation_key
-            .map_or(root, |key| root ^ key.rotate_left(17));
         for (group, (shape, chain)) in self.groups.iter().zip(hashes.iter_mut()).enumerate() {
+            let seed = self.group_seed(group, scope);
             // A draft cache page's key covers the token after it.
             let key = shape.key_tokens();
             let complete = (tokens.len() + shape.block_size).saturating_sub(key) / shape.block_size;
@@ -2202,10 +2212,6 @@ impl PrefixCacheCoordinator {
         // Complete pages remain shared. Beyond their common boundary, all
         // required groups must supply the same token extent; recurrent state
         // still ends only at an actual checkpoint boundary.
-        let root = scope.state_seed.unwrap_or(self.hash_seed);
-        let seed = scope
-            .isolation_key
-            .map_or(root, |key| root ^ key.rotate_left(17));
         let upper = prompt.len().saturating_sub(1).min(tokens + step - 1);
         for end in (tokens + 1..=upper).rev() {
             let mut tails = vec![None; self.groups.len()];
@@ -2224,7 +2230,9 @@ impl PrefixCacheCoordinator {
                 if rest == 0 {
                     return true;
                 }
-                let parent = full.checked_sub(1).map_or(seed, |page| hashes[group][page]);
+                let parent = full
+                    .checked_sub(1)
+                    .map_or_else(|| self.group_seed(group, scope), |page| hashes[group][page]);
                 let span = &prompt[full * shape.block_size..end];
                 let hash = block_hash(parent, group as u32, TEXT_MODALITY_TAG, span);
                 let Some((head, cached)) = pool.lookup(hash, group as u32, span, source, resume)
@@ -2537,11 +2545,8 @@ impl PrefixCacheCoordinator {
         let computed = computed.min(tokens.len());
         let mut hashes = vec![Vec::new(); self.groups.len()];
         self.extend_hashes(&mut hashes, tokens, scope);
-        let root = scope.state_seed.unwrap_or(self.hash_seed);
-        let seed = scope
-            .isolation_key
-            .map_or(root, |key| root ^ key.rotate_left(17));
         for (group, table) in allocation.tables.iter().enumerate() {
+            let seed = self.group_seed(group, scope);
             let shape = table.shape;
             // Request-slot checkpoints and speculative draft state have
             // their own completed-boundary rules, unchanged here.
@@ -3180,7 +3185,7 @@ mod tests {
             &prompt,
             PrefixScope {
                 isolation_key: Some(7),
-                state_seed: None,
+                state_seeds: &[],
                 resume: None,
             },
         );
@@ -3189,7 +3194,7 @@ mod tests {
             CachedTokens::new(&prompt, &generated),
             PrefixScope {
                 isolation_key: Some(7),
-                state_seed: None,
+                state_seeds: &[],
                 resume: None,
             },
         );
@@ -3199,7 +3204,7 @@ mod tests {
                 &migrated,
                 PrefixScope {
                     isolation_key: Some(7),
-                    state_seed: None,
+                    state_seeds: &[],
                     resume: None,
                 }
             )
@@ -3214,7 +3219,7 @@ mod tests {
                 &migrated,
                 PrefixScope {
                     isolation_key: Some(8),
-                    state_seed: None,
+                    state_seeds: &[],
                     resume: None,
                 }
             )
@@ -3825,18 +3830,32 @@ mod tests {
         let pool = BlockPool::new(64, 0);
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
-        let mut previous = PrefixCacheCoordinator::new(vec![full(4, 1)]);
-        previous.set_seed(prefix_seed("previous"));
+        let groups = vec![
+            full(4, 1),
+            GroupShape {
+                draft: true,
+                ..full(4, 1)
+            },
+        ];
+        let mut previous = PrefixCacheCoordinator::new(groups.clone());
+        previous.set_seeds(vec![prefix_seed("previous"), prefix_seed("draft")]);
         drop(publish(&previous, &pool, &prompt, &source));
 
-        let mut serving = PrefixCacheCoordinator::new(vec![full(4, 1)]);
-        serving.set_seed(prefix_seed("serving"));
+        let mut serving = PrefixCacheCoordinator::new(groups);
+        serving.set_seeds(vec![prefix_seed("previous"), prefix_seed("revised-draft")]);
+        assert_eq!(
+            serving
+                .probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source)
+                .cached_tokens,
+            8
+        );
+        serving.set_seeds(vec![prefix_seed("serving"), prefix_seed("revised-draft")]);
         let own =
             serving.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
         assert_eq!(own.cached_tokens, 0);
         let kept = PrefixScope {
             isolation_key: None,
-            state_seed: Some(prefix_seed("previous")),
+            state_seeds: &[prefix_seed("previous")],
             resume: None,
         };
         let continued = serving.probe_prefix(&pool, &prompt, true, false, kept, &source);

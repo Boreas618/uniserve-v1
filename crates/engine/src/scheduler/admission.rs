@@ -1402,7 +1402,7 @@ impl Scheduler {
                 if let Some(kv_offload) = self.kv_offload.as_mut()
                     && let Some(step) = kv_offload.step(&target.0)
                     && head.req.cache.read
-                    && head.req.cache.state_seed.is_none()
+                    && head.req.cache.state_seeds.is_empty()
                     && !head.has_context_images()
                 {
                     // Reusable pages leave one prompt token to compute, as
@@ -1765,7 +1765,8 @@ fn acquire_cached_prefix(
     let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images() || state.rebuilds_images();
     let cache_read = state.req.cache.read;
-    let scope = PrefixScope::of(&state.req.cache);
+    let cache_policy = state.req.cache.clone();
+    let scope = PrefixScope::of(&cache_policy);
     let allocation = state
         .prefix_cache_mut()
         .ok_or("an admitted request holds its block tables")?;

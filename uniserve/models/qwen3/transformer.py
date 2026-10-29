@@ -145,6 +145,12 @@ class TransformerLayer(nn.Module):
     """Qwen pre-normalization equations with a separate residual stream."""
 
     function = "models.qwen3.transformer.TransformerLayer/1"
+    # The output projection, attention read and MLP follow the K/V write.
+    cache_dependencies = (
+        "input_norm",
+        "attention.qkv",
+        "attention.rotary",
+    )
 
     def __init__(self, config: Config, layer: int):
         super().__init__()

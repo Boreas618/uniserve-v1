@@ -1793,7 +1793,7 @@ impl Replica {
                     .context("the successor's start did not complete")?
                     .context("the successor world did not start")?,
             );
-            let changed = running.info().prefix_seed != successor.info().prefix_seed;
+            let changed = running.info().prefix_seeds != successor.info().prefix_seeds;
             let recompute = changed && in_flight == InFlight::Recompute;
             let warmed = if adds.unmapped_cache && (!recompute || adds.host_cache) {
                 self.progress("warm_cache", Some(successor.world()));
@@ -1863,7 +1863,7 @@ impl Replica {
         // in flight continue with the state they reached unless the change
         // recomputes them.
         let (before, after) = (running.info(), successor.info());
-        let pages_change = before.prefix_seed != after.prefix_seed;
+        let pages_change = before.prefix_seeds != after.prefix_seeds;
         let trajectories_change = before.latent_seed != after.latent_seed;
         let numerics_change = pages_change || trajectories_change;
         let hold = Arc::clone(self.hold());
@@ -1872,7 +1872,7 @@ impl Replica {
         if numerics_change && in_flight == InFlight::Keep {
             hold.keep(Some(Kept {
                 world: previous_world,
-                prefix_seed: pages_change.then_some(before.prefix_seed),
+                prefix_seeds: pages_change.then(|| before.prefix_seeds.clone()),
                 latent_seed: trajectories_change.then_some(before.latent_seed),
             }));
         }

@@ -228,7 +228,7 @@ fn warmup_request(
             read: false,
             write: false,
             isolation_key: None,
-            state_seed: None,
+            state_seeds: Vec::new(),
             resume: None,
         },
         include_stop_token: false,

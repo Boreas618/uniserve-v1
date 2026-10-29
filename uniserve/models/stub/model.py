@@ -235,6 +235,7 @@ class _Layer(nn.Module):
     """Preserve features while publishing zero scalar K/V at supplied indices."""  # noqa: E501
 
     function = "models.stub.model._Layer/1"
+    cache_dependencies = ("scale", "counter")
 
     def __init__(self, request_state: bool = False):
         super().__init__()

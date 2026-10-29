@@ -183,7 +183,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
             .unwrap_or(0),
         schedulers: cores.len() as u32,
         segments: Vec::new(),
-        prefix_seed: 0,
+        prefix_seeds: Vec::new(),
         capacity: None,
         latent_seed: 0,
     };

@@ -60,6 +60,7 @@ class MoTLayer(nn.Module):
     """
 
     function = "models.mot.MoTLayer/1"
+    function_parameters = ("mlp_dtype",)
 
     def __init__(
         self,

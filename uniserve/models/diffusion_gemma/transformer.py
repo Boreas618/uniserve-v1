@@ -235,6 +235,13 @@ class Layer(PhasedLayer):
     """
 
     function = "models.diffusion_gemma.transformer.Layer/1"
+    cache_dependencies = (
+        "input_norm",
+        "attention.qkv",
+        "attention.key_norm",
+        "attention.value_norm",
+        "attention.rotary",
+    )
 
     def __init__(self, config: TextConfig, index: int):
         super().__init__()

@@ -36,7 +36,7 @@ pub struct Prefix {
     pub cached: u32,
     pub isolation_key: Option<u64>,
     /// Numerical identity under which the existing pages were computed.
-    pub state_seed: u64,
+    pub state_seeds: Vec<u64>,
     pub pages: Vec<Page>,
 }
 

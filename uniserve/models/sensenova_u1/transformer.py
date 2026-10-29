@@ -37,6 +37,12 @@ class TransformerLayer(MoTLayer):
     """Compose route-specific experts around three-axis token attention."""
 
     function = "models.sensenova_u1.transformer.TransformerLayer/1"
+    cache_dependencies = (
+        "input_norms",
+        "projections",
+        "temporal_rotary",
+        "spatial_rotary",
+    )
 
     def __init__(self, config: TransformerConfig, index: int):
         hidden, dim, eps = (

@@ -25,6 +25,7 @@ class SiLUAndMul(nn.Module):
     """
 
     function = "nn.activation.SiLUAndMul/1"
+    function_parameters = ("rounding",)
 
     def __init__(self, rounding: functional.Rounding) -> None:
         super().__init__()
@@ -41,6 +42,7 @@ class GELUAndMul(nn.Module):
     """Apply GELU gating to packed channel halves or a gate/value pair."""
 
     function = "nn.activation.GELUAndMul/1"
+    function_parameters = ("approximate",)
 
     def __init__(self, approximate: Literal["none", "tanh"] = "none") -> None:
         """Select the PyTorch GELU approximation used by the gate."""

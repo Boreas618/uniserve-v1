@@ -316,8 +316,18 @@ impl Scheduler {
     fn apply_weights_keeping(&mut self, path: &str) -> Result<Vec<String>, String> {
         let payload = serde_json::json!({ "model_path": path, "keep": true }).to_string();
         let results = self.run_hook("uniserve.update_weights", &payload)?;
+        let state_seeds = self
+            .storage
+            .cache()
+            .map(|cache| cache.coordinator.seeds().to_vec())
+            .unwrap_or_default();
         let mut kept = 0;
         for state in self.running.values_mut() {
+            // Repeated updates retain the original private lineage. New
+            // requests alone begin under the newly published component keys.
+            if state.req.cache.state_seeds.is_empty() {
+                state.req.cache.state_seeds = state_seeds.clone();
+            }
             if state.req.cache.write {
                 state.req.cache.write = false;
                 kept += 1;
@@ -359,17 +369,41 @@ impl Scheduler {
     /// worker group's page key seeds they report, which the ranks of a group
     /// agree on.
     fn reseed_pages(&mut self, results: &[String]) -> Result<(), String> {
-        let identity = results.iter().find_map(|result| {
-            serde_json::from_str::<serde_json::Value>(result)
-                .ok()?
-                .get("identity")?
-                .as_str()
-                .map(str::to_owned)
-        });
-        if let (Some(identity), Some(cache)) = (identity, self.storage.cache.as_mut()) {
-            cache
-                .coordinator
-                .set_seed(crate::kv_cache::prefix_seed(&identity));
+        if let Some(cache) = self.storage.cache.as_mut() {
+            // Pipeline stages contribute different layers to the same
+            // scheduler group. Union their components just as startup does.
+            let mut groups =
+                vec![std::collections::BTreeSet::new(); cache.coordinator.groups().len()];
+            for result in results {
+                let result: serde_json::Value =
+                    serde_json::from_str(result).map_err(|error| error.to_string())?;
+                let Some(identities) = result
+                    .get("identities")
+                    .and_then(|value| value.as_array())
+                    .filter(|values| !values.is_empty())
+                else {
+                    continue;
+                };
+                if identities.len() != groups.len() {
+                    return Err("updated cache identities do not cover every group".into());
+                }
+                for (group, identity) in groups.iter_mut().zip(identities) {
+                    let identity = identity.as_str().ok_or("a cache identity is not text")?;
+                    group.extend(identity.split('|').map(str::to_owned));
+                }
+            }
+            if groups.iter().all(|group| !group.is_empty()) {
+                cache.coordinator.set_seeds(
+                    groups
+                        .into_iter()
+                        .map(|group| {
+                            crate::kv_cache::prefix_seed(
+                                &group.into_iter().collect::<Vec<_>>().join("|"),
+                            )
+                        })
+                        .collect(),
+                );
+            }
         }
         // The trajectories the new weights compute are keyed apart from the
         // old ones.
