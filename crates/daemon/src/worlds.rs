@@ -2335,22 +2335,29 @@ pub(crate) async fn rollback(
     // world: its live schedulers park, and a scheduler that failed handed
     // its requests back as it stopped. An engine whose process ended handed
     // them back as it ended (`EngineClient`).
-    if let Some(failing) = failing {
-        if failing.state() != EngineState::Closed {
-            match tokio::time::timeout(CLOSED_EXIT, failing.park()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => info!(%error, "the world on trial parked in part"),
-                Err(_) => warn!(
-                    "the world on trial did not park within {CLOSED_EXIT:?}; closing it with \
-                     the requests it holds"
-                ),
-            }
+    if let Some(failing) = &failing
+        && failing.state() != EngineState::Closed
+    {
+        match tokio::time::timeout(CLOSED_EXIT, failing.park()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => info!(%error, "the world on trial parked in part"),
+            Err(_) => warn!(
+                "the world on trial did not park within {CLOSED_EXIT:?}; closing it with the \
+                 requests it holds"
+            ),
         }
-        close(&failing).await;
     }
+    // The pause's parts, as a promotion reports its park: stopping the world
+    // on trial, resuming (or starting again) the previous world, and
+    // restoring what the trial changed of it.
+    let stopped = paused.elapsed();
+    let parked = matches!(trial.previous, Previous::Parked(_));
     let previous = match trial.previous {
         Previous::Parked(previous) => {
-            previous.resume(vec![trial.world]).await.map_err(|error| {
+            // It resumes at once: it needs nothing the world on trial holds,
+            // whose storage it retires below, once that world's processes
+            // are gone and no claim waits for them.
+            previous.resume(Vec::new()).await.map_err(|error| {
                 hold.close(format!("the previous world did not resume: {error}"));
                 anyhow::anyhow!("the previous world did not resume: {error}")
             })?;
@@ -2358,6 +2365,11 @@ pub(crate) async fn rollback(
             previous
         }
         Previous::Weights => {
+            // The previous world starts again in the storage the world on
+            // trial holds, which its close and retirement free.
+            if let Some(failing) = &failing {
+                close(failing).await;
+            }
             let control = Arc::clone(replica.control.get().ok_or(UpdateError::NoEngine)?);
             let sink = stats_sink(
                 replica.model_name.clone(),
@@ -2389,15 +2401,34 @@ pub(crate) async fn rollback(
             started
         }
     };
+    let resumed = paused.elapsed();
     warming::restore(&previous, &trial.cache_backup)
         .await
         .map_err(anyhow::Error::msg)?;
     hold.serve(Arc::clone(&previous));
+    // The pause ends as the previous world admits requests again, as a
+    // promotion's ends as its successor does; the segments the previous
+    // world gave its successor are created again while it serves.
+    let pause = paused.elapsed();
+    // A parked previous world serves while the world on trial closes: it
+    // uses no storage the world on trial could write. Once that world's
+    // processes are gone, it retires their storage and creates again the
+    // cache segments it gave them (`Restore`).
+    if parked {
+        if let Some(failing) = &failing {
+            close(failing).await;
+        }
+        if let Err(error) = previous.resume(vec![trial.world]).await {
+            warn!(
+                world = trial.world,
+                "the world on trial was not retired: {error}"
+            );
+        }
+    }
     crate::leader::reload_adapters(replica, &previous).await;
     if let Err(error) = previous.resize_cache(wire::CacheChange::Restore).await {
         warn!("the previous world's KV cache was not restored: {error}");
     }
-    let pause = paused.elapsed();
     let mut previous_spec = trial.previous_spec;
     previous_spec.stage_cache = false;
     previous_spec.cache_keys.clear();
@@ -2408,6 +2439,9 @@ pub(crate) async fn rollback(
         "world": trial.previous_world,
         "reason": reason,
         "pause_seconds": pause.as_secs_f64(),
+        "stop_seconds": stopped.as_secs_f64(),
+        "resume_seconds": (resumed - stopped).as_secs_f64(),
+        "restore_seconds": (pause - resumed).as_secs_f64(),
         "trial_seconds": trial.promoted.elapsed().as_secs_f64(),
     });
     {

@@ -1529,11 +1529,14 @@ def test_a_fault_of_the_world_on_trial_rolls_it_back(
         status = _fault_rolls_back(
             base_url, log, streaming, engines_before, fault, report
         )
+        last = status["last"]
         print(
             f"{fault} on trial, {previous_world}: promotion pause "
             f"{report['pause_seconds']:.3f} s, rollback pause "
-            f"{status['last']['pause_seconds']:.3f} s; "
-            f"{status['last']['reason']}"
+            f"{last['pause_seconds']:.3f} s (stop "
+            f"{last['stop_seconds']:.3f} s, resume "
+            f"{last['resume_seconds']:.3f} s, restore "
+            f"{last['restore_seconds']:.3f} s); {last['reason']}"
         )
         assert status["slots"][0] == {
             "world": serving["world"],
