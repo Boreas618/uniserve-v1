@@ -1430,6 +1430,16 @@ impl Server {
         for id in released {
             self.remove_tensor(&id);
         }
+        if count > 0 {
+            tracing::info!(
+                scope = %holder.scope,
+                world = holder.world,
+                generation = holder.generation,
+                pid = holder.pid,
+                released = count,
+                "a worker's retention released its scope's tensors"
+            );
+        }
         Ok(Outcome::Reply(
             Reply::Retained { released: count },
             Vec::new(),
