@@ -60,6 +60,8 @@ pub struct PrefixStats {
     pub query_tokens: AtomicU64,
     /// Cumulative prompt tokens reused from the prefix cache.
     pub hit_tokens: AtomicU64,
+    /// The part of `hit_tokens` loaded from the host KV cache.
+    pub host_hit_tokens: AtomicU64,
 }
 
 /// Encoder-output (multimodal) cache counters.

@@ -38,6 +38,9 @@ pub struct PrefixCacheStats {
     /// Embedded base cache counters.
     #[serde(flatten)]
     pub base: BaseCacheStats,
+    /// The part of `base.hits` loaded from the host KV cache, in tokens.
+    #[serde(default)]
+    pub host_hits: u64,
     /// The number of requests preempted before this stats update.
     pub preempted_requests: u64,
     /// The `queries` number for preempted requests.

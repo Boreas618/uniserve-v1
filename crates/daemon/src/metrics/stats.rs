@@ -144,6 +144,10 @@ pub(crate) fn record_scheduler_stats(
         .prefix_cache_hits
         .get_or_create(&labels)
         .inc_by(stats.prefix_cache_stats.base.hits);
+    metrics
+        .prefix_cache_host_hits
+        .get_or_create(&labels)
+        .inc_by(stats.prefix_cache_stats.host_hits);
 
     // Worker-local forward/kernel counters. The reporter sends `None` when no
     // worker counter changed in the interval, and then none of these families

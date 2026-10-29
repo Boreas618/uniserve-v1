@@ -1702,10 +1702,15 @@ impl Scheduler {
         state.cache_visible_len = state.num_computed_prompt_tokens;
         state.cache_computed_len = state.num_computed_prompt_tokens;
         state.offload_boundary = boundary;
+        let loaded = (boundary - computed) as u64;
         self.stats
             .prefix
             .hit_tokens
-            .fetch_add((boundary - computed) as u64, Ordering::Relaxed);
+            .fetch_add(loaded, Ordering::Relaxed);
+        self.stats
+            .prefix
+            .host_hit_tokens
+            .fetch_add(loaded, Ordering::Relaxed);
     }
 }
 
