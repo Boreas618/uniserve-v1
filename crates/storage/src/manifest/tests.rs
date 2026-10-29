@@ -1173,12 +1173,13 @@ fn encoded(mut field: Field, group: &str) -> Field {
     field.encoding = Encoding::Encoded {
         name: "reversed".into(),
         group: group.into(),
-        canonical: Some(Canonical {
+        canonical: Some(Box::new(Canonical {
             offset: 0,
             shape: field.shape.clone(),
             strides: field.strides.clone(),
             logical: field.logical.clone(),
-        }),
+            parameters: serde_json::Value::Null,
+        })),
     };
     field
 }
@@ -1213,6 +1214,15 @@ fn encoded_fields_move_in_canonical_form() {
     assert_eq!(manifest.decodes.len(), 1);
     assert!(manifest.mappings.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
+    // The receiver holds a complete target plus one gathered source and
+    // its canonical form, each rounded to the device's allocation unit.
+    assert_eq!(manifest.conversion_bytes(&request, 0, 4096), 3 * 4096);
+    // Source gathering and the receiver's canonical copies both consume
+    // link bandwidth; each moves the 64-by-16 matrix of four-byte values.
+    assert_eq!(
+        manifest.links.iter().map(|link| link.bytes).sum::<u64>(),
+        2 * 64 * 16 * 4
+    );
 
     // The same encoded region on another GPU moves as it is stored.
     let request = Request {

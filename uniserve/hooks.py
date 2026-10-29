@@ -23,8 +23,8 @@ import torch
 
 from uniserve import plugins
 
-# The models this worker loaded, as ``uniserve.loading.rank.load_model``
-# returned them.
+# The roots loaded by ``uniserve.loading.rank.load_model``. Module paths stay
+# consistent with configuration and retained manifests on every rank.
 _models: list[weakref.ref] = []
 
 

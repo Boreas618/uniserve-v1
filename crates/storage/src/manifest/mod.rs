@@ -458,6 +458,41 @@ impl Manifest {
         }
         bytes
     }
+
+    /// Peak conversion scratch on a receiver. Groups execute serially:
+    /// one destination canonical form, one source's gathered fields and
+    /// canonical form. Numerical conversion writes these borrowed buffers
+    /// directly, without additional device allocations.
+    pub fn conversion_bytes(&self, request: &Request, rank: u32, granularity: u64) -> u64 {
+        let mut peak = 0;
+        for copy in self.copies.iter().filter(|copy| copy.target.rank == rank) {
+            let mut bytes = 0;
+            for (side, endpoint) in [(Side::Source, copy.source), (Side::Target, copy.target)] {
+                let Space::Staging { staging } = endpoint.space else {
+                    continue;
+                };
+                let staging = &self.stagings[staging as usize];
+                let world = match side {
+                    Side::Source => &request.source,
+                    Side::Target => &request.target,
+                };
+                bytes += staging.bytes.div_ceil(granularity) * granularity;
+                if side == Side::Source {
+                    let mut stored = 0u64;
+                    for field in world.ranks[staging.rank as usize].storages.iter()
+                        .flat_map(|storage| &storage.layout.fields)
+                        .filter(|field| matches!(&field.encoding, Encoding::Encoded { group, .. } if group == &staging.group))
+                    {
+                        let extent = field.bytes();
+                        stored = stored.div_ceil(256) * 256 + extent.end - extent.start;
+                    }
+                    bytes += stored.div_ceil(granularity) * granularity;
+                }
+            }
+            peak = peak.max(bytes);
+        }
+        peak
+    }
 }
 
 /// Computes each request's manifest once.

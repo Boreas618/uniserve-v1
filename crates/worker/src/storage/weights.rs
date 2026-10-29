@@ -55,6 +55,8 @@ use cuda::{DeviceAllocation, DeviceId, Protection};
 use sha2::{Digest, Sha256};
 use tvm_ffi::Any;
 
+mod conversion;
+
 use super::allocation::{Storage, StorageView};
 use super::retained::Retained;
 

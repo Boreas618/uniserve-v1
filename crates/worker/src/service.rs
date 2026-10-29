@@ -869,7 +869,7 @@ impl Service<'_> {
                         weights.start_experts(retained)?;
                         serde_json::Value::Null
                     }
-                    "uniserve.experts_ready" => serde_json::json!(weights.experts_ready(retained)?),
+                    "uniserve.experts_ready" => serde_json::json!(weights.experts_ready()?),
                     "uniserve.commit_experts" => {
                         // The experts' storage is remapped at the addresses
                         // the graphs captured.

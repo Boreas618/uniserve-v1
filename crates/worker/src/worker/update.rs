@@ -70,9 +70,8 @@ enum ExpertCopies {
         sources: Sources,
         transfer: Box<Transfer>,
     },
-    Copying(Rebalance),
-    Preparing(std::thread::JoinHandle<Result<(Rebalance, ExpertWeights)>>),
-    Ready(Rebalance, ExpertWeights),
+    Preparing(std::thread::JoinHandle<Result<(Rebalance, Option<ExpertWeights>)>>),
+    Ready(Box<Rebalance>, Option<ExpertWeights>),
 }
 
 impl WeightUpdate {
@@ -146,7 +145,16 @@ impl WeightUpdate {
                 "the serving world's expert weights are retained",
             ))?;
         let transfer = keys.plan_rebalance(retained, &planned, &mut sources)?;
+        let device = devices
+            .first()
+            .copied()
+            .ok_or(Error::State("expert weights use a GPU"))?;
         let bytes = transfer.manifest.created_bytes(&transfer.request, 0)
+            + transfer.manifest.conversion_bytes(
+                &transfer.request,
+                0,
+                cuda::DeviceAllocation::granularity(device)? as u64,
+            )
             + self
                 .distributed
                 .as_ref()
@@ -186,55 +194,46 @@ impl WeightUpdate {
         let previous = self
             .keys
             .as_ref()
-            .ok_or(Error::State("the serving weights are retained"))?;
-        let transfer = keys.rebalance(
-            retained,
-            layout,
-            &self.storages,
-            previous,
-            &sources,
-            *transfer,
-        )?;
-        update.copies = match &self.distributed {
-            Some(owner) => {
-                let owner = Arc::clone(owner);
-                let retained = Arc::clone(retained);
-                ExpertCopies::Preparing(std::thread::spawn(move || {
-                    let result = (|| {
-                        let mut transfer = transfer;
-                        let bound = transfer.wait(&retained)?.clone();
-                        let successor = owner.prepare(&bound)?;
-                        Ok((transfer, successor))
-                    })();
-                    result.map_err(|error: Error| {
-                        owner.cancel();
-                        Error::Invariant(format!("distributed expert preparation failed: {error}"))
-                    })
-                }))
+            .ok_or(Error::State("the serving weights are retained"))?
+            .clone();
+        let live = self.storages.clone();
+        let owner = self.distributed.clone();
+        let retained = Arc::clone(retained);
+        // Canonical conversions wait for their own copy and numerical streams.
+        // Keep those waits off the serving worker's command/execution thread.
+        update.copies = ExpertCopies::Preparing(std::thread::spawn(move || {
+            let result = (|| {
+                let mut transfer =
+                    keys.rebalance(&retained, layout, &live, &previous, &sources, *transfer)?;
+                let bound = transfer.wait(&retained)?;
+                let successor = owner
+                    .as_ref()
+                    .map(|owner| owner.prepare(bound))
+                    .transpose()?;
+                Ok((transfer, successor))
+            })();
+            if result.is_err()
+                && let Some(owner) = &owner
+            {
+                owner.cancel();
             }
-            None => ExpertCopies::Copying(transfer),
-        };
+            result
+        }));
         self.rebalance = Some(update);
         Ok(())
     }
 
-    pub(crate) fn experts_ready(&mut self, retained: &Retained) -> Result<bool> {
+    pub(crate) fn experts_ready(&mut self) -> Result<bool> {
         let mut update = self
             .rebalance
             .take()
             .ok_or(Error::State("no expert redistribution is prepared"))?;
         let (copies, ready) = match update.copies {
             ExpertCopies::Preparing(task) if task.is_finished() => {
-                let (transfer, successor) = task.join().map_err(|_| {
-                    Error::Invariant("distributed expert preparation panicked".into())
-                })??;
-                (ExpertCopies::Ready(transfer, successor), true)
-            }
-            ExpertCopies::Copying(mut transfer) => {
-                let ready = transfer.ready(retained);
-                update.copies = ExpertCopies::Copying(transfer);
-                self.rebalance = Some(update);
-                return ready;
+                let (transfer, successor) = task
+                    .join()
+                    .map_err(|_| Error::Invariant("expert preparation panicked".into()))??;
+                (ExpertCopies::Ready(Box::new(transfer), successor), true)
             }
             copies @ ExpertCopies::Ready(..) => (copies, true),
             copies => (copies, false),
@@ -251,8 +250,8 @@ impl WeightUpdate {
             .take()
             .ok_or(Error::State("no expert redistribution is prepared"))?;
         let (transfer, resident) = match update.copies {
-            ExpertCopies::Copying(transfer) => (transfer, None),
-            ExpertCopies::Ready(transfer, successor) => {
+            ExpertCopies::Ready(transfer, None) => (transfer, None),
+            ExpertCopies::Ready(transfer, Some(successor)) => {
                 let owner = self
                     .distributed
                     .as_ref()
@@ -280,16 +279,19 @@ impl WeightUpdate {
     pub(crate) fn abort_experts(&mut self, retained: &Retained) -> Result<()> {
         if let Some(update) = self.rebalance.take() {
             match update.copies {
-                ExpertCopies::Copying(transfer) | ExpertCopies::Ready(transfer, _) => {
-                    transfer.abort(retained)?
-                }
-                ExpertCopies::Preparing(_) => {
+                ExpertCopies::Ready(transfer, _) => transfer.abort(retained)?,
+                ExpertCopies::Preparing(task) => {
                     if let Some(owner) = &self.distributed {
                         owner.cancel();
                     }
-                    return Err(Error::Invariant(
-                        "interrupted distributed expert preparation requires group recovery".into(),
-                    ));
+                    // The preparation thread owns unpublished allocations.
+                    // Join it before releasing its source leases or keys.
+                    if let Ok((transfer, _)) = task
+                        .join()
+                        .map_err(|_| Error::Invariant("expert preparation panicked".into()))?
+                    {
+                        transfer.abort(retained)?;
+                    }
                 }
                 ExpertCopies::Planned { .. } => {}
             }

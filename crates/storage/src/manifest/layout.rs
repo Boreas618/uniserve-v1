@@ -85,7 +85,7 @@ pub enum Encoding {
     Encoded {
         name: String,
         group: String,
-        canonical: Option<Canonical>,
+        canonical: Option<Box<Canonical>>,
     },
 }
 
@@ -97,6 +97,10 @@ pub struct Canonical {
     pub shape: Vec<u64>,
     pub strides: Vec<u64>,
     pub logical: Logical,
+    /// Numerical arguments used to reconstruct the encoded group. These
+    /// describe tensor values and formats, never runtime resources.
+    #[serde(default)]
+    pub parameters: serde_json::Value,
 }
 
 /// One local tensor of a storage.

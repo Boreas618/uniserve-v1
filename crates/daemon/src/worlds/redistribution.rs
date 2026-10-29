@@ -219,7 +219,12 @@ pub(crate) async fn plan(
             manifest: encoded.clone(),
         }));
         for (position, &index) in members.iter().enumerate() {
-            let bytes = rank_bytes(&manifest, &request, position as u32);
+            let bytes = rank_bytes(
+                &manifest,
+                &request,
+                position as u32,
+                planned[index].allocation_granularity,
+            );
             let launch = &launches[index];
             ranks_report.push(serde_json::json!({
                 "group": launch.group,
@@ -230,6 +235,7 @@ pub(crate) async fn plan(
                 "mapped_bytes": bytes.mapped,
                 "copied_bytes": bytes.copied,
                 "created_bytes": bytes.created,
+                "conversion_bytes": bytes.conversion,
                 "missing_tensors": bytes.missing,
             }));
             per_gpu.entry(assigned[index]).or_default().add(&bytes);
@@ -291,6 +297,7 @@ pub(crate) async fn plan(
             budget.quota = budget.quota.min(quota);
         }
         budget.weights = bytes.created;
+        budget.fixed += bytes.conversion;
         budget.in_flight = Some(reservations.get(gpu).copied().unwrap_or_default());
         let available = budget
             .quota
@@ -315,6 +322,7 @@ pub(crate) async fn plan(
             "mapped_bytes": bytes.mapped,
             "copied_bytes": bytes.copied,
             "created_bytes": bytes.created,
+            "conversion_bytes": bytes.conversion,
         }));
         budgets.insert(*gpu, budget);
     }
@@ -359,6 +367,7 @@ struct Bytes {
     copied: u64,
     created: u64,
     missing: u64,
+    conversion: u64,
 }
 
 impl Bytes {
@@ -367,12 +376,18 @@ impl Bytes {
         self.copied += other.copied;
         self.created += other.created;
         self.missing += other.missing;
+        self.conversion += other.conversion;
     }
 }
 
 /// What target rank `rank` of `request` maps, copies and creates under
 /// `manifest`: every chunk it does not map it creates.
-fn rank_bytes(manifest: &Manifest, request: &manifest::Request, rank: u32) -> Bytes {
+fn rank_bytes(
+    manifest: &Manifest,
+    request: &manifest::Request,
+    rank: u32,
+    granularity: u64,
+) -> Bytes {
     let mut bytes = Bytes::default();
     let total: u64 = request.target.ranks[rank as usize]
         .storages
@@ -381,6 +396,7 @@ fn rank_bytes(manifest: &Manifest, request: &manifest::Request, rank: u32) -> By
         .map(|chunk| chunk.length)
         .sum();
     bytes.created = manifest.created_bytes(request, rank);
+    bytes.conversion = manifest.conversion_bytes(request, rank, granularity);
     bytes.mapped = total - bytes.created;
     bytes.copied = manifest
         .copies

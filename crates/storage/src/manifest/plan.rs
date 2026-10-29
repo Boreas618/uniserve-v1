@@ -74,6 +74,10 @@ type SourceChunk = (u32, u32, u32);
 /// The source fields that hold a block, each read in a form.
 type Candidates = Vec<(FieldRef, Form)>;
 
+/// A receiver's canonical destination group (or its affine destinations)
+/// gathers each encoded source group once before copying its regions.
+type Gather = (u32, Option<String>, u32, String);
+
 /// How a field is read or written: as stored, or in canonical form.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Form {
@@ -984,12 +988,13 @@ impl<'c, 'r> Draft<'c, 'r> {
         let mut order: Vec<usize> = (0..self.cells.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.cells[index].bytes));
         let mut loads = BTreeMap::new();
+        let mut gathered = BTreeSet::new();
         let mut busiest = 0.0_f64;
         for index in order {
             let cell = &self.cells[index];
             let mut best = None;
             for &(source, form) in &cell.candidates {
-                let traffic = self.traffic(cell, source, form)?;
+                let traffic = self.traffic(cell, source, form, &gathered)?;
                 let mut finish = 0.0_f64;
                 for (pair, bytes) in &traffic {
                     let load = loads.get(pair).copied().unwrap_or(0);
@@ -1006,6 +1011,9 @@ impl<'c, 'r> Draft<'c, 'r> {
             busiest = latest;
             for (pair, bytes) in traffic {
                 *loads.entry(pair).or_insert(0) += bytes;
+            }
+            if let Some(group) = self.gathering(cell, chosen.0, chosen.1) {
+                gathered.insert(group);
             }
             self.cells[index].chosen = Some(chosen);
         }
@@ -1032,6 +1040,7 @@ impl<'c, 'r> Draft<'c, 'r> {
         cell: &Cell,
         source: FieldRef,
         form: Form,
+        gathered: &BTreeSet<Gather>,
     ) -> Result<BTreeMap<(LinkEnd, LinkEnd), u64>> {
         let runs = match &cell.what {
             Block::Bytes(range) => vec![(
@@ -1050,12 +1059,41 @@ impl<'c, 'r> Draft<'c, 'r> {
             )?,
         };
         let mut traffic = BTreeMap::new();
+        let receiver = Binding::Rank.end(Some(self.gpus[cell.target.rank as usize]))?;
+        if let Some(group) = self.gathering(cell, source, form)
+            && !gathered.contains(&group)
+        {
+            let rank = &self.context.request.source.ranks[source.rank as usize];
+            for storage in &rank.storages {
+                for field in &storage.layout.fields {
+                    if !matches!(&field.encoding, Encoding::Encoded { group: name, .. } if name == &group.3)
+                    {
+                        continue;
+                    }
+                    let extent = field.bytes();
+                    for chunk in &storage.chunks {
+                        let start = extent.start.max(chunk.offset);
+                        let end = extent.end.min(chunk.offset + chunk.length);
+                        if end > start {
+                            *traffic
+                                .entry((chunk.binding.end(rank.gpu)?, receiver.clone()))
+                                .or_insert(0) += end - start;
+                        }
+                    }
+                }
+            }
+        }
         for ((from, into), length, rows, (source_pitch, target_pitch)) in runs {
             let mut row = 0;
             let mut done = 0;
             while row < rows {
-                let (source_storage, source_left) =
-                    self.storage_at(Side::Source, source, form, from + row * source_pitch + done)?;
+                // Encoded fields are gathered and converted on the receiver.
+                // Their subsequent canonical copies use its local link.
+                let (source_storage, source_left) = if form == Form::Canonical {
+                    (receiver.clone(), u64::MAX)
+                } else {
+                    self.storage_at(Side::Source, source, form, from + row * source_pitch + done)?
+                };
                 let (target_storage, target_left) = self.storage_at(
                     Side::Target,
                     cell.target,
@@ -1088,6 +1126,24 @@ impl<'c, 'r> Draft<'c, 'r> {
             }
         }
         Ok(traffic)
+    }
+
+    fn gathering(&self, cell: &Cell, source: FieldRef, form: Form) -> Option<Gather> {
+        if form != Form::Canonical {
+            return None;
+        }
+        let Encoding::Encoded { group, .. } = &self.context.field(Side::Source, source).encoding
+        else {
+            return None;
+        };
+        let target = match (
+            &cell.form,
+            &self.context.field(Side::Target, cell.target).encoding,
+        ) {
+            (Form::Canonical, Encoding::Encoded { group, .. }) => Some(group.clone()),
+            _ => None,
+        };
+        Some((cell.target.rank, target, source.rank, group.clone()))
     }
 
     fn storage_at(

@@ -1667,6 +1667,7 @@ pub(crate) fn plan_rank(
     let Some(keys) = keys else {
         return Ok(::storage::manifest::weights::PlannedRank {
             gpu,
+            allocation_granularity: cuda::DeviceAllocation::granularity(cuda)? as u64,
             total_bytes: device_storage.total,
             free_bytes: device_storage.free,
             resident_bytes: 0,
@@ -1760,6 +1761,7 @@ pub(crate) fn plan_rank(
     }
     Ok(::storage::manifest::weights::PlannedRank {
         gpu,
+        allocation_granularity: cuda::DeviceAllocation::granularity(cuda)? as u64,
         total_bytes: device_storage.total,
         free_bytes: device_storage.free,
         resident_bytes: ledger.used() + transfer,

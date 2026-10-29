@@ -35,12 +35,19 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 # Discover the real numerical module paths through the public plugin hook
 # interface. The test neither guesses checkpoint paths nor alters weights.
 EXPERT_PLUGIN = """
+import hashlib
+
+import torch
+
+from uniserve.loading.retained import to_canonical
 from uniserve.nn.moe import FusedMoE
+from uniserve.quantization import QuantizedTensor
 
 
 def register(registry):
     registry.hook("expert_layers", expert_layers)
     registry.hook("expert_distribution", expert_distribution)
+    registry.hook("expert_weights", expert_weights)
 
 
 def expert_layers(payload, models):
@@ -59,6 +66,34 @@ def expert_distribution(payload, models):
         for path, layer in model.named_modules()
         if isinstance(layer, FusedMoE) and path == payload["layer"]
     }
+
+
+def expert_weights(payload, models):
+    result = {}
+    for model in models:
+        for path, layer in model.named_modules():
+            if not isinstance(layer, FusedMoE) or path != payload["layer"]:
+                continue
+            if layer.up_gate.weight.is_meta:
+                continue
+            order = sorted(
+                range(len(layer.resident_experts)),
+                key=lambda index: layer.resident_experts[index],
+            )
+            for projection in ("up_gate", "down"):
+                weight = getattr(layer, projection).weight
+                fields = (
+                    to_canonical(weight).buffers()
+                    if isinstance(weight, QuantizedTensor)
+                    else {"values": weight}
+                )
+                for name, field in fields.items():
+                    data = field.detach().reshape(len(order), -1).cpu()
+                    data = data.view(torch.uint8)[order].numpy().tobytes()
+                    result[f"{path}.{projection}/{name}"] = (
+                        hashlib.sha256(data).hexdigest()
+                    )
+    return result
 """
 
 
@@ -72,13 +107,24 @@ def _layers(base_url: str) -> dict[str, int]:
     return layers
 
 
-@pytest.mark.parametrize("topology", ["single", "experts", "dwdp", "host"])
+@pytest.mark.parametrize(
+    "topology", ["single", "experts", "dwdp", "host", "quantized"]
+)
 def test_expert_rebalancing_preserves_a_stream_and_its_world(
     tmp_path: Path, topology: str
 ):
     """Both redistribution directions preserve the request and world."""
     name = "qwen3-expert-rebalance"
-    if topology == "dwdp":
+    if topology == "quantized":
+        devices, options = _topology("dedicated", tmp_path)
+        options = (
+            *options,
+            "--set",
+            "moe_config.exchange=megamoe",
+            "--set",
+            "quantization_config.mode=mxfp8-experts",
+        )
+    elif topology == "dwdp":
         devices, options = _topology("experts", tmp_path)
         options = (*options, "--set", "moe_config.exchange=dwdp")
     elif topology == "host":
@@ -108,6 +154,12 @@ def test_expert_rebalancing_preserves_a_stream_and_its_world(
         original = list(range(layers[layer]))
         assert len(original) > 1
         world = _config(base_url)["slots"][0]["world"]
+        if topology == "quantized":
+            response = _admin(
+                base_url, "hooks/expert_weights", {"layer": layer}
+            )
+            assert response.status_code == 200, response.text
+            weights = response.json()["result"]["results"]
 
         # This bound leaves thousands of decode steps for the two transfers
         # while keeping the reference independent of the changed world. A
@@ -156,6 +208,12 @@ def test_expert_rebalancing_preserves_a_stream_and_its_world(
             status = _config(base_url)
             assert status["slots"][0]["world"] == world, status
             assert status["trial"] is None, status
+            if topology == "quantized":
+                response = _admin(
+                    base_url, "hooks/expert_weights", {"layer": layer}
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["result"]["results"] == weights
             # At least 64 tokens must execute with each published order.
             streaming.mark()
             streaming.wait_for(streaming.marked + 64)

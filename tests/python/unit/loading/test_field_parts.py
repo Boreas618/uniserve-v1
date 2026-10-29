@@ -8,6 +8,7 @@ from torch.distributed.tensor import Shard
 
 from uniserve.distributed import DeviceMesh, Distribution
 from uniserve.distributed.logical import Logical
+from uniserve.loading.conversion import convert
 from uniserve.loading.retained import (
     field_parts,
     from_canonical,
@@ -16,9 +17,8 @@ from uniserve.loading.retained import (
 )
 from uniserve.quantization import Quantizer, RowOrder, ScaleLayout
 
-pytestmark = pytest.mark.unit
 
-
+@pytest.mark.unit
 def test_an_affine_quantized_tensor_holds_its_part_in_every_field():
     # A per-tensor FP8 matrix, the second of two row shards: values hold
     # the tensor's part element by element, and its one scale is whole.
@@ -35,6 +35,7 @@ def test_an_affine_quantized_tensor_holds_its_part_in_every_field():
     json.dumps(parts)
 
 
+@pytest.mark.unit
 def test_an_encoded_tensor_converts_through_its_canonical_form():
     # Block scales in swizzled tiles and rows in a shuffled order are no
     # strides of the tensor's part: the fields convert through their
@@ -86,4 +87,85 @@ def test_an_encoded_tensor_converts_through_its_canonical_form():
     for name, value in again.buffers().items():
         assert torch.equal(
             value.view(torch.uint8), stored.buffers()[name].view(torch.uint8)
+        )
+
+
+@pytest.mark.parametrize("format", ["mxfp8", "nvfp4"])
+@pytest.mark.parametrize(
+    "layout", [ScaleLayout.SWIZZLED_128X4, ScaleLayout.SWIZZLED_128X4_MN]
+)
+@pytest.mark.parametrize("order", list(RowOrder))
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.unit),
+        pytest.param("cuda", marks=[pytest.mark.integration, pytest.mark.gpu]),
+    ],
+)
+def test_manifest_conversion_preserves_encoded_values(
+    format, layout, order, device
+):
+    generator = torch.Generator().manual_seed(0)
+    if format == "mxfp8":
+        encoded = {
+            "values": torch.randint(
+                0, 120, (2, 128, 64), generator=generator, dtype=torch.uint8
+            ).view(torch.float8_e4m3fn),
+            "scale": torch.randint(
+                100, 130, (256, 2), generator=generator, dtype=torch.uint8
+            ),
+        }
+    else:
+        encoded = {
+            "values": torch.randint(
+                0, 256, (2, 128, 32), generator=generator, dtype=torch.uint8
+            ),
+            "block_scale": torch.randint(
+                1, 120, (256, 4), generator=generator, dtype=torch.uint8
+            ),
+            "tensor_scale": torch.tensor(0.25),
+        }
+    linear = Quantizer(format).from_tensors(
+        {name: value.to(device) for name, value in encoded.items()},
+        shape=(2, 128, 64),
+        dtype=torch.bfloat16,
+    )
+    stored = linear.repack(scale_layout=layout, row_order=order)
+    entry = tensor_entry("p:experts", stored)
+    parts = field_parts(entry, stored, None)
+    fields = []
+    size = 0
+    for name, value in entry.fields.items():
+        form = parts[name]["encoding"]["canonical"]
+        size = max(
+            size,
+            form["offset"]
+            + value.element_size() * torch.Size(form["shape"]).numel(),
+        )
+        fields.append(
+            {
+                "tensor": f"p:experts/{name}",
+                "dtype": str(value.dtype).removeprefix("torch."),
+                "encoding": parts[name]["encoding"],
+            }
+        )
+    staging = torch.zeros(size, dtype=torch.uint8, device=device)
+    stream = torch.cuda.current_stream().cuda_stream if device == "cuda" else 0
+    convert(
+        json.dumps(fields), list(entry.fields.values()), staging, True, stream
+    )
+    for field, expected in zip(fields, linear.buffers().values(), strict=True):
+        form = field["encoding"]["canonical"]
+        actual = staging[form["offset"] :][
+            : expected.numel() * expected.element_size()
+        ]
+        assert torch.equal(
+            actual, expected.contiguous().reshape(-1).view(torch.uint8)
+        )
+    outputs = [torch.zeros_like(value) for value in entry.fields.values()]
+    convert(json.dumps(fields), outputs, staging, False, stream)
+    for actual, expected in zip(outputs, entry.fields.values(), strict=True):
+        assert torch.equal(
+            actual.reshape(-1).view(torch.uint8),
+            expected.reshape(-1).view(torch.uint8),
         )
