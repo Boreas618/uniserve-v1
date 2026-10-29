@@ -64,6 +64,7 @@ from tokenizers import Tokenizer
 from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
+    scaled,
     server_process,
     tiny_input_png_b64,
     worker_executable,
@@ -268,7 +269,10 @@ def _stream(
     started = time.monotonic()
     events = []
     with httpx.stream(
-        "POST", f"{base_url}/v1/chat/completions", json=payload, timeout=1800
+        "POST",
+        f"{base_url}/v1/chat/completions",
+        json=payload,
+        timeout=scaled(1800),
     ) as response:
         response.raise_for_status()
         for event in iter_sse_events(response.iter_lines()):
@@ -301,7 +305,9 @@ def _stream(
 def _admin(
     base_url: str, path: str, body: dict | None = None
 ) -> httpx.Response:
-    return httpx.post(f"{base_url}/admin/{path}", json=body or {}, timeout=1800)
+    return httpx.post(
+        f"{base_url}/admin/{path}", json=body or {}, timeout=scaled(1800)
+    )
 
 
 # A world change's phases in their order (``GET /admin/config``).
@@ -315,7 +321,9 @@ def _wait_promotion(base_url: str, change: Future) -> None:
     """  # noqa: D205
     deadline = time.monotonic() + 900
     while time.monotonic() < deadline and not change.done():
-        config = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+        config = httpx.get(
+            f"{base_url}/admin/config", timeout=scaled(60)
+        ).json()
         if (config.get("update") or {}).get("phase") == "promote":
             return
         time.sleep(0.05)
@@ -336,7 +344,9 @@ def _wait_phase(base_url: str, change: Future, phase: str) -> None:
                 f"the change ended before its {phase} phase: "
                 f"{response.status_code} {response.text}"
             )
-        config = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+        config = httpx.get(
+            f"{base_url}/admin/config", timeout=scaled(60)
+        ).json()
         current = (config.get("update") or {}).get("phase")
         if current == phase:
             return
@@ -380,7 +390,7 @@ def _assert_continued(
         assert preempted.text == reference.text
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(scaled(3600))
 @pytest.mark.parametrize("model", ["bagel", "sensenova"])
 def test_a_preempted_image_request_continues_exactly(
     tmp_path: Path, model: str
@@ -405,7 +415,7 @@ def test_a_preempted_image_request_continues_exactly(
                 _request(setup, image_start, "sleep"),
                 received,
             )
-            assert received.get(timeout=600) == reference.images[0]
+            assert received.get(timeout=scaled(600)) == reference.images[0]
             assert not streamed.done(), "the request ended before the sleep"
             slept = _admin(base_url, "sleep")
             assert slept.status_code == 200, slept.text
@@ -431,7 +441,7 @@ def test_a_preempted_image_request_continues_exactly(
                         "update_config.previous_world=weights",
                     ]
                 },
-                timeout=3600,
+                timeout=scaled(3600),
             )
             _wait_phase(base_url, change, "prepare")
             streamed = pool.submit(
@@ -440,7 +450,7 @@ def test_a_preempted_image_request_continues_exactly(
                 _request(setup, image_start, "world"),
                 received,
             )
-            assert received.get(timeout=600) == reference.images[0]
+            assert received.get(timeout=scaled(600)) == reference.images[0]
             assert not streamed.done(), "the request ended before promotion"
             for worker in workers:
                 os.kill(worker, signal.SIGSTOP)

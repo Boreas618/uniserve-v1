@@ -44,6 +44,7 @@ from PIL import Image
 from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
+    scaled,
     server_process,
     worker_executable,
 )
@@ -146,7 +147,9 @@ def served(request, tmp_path_factory) -> Iterator[tuple[str, Path]]:
 
 
 def _readout(base_url: str, body: dict) -> dict:
-    response = httpx.post(f"{base_url}/v1/systemone", json=body, timeout=600.0)
+    response = httpx.post(
+        f"{base_url}/v1/systemone", json=body, timeout=scaled(600.0)
+    )
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -292,7 +295,7 @@ def test_distinct_images_beyond_the_encoder_cache_are_read(served):
     base_url, _ = served
     entries = ENCODER_CACHE_ENTRIES
     names = list(COLORS)
-    with httpx.Client(timeout=600.0) as client:
+    with httpx.Client(timeout=scaled(600.0)) as client:
         for index in range(entries + 8):
             # The size identifies the image; the color is the expected answer.
             color = names[index % len(names)]
