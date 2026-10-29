@@ -66,30 +66,20 @@ def _reads(
 ) -> frozenset[str]:
     """The tensors to read so that ``load`` (tensor identities) is read.
 
-    A mapping that derives constants after loading (``post_load``) reads
-    its whole module once any of its tensors is read, and a merged
-    projection reads all of its branches, which loading lays out in one
-    backing. Every rank computes the same set from the same ``load``.
+    A derivation regenerates its declared outputs together. Merged
+    projections can coalesce loaded and retained branches into one backing
+    without rereading the retained branches' checkpoint values.
     """
-    from uniserve.nn.linear import MergedColumnParallelLinear
-
     names = {id(tensor): name for name, tensor in tensors(model)}
     reads = set(load)
-
-    def within(module: nn.Module) -> set[str]:
-        return {names[id(tensor)] for _, tensor in tensors(module)}
-
-    for module in model.modules():
-        if isinstance(module, MergedColumnParallelLinear):
-            members = within(module)
+    for component in declared:
+        for derivation in component.derivations:
+            members = {
+                names[id(tensor)]
+                for tensor in derivation.tensors(component.module)
+            }
             if members & reads:
                 reads |= members
-    for component in declared:
-        if component.post_load is None:
-            continue
-        members = within(component.module)
-        if members & reads:
-            reads |= members
     return frozenset(reads)
 
 
@@ -369,6 +359,7 @@ def load_model(
             for name, tensor in tensors(model)
             if name in reads and id(tensor) in parameters
         }
+    tensor_names = {id(tensor): name for name, tensor in tensors(model)}
 
     # Narrow each declared mapping to the selected modules: unselected
     # parameters keep their meta placeholders and their assignments drop out.
@@ -382,17 +373,24 @@ def load_model(
             if id(parameter) in parameters
         }
         resident = names.intersection(component.required | component.optional)
-        if not resident and (
-            retained is not None or id(component.module) not in selected
+        derivations = tuple(
+            derivation
+            for derivation in component.derivations
+            if id(component.module) in selected
+            and (
+                retained is None
+                or any(
+                    tensor_names[id(tensor)] in reads
+                    for tensor in derivation.tensors(component.module)
+                )
+            )
+        )
+        if (
+            not resident
+            and not derivations
+            and (retained is not None or id(component.module) not in selected)
         ):
             continue
-        if component.post_load is not None and not component.required.issubset(
-            names
-        ):
-            raise ValueError(
-                "checkpoint-derived modules must load their complete "
-                "numerical inputs"
-            )
 
         def assign(reader, mapping=component.map_weights):
             return tuple(
@@ -407,6 +405,7 @@ def load_model(
                 map_weights=assign,
                 required=component.required & names,
                 optional=component.optional & names,
+                derivations=derivations,
             )
         )
 

@@ -192,7 +192,7 @@ def _rank(partition: Partition) -> Rank:
         **columns,
         "granularity": [GRANULARITY],
         "degrees": DEGREES,
-        "fingerprints": fingerprints(config, io, "bfloat16", "local"),
+        "fingerprints": fingerprints(config, io, "local"),
     }
     planned = json.loads(
         str(worker.library()["weight_storages"](json.dumps(description)))

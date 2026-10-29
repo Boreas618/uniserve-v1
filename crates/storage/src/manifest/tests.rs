@@ -1273,11 +1273,11 @@ fn weight_manifest(fingerprints: &[(&str, &str)], storages: &[&Storage]) -> Stri
 
 #[test]
 fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() {
-    let held = storage(vec![field("w", 0, &[256], vec![whole(256)], vec![1])]);
-    let partial = storage(vec![field("v", 0, &[256], vec![whole(256)], vec![1])]);
-    let other = storage(vec![field("u", 0, &[256], vec![whole(256)], vec![1])]);
+    let held = storage(vec![field("w/data", 0, &[256], vec![whole(256)], vec![1])]);
+    let partial = storage(vec![field("v/data", 0, &[256], vec![whole(256)], vec![1])]);
+    let other = storage(vec![field("u/data", 0, &[256], vec![whole(256)], vec![1])]);
     assert!(held.chunks.len() > 1);
-    let ours = [("", "structure"), ("model", "checkpoint")];
+    let ours = [("w", "weights-w"), ("v", "weights-v"), ("u", "weights-u")];
     let manifests: BTreeMap<Key, String> = [
         // Two of world 1's ranks name the same storage.
         (Key([1; 32]), weight_manifest(&ours, &[&held, &partial])),
@@ -1285,7 +1285,7 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
         // A storage of another checkpoint holds no bytes this rank needs.
         (
             Key([3; 32]),
-            weight_manifest(&[("", "structure"), ("model", "another")], &[&other]),
+            weight_manifest(&[("u", "another")], &[&other]),
         ),
         // World 2's manifest is not world 1's.
         (Key([4; 32]), weight_manifest(&ours, &[&other])),
@@ -1376,6 +1376,75 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
         weights::sources(&listing, "model", Some(&[1]), &fingerprints, read)
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn unchanged_fields_of_a_packed_weight_storage_remain_transfer_sources() {
+    let packed = storage(vec![
+        field("w/data", 0, &[128], vec![whole(128)], vec![1]),
+        field("v/data", 128, &[128], vec![whole(128)], vec![1]),
+    ]);
+    let manifest_key = Key([91; 32]);
+    let text = weight_manifest(&[("w", "same"), ("v", "previous")], &[&packed]);
+    let mut tensors = vec![listed(
+        manifest_key,
+        weights::NAME,
+        Placement::Host { numa_node: None },
+        1,
+    )];
+    tensors.extend(
+        packed
+            .chunks
+            .iter()
+            .map(|chunk| listed(chunk.key, "weights", Placement::Device { gpu: gpu(0) }, 1)),
+    );
+    let listing = crate::protocol::Listing {
+        tensors,
+        transfer: Some(crate::protocol::ListedTransfer {
+            pid: 1,
+            links: links(2),
+            contexts: Vec::new(),
+            tasks: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    let wanted = BTreeMap::from([
+        ("w".to_string(), "same".to_string()),
+        ("v".to_string(), "current".to_string()),
+    ]);
+    let source = weights::sources(&listing, "model", Some(&[1]), &wanted, |_| {
+        Ok::<_, ()>(Some(text.clone()))
+    })
+    .unwrap()
+    .unwrap()
+    .world;
+    let request = Request {
+        source,
+        target: world(vec![(
+            None,
+            vec![storage(vec![field(
+                "w/data",
+                0,
+                &[128],
+                vec![whole(128)],
+                vec![1],
+            )])],
+        )]),
+        gpus: vec![gpu(1)],
+        links: links(2),
+    };
+    let manifest = Manifest::plan(&request).unwrap();
+    assert_fields_equal(&request, &apply(&request, &manifest));
+    // The changed tensor cannot be supplied under the requested identity.
+    assert!(
+        request
+            .source
+            .ranks
+            .iter()
+            .flat_map(|rank| &rank.storages)
+            .flat_map(|storage| &storage.layout.fields)
+            .all(|field| field.tensor != "v/data")
     );
 }
 

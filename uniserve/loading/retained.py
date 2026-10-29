@@ -4,21 +4,13 @@ A worker keeps its loaded parameters and buffers at the Storage Server, so a
 restarted worker binds them instead of reading the checkpoint. The server
 stores bytes; this module defines what they are:
 
-- :func:`fingerprints` digests what determines a model's loaded bytes
-  besides the regions of its logical tensors a rank holds. The structure
-  fingerprint covers the normalized configuration, the weight choices, the
-  load mode, which kernels read the routed experts, the revisions of how
-  the model's weights derive from its checkpoint
-  (``uniserve.numerics.loading``) and what selects the providers whose
-  layouts encoded weights are stored in: the kernel libraries' versions and
-  the kernel providers plugins add. A change of code that keeps those
-  revisions keeps the bytes. Each checkpoint source's fingerprint adds that
-  source's files. A tensor loaded from a source is keyed by its source's
-  fingerprint, so a change to one source's files reloads only its tensors;
-  the manifest and the tensors no source loads are keyed by the structure.
-  The worker adds the region of each logical tensor a chunk of retained
-  storage holds and where it lies in the chunk to form the chunk's key, so
-  the key names neither the rank nor its GPU.
+- :func:`fingerprints` describes each tensor's loading inputs independently:
+  its checkpoint, assignment rectangles, numerical representation, and any
+  declared derivation. Fixed constructor constants are identified by their
+  bytes. Encoded weights also identify the providers that select their
+  layouts. The manifest identifies shapes and representations; a chunk adds
+  the regions of its tensors and their offsets. Neither the rank nor its
+  GPU enters a content key.
 - :class:`Layout` describes a loaded model's device tensors for publishing:
   each parameter and buffer as its fields (a dense tensor's data, or a
   quantized tensor's encoded fields), grouped by the torch storage they
@@ -69,7 +61,7 @@ from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve.quantization.tensor import RowOrder, ScaleLayout
 
 # The manifest's format; a manifest of another version is not bound.
-MANIFEST_VERSION = 6
+MANIFEST_VERSION = 7
 
 # The field name of a dense tensor's data.
 _DATA = "data"
@@ -137,19 +129,6 @@ def _version(distribution: str) -> str:
         return "absent"
 
 
-def _encodings(source) -> set[str]:
-    """The encodings of the weights ``source`` loads: those its weight
-    choices and its components' precisions quantize to.
-    """  # noqa: D205
-    choices = [source.weights, *source.precisions.values()]
-    return {
-        config.weight.format
-        for choice in choices
-        for config in choice.quantization.values()
-        if config is not None
-    }
-
-
 def _name(value: Any) -> str:
     """The qualified name of a class or function."""
     module = getattr(value, "__module__", "")
@@ -193,19 +172,6 @@ def _canonical(value: Any) -> Any:
     return repr(value)
 
 
-def _header(path: Path) -> str:
-    """A weight file's header.
-
-    A safetensors file's JSON header names every tensor's dtype, shape and
-    offsets; the size alone identifies any other file.
-    """
-    if path.suffix != ".safetensors":
-        return ""
-    with open(path, "rb") as file:
-        (length,) = struct.unpack("<Q", file.read(8))
-        return file.read(length).decode("utf-8", errors="replace")
-
-
 def _identity(path: Path) -> str:
     """The identity of the file ``path`` names, a link followed.
 
@@ -242,89 +208,229 @@ def _identity(path: Path) -> str:
 def fingerprints(
     source,
     io,
-    model_dtype: str,
     expert_kernels: str,
 ) -> dict[str, Any]:
-    """The digests of what determines a model's loaded bytes.
+    """Key each loaded tensor by its own assignments and transformations.
 
-    The regions of the logical tensors a rank holds aside, which the worker
-    adds with each chunk's key.
+    The manifest identity describes tensor shapes and representations. A
+    tensor's value identity describes its checkpoint inputs, slices, dtype,
+    quantization and explicitly declared derivations. Kernel providers enter
+    only encoded tensors' storage identities. Model numerical configuration
+    that changes no loading input changes no retained weight key.
 
-    Args:
-        source: The resolved ``registry.Config`` of this rank's modules,
-            with its weight configuration.
-        io: The load options; their mode (``dummy``) changes the bytes.
-        model_dtype: The compute element type's name.
-        expert_kernels: Which kernels read the routed experts
-            (``uniserve.loading.layout.ExpertKernels``).
-
-    Returns:
-        ``{"structure": digest, "sources": {name: digest}, "values":
-        digest}``: the structure fingerprint, each checkpoint source's, and
-        that of what determines the weights' values regardless of the
-        layouts their bytes take, which keys what forwards compute from
-        them; as lowercase hexadecimal SHA-256 digests. A source's digest
-        covers each of its files' name, size, header and identity
-        (:func:`_identity`).
-
-    Raises:
-        SetupError: The model's package or a quantizer it loads with
-            declares no revision (``uniserve.numerics.loading``).
+    Construction and assignment compilation use meta tensors; checkpoint
+    readers supply metadata without materializing parameter payloads.
     """
-    # What determines the weights' values: the configuration, the weight
-    # choices and the revisions of how they derive from the checkpoint.
-    # Which modules a rank selects decides which tensors it loads, never
-    # the bytes of one it loads, so ranks of any selection key the same
-    # region alike.
-    values = hashlib.sha256()
-    _hash(values, "uniserve-model-values")
-    _hash(values, numerics.loading(source.model_class, _encodings(source)))
-    for part in (
-        source.model_class,
-        source.model,
-        source.checkpoint_format,
-        source.weights,
-        io.mode,
-        str(model_dtype),
-    ):
-        _hash(values, json.dumps(_canonical(part)))
-    for checkpoint in source.checkpoint:
-        _hash(values, checkpoint.name)
-        _hash(values, checkpoint.prefix)
-    # Their bytes besides: the layouts the providers that read them select.
-    structure = hashlib.sha256()
-    _hash(structure, "uniserve-model-structure")
-    _hash(structure, values.hexdigest())
-    _hash(structure, _providers())
-    _hash(structure, str(expert_kernels))
-    structure_digest = structure.hexdigest()
+    from contextlib import ExitStack
 
-    sources = {}
-    for checkpoint in source.checkpoint:
-        files = hashlib.sha256()
-        _hash(files, "uniserve-checkpoint-files")
-        _hash(files, checkpoint.name)
-        for path in sorted(checkpoint.files):
-            _hash(files, path.relative_to(checkpoint.root).as_posix())
-            _hash(files, str(path.stat().st_size))
-            _hash(files, _header(path))
-            _hash(files, _identity(path))
-        if checkpoint.stream is not None:
-            # A plugin's weight source names what it streams.
-            _hash(files, f"stream:{checkpoint.identity}")
-        _hash(files, json.dumps(_canonical(checkpoint.headers)))
-        files_digest = files.hexdigest()
-        _hash(values, files_digest)
-        digest = hashlib.sha256()
-        _hash(digest, "uniserve-checkpoint-source")
-        _hash(digest, structure_digest)
-        _hash(digest, files_digest)
-        sources[checkpoint.name] = digest.hexdigest()
-    return {
-        "structure": structure_digest,
-        "sources": sources,
-        "values": values.hexdigest(),
+    from uniserve.loading import weights as weight_options
+    from uniserve.loading.loader import select_modules
+    from uniserve.nn.moe import ExpertLinear
+
+    def digest(*parts):
+        result = hashlib.sha256()
+        for part in parts:
+            _hash(result, json.dumps(_canonical(part), sort_keys=True))
+        return result.hexdigest()
+
+    files = {}
+
+    def input_description(value):
+        # A weight depends on the files supplying its actual inputs, not
+        # every shard in the checkpoint. Compute a file identity only once
+        # so even unsettled files have one identity throughout this load.
+        if isinstance(value, Path):
+            if io.mode == "dummy":
+                return ("dummy", io.values)
+            if value not in files:
+                files[value] = (_identity(value), value.stat().st_size)
+            return files[value]
+        if isinstance(value, dict):
+            return {key: input_description(item) for key, item in value.items()}
+        return value
+
+    with torch.device("meta"):
+        model = source.model_class(source.model)
+    declared = source.mapping(model)
+    selected = select_modules(
+        model, source.modules, exclude_modules=source.exclude_modules
+    )
+    active = {
+        id(tensor)
+        for module in selected
+        for tensor in (
+            *module.parameters(recurse=False),
+            *module.buffers(recurse=False),
+        )
     }
+    # Pipeline pruning can leave a different alias of a tied parameter.
+    # Every resident alias must resolve to the same loading identity.
+    named = {
+        name: tensor
+        for name, tensor in tensors(model, aliases=True)
+        if id(tensor) in active
+    }
+    inputs: dict[int, list[Any]] = {}
+    encodings: dict[int, set[str]] = {}
+    derived: dict[int, Any] = {}
+    # This is the loader's ordinary metadata compiler. Its settings apply
+    # the same alias checks and per-module precision choices as loading.
+    compiler = weight_options._Loader(
+        model,
+        source.checkpoint,
+        declared,
+        device="meta",
+        weights=source.weights,
+        io=io,
+        devices=None,
+    )
+    readers = {}
+    by_source = {
+        checkpoint.name: checkpoint for checkpoint in source.checkpoint
+    }
+    try:
+        with ExitStack() as stack:
+            for component in declared:
+                if component.module not in selected and not any(
+                    id(tensor) in active
+                    for _, tensor in tensors(component.module)
+                ):
+                    continue
+                if io.mode != "dummy" or component.derivations:
+                    reader = readers.get(component.source)
+                    if reader is None:
+                        reader = stack.enter_context(
+                            by_source[component.source].open(
+                                io=dataclasses.replace(io, mode="dummy")
+                            )
+                        )
+                        readers[component.source] = reader
+                    for assignment in component.map_weights(reader):
+                        compiler._compile(assignment)
+                        key = id(assignment.target)
+                        description = input_description(
+                            assignment.source.description()
+                        )
+                        encoding = description.get("encoding")
+                        if encoding is not None:
+                            encodings.setdefault(key, set()).add(encoding)
+                        entry = (
+                            description,
+                            compiler._regions[id(assignment)],
+                        )
+                        if entry not in inputs.setdefault(key, []):
+                            inputs[key].append(entry)
+                else:
+                    # Dummy loading generates each parameter from its name
+                    # within its mapping. It reads no checkpoint values.
+                    for name, parameter in component.module.named_parameters():
+                        inputs.setdefault(id(parameter), []).append(
+                            ("dummy", name, io.values)
+                        )
+                for derivation in component.derivations:
+                    for tensor in derivation.tensors(component.module):
+                        derived[id(tensor)] = (
+                            derivation.function,
+                            [
+                                input_description(
+                                    reader.get(name).description()
+                                )
+                                for name in derivation.sources
+                            ]
+                            if io.mode != "dummy"
+                            else ("dummy", derivation.sources, io.values),
+                            derivation.parameters,
+                        )
+
+        values = {}
+        stored = {}
+        layouts = []
+        for name, tensor in named.items():
+            key = id(tensor)
+            setting = compiler._settings.get(key)
+            dtype = tensor.dtype if setting is None else setting[1]
+            quantizer = None if setting is None else setting[2]
+            assignments = compiler._assignments.get(key, ())
+            preserved = {
+                assignment.source.dtype
+                for assignment in assignments
+                if assignment.preserve_dtype
+            }
+            if len(preserved) > 1 or (
+                preserved
+                and not all(
+                    assignment.preserve_dtype for assignment in assignments
+                )
+            ):
+                raise ValueError("one Parameter has conflicting source dtypes")
+            if preserved:
+                dtype = preserved.pop()
+            formats = encodings.get(key, set()).copy()
+            if quantizer is not None:
+                formats.add(quantizer.format)
+            recipe = inputs.get(key, [])
+            if key in derived:
+                recipe = [*recipe, derived[key]]
+            elif not recipe and name.startswith("b:"):
+                if tensor.is_meta:
+                    raise ValueError(
+                        f"derived tensor {name} declares no loading inputs"
+                    )
+                # Constructors keep fixed constants as real host tensors.
+                # Their exact bytes identify only that constant, independent
+                # of configuration fields the constructor did not use.
+                recipe = [
+                    "constant",
+                    tensor.detach()
+                    .contiguous()
+                    .reshape(-1)
+                    .view(torch.uint8)
+                    .numpy()
+                    .tobytes()
+                    .hex(),
+                ]
+            # With no explicit precision override the loader preserves a
+            # checkpoint's native encoding; an explicit dense choice decodes
+            # it. Both paths must have distinct identities.
+            native = (
+                sorted(formats)
+                if quantizer is None and setting is not None and not setting[3]
+                else []
+            )
+            representation = (
+                tuple(tensor.shape),
+                str(dtype),
+                quantizer,
+                native,
+            )
+            value = digest(
+                "tensor-values",
+                numerics.loading(formats),
+                representation,
+                recipe,
+            )
+            values[name] = value
+            storage = [value]
+            if quantizer is not None or native:
+                storage.append(_providers())
+                owner, _ = compiler._owners[key]
+                if isinstance(owner, ExpertLinear):
+                    storage.append(expert_kernels)
+            stored[name] = digest("tensor-storage", storage)
+            layouts.append((name, representation))
+        return {
+            "structure": digest("weight-layout", layouts),
+            "tensors": stored,
+            "values": digest(
+                "model-values",
+                source.model_class,
+                source.model,
+                source.weights,
+                values,
+            ),
+        }
+    finally:
+        compiler.close()
 
 
 @dataclass
@@ -577,11 +683,13 @@ def field_parts(
     return parts
 
 
-def tensors(module: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
-    """Every parameter and buffer of ``module`` with its identity, once each.
+def tensors(
+    module: nn.Module, *, aliases: bool = False
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Every parameter and buffer of ``module`` with its identity.
 
     In ``named_modules(remove_duplicate=False)`` order; an alias is named by
-    its first path.
+    its first path, unless ``aliases`` requests every registered path.
     """
     seen: set[int] = set()
     for path, child in module.named_modules(remove_duplicate=False):
@@ -591,7 +699,7 @@ def tensors(module: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
             ("b", child._buffers.items()),
         ):
             for name, tensor in items:
-                if tensor is None or id(tensor) in seen:
+                if tensor is None or (not aliases and id(tensor) in seen):
                     continue
                 seen.add(id(tensor))
                 yield f"{kind}:{prefix}{name}", tensor

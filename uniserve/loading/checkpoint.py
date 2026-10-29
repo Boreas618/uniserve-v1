@@ -319,6 +319,19 @@ class Weight(ABC):
         Or an explicit nonnegative rectangular slice.
         """
 
+    def description(self) -> dict[str, Any]:
+        """The logical input to an assignment, without reading its values.
+
+        Encoded sources include their scale inputs below. The reader owns
+        the source files or stream identity; this description names the
+        particular values and interpretation selected within that source.
+        """
+        return {
+            "name": self.name,
+            "shape": self.shape,
+            "dtype": str(self.dtype),
+        }
+
 
 def _region(shape, region):
     if region is None:
@@ -344,6 +357,18 @@ class _TensorWeight(Weight):
     def read(self, region=None):
         return self.tensor[_region(self.shape, region)]
 
+    def description(self) -> dict[str, Any]:
+        return {
+            **Weight.description(self),
+            "values": self.tensor.detach()
+            .contiguous()
+            .reshape(-1)
+            .view(torch.uint8)
+            .numpy()
+            .tobytes()
+            .hex(),
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class _FileWeight(Weight):
@@ -358,6 +383,19 @@ class _FileWeight(Weight):
         value = self.reader._read(self.source_name, _region(self.shape, region))
         self.reader._consumed.add(self.source_name)
         return value
+
+    def description(self) -> dict[str, Any]:
+        location = self.reader._locations.get(self.source_name)
+        return {
+            **Weight.description(self),
+            "file": None
+            if location is None or self.reader.source.stream is not None
+            else location[0],
+            "identity": self.reader.source.identity,
+            "stream_source": self.reader.source.name
+            if self.reader.source.stream is not None
+            else None,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,6 +448,15 @@ class FP8Weight(Weight):
             shape=tuple(values.shape),
             dtype=self.dtype,
         )
+
+    def description(self) -> dict[str, Any]:
+        return {
+            **Weight.description(self),
+            "encoding": "fp8",
+            "axis": self.axis,
+            "values": self.values.description(),
+            "scale": self.scale.description(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,6 +517,20 @@ class NVFP4Weight(Weight):
             return None
         return float(self.activation_scale.read().reshape(()))
 
+    def description(self) -> dict[str, Any]:
+        return {
+            **Weight.description(self),
+            "encoding": "nvfp4",
+            "values": self.values.description(),
+            "block_scale": self.block_scale.description(),
+            "tensor_scale": self.tensor_scale.description(),
+            "activation_scale": (
+                None
+                if self.activation_scale is None
+                else self.activation_scale.description()
+            ),
+        }
+
     def read(self, region=None) -> QuantizedTensor:
         region = _region(self.shape, region)
         rows, columns = region
@@ -518,6 +579,9 @@ class _ScaleWeight(Weight):
     def read(self, region=None):
         value = self.source.read().reshape(self.shape)
         return value[_region(self.shape, region)]
+
+    def description(self) -> dict[str, Any]:
+        return {**Weight.description(self), "source": self.source.description()}
 
 
 class Reader:

@@ -12,23 +12,22 @@
 //! the key of what it holds: the regions of logical tensors its bytes are,
 //! where in it they lie, and the fingerprint of what determines their
 //! values and encoding (`uniserve.loading.retained.fingerprints`: the
-//! checkpoint source's files, the configuration, the weight choices, the
-//! revisions of how the weights derive from the checkpoint and what
+//! tensor's checkpoint inputs, assignment rectangles, numerical formats,
+//! declared loading transformations and what
 //! selects the providers whose layouts encoded weights are stored in). The
 //! key names neither the worker's rank nor its GPU: a chunk lies on a GPU,
 //! the Storage Server keeping one copy of a key per GPU, so a worker of any
 //! world and any parallel configuration that needs a region on a GPU finds
 //! the chunk that holds it there.
 //!
-//! A manifest, host bytes keyed by the structure fingerprint and the rank's
+//! A manifest, host bytes keyed by the tensor identities, structure and rank's
 //! position in its parallel configuration, names each tensor's source and
 //! representation, and each storage's fields, their logical parts and
 //! encodings, and its chunks. A worker of that position binds the tensors
 //! whose storages' chunks are all retained on its GPUs instead of reading
-//! the checkpoint. Every checkpoint of one structure shares the position's
-//! manifest, so the worker looks each chunk up under the key its own
-//! checkpoint's values give it, never under the key the manifest records:
-//! the bytes of another checkpoint are never bound.
+//! the checkpoint. The worker binds only fields with matching loading identities,
+//! using the recorded keys of their retained chunks. Unchanged fields of a
+//! packed chunk remain reusable when neighboring fields change.
 //!
 //! Loading is collective, so every worker that loads with this one (its
 //! worker group, or its expert union) agrees on what to read from the
@@ -101,12 +100,10 @@ pub(crate) fn model_identity(model: &Handle) -> Result<String> {
 /// as `uniserve.loading.retained.fingerprints` states it.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct Fingerprints {
-    /// Everything but the checkpoint's files: it keys the manifest and the
-    /// tensors no checkpoint source loads.
+    /// Tensor shapes and representations, used to find the rank's manifest.
     pub structure: String,
-    /// Each checkpoint source's fingerprint, by source name: it keys the
-    /// tensors loaded from that source.
-    pub sources: BTreeMap<String, String>,
+    /// Each tensor's loading identity, keyed by its library tensor name.
+    pub tensors: BTreeMap<String, String>,
     /// What determines the weights' values, regardless of the layouts their
     /// bytes take: it keys what forwards compute from them.
     pub values: String,
@@ -133,11 +130,8 @@ fn fingerprint_digest(fingerprint: &str) -> [u8; 32] {
 /// The keys of one worker's retained weights.
 #[derive(Clone)]
 pub(crate) struct WeightKeys {
-    /// The digest of what determines the tensors no checkpoint source
-    /// loads.
-    structure: [u8; 32],
-    /// The digest of what determines each checkpoint source's tensors.
-    sources: BTreeMap<String, [u8; 32]>,
+    /// The digest of each tensor's own loading inputs and encoding.
+    tensors: BTreeMap<String, [u8; 32]>,
     /// The manifest's key: the structure and the rank's position in its
     /// parallel configuration.
     manifest: Key,
@@ -189,11 +183,8 @@ impl Load {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WeightManifest {
     version: u64,
-    /// The digest, in hex, of what determines the bytes of each checkpoint
-    /// source's tensors, by source name, and of the tensors no source
-    /// loads, under the empty name: a worker of another position takes a
-    /// storage's bytes from this rank only where its fields' sources have
-    /// its own digests.
+    /// Each tensor's loading digest in hex. Readers bind or copy only fields
+    /// whose owning tensor has the same digest.
     fingerprints: BTreeMap<String, String>,
     /// Each tensor's identity, checkpoint source, whether it streams from
     /// host storage, representation and field names, as the library writes
@@ -363,10 +354,16 @@ impl WeightKeys {
         digest.update(structure);
         digest.update((position.len() as u64).to_le_bytes());
         digest.update(&position);
+        // Manifests are immutable content-addressed records too. A changed
+        // tensor must not publish new metadata under an existing manifest key.
+        for (tensor, fingerprint) in &fingerprints.tensors {
+            digest.update((tensor.len() as u64).to_le_bytes());
+            digest.update(tensor.as_bytes());
+            digest.update(fingerprint_digest(fingerprint));
+        }
         Self {
-            structure,
-            sources: fingerprints
-                .sources
+            tensors: fingerprints
+                .tensors
                 .iter()
                 .map(|(source, fingerprint)| (source.clone(), fingerprint_digest(fingerprint)))
                 .collect(),
@@ -388,15 +385,10 @@ impl WeightKeys {
         )
     }
 
-    /// The digest of what determines the bytes of tensors loaded from
-    /// checkpoint `source` (empty for none); `None` for a source the model
-    /// does not have.
-    fn fingerprint(&self, source: &str) -> Option<[u8; 32]> {
-        if source.is_empty() {
-            Some(self.structure)
-        } else {
-            self.sources.get(source).copied()
-        }
+    /// The loading identity of the tensor owning one encoded field.
+    fn fingerprint(&self, field: &str) -> Option<[u8; 32]> {
+        let (tensor, _) = field.rsplit_once('/')?;
+        self.tensors.get(tensor).copied()
     }
 
     /// Where device `index` of the worker lies.
@@ -444,9 +436,9 @@ impl WeightKeys {
         read_text(retained, self.manifest)
     }
 
-    /// The manifest this worker reads, `None` without one or for one of
-    /// another version, its storages keyed under this worker's
-    /// fingerprints ([`WeightKeys::own_storages`]).
+    /// The manifest this worker reads, with only fields whose loading
+    /// identities match. Chunk keys continue to name the bytes actually
+    /// retained, including when a packed chunk contains changed neighbors.
     fn manifest(&self, retained: &Retained) -> Result<Option<(String, WeightManifest)>> {
         let Some(text) = self.read_manifest(retained)? else {
             return Ok(None);
@@ -463,57 +455,36 @@ impl WeightKeys {
                 "the retained weight manifest is malformed: {error}"
             ))
         })?;
-        manifest.storages = self.own_storages(manifest.storages)?;
+        let wanted = self.fingerprint_digests();
+        for storage in &mut manifest.storages {
+            storage.storage.layout.fields.retain(|field| {
+                field.tensor.rsplit_once('/').is_some_and(|(tensor, _)| {
+                    wanted
+                        .get(tensor)
+                        .is_some_and(|digest| manifest.fingerprints.get(tensor) == Some(digest))
+                })
+            });
+        }
+        manifest
+            .storages
+            .retain(|storage| !storage.storage.layout.fields.is_empty());
         Ok(Some((text, manifest)))
     }
 
-    /// `storages`, as a manifest of this worker's position names them,
-    /// keyed under this worker's fingerprints. The manifest is keyed by the
-    /// structure and the position, which every checkpoint of one structure
-    /// shares, and records the chunk keys of the checkpoint that wrote it;
-    /// a chunk is found only under its full key, the regions it holds and
-    /// the fingerprint of the checkpoint source whose values they are, so
-    /// each chunk is looked up under the key this worker's own values give
-    /// it, and another checkpoint's bytes are never bound. A storage
-    /// holding a source this worker's model lacks is left out: its tensors
-    /// are missing and load.
-    fn own_storages(&self, storages: Vec<RetainedStorage>) -> Result<Vec<RetainedStorage>> {
-        let mut own = Vec::with_capacity(storages.len());
-        for mut storage in storages {
-            let known = storage
-                .storage
-                .layout
-                .fields
-                .iter()
-                .all(|field| self.fingerprint(&field.source).is_some());
-            if !known {
-                continue;
-            }
-            let keys = rekeyed(&storage.storage, &|source| self.fingerprint(source))?;
-            for (chunk, key) in storage.storage.chunks.iter_mut().zip(keys) {
-                chunk.key = key;
-            }
-            own.push(storage);
-        }
-        Ok(own)
-    }
-
-    /// The moves that rename this worker's retained weights to their keys
-    /// under `to`, the keys of the same tensors loaded from another
-    /// checkpoint: the manifest's and every chunk's whose key changes.
-    pub(crate) fn moves(&self, to: &WeightKeys, retained: &Retained) -> Result<Vec<(Key, Key)>> {
-        let (_, manifest) = self
+    /// Rename rewritten chunks and publish their current tensor identities.
+    /// The caller has completed the in-place numerical update while serving
+    /// is paused; future readers must see both the new keys and their inputs.
+    pub(crate) fn rename(&self, to: &WeightKeys, retained: &Retained) -> Result<usize> {
+        let (_, mut manifest) = self
             .manifest(retained)?
             .ok_or_else(|| Error::State("the worker's weights have no retained manifest"))?;
         let mut moves = Vec::new();
-        if self.manifest != to.manifest {
-            moves.push((self.manifest, to.manifest));
-        }
         let mut chunks = Vec::new();
-        for storage in &manifest.storages {
+        for storage in &mut manifest.storages {
             let renamed = rekeyed(&storage.storage, &|source| to.fingerprint(source))?;
-            for (chunk, key) in storage.storage.chunks.iter().zip(renamed) {
+            for (chunk, key) in storage.storage.chunks.iter_mut().zip(renamed) {
                 chunks.push((chunk.key, key));
+                chunk.key = key;
             }
         }
         // Only the chunks the server retains on the worker's GPUs move.
@@ -529,7 +500,18 @@ impl WeightKeys {
         );
         moves.sort_unstable();
         moves.dedup();
-        Ok(moves)
+        let moved = moves.len();
+        retained.rekey(moves)?;
+        manifest.fingerprints = to.fingerprint_digests();
+        let (tensor, record, descriptor) = manifest_record(to.manifest, &manifest)?;
+        retained.call("publishing updated weight identities", |client| {
+            client.put(vec![tensor], &[(record, descriptor.as_fd())])
+        })?;
+        retained.use_keys([to.manifest]);
+        if self.manifest != to.manifest {
+            retained.forget(&[self.manifest])?;
+        }
+        Ok(moved)
     }
 
     /// Where the worker's retained weights lie: its GPUs and host storage.
@@ -886,12 +868,9 @@ impl WeightKeys {
     /// The fingerprint digests a manifest of this worker names, in hex
     /// (`WeightManifest::fingerprints`).
     pub(crate) fn fingerprint_digests(&self) -> BTreeMap<String, String> {
-        std::iter::once((String::new(), hex(&self.structure)))
-            .chain(
-                self.sources
-                    .iter()
-                    .map(|(source, digest)| (source.clone(), hex(digest))),
-            )
+        self.tensors
+            .iter()
+            .map(|(tensor, digest)| (tensor.clone(), hex(digest)))
             .collect()
     }
 }
@@ -1348,33 +1327,27 @@ impl Published {
     }
 
     /// Keep in the manifest the storages the worker bound from `found`,
-    /// beside those it publishes: a later worker binds them too. A bound
-    /// storage holding a tensor of `load`, which the worker read again, is
-    /// left out, as the published storages hold that tensor now.
+    /// beside those it publishes: a later worker binds them too. Packed
+    /// storage may hold both retained and reloaded tensors; only reloaded
+    /// fields leave its manifest. Its owner must remain available for access
+    /// changes and future updates while any retained field still uses it.
     pub(crate) fn keep(&mut self, found: &Found, load: &BTreeSet<String>) {
-        let reread = |storage: &&RetainedStorage| {
-            storage.storage.layout.fields.iter().any(|field| {
+        for (storage, owner) in found.kept.iter().zip(&found.storages) {
+            let mut storage = storage.clone();
+            storage.storage.layout.fields.retain(|field| {
                 field
                     .tensor
                     .rsplit_once('/')
-                    .is_some_and(|(tensor, _)| load.contains(tensor))
-            })
-        };
-        self.manifest.storages.extend(
-            found
-                .kept
-                .iter()
-                .filter(|storage| !reread(storage))
-                .cloned(),
-        );
-        self.storages.extend(
-            found
-                .kept
-                .iter()
-                .zip(&found.storages)
-                .filter(|(storage, _)| !reread(storage))
-                .map(|(_, owner)| Arc::clone(owner)),
-        );
+                    .is_none_or(|(tensor, _)| !load.contains(tensor))
+            });
+            if storage.storage.layout.fields.is_empty() {
+                continue;
+            }
+            self.shared
+                .extend(storage.storage.chunks.iter().map(|chunk| chunk.key));
+            self.manifest.storages.push(storage);
+            self.storages.push(Arc::clone(owner));
+        }
     }
 
     /// Add the host region of the layer stack under `path`, which
@@ -1475,9 +1448,8 @@ impl Published {
             shared,
         } = self;
         drop(layout);
-        let text = serde_json::to_string(&manifest)
-            .map_err(|error| Error::Invalid(format!("encoding the weight manifest: {error}")))?;
-        let manifest_storage = host_bytes(text.as_bytes())?;
+        let (mut manifest_tensor, manifest_record, manifest_storage) =
+            manifest_record(keys.manifest, &manifest)?;
         let mut tensors: Vec<TensorRecord> = Vec::with_capacity(created.len() + 1);
         let mut records: Vec<(StorageRecord, std::os::fd::BorrowedFd<'_>)> =
             Vec::with_capacity(created.len() + 1);
@@ -1488,25 +1460,9 @@ impl Published {
             });
             records.push((*storage, descriptor.as_fd()));
         }
-        tensors.push(TensorRecord {
-            key: keys.manifest,
-            name: MANIFEST_NAME.into(),
-            storage: records.len() as u32,
-            offset: 0,
-            dtype: "uint8".into(),
-            shape: vec![text.len() as u64],
-            strides: vec![1],
-            access: Access::ReadOnly,
-        });
-        records.push((
-            StorageRecord {
-                placement: Placement::Host { numa_node: None },
-                bytes: text.len() as u64,
-                segment: None,
-                fabric: None,
-            },
-            manifest_storage.as_fd(),
-        ));
+        manifest_tensor.storage = records.len() as u32;
+        tensors.push(manifest_tensor);
+        records.push((manifest_record, manifest_storage.as_fd()));
         let used: Vec<Key> = tensors
             .iter()
             .map(|tensor| tensor.key)
@@ -1653,6 +1609,34 @@ fn read_text(retained: &Retained, key: Key) -> Result<Option<String>> {
         .map_err(|_| Error::Interface("the retained weight manifest is not text".into()))
 }
 
+/// The immutable host record of a rank's current tensor identities and chunks.
+fn manifest_record(
+    key: Key,
+    manifest: &WeightManifest,
+) -> Result<(TensorRecord, StorageRecord, OwnedFd)> {
+    let text = serde_json::to_string(manifest)
+        .map_err(|error| Error::Invalid(format!("encoding the weight manifest: {error}")))?;
+    Ok((
+        TensorRecord {
+            key,
+            name: MANIFEST_NAME.into(),
+            storage: 0,
+            offset: 0,
+            dtype: "uint8".into(),
+            shape: vec![text.len() as u64],
+            strides: vec![1],
+            access: Access::ReadOnly,
+        },
+        StorageRecord {
+            placement: Placement::Host { numa_node: None },
+            bytes: text.len() as u64,
+            segment: None,
+            fabric: None,
+        },
+        host_bytes(text.as_bytes())?,
+    ))
+}
+
 /// A host memfd holding `bytes`.
 fn host_bytes(bytes: &[u8]) -> Result<OwnedFd> {
     let descriptor =
@@ -1688,103 +1672,4 @@ fn manifest_tensors(text: &str) -> Result<Vec<ManifestTensor>> {
         )));
     }
     Ok(described.tensors)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ::storage::manifest::{Encoding, Logical, Segment, Span};
-
-    /// The keys of a worker of a model with one checkpoint source, `model`,
-    /// whose files fingerprint as `values`; the structure is the same for
-    /// every value.
-    fn keys(values: &str) -> WeightKeys {
-        let fingerprints = Fingerprints {
-            structure: "qwen3 structure".into(),
-            sources: BTreeMap::from([("model".to_owned(), values.to_owned())]),
-            values: values.into(),
-        };
-        WeightKeys::keyed(&fingerprints, b"rank 0".to_vec(), Vec::new(), vec![1, 2])
-    }
-
-    /// One retained storage of a 4 MiB matrix loaded from `model`, chunked
-    /// and keyed as `writer` retains it.
-    fn written_by(writer: &WeightKeys) -> RetainedStorage {
-        let field = Field {
-            tensor: "p:weight/data".into(),
-            source: "model".into(),
-            dtype: "uint8".into(),
-            element: 1,
-            offset: 0,
-            shape: vec![2, 2 << 20],
-            strides: vec![2 << 20, 1],
-            logical: Logical {
-                shape: vec![2, 2 << 20],
-                dims: vec!["output".into(), "input".into()],
-                units: vec![1, 1],
-                segments: vec![
-                    vec![Segment {
-                        span: Span::range(0, 2),
-                        local: 0,
-                    }],
-                    vec![Segment {
-                        span: Span::range(0, 2 << 20),
-                        local: 0,
-                    }],
-                ],
-            },
-            encoding: Encoding::Affine,
-        };
-        let (mut storages, _) = retained_storages(
-            &[0],
-            &[4 << 20],
-            vec![(0, field)],
-            &[2 << 20],
-            &writer.degrees,
-            &|source| writer.fingerprint(source),
-        )
-        .unwrap();
-        storages.remove(0)
-    }
-
-    fn chunk_keys(storage: &RetainedStorage) -> Vec<Key> {
-        storage
-            .storage
-            .chunks
-            .iter()
-            .map(|chunk| chunk.key)
-            .collect()
-    }
-
-    /// Two checkpoints of one structure share their position's manifest:
-    /// a worker of the second looks the first's chunks up under its own
-    /// values' keys, none of which the first retained, so it binds none of
-    /// the first's bytes; a worker of the first finds its chunks as written.
-    #[test]
-    fn a_manifest_of_another_checkpoint_names_none_of_its_chunks() {
-        let original = keys("original files");
-        let renormed = keys("renormalized files");
-        assert_eq!(original.manifest, renormed.manifest);
-
-        let written = written_by(&original);
-        let recorded = chunk_keys(&written);
-        let found = renormed.own_storages(vec![written.clone()]).unwrap();
-        let looked_up = chunk_keys(&found[0]);
-        assert_eq!(looked_up.len(), recorded.len());
-        assert!(looked_up.iter().all(|key| !recorded.contains(key)));
-        assert_eq!(looked_up, chunk_keys(&written_by(&renormed)));
-
-        let again = original.own_storages(vec![written]).unwrap();
-        assert_eq!(chunk_keys(&again[0]), recorded);
-    }
-
-    /// A storage of a checkpoint source the reading worker's model does not
-    /// load is left out: its tensors are missing and load.
-    #[test]
-    fn a_storage_of_an_unknown_source_is_left_out() {
-        let original = keys("original files");
-        let mut written = written_by(&original);
-        written.storage.layout.fields[0].source = "draft".into();
-        assert!(original.own_storages(vec![written]).unwrap().is_empty());
-    }
 }

@@ -59,7 +59,7 @@ _AUDIO_UNEVALUATED_TENSORS = ("logs_proj.",)
 # ``MiniMaxH3Transformer3DModel``) by serialized prefix. The conditioner owns
 # the text projection and refiner; the transformer owns the blocks and the
 # latent input and output heads; the time embedder and the modulation
-# projections are read only by the transformer's post-load hook.
+# projections are read only by the transformer's loading derivations.
 _CONDITIONER_TENSORS = ("context_embedder.", "token_refiner.")
 _BLOCK_TENSORS = "transformer_blocks."
 _TIME_TENSORS = ("time_embedder.",)
@@ -161,10 +161,10 @@ def transformer_assignments(model, reader):
 
 
 @torch.inference_mode()
-def _prepare_adaln_cache(model, config: DenoiserConfig, reader):
+def _prepare_adaln_cache(model, config: DenoiserConfig, reader, target: str):
     """Precompute the resident layers' modulation products for the schedule.
 
-    Runs as the transformer mapping's post-load hook, after the resident
+    Runs as a declared loading derivation, after the resident
     parameters are materialized. Evaluates the checkpoint's FP32 timestep
     embedding and SiLU for each step's group timesteps, keeps one row per
     distinct timestep value, projects the rows through each resident layer's
@@ -174,6 +174,11 @@ def _prepare_adaln_cache(model, config: DenoiserConfig, reader):
     # These temporary learned projections belong to loading. Only their fixed
     # step products remain with the numerical transformer after this function.
     device = next(model.parameters()).device
+    values = schedules(config, device="cpu")
+    steps, entries, groups = adaln_timesteps(config, values)
+    if target == "groups":
+        model.adaln_cache.groups = groups.to(device)
+        return
     with torch.device("meta"):
         embedding = TimestepEmbedding(model.config)
     for index, source in ((0, "linear_1"), (2, "linear_2")):
@@ -192,8 +197,6 @@ def _prepare_adaln_cache(model, config: DenoiserConfig, reader):
     # keep the row of their first occurrence in step-major order, so a
     # schedule without repeated values projects exactly the [step, group]
     # rows. ``activated`` is [entry, time_dim].
-    values = schedules(config, device="cpu")
-    steps, entries, groups = adaln_timesteps(config, values)
     activated = torch.cat([F.silu(embedding(row.to(device))) for row in steps])
     del embedding
     first = []
@@ -212,30 +215,33 @@ def _prepare_adaln_cache(model, config: DenoiserConfig, reader):
             for field in ("weight", "bias")
         )
 
+    if target == "output_products":
+        weight, bias = projection("norm_out.linear")
+        model.adaln_cache.output_products = F.linear(
+            activated.to(weight.dtype), weight, bias
+        )
+        return
+
     prepared = AdaLNCache.from_projections(
         activated,
         (
             projection(f"transformer_blocks.{index}.adaln_proj.linear")
             for index in model.layers
         ),
-        projection("norm_out.linear")
-        if model.output_norm is not None
-        else None,
+        None,
         groups=groups,
         layer_count=len(model.layers),
     )
     # Keep the existing module identity so the loader can retain its buffers
     # along the same selected-component and device bindings as the model.
-    model.adaln_cache.products = prepared.products
-    model.adaln_cache.output_products = prepared.output_products
-    model.adaln_cache.groups = prepared.groups
+    setattr(model.adaln_cache, target, getattr(prepared, target))
 
 
 @torch.inference_mode()
-def _prepare_heads(model, schedule: PddGrid, reader):
+def _prepare_heads(model, schedule: PddGrid, reader, target: str):
     """Fuse a PDD student's output heads once per evaluation block.
 
-    Runs in the transformer mapping's post-load hook, which materializes the
+    Runs as a declared loading derivation, which materializes the
     ``StepProjection`` buffers on the device of the loaded parameters. The
     checkpoint's ``proj_out`` and ``audio_proj_out`` stack one head per
     fine-grid interval, head-major. Block ``k`` of each modality fuses its
@@ -250,6 +256,9 @@ def _prepare_heads(model, schedule: PddGrid, reader):
         (model.video_output, "proj_out", schedule.video_shift),
         (model.audio_output, "audio_proj_out", schedule.audio_shift),
     ):
+        modality = "video_output" if source == "proj_out" else "audio_output"
+        if not target.startswith(modality + "."):
+            continue
         grid = block_grid(
             schedule.intervals,
             schedule.nodes,
@@ -258,6 +267,8 @@ def _prepare_heads(model, schedule: PddGrid, reader):
             device="cpu",
         )
         for field in ("weight", "bias"):
+            if target != f"{modality}.{field}":
+                continue
             heads = (
                 reader.get(f"{source}.{field}")
                 .read()
@@ -284,14 +295,14 @@ def transformer_component(model, config: DenoiserConfig, source: str):
     Prunes ``model`` to this pipeline stage first (see ``_resident_layers``).
     Declares nonresident the conditioner's tensors, other stages' layers and
     heads, and the timestep and modulation projections (and a PDD student's
-    output heads) that only the post-load hook reads. ``source`` names the
+    output heads) that only loading derivations read. ``source`` names the
     checkpoint source of this DiT partition.
     """
     _resident_layers(model)
     fused = isinstance(model.video_output, StepProjection)
 
     # The conditioner and time embedder tensors, and every resident layer's
-    # modulation projection, are read only by the post-load hook (or by the
+    # modulation projection, are read only by loading derivations (or by the
     # conditioner); a layer of another pipeline stage is left whole.
     prefixes = [*_CONDITIONER_TENSORS, *_TIME_TENSORS, "norm_out.linear."]
     for index in range(model.config.num_hidden_layers):
@@ -305,14 +316,85 @@ def transformer_component(model, config: DenoiserConfig, source: str):
     if model.output_norm is None:
         prefixes.extend(("norm_out.", *_OUTPUT_TENSORS))
     elif fused:
-        # A PDD student's heads are fused by the post-load hook.
+        # A PDD student's heads are fused by loading derivations.
         prefixes.extend(_OUTPUT_TENSORS)
 
-    def post_load(reader):
-        _prepare_adaln_cache(model, config, reader)
-        if fused and model.output_norm is not None:
-            assert isinstance(config.schedule, PddGrid)
-            _prepare_heads(model, config.schedule, reader)
+    time_sources = tuple(
+        f"{prefix}.{field}"
+        for prefix in (
+            "time_embedder.linear_1",
+            "time_embedder.linear_2",
+        )
+        for field in ("weight", "bias")
+    )
+    schedule_inputs = {
+        "schedule": config.schedule,
+        "conditioned": config.tasks != ("t2va",),
+    }
+    derivations = []
+    for target in ("products", "output_products", "groups"):
+        if getattr(model.adaln_cache, target) is None:
+            continue
+        projections = (
+            tuple(
+                f"transformer_blocks.{index}.adaln_proj.linear"
+                for index in model.layers
+            )
+            if target == "products"
+            else ("norm_out.linear",)
+            if target == "output_products" and model.output_norm is not None
+            else ()
+        )
+        sources = (
+            (
+                *time_sources,
+                *(
+                    f"{prefix}.{field}"
+                    for prefix in projections
+                    for field in ("weight", "bias")
+                ),
+            )
+            if target != "groups"
+            else ()
+        )
+        parameters = dict(schedule_inputs)
+        if target != "groups":
+            parameters["frequency_dim"] = config.transformer.frequency_dim
+        derivations.append(
+            weights.Derivation(
+                "models.minimax_h3.modulation/1",
+                (f"adaln_cache.{target}",),
+                sources,
+                parameters,
+                lambda reader, target=target: _prepare_adaln_cache(
+                    model, config, reader, target
+                ),
+            )
+        )
+    if fused and model.output_norm is not None:
+        assert isinstance(config.schedule, PddGrid)
+        for target, prefix, shift in (
+            ("video_output", "proj_out", config.schedule.video_shift),
+            ("audio_output", "audio_proj_out", config.schedule.audio_shift),
+        ):
+            for field in ("weight", "bias"):
+                name = f"{target}.{field}"
+                derivations.append(
+                    weights.Derivation(
+                        "models.minimax_h3.fused_heads/1",
+                        (name,),
+                        (f"{prefix}.{field}",),
+                        {
+                            "intervals": config.schedule.intervals,
+                            "nodes": config.schedule.nodes,
+                            "shift": shift,
+                            "max_t": config.schedule.max_t,
+                        },
+                        lambda reader, name=name: _prepare_heads(
+                            model, config.schedule, reader, name
+                        ),
+                    )
+                )
 
     return weights.ModuleMapping(
         model,
@@ -320,7 +402,7 @@ def transformer_component(model, config: DenoiserConfig, source: str):
         lambda reader: tuple(transformer_assignments(model, reader)),
         frozenset(name for name, _ in model.named_parameters()),
         nonresident_prefixes=tuple(prefixes),
-        post_load=post_load,
+        derivations=tuple(derivations),
     )
 
 

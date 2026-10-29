@@ -422,7 +422,6 @@ def fingerprint(
         retention.fingerprints(
             resolved.source,
             description.io,
-            str(model_dtype),
             kernels,
         ),
         sort_keys=True,

@@ -22,11 +22,6 @@ from .precision import checkpoint_precision, precisions
 from .processing import image_processor
 from .weights import checkpoint_mappings, checkpoint_sources
 
-# The revision of how this package derives its parameters from its
-# checkpoint: its tensor mappings, fusions and conversions
-# (`uniserve.numerics.loading`).
-LOADING = "models.diffusion_gemma/1"
-
 # Block diffusion has no classifier-free-guidance prompt framing.
 flow_prompt = None
 
