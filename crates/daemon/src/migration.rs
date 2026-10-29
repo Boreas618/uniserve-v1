@@ -1,13 +1,14 @@
 //! Request migration: how a token or video request moves between engines.
 //!
 //! An engine that parks for a world change or a rollback, sleeps, rewrites
-//! its weights in place, or loses the workers that hold a request, ends the
-//! request as migratable (`Event::Migratable`): a token request after every
-//! token and image it generated there, a video request at a denoising step
-//! boundary, with the steps of its trajectory the engine stored. The leader
-//! submits every request through its [`Migrator`], which keeps the facts a
-//! continuation needs and, on that event, submits the request again with
-//! them through the hold to the engine that serves next:
+//! its weights in place, shrinks its KV cache, or loses the workers that
+//! hold a request, ends the request as migratable (`Event::Migratable`): a
+//! token request after every token and image it generated there, a video
+//! request at a denoising step boundary, each with the steps of the
+//! trajectory the engine stored of the image or video it was denoising. The
+//! leader submits every request through its [`Migrator`], which keeps the
+//! facts a continuation needs and, on that event, submits the request again
+//! with them through the hold to the engine that serves next:
 //!
 //! - a token request's generated tokens, every one its engine counted, the
 //!   text it published and the control tokens it did not, such as those
@@ -17,7 +18,11 @@
 //!   read (the decoded image product's values the engine published with the
 //!   image, or its PNG when feedback reads the artifact) and the number of
 //!   tokens before it (`GenerationRequest::generated_images`);
-//! - a video request's stored steps (`Trajectory::denoised_steps`).
+//! - the stored steps of the trajectory of a video request, or of the image
+//!   a token request had begun and not finished, and the engine's record of
+//!   where they lie (`Trajectory::denoised_steps`, `Trajectory::stored_layout`;
+//!   `GenerationRequest::trajectory` for a token request, forgotten once
+//!   the image completes).
 //!
 //! These are facts: the client received every token and image, and the
 //! engine that continues the request computes everything else from them, its
@@ -26,9 +31,13 @@
 //! image it received, numbers its next image after them and charges the
 //! request's whole usage, or continues the trajectory from the stored step,
 //! and the daemon's detokenizer, stop-string matcher and response assembly
-//! keep their state. An image the request had begun and not finished starts
-//! again from noise, which follows from its facts; the consumer does not
-//! read its start or its steps again.
+//! keep their state. An image the request had begun and not finished
+//! continues from its stored step when the engine that serves next computes
+//! the same (or when a world change keeps the state of the requests in
+//! flight, `in_flight = keep`) and its host latent pools hold the
+//! trajectory, and starts again from noise otherwise, which follows from
+//! its facts; the consumer does not read its start or the steps it read
+//! again.
 //!
 //! A migration caused by a drain is not counted. A request survives
 //! `max_migrations` migrations caused by losses and fails on the next one.
@@ -41,9 +50,10 @@
 //! and its token position alone. An image's noise follows the request's
 //! image seed and the image's index, and a latent encoding's posterior draw
 //! the encoding's place among the request's encodings, which the request's
-//! facts fix. A video request's draws follow its seed, and the migrator
-//! gives it the identity that keys its stored trajectory (`Trajectory::id`)
-//! when it is first submitted.
+//! facts fix. A video request's draws follow its seed. The migrator gives
+//! a video request, and a token request that generates images, the identity
+//! that keys its stored trajectories (`Trajectory::id`) when it is first
+//! submitted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +61,7 @@ use std::time::Instant;
 
 use proto::request::{
     DiffusionRequest, Event, FeedbackImage, FeedbackSource, GeneratedImage, GenerationRequest,
-    MigrationCause, Request,
+    MigrationCause, Request, Trajectory,
 };
 use tokio::sync::mpsc;
 
@@ -86,7 +96,8 @@ impl Migrator {
     /// that resumes from its tokens, and a video request, are kept for a
     /// later migration; a token request that names no seed takes one first,
     /// so that its draws repeat on the engine that serves it next, and a
-    /// video request takes its trajectory's identity.
+    /// video request, or a token request that generates images, takes its
+    /// trajectories' identity.
     ///
     /// # Errors
     ///
@@ -99,6 +110,9 @@ impl Migrator {
             Request::Generation(generation) if generation.is_migratable() => {
                 if generation.sampling.seed.is_none() {
                     generation.sampling.seed = Some(uuid::Uuid::new_v4().as_u64_pair().0);
+                }
+                if generation.generates_images() && generation.trajectory.id == 0 {
+                    generation.trajectory.id = uuid::Uuid::new_v4().as_u64_pair().0;
                 }
                 Some(Resumable::Generation(generation.clone()))
             }
@@ -139,12 +153,12 @@ enum Resumable {
 
 impl Resumable {
     /// The request `migration` submits again: a token request with the
-    /// tokens it generated, a video request naming the trajectory steps
-    /// its engine stored and its record of where they lie
-    /// (`Migration::denoised_steps`, zero for none). `kept` is the state a
-    /// world change keeps of the requests in flight (`in_flight = keep`),
-    /// which the request continues with when the world that serves next
-    /// computes other numerics.
+    /// tokens it generated, each naming the trajectory steps its engine
+    /// stored (of a video request, or of the image a token request had
+    /// begun) and its record of where they lie (`Migration::denoised_steps`,
+    /// zero for none). `kept` is the state a world change keeps of the
+    /// requests in flight (`in_flight = keep`), which the request continues
+    /// with when the world that serves next computes other numerics.
     fn continuation(&self, migration: &Migration, kept: Option<Kept>) -> Request {
         let Migration {
             cause,
@@ -164,29 +178,30 @@ impl Resumable {
                     continuation.cache.state_seed = Some(seed);
                     continuation.cache.write = false;
                 }
+                stored(
+                    &mut continuation.trajectory,
+                    denoised_steps,
+                    stored_layout,
+                    kept,
+                );
                 tracing::info!(
                     ?cause,
                     generated = request.generated_token_ids.len(),
                     images = request.generated_images.len(),
+                    denoised_steps = continuation.trajectory.denoised_steps,
+                    stored = denoised_steps > 0,
                     "a request migrated to the engine that serves next"
                 );
                 Request::Generation(Box::new(continuation))
             }
             Self::Diffusion(request) => {
                 let mut continuation = request.clone();
-                // The engine stored the trajectory at a step boundary, keyed
-                // by what it computes: the next engine reads it when it
-                // computes the same, or when a world change keeps the state
-                // the request reached, whatever its parallel configuration,
-                // from where the engine's record says the pages lie. A
-                // request the engine stored nothing of names the trajectory
-                // it named before, which is the same at that step whenever
-                // it is read.
-                if denoised_steps > 0 {
-                    continuation.trajectory.denoised_steps = denoised_steps;
-                    continuation.trajectory.state_seed = kept.and_then(|kept| kept.latent_seed);
-                    continuation.trajectory.stored_layout = stored_layout.clone();
-                }
+                stored(
+                    &mut continuation.trajectory,
+                    denoised_steps,
+                    stored_layout,
+                    kept,
+                );
                 tracing::info!(
                     ?cause,
                     denoised_steps = continuation.trajectory.denoised_steps,
@@ -196,6 +211,27 @@ impl Resumable {
                 Request::Diffusion(continuation)
             }
         }
+    }
+}
+
+/// Names in `trajectory` the `denoised_steps` of it an engine stored at a
+/// step boundary, keyed by what that engine computes, and its record of
+/// where they lie (`stored_layout`): the next engine reads them when it
+/// computes the same, or when a world change keeps the state the request
+/// reached (`kept`), whatever its parallel configuration, from where the
+/// record says the pages lie. A request the engine stored nothing of names
+/// the trajectory it named before, which is the same at that step whenever
+/// it is read.
+fn stored(
+    trajectory: &mut Trajectory,
+    denoised_steps: u32,
+    stored_layout: &[u8],
+    kept: Option<Kept>,
+) {
+    if denoised_steps > 0 {
+        trajectory.denoised_steps = denoised_steps;
+        trajectory.state_seed = kept.and_then(|kept| kept.latent_seed);
+        trajectory.stored_layout = stored_layout.to_vec();
     }
 }
 
@@ -238,7 +274,7 @@ pub struct RequestEvents {
     /// The last step the consumer received of each image that began, by
     /// image identity: an image a migration restarts from noise repeats its
     /// start and the steps the consumer received, which it does not read
-    /// again.
+    /// again; one that continues from a stored step repeats none.
     images: HashMap<u32, u16>,
     /// When the request's last migration began, until the engine that serves
     /// it next delivers its first token.
@@ -415,7 +451,10 @@ impl RequestEvents {
                 pixels_png_b64,
                 feedback,
                 ..
-            } => self.keep_image(pixels_png_b64, feedback.as_ref()),
+            } => {
+                self.forget_trajectory();
+                self.keep_image(pixels_png_b64, feedback.as_ref());
+            }
             event if event.is_terminal() => self.finish(),
             _ => {}
         }
@@ -451,6 +490,18 @@ impl RequestEvents {
             tokens: u32::try_from(request.generated_token_ids.len()).unwrap_or(u32::MAX),
             image,
         });
+    }
+
+    /// Forgets the stored steps a token request names: they are of the
+    /// image it had begun, which completed, and its next image starts from
+    /// noise unless an engine stores its trajectory.
+    fn forget_trajectory(&mut self) {
+        if let Some(Resumable::Generation(request)) = &mut self.request {
+            request.trajectory = Trajectory {
+                id: request.trajectory.id,
+                ..Trajectory::default()
+            };
+        }
     }
 
     /// Appends generated tokens to the request a migration submits; the
@@ -524,6 +575,7 @@ impl RequestEvents {
         match (&continuation, &mut self.request) {
             (Request::Generation(submitted), Some(Resumable::Generation(request))) => {
                 request.cache = submitted.cache.clone();
+                request.trajectory = submitted.trajectory.clone();
             }
             (Request::Diffusion(submitted), Some(Resumable::Diffusion(request))) => {
                 *request = submitted.clone();
@@ -595,6 +647,7 @@ mod tests {
             generated_token_ids: Vec::new(),
             adapter: 0,
             generated_images: Vec::new(),
+            trajectory: Default::default(),
         }
     }
 
@@ -989,8 +1042,11 @@ mod tests {
     /// and a usage that counts every token and image. The engine that
     /// continues it first writes into its context exactly what the
     /// preempted engine wrote, its images included; an image the request
-    /// had begun starts again from noise, and every image is the one the
-    /// uninterrupted request generates under that image index.
+    /// had begun starts again from noise, as these simulated engines map no
+    /// host latent pools to store its trajectory in
+    /// (`crates/engine/tests/it/media_preemption.rs` stores it), and every
+    /// image is the one the uninterrupted request generates under that
+    /// image index.
     async fn an_image_request_resumes(phase: Phase, sampled: bool, preemption: Preemption) {
         let (whole, _, whole_log) = image_engine(false);
         let (first, pace, first_log) = image_engine(true);

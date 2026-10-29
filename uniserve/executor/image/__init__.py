@@ -1480,11 +1480,14 @@ class ImageExecutor:
         call's image tensors in call order (its resident read, its prepared
         pixels, each write, its lent bytes, then for an encoding whose
         features lie in the host encoder pool one ``uint8 [page_bytes]``
-        host tensor per copy its ``host["copies"]`` lists), then for a
-        denoising batch the ``int64 [5 + 2G, R]`` attention rows. An
-        encoding with ``host["import"]`` reads its features from those
-        pages instead of encoding; any other writes the features it encoded
-        to them. Returns each call's graph mode.
+        host tensor per copy its ``host["copies"]`` lists, then for a latent
+        preparation that restores a stored trajectory one ``uint8
+        [page_bytes]`` host tensor per stored page its
+        ``latent["restore"]["pages"]`` counts), then for a denoising batch
+        the ``int64 [5 + 2G, R]`` attention rows. An encoding with
+        ``host["import"]`` reads its features from those pages instead of
+        encoding; any other writes the features it encoded to them. Returns
+        each call's graph mode.
         """
         placed = self.placed[int(computation)]
         calls = step["calls"]
@@ -1502,8 +1505,10 @@ class ImageExecutor:
         bound: list[
             tuple[Mapping[str, Any], PlanEntry, list[torch.Tensor]]
         ] = []
-        # Each encoding's host encoder pool pages, by call index.
+        # Each encoding's host encoder pool pages, and each restoring latent
+        # preparation's stored pages, by call index.
         pages: dict[int, list[torch.Tensor]] = {}
+        stored: dict[int, list[torch.Tensor]] = {}
         for entry, planned in zip(calls, prepared, strict=True):
             plan = PlanEntry.from_json(planned)
             if plan is None or entry["refused"] or not entry["active"]:
@@ -1518,6 +1523,13 @@ class ImageExecutor:
                     tensors[cursor : cursor + copied]
                 )
                 cursor += copied
+            restore = (entry.get("latent") or {}).get("restore")
+            if restore is not None:
+                read = int(restore["pages"])
+                stored[int(entry["index"])] = list(
+                    tensors[cursor : cursor + read]
+                )
+                cursor += read
         rest = list(tensors[cursor:])
         modes = {int(entry["index"]): GraphMode.EAGER for entry in calls}
         # The encodings whose features the host encoder pool holds read them
@@ -1542,7 +1554,7 @@ class ImageExecutor:
             elif kind == "latent_encoding":
                 self._encode_latents(placed, bound, modes)
             elif kind == "latent_preparation":
-                self._prepare_latents(placed, bound, modes, predicates)
+                self._prepare_latents(placed, bound, modes, predicates, stored)
             elif kind == "denoising":
                 if len(rest) != 1:
                     raise ValueError(
@@ -1664,7 +1676,14 @@ class ImageExecutor:
                 pixels, out, seed=request.seed, draw=int(draw)
             )
 
-    def _prepare_latents(self, computation, bound, modes, predicates) -> None:
+    def _prepare_latents(
+        self, computation, bound, modes, predicates, stored
+    ) -> None:
+        """Open each call's trajectory from its seeded noise, or from the
+        stored trajectory a resumed request's call restores: the stored
+        pages ``stored`` holds by call index, laid out by the copies its
+        ``latent["restore"]["copies"]`` lists.
+        """  # noqa: D205
         denoiser = computation.denoiser
         assert denoiser is not None
         for entry, _, _ in bound:
@@ -1673,14 +1692,26 @@ class ImageExecutor:
             image_index = entry["call"].get("image_index")
             if image_index is None:
                 raise ValueError("latent preparation names no image index")
-            modes[int(entry["index"])] = denoiser.prepare_latents(
+            index = int(entry["index"])
+            restore = entry["latent"].get("restore")
+            restored = None
+            if restore is not None:
+                restored = (
+                    [
+                        [int(value) for value in copy]
+                        for copy in restore["copies"]
+                    ],
+                    stored[index],
+                )
+            modes[index] = denoiser.prepare_latents(
                 int(entry["slot"]),
                 request.key,
                 params,
                 request.negative,
                 int(image_index),
                 LatentBinding.from_json(entry["latent"]),
-                predicates.get(int(entry["index"])),
+                predicates.get(index),
+                restored,
             )
 
     def _denoise(

@@ -352,24 +352,17 @@ struct MediaFlowState {
     predecessor: CallId,
     terminal_intent: TerminalIntent,
     artifact: Option<ArtifactEvent>,
-    /// Whether the request's trajectory continues from a stored step, which
-    /// its latent preparation waits for (`trajectories`).
-    restoring: Restoring,
-    /// Whether the host latent pools are storing the trajectory of the
-    /// request, which a preemption ends at a step boundary
-    /// (`TerminalIntent::Migrate`); it leaves once they stored it or failed
-    /// to.
-    offloading: bool,
-    /// How each denoising rank's request slot pages hold the request's
-    /// samples, by rank, as its latent preparation reported them
-    /// (`CallOutput::latent_layouts`): a stored trajectory's pages are keyed
-    /// and recorded by them.
-    latent_layouts: BTreeMap<u32, String>,
+    /// The request's trajectory in the host latent pools.
+    host_trajectory: HostTrajectory,
 }
 
-/// What a video request's latent preparation opens its trajectory from.
+/// What a request's latent preparation opens its trajectory from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Restoring {
+    /// A token request resumes the image it had begun, of which it names
+    /// stored steps: the stored trajectory is pinned once the image's
+    /// latent preparation is due, for the replica that runs it.
+    Due,
     /// Its stored trajectory's pages are being pinned in the host latent
     /// pools; the preparation waits for the answers.
     Pinning,
@@ -379,6 +372,31 @@ enum Restoring {
     Ready(Option<ipc::LatentRestore>),
     /// The preparation was planned; the pins, if any, end with its result.
     Planned,
+}
+
+impl Default for Restoring {
+    fn default() -> Self {
+        Self::Ready(None)
+    }
+}
+
+/// A request's latent trajectory in the host latent pools
+/// (`crate::trajectories`): a video request's, or that of the image a token
+/// request is generating.
+#[derive(Debug, Clone, Default)]
+struct HostTrajectory {
+    /// Whether the trajectory continues from a stored step, which its
+    /// latent preparation waits for.
+    restoring: Restoring,
+    /// Whether the host latent pools are storing the trajectory, which a
+    /// preemption ended at a step boundary (`TerminalIntent::Migrate`); the
+    /// request leaves once they stored it or failed to.
+    offloading: bool,
+    /// How each denoising rank's pages hold the trajectory's samples, by
+    /// rank, as its latent preparation reported them
+    /// (`CallOutput::latent_layouts`): a stored trajectory's pages are
+    /// keyed and recorded by them.
+    layouts: BTreeMap<u32, String>,
 }
 
 /// Progress of a media request's worker admission (`NewRequest`).

@@ -449,8 +449,27 @@ impl RequestState {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
                 if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
-                    // An image trajectory always opens at step zero.
-                    self.denoising.open(0, call.latent_output.clone());
+                    // An image trajectory opens at step zero, or at the
+                    // stored step its preparation restored, which a
+                    // preemption stored within the schedule.
+                    let opened = call
+                        .latent_restore
+                        .as_ref()
+                        .map_or(0, |restore| restore.steps);
+                    if record.step_index != opened
+                        || !self.denoising.open(opened, call.latent_output.clone())
+                    {
+                        return Err(GenerationResultError::Progress {
+                            detail: "latent_restore_step_mismatch",
+                        });
+                    }
+                    // How each denoising rank holds the trajectory, which a
+                    // preemption keys and records the stored trajectory by.
+                    self.host_trajectory.layouts = record
+                        .latent_layouts
+                        .iter()
+                        .map(|layout| (layout.rank, layout.layout.clone()))
+                        .collect();
                     self.phase = GenerationPhase::Denoising;
                 } else {
                     let accepted = self
@@ -1654,6 +1673,10 @@ pub(crate) struct RequestState {
     pub(super) image_reservation_pending: bool,
     /// Solver progress of the current image's latent trajectory.
     pub(super) denoising: super::Denoising,
+    /// The current image's trajectory in the host latent pools: the stored
+    /// steps of the image a migrated request had begun, which its latent
+    /// preparation restores, and the store of a preempted one.
+    pub(super) host_trajectory: super::HostTrajectory,
     /// Exact generations retained for conditioning, denoising, and feedback.
     pub(super) image_conditioning: Option<ipc::BufferId>,
     /// The prefill group's export of the request's KV cache during

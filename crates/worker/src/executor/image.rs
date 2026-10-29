@@ -19,9 +19,11 @@
 //!   the batch's output lease, passes the host encoder pool pages an
 //!   encoding reads its features from or writes them to ([`host_copies`])
 //!   and binds its trajectory in the latent ledger
-//!   ([`LatentLedger::bind_image`]); a denoising batch over the prefix cache
-//!   also reserves its rows' slots (the guidance prefixes) and passes its
-//!   attention rows ([`reserve_rows`]);
+//!   ([`LatentLedger::bind_image`]), a resumed request's latent preparation
+//!   with the stored pages of the image it had begun
+//!   ([`LatentLedger::bind_image_restore`]); a denoising batch over the
+//!   prefix cache also reserves its rows' slots (the guidance prefixes) and
+//!   passes its attention rows ([`reserve_rows`]);
 //! - [`publish`], behind the execution, fences what the calls wrote with
 //!   its metadata and issues the exports remote readers import (features,
 //!   trajectory versions), configures the PNG encodings of decoded images,
@@ -35,8 +37,10 @@
 //! call (image calls have none), in call order: the resident image read, the
 //! prepared pixels, each prepared write, the lent bytes, the host encoder
 //! pool pages of an encoding with a host output (one `uint8 [page_bytes]`
-//! host view per copy `calls[i].host` lists); then, for a denoising batch
-//! over the prefix cache, one `int64 [5 + 2G, R]` host tensor of its
+//! host view per copy `calls[i].host` lists), the stored pages a restoring
+//! latent preparation reads (one `uint8 [page_bytes]` host view each, as
+//! many as `calls[i].latent.restore.pages` counts); then, for a denoising
+//! batch over the prefix cache, one `int64 [5 + 2G, R]` host tensor of its
 //! attention rows ([`reserve_rows`]).
 
 use std::collections::{BTreeSet, HashMap};
@@ -366,6 +370,9 @@ pub(crate) struct Owners<'a> {
     pub(crate) images: Option<&'a Images>,
     /// The host encoder pool of a rank that maps one.
     pub(crate) encoders: Option<&'a EncoderHostPool>,
+    /// The rank's index in its worker group, which reports the layout of
+    /// the trajectories it opens and reads the stored pages pinned for it.
+    pub(crate) rank: u32,
 }
 
 impl Owners<'_> {
@@ -449,6 +456,9 @@ pub(crate) fn bind(
         }
         let active = batch.calls[index].active;
         let slot = batch.calls[index].slot;
+        // The stored pages a restoring latent preparation reads, which
+        // follow the call's other tensors.
+        let mut stored_pages = Vec::new();
 
         // The resident image it reads, whose size a decoding stages.
         let mut size = None;
@@ -518,13 +528,39 @@ pub(crate) fn bind(
             let image = request.admission().image.as_ref().ok_or_else(|| {
                 Error::Invalid("an image trajectory requires image parameters".into())
             })?;
+            let rank = owners.rank;
             let ledger = owners.ledger()?;
             if !record.entered {
                 ledger.enter(issue)?;
                 record.entered = true;
             }
-            let bound = ledger.bind_image(slot, call, params, image)?;
+            // A resumed request's preparation lays the stored values of the
+            // image it had begun out in the trajectory's pages and commits
+            // their step.
+            let (bound, stored) = match &call.latent_restore {
+                Some(restore) => {
+                    let (bound, stored) =
+                        ledger.bind_image_restore(slot, call, params, image, restore, rank)?;
+                    (bound, Some(stored))
+                }
+                None => (ledger.bind_image(slot, call, params, image)?, None),
+            };
             step["calls"][index]["latent"] = bound.to_json();
+            if let Some(stored) = stored {
+                step["calls"][index]["latent"]["restore"] = serde_json::json!({
+                    "pages": stored.pages.len(),
+                    "copies": stored.copies,
+                });
+                stored_pages = stored.pages;
+            }
+            // An image latent preparation reports how the rank's pages hold
+            // the trajectory, which key and record it when a preemption
+            // stores it.
+            if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
+                let layout = serde_json::to_string(&ledger.image_layout(&bound.params))
+                    .map_err(|error| Error::Invariant(format!("a latent layout: {error}")))?;
+                batch.calls[index].output.set_latent_layout(rank, layout);
+            }
             size = Some((bound.params.height, bound.params.width));
             let state = &mut batch.calls[index];
             state.forward.products.latent = Some(bound.update);
@@ -601,6 +637,7 @@ pub(crate) fn bind(
             tensors.extend(pages);
             step["calls"][index]["host"] = host;
         }
+        tensors.extend(stored_pages);
     }
 
     // A denoising batch's attention rows.
@@ -971,8 +1008,10 @@ pub(crate) fn publish(
             call.latent_output.as_ref(),
             exports,
         ) {
+            // A preparation opens the trajectory at its bound step: zero,
+            // or the stored step it restored.
             let step_index = match call.kind {
-                CallKind::Media(MediaCall::LatentPreparation) => 0,
+                CallKind::Media(MediaCall::LatentPreparation) => banks.step,
                 CallKind::Media(MediaCall::Denoising) => banks.step + 1,
                 _ => continue,
             };

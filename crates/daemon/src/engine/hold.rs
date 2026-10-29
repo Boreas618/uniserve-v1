@@ -50,8 +50,9 @@ pub struct Kept {
     /// The prefix seed of the pages a token request continues with
     /// (`CachePolicy::state_seed`), when the worlds' pages differ.
     pub prefix_seed: Option<u64>,
-    /// The latent seed of the trajectories a video request continues with
-    /// (`Trajectory::state_seed`), when the worlds' trajectories differ.
+    /// The latent seed of the trajectories a request continues with
+    /// (`Trajectory::state_seed`: a video request's, or the image a token
+    /// request had begun), when the worlds' trajectories differ.
     pub latent_seed: Option<u64>,
 }
 
@@ -351,6 +352,7 @@ mod tests {
             generated_token_ids: Vec::new(),
             adapter: 0,
             generated_images: Vec::new(),
+            trajectory: Default::default(),
         }
         .into()
     }

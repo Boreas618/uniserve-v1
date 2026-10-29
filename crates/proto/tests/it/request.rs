@@ -130,6 +130,13 @@ fn generation() -> GenerationRequest {
                 image: FeedbackImage::Png(Arc::from("cG5n")),
             },
         ],
+        // The image it had begun, which an engine stored at step 4.
+        trajectory: Trajectory {
+            id: 19,
+            denoised_steps: 4,
+            state_seed: Some(23),
+            stored_layout: b"{\"version\":1}".to_vec(),
+        },
     }
 }
 

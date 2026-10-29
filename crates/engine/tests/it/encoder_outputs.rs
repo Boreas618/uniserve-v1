@@ -289,6 +289,7 @@ fn image_request(id: u64, image: u8, seed: u64, cache: CachePolicy) -> Generatio
         generated_token_ids: Vec::new(),
         adapter: 0,
         generated_images: Vec::new(),
+        trajectory: Default::default(),
     }
 }
 

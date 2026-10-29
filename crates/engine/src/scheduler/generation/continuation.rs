@@ -34,7 +34,12 @@
 //! wrote, and the state the request resumes in. The continuation writes
 //! them by the same calls, sampling nothing until it resumes: a decode of
 //! its pending token, the feedback write of its last image that samples,
-//! or the opening of the image it had begun, which starts from noise.
+//! or the opening of the image it had begun. That image continues from the
+//! step of its trajectory the preempting engine stored in the host latent
+//! pools (`GenerationRequest::trajectory`, `crate::trajectories`) when they
+//! hold it, conditioned on the context the continuation rebuilt, which is
+//! the one it was conditioned on; it starts from noise otherwise
+//! (`Scheduler::image_restore`).
 
 use std::collections::VecDeque;
 

@@ -275,6 +275,32 @@ impl Scheduler {
         // generates images extends its prompt by the tokens its decodes
         // wrote instead, writes its images between them, and resumes in the
         // state it left (`generation::continuation`).
+        // A request that resumes the image it had begun, of which an engine
+        // stored steps within the image's schedule, restores them once the
+        // image's latent preparation is due; every other image starts from
+        // noise.
+        let stored = &req.trajectory;
+        // An image-only request can be preempted before it emits any token:
+        // its prompt already determines the context to rebuild.
+        let resumes_image = req.starts_with_image()
+            || continuation.as_ref().is_some_and(|continuation| {
+                matches!(
+                    continuation.resume,
+                    generation::continuation::Resume::Open { .. }
+                )
+            });
+        let restores = resumes_image
+            && stored.id != 0
+            && stored.denoised_steps > 0
+            && stored.denoised_steps <= u32::from(req.image.steps);
+        let host_trajectory = HostTrajectory {
+            restoring: if restores {
+                Restoring::Due
+            } else {
+                Restoring::Ready(None)
+            },
+            ..HostTrajectory::default()
+        };
         let (generated_token_ids, round_token_ids, next_token, replay) = match continuation {
             Some(continuation) => {
                 req.prompt_token_ids
@@ -343,6 +369,7 @@ impl Scheduler {
             num_generated_images: images,
             image_reservation_pending: false,
             denoising: Denoising::new(u32::from(req.image.steps)),
+            host_trajectory,
             image_conditioning: None,
             handoff_export: None,
             feedback_encoder_index: 0,
@@ -908,9 +935,7 @@ impl Scheduler {
                 predecessor: root,
                 terminal_intent: TerminalIntent::None,
                 artifact: None,
-                restoring: Restoring::Ready(None),
-                offloading: false,
-                latent_layouts: BTreeMap::new(),
+                host_trajectory: HostTrajectory::default(),
             };
 
             // The interval from receipt to admission is the queue wait. The
@@ -931,7 +956,7 @@ impl Scheduler {
             // are looked up before its encoders are offered.
             let restoring = self.start_restore(id);
             if let Some(state) = self.media_state_mut(id) {
-                state.restoring = restoring;
+                state.host_trajectory.restoring = restoring;
             }
             self.look_up_encoder_outputs(id);
         }
@@ -1233,8 +1258,11 @@ impl Scheduler {
         for (id, intent) in cancelled {
             let reason = match intent {
                 TerminalIntent::Finish(reason) => reason,
+                // A preempted request is at a step boundary of the image it
+                // generates: the image's trajectory is stored before it
+                // leaves.
                 TerminalIntent::Migrate(cause) => {
-                    self.migrate_request(id, cause);
+                    self.retire_preempted_token(id, cause);
                     continue;
                 }
                 TerminalIntent::Failure(_) | TerminalIntent::Rejected(_) => FinishReason::Error,

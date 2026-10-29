@@ -1976,6 +1976,7 @@ mod tests {
             generated_token_ids: Vec::new(),
             adapter: 0,
             generated_images: Vec::new(),
+            trajectory: Default::default(),
         }
         .into()
     }

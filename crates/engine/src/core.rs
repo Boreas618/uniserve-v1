@@ -528,8 +528,8 @@ pub struct SchedulerHandle {
     /// which a successor world matches the scheduler's prefix cache index;
     /// `None` without a prefix cache.
     cache_group: Option<String>,
-    /// The latent seed of what the scheduler's video denoising computes,
-    /// which keys the trajectories it stores (`Scheduler::latent_seed`).
+    /// The latent seed of what the scheduler's denoising computes, which
+    /// keys the trajectories it stores (`Scheduler::latent_seed`).
     latent_seed: u64,
     /// The served model identifier.
     model: String,
@@ -954,8 +954,9 @@ impl SchedulerHandle {
                 )
                 .context("sizing the world's host KV cache")?;
         }
-        // Video denoising ranks that map host latent pools report them: a
-        // preempted request's trajectory is stored there.
+        // Denoising ranks that map host latent pools report them: a
+        // preempted request's trajectory (a video's, or an image's) is
+        // stored there.
         scheduler.enable_trajectory_store(
             &storage::socket::default_socket(),
             &config.worker_process.deployment,
@@ -1055,9 +1056,9 @@ impl SchedulerHandle {
         self.cache_group.clone()
     }
 
-    /// Returns the latent seed of what the scheduler's video denoising
-    /// computes, which keys the trajectories it stores at preemption; zero
-    /// when it stores none.
+    /// Returns the latent seed of what the scheduler's denoising computes,
+    /// which keys the trajectories it stores at preemption; zero when it
+    /// stores none.
     pub fn latent_seed(&self) -> u64 {
         self.latent_seed
     }

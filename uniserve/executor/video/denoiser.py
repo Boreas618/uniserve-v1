@@ -34,6 +34,7 @@ import torch
 
 from uniserve.cuda_graph import BreakableCUDAGraph, capture
 from uniserve.executor.predicates import kept
+from uniserve.executor.trajectories import copy_runs
 from uniserve.executor.video.plan import (
     Canvas,
     ConditionShape,
@@ -58,7 +59,6 @@ __all__ = [
     "Conditioning",
     "Denoiser",
     "close_all",
-    "copy_runs",
     "keyframe_sets",
 ]
 
@@ -66,33 +66,6 @@ __all__ = [
 # capture, is never reported: startup captures before serving).
 EAGER = 0
 REPLAY = 1
-
-
-def copy_runs(
-    target: torch.Tensor,
-    stored: Sequence[torch.Tensor],
-    copies: Iterable[Sequence[int]],
-) -> None:
-    """Copy runs of bytes of stored pages into ``target``.
-
-    ``target`` and every ``stored`` page are flat ``uint8`` tensors; each
-    copy ``[page, offset, at, bytes]`` writes ``bytes`` bytes from byte
-    ``offset`` of ``stored[page]`` at byte ``at`` of ``target``, in the
-    current stream's order, without waiting on the host.
-
-    Raises:
-        ValueError: A copy reaches past its page or past ``target``.
-    """
-    for page, offset, at, length in copies:
-        source = stored[page]
-        if offset + length > source.numel() or at + length > target.numel():
-            raise ValueError(
-                f"a latent copy of {length} bytes reaches past its page or "
-                "its slot"
-            )
-        target[at : at + length].copy_(
-            source[offset : offset + length], non_blocking=True
-        )
 
 
 def size_values(size: VideoSize) -> tuple[list[int], list[int], list[int]]:

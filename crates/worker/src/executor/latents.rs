@@ -23,19 +23,23 @@
 //! another stream ([`LatentLedger::enter`]) and records its end
 //! ([`LatentLedger::leave`]).
 //!
-//! A video denoising rank whose host maps a host latent pool
-//! ([`LatentHostPool`]) writes a preempted request's committed trajectory
-//! there, on a copy stream behind every batch that used the banks
-//! ([`LatentLedger::offload`]), and a resumed request's latent preparation
-//! copies the stored values into the bank it initializes, laid out in the
-//! rank's own pages by the copy manifest from the stored ranks' pages
-//! (`crate::storage::latent::restore`), and commits the trajectory at the
-//! stored step ([`LatentLedger::bind_restore`]).
+//! A denoising rank (a video or an image model's) whose host maps a host
+//! latent pool ([`LatentHostPool`]) writes a preempted request's committed
+//! trajectory there, on a copy stream behind every batch that used the
+//! banks ([`LatentLedger::offload`]), and a resumed request's latent
+//! preparation copies the stored values into the bank it initializes, laid
+//! out in the rank's own pages by the copy manifest from the stored ranks'
+//! pages (`crate::storage::latent::restore`), and commits the trajectory at
+//! the stored step ([`LatentLedger::bind_restore`] for a video trajectory,
+//! [`LatentLedger::bind_image_restore`] for an image's). A video rank's
+//! executor states how its slot pages hold a request's samples; an image
+//! trajectory's whole latent rows lie in its pages in logical order on
+//! every rank ([`image_layout`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ::storage::manifest::StorageLayout;
+use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
 use cuda::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
 use ipc::{
     BufferId, Call, CallKind, ImageParams, LatentOffload, LatentParams, LatentRestore, MediaCall,
@@ -47,7 +51,7 @@ use crate::executor::batch::StreamOrder;
 use crate::job::Job;
 use crate::storage::allocation::StorageView;
 use crate::storage::latent::restore;
-use crate::storage::{LatentHostPool, TrajectoryVersion};
+use crate::storage::{BankPages, LatentHostPool, TrajectoryVersion};
 use crate::stream::Issue;
 use crate::{LatentPool, LatentStorage, LatentUpdate, Result};
 
@@ -75,8 +79,8 @@ pub(crate) struct LatentLedger {
     canvases: HashMap<usize, (u32, u32)>,
     /// Orders batches addressing the banks across the computations' streams.
     order: StreamOrder,
-    /// The host latent pool of a video denoising rank that maps one, and the
-    /// copy stream its offloads run on.
+    /// The host latent pool of a denoising rank that maps one, and the copy
+    /// stream its offloads run on.
     host: Option<HostCopies>,
 }
 
@@ -87,18 +91,64 @@ struct HostCopies {
     device: DeviceId,
 }
 
-/// What [`LatentLedger::bind_restore`] binds of a resumed request's latent
-/// preparation: its banks and commit, and the stored pages it copies from.
+/// What [`LatentLedger::bind_restore`] binds of a resumed video request's
+/// latent preparation: its banks and commit, and the stored pages it copies
+/// from.
 pub(crate) struct Restored {
     pub(crate) banks: Banks,
     pub(crate) update: LatentUpdate,
+    pub(crate) stored: StoredPages,
+}
+
+/// The stored pages a resumed request's latent preparation copies from and
+/// the copies that lay them out in the trajectory's pages.
+pub(crate) struct StoredPages {
     /// The `uint8 [page_bytes]` view of every stored page the copies read,
     /// in a host latent pool.
     pub(crate) pages: Vec<StorageView>,
     /// The copies, each `[page, offset, target, bytes]`: `bytes` bytes from
     /// byte `offset` of stored page `pages[page]` to byte `target` of the
-    /// request slot's pages, which lie back to back in the bank.
+    /// trajectory's pages laid back to back in logical order (a video
+    /// request slot's pages, which lie so in the bank; an image
+    /// trajectory's pages in the order its calls name them).
     pub(crate) copies: Vec<[u64; 4]>,
+}
+
+/// How a rank's pages hold an image trajectory of `units` latent rows of
+/// `width` values of `dtype`, as the copy manifest library reads it: the
+/// whole `[units, width]` latent, its rows back to back from the first
+/// page's first byte, in the order the trajectory's calls name its pages.
+/// Every rank of an image denoiser holds the whole latent, so two ranks or
+/// worlds whose pages hold as many rows lay a page out alike.
+pub(crate) fn image_layout(units: u32, width: u32, dtype: crate::ffi::DType) -> StorageLayout {
+    let (units, width) = (u64::from(units), u64::from(width));
+    let element = dtype.bytes() as u64;
+    let whole = |extent| {
+        vec![Segment {
+            span: Span::range(0, extent),
+            local: 0,
+        }]
+    };
+    StorageLayout {
+        bytes: units * width * element,
+        fields: vec![Field {
+            tensor: "image_latents".to_owned(),
+            source: String::new(),
+            dtype: dtype.name().to_owned(),
+            element,
+            offset: 0,
+            shape: vec![units, width],
+            strides: vec![width, 1],
+            logical: Logical {
+                shape: vec![units, width],
+                dims: vec!["row".to_owned(), "channel".to_owned()],
+                // No parallel configuration divides an image's latent.
+                units: vec![0, 0],
+                segments: vec![whole(units), whole(width)],
+            },
+            encoding: Encoding::Affine,
+        }],
+    }
 }
 
 /// What [`LatentLedger::bind`] binds of one call.
@@ -161,18 +211,38 @@ impl LatentLedger {
         }
     }
 
-    /// The pages each request slot owns, for a video model's ledger; `None`
-    /// for an image model's, whose trajectories the scheduler pages.
-    pub(crate) fn slot_pages(&self) -> Option<u32> {
-        match self.layout {
-            Layout::Slots { pages } => u32::try_from(pages).ok(),
-            Layout::Scheduled => None,
-        }
+    /// The pages of the rank's banks as its host latent pool pages them:
+    /// one pool page per bank page, of the banks' element type, the most
+    /// pages one trajectory occupies (a video slot's pages; the pages of the
+    /// longest image, `longest_image` latent rows, for an image model's
+    /// ledger) and every page but the padding page. `None` for an image
+    /// ledger without its longest image.
+    pub(crate) fn host_pages(&self, longest_image: Option<u64>) -> Result<Option<BankPages>> {
+        let page_values = u32::try_from(self.page_units * u64::from(self.storage.width()))
+            .map_err(|_| Error::Invalid("a latent page exceeds its range".into()))?;
+        let trajectory_pages = match (self.layout, longest_image) {
+            (Layout::Slots { pages }, _) => pages,
+            (Layout::Scheduled, Some(rows)) => rows.div_ceil(self.page_units),
+            (Layout::Scheduled, None) => return Ok(None),
+        };
+        let trajectory_pages = u32::try_from(trajectory_pages)
+            .map_err(|_| Error::Invalid("a trajectory's pages exceed their range".into()))?;
+        Ok(Some(BankPages {
+            dtype: self.storage.dtype(),
+            page_values,
+            trajectory_pages,
+            pages: self.pool.capacity_units() as u64 / self.page_units,
+        }))
     }
 
-    /// The values one page holds.
-    pub(crate) fn page_units(&self) -> u64 {
-        self.page_units
+    /// How the rank's pages hold the image trajectory `params` addresses
+    /// ([`image_layout`]), at the banks' width and element type.
+    pub(crate) fn image_layout(&self, params: &LatentParams) -> StorageLayout {
+        image_layout(
+            params.latent_units,
+            self.storage.width(),
+            self.storage.dtype(),
+        )
     }
 
     /// Write preempted trajectories to `pool` and restore resumed ones from
@@ -186,18 +256,37 @@ impl LatentLedger {
         });
     }
 
+    /// The pages `slot`'s trajectory occupies, in logical order: a video
+    /// slot's own run of pages after the padding page, or the pages an
+    /// image trajectory's committed version lies in.
+    fn trajectory_pages(&self, slot: usize) -> Vec<u64> {
+        match self.layout {
+            Layout::Slots { pages } => {
+                let first = 1 + (slot as u64 - 1) * pages;
+                (first..first + pages).collect()
+            }
+            Layout::Scheduled => self
+                .pool
+                .committed_pages(slot)
+                .iter()
+                .map(|&page| page as u64)
+                .collect(),
+        }
+    }
+
     /// Record into `job` the copies of `offloads` on the copy stream, each
     /// the committed trajectory of the request in the slot it names with
-    /// it: every page of the bank holding the committed step into the pool
-    /// slot the engine reserved for it. The copies wait for the last batch
-    /// that used the banks on another stream; the batch's output waits on
-    /// the returned fence, recorded on the copy stream of the returned
-    /// device, after which the engine commits the pool slots. The engine
-    /// sends them once every call of the requests completed, so no batch
-    /// writes the trajectories meanwhile.
+    /// it: every page of the trajectory in the bank holding the committed
+    /// step into the pool slot the engine reserved for it. The copies wait
+    /// for the last batch that used the banks on another stream; the
+    /// batch's output waits on the returned fence, recorded on the copy
+    /// stream of the returned device, after which the engine commits the
+    /// pool slots. The engine sends them once every call of the requests
+    /// completed, so no batch writes the trajectories meanwhile.
     ///
     /// Fails for a rank that maps no latent pool, a request without a
-    /// committed step past zero, or a page or pool slot outside its pool.
+    /// committed step past zero, or a page or pool slot outside its
+    /// trajectory or its pool.
     pub(crate) fn offload(
         &mut self,
         offloads: &[(usize, &LatentOffload)],
@@ -206,11 +295,6 @@ impl LatentLedger {
         let host = self.host.as_ref().ok_or_else(|| {
             Error::Invalid("a batch offloads a trajectory but the rank maps no latent pool".into())
         })?;
-        let Layout::Slots { pages } = self.layout else {
-            return Err(Error::Invariant(
-                "only a video trajectory is offloaded".into(),
-            ));
-        };
         let mut batch = CopyBatch::new(SourceOrder::Stream);
         for &(slot, offload) in offloads {
             if self.pool.step_index(slot) < 1 {
@@ -219,17 +303,16 @@ impl LatentLedger {
                 ));
             }
             let bank = self.pool.committed_bank(slot);
-            let first = 1 + (slot as u64 - 1) * pages;
+            let pages = self.trajectory_pages(slot);
             for copy in &offload.pages {
-                if u64::from(copy.page) >= pages {
-                    return Err(Error::Invalid(format!(
-                        "latent page {} is outside a slot of {pages} pages",
-                        copy.page
-                    )));
-                }
-                let device = self
-                    .storage
-                    .page_address(bank, first + u64::from(copy.page))?;
+                let page = *pages.get(copy.page as usize).ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "latent page {} is outside a trajectory of {} pages",
+                        copy.page,
+                        pages.len()
+                    ))
+                })?;
+                let device = self.storage.page_address(bank, page)?;
                 batch.push(
                     host.pool.address(copy)?,
                     device,
@@ -274,12 +357,9 @@ impl LatentLedger {
         rank: u32,
         layout: StorageLayout,
     ) -> Result<Restored> {
-        let host = self.host.as_ref().ok_or_else(|| {
-            Error::Invalid("a call restores a trajectory but the rank maps no latent pool".into())
-        })?;
         let Layout::Slots { pages } = self.layout else {
             return Err(Error::Invariant(
-                "only a video trajectory is restored".into(),
+                "an image trajectory restores into its scheduled pages".into(),
             ));
         };
         let canvas = *self
@@ -287,6 +367,83 @@ impl LatentLedger {
             .get(&slot)
             .ok_or_else(|| Error::Invalid("a denoising request has no canvas".into()))?;
         let params = self.slot_params(slot, call, canvas, pages);
+        let stored = self.stored_pages(restore, rank, layout, pages)?;
+        let bound = self.initial(slot, call, params)?;
+        let update = LatentUpdate::restored(bound.update, i64::from(restore.steps), true)?;
+        Ok(Restored {
+            banks: Banks {
+                step: i64::from(restore.steps),
+                ..bound.banks
+            },
+            update,
+            stored,
+        })
+    }
+
+    /// What a resumed request's image latent preparation binds, as
+    /// [`Self::bind_image`] binds one that opens at step zero, with the
+    /// stored pages of `restore` that `rank` reads and the copies that lay
+    /// them out in the trajectory's pages ([`image_layout`]): the
+    /// preparation commits the trajectory at the stored step. Every
+    /// denoising call after it advances that step, and a trajectory stored
+    /// after its last step is decoded next.
+    ///
+    /// Fails as `bind_image` fails, and for a rank that maps no latent
+    /// pool, a source whose pages its layout does not name one by one, or
+    /// sources that do not hold every value of the trajectory.
+    pub(crate) fn bind_image_restore(
+        &self,
+        slot: usize,
+        call: &Call,
+        params: &LatentParams,
+        image: &ImageParams,
+        restore: &LatentRestore,
+        rank: u32,
+    ) -> Result<(Bound, StoredPages)> {
+        if call.kind != CallKind::Media(MediaCall::LatentPreparation) {
+            return Err(Error::Invalid(
+                "only a latent preparation restores a stored trajectory".into(),
+            ));
+        }
+        // A trajectory stored after its last step opens complete: its
+        // decoding follows.
+        if i64::from(restore.steps) > i64::from(image.steps) {
+            return Err(Error::Invalid(
+                "a restored image trajectory lies past its schedule".into(),
+            ));
+        }
+        let bound = self.bind_image(slot, call, params, image)?;
+        let layout = self.image_layout(params);
+        let stored = self.stored_pages(restore, rank, layout, params.page_table.len() as u64)?;
+        let update = LatentUpdate::restored(bound.update, i64::from(restore.steps), false)?;
+        Ok((
+            Bound {
+                banks: Banks {
+                    step: i64::from(restore.steps),
+                    ..bound.banks
+                },
+                update,
+                params: bound.params,
+            },
+            stored,
+        ))
+    }
+
+    /// The stored pages of `restore` that `rank` reads and the copies that
+    /// lay them out in the rank's own pages of the trajectory, held as
+    /// `layout` states in at most `pages` pages: the copy manifest from the
+    /// stored ranks' pages to the rank's ([`restore::copies`]), which copies
+    /// a page laid out as a stored one was whole.
+    fn stored_pages(
+        &self,
+        restore: &LatentRestore,
+        rank: u32,
+        layout: StorageLayout,
+        pages: u64,
+    ) -> Result<StoredPages> {
+        let host = self.host.as_ref().ok_or_else(|| {
+            Error::Invalid("a call restores a trajectory but the rank maps no latent pool".into())
+        })?;
 
         // The rank's own pages and the stored pages on its host.
         let target = restore::Stored {
@@ -295,7 +452,7 @@ impl LatentLedger {
         };
         if target.pages() > pages {
             return Err(Error::Invalid(
-                "a request's latent layout lies past its slot's pages".into(),
+                "a request's latent layout lies past its trajectory's pages".into(),
             ));
         }
         let read: Vec<&ipc::LatentSource> = restore
@@ -347,14 +504,7 @@ impl LatentLedger {
             copies = copies.len(),
             "restoring a stored trajectory into the rank's pages"
         );
-        let bound = self.initial(slot, call, params)?;
-        let update = LatentUpdate::restored(bound.update, i64::from(restore.steps))?;
-        Ok(Restored {
-            banks: Banks {
-                step: i64::from(restore.steps),
-                ..bound.banks
-            },
-            update,
+        Ok(StoredPages {
             pages: views,
             copies,
         })
@@ -789,12 +939,12 @@ mod tests {
         ledger.admit(1, (1344, 768));
         let preparation = call(1, MediaCall::LatentPreparation);
         let (prepared, initial) = ledger.bind(1, &preparation, MediaCall::LatentPreparation)?;
-        assert!(LatentUpdate::restored(initial.clone(), 0).is_err());
+        assert!(LatentUpdate::restored(initial.clone(), 0, true).is_err());
         let mut unrestored = initial.clone();
         unrestored.step_index = 3;
         assert!(ledger.validate(&[unrestored]).is_err());
 
-        let restored = LatentUpdate::restored(initial, 3)?;
+        let restored = LatentUpdate::restored(initial, 3, true)?;
         ledger.validate(std::slice::from_ref(&restored))?;
         ledger.apply(&[restored])?;
         let (banks, update) =

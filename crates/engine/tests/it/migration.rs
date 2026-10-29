@@ -42,6 +42,7 @@ fn request(
         generated_token_ids: generated,
         adapter: 0,
         generated_images: Vec::new(),
+        trajectory: Default::default(),
     }
 }
 

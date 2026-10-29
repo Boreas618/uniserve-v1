@@ -152,6 +152,29 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                     }),
                 })
                 .collect(),
+            trajectory: Some((&request.trajectory).into()),
+        }
+    }
+}
+
+impl From<&Trajectory> for wire::Trajectory {
+    fn from(trajectory: &Trajectory) -> Self {
+        Self {
+            id: trajectory.id,
+            denoised_steps: trajectory.denoised_steps,
+            state_seed: trajectory.state_seed,
+            stored_layout: trajectory.stored_layout.clone(),
+        }
+    }
+}
+
+impl From<wire::Trajectory> for Trajectory {
+    fn from(trajectory: wire::Trajectory) -> Self {
+        Self {
+            id: trajectory.id,
+            denoised_steps: trajectory.denoised_steps,
+            state_seed: trajectory.state_seed,
+            stored_layout: trajectory.stored_layout,
         }
     }
 }
@@ -260,6 +283,9 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                     })
                 })
                 .collect::<Result<_, WireError>>()?,
+            // A request without a trajectory names none: it starts every
+            // image from noise.
+            trajectory: request.trajectory.map(Into::into).unwrap_or_default(),
         })
     }
 }

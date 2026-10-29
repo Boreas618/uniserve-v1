@@ -207,15 +207,17 @@ pub enum Event {
     },
     /// Ends a request on this engine without finishing it: every token it
     /// generated here was sent before, and the daemon may submit it again
-    /// with those tokens (`GenerationRequest::generated_token_ids`), or a
-    /// video request with the trajectory steps the engine stored
-    /// (`Trajectory::denoised_steps`), to the engine that serves next.
+    /// with those tokens (`GenerationRequest::generated_token_ids`) and
+    /// with the trajectory steps the engine stored of the image or video it
+    /// was denoising (`Trajectory::denoised_steps`), to the engine that
+    /// serves next.
     Migratable {
         /// Why the request leaves its engine.
         cause: MigrationCause,
-        /// For a video request, the denoising steps of its trajectory the
-        /// engine stored in its host latent pools at the step boundary it
-        /// was preempted at; zero when it stored none.
+        /// The denoising steps of the trajectory the engine stored in its
+        /// host latent pools at the step boundary it preempted the request
+        /// at: a video request's, or the image a token request had begun
+        /// and not finished; zero when it stored none.
         denoised_steps: u32,
         /// With stored steps, where the engine put the trajectory's pages
         /// and how each stored rank laid its part out
@@ -359,10 +361,13 @@ pub struct EncoderInputs {
     pub audio: Option<[u8; 32]>,
 }
 
-/// A video request's latent trajectory across the engines that serve it.
+/// A request's latent trajectory across the engines that serve it: a video
+/// request's, or the trajectory of the image a token request had begun and
+/// not finished when an engine preempted it.
 ///
 /// An engine that preempts the request at a denoising-step boundary stores
-/// the trajectory in its host latent pools, each page keyed by `id`, the
+/// the trajectory in its host latent pools, each page keyed by `id` (and,
+/// for a token request's image, the image's index among its images), the
 /// steps it took, the latent seed of what its denoising computes and the
 /// part of the samples the page holds; the daemon submits the request again
 /// with those steps and the engine's record of the stored layout
@@ -376,10 +381,12 @@ pub struct EncoderInputs {
 pub struct Trajectory {
     /// The identity that keys the stored trajectory: the daemon gives a
     /// request one when it first submits it and keeps it across its
-    /// migrations.
+    /// migrations; zero for a request no engine stores a trajectory of.
     pub id: u64,
     /// The denoising steps of the trajectory an engine stored when it
     /// preempted the request; zero for a request that starts from noise.
+    /// A token request names the steps of the image it had begun, which
+    /// the daemon forgets once the image completes.
     pub denoised_steps: u32,
     /// The latent seed of the world whose stored trajectory the request
     /// continues although the serving world's denoising computes other

@@ -2,9 +2,10 @@
 //!
 //! Image generation inside a text request and the video pipeline keep their
 //! own lifecycles, but both advance a trajectory the same way: latent
-//! preparation opens it at step zero, each denoising call covers the next
-//! step of its fixed schedule, and the worker reports the steps it has
-//! accepted. [`Denoising`] owns that progress for both.
+//! preparation opens it at step zero, or at the stored step a resumed
+//! request restores, each denoising call covers the next step of its fixed
+//! schedule, and the worker reports the steps it has accepted.
+//! [`Denoising`] owns that progress for both.
 
 use ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef};
 
@@ -117,12 +118,13 @@ impl Denoising {
     }
 
     /// Opens a trajectory at step `step`, with its prepared latent: zero, or
-    /// the stored step a video request's latent preparation restored.
-    /// Returns `false`, leaving progress unchanged, for a restored step that
-    /// leaves no denoising step of the schedule, which a preemption never
-    /// stores.
+    /// the stored step a resumed request's latent preparation restored. An
+    /// image's trajectory may be stored after its last step, before its
+    /// decoding; a video request is not preempted once its denoising is
+    /// scheduled whole. Returns `false`, leaving progress unchanged, for a
+    /// restored step past the schedule, which a preemption never stores.
     pub(crate) fn open(&mut self, step: u32, latent: Option<TensorRef>) -> bool {
-        if step > 0 && step >= self.steps {
+        if step > self.steps {
             return false;
         }
         self.completed = step;

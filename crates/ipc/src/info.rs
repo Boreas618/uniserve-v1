@@ -150,21 +150,24 @@ pub struct PagePoolInfo {
     pub endpoint: Option<String>,
 }
 
-/// The host latent pool of a video denoising rank: the Storage Server page
-/// pool its preempted trajectories are written to, one pool page per page
-/// of a request slot's latent banks.
+/// The host latent pool of a denoising rank (a video model's, or an image
+/// model's): the Storage Server page pool its preempted trajectories are
+/// written to, one pool page per page of its latent banks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentPoolInfo {
     /// The pool, as any rank of the deployment on the host maps it.
     pub pool: crate::LatentPoolRef,
-    /// The pages a request slot owns in the rank's latent banks, each a
-    /// pool page; an offload copies every one of them.
-    pub slot_pages: u32,
+    /// The most pages one trajectory occupies in the rank's latent banks,
+    /// each a pool page: a video request slot's pages, or the pages of an
+    /// image model's longest image.
+    pub trajectory_pages: u32,
     /// The digest of what determines the rank's share of every request's
-    /// samples: the video plan that selects a request's layout, the slot's
-    /// pages, the rank's coordinate in the denoiser's mesh and its rows of
-    /// every layout startup prepares. A rank of another world with the same
-    /// share holds what this rank held of any trajectory.
+    /// samples: for a video denoiser, the video plan that selects a
+    /// request's layout, the slot's pages, the rank's coordinate in the
+    /// denoiser's mesh and its rows of every layout startup prepares; for
+    /// an image denoiser, whose every rank holds whole latents, the page
+    /// encoding alone. A rank of another world with the same share holds
+    /// what this rank held of any trajectory.
     pub region: [u8; 32],
     /// The identity of what the rank's trajectories are computed with: the
     /// weights' values and the declared function and format identities of

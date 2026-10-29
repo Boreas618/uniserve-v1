@@ -208,7 +208,7 @@ impl Scheduler {
                         // How each denoising rank holds the request's
                         // samples, which a preemption keys and records the
                         // stored trajectory by.
-                        state.latent_layouts = record
+                        state.host_trajectory.layouts = record
                             .latent_layouts
                             .iter()
                             .map(|layout| (layout.rank, layout.layout.clone()))
@@ -749,6 +749,14 @@ impl Scheduler {
                     }
                     InflightInput::Generation { image_cache } => image_cache,
                 };
+                // An image's latent preparation read the stored pages its
+                // restore pinned, or failed: either way the pins end, and
+                // the request's later images start from noise.
+                if call.kind == CallKind::Media(MediaCall::LatentPreparation)
+                    && call.latent_restore.is_some()
+                {
+                    self.end_image_restore(id);
+                }
                 // An image encoding that read or wrote its output in the host
                 // encoder pool completed: it succeeded only when it ran.
                 if let Some(store) = self.encoder_outputs.as_mut() {
@@ -845,17 +853,31 @@ impl Scheduler {
                     }
                 }
 
-                // A request with a terminal intent or a deferred finish takes no
-                // further semantic effect; an image decode still releases the
-                // request latent it closes.
+                // Decoding closes the worker's latent trajectory. If that
+                // call completes during migration, publish its image before
+                // retiring the request: the daemon can carry the completed
+                // image, but those released latent pages cannot be stored.
+                let preempted = self.running.get(&id).is_some_and(|state| {
+                    matches!(state.terminal_intent, TerminalIntent::Migrate(_))
+                }) && !self.inflight.pending_finishes.contains_key(&id);
+                let completed_image = preempted
+                    && call.kind == CallKind::Media(MediaCall::ImageDecoding)
+                    && record.status == CallStatus::Ok;
+                // Other terminal requests take no further semantic effect.
+                // A preempted image's denoising progress still follows the
+                // worker's committed trajectory, which its store continues.
                 let semantic_blocked = self
                     .running
                     .get(&id)
                     .is_some_and(|state| state.terminal_intent.is_terminal())
+                    && !completed_image
                     || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {
                     if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                         self.free_request_latent(id);
+                    }
+                    if preempted {
+                        self.accept_preempted_trajectory(id, &call, &record);
                     }
                     self.finish_pending_if_idle(id);
                     continue;

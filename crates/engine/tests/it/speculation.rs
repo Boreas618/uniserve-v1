@@ -52,6 +52,7 @@ fn request(id: u64, prompt: Vec<u32>, max_tokens: usize) -> GenerationRequest {
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
         generated_images: Vec::new(),
+        trajectory: Default::default(),
         adapter: 0,
     }
 }
