@@ -93,7 +93,8 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
 STEPS = 24
 # The longest the paused workers run at once while a request steps into its
 # second image: far shorter than an image's denoising, so that one slice
-# completes a few of its calls, never the rest of an image.
+# completes a few of its calls, never the rest of an image. It stretches
+# with the run's waits (`scaled`), as the workers' calls do.
 _SLICE_SECONDS = 0.01
 # Slices after which a request that has not reached its second image's
 # first denoising step fails the test.
@@ -430,7 +431,7 @@ def _pause_in_second_image(
             )
             return
         _signal(workers, signal.SIGCONT)
-        time.sleep(_SLICE_SECONDS)
+        time.sleep(scaled(_SLICE_SECONDS))
         _signal(workers, signal.SIGSTOP)
     pytest.fail(
         f"the request did not complete its second image's first step in "
