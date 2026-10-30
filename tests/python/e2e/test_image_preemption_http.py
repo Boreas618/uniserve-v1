@@ -351,25 +351,41 @@ def _admin(
     )
 
 
-# A world change's phases in their order (``GET /admin/config``).
-_PHASES = ("shrink", "prepare", "promote")
+# A world change's phases in their order (``GET /admin/config``, the steps
+# ``docs/admin.md`` lists).
+_PHASES = (
+    "eager",
+    "shrink",
+    "baseline",
+    "prepare",
+    "warm_cache",
+    "park",
+    "evict",
+    "materialize",
+    "promote",
+    "keep_previous",
+    "trial",
+)
 
 
-def _wait_promotion(base_url: str, change: Future) -> None:
-    """Waits until the world change `change` promotes its successor, or has
-    answered: a park whose requests have no call in flight completes at
-    once, and the promotion with it.
+def _wait_park(base_url: str, change: Future) -> None:
+    """Waits until the world change `change` parks the serving world (or
+    takes a later step), or has answered. The park ends a request at the
+    step boundary its calls in flight reach and stores the trajectory of
+    the image it was generating, both on the serving world's workers, so
+    the promotion follows the park only once those workers run.
     """  # noqa: D205
     deadline = time.monotonic() + 900
     while time.monotonic() < deadline and not change.done():
         config = httpx.get(
             f"{base_url}/admin/config", timeout=scaled(60)
         ).json()
-        if (config.get("update") or {}).get("phase") == "promote":
+        phase = (config.get("update") or {}).get("phase")
+        if phase in _PHASES and _PHASES.index(phase) >= _PHASES.index("park"):
             return
         time.sleep(0.05)
     if not change.done():
-        raise TimeoutError("the world change did not promote")
+        raise TimeoutError("the world change did not park the serving world")
 
 
 def _wait_phase(base_url: str, change: Future, phase: str) -> None:
@@ -490,8 +506,9 @@ def test_a_preempted_image_request_continues_exactly(
 
         # A world change whose numerics are unchanged, the serving world's
         # workers paused while the second image denoises and resumed once
-        # the change promotes, well within the
-        # workers' five-minute watchdog.
+        # the change parks the serving world, well within the workers'
+        # five-minute watchdog: the park ends the request at the step
+        # boundary those workers reach.
         before = _settled_steps(base_url)
         workers = _workers(runtime)
         assert workers, "the serving world's workers"
@@ -517,7 +534,7 @@ def test_a_preempted_image_request_continues_exactly(
             for worker in workers:
                 os.kill(worker, signal.SIGSTOP)
             try:
-                _wait_promotion(base_url, change)
+                _wait_park(base_url, change)
             finally:
                 # The previous world's processes exit once it is kept as
                 # its weights.

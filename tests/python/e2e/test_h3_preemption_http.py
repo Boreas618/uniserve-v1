@@ -305,8 +305,21 @@ def _wait_denoising(base_url: str, job: str, steps: int) -> int:
     raise TimeoutError("the job did not denoise")
 
 
-# A world change's phases in their order (``GET /admin/config``).
-_PHASES = ("shrink", "prepare", "warm_cache", "promote")
+# A world change's phases in their order (``GET /admin/config``, the steps
+# ``docs/admin.md`` lists).
+_PHASES = (
+    "eager",
+    "shrink",
+    "baseline",
+    "prepare",
+    "warm_cache",
+    "park",
+    "evict",
+    "materialize",
+    "promote",
+    "keep_previous",
+    "trial",
+)
 
 
 def _wait_phase(base_url: str, change: Future, *phases: str) -> None:
@@ -391,7 +404,8 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # shrink (its scheduler answers between steps, which paused workers
         # never end) and the successor prepares; the serving world's model
         # group stays paused from the request's first step until the change
-        # promotes, well within the workers' five-minute watchdog.
+        # warms the successor's cache or parks the serving world, well
+        # within the workers' five-minute watchdog.
         workers = _group_workers(runtime, "model")
         assert len(workers) == 2, workers
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -408,9 +422,11 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
                 os.kill(worker, signal.SIGSTOP)
             try:
                 # Warming the successor's cache reads the requests the
-                # serving scheduler holds, which answers between steps: the
-                # workers resume once the change warms or promotes.
-                _wait_phase(base_url, change, "warm_cache", "promote")
+                # serving scheduler holds, which answers between steps, and
+                # the park ends them at the step boundary their calls in
+                # flight reach: the workers resume once the change warms or
+                # parks.
+                _wait_phase(base_url, change, "warm_cache", "park")
             finally:
                 for worker in workers:
                     os.kill(worker, signal.SIGCONT)
@@ -463,9 +479,11 @@ def test_a_video_request_continues_under_another_parallel_configuration(
                 os.kill(worker, signal.SIGSTOP)
             try:
                 # Warming the successor's cache reads the requests the
-                # serving scheduler holds, which answers between steps: the
-                # workers resume once the change warms or promotes.
-                _wait_phase(base_url, change, "warm_cache", "promote")
+                # serving scheduler holds, which answers between steps, and
+                # the park ends them at the step boundary their calls in
+                # flight reach: the workers resume once the change warms or
+                # parks.
+                _wait_phase(base_url, change, "warm_cache", "park")
             finally:
                 for worker in workers:
                     os.kill(worker, signal.SIGCONT)
