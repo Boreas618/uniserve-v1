@@ -557,6 +557,16 @@ impl WorkerProcess {
             if let WorkerResponse::Stalled { stall } = response {
                 return Err(self.stalled(&stall));
             }
+            // An error that answers no request is the rank's own failure,
+            // which it reports before it closes: it fails the rank.
+            if let WorkerResponse::Error {
+                message_id: None,
+                error,
+            } = response
+            {
+                tracing::error!(rank = self.rank, error = %error.message, "a rank reports its failure");
+                return Err(anyhow::anyhow!("{}", error.message));
+            }
             // A response answers the request whose identity it states.
             let message_id = response
                 .message_id()
