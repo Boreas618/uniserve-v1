@@ -25,12 +25,15 @@ def served():
 
 
 def _request(model, prompt, limit=24):
+    # The checks read the reply itself: the model answers directly rather
+    # than reasoning first, which would spend the token limit before it.
     return {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_completion_tokens": limit,
         "return_token_ids": True,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
 
