@@ -1719,11 +1719,9 @@ pub(crate) fn plan_rank(
     )?;
     let mut budget = ::storage::manifest::weights::RankBudget {
         quota,
-        graphs: if config.graph_policy == "off" {
-            0
-        } else {
-            graph_storage_budget_bytes(device_storage.total as i64)
-        },
+        // The device share every rank keeps for graph capture and warmup's
+        // eager allocations, whatever its graph policy.
+        graphs: graph_storage_budget_bytes(device_storage.total as i64),
         fixed: capacity
             .fixed_device_bytes
             .get(&device)

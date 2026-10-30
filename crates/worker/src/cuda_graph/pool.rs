@@ -224,7 +224,9 @@ impl GraphStorage {
     }
 }
 
-/// The worker reserves the same graph share when planning and allocating.
+/// The device share every rank reserves, whatever its graph policy, for
+/// graph capture and the eager allocations warmup makes: the same when
+/// planning and allocating. Warmup's residency is checked against it.
 pub(crate) fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
     (total_device_bytes.max(0) as f64 * 0.10) as u64
 }
