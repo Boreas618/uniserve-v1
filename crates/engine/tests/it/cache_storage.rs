@@ -2,7 +2,8 @@
 //! storage ledger: a shrink keeps the segments the quota leaves the serving
 //! world beside everything else the ledger books and what a successor adds,
 //! lets the requests that hold the tail it withdraws run to their end (or
-//! recomputes them past its bound) before the workers give the tail back,
+//! recomputes them past its bound, or once they cannot get a unit to
+//! continue) before the workers give the tail back,
 //! and refuses a successor whose limit cannot hold the first segment; a
 //! restore creates the tail again and a growth as much of it as the
 //! ledger's room holds; a sleeping scheduler admits nothing until it wakes,
@@ -937,6 +938,46 @@ fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
             })
         ),
         "the request holding the tail is recomputed"
+    );
+    assert_eq!(
+        workers.lock().unwrap().hooks.last().map(String::as_str),
+        Some(r#"uniserve.release_cache {"from":4}"#)
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A request holding the tail that cannot get a unit to continue is
+/// recomputed at once, though the shrink has no bound: the request holding
+/// units 1..=20 and more has none left to grow by once the shrink withdraws
+/// units 16..32, so it ends as migratable, and the workers give the tail
+/// back.
+#[test]
+fn a_shrink_recomputes_the_holders_of_the_tail_that_cannot_continue() {
+    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let mut holder = handle.submit(request(1, 20, 10_000)).unwrap();
+    assert!(next_token(&mut holder, Duration::from_secs(10)).is_some());
+
+    assert!(
+        resize(
+            &handle,
+            CacheChange::Shrink {
+                preempt_after: None,
+                successor: Successor::default(),
+            },
+        )
+        .is_ok()
+    );
+    assert!(
+        matches!(
+            terminal(&mut holder),
+            Some(Event::Migratable {
+                cause: MigrationCause::Drain,
+                ..
+            })
+        ),
+        "the request that cannot continue is recomputed"
     );
     assert_eq!(
         workers.lock().unwrap().hooks.last().map(String::as_str),

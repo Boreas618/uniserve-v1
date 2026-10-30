@@ -604,7 +604,11 @@ impl Scheduler {
         read_start: usize,
         total_tokens: usize,
     ) -> bool {
-        self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Boundary)
+        let grown = self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Boundary);
+        if !grown {
+            self.note_stuck_holder(id);
+        }
+        grown
     }
 
     /// Grows the request's cache tables for a decode call, as
@@ -618,7 +622,11 @@ impl Scheduler {
         total_tokens: usize,
     ) -> bool {
         let checkpoint = Checkpoint::Interval(self.state_interval);
-        self.grow_request_tables(id, read_start, total_tokens, checkpoint)
+        let grown = self.grow_request_tables(id, read_start, total_tokens, checkpoint);
+        if !grown {
+            self.note_stuck_holder(id);
+        }
+        grown
     }
 
     /// Grows the request's tables over the positions `[read_start,
