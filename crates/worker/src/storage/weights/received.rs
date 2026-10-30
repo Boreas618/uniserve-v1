@@ -250,7 +250,7 @@ impl WeightKeys {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let request = manifest::Request {
-                    source: sources.world.clone(),
+                    source: agreed_sources(agreement, &sources.world)?,
                     gpus: targets.iter().filter_map(|target| target.gpu).collect(),
                     target: manifest::World { ranks: targets },
                     links,
@@ -260,6 +260,13 @@ impl WeightKeys {
                 Transfer { request, manifest }
             }
         };
+        // This rank's reading of the source world the plan was made from,
+        // bound from its own host.
+        let reading = sources.world.reading_of(&request.source).ok_or_else(|| {
+            Error::Invariant(
+                "the rank's reading of the retained sources lacks a storage the plan reads".into(),
+            )
+        })?;
         // Before any rank maps, creates or copies a chunk, every rank holds
         // the same manifest: its digest covers everything it directs, so a
         // manifest altered on its way, or one a rank computed from other
@@ -399,7 +406,7 @@ impl WeightKeys {
                 && matches!(copy.target.space, Space::Storage { .. })
         });
         let spans = copies
-            .bind(&request, &sources.world)
+            .bind(&request, &reading)
             .spans()
             .map(|span| {
                 let mut span = span.map_err(|error| Error::Interface(error.to_string()))?;
@@ -457,7 +464,7 @@ impl WeightKeys {
             retained,
             request: &request,
             manifest: &manifest,
-            sources: &sources.world,
+            sources: &reading,
             rank: own_rank,
             device,
         };
@@ -627,6 +634,29 @@ impl Receipt {
         );
         Ok(())
     }
+}
+
+/// The source world the ranks of `agreement` plan one manifest from: the
+/// storages every one of them read (`own` is this rank's reading), in the
+/// first rank's order and bindings ([`manifest::World::common`]). Each rank
+/// lists its host's and its peers' servers at its own time and from its own
+/// host, while worker groups of the same world may still publish their
+/// weights, so their readings differ; planned from their own readings, the
+/// ranks of different hosts would compute different manifests.
+fn agreed_sources(agreement: &HostGroup, own: &manifest::World) -> Result<manifest::World> {
+    let encoded = serde_json::to_vec(own).map_err(|error| Error::Invalid(error.to_string()))?;
+    let readings = agreement
+        .all_gather_bytes(&encoded)?
+        .iter()
+        .map(|bytes| {
+            serde_json::from_slice::<manifest::World>(bytes)
+                .map_err(|error| Error::Interface(error.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (first, others) = readings
+        .split_first()
+        .ok_or_else(|| Error::Invariant("ranks that receive together include none".into()))?;
+    Ok(first.common(others))
 }
 
 /// Every link the ranks of `agreement` measured, each rank giving `links`,
