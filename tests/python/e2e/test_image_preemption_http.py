@@ -5,12 +5,12 @@ Serves BAGEL (``UNISERVE_BAGEL_MODEL``) and SenseNova-U1
 GPU the GPU locks granted (``UNISERVE_WORLD_DEVICE``). One interleaved
 streaming chat request, greedy and seeded, whose image start is biased so
 that it generates its two images back to back and then text, is served
-uninterrupted as the reference. The same request is then preempted once
-its stream has delivered its first image, while it goes on to its second:
-the stream publishes an image when its decoding completes, and the request
-then feeds that image back into its context, opens its second image with a
-control token, which publishes no text, prepares its latent and denoises it.
-The request is preempted:
+uninterrupted as the reference. The same request is then preempted while
+it denoises its second image: once its stream has delivered its first
+image (published when its decoding completes), the serving world's
+workers are paused (``SIGSTOP``) and run in short slices until the second
+image has prepared its latent and completed a denoising step, and the
+interruption starts from that paused state. The request is preempted:
 
 - by a sleep: the engine ends it as migratable, the daemon keeps its tokens
   (the image starts among them) and the decoded values of its first image,
@@ -27,10 +27,10 @@ The request is preempted:
   grows into the previous world's at its promotion and holds the whole
   cache the request reserves again. A request generates its images in
   seconds while a successor prepares for tens of them, so the request
-  starts once the successor prepares, and the serving world's workers are
-  paused (``SIGSTOP``) once the first image is streamed and resumed once
-  the change parks the serving world: the park then lands where the paused
-  calls end, and the successor continues the request.
+  starts once the successor prepares, and the serving world's workers,
+  paused inside its second image, resume once the change parks the serving
+  world: the park then lands where the paused calls end, and the successor
+  continues the request.
 
 SenseNova also loses the serving world's worker while a world change
 prepares its successor beside it, once the successor maps the serving
