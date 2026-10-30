@@ -108,8 +108,20 @@ CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
 # beside the serving world's weights, process, graphs and the KV cache it
 # keeps.
 SUCCESSOR_SHARE = "mem_fraction_static=0.9"
+# The share of the GPU the TP1 world serves with when its TP2 successor's
+# first rank shares that GPU: the successor's weights it does not map, graph
+# pool, process and head segment fit beside the serving world only once the
+# requests' pages are staged in host storage instead of the successor's
+# cache (on a GB200 GPU the staged plan needs about 163.5 GB of quota, the
+# plan without staging about 175.3 GB), so the change stages them.
+STAGING_SHARE = "mem_fraction_static=0.855"
 # The draft tokens a speculating deployment verifies per request and step.
 DRAFTS = "speculative_config.num_draft_tokens=3"
+# The tokens a world change's streaming requests and their reference
+# generate past their end of sequence: the request streaming when the change
+# starts still streams while the successor prepares (capturing its graphs
+# first) and once it serves.
+LONG_STREAM_TOKENS = 8192
 # The prompts and length of the comparison with and without speculation.
 SPECULATED = (*PROMPTS, LONG_PROMPT, COUNT_PROMPT)
 SPECULATED_TOKENS = 96
@@ -205,7 +217,13 @@ def _wait_until(predicate, timeout_s: float, what: str) -> None:
     raise TimeoutError(f"{what} within {timeout_s} s")
 
 
-def _body(name: str, prompt: str, tokens: int, stream: bool = False) -> dict:
+def _body(
+    name: str,
+    prompt: str,
+    tokens: int,
+    stream: bool = False,
+    ignore_eos: bool = False,
+) -> dict:
     body = {
         "model": name,
         "messages": [{"role": "user", "content": prompt}],
@@ -220,6 +238,8 @@ def _body(name: str, prompt: str, tokens: int, stream: bool = False) -> dict:
     }
     if stream:
         body["stream_options"] = {"include_usage": True}
+    if ignore_eos:
+        body["ignore_eos"] = True
     return body
 
 
@@ -230,13 +250,20 @@ def _token_id(token: str) -> int:
     return int(value)
 
 
-def _generate(base_url: str, name: str, prompt: str, tokens: int) -> dict:
+def _generate(
+    base_url: str,
+    name: str,
+    prompt: str,
+    tokens: int,
+    ignore_eos: bool = False,
+) -> dict:
     """A greedy request's prompt ids, generated ids and each generated
-    position's five most likely ids.
+    position's five most likely ids; with `ignore_eos`, it generates all
+    `tokens`.
     """  # noqa: D205
     response = httpx.post(
         f"{base_url}/v1/chat/completions",
-        json=_body(name, prompt, tokens),
+        json=_body(name, prompt, tokens, ignore_eos=ignore_eos),
         timeout=scaled(1800),
     )
     response.raise_for_status()
@@ -390,26 +417,36 @@ def test_a_prompt_resumes_from_the_checkpoint_of_an_earlier_one(
 
 
 class _Streaming:
-    """A greedy request streaming on a thread of its own: the tokens it
+    """A greedy request of `COUNT_PROMPT` streaming up to `tokens` tokens
+    (all of them with `ignore_eos`) on a thread of its own: the tokens it
     read, each position's five most likely ids and its usage.
     """  # noqa: D205
 
-    def __init__(self, base_url: str, name: str):
+    def __init__(
+        self,
+        base_url: str,
+        name: str,
+        tokens: int = COUNT_TOKENS,
+        ignore_eos: bool = False,
+    ):
         self.tokens: list[int] = []
         self.top: list[list[int]] = []
         self.usage: dict | None = None
         self.error: BaseException | None = None
+        body = _body(
+            name, COUNT_PROMPT, tokens, stream=True, ignore_eos=ignore_eos
+        )
         self._thread = threading.Thread(
-            target=self._read, args=(base_url, name), daemon=True
+            target=self._read, args=(base_url, body), daemon=True
         )
         self._thread.start()
 
-    def _read(self, base_url: str, name: str) -> None:
+    def _read(self, base_url: str, body: dict) -> None:
         try:
             with httpx.stream(
                 "POST",
                 f"{base_url}/v1/chat/completions",
-                json=_body(name, COUNT_PROMPT, COUNT_TOKENS, stream=True),
+                json=body,
                 timeout=scaled(1800),
             ) as response:
                 response.raise_for_status()
@@ -467,8 +504,14 @@ def test_repartitioned_recurrent_pages_resume_a_streaming_request(
     devices = os.environ["UNISERVE_WORLD_DEVICES"]
     assert len(devices.split(",")) == 2
     name = "qwen3_5-repartition"
-    with _serve(tmp_path, name, devices=devices) as (base_url, log):
-        streams = [_Streaming(base_url, name)]
+    with _serve(tmp_path, name, (STAGING_SHARE,), devices) as (base_url, log):
+
+        def stream() -> _Streaming:
+            return _Streaming(
+                base_url, name, LONG_STREAM_TOKENS, ignore_eos=True
+            )
+
+        streams = [stream()]
         streams[-1].wait_for(EARLY_TOKENS)
         with ThreadPoolExecutor(max_workers=1) as executor:
             change = executor.submit(
@@ -485,7 +528,7 @@ def test_repartitioned_recurrent_pages_resume_a_streaming_request(
             while not change.done():
                 if streams[-1].finished:
                     streams[-1].join()
-                    streams.append(_Streaming(base_url, name))
+                    streams.append(stream())
                 time.sleep(0.01)
             response = change.result()
         assert response.status_code == 200, response.text
@@ -512,7 +555,13 @@ def test_repartitioned_recurrent_pages_resume_a_streaming_request(
         streams[-1].join()
         if finish == "rollback":
             assert _prefix_hits(base_url) - hits >= warming["warmed_tokens"]
-        alone = _generate(base_url, name, COUNT_PROMPT, COUNT_TOKENS)
+        alone = _generate(
+            base_url,
+            name,
+            COUNT_PROMPT,
+            LONG_STREAM_TOKENS,
+            ignore_eos=True,
+        )
 
     assert any("a request migrated" in line for line in _log_lines(log))
     for stream in streams:
@@ -614,9 +663,21 @@ def test_a_world_change_turns_speculation_on_for_a_streaming_request(
     with its logprobs.
     """  # noqa: D205
     name = "qwen3_5-speculation-change"
-    with _serve(tmp_path, name, (SUCCESSOR_SHARE,)) as (base_url, log):
-        alone = _generate(base_url, name, COUNT_PROMPT, COUNT_TOKENS)
-        streaming = _Streaming(base_url, name)
+    # Both worlds capture the decode batch sizes of `CHANGE`, so the change
+    # turns speculation on alone and the successor captures the
+    # verification and drafting passes of those sizes.
+    options = (SUCCESSOR_SHARE, CHANGE)
+    with _serve(tmp_path, name, options) as (base_url, log):
+        alone = _generate(
+            base_url,
+            name,
+            COUNT_PROMPT,
+            LONG_STREAM_TOKENS,
+            ignore_eos=True,
+        )
+        streaming = _Streaming(
+            base_url, name, LONG_STREAM_TOKENS, ignore_eos=True
+        )
         streaming.wait_for(EARLY_TOKENS)
         response = httpx.put(
             f"{base_url}/admin/config",
