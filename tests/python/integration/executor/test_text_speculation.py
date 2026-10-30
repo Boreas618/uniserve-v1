@@ -230,6 +230,7 @@ class Worker:
                         "block_size": group.block_size,
                         "units_per_page": group.units_per_page,
                         "window": 1 if group.states else None,
+                        "state": group.states,
                     }
                     for group in self.pool.groups
                 ],

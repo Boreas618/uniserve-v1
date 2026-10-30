@@ -266,6 +266,7 @@ def _settings(model: Model, graphs: bool) -> dict:
                     "block_size": group.block_size,
                     "units_per_page": group.units_per_page,
                     "window": group.window,
+                    "state": group.states,
                 }
                 for group in model.pool.groups
             ],
