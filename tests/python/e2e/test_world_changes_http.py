@@ -89,6 +89,7 @@ from tests.python.e2e.http_helpers import (
     dedicated_experts,
     find_free_port,
     require_uniserve_binary,
+    scaled,
     second_host,
     server_process,
     worker_executable,
@@ -496,7 +497,7 @@ class Streaming:
         return not self._thread.is_alive()
 
     def join(self) -> None:
-        self._thread.join(timeout=1800)
+        self._thread.join(timeout=scaled(1800))
         assert not self._thread.is_alive(), "the count did not end"
         assert self.error is None, f"the stream failed: {self.error!r}"
 
@@ -511,14 +512,16 @@ def _apply(
     return httpx.put(
         f"{base_url}/admin/config",
         json={"set": list(assignments), "force": force},
-        timeout=1800,
+        timeout=scaled(1800),
     )
 
 
 def _admin(
     base_url: str, path: str, body: dict | None = None
 ) -> httpx.Response:
-    return httpx.post(f"{base_url}/admin/{path}", json=body or {}, timeout=1800)
+    return httpx.post(
+        f"{base_url}/admin/{path}", json=body or {}, timeout=scaled(1800)
+    )
 
 
 def _world_change(base_url: str, *assignments: str) -> dict:
