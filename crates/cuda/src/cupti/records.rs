@@ -10,7 +10,7 @@
 //! its text.
 //!
 //! The field offsets are those of the CUPTI 13 structs the loaded library
-//! writes (`cupti_activity.h` of `nvidia-cuda-cupti` 13.0): every record
+//! writes (`cupti_activity.h` of `nvidia-cuda-cupti` 13.4): every record
 //! starts with its `CUpti_ActivityKind`, which names its struct.
 
 use std::collections::HashMap;
@@ -37,7 +37,7 @@ pub const STORAGE2: u32 = 49;
 /// `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`.
 pub const GRAPH_TRACE: u32 = super::subscriber::GRAPH_TRACE;
 
-/// A kernel's execution (`CUpti_ActivityKernel10`).
+/// A kernel's execution (`CUpti_ActivityKernel13`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Kernel {
     pub start: u64,
@@ -63,7 +63,7 @@ pub struct Kernel {
     pub channel: u32,
 }
 
-/// A copy (`CUpti_ActivityMemcpy6`, or `CUpti_ActivityMemcpyPtoP4` for a
+/// A copy (`CUpti_ActivityMemcpy7`, or `CUpti_ActivityMemcpyPtoP4` for a
 /// peer copy).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Copy {
@@ -86,7 +86,7 @@ pub struct Copy {
     pub peer: Option<(u32, u32)>,
 }
 
-/// A fill (`CUpti_ActivityMemset4`).
+/// A fill (`CUpti_ActivityMemset5`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fill {
     pub value: u32,
@@ -163,7 +163,7 @@ pub struct Graph {
     pub stream: u32,
 }
 
-/// An NVLink connection (`CUpti_ActivityNvLink4`).
+/// An NVLink connection (`CUpti_ActivityNvLink5`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NvLink {
     pub version: u32,
@@ -407,8 +407,10 @@ pub(super) unsafe fn decode(record: *const u8, names: &mut Names) -> Option<Reco
                 ends: [read(record, 16), read(record, 32)],
                 flag: read(record, 48),
                 links: read(record, 52),
-                bandwidth: read(record, 120),
-                nvswitch: read::<u8>(record, 128) != 0,
+                // The ports of each end are pointers in this struct
+                // version, which puts the bandwidth at 72.
+                bandwidth: read(record, 72),
+                nvswitch: read::<u8>(record, 80) != 0,
             }),
             PCIE => Record::Pcie(Pcie {
                 device_type: read(record, 4),

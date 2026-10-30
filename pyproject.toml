@@ -79,8 +79,17 @@ uniserve-eval = { path = "uniserve_eval", editable = true }
 [tool.uv]
 # DeepEP's elastic transport uses the GIN request and traffic-class APIs
 # supplied by NCCL 2.30.4. Keep one NCCL runtime for PyTorch and DeepEP.
+#
+# PyTorch's `cuda-toolkit` 13.0.3 pins CUPTI 13.0.85, whose software kernel
+# timestamps are written by the device into per-kernel host records that
+# CUPTI's worker thread may already have freed; on GB200 such a write that
+# reaches a page the allocator returned faults the device front end (Xid 31)
+# and leaves the context unusable. CUPTI 13.4.92 records kernels, copies and
+# fills on the CUDA 13.0 driver without it. Records keep the field offsets the
+# worker decodes (`crates/cuda/src/cupti/records.rs`).
 override-dependencies = [
     "nvidia-nccl-cu13==2.30.4; sys_platform == 'linux'",
+    "nvidia-cuda-cupti==13.4.92; sys_platform == 'linux'",
 ]
 
 [tool.setuptools.packages.find]

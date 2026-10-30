@@ -60,7 +60,7 @@ struct Fields {
     stream: usize,
 }
 
-/// `CUpti_ActivityKernel10`.
+/// `CUpti_ActivityKernel13`.
 const KERNEL: Fields = Fields {
     start: 16,
     end: 24,
@@ -68,8 +68,8 @@ const KERNEL: Fields = Fields {
     stream: 48,
 };
 
-/// `CUpti_ActivityMemcpy6`, `CUpti_ActivityMemcpyPtoP4` and
-/// `CUpti_ActivityMemset4`, which share these offsets.
+/// `CUpti_ActivityMemcpy7`, `CUpti_ActivityMemcpyPtoP4` and
+/// `CUpti_ActivityMemset5`, which share these offsets.
 const TRANSFER: Fields = Fields {
     start: 16,
     end: 24,
