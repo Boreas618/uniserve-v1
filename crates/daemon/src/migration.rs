@@ -693,7 +693,7 @@ mod tests {
             }
         }
         hold.serve(client());
-        first.park().await.unwrap();
+        first.park(false).await.unwrap();
 
         let finished = loop {
             match next(&mut events).await {
@@ -1086,7 +1086,7 @@ mod tests {
                 hold.serve(second);
                 let parking = {
                     let first = Arc::clone(&first);
-                    tokio::spawn(async move { first.park().await })
+                    tokio::spawn(async move { first.park(false).await })
                 };
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 drop(pace);

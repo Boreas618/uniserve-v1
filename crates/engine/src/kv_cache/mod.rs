@@ -216,9 +216,30 @@ struct PoolInner {
     /// imported pages acquired and released, until the world takes them
     /// (`BlockPool::take_inherited`).
     inherited: std::ops::Range<u32>,
+    /// Of the inherited units, those the predecessor lent this world for
+    /// its trial (`BlockPool::borrow`): the workers map them writable and
+    /// the pool allocates them as its own.
+    borrowed: Vec<std::ops::Range<u32>>,
+    /// The units this world lent its successor at its park
+    /// (`BlockPool::lend`), which the successor may write: never queued or
+    /// allocated until the world takes them back (`BlockPool::reclaim`).
+    lent: Vec<std::ops::Range<u32>>,
+}
+
+/// The units of `range` below `end`.
+fn units_below(range: &std::ops::Range<u32>, end: u32) -> u32 {
+    range.end.min(end).saturating_sub(range.start.min(end))
 }
 
 impl PoolInner {
+    /// Whether the world may not write `unit`: it maps it read-only from
+    /// the predecessor's planes, or lent it to its successor.
+    fn foreign(&self, unit: u32) -> bool {
+        let borrowed = || self.borrowed.iter().any(|range| range.contains(&unit));
+        let lent = self.lent.iter().any(|range| range.contains(&unit));
+        lent || (self.inherited.contains(&unit) && !borrowed())
+    }
+
     /// Appends a unit to the free queue.
     fn fq_push_back(&mut self, index: u32) {
         let tail = self.fq_tail;
@@ -293,6 +314,7 @@ impl PoolInner {
     /// request can reacquire the page until allocation reaches it.
     fn release_page(&mut self, units: &[UnitId]) {
         for unit in units {
+            let foreign = self.foreign(unit.0);
             let meta = &mut self.meta[unit.0 as usize];
             debug_assert!(meta.ref_cnt > 0, "cache unit reference count underflow");
             meta.ref_cnt = meta.ref_cnt.saturating_sub(1);
@@ -311,8 +333,9 @@ impl PoolInner {
                 continue;
             }
             // An inherited unit keeps its page for later readers and is
-            // never allocated: the world does not write it.
-            if self.inherited.contains(&unit.0) {
+            // never allocated: the world does not write it, nor a unit it
+            // lent until it takes it back.
+            if foreign {
                 meta.state = if meta.published.is_some() {
                     UnitState::Cached
                 } else {
@@ -340,11 +363,22 @@ impl PoolInner {
     }
 
     /// Recounts the allocatable units: those below the first withdrawn,
-    /// beside the sentinel, the scratch and the inherited units.
+    /// beside the sentinel, the scratch, the inherited units not borrowed
+    /// and the lent ones.
     fn recount(&mut self) {
-        let inherited =
-            self.inherited.end.min(self.withdrawn) - self.inherited.start.min(self.withdrawn);
-        self.stats.total = (self.withdrawn.saturating_sub(1 + self.scratch) - inherited) as usize;
+        let below = |ranges: &[std::ops::Range<u32>]| -> u32 {
+            ranges
+                .iter()
+                .map(|range| units_below(range, self.withdrawn))
+                .sum()
+        };
+        let foreign = units_below(&self.inherited, self.withdrawn)
+            .saturating_sub(below(&self.borrowed))
+            + below(&self.lent);
+        self.stats.total = self
+            .withdrawn
+            .saturating_sub(1 + self.scratch)
+            .saturating_sub(foreign) as usize;
         self.stats.free = self.free_count;
     }
 
@@ -456,6 +490,8 @@ impl BlockPool {
             scratch,
             withdrawn: num_units,
             inherited: 0..0,
+            borrowed: Vec::new(),
+            lent: Vec::new(),
         };
 
         // Unit zero is the worker's padding sentinel and is never queued,
@@ -542,10 +578,13 @@ impl BlockPool {
         }
         inner.withdrawn = end;
         for unit in from..end {
-            let meta = &mut inner.meta[unit as usize];
-            if meta.ref_cnt > 0 {
+            // A lent unit waits for its reclaim, wherever it lies.
+            if inner.meta[unit as usize].ref_cnt > 0
+                || inner.lent.iter().any(|lent| lent.contains(&unit))
+            {
                 continue;
             }
+            let meta = &mut inner.meta[unit as usize];
             meta.state = UnitState::Free;
             meta.published = None;
             inner.fq_push_back(unit);
@@ -577,9 +616,9 @@ impl BlockPool {
     /// write such a page.
     pub(crate) fn shared(&self, page: &PageRef) -> bool {
         let inner = lock(&self.inner);
-        page.units.iter().any(|unit| {
-            inner.inherited.contains(&unit.0) || inner.meta[unit.0 as usize].published.is_some()
-        })
+        page.units
+            .iter()
+            .any(|unit| inner.foreign(unit.0) || inner.meta[unit.0 as usize].published.is_some())
     }
 
     /// Returns the inherited units to allocation: the predecessor world is
@@ -587,6 +626,7 @@ impl BlockPool {
     pub(crate) fn take_inherited(&self) {
         let mut inner = lock(&self.inner);
         let range = std::mem::replace(&mut inner.inherited, 0..0);
+        inner.borrowed.clear();
         for unit in range {
             let meta = &inner.meta[unit as usize];
             if meta.ref_cnt > 0 || meta.in_fq || unit >= inner.withdrawn {
@@ -595,6 +635,82 @@ impl BlockPool {
             inner.fq_push_back(unit);
         }
         inner.recount();
+    }
+
+    /// Borrows the inherited units `ranges` for the world's trial: its
+    /// predecessor lent them at its park ([`Self::lend`]) and the workers
+    /// map them writable. The pool queues them behind its own free units and
+    /// allocates them as its own; the predecessor's pages they hold stay
+    /// published until allocation reaches them. Units outside the inherited
+    /// ones are left out. Returns how many units it borrowed.
+    pub(crate) fn borrow(&self, ranges: &[std::ops::Range<u32>]) -> u32 {
+        let mut inner = lock(&self.inner);
+        let inherited = inner.inherited.clone();
+        let mut borrowed = 0;
+        for range in ranges {
+            let range = range.start.max(inherited.start)..range.end.min(inherited.end);
+            if range.is_empty() {
+                continue;
+            }
+            for unit in range.clone() {
+                let meta = &inner.meta[unit as usize];
+                if meta.ref_cnt > 0 || meta.in_fq || unit >= inner.withdrawn {
+                    continue;
+                }
+                inner.fq_push_back(unit);
+            }
+            borrowed += range.end - range.start;
+            inner.borrowed.push(range);
+        }
+        inner.recount();
+        borrowed
+    }
+
+    /// Lends the units `ranges` to the world that succeeds this one, at the
+    /// park: the successor may write them, so the pool forgets the pages
+    /// they hold and allocates none of them until it takes them back
+    /// ([`Self::reclaim`]). Returns how many pages it forgot.
+    pub(crate) fn lend(&self, ranges: &[std::ops::Range<u32>]) -> usize {
+        let mut inner = lock(&self.inner);
+        let mut heads = Vec::new();
+        for unit in ranges.iter().cloned().flatten() {
+            if let Some(head) = inner.meta[unit as usize].published {
+                heads.push(head);
+            }
+            inner.fq_unlink(unit);
+        }
+        heads.sort_unstable();
+        heads.dedup();
+        for &head in &heads {
+            inner.remove_page(head);
+        }
+        inner.lent.extend(ranges.iter().cloned());
+        inner.recount();
+        heads.len()
+    }
+
+    /// The units the world lent its successor and has not taken back.
+    pub(crate) fn lent(&self) -> Vec<std::ops::Range<u32>> {
+        lock(&self.inner).lent.clone()
+    }
+
+    /// Takes back the units lent to the successor world ([`Self::lend`]),
+    /// whose processes are gone: they return to allocation holding no page.
+    /// Returns how many units it took back.
+    pub(crate) fn reclaim(&self) -> u32 {
+        let mut inner = lock(&self.inner);
+        let lent = std::mem::take(&mut inner.lent);
+        let mut reclaimed = 0;
+        for unit in lent.into_iter().flatten() {
+            let meta = &inner.meta[unit as usize];
+            if meta.ref_cnt > 0 || meta.in_fq || unit >= inner.withdrawn {
+                continue;
+            }
+            inner.fq_push_back(unit);
+            reclaimed += 1;
+        }
+        inner.recount();
+        reclaimed
     }
 
     /// The published pages whose units the pool holds (none withdrawn), as
@@ -4011,6 +4127,106 @@ mod tests {
         );
         assert_eq!(hit.cached_tokens, 8);
         assert_eq!(hit.cached_free_units, 2);
+    }
+
+    /// A predecessor's pool of 16 units whose units 8, 9 and 10 hold
+    /// `prompt`'s two complete pages and its partial last page, then released.
+    fn pages_past_a_filler(
+        coordinator: &PrefixCacheCoordinator,
+        prompt: &[u32],
+        source: &Arc<WorkerEndpoint>,
+    ) -> BlockPool {
+        let pool = BlockPool::new(16, 0);
+        let filler = pool.allocate(7, 1).unwrap();
+        drop(publish(coordinator, &pool, prompt, source));
+        drop(filler);
+        pool
+    }
+
+    /// The inherited units a successor borrows are allocated as its own on
+    /// trial, after its own free units, and the predecessor's pages on them
+    /// are hit until allocation reaches them; the inherited units it does
+    /// not borrow stay out of allocation until the commit.
+    #[test]
+    fn a_successor_allocates_the_inherited_units_it_borrows() {
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let prompt = (1..=9).collect::<Vec<u32>>();
+        let predecessor = pages_past_a_filler(&coordinator, &prompt, &source);
+
+        // The successor maps the predecessor's 16 units after its own 16.
+        let successor = BlockPool::new(32, 0);
+        successor.inherit(16..32);
+        assert_eq!(successor.import(&predecessor.export(), 16, &source), 2);
+        assert_eq!(successor.borrow(std::slice::from_ref(&(24..32))), 8);
+        assert_eq!(successor.free_units(), 15 + 8);
+        assert_eq!(successor.usable_units(), 15 + 8);
+        let hit = coordinator.probe_prefix(
+            &successor,
+            &prompt,
+            true,
+            false,
+            PrefixScope::default(),
+            &source,
+        );
+        assert_eq!(hit.cached_tokens, 8);
+        assert_eq!(hit.cached_free_units, 2);
+
+        let pages = successor.allocate(15 + 8, 1).unwrap();
+        let units: Vec<u32> = pages.iter().map(|page| page.units()[0].0).collect();
+        assert!(
+            units[..15].iter().all(|unit| (1..16).contains(unit)),
+            "{units:?}"
+        );
+        assert!(
+            units[15..].iter().all(|unit| (24..32).contains(unit)),
+            "{units:?}"
+        );
+        assert!(pages.iter().all(|page| !successor.shared(page)));
+        assert!(successor.allocate(1, 1).is_none());
+        let hit = coordinator.probe_prefix(
+            &successor,
+            &prompt,
+            true,
+            false,
+            PrefixScope::default(),
+            &source,
+        );
+        assert_eq!(hit.cached_tokens, 0);
+
+        successor.take_inherited();
+        assert_eq!(successor.free_units(), 8);
+        drop(pages);
+        assert_eq!(successor.free_units(), 31);
+    }
+
+    /// A world allocates none of the units it lent its successor, whose
+    /// pages it forgets, until it takes them back.
+    #[test]
+    fn a_world_allocates_no_unit_it_lent_until_it_takes_them_back() {
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let prompt = (1..=9).collect::<Vec<u32>>();
+        let pool = pages_past_a_filler(&coordinator, &prompt, &source);
+        assert_eq!(pool.free_units(), 15);
+
+        assert_eq!(pool.lend(std::slice::from_ref(&(8..16))), 2);
+        assert_eq!(pool.lent(), vec![8..16]);
+        assert_eq!(pool.free_units(), 7);
+        assert_eq!(pool.usable_units(), 7);
+        let hit =
+            coordinator.probe_prefix(&pool, &prompt, true, false, PrefixScope::default(), &source);
+        assert_eq!(hit.cached_tokens, 0);
+        let pages = pool.allocate(7, 1).unwrap();
+        assert!(pages.iter().all(|page| page.units()[0].0 < 8));
+        assert!(pool.allocate(1, 1).is_none());
+
+        assert_eq!(pool.reclaim(), 8);
+        assert!(pool.lent().is_empty());
+        assert_eq!(pool.free_units(), 8);
+        assert_eq!(pool.usable_units(), 15);
+        drop(pages);
+        assert_eq!(pool.free_units(), 15);
     }
 
     #[test]

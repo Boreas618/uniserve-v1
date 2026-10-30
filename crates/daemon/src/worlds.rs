@@ -2316,7 +2316,9 @@ impl Replica {
         let paused = Instant::now();
         hold.hold();
         self.progress_edit(|progress| progress.paused = Some(paused));
-        let index = match running.park().await {
+        // The successor maps the serving world's cache unless it lays out
+        // its own, and borrows the segments the park lends.
+        let index = match running.park(!adds.unmapped_cache).await {
             Ok(index) => index,
             Err(error) => {
                 // The serving world serves on: it resumes, and the successor
@@ -2932,7 +2934,7 @@ pub(crate) async fn rollback(
     if let Some(failing) = &failing
         && failing.state() != EngineState::Closed
     {
-        match tokio::time::timeout(CLOSED_EXIT, failing.park()).await {
+        match tokio::time::timeout(CLOSED_EXIT, failing.park(false)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => info!(%error, "the world on trial parked in part"),
             Err(_) => warn!(

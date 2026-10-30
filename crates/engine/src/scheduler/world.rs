@@ -12,13 +12,19 @@
 //!   It answers with its cache index: every published page's public and
 //!   private continuation aliases with their units, which the successor
 //!   reads from the planes it maps read-only without duplicating the bytes.
-//!   Its storage and index stay as they were, so a rollback resumes it.
+//!   When the successor maps its cache, it lends it the segments no
+//!   request in flight continues from, whose pages it forgets, since the
+//!   successor writes them on trial. Its storage and the rest of its index
+//!   stay as they were, so a rollback resumes it.
 //! - **Promote** (the successor): its workers copy the predecessor's cache
-//!   flags and scales of the units they inherit (`uniserve.adopt_cache`),
-//!   and its pool imports the predecessor's pages into those units, from
-//!   which migrated requests reuse their prefixes.
+//!   flags and scales of the units they inherit and map the lent segments
+//!   writable (`uniserve.adopt_cache`), its pool imports the predecessor's
+//!   pages into those units, from which migrated requests reuse their
+//!   prefixes, and allocates the lent ones as its own.
 //! - **Resume** (the parked world, at a rollback): it admits and executes
-//!   again, with the index it parked with.
+//!   again, with the index it parked with, and allocates the units it lent
+//!   once the world on trial writes none of them any more (its processes
+//!   are gone).
 //! - **Commit** (the successor, once the predecessor is gone): its workers
 //!   take the segments they mapped read-only (`uniserve.take_cache`), its
 //!   pool allocates the inherited units, and its worker groups relaunch on
@@ -62,6 +68,10 @@ struct CacheReport {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParkedCache {
     pub pages: Vec<IndexedPage>,
+    /// The units of the segments the scheduler lent the successor at its
+    /// park, in its own planes: the successor maps them writable and
+    /// allocates them on trial (`specs/online-operations.md` §6.4).
+    pub lent: Vec<std::ops::Range<u32>>,
     /// The cache units the migrating requests held: those a successor
     /// recomputing them computes again.
     pub held_units: u32,
@@ -78,6 +88,9 @@ pub struct ParkedCache {
 /// A park waiting for the scheduler's requests to end.
 pub(super) struct Parking {
     answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
+    /// Whether the world that succeeds this one maps its cache, and borrows
+    /// the segments it lends.
+    lend: bool,
     held_units: u32,
     requests: u32,
     reserved_units: u32,
@@ -86,11 +99,22 @@ pub(super) struct Parking {
 
 impl Scheduler {
     /// Parks the scheduler (see the module documentation), answering with
-    /// its prefix cache index once it is parked.
-    pub(super) fn park(&mut self, answer: crossbeam_channel::Sender<Result<ParkedCache, String>>) {
+    /// its prefix cache index once it is parked; when it `lend`s, the world
+    /// that succeeds it maps its cache and borrows the segments it lends
+    /// ([`Self::lend_cache`]).
+    pub(super) fn park(
+        &mut self,
+        answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
+        lend: bool,
+    ) {
         if self.parked {
             let _ = answer.send(Ok(ParkedCache {
                 pages: self.index(),
+                lent: self
+                    .storage
+                    .cache()
+                    .map(|cache| cache.block_pool.lent())
+                    .unwrap_or_default(),
                 ..ParkedCache::default()
             }));
             return;
@@ -128,6 +152,7 @@ impl Scheduler {
         self.preempt_media(MigrationCause::Drain, |_| true);
         self.parking = Some(Parking {
             answer,
+            lend,
             held_units: migrating.iter().map(|(units, _)| units).sum(),
             requests: migrating.len() as u32,
             reserved_units: reserved.iter().sum(),
@@ -225,14 +250,21 @@ impl Scheduler {
         self.flush_offloads();
         self.parked = true;
         let index = self.index();
+        let lent = if parking.lend {
+            self.lend_cache(&index)
+        } else {
+            Vec::new()
+        };
         tracing::info!(
             pages = index.len(),
             held_units = parking.held_units,
             requests = parking.requests,
+            lent_units = lent.iter().map(|units| units.len()).sum::<usize>(),
             "the scheduler parked"
         );
         let _ = parking.answer.send(Ok(ParkedCache {
             pages: index,
+            lent,
             held_units: parking.held_units,
             requests: parking.requests,
             reserved_units: parking.reserved_units,
@@ -246,8 +278,10 @@ impl Scheduler {
         self.parked
     }
 
-    /// Resumes a parked scheduler: it admits and executes again.
-    pub(super) fn resume(&mut self) -> Result<(), String> {
+    /// Resumes a parked scheduler: it admits and executes again. When it
+    /// `reclaim`s, the world it lent cache units to at its park writes none
+    /// of them any more, and the pool allocates them again.
+    pub(super) fn resume(&mut self, reclaim: bool) -> Result<(), String> {
         if self.parking.is_some() {
             return Err("the scheduler is still parking".to_owned());
         }
@@ -256,27 +290,93 @@ impl Scheduler {
             self.closing = false;
             tracing::info!("the parked scheduler resumes");
         }
+        if reclaim && let Some(cache) = self.storage.cache() {
+            let reclaimed = cache.block_pool.reclaim();
+            if reclaimed > 0 {
+                tracing::info!(
+                    units = reclaimed,
+                    "took back the cache units lent to the successor world"
+                );
+            }
+        }
         Ok(())
     }
 
+    /// Lends the world that succeeds this one, which maps this world's
+    /// cache, the segments no request in flight continues from
+    /// (`specs/online-operations.md` §6.4): the segments the planes hold
+    /// past the first, which holds the padding and warmup units, and past
+    /// those the world inherited and does not own yet, none of whose units
+    /// holds a page of `index` under a private continuation alias. The
+    /// successor maps them writable and allocates their units on trial, so
+    /// the pool forgets their pages and allocates none of their units until
+    /// it reclaims them ([`Self::resume`]). Returns their units.
+    fn lend_cache(&self, index: &[IndexedPage]) -> Vec<std::ops::Range<u32>> {
+        let Some(cache) = self.storage.cache() else {
+            return Vec::new();
+        };
+        // Every worker splits the planes alike (`Self::describe_cache`).
+        let Some(segments) = self.executor.info().workers.iter().find_map(|(_, info)| {
+            info.prefix_cache
+                .as_ref()
+                .map(|cache| cache.segments.clone())
+                .filter(|segments| !segments.is_empty())
+        }) else {
+            return Vec::new();
+        };
+        let pool = &cache.block_pool;
+        let inherited = pool.inherited();
+        let held = pool.withdrawn();
+        let continued: std::collections::BTreeSet<u32> = index
+            .iter()
+            .filter(|page| page.resume.is_some())
+            .flat_map(|page| page.units.iter().copied())
+            .collect();
+        let mut lent = Vec::new();
+        let mut start = 0;
+        for (position, segment) in segments.iter().enumerate() {
+            let units = start..start + segment.units;
+            start = units.end;
+            let foreign = units.start < inherited.end && inherited.start < units.end;
+            if position == 0
+                || units.end > held
+                || foreign
+                || continued.range(units.clone()).next().is_some()
+            {
+                continue;
+            }
+            lent.push(units);
+        }
+        let forgotten = pool.lend(&lent);
+        tracing::info!(
+            segments = lent.len(),
+            of = segments.len(),
+            forgotten_pages = forgotten,
+            "lent the successor world the cache segments no request in flight continues from"
+        );
+        lent
+    }
+
     /// Promotes a successor scheduler: its workers adopt the predecessor's
-    /// cache flags of the units they inherit, and its pool imports the
-    /// predecessor's published pages, each unit moved to where the workers
-    /// map it.
+    /// cache flags of the units they inherit and map the segments the
+    /// predecessor lent writable, its pool imports the predecessor's
+    /// published pages, each unit moved to where the workers map it, and
+    /// allocates the lent units as its own.
     ///
     /// Fails, changing nothing, when the world's KV cache limit in the
     /// trial cannot hold what the requests the predecessor hands over
     /// compute: the whole cache a request reserved at admission (one with
     /// images), which it reserves again, and of every other request all the
     /// units it held when they `recompute` from their tokens, beside a page
-    /// each, the last they continue. The limit is the
-    /// units its own segments hold free, and those of the segments it has
-    /// yet to create that every device's storage ledger has room for: the
-    /// quota less everything booked, the predecessor's kept storage
-    /// included, and, when the predecessor's processes exit at the
-    /// promotion (it `grows`), with what they booked transferred to this
-    /// world. The world has no more until its commit gives it the
-    /// predecessor's segments, and the requests would wait for it.
+    /// each, the last they continue. The limit is the units its own
+    /// segments hold free, those of the segments the predecessor lent, and
+    /// those of the segments it has yet to create that every device's
+    /// storage ledger has room for: the quota less everything booked, the
+    /// predecessor's kept storage included, and, when the predecessor's
+    /// processes exit at the promotion (it `grows`), with what they booked
+    /// transferred to this world. The world has no more until its commit
+    /// gives it the predecessor's segments, and the requests would wait for
+    /// it.
     pub(super) fn promote(
         &mut self,
         parked: &ParkedCache,
@@ -304,6 +404,20 @@ impl Scheduler {
                 0
             };
         let own_free = cache.block_pool.free_units() as u32;
+        // The segments the predecessor lent, in this pool's units, where the
+        // workers map the predecessor's planes after the world's head.
+        let inherited = cache.block_pool.inherited();
+        let borrowed: Vec<std::ops::Range<u32>> = parked
+            .lent
+            .iter()
+            .filter_map(|lent| {
+                let units = lent.start.checked_add(inherited.start)?
+                    ..lent.end.checked_add(inherited.start)?;
+                (!units.is_empty() && inherited.start <= units.start && units.end <= inherited.end)
+                    .then_some(units)
+            })
+            .collect();
+        let lent: u32 = borrowed.iter().map(|units| units.end - units.start).sum();
         let growable = match self.cache_storage()? {
             Some(reports) => {
                 let fit = reports
@@ -320,13 +434,13 @@ impl Scheduler {
             }
             None => 0,
         };
-        let free = own_free + growable;
+        let free = own_free + lent + growable;
         if needed > free {
             return Err(format!(
                 "the successor world's KV cache holds {free} free units within its storage \
-                 ledgers until its commit ({own_free} in its own segments, {growable} in the \
-                 segments the ledgers have room for), and the {} requests in flight need \
-                 {needed}{}{}",
+                 ledgers until its commit ({own_free} in its own segments, {lent} in the \
+                 segments its predecessor lent, {growable} in the segments the ledgers have \
+                 room for), and the {} requests in flight need {needed}{}{}",
                 parked.requests,
                 if parked.reserving > 0 {
                     format!(
@@ -343,15 +457,17 @@ impl Scheduler {
                 },
             ));
         }
-        let Some(cache) = self.storage.cache() else {
-            return Ok(());
-        };
         let index = &parked.pages;
-        let inherited = cache.block_pool.inherited();
         if inherited.is_empty() {
             return Ok(());
         }
-        self.run_hook("uniserve.adopt_cache", "")?;
+        let adopt = serde_json::json!({
+            "borrowed": borrowed
+                .iter()
+                .map(|units| [units.start, units.end])
+                .collect::<Vec<_>>(),
+        });
+        self.run_hook("uniserve.adopt_cache", &adopt.to_string())?;
         let source = self
             .executor
             .info()
@@ -368,10 +484,12 @@ impl Scheduler {
             return Ok(());
         };
         let imported = cache.block_pool.import(index, inherited.start, &source);
+        let borrowed = cache.block_pool.borrow(&borrowed);
         tracing::info!(
             pages = imported,
             offered = index.len(),
             units = inherited.end - inherited.start,
+            borrowed,
             "imported the predecessor's prefix cache index"
         );
         Ok(())

@@ -1741,6 +1741,39 @@ impl SimEngine {
             .num_units = count;
     }
 
+    /// Splits the simulated planes into `segments` of `units` each, all
+    /// held, the first `inherited` of them after the first mapped from a
+    /// predecessor world, as a successor's planes are.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the simulated worker does not expose a prefix cache.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test setter whose missing prefix cache is documented under Panics"
+    )]
+    pub fn set_segments(&mut self, segments: u32, units: u32, inherited: u32) {
+        let cache = self
+            .info
+            .prefix_cache
+            .as_mut()
+            .expect("sim AR worker has a prefix cache");
+        cache.segments = (0..segments)
+            .map(|ordinal| ipc::CacheSegment {
+                world: if (1..=inherited).contains(&ordinal) {
+                    1
+                } else {
+                    2
+                },
+                ordinal,
+                units,
+            })
+            .collect();
+        cache.held_segments = segments;
+        cache.inherited_start = if inherited > 0 { units } else { 0 };
+        cache.inherited_units = inherited * units;
+    }
+
     /// Reports a state group after the K/V groups: checkpoints of a layer
     /// kept per request slot, a page of `units_per_page` units at every
     /// boundary of the first group's block size.

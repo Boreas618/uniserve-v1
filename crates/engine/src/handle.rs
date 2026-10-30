@@ -572,10 +572,19 @@ pub enum Command {
     /// Parks the scheduler (`Scheduler::park`): ends every token request
     /// that resumes from its generated tokens as migratable, lets the
     /// others finish, and answers with the prefix cache index once nothing
-    /// runs; it executes nothing more until resumed.
-    Park(crossbeam_channel::Sender<Result<crate::scheduler::ParkedCache, String>>),
-    /// Resumes a parked scheduler, and answers whether it did.
-    Resume(crossbeam_channel::Sender<Result<(), String>>),
+    /// runs, having lent the world that succeeds it the cache segments no
+    /// request in flight continues from when it `lend`s; it executes
+    /// nothing more until resumed.
+    Park {
+        lend: bool,
+        answer: crossbeam_channel::Sender<Result<crate::scheduler::ParkedCache, String>>,
+    },
+    /// Resumes a parked scheduler, taking back the cache units it lent when
+    /// it `reclaim`s them, and answers whether it did.
+    Resume {
+        reclaim: bool,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
     /// Promotes a successor scheduler (`Scheduler::promote`): imports its
     /// predecessor's prefix cache index, once its cache holds the requests
     /// the predecessor hands over (which `recompute` from their tokens or
@@ -883,22 +892,25 @@ impl CommandSender {
         let _ = self.send(Command::Abort(id));
     }
 
-    /// Parks the scheduler (`Command::Park`); the receiver gets its
-    /// prefix cache index and what its migrating requests held once it
-    /// parked, or why it did not.
+    /// Parks the scheduler (`Command::Park`), lending its successor cache
+    /// segments when it `lend`s; the receiver gets its prefix cache index
+    /// and what its migrating requests held once it parked, or why it did
+    /// not.
     pub fn park(
         &self,
+        lend: bool,
     ) -> crossbeam_channel::Receiver<Result<crate::scheduler::ParkedCache, String>> {
         let (answer, parked) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Park(answer));
+        let _ = self.send(Command::Park { lend, answer });
         parked
     }
 
-    /// Resumes a parked scheduler (`Command::Resume`); the receiver gets
+    /// Resumes a parked scheduler (`Command::Resume`), taking back the
+    /// cache units it lent when it `reclaim`s them; the receiver gets
     /// whether it did.
-    pub fn resume(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+    pub fn resume(&self, reclaim: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, resumed) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Resume(answer));
+        let _ = self.send(Command::Resume { reclaim, answer });
         resumed
     }
 

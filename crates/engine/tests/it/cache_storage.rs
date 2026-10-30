@@ -270,6 +270,7 @@ impl Executor for Segmented {
                 serde_json::Value::Null
             }
             "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
+            "uniserve.adopt_cache" => serde_json::json!({ "inherited": 0 }),
             other => anyhow::bail!("no worker hook {other}"),
         };
         let mut results = vec![result.to_string()];
@@ -313,10 +314,22 @@ impl Executor for Segmented {
 /// A scheduler over the simulator whose `workers` serve a cache of
 /// segmented planes of 32 units of `BLOCK` tokens.
 fn start(workers: Workers) -> (CommandSender, Arc<Mutex<Workers>>, thread::JoinHandle<()>) {
+    start_split(workers, None)
+}
+
+/// [`start`], the workers reporting their planes' segments when `split`,
+/// the first `inherited` of them past the head mapped from a predecessor.
+fn start_split(
+    workers: Workers,
+    split: Option<u32>,
+) -> (CommandSender, Arc<Mutex<Workers>>, thread::JoinHandle<()>) {
     let mut sim = SimEngine::new();
     sim.set_text_len(10_000);
     sim.set_num_units(SEGMENTS * SEGMENT_UNITS);
     sim.set_block_size(BLOCK);
+    if let Some(inherited) = split {
+        sim.set_segments(SEGMENTS, SEGMENT_UNITS, inherited);
+    }
     let workers = Arc::new(Mutex::new(workers));
     let scheduler = support::scheduler_with(
         Box::new(Segmented {
@@ -1270,6 +1283,7 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
     workers.lock().unwrap().other_world_bytes = 4 * SEGMENT_BYTES;
     let parked = engine::ParkedCache {
         pages: Vec::new(),
+        lent: Vec::new(),
         held_units: 20,
         requests: 1,
         reserved_units: 0,
@@ -1383,6 +1397,133 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
     thread.join().unwrap();
 }
 
+/// A world parked for a successor that maps its cache lends it the
+/// segments past its first that hold no page a request in flight continues
+/// from, and allocates none of their units until a resume takes them back:
+/// a request that needs more than the units it kept waits for that resume.
+#[test]
+fn a_parked_world_lends_the_segments_no_request_in_flight_continues_from() {
+    let (handle, _workers, thread) = start_split(Workers::filling(0), Some(0));
+    let mut running = handle.submit(request(1, 2, 10_000)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut generated = 0;
+    while generated < 3 && Instant::now() < deadline {
+        match running.try_recv() {
+            Ok(Event::TextToken { .. }) => generated += 1,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    let parked = handle
+        .park(true)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers")
+        .expect("the scheduler parks");
+    assert!(matches!(
+        terminal(&mut running),
+        Some(Event::Migratable { .. })
+    ));
+
+    // The request in flight continues from the pages it published under
+    // its private alias; every other segment past the first is lent.
+    let continued: std::collections::BTreeSet<u32> = parked
+        .pages
+        .iter()
+        .filter(|page| page.resume.is_some())
+        .flat_map(|page| page.units.iter().copied())
+        .collect();
+    assert!(!continued.is_empty(), "{parked:?}");
+    let lent: Vec<_> = (1..SEGMENTS)
+        .map(|segment| segment * SEGMENT_UNITS..(segment + 1) * SEGMENT_UNITS)
+        .filter(|units| !continued.iter().any(|unit| units.contains(unit)))
+        .collect();
+    assert!(!lent.is_empty());
+    assert_eq!(parked.lent, lent);
+
+    // The units kept: those past the sentinel less the lent ones. A request
+    // of as many prompt pages needs one more page for its token.
+    let kept = SEGMENTS * SEGMENT_UNITS - 1 - lent.len() as u32 * SEGMENT_UNITS;
+    let resumed = handle
+        .resume(false)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(resumed.is_ok(), "{resumed:?}");
+    let mut waiting = handle.submit(request(2, kept, 1)).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        std::iter::from_fn(|| waiting.try_recv().ok()).all(|event| !event.is_terminal()),
+        "the request ended within the units the world kept"
+    );
+    let reclaimed = handle
+        .resume(true)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(reclaimed.is_ok(), "{reclaimed:?}");
+    assert!(matches!(
+        terminal(&mut waiting),
+        Some(Event::Finished { .. })
+    ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A successor promoted with the segments its predecessor lent maps them
+/// writable (`uniserve.adopt_cache`), counts their units in what its cache
+/// holds on trial, and allocates them: the requests handed over fit, and a
+/// request that needs its own free units and the lent ones runs.
+#[test]
+fn a_successor_allocates_the_segments_its_predecessor_lent() {
+    // Segments 1 to 4 (units 4 to 19) map the predecessor's units 0 to 15.
+    let (handle, workers, thread) = start_split(Workers::filling(0), Some(4));
+    let parked = engine::ParkedCache {
+        pages: Vec::new(),
+        lent: Vec::new(),
+        held_units: 20,
+        requests: 1,
+        reserved_units: 0,
+        reserving: 0,
+    };
+    let refused = handle
+        .promote(parked.clone(), true, false)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers")
+        .expect_err("15 free units cannot hold 21");
+    assert!(
+        refused.contains("15 free units") && refused.contains("need 21"),
+        "{refused}"
+    );
+    let lent = engine::ParkedCache {
+        lent: vec![4..8, 12..16],
+        ..parked
+    };
+    let promoted = handle
+        .promote(lent, true, false)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(promoted.is_ok(), "{promoted:?}");
+    assert!(
+        workers
+            .lock()
+            .unwrap()
+            .hooks
+            .contains(&r#"uniserve.adopt_cache {"borrowed":[[8,12],[16,20]]}"#.to_owned()),
+        "{:?}",
+        workers.lock().unwrap().hooks
+    );
+
+    // Its own 15 free units and the 8 lent hold a request of 22 prompt
+    // pages and the page of its token.
+    let mut request = handle.submit(request(1, 22, 1)).unwrap();
+    assert!(matches!(
+        terminal(&mut request),
+        Some(Event::Finished { .. })
+    ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// A parked world whose successor maps none of its cache gives back every
 /// segment past its first, which a world that serves refuses; resumed at a
 /// rollback, it creates them again.
@@ -1392,7 +1533,7 @@ fn a_parked_world_evicts_its_cache_past_its_first_segment() {
     assert!(resize(&handle, CacheChange::Evict).is_err());
 
     let parked = handle
-        .park()
+        .park(false)
         .recv_timeout(Duration::from_secs(10))
         .expect("the scheduler answers");
     assert!(parked.is_ok(), "{parked:?}");
@@ -1408,7 +1549,7 @@ fn a_parked_world_evicts_its_cache_past_its_first_segment() {
     // The rollback resumes the world, which creates its cache again and
     // serves a request on all of it.
     let resumed = handle
-        .resume()
+        .resume(true)
         .recv_timeout(Duration::from_secs(10))
         .expect("the scheduler answers");
     assert!(resumed.is_ok(), "{resumed:?}");

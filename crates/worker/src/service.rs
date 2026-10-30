@@ -1136,7 +1136,9 @@ impl Service<'_> {
             "uniserve.adopt_cache" => {
                 // The world's promotion: the predecessor parked, so the
                 // flags and scales of the units the planes inherit are
-                // final, and the rank copies them into its own.
+                // final, and the rank copies them into its own. It maps the
+                // segments the predecessor lent (`borrowed`, unit ranges)
+                // writable.
                 let (Some(planes), Some(predecessor), Some(retained)) = (
                     planes.as_ref(),
                     self.maintenance.predecessor.as_ref(),
@@ -1178,9 +1180,29 @@ impl Service<'_> {
                 drop(storages);
                 drop(mapped);
                 retained.forget(&keys)?;
+                let borrowed: Vec<std::ops::Range<u32>> = payload["borrowed"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|range| {
+                        let bound = |index: usize| {
+                            range[index]
+                                .as_u64()
+                                .and_then(|unit| u32::try_from(unit).ok())
+                        };
+                        match (bound(0), bound(1)) {
+                            (Some(start), Some(end)) if start < end => Ok(start..end),
+                            _ => Err(Error::Invalid(format!(
+                                "a borrowed cache unit range {range}"
+                            ))),
+                        }
+                    })
+                    .collect::<crate::Result<_>>()?;
+                let borrowed = planes.borrow(&borrowed, retained)?;
                 let inherited = planes.inherited();
                 tracing::info!(
                     units = inherited.end - inherited.start,
+                    borrowed_segments = borrowed,
                     "adopted the predecessor world's cache flags"
                 );
                 serde_json::json!({ "inherited": inherited.end - inherited.start })

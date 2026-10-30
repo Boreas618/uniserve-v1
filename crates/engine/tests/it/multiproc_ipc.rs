@@ -2388,7 +2388,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() -> anyhow
             );
             let successor = SchedulerHandle::start_all(config)?.remove(0);
             let index = running
-                .park()
+                .park(true)
                 .recv()?
                 .map_err(|error| anyhow::anyhow!(error))?;
             successor.promote(index, false, false)?;

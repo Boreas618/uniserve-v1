@@ -240,10 +240,19 @@ struct State {
     /// A standby worker's exclusive storages, until it is promoted; `None`
     /// for a worker that takes write access at once.
     standby: Option<Standby>,
-    /// The predecessor world's segments the worker maps read-only, each
-    /// with the storage and part index that maps it, until the worker takes
-    /// them at its world's commit.
-    inherited: Vec<(Key, Arc<Storage>, usize)>,
+    /// The predecessor world's segments the worker maps, read-only unless
+    /// the predecessor lent them, until the worker takes them at its
+    /// world's commit.
+    inherited: Vec<InheritedPart>,
+}
+
+/// One part of a predecessor world's segment that a worker maps.
+struct InheritedPart {
+    key: Key,
+    /// The storage that maps the part, as its part `index`.
+    storage: Arc<Storage>,
+    index: usize,
+    segment: ipc::CacheSegment,
 }
 
 impl State {
@@ -1037,7 +1046,12 @@ impl Retained {
             match found.remove(key) {
                 Some(descriptor) if inherited => {
                     storage.import_segment_read_only(index, &descriptor)?;
-                    state.inherited.push((*key, Arc::clone(&storage), index));
+                    state.inherited.push(InheritedPart {
+                        key: *key,
+                        storage: Arc::clone(&storage),
+                        index,
+                        segment: spec.parts[index].segment,
+                    });
                 }
                 Some(descriptor) => storage.import_segment(index, &descriptor)?,
                 None if standby || !spec.parts[index].create => {
@@ -1084,9 +1098,7 @@ impl Retained {
             let key = self.segment_key(spec.name, &spec.parts[index], &gpu);
             state.used.remove(&key);
             state.written.remove(&key);
-            state
-                .inherited
-                .retain(|(inherited, _, _)| *inherited != key);
+            state.inherited.retain(|part| part.key != key);
             given.insert(key);
         }
         self.release_keys(&mut state, &given, "giving back segments")
@@ -1217,9 +1229,33 @@ impl Retained {
         Ok(())
     }
 
+    /// Maps the predecessor world's `segments` writable, every column's
+    /// part: the predecessor lent them for the world's trial, and its
+    /// writer, parked, writes none of them until the world's processes are
+    /// gone. The worker takes them like the others at the commit. Returns
+    /// how many parts it mapped writable.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the driver refuses.
+    pub(crate) fn borrow(&self, segments: &[ipc::CacheSegment]) -> Result<usize> {
+        let state = lock(&self.state);
+        let mut borrowed = 0;
+        for part in state
+            .inherited
+            .iter()
+            .filter(|part| segments.contains(&part.segment))
+        {
+            part.storage
+                .protect_segment(part.index, Protection::ReadWrite)?;
+            borrowed += 1;
+        }
+        Ok(borrowed)
+    }
+
     /// Takes write access to the predecessor world's segments the worker
-    /// maps read-only, once their writer is gone, and makes them writable
-    /// at unchanged addresses: the world's commit, after which they are its
+    /// maps, once their writer is gone, and makes them writable at
+    /// unchanged addresses: the world's commit, after which they are its
     /// own. Returns how many segments it took.
     pub(crate) fn take_inherited(&self) -> Result<usize> {
         let mut state = lock(&self.state);
@@ -1227,13 +1263,14 @@ impl Retained {
         if inherited.is_empty() {
             return Ok(0);
         }
-        let keys: Vec<Key> = inherited.iter().map(|(key, _, _)| *key).collect();
+        let keys: Vec<Key> = inherited.iter().map(|part| part.key).collect();
         if let Err(error) = state.client.promote(keys.clone()) {
             state.inherited = inherited;
             return Err(storage_error("taking the predecessor's segments", error));
         }
-        for (_, storage, index) in &inherited {
-            storage.protect_segment(*index, Protection::ReadWrite)?;
+        for part in &inherited {
+            part.storage
+                .protect_segment(part.index, Protection::ReadWrite)?;
         }
         state.written.extend(keys);
         tracing::info!(
