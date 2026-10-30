@@ -1,24 +1,30 @@
 //! Measured links between retained storage regions on deployment nodes.
 
 use crate::storage::allocation::Storage;
-use crate::storage::retained::Retained;
+use crate::storage::retained::{ExclusiveSpec, Retained};
 use crate::{Error, Result};
+use ::storage::manifest::Binding;
 use ::storage::manifest::weights::Sources;
-use ::storage::manifest::{Binding, Gpu};
 use ::storage::protocol::{Access, LinkBandwidth, LinkEnd, Priority, Region, Span};
-use ::storage::{Key, Placement, StorageRecord, TensorRecord};
+use ::storage::{Placement, StorageRecord, TensorRecord};
 use std::collections::BTreeMap;
 use std::os::fd::AsFd;
 
 /// Bytes per sampling window used by the Transfer Server estimator.
 const LINK_SAMPLE: u64 = 64 << 20;
 
+/// The name of the scratch storage a measurement copies into.
+const SCRATCH: &str = "link measurement scratch";
+
 /// The links of `sources` into local storage `at`, after the host's Transfer
 /// Server measures each unmeasured remote host or device source: two copies of
 /// [`LINK_SAMPLE`] byte windows from the longest retained chunk into a
 /// scratch storage the rank creates and releases. Smaller chunks repeat
 /// until the window is complete. `device` owns the scratch allocation and
-/// CUDA registration even when the destination is host storage.
+/// CUDA registration even when the destination is host storage. The
+/// scratch is an exclusive storage of the rank's scope
+/// ([`Retained::exclusive_key`]), so ranks of other worker groups on the
+/// same GPU measure their links at once.
 pub(crate) fn measure(
     retained: &Retained,
     sources: &Sources,
@@ -71,12 +77,20 @@ pub(crate) fn measure(
         }
         Placement::Host { .. } => Storage::host_retainable(device, bytes as usize)?,
     };
-    let key = measuring_key(retained.world(), &device.uuid()?.0);
+    let key = retained.exclusive_key(
+        &ExclusiveSpec {
+            name: SCRATCH,
+            device,
+            bytes: bytes as usize,
+            access: &[],
+        },
+        &device.uuid()?.0,
+    );
     retained.call("retaining a link measurement's scratch", |client| {
         client.put(
             vec![TensorRecord {
                 key,
-                name: "link measurement scratch".into(),
+                name: SCRATCH.into(),
                 storage: 0,
                 offset: 0,
                 dtype: "uint8".into(),
@@ -143,15 +157,4 @@ pub(crate) fn measure(
         "measured remote storage links"
     );
     Ok(links)
-}
-
-/// The key a rank's link measurement scratch on `gpu` is retained under in
-/// world `world`.
-fn measuring_key(world: u64, gpu: &Gpu) -> Key {
-    // Scratch is named by its owner, not by the bytes the transfer writes.
-    let mut key = [0; 32];
-    key[..8].copy_from_slice(b"linkbw\0\0");
-    key[8..16].copy_from_slice(&world.to_le_bytes());
-    key[16..].copy_from_slice(gpu);
-    Key(key)
 }
