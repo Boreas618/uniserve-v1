@@ -11,7 +11,9 @@
 //! A shrink may name a bound after which the requests still holding the
 //! tail are recomputed instead (ended as migratable, and submitted again by
 //! the daemon with their generated tokens, as vLLM's recompute preemption
-//! does). A restore creates the tail again, all of it or as many segments
+//! does). A request holding the tail that cannot get a unit to continue,
+//! because the requests running hold every unit left to allocation, is
+//! recomputed at once: it could not run on to its end. A restore creates the tail again, all of it or as many segments
 //! as the storage now holds. A sleep gives back every segment and the CUDA
 //! graph storage once no request runs, and admits nothing until a wake
 //! restores both; it preempts video requests at their next denoising step
@@ -35,6 +37,10 @@ pub(super) struct PendingResize {
     /// When a shrink recomputes the requests still holding withdrawn units;
     /// `None` while it waits for them to end.
     preempt_at: Option<std::time::Instant>,
+    /// Requests holding withdrawn units that could not get the units their
+    /// next call needs (`Scheduler::note_stuck_holder`): recomputed at the
+    /// next poll.
+    stuck: Vec<RequestId>,
 }
 
 /// What a pending change does once its units are let go.
@@ -141,6 +147,7 @@ impl Scheduler {
                     change: pending,
                     answer,
                     preempt_at,
+                    stuck: Vec::new(),
                 });
                 self.poll_resize();
             }
@@ -198,6 +205,7 @@ impl Scheduler {
             change: Pending::Weights(model_path),
             answer,
             preempt_at: None,
+            stuck: Vec::new(),
         });
         self.poll_resize();
     }
@@ -234,6 +242,19 @@ impl Scheduler {
                 "the shrink's bound passed: the requests holding the tail are recomputed"
             );
             self.migrate_holders(withdrawn);
+        }
+        // A request holding the tail that could not get a unit to continue
+        // cannot run on to its end, which the shrink waits for: it is
+        // recomputed now, as the shrink's bound would recompute it.
+        if let Some(resize) = self.resizing.as_mut()
+            && !resize.stuck.is_empty()
+        {
+            let stuck = std::mem::take(&mut resize.stuck);
+            tracing::info!(
+                requests = stuck.len(),
+                "requests holding the withdrawn tail cannot continue: they are recomputed"
+            );
+            self.migrate_running(MigrationCause::Drain, |id| stuck.contains(&id));
         }
         let Some(resize) = self.resizing.as_ref() else {
             return;
@@ -826,7 +847,8 @@ impl Scheduler {
     /// hold, and, when `recompute`, ends as migratable every running request
     /// that resumes from its generated tokens and holds one, which the
     /// daemon submits again: it recomputes on the units left. Otherwise the
-    /// requests holding them run to their end.
+    /// requests holding them run to their end, or until they cannot get a
+    /// unit to continue (`Self::note_stuck_holder`).
     fn withdraw_from(&mut self, first: u32, recompute: bool) {
         let Some(cache) = self.storage.cache() else {
             return;
@@ -844,20 +866,45 @@ impl Scheduler {
         }
     }
 
+    /// Notes that the running request `id` could not get the units its next
+    /// call needs. While a shrink waits for the requests holding withdrawn
+    /// units to let them go, such a request that holds one cannot run on:
+    /// only the units left to allocation can grow it. `Self::poll_resize`
+    /// recomputes it.
+    pub(super) fn note_stuck_holder(&mut self, id: RequestId) {
+        let shrinking = self
+            .resizing
+            .as_ref()
+            .is_some_and(|resize| matches!(resize.change, Pending::Shrink { .. }));
+        if !shrinking {
+            return;
+        }
+        let Some(first) = self
+            .storage
+            .cache()
+            .map(|cache| cache.block_pool.withdrawn())
+        else {
+            return;
+        };
+        let holds = self
+            .running
+            .get(&id)
+            .is_some_and(|state| holds_from(state, first));
+        if let Some(resize) = self.resizing.as_mut()
+            && holds
+            && !resize.stuck.contains(&id)
+        {
+            resize.stuck.push(id);
+        }
+    }
+
     /// Ends as migratable every running request that resumes from its
     /// generated tokens and holds a unit from `first` on.
     fn migrate_holders(&mut self, first: u32) {
         let holders: Vec<RequestId> = self
             .running
             .iter()
-            .filter(|(_, state)| {
-                state.allocations.as_ref().is_some_and(|allocations| {
-                    allocations
-                        .block_tables()
-                        .iter()
-                        .any(|table| table.unit_ids().iter().any(|unit| unit.0 >= first))
-                })
-            })
+            .filter(|(_, state)| holds_from(state, first))
             .map(|(id, _)| *id)
             .collect();
         self.migrate_running(MigrationCause::Drain, |id| holders.contains(&id));
@@ -947,4 +994,14 @@ fn seed(text: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(text.get(2 * index..2 * index + 2)?, 16).ok()?;
     }
     Some(seed)
+}
+
+/// Returns whether the request holds a unit from `first` on.
+fn holds_from(state: &RequestState, first: u32) -> bool {
+    state.allocations.as_ref().is_some_and(|allocations| {
+        allocations
+            .block_tables()
+            .iter()
+            .any(|table| table.unit_ids().iter().any(|unit| unit.0 >= first))
+    })
 }

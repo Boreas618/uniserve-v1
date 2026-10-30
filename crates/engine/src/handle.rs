@@ -717,7 +717,8 @@ pub enum CacheChange {
     /// Gives back the tail of the cache until each device has the storage a
     /// world succeeding this one needs beside the storage they share, the
     /// weights it creates included; the requests that hold the tail run
-    /// on, and are recomputed only once `preempt_after` passed, when given.
+    /// on, and are recomputed once `preempt_after` passed, when given, or
+    /// once one cannot get a unit to continue.
     Shrink {
         preempt_after: Option<std::time::Duration>,
         successor: Successor,
