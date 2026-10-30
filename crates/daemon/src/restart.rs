@@ -2,7 +2,7 @@
 //! another, takes the deployment over while the daemon it replaces finishes
 //! the requests it took, as Envoy's hot restart does.
 //!
-//! `POST /admin/restart` starts the successor (`uniserve serve --takeover
+//! `POST /admin/restart` starts the successor (`uniserve serve --predecessor
 //! FD`) with one end of a socket pair at that descriptor. They talk over it:
 //!
 //! 1. The daemon sends its options (`Prepare`). The successor restarts
@@ -58,7 +58,7 @@ use crate::supervision::{Daemon, HandedService};
 pub(crate) mod requests;
 
 /// The descriptor a successor finds the handoff socket at.
-pub const TAKEOVER_DESCRIPTOR: i32 = 3;
+pub const PREDECESSOR_DESCRIPTOR: i32 = 3;
 
 /// How long each side waits for the other's next step.
 const STEP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -104,7 +104,7 @@ enum Message {
 /// The options a daemon serves with.
 #[derive(Debug, Serialize, Deserialize)]
 struct Prepare {
-    /// The configuration as TOML, as `uniserve serve --print-config` prints
+    /// The configuration as TOML, as `GET /admin/config` prints
     /// it.
     config: String,
     stated: Vec<String>,
@@ -393,19 +393,23 @@ impl Restarter {
     }
 }
 
-/// Starts `executable serve --takeover` with `socket` at
-/// [`TAKEOVER_DESCRIPTOR`]; returns its process id. The successor is not
+/// Starts `executable serve --predecessor` with `socket` at
+/// [`PREDECESSOR_DESCRIPTOR`]; returns its process id. The successor is not
 /// this daemon's to stop: it outlives it.
 fn spawn(executable: &std::path::Path, socket: UnixStream) -> anyhow::Result<u32> {
     let descriptor = socket.as_raw_fd();
     let mut command = std::process::Command::new(executable);
-    command.args(["serve", "--takeover", &TAKEOVER_DESCRIPTOR.to_string()]);
+    command.args([
+        "serve",
+        "--predecessor",
+        &PREDECESSOR_DESCRIPTOR.to_string(),
+    ]);
     // SAFETY: the closure runs in the forked child before exec and calls
     // only `dup2`, which is async-signal-safe; `socket` stays open in the
     // parent until the spawn returned.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(descriptor, TAKEOVER_DESCRIPTOR) == -1 {
+            if libc::dup2(descriptor, PREDECESSOR_DESCRIPTOR) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

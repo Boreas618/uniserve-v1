@@ -69,10 +69,11 @@ pub(crate) enum StorageCommand {
         /// other hosts; found on the loader's search path when unset.
         #[arg(long)]
         nixl_library: Option<PathBuf>,
-        /// Go on with the server the predecessor of a hot restart hands over
-        /// on the handoff socket at this descriptor (`storage restart`).
-        #[arg(long, hide = true)]
-        takeover: Option<i32>,
+        /// The descriptor of the handoff socket to the server this one
+        /// succeeds in a hot restart (`storage restart`), which it goes on
+        /// with.
+        #[arg(long, hide = true, value_name = "FD")]
+        predecessor: Option<i32>,
     },
     /// The Mooncake connector a server runs as its child.
     #[command(hide = true)]
@@ -187,7 +188,7 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
             mooncake,
             transfer_chunk_us,
             nixl_library,
-            takeover,
+            predecessor,
         } => mooncake.settings().and_then(|connector| {
             let executable = std::env::current_exe().context("locating this executable")?;
             storage_server::serve(storage_server::ServeOptions {
@@ -205,7 +206,7 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
                 transfer_command: vec![executable.into(), "storage".into(), "transfer".into()],
                 transfer_chunk: std::time::Duration::from_micros(transfer_chunk_us),
                 nixl_library,
-                takeover,
+                predecessor,
             })
         }),
         StorageCommand::Connector { socket, mooncake } => mooncake

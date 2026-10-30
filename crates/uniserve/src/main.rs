@@ -101,9 +101,6 @@ fn shutdown_signal() -> CancellationToken {
 }
 
 /// Starts the UniServe command-line process.
-///
-/// `serve --print-config` prints the resolved serving configuration, and
-/// nothing else, to stdout and exits before tracing or the runtime starts.
 fn main() -> Result<std::process::ExitCode> {
     let lifeline = take_lifeline();
     let cli = Cli::parse();
@@ -125,7 +122,7 @@ fn main() -> Result<std::process::ExitCode> {
         }
         Command::Storage(args) => return Ok(storage::run(*args)),
     };
-    if let Some(descriptor) = args.takeover {
+    if let Some(descriptor) = args.predecessor {
         logging::init_tracing(
             "Daemon",
             cli.log.log_level.as_deref(),
@@ -134,11 +131,6 @@ fn main() -> Result<std::process::ExitCode> {
         runtime()?.block_on(async move {
             daemon::restart::take_over(descriptor, shutdown_signal()).await
         })?;
-        return Ok(std::process::ExitCode::SUCCESS);
-    }
-    if args.print_config {
-        let (config, _) = args.resolve()?;
-        print!("{}", options::printed(&config)?);
         return Ok(std::process::ExitCode::SUCCESS);
     }
 

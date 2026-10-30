@@ -10,7 +10,7 @@ A UniServe server is configured by one tree of serving options and, for a parall
 2. **Flags** for the most common options, each a shortcut for one path of the tree.
 3. **`--set PATH=VALUE`**, repeatable, reaching any option by its path.
 
-Options none of them states keep their defaults. `--print-config` prints the resolved non-default options as reloadable TOML and exits. The admin API exports the same form. Reading it restores defaults without treating options belonging to other model families or rank-assignment modes as explicitly configured.
+Options none of them states keep their defaults. `GET /admin/config` returns the resolved non-default options as reloadable TOML. Reading it restores defaults without treating options belonging to other model families or rank-assignment modes as explicitly configured.
 
 ```bash
 uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
@@ -19,7 +19,6 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --set video_config.text_capacities=1024,10240
 
 uniserve serve --config fasth3.toml --set quantization_config.mode=performance
-uniserve serve --config fasth3.toml --print-config
 ```
 
 | Flag | Path |
@@ -48,7 +47,7 @@ Some tables configure one model family: `chat_config` and `image_fetch_config` c
 
 ## Configuration file
 
-A configuration file is the tree in TOML, as `--print-config` prints it:
+A configuration file is the tree in TOML, as `GET /admin/config` returns it:
 
 ```toml
 model = "/workspace/models/FastVideo-FastH3-8-Step-V2"

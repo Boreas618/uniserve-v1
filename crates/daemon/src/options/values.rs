@@ -1,7 +1,7 @@
 //! Serde forms of serving-option values.
 //!
 //! Each form reads what a configuration file or a `--set` value states and
-//! writes what `--print-config` prints, so a printed configuration reads back
+//! writes what `GET /admin/config` returns, so a printed configuration reads back
 //! unchanged:
 //!
 //! - a duration is whole seconds (`30`) or a value with units (`500ms`,
