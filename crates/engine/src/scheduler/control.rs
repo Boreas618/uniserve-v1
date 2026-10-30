@@ -104,9 +104,9 @@ impl Scheduler {
             } => self.acknowledge_output(request_id, output_token_count),
             Command::Stop(request_id) => self.mark_stopped(request_id),
             Command::Abort(id) => self.mark_cancelled(id, true),
-            Command::Park(answer) => self.park(answer),
-            Command::Resume(answer) => {
-                let _ = answer.send(self.resume());
+            Command::Park { lend, answer } => self.park(answer, lend),
+            Command::Resume { reclaim, answer } => {
+                let _ = answer.send(self.resume(reclaim));
             }
             Command::Promote {
                 cache,

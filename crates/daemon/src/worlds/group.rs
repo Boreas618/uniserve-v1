@@ -561,7 +561,8 @@ pub(crate) async fn apply(
     let result: anyhow::Result<()> = async {
         for (replica, client) in previous.iter().zip(&serving) {
             crate::profiling::end_for_world(replica, Some(client), "group change").await;
-            client.park().await.map_err(anyhow::Error::msg)?;
+            // The candidates map none of the serving worlds' caches.
+            client.park(false).await.map_err(anyhow::Error::msg)?;
             parked.push(client.world());
         }
         park_time = promoted.elapsed();
@@ -804,7 +805,7 @@ pub(crate) async fn rollback(
             crate::profiling::end_for_world(replica, Some(&client), "group rollback").await;
             replica.hold.hold();
             if client.state() != EngineState::Closed {
-                let _ = tokio::time::timeout(CLOSED_EXIT, client.park()).await;
+                let _ = tokio::time::timeout(CLOSED_EXIT, client.park(false)).await;
             }
             close(&client).await;
         }

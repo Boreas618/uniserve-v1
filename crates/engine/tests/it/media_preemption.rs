@@ -449,7 +449,7 @@ fn an_image_resumes_after_its_stored_step_and_recomputes_missing_pages() {
     };
     let mut events = serving.handle.submit(request.clone()).unwrap();
     gate.wait_reached();
-    let parked = serving.handle.park();
+    let parked = serving.handle.park(false);
     gate.open();
     let before = until_terminal(&mut events);
     let stored = left_with(&before, MigrationCause::Drain, TRAJECTORY);
@@ -460,7 +460,7 @@ fn an_image_resumes_after_its_stored_step_and_recomputes_missing_pages() {
         .unwrap();
     serving
         .handle
-        .resume()
+        .resume(false)
         .recv_timeout(Duration::from_secs(10))
         .unwrap()
         .unwrap();
@@ -612,7 +612,7 @@ fn park(server: &StorageServer, pool: u64, shares: &[(u64, u64)]) -> (Trajectory
     };
     let mut events = serving.handle.submit(request(started)).unwrap();
     gate.wait_reached();
-    let parked = serving.handle.park();
+    let parked = serving.handle.park(false);
     gate.open();
     let stored = left_with(
         &until_terminal(&mut events),

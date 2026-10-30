@@ -519,6 +519,11 @@ message Promote {
 message Park {
   // Matches the `Parked` answer.
   uint64 id = 1;
+  // Whether the world that succeeds the engine maps its KV cache: each
+  // scheduler then lends it the segments no request in flight continues
+  // from (`GroupIndex.lent`), forgets their pages and allocates none of
+  // their units until a `Resume` retires that world.
+  bool lend = 2;
 }
 
 // The answer to a `Park`: every request ended as migratable, or why the
@@ -537,7 +542,9 @@ message Resume {
   // Matches the `Hooked` answer.
   uint64 id = 1;
   // Worlds whose storage ends on every node of the engine: the one a
-  // rollback discarded.
+  // rollback discarded. A world named here writes none of the engine's
+  // storage any more (its processes are gone, or it was never promoted),
+  // so the engine takes back the cache units it lent it.
   repeated uint64 retire = 2;
 }
 
@@ -578,6 +585,16 @@ message GroupIndex {
   // reserves whole again: it computes their context anew.
   uint32 reserved_units = 5;
   uint32 reserving = 6;
+  // The units of the segments the scheduler lent its successor at the park
+  // (`Park.lend`): the successor maps them writable and allocates them on
+  // trial.
+  repeated UnitRange lent = 7;
+}
+
+// Cache units `[start, end)` of one engine's planes.
+message UnitRange {
+  uint32 start = 1;
+  uint32 end = 2;
 }
 
 // One published page: its cache group, its chained hash, its tokens and its

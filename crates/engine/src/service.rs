@@ -520,7 +520,7 @@ fn read_requests(
                     return Ok(());
                 }
                 Some(wire::engine_command::Kind::Park(park)) => {
-                    park_schedulers(park.id, front, routing)
+                    park_schedulers(park.id, park.lend, front, routing)
                 }
                 Some(wire::engine_command::Kind::Resume(resume)) => {
                     resume_schedulers(resume, front, routing);
@@ -1135,6 +1135,11 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                 requests: indexed.requests,
                                 reserved_units: indexed.reserved_units,
                                 reserving: indexed.reserving,
+                                lent: indexed
+                                    .lent
+                                    .iter()
+                                    .map(|units| units.start..units.end)
+                                    .collect(),
                             })
                             .unwrap_or_default();
                         for resume in parked.pages.iter().filter_map(|page| page.resume) {
@@ -1180,7 +1185,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
 /// daemon `front` with `Parked` and every scheduler's prefix cache index,
 /// each by the worker group whose cache it indexes; every daemon reads the
 /// engine's new state.
-fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
+fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
     if routing
         .state
         .swap(wire::EngineState::Parked as i32, Ordering::AcqRel)
@@ -1197,7 +1202,7 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
         .iter()
         .enumerate()
         .map(|(index, slot)| {
-            let answer = (!slot.handle.is_dead()).then(|| slot.handle.park());
+            let answer = (!slot.handle.is_dead()).then(|| slot.handle.park(lend));
             (index, slot.handle.cache_group(), answer)
         })
         .collect();
@@ -1240,6 +1245,14 @@ fn park_schedulers(id: u64, front: usize, routing: &Arc<Routing>) {
                                 requests: parked.requests,
                                 reserved_units: parked.reserved_units,
                                 reserving: parked.reserving,
+                                lent: parked
+                                    .lent
+                                    .into_iter()
+                                    .map(|units| wire::UnitRange {
+                                        start: units.start,
+                                        end: units.end,
+                                    })
+                                    .collect(),
                             });
                         }
                     }
@@ -1278,10 +1291,13 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
         .slots
         .first()
         .map(|slot| slot.handle.retire(resume.retire.clone()));
+    // A world the resume retires writes none of the engine's storage any
+    // more: each scheduler takes back the cache units it lent it.
+    let reclaim = !resume.retire.is_empty();
     let answers: Vec<_> = routing
         .slots
         .iter()
-        .map(|slot| slot.handle.resume())
+        .map(|slot| slot.handle.resume(reclaim))
         .collect();
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()

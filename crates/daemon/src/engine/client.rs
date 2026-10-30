@@ -481,15 +481,19 @@ impl EngineClient {
     /// Parks the engine: at its next step boundary it ends every token
     /// request that resumes from its generated tokens as migratable, lets
     /// the others finish, and executes nothing more, keeping its storage and
-    /// prefix cache index. Returns that index once it parked.
+    /// prefix cache index. When it `lend`s, the world that succeeds it maps
+    /// its KV cache: it lends that world the segments no request in flight
+    /// continues from, forgetting their pages, and allocates none of their
+    /// units until a resume retires that world. Returns its index once it
+    /// parked.
     ///
     /// # Errors
     ///
     /// Fails with the reason a scheduler did not park, or when the engine
     /// ends first.
-    pub async fn park(&self) -> Result<Vec<wire::GroupIndex>, String> {
+    pub async fn park(&self, lend: bool) -> Result<Vec<wire::GroupIndex>, String> {
         match self
-            .ask(|id| wire::engine_command::Kind::Park(wire::Park { id }))
+            .ask(|id| wire::engine_command::Kind::Park(wire::Park { id, lend }))
             .await?
         {
             Answered::Index(index) => Ok(index),

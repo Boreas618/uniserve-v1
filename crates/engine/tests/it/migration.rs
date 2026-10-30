@@ -184,7 +184,7 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
         }
     }
     assert_eq!(before, 3, "the first request generates before it migrates");
-    let parked = handle.park();
+    let parked = handle.park(false);
 
     let (_, terminal) = drain(&mut running);
     assert!(
@@ -229,7 +229,7 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
         .flat_map(|page| page.units.iter().copied())
         .collect();
     assert!(parked.held_units as usize >= units.len(), "{parked:?}");
-    assert!(handle.resume().recv().unwrap().is_ok());
+    assert!(handle.resume(false).recv().unwrap().is_ok());
     handle.shutdown();
     thread.join().unwrap();
 }
@@ -729,6 +729,7 @@ fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
 
     let parked = engine::ParkedCache {
         pages: Vec::new(),
+        lent: Vec::new(),
         held_units: 64,
         requests: 1,
         reserved_units: 0,

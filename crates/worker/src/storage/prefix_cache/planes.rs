@@ -693,6 +693,50 @@ impl CachePlanes {
         Ok(taken)
     }
 
+    /// Maps the inherited segments that hold exactly the units of
+    /// `borrowed` writable through `retained`: the predecessor lent them for
+    /// the world's trial, and the engine allocates their units as its own.
+    /// Returns how many segments it mapped writable.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a range is not made of whole inherited segments, or when
+    /// the driver refuses.
+    pub(crate) fn borrow(
+        &self,
+        borrowed: &[std::ops::Range<u32>],
+        retained: &crate::storage::retained::Retained,
+    ) -> Result<usize> {
+        if borrowed.is_empty() {
+            return Ok(0);
+        }
+        let (segmenting, _) = self.segmented()?;
+        let mut segments = Vec::new();
+        let mut covered = 0;
+        for (index, (segment, inherited)) in segmenting.segments.iter().enumerate() {
+            let first = segmenting.first_unit(index as u32);
+            let units = first..first + segment.units;
+            if inherited.load(Ordering::Acquire)
+                && borrowed
+                    .iter()
+                    .any(|range| range.start <= units.start && units.end <= range.end)
+            {
+                segments.push(*segment);
+                covered += segment.units;
+            }
+        }
+        // A range that splits a segment would leave part of it read-only to
+        // the world while the engine allocates all of its units.
+        let requested: u32 = borrowed.iter().map(|range| range.end - range.start).sum();
+        if covered != requested {
+            return Err(Error::Invalid(format!(
+                "the borrowed cache units {borrowed:?} are not whole inherited segments"
+            )));
+        }
+        retained.borrow(&segments)?;
+        Ok(segments.len())
+    }
+
     /// Copies the predecessor's cache flags and scales of the units the
     /// planes inherit from it into the planes' own, issued to `stream`,
     /// which is synchronized before returning: the predecessor's planes

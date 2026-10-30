@@ -1184,11 +1184,14 @@ impl SchedulerHandle {
     /// flight drain, after every token it generated; the other requests
     /// finish; then it executes nothing more until resumed. The receiver
     /// gets its prefix cache index and what its migrating requests held
-    /// once it parked.
+    /// once it parked. When it `lend`s, the world that succeeds it maps its
+    /// cache: it lends that world the segments no request in flight
+    /// continues from (`Scheduler::park`).
     pub fn park(
         &self,
+        lend: bool,
     ) -> crossbeam_channel::Receiver<Result<crate::scheduler::ParkedCache, String>> {
-        self.commands.park()
+        self.commands.park(lend)
     }
 
     /// Reports the KV cache each of the scheduler's worker groups holds now,
@@ -1256,9 +1259,11 @@ impl SchedulerHandle {
         self.commands.throttle(halve)
     }
 
-    /// Resumes a parked scheduler; the receiver gets whether it did.
-    pub fn resume(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.resume()
+    /// Resumes a parked scheduler; the receiver gets whether it did. When
+    /// it `reclaim`s, the world it lent cache units to writes none of them
+    /// any more, and it takes them back.
+    pub fn resume(&self, reclaim: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.resume(reclaim)
     }
 
     /// Commits the scheduler's world, which succeeded another: its workers
