@@ -571,6 +571,17 @@ impl BlockPool {
         lock(&self.inner).inherited.clone()
     }
 
+    /// Whether readers other than its holder may read `page`: the prefix
+    /// cache publishes one of its units, which any request can acquire, or
+    /// the predecessor world writes them, mapped read-only here. No call may
+    /// write such a page.
+    pub(crate) fn shared(&self, page: &PageRef) -> bool {
+        let inner = lock(&self.inner);
+        page.units.iter().any(|unit| {
+            inner.inherited.contains(&unit.0) || inner.meta[unit.0 as usize].published.is_some()
+        })
+    }
+
     /// Returns the inherited units to allocation: the predecessor world is
     /// gone and the workers took its storage. Their pages stay published.
     pub(crate) fn take_inherited(&self) {
@@ -1359,8 +1370,19 @@ impl BlockTable {
     /// needs; a full-attention table always starts at page zero. A K/V
     /// table's pages all take units; a state table's take units only for
     /// the page the call checkpoints into ([`GroupShape::checkpoint_page`]),
-    /// which may be a page the table already holds without them.
-    fn demand(&self, read_start: usize, total_tokens: usize, checkpoint: Checkpoint) -> Growth {
+    /// which may be a page the table already holds without them, or holds
+    /// in units `shared` says other readers read. The forward writes its
+    /// checkpoint into whatever units the table names for that page, so a
+    /// call that evaluates tokens again up to a checkpoint the table holds
+    /// from the prefix cache (a draft cache refill) writes it into fresh
+    /// units of its own, and the shared page stays as its readers found it.
+    fn demand(
+        &self,
+        read_start: usize,
+        total_tokens: usize,
+        checkpoint: Checkpoint,
+        shared: impl Fn(&PageRef) -> bool,
+    ) -> Growth {
         let fresh = self.pages.is_empty() && self.start_page == 0;
         let start = if fresh {
             self.shape.first_needed_page(read_start)
@@ -1381,7 +1403,7 @@ impl BlockTable {
                 && page
                     .checked_sub(self.start_page)
                     .and_then(|offset| self.pages.get(offset))
-                    .is_some_and(|entry| entry.page.is_none())
+                    .is_some_and(|entry| entry.page.as_ref().is_none_or(&shared))
         });
         Growth {
             start,
@@ -1724,11 +1746,12 @@ impl PrefixCacheCoordinator {
     /// A full-attention group needs every page before `total_tokens`; a
     /// sliding-window group needs only the pages intersecting
     /// `[read_start - window, total_tokens)`; a state group only the page
-    /// the call checkpoints into; the draft cache, which takes units only
-    /// as the pool allows, none. Returns `None` when the tables do not
-    /// match the groups.
+    /// the call checkpoints into, unless the table holds it in units of its
+    /// own; the draft cache, which takes units only as the pool allows,
+    /// none. Returns `None` when the tables do not match the groups.
     pub(crate) fn units_needed(
         &self,
+        pool: &BlockPool,
         allocation: &CacheAllocation,
         read_start: usize,
         total_tokens: usize,
@@ -1743,7 +1766,11 @@ impl PrefixCacheCoordinator {
                 .iter()
                 .filter(|table| !table.shape.draft)
                 .map(|table| {
-                    table.demand(read_start, total_tokens, checkpoint).pages()
+                    table
+                        .demand(read_start, total_tokens, checkpoint, |page| {
+                            pool.shared(page)
+                        })
+                        .pages()
                         * table.shape.units_per_page
                 })
                 .sum(),
@@ -1837,7 +1864,7 @@ impl PrefixCacheCoordinator {
         total_tokens: usize,
         checkpoint: Checkpoint,
     ) -> Option<()> {
-        let demand = self.units_needed(allocation, read_start, total_tokens, checkpoint)?;
+        let demand = self.units_needed(pool, allocation, read_start, total_tokens, checkpoint)?;
         let growths: Vec<Growth> = allocation
             .tables
             .iter()
@@ -1850,7 +1877,9 @@ impl PrefixCacheCoordinator {
                         filled: None,
                     }
                 } else {
-                    table.demand(read_start, total_tokens, checkpoint)
+                    table.demand(read_start, total_tokens, checkpoint, |page| {
+                        pool.shared(page)
+                    })
                 }
             })
             .collect();
@@ -3310,7 +3339,7 @@ mod tests {
 
         // Eight tokens need one full page and two sliding pages: 1 + 6 units.
         assert_eq!(
-            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
+            coordinator.units_needed(&pool, &allocation, 0, 8, Checkpoint::Boundary),
             Some(7)
         );
         coordinator
@@ -3463,7 +3492,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), full(8, 3)]);
         let mut allocation = coordinator.empty();
         assert_eq!(
-            coordinator.units_needed(&allocation, 0, 8, Checkpoint::Boundary),
+            coordinator.units_needed(&pool, &allocation, 0, 8, Checkpoint::Boundary),
             Some(5)
         );
         let blocker = pool.allocate(1, 1).unwrap();
@@ -3655,6 +3684,86 @@ mod tests {
         assert_eq!(target.tables[1].unit_ids(), units[3..6].to_vec());
     }
 
+    /// A request resumed from a checkpoint the prefix cache shares (in this
+    /// world, or mapped read-only from the predecessor's) and admitted
+    /// short of the next boundary still holds that page as its latest
+    /// checkpoint. A refill of its draft cache evaluates its tokens again
+    /// up to that boundary: its tables name fresh units of the request's
+    /// own for the checkpoint it writes, and the shared page keeps its
+    /// units for its other readers.
+    #[test]
+    fn a_refill_checkpoints_into_units_of_its_own() {
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), state(4, 3)]);
+        let source = endpoint();
+        let prompt = (1..=10).collect::<Vec<u32>>();
+        for inherited in [false, true] {
+            let publisher = BlockPool::new(64, 0);
+            drop(publish(&coordinator, &publisher, &prompt, &source));
+            let pool = if inherited {
+                let successor = BlockPool::new(128, 0);
+                successor.inherit(64..128);
+                successor.import(&publisher.export(), 64, &source);
+                successor
+            } else {
+                publisher
+            };
+
+            // The hit ends at the checkpoint of boundary 8, and the
+            // admission's forward reaches no later boundary.
+            let mut resumed = coordinator.empty();
+            let hit = coordinator
+                .acquire_prefix(
+                    &pool,
+                    &mut resumed,
+                    &prompt,
+                    true,
+                    false,
+                    PrefixScope::default(),
+                    &source,
+                )
+                .unwrap();
+            assert_eq!(hit.cached_tokens, 8);
+            coordinator
+                .ensure_capacity(&pool, &mut resumed, 8, 10, Checkpoint::Boundary)
+                .unwrap();
+            let shared = resumed.tables[1].page(1).unwrap().units().to_vec();
+            assert_eq!(shared.iter().all(|unit| unit.0 >= 64), inherited);
+
+            // The refill's last chunk ends at boundary 8.
+            coordinator.hold_states_from(&mut resumed, 0);
+            assert_eq!(
+                coordinator.units_needed(&pool, &resumed, 0, 8, Checkpoint::Boundary),
+                Some(3)
+            );
+            coordinator
+                .ensure_capacity(&pool, &mut resumed, 0, 8, Checkpoint::Boundary)
+                .unwrap();
+            let written = resumed.tables[1].page(1).unwrap().units().to_vec();
+            assert!(
+                written
+                    .iter()
+                    .all(|unit| !shared.contains(unit) && unit.0 < 64)
+            );
+            let serial = resumed.allocated_units - 3;
+            assert_eq!(resumed.tables[1].fresh_units(serial), written);
+
+            let mut other = coordinator.empty();
+            let hit = coordinator
+                .acquire_prefix(
+                    &pool,
+                    &mut other,
+                    &prompt,
+                    true,
+                    false,
+                    PrefixScope::default(),
+                    &source,
+                )
+                .unwrap();
+            assert_eq!(hit.cached_tokens, 8);
+            assert_eq!(other.tables[1].page(1).unwrap().units(), shared.as_slice());
+        }
+    }
+
     #[test]
     fn unpublished_sliding_pages_return_free() {
         let pool = BlockPool::new(16, 0);
@@ -3679,7 +3788,7 @@ mod tests {
         // A read from token 16 needs history [11, 20): sliding pages 2..5,
         // while the full group needs pages 0..5.
         assert_eq!(
-            coordinator.units_needed(&allocation, 16, 20, Checkpoint::Boundary),
+            coordinator.units_needed(&pool, &allocation, 16, 20, Checkpoint::Boundary),
             Some(5 + 3)
         );
         coordinator

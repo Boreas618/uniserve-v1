@@ -685,6 +685,7 @@ impl Scheduler {
                 return true;
             }
             needed = cache.coordinator.units_needed(
+                &cache.block_pool,
                 &allocations.prefix_cache,
                 read_start as usize,
                 total_tokens as usize,

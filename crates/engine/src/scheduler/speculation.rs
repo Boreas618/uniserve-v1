@@ -418,8 +418,12 @@ impl Scheduler {
     /// itself. A model with layers kept per request slot ends a chunk short
     /// of that at a checkpoint boundary, from which the next continues. The
     /// chunk's tables grow first: the state checkpoint it writes and its
-    /// draft pages, without which no refill is planned. Returns `None` when
-    /// no chunk fits or the tables cannot grow.
+    /// draft pages, without which no refill is planned. A checkpoint page
+    /// the request holds from the prefix cache, such as the one a migrated
+    /// request resumed from, takes fresh units for the chunk to write: other
+    /// requests read the shared page, and a predecessor world's is mapped
+    /// read-only. Returns `None` when no chunk fits or the tables cannot
+    /// grow.
     pub(in crate::scheduler) fn plan_refill(
         &mut self,
         id: RequestId,
