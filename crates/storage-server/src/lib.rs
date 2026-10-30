@@ -61,7 +61,7 @@ use ::storage::transport::Connection;
 pub use child::Launch;
 use kv_storage::{KvStorage, Task};
 pub use pages::{DEFAULT_POOL_BYTES, STAGING_POOL_BYTES};
-pub use restart::{Pending as RestartPending, TAKEOVER_DESCRIPTOR, relaunch_arguments};
+pub use restart::{PREDECESSOR_DESCRIPTOR, Pending as RestartPending, relaunch_arguments};
 pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
 use shoot::ShootDowns;
 

@@ -60,7 +60,7 @@ pub struct ServeOptions {
     /// Go on with the server the predecessor of a hot restart hands over on
     /// the handoff socket at this descriptor, rather than binding the
     /// socket (`crate::restart`).
-    pub takeover: Option<i32>,
+    pub predecessor: Option<i32>,
 }
 
 /// Serve until stopped. Must be called before the process starts a thread:
@@ -72,13 +72,13 @@ pub struct ServeOptions {
 /// server cannot start, or it fails while serving.
 pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
     // Forked before any thread exists. A successor runs detached already.
-    let ready = if options.daemon && options.takeover.is_none() {
+    let ready = if options.daemon && options.predecessor.is_none() {
         Some(detach(&options.socket)?)
     } else {
         None
     };
     init_logging();
-    let served = match options.takeover {
+    let served = match options.predecessor {
         Some(descriptor) => serve_resumed(&options, descriptor),
         None => serve_on(&options, ready),
     };

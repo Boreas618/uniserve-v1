@@ -121,7 +121,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `--worker-groups`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Parallel configuration: a deployment file, or the tensor- and data-parallel shorthand |
 | `--max-running-requests`, `--mem-fraction-static` | Resident requests and each GPU worker's device-storage share |
 | `--worker-executable` | The `uniserve` executable the workers run as (`worker_config.executable`) |
-| `--config`, `--set`, `--print-config` | The configuration file, assignments by path, and printing the resolved tree |
+| `--config`, `--set` | The configuration file and assignments by path |
 
 | Table | Options for |
 | --- | --- |
@@ -134,11 +134,11 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `video_config`, `media_config`, `video_job_config` | MiniMax-H3: canvases, durations, prompt capacities, condition media and asynchronous jobs |
 | `readout_config`, `diffusion_generation_config` | DiffusionGemma readouts and block-diffusion sampling |
 
-A model-family table is refused at startup when the served checkpoint belongs to another family. `--print-config` prints the resolved tree, defaults included, in the form `--config` reads; `--log-level` and `--log-level-http` set the process's log levels. [Configuration](docs/configuration.md) describes every option, the configuration file and the deployment-file format.
+A model-family table is refused at startup when the served checkpoint belongs to another family. `GET /admin/config` returns the resolved tree in the form `--config` reads; `--log-level` and `--log-level-http` set the process's log levels. [Configuration](docs/configuration.md) describes every option, the configuration file and the deployment-file format.
 
 On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Prefill graphs hold up to `max_num_batched_tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `max_running_requests` and at most as many requests as the KV pool holds a page of every cache group for. A prefill or decode step that no captured graph holds runs eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `cuda_graph_config.policy = "off"` serves every call without graphs, and so does `auto` with `attention_backend = "torch"`, whose captured calls attend over every row's whole capacity.
 
-Run `uniserve serve --help` for the flags and `uniserve serve --print-config` for every option.
+Run `uniserve serve --help` for the flags; [Configuration](docs/configuration.md) lists every option.
 
 ## Reproduce the measurements
 

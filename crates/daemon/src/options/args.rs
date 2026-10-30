@@ -93,7 +93,6 @@ pub struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     pub worker_executable: Option<PathBuf>,
     /// TOML file of serving options; the flags and `--set` override it.
-    /// `--print-config` prints the resolved non-default options.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
     /// Set the option at PATH, such as `cuda_graph_config.policy=off` or
@@ -104,14 +103,11 @@ pub struct ServeArgs {
     /// option inside it.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
-    /// Print the resolved non-default options as reloadable TOML and exit.
-    #[arg(long)]
-    pub print_config: bool,
-    /// Take a deployment over from the daemon at the other end of the
-    /// handoff socket at this descriptor, as `POST /admin/restart` starts
-    /// its successor (`daemon::restart`); every other argument is ignored.
-    #[arg(long, hide = true)]
-    pub takeover: Option<i32>,
+    /// The descriptor of the handoff socket to the daemon this one succeeds,
+    /// whose deployment it takes over, as `POST /admin/restart` starts its
+    /// successor (`daemon::restart`); every other argument is ignored.
+    #[arg(long, hide = true, value_name = "FD")]
+    pub predecessor: Option<i32>,
 }
 
 /// The configuration paths an invocation stated: every table and option the

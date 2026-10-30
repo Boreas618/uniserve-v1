@@ -3,7 +3,7 @@
 //! close.
 //!
 //! An operator's [`Request::Restart`] starts the successor (`uniserve
-//! storage serve ... --takeover FD`) with one end of a socket pair at that
+//! storage serve ... --predecessor FD`) with one end of a socket pair at that
 //! descriptor and answers with its process id. The server serves on until
 //! nothing is in flight: no request waits, no shoot-down runs, neither the
 //! connector nor the Transfer Server runs a task, and every reply was
@@ -36,7 +36,7 @@ use crate::{ClientId, Deployment, Holder, Launch, Server, StorageEntry, TensorEn
 use ::storage::protocol::Retainer;
 
 /// The descriptor a successor finds the handoff socket at.
-pub const TAKEOVER_DESCRIPTOR: i32 = 3;
+pub const PREDECESSOR_DESCRIPTOR: i32 = 3;
 
 /// How long the successor takes to answer.
 const STEP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -206,13 +206,13 @@ impl Server {
         let mut command = std::process::Command::new(&executable);
         command
             .args(&self.relaunch)
-            .args(["--takeover", &TAKEOVER_DESCRIPTOR.to_string()]);
+            .args(["--predecessor", &PREDECESSOR_DESCRIPTOR.to_string()]);
         // SAFETY: the closure runs in the forked child before exec and calls
         // only `dup2`, which is async-signal-safe; `theirs` stays open in
         // this process until the spawn returned.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(descriptor, TAKEOVER_DESCRIPTOR) == -1 {
+                if libc::dup2(descriptor, PREDECESSOR_DESCRIPTOR) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -243,7 +243,7 @@ impl Server {
     }
 
     /// The arguments a successor server starts with, before
-    /// `--takeover`: those of the `uniserve storage serve` that started
+    /// `--predecessor`: those of the `uniserve storage serve` that started
     /// this one, without `--daemon`.
     pub fn set_relaunch(&mut self, arguments: Vec<String>) {
         self.relaunch = arguments;
@@ -679,7 +679,7 @@ impl Server {
 
 /// The arguments of a `uniserve storage serve` that a successor starts with:
 /// `arguments` (this process's, the program's name first) without the
-/// program's name, `--daemon` and an earlier `--takeover`.
+/// program's name, `--daemon` and an earlier `--predecessor`.
 pub fn relaunch_arguments(arguments: Vec<OsString>) -> Vec<String> {
     let mut kept = Vec::new();
     let mut arguments = arguments
@@ -689,10 +689,10 @@ pub fn relaunch_arguments(arguments: Vec<OsString>) -> Vec<String> {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--daemon" => {}
-            "--takeover" => {
+            "--predecessor" => {
                 arguments.next();
             }
-            _ if argument.starts_with("--takeover=") => {}
+            _ if argument.starts_with("--predecessor=") => {}
             _ => kept.push(argument),
         }
     }
@@ -914,7 +914,7 @@ mod tests {
             "--socket",
             "/tmp/s.sock",
             "--daemon",
-            "--takeover",
+            "--predecessor",
             "3",
             "--page-pool-gib",
             "8",
