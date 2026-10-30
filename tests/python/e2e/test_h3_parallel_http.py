@@ -167,7 +167,7 @@ def _follower(leader_log: Path, log: Path, address: str) -> Iterator[None]:
     )
     remote = (
         f"cd {shlex.quote(str(Path.cwd()))} && echo follower pid $$ && "
-        f"exec env {environment} NCCL_NVLS_ENABLE=0 "
+        f"exec env {environment} "
         f"{shlex.quote(str(require_uniserve_binary()))} serve --nnodes 2 "
         f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1"
     )
@@ -510,9 +510,6 @@ def test_component_bindings_release_cancelled_requests(
             str(index) for index in range(min(visible_devices, local_devices))
         )
     }
-    if two_hosts:
-        # NVLink SHARP is off across hosts, as in the two-host measurements.
-        environment["NCCL_NVLS_ENABLE"] = "0"
     follower = (
         _follower(log, tmp_path / "h3-follower.log", address)
         if two_hosts
