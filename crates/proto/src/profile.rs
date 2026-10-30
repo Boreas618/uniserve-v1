@@ -129,12 +129,15 @@ pub const PM_MIN_INTERVAL_NS: u64 = 20_000;
 /// `pass_ranges / RANGE_STEP_LAUNCHES` recorded steps.
 pub const RANGE_STEP_LAUNCHES: usize = 32;
 
-/// The device storage a range profiler pass takes per range. CUPTI takes it
-/// at the pass's first start, in whole [`RANGE_STORAGE_GRANULE`]s, and keeps
-/// it until the profiler is disabled. Measured on GB200 with
-/// `nvidia-cuda-cupti` 13.0, the same for one to four metrics and for
-/// either range mode.
-const RANGE_STORAGE: u64 = 1_421_312;
+/// The device storage a range profiler pass takes per range. CUPTI takes the
+/// pass's ranges' storage at its first start, rounded up to whole
+/// [`RANGE_STORAGE_GRANULE`]s, and keeps it until the profiler is disabled.
+/// Measured on GB200 with `nvidia-cuda-cupti` 13.4.92 as the device's free
+/// storage (`cuMemGetInfo`) a pass's first start took: 727,711,744,
+/// 1,746,927,616, 2,908,749,824 and 5,817,499,648 bytes for passes of 512,
+/// 1,229, 2,048 and 4,096 ranges, which this size per range gives for
+/// each; the same for one, two and four metrics.
+const RANGE_STORAGE: u64 = 1_420_288;
 
 /// The unit CUPTI takes a pass's device storage in: 2 MiB.
 const RANGE_STORAGE_GRANULE: u64 = 2 << 20;
@@ -164,8 +167,8 @@ impl Default for RangeMetricsOptions {
 }
 
 impl RangeMetricsOptions {
-    /// The device storage one pass takes: 1,421,312 bytes per range,
-    /// rounded up to 2 MiB.
+    /// The device storage one pass takes: 1,420,288 bytes per range, the
+    /// pass's total rounded up to whole 2 MiB.
     pub fn pass_storage(&self) -> u64 {
         (self.pass_ranges as u64 * RANGE_STORAGE).next_multiple_of(RANGE_STORAGE_GRANULE)
     }

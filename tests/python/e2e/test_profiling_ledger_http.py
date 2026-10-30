@@ -32,7 +32,7 @@ OPTIONS = (
 
 # A pass's device storage per range, and the unit CUPTI takes it in
 # (docs/profiling.md).
-RANGE_STORAGE = 1_421_312
+RANGE_STORAGE = 1_420_288
 GRANULE = 2 << 20
 
 
