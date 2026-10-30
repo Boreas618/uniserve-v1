@@ -4,14 +4,16 @@ import base64
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -208,6 +210,150 @@ def stop_storage_server(runtime: Path) -> None:
             continue
         if b"serve" in command and socket in command:
             os.kill(int(entry.name), signal.SIGTERM)
+
+
+# What a deployment's leader logs while it awaits the nodes below `--nnodes`.
+AWAITING_NODES = "awaiting the deployment's other nodes"
+
+# Stops the Storage Server serving the socket given as its argument, found by
+# its command line, as `stop_storage_server` does on this host.
+_STOP_STORAGE = """
+import os
+import signal
+import sys
+
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    try:
+        command = open(f"/proc/{entry}/cmdline", "rb").read().split(b"\\0")
+    except OSError:
+        continue
+    if b"serve" in command and sys.argv[1].encode() in command:
+        os.kill(int(entry), signal.SIGTERM)
+"""
+
+
+def _on_host(host: str, command: str, timeout: float = 120) -> str:
+    """Runs `command` on `host` over ssh; returns its output."""
+    done = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", host, command],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=True,
+    )
+    return done.stdout
+
+
+@contextmanager
+def second_host(
+    host: str,
+    log: Path,
+    address: str,
+    *,
+    devices: str | None = None,
+    env: dict[str, str] | None = None,
+    leader_log: Path | None = None,
+) -> Iterator[Callable[[], None]]:
+    """The daemon of a deployment's second host, joining the leader at
+    `address` as node `rank-1`.
+
+    `host` is an ssh destination whose checkout path holds this build. The
+    daemon runs in this test's environment (its search and package paths,
+    native libraries, kernel build settings and the network devices UCX
+    may use), with `env` beside it and on `devices` (all of the host's
+    without them), under a runtime directory of its own: the Storage Server
+    it starts serves this deployment alone, in that environment. It starts
+    once `leader_log` shows the leader awaits it, or when the test calls the
+    callable this yields. On exit, which follows the leader's, it waits
+    until the daemon ended, which it does when the leader's connection
+    closes, keeps the Storage Server's log beside `log` and stops that
+    server. A daemon that outlives its leader fails the test.
+    """  # noqa: D205
+    runtime = f"/tmp/uniserve-follower-{os.getpid()}-{find_free_port()}"
+    variables = {
+        name: os.environ.get(name, "")
+        for name in (
+            "PATH",
+            "LD_LIBRARY_PATH",
+            "PYTHONPATH",
+            "MAX_JOBS",
+            "FLASHINFER_WORKSPACE_BASE",
+            "UCX_NET_DEVICES",
+        )
+    }
+    variables.update(env or {})
+    variables["XDG_RUNTIME_DIR"] = runtime
+    if devices is not None:
+        variables["CUDA_VISIBLE_DEVICES"] = devices
+    environment = " ".join(
+        f"{name}={shlex.quote(value)}" for name, value in variables.items()
+    )
+    launcher = os.environ.get("UNISERVE_FOLLOWER_LAUNCHER")
+    command_prefix = f"{shlex.quote(launcher)} " if launcher else ""
+    remote = (
+        f"mkdir -m 700 {runtime} && cd {shlex.quote(str(Path.cwd()))} && "
+        f"echo follower pid $$ && exec env {environment} "
+        f"{command_prefix}{shlex.quote(str(require_uniserve_binary()))} "
+        "serve --nnodes 2 "
+        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
+        f"--worker-executable {shlex.quote(str(worker_executable()))}"
+    )
+    started: list[subprocess.Popen[str]] = []
+    leaving = threading.Event()
+
+    def start() -> None:
+        if not started:
+            started.append(
+                subprocess.Popen(
+                    ["ssh", "-o", "BatchMode=yes", host, remote],
+                    stdout=log.open("w", encoding="utf-8"),
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+
+    def start_when_awaited() -> None:
+        while not leaving.is_set():
+            if (
+                leader_log is not None
+                and leader_log.exists()
+                and AWAITING_NODES in leader_log.read_text(errors="replace")
+            ):
+                start()
+                return
+            time.sleep(1)
+
+    starter = threading.Thread(target=start_when_awaited, daemon=True)
+    if leader_log is not None:
+        starter.start()
+    try:
+        yield start
+    finally:
+        leaving.set()
+        if leader_log is not None:
+            starter.join()
+        outlived = False
+        for process in started:
+            try:
+                process.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                pid = log.read_text().split("follower pid ")[1].split()[0]
+                _on_host(host, f"kill {pid}")
+                process.wait(timeout=120)
+                outlived = True
+        if started:
+            storage_socket = f"{runtime}/uniserve/storage.sock"
+            kept = shlex.quote(str(log.with_suffix(".storage.log")))
+            _on_host(
+                host,
+                f"python3 -c {shlex.quote(_STOP_STORAGE)} {storage_socket}; "
+                f"cp {runtime}/uniserve/storage-server.log {kept} 2>/dev/null; "
+                f"rm -rf {runtime}",
+            )
+        if outlived:
+            raise AssertionError("the second host's daemon outlived its leader")
 
 
 @contextmanager

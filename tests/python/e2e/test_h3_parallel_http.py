@@ -6,11 +6,6 @@ import contextlib
 import io
 import json
 import os
-import shlex
-import subprocess
-import threading
-import time
-from collections.abc import Iterator
 from itertools import zip_longest
 from pathlib import Path
 
@@ -24,6 +19,7 @@ from transformers import AutoTokenizer
 from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
+    second_host,
     server_process,
     t2va_request,
     worker_executable,
@@ -144,70 +140,12 @@ EIGHT_RANK_DENOISER_RANKS = [2, 3, 0, 1, 6, 7, 4, 5]
 # A layout needing more devices than this host has runs on two hosts when
 # UNISERVE_H3_FOLLOWER names the second (an ssh destination whose checkout
 # path holds the same build) and UNISERVE_H3_LEADER_ADDRESS the address of
-# this host that the second reaches. The second host's daemon joins this
-# host's leader as node `rank-1`, as docs/minimax_h3/minimax_h3.md's two-host
-# deployments do, and runs the ranks placed on its devices.
+# this host that the second reaches. The second host's daemon
+# (`http_helpers.second_host`) joins this host's leader as node `rank-1`, as
+# docs/minimax_h3/minimax_h3.md's two-host deployments do, and runs the ranks
+# placed on its devices.
 FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
 LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
-AWAITING = "awaiting the deployment's other nodes"
-
-
-@contextlib.contextmanager
-def _follower(leader_log: Path, log: Path, address: str) -> Iterator[None]:
-    """Start the second host's daemon once the leader logged that it awaits
-    it, joining at ``address``; on exit wait until it ended, which it does
-    when the leader's connection closes.
-    """  # noqa: D205
-    assert FOLLOWER is not None
-    # The second host runs the same checkout's environment, including a
-    # package path that shadows the installed one.
-    environment = " ".join(
-        f"{name}={shlex.quote(os.environ.get(name, ''))}"
-        for name in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH")
-    )
-    remote = (
-        f"cd {shlex.quote(str(Path.cwd()))} && echo follower pid $$ && "
-        f"exec env {environment} "
-        f"{shlex.quote(str(require_uniserve_binary()))} serve --nnodes 2 "
-        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1"
-    )
-    started: list[subprocess.Popen[str]] = []
-    leaving = threading.Event()
-
-    def start() -> None:
-        while not leaving.is_set():
-            if leader_log.exists() and AWAITING in leader_log.read_text(
-                errors="replace"
-            ):
-                started.append(
-                    subprocess.Popen(
-                        ["ssh", "-o", "BatchMode=yes", FOLLOWER, remote],
-                        stdout=log.open("w", encoding="utf-8"),
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                    )
-                )
-                return
-            time.sleep(1)
-
-    starter = threading.Thread(target=start, daemon=True)
-    starter.start()
-    try:
-        yield
-    finally:
-        leaving.set()
-        starter.join()
-        for process in started:
-            try:
-                process.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                pid = log.read_text().split("follower pid ")[1].split()[0]
-                subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", FOLLOWER, f"kill {pid}"],
-                    check=False,
-                )
-                process.wait(timeout=120)
-                pytest.fail("the follower daemon outlived its leader")
 
 
 def _eight_rank_worker_config(parallel_kind: str) -> dict:
@@ -511,7 +449,9 @@ def test_component_bindings_release_cancelled_requests(
         )
     }
     follower = (
-        _follower(log, tmp_path / "h3-follower.log", address)
+        second_host(
+            FOLLOWER, tmp_path / "h3-follower.log", address, leader_log=log
+        )
         if two_hosts
         else contextlib.nullcontext()
     )
