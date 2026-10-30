@@ -647,7 +647,7 @@ fn prepare(
             let (context, device) = device()?;
             let options = &request.range_metrics;
             let ranges = match options.ranges {
-                MetricRanges::Kernel => Ranges::Kernels,
+                MetricRanges::Kernel => Ranges::Launches,
                 MetricRanges::Component => {
                     if Fences::installed().is_none() {
                         return Err("component ranges need the rank's fence probes \
