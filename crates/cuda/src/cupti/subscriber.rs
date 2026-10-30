@@ -291,14 +291,18 @@ fn flush_loop() {
 
 /// The CUPTI callback: hands each callback to the collectors that use it.
 /// Every collector's part only touches atomics, thread locals and its own
-/// locks.
+/// locks, and the range profiler's launch ranges also push and pop a CUPTI
+/// range.
 unsafe extern "C" fn dispatch(_userdata: *mut c_void, domain: i32, cbid: u32, data: *const c_void) {
     if data.is_null() {
         return;
     }
     if domain == DRIVER_DOMAIN {
         // SAFETY: CUPTI supplies CUpti_CallbackData for this API domain.
-        unsafe { super::blocking::on_driver_call(cbid, data) };
+        unsafe {
+            super::blocking::on_driver_call(cbid, data);
+            super::range_profiler::on_launch(cbid, data);
+        }
     }
     if domain == DRIVER_DOMAIN || domain == RUNTIME_DOMAIN {
         // SAFETY: both API domains supply CUpti_CallbackData.
