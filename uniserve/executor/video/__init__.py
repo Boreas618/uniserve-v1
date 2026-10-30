@@ -918,8 +918,10 @@ class VideoExecutor:
         the output, which orders them after the encoding.
 
         ``host["copies"]`` holds, for each page of ``pages``, the byte offset
-        in the call's output, the byte offset in the page and the bytes
-        copied (``crates/worker/src/executor/products.rs::host_copies``).
+        in the rank's write (its region of the call's output, or the whole
+        output; ``writes[0]`` starts at its first row), the byte offset in
+        the page and the bytes copied
+        (``crates/worker/src/executor/products.rs::host_copies``).
         ``export`` writes the output to the pages, otherwise the output is
         read from them.
         """  # noqa: D205

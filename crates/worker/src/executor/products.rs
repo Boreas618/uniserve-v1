@@ -613,12 +613,13 @@ pub(crate) fn bind_prepared(
 /// copies between them (`Call::host_output`), as `bind_prepared` hands them
 /// to the executor: the views, and `{"import": bool, "copies": [[output,
 /// page offset, bytes], ...]}` with one copy per view, the byte offset in
-/// the call's output, the byte offset in the page and the bytes copied.
+/// the rank's write, the byte offset in the page and the bytes copied.
 ///
-/// An import reads every row of the call's output from the pages; an export
-/// writes the rows the rank wrote (the region the executor prepared its
-/// write in, or all of them) to the pages the pool does not hold already.
-/// Ranks that write the same rows write the same bytes. `None` for a rank
+/// The rank's write holds the rows of the region the executor prepared it
+/// in, or every row of the call's output, and its view starts at the first
+/// of them. An import reads those rows from the pages; an export writes them
+/// to the pages the pool does not hold already. Ranks that write the same
+/// rows write the same bytes. `None` for a rank
 /// that writes none of the output, as a latent encoding's audio call on a
 /// rank other than its first.
 fn host_copies(
@@ -657,19 +658,20 @@ fn host_copies(
             output.rows
         )));
     }
-    // The rows this rank's copies cover.
-    let copied = match (&write.region, output.import) {
-        (Some(region), false) => {
+    // The rows of this rank's write, which its copies cover.
+    let written = match &write.region {
+        Some(region) => {
             let rows = region
                 .first()
                 .ok_or_else(|| Error::Interface("an encoder write's region has no rows".into()))?;
             rows[0]..rows[1]
         }
-        _ => 0..rows,
+        None => 0..rows,
     };
     let mut views = Vec::new();
     let mut copies = Vec::new();
-    for copy in encoders::page_copies(output.rows[0], copied, output.row_bytes, pool.page_bytes()) {
+    for copy in encoders::write_copies(output.rows[0], written, output.row_bytes, pool.page_bytes())
+    {
         let slot = output.slots.get(copy.page).ok_or_else(|| {
             Error::Invalid("an encoder output's rows lie beyond its pages".into())
         })?;
