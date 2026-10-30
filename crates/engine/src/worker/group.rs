@@ -100,7 +100,8 @@ pub struct WorkerGroup {
     /// domain even when another consumes its notification first.
     failure_wake: crate::handle::WakeSignal,
     /// While the group waits for its failure domain's relaunch: the info
-    /// its workers reported, which their replacements must match.
+    /// its workers reported, with what their planes held when they were
+    /// lost, which their replacements must match.
     awaiting: Option<Vec<WorkerInfo>>,
     /// The deployment's connection to its daemons, shared with the other
     /// groups. A daemon ends the processes an engine started when the
@@ -306,11 +307,7 @@ impl WorkerGroup {
             .map(|worker| worker.info().endpoint.clone())
             .collect();
         let requests = self.resident_requests.iter().copied().collect();
-        let expected = self
-            .workers
-            .iter()
-            .map(|worker| worker.info().clone())
-            .collect::<Vec<_>>();
+        let expected = self.replacement_infos();
         let generation = self.workers.first().map(WorkerProcess::generation);
         for worker in &mut self.workers {
             worker.terminate();
@@ -399,6 +396,13 @@ impl WorkerGroup {
         }
         let _ = self.failure_wake.drain();
         self.awaiting = Some(expected);
+        // The relaunched ranks lay their cache planes out as the lost ones
+        // hold them now: they take those segments back from the Storage
+        // Server and leave the ones given back absent. A pool sized afresh
+        // against the device's ledger differs once the world's storage
+        // changed since it started: beside a successor world prepared on the
+        // same devices, the grant holds only what the successor left.
+        self.process_args.segments = self.cache_table();
         domain.arrive(index, self.process_args.clone());
         failure(format!(
             "WorkerGroup {} lost its resident allocations and is relaunched with its failure \
@@ -830,7 +834,24 @@ impl WorkerGroup {
     }
 }
 
-/// Validates that a replacement rank preserves the established worker contract.
+/// `info`, a rank's startup report, with what its cache planes hold now as
+/// `planes`, the group's record of them, states it: the leading segments
+/// held, which a world's cache changes give back and create again, and the
+/// units inherited from a predecessor world, which its commit takes.
+fn holding(info: &WorkerInfo, planes: Option<&ipc::PrefixCacheInfo>) -> WorkerInfo {
+    let mut info = info.clone();
+    if let (Some(cache), Some(planes)) = (info.prefix_cache.as_mut(), planes) {
+        cache.held_segments = planes.held_segments;
+        cache.inherited_start = planes.inherited_start;
+        cache.inherited_units = planes.inherited_units;
+    }
+    info
+}
+
+/// Validates that a replacement rank preserves the established worker
+/// contract: it reports `expected`, the replaced rank's description as it
+/// stands ([`WorkerGroup::replacement_infos`]), apart from its endpoint,
+/// which must name a new incarnation.
 fn validate_replacement_info(
     expected: &WorkerInfo,
     actual: &WorkerInfo,

@@ -68,10 +68,11 @@ pub struct WorkerProcessArgs {
     /// How a standby launch keeps its graph storage while it parks
     /// (`worker_config.standby_storage`).
     pub standby_storage: proto::request::StandbyStorage,
-    /// The exact KV cache segments the group's planes are made of: the
-    /// serving workers' for a standby launch, the world's own for a
-    /// relaunch of a world whose planes another world's segments began;
-    /// `None` lays them out afresh.
+    /// The exact KV cache segments the group's planes are made of, and the
+    /// leading ones its ranks hold: the serving workers' for a standby
+    /// launch, the lost ranks' for a relaunch, the committed world's for an
+    /// engine that replaces a lost one (`EngineConfig::segments`); `None`
+    /// lays them out afresh, as a world's first launch does.
     pub segments: Option<ipc::CacheTable>,
     /// The world the group's workers belong to, which keys the storage they
     /// create and retains what they use.

@@ -18,7 +18,7 @@
 //! round of the domain promotes as a whole.
 
 use super::WorkerGroup;
-use super::validate_replacement_info;
+use super::{holding, validate_replacement_info};
 use crate::worker::WorkerProcess;
 
 /// The standby rank group of a serving group.
@@ -109,13 +109,19 @@ impl WorkerGroup {
             }
         }
         if polled.is_ok() && ready && !standby.ready {
+            // The standby maps the planes as the serving ranks hold them now.
+            let planes = self.info.prefix_cache.as_ref();
             polled = standby
                 .workers
                 .iter()
                 .zip(&self.workers)
                 .enumerate()
                 .try_for_each(|(rank, (standby, serving))| {
-                    validate_replacement_info(serving.info(), standby.info(), rank)
+                    validate_replacement_info(
+                        &holding(serving.info(), planes),
+                        standby.info(),
+                        rank,
+                    )
                 });
             if polled.is_ok() {
                 standby.ready = true;
@@ -156,8 +162,9 @@ impl WorkerGroup {
     }
 
     /// The segments the group's planes are made of, as its ranks reported
-    /// them; `None` for planes not split.
-    fn cache_table(&self) -> Option<ipc::CacheTable> {
+    /// them, and the leading ones they hold now (`record_held`); `None` for
+    /// planes not split.
+    pub(super) fn cache_table(&self) -> Option<ipc::CacheTable> {
         self.info
             .prefix_cache
             .as_ref()
@@ -186,9 +193,12 @@ impl WorkerGroup {
         }
         let results = self.hook("uniserve.take_cache", "")?;
         self.process_args.predecessor = None;
-        // A relaunch lays the planes out as they are now: the predecessor's
-        // segments are the world's own.
-        self.process_args.segments = self.cache_table();
+        // The predecessor's segments are the world's own: the planes inherit
+        // none, as a relaunch lays them out.
+        if let Some(cache) = self.info.prefix_cache.as_mut() {
+            cache.inherited_start = 0;
+            cache.inherited_units = 0;
+        }
         tracing::info!(
             worker = %self.process_args.worker_id,
             "the group's world is committed: it relaunches on a loss from now on"
@@ -199,13 +209,70 @@ impl WorkerGroup {
 
     /// Runs the worker hook `name` on the group's serving ranks; each rank's
     /// result, in rank order.
+    ///
+    /// The hooks that give cache segments back or create them again answer
+    /// with the segments the rank's planes hold after them, which the group
+    /// records (`record_held`). A sleep's answer states none: the ranks that
+    /// replace a sleeping group's start awake, and warm up on the planes as
+    /// they held them before it.
     pub(crate) fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
-        crate::worker::process::hook_all(
+        let results = crate::worker::process::hook_all(
             &mut self.workers,
             name,
             payload,
             self.process_args.watchdog_timeout,
-        )
+        )?;
+        if matches!(
+            name,
+            "uniserve.release_cache" | "uniserve.restore_cache" | "uniserve.wake"
+        ) {
+            self.record_held(&results)?;
+        }
+        Ok(results)
+    }
+
+    /// Records the leading segments the group's planes hold, as every rank
+    /// answered a hook that gives segments back or creates them again
+    /// (`{"held": n}`): the ranks that replace lost ones hold those and
+    /// leave the others absent (`cache_table`, `replacement_infos`). Planes
+    /// not split record nothing.
+    ///
+    /// Fails when a rank states no count or another one than its peers: the
+    /// ranks of a group give back and create the same segments.
+    fn record_held(&mut self, results: &[String]) -> anyhow::Result<()> {
+        if self.cache_table().is_none() {
+            return Ok(());
+        }
+        let mut held = None;
+        for (rank, result) in results.iter().enumerate() {
+            let stated = serde_json::from_str::<serde_json::Value>(result)
+                .ok()
+                .and_then(|answer| answer["held"].as_u64())
+                .and_then(|count| u32::try_from(count).ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("rank {rank} did not state the cache segments it holds")
+                })?;
+            anyhow::ensure!(
+                *held.get_or_insert(stated) == stated,
+                "rank {rank} holds {stated} cache segments, another rank {}",
+                held.unwrap_or_default()
+            );
+        }
+        if let (Some(held), Some(cache)) = (held, self.info.prefix_cache.as_mut()) {
+            cache.held_segments = held;
+        }
+        Ok(())
+    }
+
+    /// Each rank's description as a rank that replaces it must report it
+    /// (`validate_replacement_info`): its startup report, with what the
+    /// group's planes hold now ([`holding`]).
+    pub(super) fn replacement_infos(&self) -> Vec<ipc::WorkerInfo> {
+        let planes = self.info.prefix_cache.as_ref();
+        self.workers
+            .iter()
+            .map(|worker| holding(worker.info(), planes))
+            .collect()
     }
 
     /// Record recovery's distribution before publishing it in the live ranks.

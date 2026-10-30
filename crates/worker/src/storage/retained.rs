@@ -995,7 +995,18 @@ impl Retained {
                     segment_name(spec.name, &spec.parts[index])
                 )));
             }
-            if mode == Mode::Write && !got.missing.is_empty() {
+            // The storages a predecessor left that no owner takes again are
+            // released before a missing part is created in their place.
+            // Parts left absent (segments given back) create nothing, and
+            // the storages not taken yet include other planes' segments,
+            // which their owner takes next: the value planes' after the key
+            // planes'.
+            let creates = got.missing.iter().any(|missing| {
+                keys.iter()
+                    .position(|key| key == missing)
+                    .is_some_and(|index| spec.parts[index].create)
+            });
+            if mode == Mode::Write && creates {
                 let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
                 self.release_untaken(&mut state, &taking)?;
             }

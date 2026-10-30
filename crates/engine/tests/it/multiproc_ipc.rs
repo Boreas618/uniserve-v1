@@ -1090,6 +1090,140 @@ fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A group whose ranks gave back the tail of their split cache planes is
+/// relaunched holding the segments the lost ranks held: every relaunched
+/// rank's launch descriptor carries the planes' segments with the count
+/// held after the give-back, and the group serves again on ranks that hold
+/// that many, rather than refusing them for the count its ranks held at
+/// startup.
+#[test]
+fn a_relaunched_group_holds_the_cache_segments_its_lost_ranks_held() -> anyhow::Result<()> {
+    use engine::{WorkerExecutor, WorkerGroupId};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The ranks are `media_worker` processes in its `planes` case, which
+    // hold the segments a relaunch's descriptor names and give back the
+    // tail `uniserve.release_cache` names. They start from a stub group's
+    // report whose planes split into eight segments of world 1.
+    const SEGMENTS: u32 = 8;
+    const KEPT: u32 = 5;
+    let directory = tempfile::tempdir()?;
+    let info_path = directory.path().join("info.json");
+    let mut template = {
+        let mut worker = spawn_worker_group()?;
+        let info = worker.info().clone();
+        worker.close()?;
+        info
+    };
+    let cache = template
+        .prefix_cache
+        .as_mut()
+        .context("the stub group reports no KV cache")?;
+    let units = cache.num_units / SEGMENTS;
+    cache.num_units = units * SEGMENTS;
+    cache.segments = (0..SEGMENTS)
+        .map(|ordinal| ipc::CacheSegment {
+            world: 1,
+            ordinal,
+            units,
+        })
+        .collect();
+    cache.held_segments = SEGMENTS;
+    let segments = cache.segments.clone();
+    std::fs::write(&info_path, serde_json::to_vec(&template)?)?;
+
+    // The wrapper records each rank's process id and runs it as the fake
+    // rank, which records the cache table its launch descriptor carried.
+    let wrapper = directory.path().join("worker");
+    let executable = serde_json::to_string(&std::env::current_exe()?)?;
+    let state = serde_json::to_string(directory.path())?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\nstate = Path({state})\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(state / (rank + '.pid')).write_text(str(os.getpid()))\nenv = dict(os.environ, {MEDIA_WORKER_ARGS}=json.dumps(sys.argv[1:]), {MEDIA_WORKER_INFO}={info}, {MEDIA_WORKER_CASE}='planes', {MEDIA_WORKER_NAME}=str(state / 'media-name'), {MEDIA_WORKER_TABLES}=str(state))\nos.execve({executable}, [{executable}, '--exact', 'multiproc_ipc::media_worker', '--ignored', '--nocapture', '--test-threads', '1'], env)\n",
+            info = serde_json::to_string(&info_path)?,
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let id = WorkerGroupId("planes".into());
+    let mut args = worker_group_args();
+    args.worker_id = id.0.clone();
+    args.executable = wrapper;
+    let mut executor = WorkerExecutor::try_new(
+        vec![(id.clone(), WorkerGroup::spawn(args)?)],
+        engine::TransferConfig::default(),
+    )?;
+
+    // The ranks give back the planes' segments from `KEPT` on, as a shrink
+    // for a successor world does.
+    let answers = executor.hook(
+        "uniserve.release_cache",
+        &serde_json::json!({ "from": KEPT }).to_string(),
+    )?;
+    assert_eq!(answers.len(), WORLD_SIZE);
+
+    let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+    // SAFETY: kill takes only integer arguments and touches no storage of this process.
+    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let loss = loop {
+        match executor.poll(Duration::from_millis(100)) {
+            Ok(None) => anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the loss was not reported"
+            ),
+            Ok(Some(result)) => anyhow::bail!("an idle group returned {result:?}"),
+            Err(loss) => break loss,
+        }
+    };
+    anyhow::ensure!(
+        loss.downcast_ref::<WorkerFailure>()
+            .is_some_and(|loss| loss.worker_id == id),
+        "unexpected loss: {loss:#}"
+    );
+
+    // The group installs the relaunched ranks, which hold the segments the
+    // lost ones held, and serves.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !executor.has_capacity(&id) {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the relaunched group did not become ready"
+        );
+        executor.poll(Duration::from_millis(100))?;
+    }
+    for rank in 0..WORLD_SIZE {
+        let table: Option<ipc::CacheTable> = serde_json::from_slice(&std::fs::read(
+            directory.path().join(format!("2-{rank}.json")),
+        )?)?;
+        assert_eq!(
+            table,
+            Some(ipc::CacheTable {
+                segments: segments.clone(),
+                held: KEPT,
+            }),
+            "relaunched rank {rank}"
+        );
+    }
+    let admission = text_admission(91, 1, 1)?;
+    let batch = token_batch(
+        1,
+        1,
+        admission.request_key,
+        Some(admission),
+        CallId::new(1, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7],
+        UnitId(1),
+        0,
+    );
+    executor.submit(place(batch, &id.0, Vec::new()))?;
+    let served = poll_logical(&mut executor)?.context("the relaunched group did not serve")?;
+    assert_eq!(served.results[0].output.status, CallStatus::Ok);
+    executor.close()?;
+    Ok(())
+}
+
 #[test]
 fn closing_a_group_lets_every_worker_finish_a_collective_teardown() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -5105,12 +5239,14 @@ fn gated_prefill(
 }
 
 /// Environment of a rank process `media_worker` serves: the launch arguments
-/// (JSON), the worker info template (a path), the media case and the path
-/// that receives the published media name.
+/// (JSON), the worker info template (a path), the media case, the path
+/// that receives the published media name, and, in the `planes` case, the
+/// directory that receives the cache table each launch descriptor carried.
 const MEDIA_WORKER_ARGS: &str = "UNISERVE_TEST_MEDIA_WORKER_ARGS";
 const MEDIA_WORKER_INFO: &str = "UNISERVE_TEST_MEDIA_WORKER_INFO";
 const MEDIA_WORKER_CASE: &str = "UNISERVE_TEST_MEDIA_RESPONSE";
 const MEDIA_WORKER_NAME: &str = "UNISERVE_TEST_MEDIA_NAME";
+const MEDIA_WORKER_TABLES: &str = "UNISERVE_TEST_MEDIA_TABLES";
 /// The bytes a `media_worker` process publishes.
 const MEDIA_PAYLOAD: &[u8] = b"generated media content";
 
@@ -5235,6 +5371,14 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 /// the template worker info under its own identity, completes every call it
 /// receives as the stub's prefill of a request's first prompt tokens would,
 /// and attaches the case's media payload to a completion.
+///
+/// In the `planes` case it stands in for a rank whose cache planes split
+/// into segments instead, and attaches no media: it records the cache table
+/// its launch descriptor carried (`<generation>-<rank>.json` under
+/// `MEDIA_WORKER_TABLES`), holds the leading segments the table names, as a
+/// relaunched worker lays its planes out, and answers
+/// `uniserve.release_cache` by giving back the segments from the one it
+/// names, with the count it then holds.
 #[test]
 #[ignore = "runs as a rank process of the media result test"]
 fn media_worker() -> anyhow::Result<()> {
@@ -5275,9 +5419,27 @@ fn media_worker() -> anyhow::Result<()> {
         serde_json::from_slice(&std::fs::read(std::env::var(MEDIA_WORKER_INFO)?)?)?;
     info.endpoint.address_space = format!("rust:{}", std::process::id());
     info.endpoint.incarnation = format!("media-rank-{}-{}", descriptor.rank, std::process::id());
+    let planes = case == "planes";
+    if planes {
+        std::fs::write(
+            Path::new(&std::env::var(MEDIA_WORKER_TABLES)?).join(format!(
+                "{}-{}.json",
+                argument("--generation")?,
+                descriptor.rank
+            )),
+            serde_json::to_vec(&descriptor.segments)?,
+        )?;
+        if let (Some(table), Some(cache)) = (&descriptor.segments, info.prefix_cache.as_mut()) {
+            cache.held_segments = table.held;
+        }
+    }
 
     // Media attaches to rank 1's completion only in "rank-output".
-    let media_rank = u32::from(case == "rank-output");
+    let media_rank = if planes {
+        u32::MAX
+    } else {
+        u32::from(case == "rank-output")
+    };
     loop {
         let request = loop {
             if let Some(request) = server.try_recv::<WorkerRequest>()? {
@@ -5295,6 +5457,25 @@ fn media_worker() -> anyhow::Result<()> {
                 return Ok(());
             }
             WorkerRequest::Promote { message_id } => WorkerResponse::Ok { message_id },
+            WorkerRequest::Hook {
+                message_id,
+                name,
+                payload,
+            } if planes && name == "uniserve.release_cache" => {
+                let payload: serde_json::Value = serde_json::from_str(&payload)?;
+                let from = payload["from"]
+                    .as_u64()
+                    .context("release_cache names no segment")?;
+                let cache = info
+                    .prefix_cache
+                    .as_mut()
+                    .context("the template reports no KV cache")?;
+                cache.held_segments = cache.held_segments.min(u32::try_from(from)?);
+                WorkerResponse::Hooked {
+                    message_id,
+                    result: serde_json::json!({ "held": cache.held_segments }).to_string(),
+                }
+            }
             WorkerRequest::Hook { message_id, .. } => WorkerResponse::Error {
                 message_id,
                 error: ipc::WorkerResponseError {
