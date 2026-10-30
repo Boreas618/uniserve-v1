@@ -215,16 +215,20 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
         .expect("the scheduler parked without an error");
     // The running request published the pages of its prompt and the tokens
     // it generated, which a successor imports; it is the one request handed
-    // over with a state, and held the units its pages took.
+    // over with a state, and held the units its pages took. A page it
+    // published and its own continuation of that page are two entries of
+    // the index over the same units.
     assert!(
         parked.pages.iter().all(|page| !page.units.is_empty()),
         "{parked:?}"
     );
     assert_eq!(parked.requests, 1);
-    assert!(
-        parked.held_units as usize >= parked.pages.len(),
-        "{parked:?}"
-    );
+    let units: std::collections::BTreeSet<_> = parked
+        .pages
+        .iter()
+        .flat_map(|page| page.units.iter().copied())
+        .collect();
+    assert!(parked.held_units as usize >= units.len(), "{parked:?}");
     assert!(handle.resume().recv().unwrap().is_ok());
     handle.shutdown();
     thread.join().unwrap();
