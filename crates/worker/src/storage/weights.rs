@@ -103,8 +103,14 @@ pub(crate) fn model_identity(model: &Handle) -> Result<String> {
 pub(crate) struct Fingerprints {
     /// Tensor shapes and representations, used to find the rank's manifest.
     pub structure: String,
-    /// Each tensor's loading identity, keyed by its library tensor name.
+    /// Each tensor's loading identity, keyed by its library tensor name:
+    /// the tensors this rank's modules hold.
     pub tensors: BTreeMap<String, String>,
+    /// The loading identity of every tensor of the model, whichever ranks
+    /// hold it. Every rank of the model states the same identities, so the
+    /// ranks that receive weights together select the same source fields
+    /// from the weights other worlds retain ([`WeightKeys::sources`]).
+    pub model_tensors: BTreeMap<String, String>,
     /// What determines the weights' values, regardless of the layouts their
     /// bytes take: it keys what forwards compute from them.
     pub values: String,
@@ -170,6 +176,9 @@ fn fingerprint_digest(fingerprint: &str) -> [u8; 32] {
 pub(crate) struct WeightKeys {
     /// The digest of each tensor's own loading inputs and encoding.
     tensors: BTreeMap<String, [u8; 32]>,
+    /// The same digest of every tensor of the model, those of other ranks
+    /// included ([`Fingerprints::model_tensors`]).
+    model_tensors: BTreeMap<String, [u8; 32]>,
     /// The manifest's key: the structure and the rank's position in its
     /// parallel configuration.
     manifest: Key,
@@ -399,12 +408,15 @@ impl WeightKeys {
             digest.update(tensor.as_bytes());
             digest.update(fingerprint_digest(fingerprint));
         }
-        Self {
-            tensors: fingerprints
-                .tensors
+        let digests = |tensors: &BTreeMap<String, String>| {
+            tensors
                 .iter()
-                .map(|(source, fingerprint)| (source.clone(), fingerprint_digest(fingerprint)))
-                .collect(),
+                .map(|(tensor, fingerprint)| (tensor.clone(), fingerprint_digest(fingerprint)))
+                .collect()
+        };
+        Self {
+            tensors: digests(&fingerprints.tensors),
+            model_tensors: digests(&fingerprints.model_tensors),
             manifest: Key(digest.finalize().into()),
             position,
             devices,
@@ -913,6 +925,16 @@ impl WeightKeys {
     /// (`WeightManifest::fingerprints`).
     pub(crate) fn fingerprint_digests(&self) -> BTreeMap<String, String> {
         self.tensors
+            .iter()
+            .map(|(tensor, digest)| (tensor.clone(), hex(digest)))
+            .collect()
+    }
+
+    /// The digest of every tensor of the model, in hex as a manifest
+    /// states them, whichever ranks hold it: what selects the fields of
+    /// other worlds' retained storages a rank of this model may receive.
+    pub(crate) fn model_digests(&self) -> BTreeMap<String, String> {
+        self.model_tensors
             .iter()
             .map(|(tensor, digest)| (tensor.clone(), hex(digest)))
             .collect()

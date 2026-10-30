@@ -4,15 +4,19 @@
 //! world that changes the deployment's parallel configuration, finds the
 //! weights the deployment's other worlds retain on the host's GPUs and on
 //! the GPUs of the deployment's other nodes: every manifest a Storage
-//! Server retains, of this version and of the same fingerprints, names
-//! storages whose chunks lie on the GPUs that hold them
-//! ([`WeightKeys::sources`]). The host's server is listed and read through
-//! the worker's own connection; another node's over TCP as a peer, whose
-//! manifests the worker reads inline (`Request::Read`). The worker plans
-//! the storages its own weights take without reading the checkpoint
-//! ([`WeightKeys::plan`] over an unread model), and the ranks that load
-//! together consume the daemon's copy manifest. Cold starts without such
-//! a plan compute it from the ranks' target layouts ([`WeightKeys::receive`]).
+//! Server retains, of this version, names storages whose chunks lie on the
+//! GPUs that hold them, and their fields of the model's tensors with the
+//! same fingerprints ([`WeightKeys::sources`]). The fingerprints are the
+//! whole model's, not those of the rank's own tensors, so every rank of a
+//! world selects the same source world: the one that the copy manifest of
+//! the ranks that load together was planned from and indexes. The host's
+//! server is listed and read through the worker's own connection; another
+//! node's over TCP as a peer, whose manifests the worker reads inline
+//! (`Request::Read`). The worker plans the storages its own weights take
+//! without reading the checkpoint ([`WeightKeys::plan`] over an unread
+//! model), and the ranks that load together consume the daemon's copy
+//! manifest. Cold starts without such a plan compute it from the ranks'
+//! target layouts ([`WeightKeys::receive`]).
 //!
 //! A manifest's plan weighs every block by the bandwidth of its link, so
 //! each rank first has its host's Transfer Server measure the link from
@@ -87,6 +91,12 @@ impl WeightKeys {
     /// at `peers`), of the same model, which this worker may receive:
     /// `None` when they retain none, or no Transfer Server runs to copy
     /// them. Failure to reach a peer is reported to the caller.
+    ///
+    /// Fields are selected by the fingerprints of every tensor of the model
+    /// ([`WeightKeys::model_digests`]), whichever ranks hold them, so the
+    /// ranks of one world compute one source world from the same listings,
+    /// whatever tensors each of them holds: a copy manifest planned from
+    /// one rank's source world indexes the storages of every other's.
     pub(crate) fn sources(
         &self,
         retained: &Retained,
@@ -97,7 +107,7 @@ impl WeightKeys {
             return Ok(None);
         }
         let deployment = &retained.scope().deployment;
-        let fingerprints = self.fingerprint_digests();
+        let fingerprints = self.model_digests();
         let listing = retained.call("listing the storage server", |client| client.list())?;
         let mut sources =
             manifest::weights::sources(&listing, deployment, worlds, &fingerprints, |key| {
@@ -199,6 +209,18 @@ impl WeightKeys {
         let freed = started.elapsed();
         let rank = agreement.index();
         let Transfer { request, manifest } = match transfer {
+            // The daemon planned the copies from the source world one rank
+            // of this agreement read; they name its ranks and storages by
+            // position. This rank's own reading of the same listings binds
+            // them, so it must hold the same storages in the same order,
+            // only reached from this host ([`Manifest::bind`]); bound to
+            // any other world the copies would read other bytes.
+            Some(transfer) if !transfer.request.source.same_storage(&sources.world) => {
+                return Err(Error::State(
+                    "the retained source weights differ from those the weight \
+                     redistribution plan was made from",
+                ));
+            }
             Some(transfer) => transfer,
             None => {
                 // Cold starts have no daemon redistribution plan. The ranks
