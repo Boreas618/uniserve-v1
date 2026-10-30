@@ -209,6 +209,9 @@ pub(crate) struct Service<'a> {
     /// The engine's channel failed: it closed, or a send or receive on it
     /// did.
     channel_failed: Cell<bool>,
+    /// A fatal error was sent to the engine as the answer to a batch it
+    /// awaited, which fails the rank there.
+    failure_answered: bool,
     /// The Storage Server connection of a parked standby worker, which
     /// promotion takes write access through; `None` once the rank serves.
     standby: Option<Parked>,
@@ -239,6 +242,7 @@ impl<'a> Service<'a> {
             stalled: false,
             probed: Instant::now(),
             channel_failed: Cell::new(false),
+            failure_answered: false,
             standby,
             maintenance,
         }
@@ -255,7 +259,10 @@ impl<'a> Service<'a> {
         let error = match self.serve() {
             Ok(()) => return Ok(Ending::Closed),
             Err(error) if self.channel_failed.get() => error,
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.report_failure(&error);
+                return Err(error);
+            }
         };
         if self.settled() {
             tracing::warn!(
@@ -509,6 +516,7 @@ impl<'a> Service<'a> {
             }
             if matches!(response, WorkerResponse::Error { ref error, .. } if error.fatal) {
                 self.closing = true;
+                self.failure_answered = true;
             }
             return Ok(true);
         }
@@ -587,6 +595,7 @@ impl<'a> Service<'a> {
                     let response = self.error_response(message_id, error.clone())?;
                     self.respond(&response)?;
                     self.channel.flush().map_err(|e| self.channel_error(e))?;
+                    self.failure_answered = true;
                 }
                 return Err(error);
             }
@@ -609,6 +618,33 @@ impl<'a> Service<'a> {
         self.stalled = true;
         self.respond(&WorkerResponse::Stalled { stall })?;
         Ok(None)
+    }
+
+    /// Send the engine the error that ends the rank's serving, unasked,
+    /// unless it already answered a batch the engine awaited.
+    ///
+    /// The rank closes after this, and its close can wait on the builder
+    /// thread, which may stay inside a collective whose peers wait for this
+    /// rank's device work, which never runs once the device context failed.
+    /// The report lets the engine fail the rank's group at once rather than
+    /// when a peer reaches its stall bound. A send that fails leaves the
+    /// engine to notice the closed connection.
+    fn report_failure(&mut self, error: &WorkerError) {
+        if self.failure_answered {
+            return;
+        }
+        let response = WorkerResponse::Error {
+            message_id: None,
+            error: error.response(),
+        };
+        if self
+            .channel
+            .send(&response)
+            .and_then(|()| self.channel.flush())
+            .is_ok()
+        {
+            self.failure_answered = true;
+        }
     }
 
     fn channel_error(&self, error: IpcError) -> WorkerError {
