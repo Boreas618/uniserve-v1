@@ -32,6 +32,14 @@ The request is preempted:
   the change parks the serving world: the park then lands where the paused
   calls end, and the successor continues the request.
 
+SenseNova also loses the serving world's worker while a world change
+prepares its successor beside it, once the successor maps the serving
+world's KV cache segments the shrink kept. The relaunched worker lays its KV
+cache out as the lost one held it, rather than sizing a pool afresh beside
+the successor's storage, so the engine takes it as the lost worker's
+replacement; the change promotes, and once it is rolled back the relaunched
+worker serves the request as the uninterrupted one was served.
+
 Each run has its own cache salt. The test checks that the stream continues
 with two images, the same usage and finish reason, and preserves the image
 completed before preemption:
@@ -476,6 +484,21 @@ def _assert_stored_second_image(log: Path, request_id: str) -> None:
     )
 
 
+def _await_log(log: Path, *texts: str) -> str:
+    """Waits until the server log holds a line containing one of `texts`;
+    returns that text.
+    """  # noqa: D205
+    colors = re.compile(r"\x1b\[[0-9;]*m")
+    deadline = time.monotonic() + scaled(900)
+    while time.monotonic() < deadline:
+        lines = colors.sub("", log.read_text())
+        for text in texts:
+            if text in lines:
+                return text
+        time.sleep(0.5)
+    raise TimeoutError(f"the server logged none of {texts}")
+
+
 def _admin(
     base_url: str, path: str, body: dict | None = None
 ) -> httpx.Response:
@@ -696,3 +719,57 @@ def test_a_preempted_image_request_continues_exactly(
         _assert_stored_second_image(log, changed_stream.request_id)
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
+
+
+@pytest.mark.timeout(scaled(3600))
+def test_a_serving_world_relaunched_beside_its_successor_keeps_its_cache(
+    tmp_path: Path,
+) -> None:
+    setup = SETUPS["sensenova"]
+    checkpoint = _checkpoint(setup)
+    image_start = _image_start(checkpoint, setup)
+    with _serve(tmp_path, setup, checkpoint) as (base_url, log, runtime):
+        reference = _stream(base_url, _request(setup, image_start, "reference"))
+        assert len(reference.images) == 2, reference
+        workers = _workers(runtime)
+        assert len(workers) == 1, workers
+
+        # A world change whose numerics are unchanged; the serving world's
+        # worker is lost once the successor laid out its KV cache beside the
+        # segments the shrink kept, which it maps.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            change = pool.submit(
+                httpx.put,
+                f"{base_url}/admin/config",
+                json={"set": ["worker_config.watchdog_timeout=6m"]},
+                timeout=scaled(3600),
+            )
+            _wait_phase(base_url, change, "prepare")
+            _await_log(log, "laid out a successor world's KV cache")
+            worker = workers[0]
+            subprocess.run(
+                ["ps", "-o", "pid,ppid,args", "--forest", "-p", str(worker)],
+                check=True,
+            )
+            os.kill(worker, signal.SIGKILL)
+            relaunch = _await_log(
+                log,
+                "rank group relaunched with its failure domain",
+                "rank recovery failed",
+            )
+            changed = change.result()
+        assert relaunch == "rank group relaunched with its failure domain"
+        assert changed.status_code == 200, changed.text
+        result = changed.json()["result"]
+        assert result["change"] == "world", result
+        assert result["world"]["numerics"] == "unchanged", result
+
+        # The rollback resumes the serving world, whose relaunched worker
+        # serves the request as the uninterrupted one was served.
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        served = _stream(base_url, _request(setup, image_start, "relaunched"))
+        assert served.images == reference.images
+        assert served.text == reference.text
+        assert served.usage == reference.usage
+        assert served.finish_reasons == reference.finish_reasons

@@ -679,9 +679,16 @@ impl Service<'_> {
     /// - `uniserve.release_cache` (`{"from": segment}`): gives back the
     ///   planes' segments from `segment` on, whose units the engine
     ///   withdrew;
-    /// - `uniserve.restore_cache`: creates them again;
+    /// - `uniserve.restore_cache` (`{"segments": count}`, or empty for
+    ///   all): creates them again;
     /// - `uniserve.sleep`: suspends the graph storage and gives back every
     ///   segment; `uniserve.wake` restores both;
+    ///
+    ///   `uniserve.release_cache`, `uniserve.restore_cache` and
+    ///   `uniserve.wake` answer the leading segments split planes hold after
+    ///   them (`{"held": count}`), which a rank that replaces this one holds
+    ///   (`ipc::CacheTable::held`); a rank without split planes answers
+    ///   `null`;
     /// - `uniserve.host_cache` (`{"tokens": count}`): maps the rank's host
     ///   page pools, each holding the pages of `count` tokens, the count
     ///   the engine sizes the world's host KV cache at, and answers what the
@@ -1109,11 +1116,11 @@ impl Service<'_> {
                     .ok_or_else(|| Error::Invalid("release_cache names no segment".into()))?;
                 // A rank that holds no cache, such as an expert worker, has
                 // none to give back.
-                if let Some(planes) = planes {
+                if let Some(planes) = &planes {
                     planes.release_segments(first, storage)?;
                     renew_graphs()?;
                 }
-                serde_json::Value::Null
+                held_segments(planes.as_ref())
             }
             "uniserve.restore_cache" => {
                 let limit = payload["segments"]
@@ -1121,7 +1128,7 @@ impl Service<'_> {
                     .and_then(|count| u32::try_from(count).ok());
                 restore(planes.as_ref(), storage, limit)?;
                 renew_graphs()?;
-                serde_json::Value::Null
+                held_segments(planes.as_ref())
             }
             "uniserve.adopt_cache" => {
                 // The world's promotion: the predecessor parked, so the
@@ -1217,7 +1224,7 @@ impl Service<'_> {
                     self.maintenance.asleep = false;
                     tracing::info!("the worker woke: its graph storage and cache are restored");
                 }
-                serde_json::Value::Null
+                held_segments(planes.as_ref())
             }
             "uniserve.update_weights" => {
                 let path = payload["model_path"]
@@ -1517,6 +1524,18 @@ fn renew_graphs() -> crate::Result<()> {
             .call_values(&[])?;
     }
     Ok(())
+}
+
+/// The leading segments `planes` hold, as a hook that gives segments back
+/// or creates them again answers them (`{"held": count}`); `null` for a
+/// rank without planes split into segments.
+fn held_segments(planes: Option<&Arc<crate::storage::CachePlanes>>) -> serde_json::Value {
+    match planes {
+        Some(planes) if planes.segments().is_some() => {
+            serde_json::json!({ "held": planes.held_segments() })
+        }
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// Creates the segments `planes` gave back again, through `storage`.
