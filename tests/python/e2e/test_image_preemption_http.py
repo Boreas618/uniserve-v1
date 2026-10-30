@@ -213,6 +213,27 @@ def _workers(runtime: Path) -> list[int]:
     return workers
 
 
+def _kill(runtime: Path, workers: list[int]) -> None:
+    """Lose the serving world's worker: end every process of it at once. A
+    worker started through a wrapper (a sanitizer) runs as a chain of
+    processes, each of which `_workers` finds; the loss ends them all.
+    """  # noqa: D205
+    subprocess.run(
+        [
+            "ps",
+            "-o",
+            "pid,ppid,args",
+            "--forest",
+            "-p",
+            ",".join(map(str, workers)),
+        ],
+        check=True,
+    )
+    assert set(workers) <= set(_workers(runtime)), "the worker already exited"
+    for worker in workers:
+        os.kill(worker, signal.SIGKILL)
+
+
 @contextmanager
 def _serve(
     tmp_path: Path, setup: Setup, model: Path
@@ -655,7 +676,7 @@ def test_a_preempted_image_request_continues_exactly(
         # compute its unfinished image from the request facts.
         arrived = queue.SimpleQueue()
         workers = _workers(runtime)
-        assert len(workers) == 1, workers
+        assert workers, "the serving world's workers"
         before = _settled_media_calls(base_url)
         with ThreadPoolExecutor(max_workers=1) as pool:
             streamed = pool.submit(
@@ -665,13 +686,7 @@ def test_a_preempted_image_request_continues_exactly(
                 arrived,
             )
             _pause_in_second_image(base_url, streamed, arrived, workers, before)
-            worker = workers[0]
-            subprocess.run(
-                ["ps", "-o", "pid,ppid,args", "--forest", "-p", str(worker)],
-                check=True,
-            )
-            assert worker in _workers(runtime), "the worker already exited"
-            os.kill(worker, signal.SIGKILL)
+            _kill(runtime, workers)
             recovered_stream = streamed.result()
         _assert_continued(recovered_stream, reference, 1, setup)
 
@@ -733,7 +748,7 @@ def test_a_serving_world_relaunched_beside_its_successor_keeps_its_cache(
         reference = _stream(base_url, _request(setup, image_start, "reference"))
         assert len(reference.images) == 2, reference
         workers = _workers(runtime)
-        assert len(workers) == 1, workers
+        assert workers, "the serving world's workers"
 
         # A world change whose numerics are unchanged; the serving world's
         # worker is lost once the successor laid out its KV cache beside the
@@ -747,12 +762,7 @@ def test_a_serving_world_relaunched_beside_its_successor_keeps_its_cache(
             )
             _wait_phase(base_url, change, "prepare")
             _await_log(log, "laid out a successor world's KV cache")
-            worker = workers[0]
-            subprocess.run(
-                ["ps", "-o", "pid,ppid,args", "--forest", "-p", str(worker)],
-                check=True,
-            )
-            os.kill(worker, signal.SIGKILL)
+            _kill(runtime, workers)
             relaunch = _await_log(
                 log,
                 "rank group relaunched with its failure domain",
