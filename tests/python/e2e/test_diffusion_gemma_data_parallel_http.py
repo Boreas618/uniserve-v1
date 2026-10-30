@@ -251,18 +251,15 @@ def test_mixed_text_and_image_readouts_complete_across_replicas(served):
 
 
 def test_every_replica_answers_a_seeded_request(served):
-    """One seeded request sent once per replica at the same time.
+    """One seeded request sent once per replica at the same time: each copy
+    is routed while the others are in flight, and every reply is complete.
 
-    Each copy is routed while the others are in flight, so every replica
-    serves one. Independent replicas each serve their copy alone with the
-    same model, so their replies are identical. Expert-parallel replicas
-    take every expert layer in steps together. Their attention and dense
-    computation keeps local shapes, while the shared expert computation
-    receives the group's tokens. Different peer batches can change its
-    floating-point rounding. Each replica must still answer with a complete
-    reply of its own. DWDP keeps local numerical batches independent.
-    """
-    base_url, replicas, topology = served
+    Replies are not compared with each other: replicas serve without a
+    batch-invariant mode, so the batches a copy shares (with a peer copy,
+    or with the expert group's tokens of other replicas) can change its
+    floating-point rounding and, through a near tie, its wording.
+    """  # noqa: D205
+    base_url, replicas, _ = served
     body = {
         "model": SERVED_MODEL,
         "messages": [
@@ -289,8 +286,3 @@ def test_every_replica_answers_a_seeded_request(served):
         assert choice["message"]["content"].strip()
         assert choice["finish_reason"] in ("stop", "length")
         assert 0 < reply["usage"]["completion_tokens"] <= 256
-    if topology in {"replicas", "dwdp"}:
-        first = replies[0]
-        for reply in replies[1:]:
-            assert reply["choices"] == first["choices"]
-            assert reply["usage"] == first["usage"]
