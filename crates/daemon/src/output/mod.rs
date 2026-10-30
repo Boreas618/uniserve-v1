@@ -403,63 +403,111 @@ mod tests {
         );
     }
 
-    /// A completed image is held back and published immediately before the
-    /// next text token (or the terminal event), so it stays ordered ahead of
-    /// that token.
+    /// The engine events of image `image_id`, denoised in one step.
+    fn image_events(image_id: u32) -> [Event; 4] {
+        [
+            Event::ImageBegin {
+                image_id,
+                height: 1,
+                width: 1,
+                steps: 1,
+            },
+            Event::ImageStep { image_id, step: 1 },
+            Event::ImageCommit { image_id },
+            Event::ImageDone {
+                image_id,
+                height: 1,
+                width: 1,
+                bytes: 3,
+                pixels_png_b64: "cG5n".to_string(),
+                feedback: None,
+            },
+        ]
+    }
+
+    /// The next output of `outputs`, which the events sent so far must
+    /// produce: a stream that holds it back fails the test instead of
+    /// hanging it.
+    async fn next_output(outputs: &mut RequestOutputStream) -> RequestOutput {
+        tokio::time::timeout(std::time::Duration::from_secs(10), outputs.next())
+            .await
+            .expect("the events sent so far produce the next output")
+            .expect("the stream goes on")
+            .expect("the output is processed")
+    }
+
+    /// A completed image is published when the engine reports it, after the
+    /// text decoded before it: neither the request's next image, nor its
+    /// next text token, nor its end has to arrive first.
     #[tokio::test]
-    async fn an_image_is_published_with_its_next_text_token() {
+    async fn an_image_is_published_when_it_completes() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
         .unwrap();
-        let outputs = output(
+        tx.send(text_token(b'a')).unwrap();
+        let mut outputs = output(
             ChatOutputProcessor::default(),
             TextDecodeOptions::default(),
             false,
             RequestEvents::detached(rx),
         );
-        tokio::pin!(outputs);
-        assert!(matches!(
-            outputs.next().await,
-            Some(Ok(RequestOutput::Accepted(_)))
-        ));
-        assert!(matches!(
-            outputs.next().await,
-            Some(Ok(RequestOutput::Scheduled { .. }))
-        ));
 
-        tx.send(text_token(b'a')).unwrap();
-        while !matches!(
-            outputs.next().await,
-            Some(Ok(RequestOutput::TokenDelta { .. }))
-        ) {}
+        // The outputs through the token metadata of the text before the
+        // first image.
+        let mut before = Vec::new();
+        loop {
+            match next_output(&mut outputs).await {
+                RequestOutput::TokenDelta { .. } => break,
+                output => before.push(Ok(output)),
+            }
+        }
+        assert_eq!(text(&before), "a");
 
-        tx.send(Event::ImageCommit { image_id: 0 }).unwrap();
-        tx.send(Event::ImageDone {
-            image_id: 0,
-            height: 1,
-            width: 1,
-            bytes: 3,
-            pixels_png_b64: "cG5n".to_string(),
-            feedback: None,
-        })
-        .unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), outputs.next())
-                .await
-                .is_err(),
-            "the image became public before a continuation token arrived"
-        );
+        // Each image is published before the engine reports anything after
+        // it: the first before the second begins, the second before the
+        // text after it and the end of the request.
+        for image_id in [0, 1] {
+            for event in image_events(image_id) {
+                tx.send(event).unwrap();
+            }
+            let step = next_output(&mut outputs).await;
+            assert!(
+                matches!(step, RequestOutput::ImageStep { image_id: id } if id == image_id),
+                "{step:?}"
+            );
+            let done = next_output(&mut outputs).await;
+            assert!(
+                matches!(
+                    &done,
+                    RequestOutput::ImageDone(GeneratedImage { image_id: id, .. })
+                        if *id == image_id
+                ),
+                "{done:?}"
+            );
+        }
 
         tx.send(text_token(b'b')).unwrap();
-        assert!(matches!(
-            outputs.next().await,
-            Some(Ok(RequestOutput::ImageDone(GeneratedImage {
-                image_id: 0,
-                ..
-            })))
-        ));
+        tx.send(finished(proto::request::FinishReason::MaxTokens, 2))
+            .unwrap();
+        let after = outputs.collect::<Vec<_>>().await;
+        assert_eq!(text(&after), "b");
+        assert!(
+            matches!(
+                after.last(),
+                Some(Ok(RequestOutput::Finished {
+                    reason: FinishReason::Length,
+                    usage: RequestUsage {
+                        image_count: 2,
+                        image_steps: 2,
+                        ..
+                    },
+                }))
+            ),
+            "{:?}",
+            after.last()
+        );
     }
 }

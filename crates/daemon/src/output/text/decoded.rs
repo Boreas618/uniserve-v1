@@ -115,9 +115,9 @@ pub enum DecodedTextEvent {
         /// Per-position candidate log-probabilities, when requested.
         logprobs: Option<DecodedLogprobs>,
     },
-    /// An image event. A completed image is held until the next generated
-    /// token or the end of the request, so it stays ordered ahead of the
-    /// text that follows it.
+    /// An image event, yielded when the engine reports it: a completed
+    /// image follows the text decoded before it and reaches the client
+    /// while the request goes on, ahead of its later tokens and images.
     Image(ImageEvent),
     /// The request finished.
     Done(Finished),
@@ -158,9 +158,6 @@ struct DecodeState<'a> {
     /// Generated token awaiting its `TokenLogprobs` event when generated
     /// logprobs are requested.
     pending_token: Option<u32>,
-    /// Completed images held until the next generated token or the end of
-    /// the request.
-    pending_images: Vec<GeneratedImage>,
     /// Generated text tokens consumed by the decoder.
     output_tokens: usize,
 }
@@ -226,14 +223,6 @@ impl DecodeState<'_> {
         }
     }
 
-    /// Yields the held completed images in arrival order.
-    async fn flush_images(&mut self, y: &mut TryYielder<DecodedTextEvent, Error>) {
-        for image in self.pending_images.drain(..) {
-            y.yield_ok(DecodedTextEvent::Image(ImageEvent::Done(image)))
-                .await;
-        }
-    }
-
     /// Decodes committed tokens in order and applies stop-string holdback.
     ///
     /// `token_ids` are the tokens of one engine output event and `positions`
@@ -253,8 +242,6 @@ impl DecodeState<'_> {
         raw_stream: &mut RequestEvents,
         y: &mut TryYielder<DecodedTextEvent, Error>,
     ) -> Result<bool, Error> {
-        // Images completed before these tokens stay ordered ahead of them.
-        self.flush_images(y).await;
         let decoded_logprobs = (!positions.is_empty())
             .then(|| decode_logprobs(tokenizer, &positions, self.options.skip_special_tokens))
             .transpose()?;
@@ -388,7 +375,6 @@ pub async fn decoded_text_event_stream(
         scheduled: None,
         started: false,
         pending_token: None,
-        pending_images: Vec::new(),
         output_tokens: 0,
     };
 
@@ -554,14 +540,19 @@ pub async fn decoded_text_event_stream(
                 pixels_png_b64,
                 ..
             } => {
+                // Published at once, after the text decoded before it: the
+                // request may generate for long before its next text token,
+                // such as a whole next image, which opens with a control
+                // token and publishes no text.
                 state.ensure_output_ready(&request_id, "a completed image")?;
-                state.pending_images.push(GeneratedImage {
+                y.yield_ok(DecodedTextEvent::Image(ImageEvent::Done(GeneratedImage {
                     image_id,
                     width,
                     height,
                     bytes,
                     png_base64: pixels_png_b64,
-                });
+                })))
+                .await;
             }
             // A terminal event flushes decoder holdback only after every pending
             // token/logprob pair and all prompt metadata have resolved.
@@ -582,7 +573,6 @@ pub async fn decoded_text_event_stream(
                     )
                     .await?;
                 state.ensure_output_ready(&request_id, "the terminal event")?;
-                state.flush_images(&mut y).await;
                 let Some(reason) = FinishReason::from_engine(reason, stop_reason) else {
                     y.yield_ok(DecodedTextEvent::Failed {
                         message: "engine execution failed".to_owned(),
@@ -624,7 +614,6 @@ pub async fn decoded_text_event_stream(
                 return Ok(());
             }
             Event::Error { message } | Event::ArtifactUnavailable { message } => {
-                state.flush_images(&mut y).await;
                 y.yield_ok(DecodedTextEvent::Failed { message }).await;
                 return Ok(());
             }
