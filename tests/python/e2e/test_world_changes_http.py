@@ -70,7 +70,6 @@ import contextlib
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -78,7 +77,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -90,6 +89,7 @@ from tests.python.e2e.http_helpers import (
     dedicated_experts,
     find_free_port,
     require_uniserve_binary,
+    second_host,
     server_process,
     worker_executable,
 )
@@ -2179,140 +2179,8 @@ def test_a_parallel_configuration_change_continues_a_streaming_request(
 FOLLOWER = os.environ.get("UNISERVE_FOLLOWER")
 FOLLOWER_DEVICES = os.environ.get("UNISERVE_FOLLOWER_DEVICES", "0,1,2,3")
 LEADER_ADDRESS = os.environ.get("UNISERVE_LEADER_ADDRESS")
-# What the leader logs while it awaits the nodes below `--nnodes`, and once
-# a node joined it.
-AWAITING = "awaiting the deployment's other nodes"
+# What the leader logs once a node joined it.
 JOINED = "a node joined"
-
-
-def _remote(command: str, timeout: float = 120) -> str:
-    """Runs `command` on the second host; returns its output."""
-    assert FOLLOWER is not None
-    done = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", FOLLOWER, command],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=True,
-    )
-    return done.stdout
-
-
-# Stops the Storage Server serving the socket given as its argument, found
-# by its command line, as `_stop_storage_server` does on this host.
-STOP_STORAGE = """
-import os
-import signal
-import sys
-
-for entry in os.listdir("/proc"):
-    if not entry.isdigit():
-        continue
-    try:
-        command = open(f"/proc/{entry}/cmdline", "rb").read().split(b"\\0")
-    except OSError:
-        continue
-    if b"serve" in command and sys.argv[1].encode() in command:
-        os.kill(int(entry), signal.SIGTERM)
-"""
-
-
-@contextmanager
-def _follower(
-    log: Path,
-    address: str,
-    env: dict[str, str],
-    leader_log: Path | None = None,
-) -> Iterator[Callable[[], None]]:
-    """The second host's daemon, joining the leader at `address` with the
-    variables `env` beside the test's environment: started once
-    `leader_log` shows the leader awaits it, or when the test calls the
-    callable it yields. On exit, which follows the leader's, it waits
-    until the daemon ended, which it does when the leader's connection
-    closes, and stops the Storage Server the daemon started.
-    """  # noqa: D205
-    runtime = f"/tmp/uniserve-follower-{os.getpid()}-{find_free_port()}"
-    variables = {
-        name: os.environ.get(name, "")
-        for name in (
-            "PATH",
-            "LD_LIBRARY_PATH",
-            "PYTHONPATH",
-            "MAX_JOBS",
-            "FLASHINFER_WORKSPACE_BASE",
-            "UCX_NET_DEVICES",
-        )
-    }
-    variables.update(env)
-    variables.update(
-        {
-            "CUDA_VISIBLE_DEVICES": FOLLOWER_DEVICES,
-            "XDG_RUNTIME_DIR": runtime,
-        }
-    )
-    environment = " ".join(
-        f"{name}={shlex.quote(value)}" for name, value in variables.items()
-    )
-    launcher = os.environ.get("UNISERVE_FOLLOWER_LAUNCHER")
-    command_prefix = f"{shlex.quote(launcher)} " if launcher else ""
-    remote = (
-        f"mkdir -m 700 {runtime} && cd {shlex.quote(str(Path.cwd()))} && "
-        f"echo follower pid $$ && exec env {environment} "
-        f"{command_prefix}{shlex.quote(str(require_uniserve_binary()))} "
-        "serve --nnodes 2 "
-        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
-        f"--worker-executable {shlex.quote(str(worker_executable()))}"
-    )
-    started: list[subprocess.Popen[str]] = []
-    leaving = threading.Event()
-
-    def start() -> None:
-        if not started:
-            started.append(
-                subprocess.Popen(
-                    ["ssh", "-o", "BatchMode=yes", FOLLOWER, remote],
-                    stdout=log.open("w", encoding="utf-8"),
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-            )
-
-    def start_when_awaited() -> None:
-        while not leaving.is_set():
-            if (
-                leader_log is not None
-                and leader_log.exists()
-                and AWAITING in (leader_log.read_text(errors="replace"))
-            ):
-                start()
-                return
-            time.sleep(1)
-
-    starter = threading.Thread(target=start_when_awaited, daemon=True)
-    if leader_log is not None:
-        starter.start()
-    try:
-        yield start
-    finally:
-        leaving.set()
-        if leader_log is not None:
-            starter.join()
-        for process in started:
-            try:
-                process.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                pid = log.read_text().split("follower pid ")[1].split()[0]
-                _remote(f"kill {pid}")
-                process.wait(timeout=120)
-                pytest.fail("the follower daemon outlived its leader")
-        if started:
-            socket = f"{runtime}/uniserve/storage.sock"
-            kept = shlex.quote(str(log.with_suffix(".storage.log")))
-            _remote(
-                f"python3 -c {shlex.quote(STOP_STORAGE)} {socket}; "
-                f"cp {runtime}/uniserve/storage-server.log {kept} 2>/dev/null; "
-                f"rm -rf {runtime}"
-            )
 
 
 def _two_host_options(address: str, nnodes: int) -> tuple[str, ...]:
@@ -2424,7 +2292,13 @@ def test_a_change_across_hosts_continues_a_streaming_request(
     with contextlib.ExitStack() as stack:
         # The follower's daemon ends after the leader's.
         join = stack.enter_context(
-            _follower(changed_path / "follower.log", address, environment)
+            second_host(
+                FOLLOWER,
+                changed_path / "follower.log",
+                address,
+                devices=FOLLOWER_DEVICES,
+                env=environment,
+            )
         )
         base_url, log = stack.enter_context(
             _serve(
@@ -2503,10 +2377,12 @@ def test_a_change_across_hosts_continues_a_streaming_request(
     address = f"{LEADER_ADDRESS}:{find_free_port()}"
     with contextlib.ExitStack() as stack:
         stack.enter_context(
-            _follower(
+            second_host(
+                FOLLOWER,
                 direct_path / "follower.log",
                 address,
-                environment,
+                devices=FOLLOWER_DEVICES,
+                env=environment,
                 leader_log=direct_path / "server.log",
             )
         )
