@@ -739,8 +739,9 @@ class Layout:
         default_factory=list
     )
     # Bytes freed into the torch allocator cache since it last returned
-    # storage to the driver.
+    # storage to the driver, and the storages published so far.
     _cached: int = 0
+    _published: int = 0
     # The entries of host-streamed matrices, by parameter identity.
     _host: dict[int, _Entry] = field(default_factory=dict)
 
@@ -995,8 +996,9 @@ class Layout:
         field keeps its tensor object, so every module that holds it reads
         the retained bytes. The loaded storage returns to the driver with
         the allocator cache once the cache holds ``_RELEASE_BYTES``, and
-        after the last storage, so the next retained chunks can take its
-        device storage; the copies have then completed.
+        once every storage is published (in any order of ``index``), so the
+        next retained chunks can take its device storage; the copies have
+        then completed.
         """
         storage = self._storages[index]
         size = storage.nbytes()
@@ -1023,7 +1025,10 @@ class Layout:
         del source
         self._storages[index] = torch.UntypedStorage(0)
         self._cached += size
-        if self._cached >= _RELEASE_BYTES or index == len(self._storages) - 1:
+        self._published += 1
+        if self._cached >= _RELEASE_BYTES or self._published == len(
+            self._storages
+        ):
             torch.cuda.current_stream(device).synchronize()
             torch.cuda.empty_cache()
             self._cached = 0

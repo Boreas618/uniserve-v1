@@ -42,7 +42,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
-use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
@@ -806,6 +805,12 @@ impl WeightKeys {
     /// Allocate `retained_storages` and move the loaded bytes `layout`
     /// describes into them: a chunk of `existing` (by key and location) is
     /// mapped read-only, every other chunk created and written.
+    ///
+    /// One retained storage at a time: its chunks are created, the torch
+    /// storages placed in it are copied in and returned to the driver, and
+    /// only then the next one's chunks are created. The device therefore
+    /// holds the loaded weights plus one retained storage at the peak, not
+    /// both copies of every weight.
     fn materialize(
         &self,
         layout: Handle,
@@ -816,12 +821,11 @@ impl WeightKeys {
         existing: HashMap<(Key, Placement), OwnedFd>,
     ) -> Result<Published> {
         let method = |name: &str| Interpreter::import(&format!("{RETAINED}.Layout.{name}"));
+        let publish = method("publish")?;
         let mut storages = Vec::with_capacity(retained_storages.len());
         let mut created = Vec::new();
         let mut shared = Vec::new();
-        // The byte ranges of each retained storage the worker writes.
-        let mut written: Vec<Vec<Range<u64>>> = Vec::with_capacity(retained_storages.len());
-        for retained_storage in &retained_storages {
+        for (retained_index, retained_storage) in retained_storages.iter().enumerate() {
             let (device, gpu) = self.device(retained_storage.device.unwrap_or(0))?;
             let location = Placement::Device { gpu };
             let chunks = &retained_storage.storage.chunks;
@@ -856,39 +860,40 @@ impl WeightKeys {
                 ));
                 ranges.push(chunk.offset..chunk.offset + chunk.length);
             }
-            storages.push(storage);
-            written.push(ranges);
-        }
 
-        // Copy each torch storage's bytes into the chunks the worker
-        // created; the chunks it maps hold them already.
-        let publish = method("publish")?;
-        let views = storages
-            .iter()
-            .map(|storage| StorageView::whole(Arc::clone(storage) as Arc<dyn Backing>, DType::U8))
-            .collect::<Result<Vec<_>>>()?;
-        for (index, &(storage, offset)) in placed.iter().enumerate() {
-            let size = sizes[index] as u64;
-            // The created chunks' bytes of this torch storage, relative to
-            // its start, one range per chunk.
-            let ranges: Vec<i64> = written[storage]
+            // Copy the bytes of each torch storage placed here into the
+            // chunks the worker created (the chunks it maps hold them
+            // already); publishing returns the loaded storage to the driver
+            // before the next retained storage's chunks are created.
+            let view = StorageView::whole(Arc::clone(&storage) as Arc<dyn Backing>, DType::U8)?;
+            for (index, &(_, offset)) in placed
                 .iter()
-                .filter_map(|range| {
-                    let start = range.start.max(offset);
-                    let end = range.end.min(offset + size);
-                    (start < end).then(|| [(start - offset) as i64, (end - offset) as i64])
-                })
-                .flatten()
-                .collect();
-            publish.call_values(&[
-                layout.to_any(),
-                Any::from(index as i64),
-                views[storage].handle()?.to_any(),
-                Any::from(offset as i64),
-                Any::from(integer_list(ranges)),
-            ])?;
+                .enumerate()
+                .filter(|(_, (storage, _))| *storage == retained_index)
+            {
+                let size = sizes[index] as u64;
+                // The created chunks' bytes of this torch storage, relative
+                // to its start, one range per chunk.
+                let written: Vec<i64> = ranges
+                    .iter()
+                    .filter_map(|range| {
+                        let start = range.start.max(offset);
+                        let end = range.end.min(offset + size);
+                        (start < end).then(|| [(start - offset) as i64, (end - offset) as i64])
+                    })
+                    .flatten()
+                    .collect();
+                publish.call_values(&[
+                    layout.to_any(),
+                    Any::from(index as i64),
+                    view.handle()?.to_any(),
+                    Any::from(offset as i64),
+                    Any::from(integer_list(written)),
+                ])?;
+            }
+            drop(view);
+            storages.push(storage);
         }
-        drop(views);
         Ok(Published {
             keys: self.clone(),
             layout,
