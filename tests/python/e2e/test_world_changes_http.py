@@ -2248,7 +2248,6 @@ def _follower(
         {
             "CUDA_VISIBLE_DEVICES": FOLLOWER_DEVICES,
             "XDG_RUNTIME_DIR": runtime,
-            "NCCL_NVLS_ENABLE": "0",
         }
     )
     environment = " ".join(
@@ -2402,8 +2401,6 @@ def test_a_change_across_hosts_continues_a_streaming_request(
     source, assignments, target, moved_to, ranks = HOST_CHANGES[change]
     name = "qwen3-host-change"
     environment = _plugin(tmp_path / "plugins", "digest", DIGEST_PLUGIN)
-    # NVLink SHARP is off across hosts, as in the two-host deployments.
-    environment["NCCL_NVLS_ENABLE"] = "0"
     # The GPUs of this host gpu-any.sh granted, as many as the first
     # world's ranks.
     devices = _four_devices() if ranks == 4 else _device()
