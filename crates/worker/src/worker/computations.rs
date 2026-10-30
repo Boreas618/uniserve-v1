@@ -124,17 +124,22 @@ pub(crate) fn page_settings(
     let Some(cache) = cache.filter(|_| holds && config.role != "experts") else {
         return Ok(None);
     };
+    // Each group's shape as its readers stage it (the state group reads a
+    // one-page window), and whether its pages hold state checkpoints, which
+    // warmup's rows share (`PrefixCache::install_scratch`).
     let groups: Vec<serde_json::Value> = cache
-        .group_shapes()?
+        .groups
         .iter()
-        .map(|shape| {
-            serde_json::json!({
+        .map(|group| {
+            let shape = group.shape()?;
+            Ok(serde_json::json!({
                 "block_size": shape.block_size,
                 "units_per_page": shape.units_per_page,
                 "window": shape.window,
-            })
+                "state": group.state,
+            }))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let union = launch.expert_parallel.as_ref();
     Ok(Some(serde_json::json!({
         "max_batch_calls": config.max_batch_calls,

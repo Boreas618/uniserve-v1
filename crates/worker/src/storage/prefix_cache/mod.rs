@@ -769,38 +769,84 @@ impl PrefixCache {
     /// the tables installed. A startup forward over them stages its rows
     /// from the resident tables, as serving does, so what a graph is
     /// captured over is what serving stages.
+    ///
+    /// Each row holds whole pages of its own in every K/V group, at least
+    /// one. The rows share the state groups' pages, as many as the longest
+    /// row takes: a state page holds every recurrent layer's checkpoint, so
+    /// a page per row would make the scratch, and the writable head the
+    /// capacity plan reserves for it, the batch size times every layer's
+    /// state. Warmup discards what its rows compute, so a row may overwrite
+    /// another's checkpoints, as padding rows share the sentinel when
+    /// serving. `uniserve.executor.Executor.manifest` sizes the head by the
+    /// same rule.
     pub(crate) fn install_scratch(
         &mut self,
         lengths: &[usize],
         stream: impl Issue,
     ) -> Result<ScratchUnits> {
-        let shapes = self.plan().group_shapes()?;
-        // Whole pages of every group for each row, at least one.
-        let units_of = |length: usize| -> usize {
-            shapes
+        // Each group's (state, tokens per page, units per page).
+        let groups: Vec<(bool, usize, usize)> = self
+            .plan()
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.state,
+                    group.block_size as usize,
+                    group.units_per_page as usize,
+                )
+            })
+            .collect();
+        let pages = |block: usize, length: usize| length.max(1).div_ceil(block);
+
+        let shared: usize = lengths.iter().max().map_or(0, |&longest| {
+            groups
                 .iter()
-                .map(|shape| {
-                    length.max(1).div_ceil(shape.block_size as usize)
-                        * shape.units_per_page as usize
-                })
+                .filter(|(state, _, _)| *state)
+                .map(|&(_, block, units)| pages(block, longest) * units)
                 .sum()
-        };
-        let count: usize = lengths.iter().map(|&length| units_of(length)).sum();
-        let scratch = self.scratch_units(count as u32, stream)?;
+        });
+        let own: usize = lengths
+            .iter()
+            .map(|&length| {
+                groups
+                    .iter()
+                    .filter(|(state, _, _)| !*state)
+                    .map(|&(_, block, units)| pages(block, length) * units)
+                    .sum::<usize>()
+            })
+            .sum();
+        let scratch = self.scratch_units((shared + own) as u32, stream)?;
+
+        // The state groups' shared pages come first, then each row's own.
         let mut unit = *scratch.units().start();
+        let mut shared_from = vec![0; groups.len()];
+        if let Some(&longest) = lengths.iter().max() {
+            for (group, &(state, block, units)) in groups.iter().enumerate() {
+                if state {
+                    shared_from[group] = unit;
+                    unit += (pages(block, longest) * units) as u32;
+                }
+            }
+        }
         let mut tables = Vec::new();
         for (row, &length) in lengths.iter().enumerate() {
-            for (group, shape) in shapes.iter().enumerate() {
-                let pages = length.max(1).div_ceil(shape.block_size as usize);
-                let units = pages * shape.units_per_page as usize;
+            for (group, &(state, block, units_per_page)) in groups.iter().enumerate() {
+                let count = pages(block, length);
+                let units = (count * units_per_page) as u32;
+                let first = if state {
+                    shared_from[group]
+                } else {
+                    unit += units;
+                    unit - units
+                };
                 tables.push(BlockTable {
                     request_pool_idx: row as u32 + 1,
                     group_id: group as u32,
                     start_page: 0,
-                    unit_ids: (unit..unit + units as u32).map(ipc::UnitId).collect(),
-                    allocated_tokens: (pages * shape.block_size as usize) as u32,
+                    unit_ids: (first..first + units).map(ipc::UnitId).collect(),
+                    allocated_tokens: (count * block) as u32,
                 });
-                unit += units as u32;
             }
         }
         self.install(&tables, stream)?;

@@ -661,18 +661,8 @@ class Executor:
             if self._image is not None:
                 lengths.extend(manifest["image"]["warmup_lengths"])
             groups = self._settings["pages"]["cache_groups"]
-            # Each warmup phase lends whole pages per scratch table. Phases
-            # run serially, so the largest footprint is the writable head.
             warmup_units = max(
-                (
-                    sum(
-                        -(-max(length, 1) // group["block_size"])
-                        * group["units_per_page"]
-                        for length in phase
-                        for group in groups
-                    )
-                    for phase in lengths
-                ),
+                (_scratch_units(phase, groups) for phase in lengths),
                 default=0,
             )
             manifest["pages"] = {
@@ -1076,6 +1066,36 @@ def _computation_bindings(
             )
         )
     return tuple(entries)
+
+
+def _scratch_units(
+    lengths: Sequence[int], groups: Sequence[Mapping[str, Any]]
+) -> int:
+    """Pool units one warmup phase of rows of ``lengths`` tokens borrows.
+
+    Each row takes whole pages of its own in every K/V group, at least one;
+    the rows share the state groups' pages, as many as the longest row takes
+    (the worker's ``PrefixCache::install_scratch``): a state page holds every
+    recurrent layer's checkpoint, and warmup discards what its rows compute.
+    Phases run serially, so the largest phase's units are the writable head.
+    """
+    if not lengths:
+        return 0
+
+    def units(length: int, group: Mapping[str, Any]) -> int:
+        pages = -(-max(length, 1) // int(group["block_size"]))
+        return pages * int(group["units_per_page"])
+
+    own = sum(
+        units(length, group)
+        for length in lengths
+        for group in groups
+        if not group["state"]
+    )
+    shared = sum(
+        units(max(lengths), group) for group in groups if group["state"]
+    )
+    return own + shared
 
 
 def _holds(settings: Mapping[str, Any], capability: str) -> bool:

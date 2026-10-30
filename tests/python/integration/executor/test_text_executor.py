@@ -137,7 +137,12 @@ def _settings(graphs: bool, media: bool) -> dict:
             "prefill_graph_token_sizes": [16, 32],
             "prefill_outputs": True,
             "cache_groups": [
-                {"block_size": PAGE, "units_per_page": 1, "window": None}
+                {
+                    "block_size": PAGE,
+                    "units_per_page": 1,
+                    "window": None,
+                    "state": False,
+                }
             ],
             "image_processor": media,
             "media_axes": 1 if media else None,
