@@ -15,11 +15,15 @@
 //! - What the processes book themselves ([`Request::Book`]), which the server
 //!   cannot see: a worker's graph pool, process storage and staging under its
 //!   scope and world; the Transfer Server's staging, and its CUDA context
-//!   while it holds the context on the GPU, in every ledger of the GPU. A
-//!   booking lives as long as its process's connection, since the process's
-//!   storage ends with the process. The processes of one scope and world
-//!   serve in turn (a rank and the relaunch or standby that replaces it), so
-//!   the largest of their bookings of an item counts.
+//!   while it holds the context on the GPU, in every ledger of the GPU. The
+//!   processes of one scope and world serve in turn (a rank and the
+//!   relaunch or standby that replaces it), so the largest of their bookings
+//!   of an item counts. A worker that ends in order withdraws its bookings
+//!   first; a worker's process that is lost leaves them reserved for the
+//!   process that replaces it, which takes each item over as it books it,
+//!   so a successor world cannot take a lost rank's storage before its
+//!   relaunch does. The reservation ends with its world's retirement or the
+//!   deployment. The Transfer Server's bookings end with its connection.
 //!
 //! The quota of a deployment's ledger is `⌊total × fraction⌋` of the whole
 //! GPU, which its workers state with their bookings; while two worlds that
@@ -49,12 +53,14 @@ pub(crate) enum Booker {
     Transfer,
 }
 
+/// Bytes per GPU and item; an item booked at 0 is absent.
+pub(crate) type ItemBytes = BTreeMap<([u8; 16], Item), u64>;
+
 /// One process's bookings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Booking {
     pub(crate) booker: Booker,
-    /// Bytes per GPU and item; an item booked at 0 is absent.
-    pub(crate) items: BTreeMap<([u8; 16], Item), u64>,
+    pub(crate) items: ItemBytes,
 }
 
 /// One retained device storage as the ledgers see it: its record, whether
@@ -79,6 +85,11 @@ pub(crate) struct Ledgers {
     quotas: BTreeMap<(String, [u8; 16], u64), u64>,
     /// The bookings of each connected process.
     bookings: BTreeMap<ClientId, Booking>,
+    /// The bookings of each scope and world whose worker's process was lost,
+    /// per GPU and item, until a process of the scope and world books the
+    /// item again or the world retires.
+    #[serde(default)]
+    reserved: BTreeMap<(Scope, u64), ItemBytes>,
 }
 
 /// An entry's identity within a ledger, under which its bytes add up.
@@ -104,6 +115,18 @@ impl Ledgers {
             self.quotas
                 .insert((scope.deployment.clone(), gpu, *world), quota);
         }
+        // A process of a scope and world takes each item it books over from
+        // the reservation its lost predecessor left.
+        if let Booker::Worker { scope, world } = &booker
+            && let Some(reserved) = self.reserved.get_mut(&(scope.clone(), *world))
+        {
+            for &(item, _) in items {
+                reserved.remove(&(gpu, item));
+            }
+            if reserved.is_empty() {
+                self.reserved.remove(&(scope.clone(), *world));
+            }
+        }
         let booking = self.bookings.entry(client).or_insert_with(|| Booking {
             booker,
             items: BTreeMap::new(),
@@ -118,20 +141,59 @@ impl Ledgers {
         before
     }
 
-    /// The bookings of `client` end: its process is gone.
+    /// The connection of `client` ends: its process is gone. A worker's
+    /// remaining bookings that no other process of its scope and world
+    /// books (one that ended in order withdrew them first) stay reserved
+    /// for the process that replaces it; the Transfer Server's end.
     pub(crate) fn disconnect(&mut self, client: ClientId) {
-        self.bookings.remove(&client);
+        let Some(Booking {
+            booker: Booker::Worker { scope, world },
+            items,
+        }) = self.bookings.remove(&client)
+        else {
+            return;
+        };
+        let served: BTreeSet<([u8; 16], Item)> = self
+            .bookings
+            .values()
+            .filter(|booking| match &booking.booker {
+                Booker::Worker {
+                    scope: of,
+                    world: at,
+                } => *of == scope && *at == world,
+                Booker::Transfer => false,
+            })
+            .flat_map(|booking| booking.items.keys().copied())
+            .collect();
+        let lost: Vec<_> = items
+            .into_iter()
+            .filter(|(key, _)| !served.contains(key))
+            .collect();
+        if lost.is_empty() {
+            return;
+        }
+        let reserved = self.reserved.entry((scope, world)).or_default();
+        for (key, bytes) in lost {
+            let counted = reserved.entry(key).or_default();
+            *counted = (*counted).max(bytes);
+        }
     }
 
-    /// The quotas the worlds of `retired` stated end with their storage.
+    /// The quotas the worlds of `retired` stated, and the bookings reserved
+    /// for their lost processes, end with their storage.
     pub(crate) fn retire(&mut self, deployment: &str, retired: &BTreeSet<u64>) {
         self.quotas
             .retain(|(of, _, world), _| of != deployment || !retired.contains(world));
+        self.reserved
+            .retain(|(scope, world), _| scope.deployment != deployment || !retired.contains(world));
     }
 
-    /// Every quota of `deployment` ends: it is no longer served.
+    /// Every quota and reservation of `deployment` ends: it is no longer
+    /// served.
     pub(crate) fn release(&mut self, deployment: &str) {
         self.quotas.retain(|(of, _, _), _| of != deployment);
+        self.reserved
+            .retain(|(scope, _), _| scope.deployment != deployment);
     }
 
     /// The ledgers of the GPUs `gpus` admits and the deployments `deployment`
@@ -198,9 +260,25 @@ impl Ledgers {
         }
 
         // Each worker's booking, the largest of its scope and world's
-        // processes; the Transfer Server's, the largest of its processes.
+        // processes and of what a lost process of theirs reserved; the
+        // Transfer Server's, the largest of its processes.
         let mut workers: BTreeMap<(String, [u8; 16], EntryKey), u64> = BTreeMap::new();
         let mut transfer: BTreeMap<([u8; 16], Item), u64> = BTreeMap::new();
+        for ((scope, world), items) in &self.reserved {
+            if !deployment(&scope.deployment) {
+                continue;
+            }
+            for (&(gpu, item), &bytes) in items {
+                if !gpus(&gpu) {
+                    continue;
+                }
+                let key = (item, Some(scope.clone()), vec![*world], None);
+                let counted = workers
+                    .entry((scope.deployment.clone(), gpu, key))
+                    .or_default();
+                *counted = (*counted).max(bytes);
+            }
+        }
         for booking in self.bookings.values() {
             for (&(gpu, item), &bytes) in &booking.items {
                 if !gpus(&gpu) {

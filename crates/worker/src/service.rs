@@ -257,7 +257,10 @@ impl<'a> Service<'a> {
     /// and [`Ending::Abandoned`] otherwise.
     pub(crate) fn run(&mut self) -> Result<Ending, WorkerError> {
         let error = match self.serve() {
-            Ok(()) => return Ok(Ending::Closed),
+            Ok(()) => {
+                self.withdraw_bookings();
+                return Ok(Ending::Closed);
+            }
             Err(error) if self.channel_failed.get() => error,
             Err(error) => {
                 self.report_failure(&error);
@@ -1489,6 +1492,31 @@ impl Service<'_> {
             )));
         }
         Ok(true)
+    }
+
+    /// Withdraws the rank's bookings from its GPUs' ledgers: the engine
+    /// closed it in order, so the Storage Server reserves nothing of them
+    /// for a process that replaces it, as it does for a rank that is lost.
+    /// A withdrawal that fails leaves the reservation to the world's
+    /// retirement.
+    fn withdraw_bookings(&self) {
+        let Some(retained) = self.maintenance.retained.as_deref() else {
+            return;
+        };
+        for booking in &self.maintenance.bookings {
+            let items = vec![
+                (::storage::Item::GraphPool, 0),
+                (::storage::Item::Process, 0),
+                (::storage::Item::Staging, 0),
+            ];
+            if let Err(error) = retained.book(booking.device, booking.total, booking.quota, items) {
+                tracing::warn!(
+                    device = %booking.device,
+                    %error,
+                    "the rank could not withdraw its bookings"
+                );
+            }
+        }
     }
 
     /// Books `bytes` of staging on each device of the rank's ledger
