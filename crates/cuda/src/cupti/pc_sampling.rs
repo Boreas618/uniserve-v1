@@ -7,7 +7,7 @@
 //! [`PcSampler::stop`] the device samples a warp of each SM every
 //! `2^(5 + period)` cycles. CUPTI aggregates the samples per program counter:
 //! a [`Pc`] is a function, an offset in it and the samples of each stall
-//! reason at that offset. On this CUPTI (13.0.85), stopping moves what was
+//! reason at that offset. On this CUPTI (13.4.92), stopping moves what was
 //! collected into the sampler's buffer; [`PcSampler::take`] reads it, and
 //! while sampling asks CUPTI for what it collected so far.
 
