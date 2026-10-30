@@ -1099,6 +1099,46 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
     }
 }
 
+/// Ranks on two hosts read the sources at other times and bind them from
+/// their own hosts: they plan from the storages both read, in the first
+/// reader's order and bindings, and each binds that world from its host.
+#[test]
+fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
+    let page = |name: &str| storage(vec![field(name, 0, &[64], vec![whole(64)], vec![0])]);
+    let remote = |mut storage: Storage, gpu: Gpu| {
+        for chunk in &mut storage.chunks {
+            chunk.binding = Binding::Remote {
+                endpoint: "host-a:4100".into(),
+                at: Placement::Device { gpu },
+            };
+        }
+        storage
+    };
+    // Host A holds GPU 0's storages: its reader binds them locally and
+    // read before the second was published; host B's reader reads both
+    // from host A's server.
+    let first = world(vec![(Some(gpu(0)), vec![page("a")])]);
+    let second = world(vec![(
+        Some(gpu(0)),
+        vec![remote(page("b"), gpu(0)), remote(page("a"), gpu(0))],
+    )]);
+
+    let agreed = first.common([&second]);
+    assert_eq!(agreed, first);
+    assert!(
+        first
+            .common([&second])
+            .same_storage(&second.common([&first]))
+    );
+
+    let reading = second.reading_of(&agreed).unwrap();
+    assert!(reading.same_storage(&agreed));
+    assert_eq!(reading.ranks[0].storages, vec![remote(page("a"), gpu(0))]);
+    assert_eq!(first.reading_of(&agreed).unwrap(), first);
+    // A reader that lacks a storage of the plan cannot bind it.
+    assert!(first.reading_of(&second).is_none());
+}
+
 #[test]
 fn one_gpu_copy_plan_binds_to_each_submitting_host() {
     let page = storage(vec![field("page", 0, &[64], vec![whole(64)], vec![0])]);

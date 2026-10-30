@@ -220,27 +220,107 @@ pub struct World {
     pub ranks: Vec<Rank>,
 }
 
+impl Storage {
+    /// Whether this storage of a rank on `gpu` and `other` of a rank on
+    /// `other_gpu` are one numerical storage in one physical storage. A
+    /// GPU's local and remote bindings are views of one allocation, while
+    /// host endpoints remain distinct.
+    fn same_as(&self, gpu: Option<Gpu>, other: &Self, other_gpu: Option<Gpu>) -> bool {
+        self.layout == other.layout
+            && self.chunks.len() == other.chunks.len()
+            && self.chunks.iter().zip(&other.chunks).all(|(x, y)| {
+                x.offset == y.offset
+                    && x.length == y.length
+                    && x.key == y.key
+                    && x.storage_offset == y.storage_offset
+                    && x.binding.end(gpu).ok() == y.binding.end(other_gpu).ok()
+            })
+    }
+}
+
 impl World {
     /// Whether the same ordered ranks retain the same numerical storage
-    /// in the same physical storage. A GPU's local and remote bindings are
-    /// views of one allocation, while host endpoints remain distinct.
+    /// in the same physical storage ([`Storage::same_as`]).
     pub fn same_storage(&self, other: &Self) -> bool {
         self.ranks.len() == other.ranks.len()
             && self.ranks.iter().zip(&other.ranks).all(|(one, two)| {
                 one.gpu == two.gpu
                     && one.storages.len() == two.storages.len()
-                    && one.storages.iter().zip(&two.storages).all(|(a, b)| {
-                        a.layout == b.layout
-                            && a.chunks.len() == b.chunks.len()
-                            && a.chunks.iter().zip(&b.chunks).all(|(x, y)| {
-                                x.offset == y.offset
-                                    && x.length == y.length
-                                    && x.key == y.key
-                                    && x.storage_offset == y.storage_offset
-                                    && x.binding.end(one.gpu).ok() == y.binding.end(two.gpu).ok()
-                            })
-                    })
+                    && one
+                        .storages
+                        .iter()
+                        .zip(&two.storages)
+                        .all(|(a, b)| a.same_as(one.gpu, b, two.gpu))
             })
+    }
+
+    /// Whether a rank on `gpu` of this world holds `storage` of a rank on
+    /// that GPU of another reading.
+    fn holds(&self, gpu: Option<Gpu>, storage: &Storage) -> bool {
+        self.ranks
+            .iter()
+            .filter(|rank| rank.gpu == gpu)
+            .flat_map(|rank| &rank.storages)
+            .any(|own| own.same_as(gpu, storage, gpu))
+    }
+
+    /// The storages of this world that every one of `others` holds too, in
+    /// this world's order and with its bindings; a rank left without
+    /// storages is dropped. Readings of retained sources taken at other
+    /// times or from other hosts list other storages and bind them from
+    /// their own host; the ranks that plan one manifest together plan it
+    /// from this one world, which each of them binds ([`World::reading_of`]).
+    pub fn common<'a>(&self, others: impl IntoIterator<Item = &'a World> + Clone) -> World {
+        let ranks = self
+            .ranks
+            .iter()
+            .map(|rank| Rank {
+                gpu: rank.gpu,
+                storages: rank
+                    .storages
+                    .iter()
+                    .filter(|storage| {
+                        others
+                            .clone()
+                            .into_iter()
+                            .all(|other| other.holds(rank.gpu, storage))
+                    })
+                    .cloned()
+                    .collect(),
+            })
+            .filter(|rank| !rank.storages.is_empty())
+            .collect();
+        World { ranks }
+    }
+
+    /// This reading's storages that `plan` names, in `plan`'s order and
+    /// with this reading's bindings: the source world a plan made from
+    /// `plan` binds on this reader's host ([`Manifest::bind`]). `None` when
+    /// this reading lacks one of them.
+    pub fn reading_of(&self, plan: &World) -> Option<World> {
+        let ranks = plan
+            .ranks
+            .iter()
+            .map(|rank| {
+                let storages = rank
+                    .storages
+                    .iter()
+                    .map(|storage| {
+                        self.ranks
+                            .iter()
+                            .filter(|own| own.gpu == rank.gpu)
+                            .flat_map(|own| &own.storages)
+                            .find(|own| own.same_as(rank.gpu, storage, rank.gpu))
+                            .cloned()
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Rank {
+                    gpu: rank.gpu,
+                    storages,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(World { ranks })
     }
 }
 
