@@ -187,3 +187,21 @@ def test_changing_one_checkpoint_shard_keeps_unrelated_tensors(source):
     assert {name for name in before if before[name] != after[name]} == {
         "p:head.weight"
     }
+
+
+def test_a_rank_of_some_modules_keys_every_tensor_of_the_model_alike(source):
+    # Ranks that receive weights together select other worlds' retained
+    # fields by the model's tensor identities, so a rank holding only some
+    # modules must state the same identities as a rank holding them all,
+    # while its own identities name only the tensors it holds.
+    whole = fingerprints(source, source.io, "local")
+    narrowed = fingerprints(
+        replace(source, modules=frozenset(("projection",))),
+        source.io,
+        "local",
+    )
+    assert narrowed["tensors"] == {
+        "p:projection.weight": whole["tensors"]["p:projection.weight"]
+    }
+    assert narrowed["model_tensors"] == whole["model_tensors"]
+    assert whole["model_tensors"] == whole["tensors"]

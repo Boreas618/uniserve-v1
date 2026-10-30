@@ -220,6 +220,11 @@ def fingerprints(
     numerical configuration that changes no loading input changes no retained
     weight key.
 
+    ``tensors`` keys the tensors this rank's modules hold, which its
+    retained-weight manifest names; ``model_tensors`` keys every tensor of
+    the model alike, whichever ranks hold it, which is what ranks that
+    receive weights together select other worlds' retained fields by.
+
     Construction and assignment compilation use meta tensors; checkpoint
     readers supply metadata without materializing parameter payloads.
     """
@@ -339,6 +344,11 @@ def fingerprints(
                         )
 
         values = {}
+        # Every tensor's loading identity, the rank's own and those only
+        # other ranks of the model hold: computed on the whole meta model,
+        # it is the same on every rank, so ranks holding different tensors
+        # select the same source weights from other worlds.
+        identities = {}
         stored = {}
         layouts = []
         for name, tensor in named.items():
@@ -412,12 +422,13 @@ def fingerprints(
                 owner, _ = compiler._owners[key]
                 if isinstance(owner, ExpertLinear):
                     storage.append(expert_kernels)
+            # Provider selection chooses a layout, not new numerical values.
+            # Exact manifest lookup includes that choice; the redistribution
+            # planner can still match its source values and convert the
+            # declared encoding without reading files.
+            identities[name] = digest("tensor-storage", value)
             if key in active:
-                # Provider selection chooses a layout, not new numerical
-                # values. Exact manifest lookup includes that choice; the
-                # redistribution planner can still match its source values
-                # and convert the declared encoding without reading files.
-                stored[name] = digest("tensor-storage", value)
+                stored[name] = identities[name]
                 layouts.append((name, representation, storage[1:]))
         tensor_values = {
             id(tensor): values[name] for name, tensor in named.items()
@@ -425,6 +436,7 @@ def fingerprints(
         return {
             "structure": digest("weight-layout", layouts),
             "tensors": stored,
+            "model_tensors": identities,
             "values": digest("model-values", source.model, values),
             "cache": numerics.cache_identities(model, tensor_values),
         }

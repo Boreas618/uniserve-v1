@@ -6,11 +6,12 @@
 //! determines each tensor's bytes (`fingerprints`, by tensor name),
 //! the rank's tensors as its library describes them, and
 //! its storages ([`RetainedStorage`]): each one's device among the rank's
-//! devices, layout and chunks. The worker writes it; a world that receives
-//! weights and the daemon that plans its preparation read the storages of
-//! every manifest a world retains as the source world of a copy manifest
-//! ([`sources`]), both from the same listing and texts, so both compute the
-//! same source world.
+//! devices, layout and chunks. The worker writes it; the ranks of a world
+//! that receives weights and the ranks a daemon plans its preparation with
+//! read the storages of every manifest a world retains as the source world
+//! of a copy manifest ([`sources`]), all from the same listing and texts and
+//! by the fingerprints of the whole model, so all compute the same source
+//! world.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -221,17 +222,22 @@ pub struct Transfer {
 }
 
 /// The weights the selected `worlds` of `deployment` retain on the host `listing`
-/// lists, for a rank whose checkpoint sources have the digests
-/// `fingerprints` (hex, by tensor name, as a manifest states them).
+/// lists, for a model whose tensors have the digests `fingerprints` (hex,
+/// by tensor name, as a manifest states them).
 ///
-/// Every manifest the selected worlds retain names storages; a storage on a device
-/// whose fields' sources all have this rank's digests holds bytes the rank
-/// may need, on every GPU where the world retains all of its chunks. Each
-/// GPU is one source rank, its storages once each in the order of their
-/// serialized form, so every reader of the same listing and texts computes
-/// the same world. `read` returns the text of the host bytes of a key
-/// (`None` when the server no longer retains them). Returns `None` when the
-/// world retains no such storage, or no Transfer Server runs to copy them.
+/// Every manifest the selected worlds retain names storages; the fields of
+/// a storage on a device whose tensors have the model's digests hold bytes
+/// a rank of the model may need, on every GPU where the world retains all
+/// of the storage's chunks. Each GPU is one source rank, its storages once
+/// each in the order of their serialized form, so every reader of the same
+/// listing and texts with the same `fingerprints` computes the same world.
+/// The ranks that receive one copy manifest bind the world it was planned
+/// from, so `fingerprints` must name every tensor of the model, not only
+/// those the reading rank holds: a rank that leaves out tensors another
+/// rank holds selects fewer storages, at other positions. `read` returns
+/// the text of the host bytes of a key (`None` when the server no longer
+/// retains them). Returns `None` when the world retains no such storage,
+/// or no Transfer Server runs to copy them.
 ///
 /// # Errors
 ///
