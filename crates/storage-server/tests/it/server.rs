@@ -2005,9 +2005,17 @@ fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     }
     assert_eq!(ledger(&mut head).used(), 700);
 
-    // The commit: world 1's processes end, which ends what they booked, and
-    // the claim retires world 1, which releases its buffer. The segment
-    // world 2 maps is world 2's alone, its bytes unchanged.
+    // The commit: world 1's processes end in order, withdrawing what they
+    // booked, and the claim retires world 1, which releases its buffer. The
+    // segment world 2 maps is world 2's alone, its bytes unchanged.
+    first
+        .book(
+            GPU,
+            1000,
+            Some(700),
+            vec![(Item::Process, 0), (Item::GraphPool, 0)],
+        )
+        .unwrap();
     drop(first);
     await_used(&mut head, 500);
     head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
@@ -2057,6 +2065,10 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     assert_eq!(ledger(&mut head).used(), 370);
 
     // The previous world's processes exit; the head keeps its weights.
+    // The kept world's processes end in order, withdrawing what they booked.
+    first
+        .book(GPU, 1000, Some(700), vec![(Item::Process, 0)])
+        .unwrap();
     drop(first);
     await_used(&mut head, 270);
     assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
@@ -2158,6 +2170,86 @@ fn the_processes_of_one_scope_count_as_their_largest_booking() {
     assert_eq!(ledger(&mut head).used(), 350);
     drop(standby);
     await_used(&mut head, 300);
+}
+
+/// A lost rank's booking stays reserved for the process that replaces it:
+/// another scope cannot book into it, and the relaunch takes each item over
+/// as it books it.
+#[test]
+fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head
+        .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .unwrap();
+    head.publish_worlds(vec![1]).unwrap();
+    let mut rank = world_worker(&server.socket, scope("text", 0), 1, claim);
+    rank.book(
+        GPU,
+        1000,
+        Some(700),
+        vec![(Item::Process, 300), (Item::GraphPool, 200)],
+    )
+    .unwrap();
+    drop(rank);
+
+    // The lost rank's 500 bytes leave 200 of the quota to another scope.
+    let mut other = world_worker(&server.socket, scope("text", 1), 1, claim);
+    assert_eq!(
+        server_error(other.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])),
+        ErrorKind::Quota
+    );
+    assert_eq!(ledger(&mut head).used(), 500);
+
+    // The relaunch books a smaller process and takes that item over; the
+    // graph pool it has not booked yet stays reserved.
+    let mut relaunch = world_worker(&server.socket, scope("text", 0), 1, claim);
+    relaunch
+        .book(GPU, 1000, Some(700), vec![(Item::Process, 250)])
+        .unwrap();
+    assert_eq!(ledger(&mut head).used(), 450);
+    relaunch
+        .book(GPU, 1000, Some(700), vec![(Item::GraphPool, 150)])
+        .unwrap();
+    assert_eq!(ledger(&mut head).used(), 400);
+}
+
+/// A rank that withdraws its bookings before its connection ends, as a
+/// worker that ends in order does, leaves nothing reserved, and a lost
+/// rank's reservation ends with its world's retirement.
+#[test]
+fn reservations_end_with_a_withdrawal_or_the_world_s_retirement() {
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head
+        .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .unwrap();
+    head.publish_worlds(vec![1]).unwrap();
+    let mut closed = world_worker(&server.socket, scope("text", 0), 1, claim);
+    closed
+        .book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
+        .unwrap();
+    closed
+        .book(GPU, 1000, Some(700), vec![(Item::Process, 0)])
+        .unwrap();
+    drop(closed);
+    await_used(&mut head, 0);
+
+    let mut lost = world_worker(&server.socket, scope("text", 1), 1, claim);
+    lost.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
+        .unwrap();
+    drop(lost);
+    assert_eq!(ledger(&mut head).used(), 300);
+    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    head.publish_worlds(vec![2]).unwrap();
+    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    // Nothing is booked on the GPU any more: it has no ledger, or an empty
+    // one.
+    let ledgers = head.ledger(vec![GPU]).unwrap().ledgers;
+    assert_eq!(
+        ledgers.iter().map(::storage::GpuLedger::used).sum::<u64>(),
+        0
+    );
 }
 
 /// A worker books only its own items, and a booking that leaves a ledger
