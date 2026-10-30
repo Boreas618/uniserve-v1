@@ -430,6 +430,10 @@ impl Collectors {
 
     /// Stop the range profiler, hand its ranges to the file and start it
     /// again, so that a long window never fills its counter data image.
+    ///
+    /// A stop or start CUPTI refuses releases the collector as failed, with
+    /// CUPTI's result as the detail of its state: the profiler collects
+    /// nothing more, and the ranges of a failed stop are lost.
     pub(crate) fn cycle_ranges(&mut self) {
         if !self.armed {
             return;
@@ -438,18 +442,22 @@ impl Collectors {
             .context
             .as_ref()
             .and_then(|context| context.enter().ok());
-        if let Some(Prepared::RangeMetrics { profiler, .. }) =
+        let Some(Prepared::RangeMetrics { profiler, .. }) =
             self.prepared.get_mut(&Collector::RangeMetrics)
-        {
-            match profiler.stop() {
-                Ok(collected) => {
-                    send_ranges(&self.rows, profiler, collected);
-                    if let Err(error) = profiler.start() {
-                        tracing::warn!("the range profiler did not start again: {error}");
-                    }
-                }
-                Err(error) => tracing::warn!("the range profiler could not be read: {error}"),
-            }
+        else {
+            return;
+        };
+        let cycled = profiler.stop().and_then(|collected| {
+            send_ranges(&self.rows, profiler, collected);
+            profiler.start()
+        });
+        if let Err(error) = cycled {
+            let reason = error.to_string();
+            tracing::warn!(
+                "profiling collector {} failed between two passes: {reason}",
+                Collector::RangeMetrics.as_str()
+            );
+            self.release(Collector::RangeMetrics, "failed", &reason);
         }
     }
 
