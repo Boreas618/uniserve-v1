@@ -606,7 +606,7 @@ impl Scheduler {
     ) -> bool {
         let grown = self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Boundary);
         if !grown {
-            self.note_stuck_holder(id);
+            self.note_starved(id);
         }
         grown
     }
@@ -624,7 +624,7 @@ impl Scheduler {
         let checkpoint = Checkpoint::Interval(self.state_interval);
         let grown = self.grow_request_tables(id, read_start, total_tokens, checkpoint);
         if !grown {
-            self.note_stuck_holder(id);
+            self.note_starved(id);
         }
         grown
     }

@@ -13,7 +13,11 @@
 //! the daemon with their generated tokens, as vLLM's recompute preemption
 //! does). A request holding the tail that cannot get a unit to continue,
 //! because the requests running hold every unit left to allocation, is
-//! recomputed at once: it could not run on to its end. A restore creates the tail again, all of it or as many segments
+//! recomputed at once: it could not run on to its end. Whenever every
+//! running request waits for units the others hold and nothing in flight
+//! will free any, none could end: the one of the lowest priority admitted
+//! last is recomputed, as vLLM's recompute preemption does, and its units
+//! go to the others. A restore creates the tail again, all of it or as many segments
 //! as the storage now holds. A sleep gives back every segment and the CUDA
 //! graph storage once no request runs, and admits nothing until a wake
 //! restores both; it preempts video requests at their next denoising step
@@ -867,10 +871,69 @@ impl Scheduler {
     }
 
     /// Notes that the running request `id` could not get the units its next
-    /// call needs. While a shrink waits for the requests holding withdrawn
-    /// units to let them go, such a request that holds one cannot run on:
-    /// only the units left to allocation can grow it. `Self::poll_resize`
-    /// recomputes it.
+    /// call needs, for [`Self::recompute_starved`] and, while a shrink is
+    /// pending, [`Self::note_stuck_holder`].
+    pub(super) fn note_starved(&mut self, id: RequestId) {
+        if !self.starved.contains(&id) {
+            self.starved.push(id);
+        }
+        self.note_stuck_holder(id);
+    }
+
+    /// Recomputes a running request when none can go on: every running
+    /// token request could not get the cache units its next call needs
+    /// ([`Self::note_starved`]) as the executor was refilled, which
+    /// `submitted` nothing, and no batch is in flight, so none would end and
+    /// let units go. The one of the lowest priority (the highest value)
+    /// admitted last ends as migratable, and the daemon submits it again
+    /// with its generated tokens, to wait for units like any new request;
+    /// the units it holds return to allocation for the others. A request
+    /// running alone gains nothing from giving up its own units, and is not
+    /// recomputed.
+    pub(super) fn recompute_starved(&mut self, submitted: bool) {
+        let starved = std::mem::take(&mut self.starved);
+        if starved.is_empty()
+            || submitted
+            || self.parked
+            || self.parking.is_some()
+            || !self.inflight.pending_batches.is_empty()
+            || !self.inflight.pending_submissions.is_empty()
+        {
+            return;
+        }
+        let live: Vec<(&RequestId, &RequestState)> = self
+            .running
+            .iter()
+            .filter(|(_, state)| !state.terminal_intent.is_terminal())
+            .collect();
+        if live.len() < 2 || live.iter().any(|(id, _)| !starved.contains(id)) {
+            return;
+        }
+        let Some(victim) = live
+            .iter()
+            .filter(|(_, state)| state.req.is_migratable())
+            .max_by(|(_, a), (_, b)| {
+                (a.req.priority, a.queued_at)
+                    .partial_cmp(&(b.req.priority, b.queued_at))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(id, _)| **id)
+        else {
+            return;
+        };
+        tracing::info!(
+            request = victim.0,
+            running = live.len(),
+            "no running request can get the cache units it needs: the one admitted last is \
+             recomputed"
+        );
+        self.migrate_running(MigrationCause::Drain, |id| id == victim);
+    }
+
+    /// While a shrink waits for the requests holding withdrawn units to let
+    /// them go, a running request that holds one and could not get the
+    /// units its next call needs cannot run on: only the units left to
+    /// allocation can grow it. `Self::poll_resize` recomputes it.
     pub(super) fn note_stuck_holder(&mut self, id: RequestId) {
         let shrinking = self
             .resizing

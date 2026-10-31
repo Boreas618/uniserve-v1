@@ -192,8 +192,10 @@ impl Scheduler {
             .as_mut()
             .is_some_and(crate::encoder_outputs::EncoderStore::poll);
 
-        progressed |= self.refill_executor();
+        let submitted = self.refill_executor();
+        progressed |= submitted;
         self.poll_resize();
+        self.recompute_starved(submitted);
         self.poll_park();
 
         self.stats

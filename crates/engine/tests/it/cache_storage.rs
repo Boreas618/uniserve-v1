@@ -1397,6 +1397,39 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
     thread.join().unwrap();
 }
 
+/// Two requests that each grow past half the cache: once neither can get
+/// the units its next call needs and nothing in flight frees any, the one
+/// admitted last is recomputed (it ends as migratable after the tokens it
+/// generated), and the other runs to its end on the units it let go.
+#[test]
+fn requests_that_wait_for_each_others_units_recompute_the_last_admitted() {
+    let (handle, _workers, thread) = start(Workers::filling(0));
+    // Each takes 10 pages of prompt and 10 more of the 160 tokens it
+    // generates: 40 pages of the 31 units past the sentinel.
+    let mut first = handle.submit(request(1, 10, 10 * BLOCK as usize)).unwrap();
+    let mut second = handle.submit(request(2, 10, 10 * BLOCK as usize)).unwrap();
+    assert!(
+        matches!(
+            terminal(&mut second),
+            Some(Event::Migratable {
+                cause: MigrationCause::Drain,
+                ..
+            })
+        ),
+        "the request admitted last runs on or ends otherwise"
+    );
+    assert!(matches!(
+        terminal(&mut first),
+        Some(Event::Finished {
+            completion_tokens: 160,
+            ..
+        })
+    ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// A world parked for a successor that maps its cache lends it the
 /// segments past its first that hold no page a request in flight continues
 /// from, and allocates none of their units until a resume takes them back:
