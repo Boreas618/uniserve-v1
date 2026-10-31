@@ -239,6 +239,7 @@ impl Scheduler {
             encoder_outputs: None,
             closing: false,
             resizing: None,
+            starved: Vec::new(),
             asleep: false,
             parking: None,
             warming: super::warming::Warming::default(),
