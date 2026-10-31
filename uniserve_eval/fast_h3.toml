@@ -28,9 +28,6 @@ host = "127.0.0.1"
 port = 18083
 command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses4.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--set", "quantization_config.mode=quality"]
 
-[servers.gb200-4-bf16.environment]
-NCCL_NVLS_ENABLE = "0"
-
 [benchmarks.gb200-4-bf16-latency]
 server = "gb200-4-bf16"
 task = "video"
@@ -139,9 +136,6 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses4.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16"]
-
-[servers.gb200-4-nvfp4.environment]
-NCCL_NVLS_ENABLE = "0"
 
 [benchmarks.gb200-4-nvfp4-latency]
 server = "gb200-4-nvfp4"
@@ -252,9 +246,6 @@ host = "127.0.0.1"
 port = 18083
 command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses8-two-host.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0", "--nnodes", "2", "--dist-init-addr", "${UNISERVE_DIST_INIT_ADDR}", "--set", "quantization_config.mode=quality"]
 
-[servers.gb200-8-bf16-latency.environment]
-NCCL_NVLS_ENABLE = "0"
-
 [benchmarks.gb200-8-bf16-latency]
 server = "gb200-8-bf16-latency"
 task = "video"
@@ -279,9 +270,6 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/fasth3-ulysses4x2-two-host.toml", "--max-running-requests", "4", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0", "--nnodes", "2", "--dist-init-addr", "${UNISERVE_DIST_INIT_ADDR}", "--set", "quantization_config.mode=quality"]
-
-[servers.gb200-8-bf16-throughput.environment]
-NCCL_NVLS_ENABLE = "0"
 
 [benchmarks.gb200-8-bf16-throughput-c1]
 server = "gb200-8-bf16-throughput"
@@ -393,9 +381,6 @@ host = "127.0.0.1"
 port = 18083
 command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses8-two-host.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0", "--nnodes", "2", "--dist-init-addr", "${UNISERVE_DIST_INIT_ADDR}"]
 
-[servers.gb200-8-nvfp4-latency.environment]
-NCCL_NVLS_ENABLE = "0"
-
 [benchmarks.gb200-8-nvfp4-latency]
 server = "gb200-8-nvfp4-latency"
 task = "video"
@@ -420,9 +405,6 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/fasth3-ulysses4x2-two-host.toml", "--max-running-requests", "4", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0"]
-
-[servers.gb200-8-nvfp4-throughput.environment]
-NCCL_NVLS_ENABLE = "0"
 
 [benchmarks.gb200-8-nvfp4-throughput-c1]
 server = "gb200-8-nvfp4-throughput"
