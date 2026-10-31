@@ -1,0 +1,11 @@
+{
+  // The pinned `tvm-ffi` crate's build script runs `tvm-ffi-config`, which the
+  // project virtualenv installs. The editor does not inherit an activated
+  // shell, so rust-analyzer (and the test runnables it launches) put
+  // `.venv/bin` first on PATH. The extension cannot expand `${env:PATH}`
+  // inside PATH itself, so the remaining entries are spelled out.
+  "rust-analyzer.server.extraEnv": {
+    "PATH": "${workspaceFolder}/.venv/bin:${userHome}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  },
+  "rust-analyzer.server.path": "~/.cargo/bin/rust-analyzer"
+}
