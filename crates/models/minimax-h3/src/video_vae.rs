@@ -765,6 +765,18 @@ impl VideoDecoder {
                 out.shape.dims()
             )));
         }
+        // The rotation reads one leading coordinate per axis; a row-major table would be read
+        // transposed and rotate every row by another row's angles, so the shape is checked here
+        // rather than trusted.
+        if positions.shape.rank() != 2
+            || positions.shape.dim(0) != 3
+            || positions.shape.dim(1) != rows
+        {
+            return Err(Error::config(format!(
+                "the decoder reads a [3, {rows}] position table, not {:?}",
+                positions.shape.dims()
+            )));
+        }
 
         let stream = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
         let projected = f.arena().tensor(DType::F16, Shape::new(&[voxels, width]))?;
