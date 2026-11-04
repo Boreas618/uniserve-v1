@@ -39,8 +39,6 @@ use scheduling::guest::wire::Call;
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
 use serde::{Deserialize, Serialize};
 
-use crate::scheduler::SchedulerConfig;
-
 /// A policy program's identity and arguments (§5.1): the backend the
 /// configuration names, the revision the Program Server numbered the package
 /// under, and the arguments that shape its decisions.
@@ -116,46 +114,6 @@ fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T
     toml::from_str(&format!("value = {value}")).map_err(|error| PolicyError::Load {
         message: format!("the policy argument `{name} = {value}` does not parse: {error}"),
     })
-}
-
-/// The policy a scheduler configuration states, before the daemon names the
-/// revision it installed (§5.1).
-///
-/// The arguments are the configuration's scheduling values, so the policy sees
-/// the deployment's own limits and applies its own defaults only where the
-/// configuration states none.
-pub fn program_of(config: &SchedulerConfig) -> PolicyProgram {
-    PolicyProgram {
-        backend: backend_name(config.policy).to_owned(),
-        revision: 0,
-        arguments: parameters_of(config),
-    }
-}
-
-/// The backend name of a scheduling policy word, as `scheduler_config.policy`
-/// spells it and the Program Server's store names it.
-pub fn backend_name(policy: proto::request::SchedulingPolicy) -> &'static str {
-    match policy {
-        proto::request::SchedulingPolicy::Fcfs => "fcfs",
-        proto::request::SchedulingPolicy::Priority => "priority",
-    }
-}
-
-/// The policy's arguments from the scheduler configuration (§7.7: the
-/// `scheduler_config` fields and the `speculative_config` decision values).
-pub fn parameters_of(config: &SchedulerConfig) -> Parameters {
-    Parameters {
-        chunked_prefill_size: Some(token_count(config.chunked_prefill_size)),
-        max_queued_requests: config.max_queued_requests,
-        max_batch: Some(config.max_batch),
-        max_num_batched_tokens: Some(token_count(config.max_num_batched_tokens)),
-        // The policy states its own deepening floor and starvation deadline;
-        // the build config only bounds them (`ceilings_of`).
-        prefetch_min_tokens: None,
-        timeout: None,
-        expected_speedup: config.refill.expected_speedup,
-        refill_token_cost: config.refill.token_cost,
-    }
 }
 
 /// The build config's hard bounds on what one step may be given to run (§4.4):

@@ -64,7 +64,7 @@ pub use crate::scheduler::{
     PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyStore,
     PrefixCacheUsage, PrefixStats, RefillPolicy, RoutePolicy, RouteTrial, Scheduler,
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
-    Validators, WorkerStats, arrival_view, backend_name, ceilings_of, parameters_of, program_of,
+    Validators, WorkerStats, arrival_view, ceilings_of,
 };
 pub use crate::service::{continuation_slot, run_engine, serve_requests};
 #[cfg(feature = "testing")]
