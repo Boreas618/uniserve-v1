@@ -20,11 +20,15 @@ it had none, because a silent fallback there is a splice that never happened.
 
 The case is the candidate harness's own statement of the request, exactly as for the other stages:
 
-    {"task": "t2va", "text_tokens": 15, "hidden": 5120, "prompt_ids": [...], "vision": "none"}
+    {"task": "t2va", "text_tokens": 15, "hidden": 5120, "prompt": "...", "prompt_ids": [...],
+     "vision": "none"}
 
 `prompt_ids` is the tokenizer's answer, carried as data rather than re-derived here: the tokenizer is
 one variable, and a tokenizer disagreement must be able to appear as itself instead of as a
-difference in every row. `vision` names what the tower is asked to encode; `"none"` is a prompt with
+difference in every row. The `prompt` string beside it is the cross-check: this probe tokenizes it
+with the **reference's** tokenizer and refuses on a mismatch, naming the first index where the two
+lists differ. The crates have no tokenizer of their own, so without that check a front end's
+tokenizer would be invisible until a page disagreed in every row. `vision` names what the tower is asked to encode; `"none"` is a prompt with
 no images, which is the cheap case this probe is meant to answer first.
 
 It runs on the reference's own weight path - the `text_encoder` component's shards through
@@ -122,6 +126,51 @@ def encoder_case(case: dict) -> dict:
     return case
 
 
+def tokenizer_check(
+    case: dict, checkpoint: Path, ids: list[int]
+) -> None:
+    """Tokenize the case's prompt with the reference's own tokenizer and refuse a mismatch.
+
+    The ids are data because the crates have no tokenizer; the string is the cross-check, so a
+    disagreement between a front end's tokenizer and the checkpoint's appears as itself, named at
+    the first index where the two lists part, rather than as a difference in every row of the
+    tensor.
+    """
+    prompt = case.get("prompt")
+    if prompt is None:
+        print("prompt  no string in the case; the ids are taken on trust")
+        return
+    if not isinstance(prompt, str):
+        raise SystemExit(
+            f"the case's prompt is {type(prompt).__name__}; a prompt is a string"
+        )
+    directory = checkpoint / "tokenizer"
+    if not directory.is_dir():
+        raise SystemExit(
+            f"{directory} is absent, and the case carries a prompt to cross-check; point"
+            f" --checkpoint at the export's root"
+        )
+    # The repository root, so `uniserve` resolves when the package is not installed editable: the
+    # tokenizer is the one part of the reference this probe can exercise without a device.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    processing = reference("uniserve.processing")
+    tokenizer = processing.load_tokenizer(directory)
+    tokenized = [int(value) for value in tokenizer(prompt)["input_ids"]]
+    if tokenized == ids:
+        print(f"prompt  the tokenizer agrees on all {len(ids)} ids")
+        return
+    for index, (mine, theirs) in enumerate(zip(ids, tokenized, strict=False)):
+        if mine != theirs:
+            raise SystemExit(
+                f"the case's prompt_ids and the checkpoint's tokenizer differ at index"
+                f" {index}: the case has {mine} and the tokenizer {theirs}"
+            )
+    raise SystemExit(
+        f"the case's prompt_ids hold {len(ids)} ids and the checkpoint's tokenizer"
+        f" answers {len(tokenized)}"
+    )
+
+
 def text_source(checkpoint: Path):
     """The checkpoint source of the text encoder's own shards."""
     from uniserve.loading import checkpoint as checkpoint_module
@@ -198,6 +247,7 @@ def run_prompt_hidden(
     case = encoder_case(json.loads((stack / "case.json").read_text()))
     ids = [int(value) for value in case["prompt_ids"]]
     print(f"prompt  {len(ids)} ids, first {ids[:ID_SAMPLE]}, last {ids[-ID_SAMPLE:]}")
+    tokenizer_check(case, checkpoint, ids)
     vision = case.get("vision", "none")
     if vision not in (None, "none"):
         raise SystemExit(
