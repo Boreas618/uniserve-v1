@@ -469,6 +469,15 @@ fn expert_block(
             )));
         }
         let vocabulary = as_u32(config.num_experts, "num_experts")?;
+        // The shard's block scales are the export's own — linear, one per sixteen elements — and the
+        // products read the swizzled 128x4 table, which the loader builds once at load. A checkpoint
+        // that already holds a converted table is refused here rather than swizzled a second time.
+        if layout != ScaleLayout::Linear {
+            return Err(Error::Unsupported(format!(
+                "{parameter} declares {layout} block scales, and this loader builds the published \
+                 table from a linear shard: a converted checkpoint needs its own reader"
+            )));
+        }
         let up_gate: QuantizedStack = loader
             .nvfp4_stack(
                 &format!("{parameter}.mlp.experts.up_gate"),
@@ -479,7 +488,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                layout,
+                ScaleLayout::Swizzled128X4,
                 false,
             )
             .map_err(Error::from)?;
@@ -493,7 +502,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                layout,
+                ScaleLayout::Swizzled128X4,
                 false,
             )
             .map_err(Error::from)?;

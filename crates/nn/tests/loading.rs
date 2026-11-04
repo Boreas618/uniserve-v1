@@ -1409,3 +1409,73 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
     };
     assert!(format!("{error}").contains("32-row blocks"), "{error}");
 }
+
+/// The products read their weight scales swizzled, and an export holds them linear: the loader
+/// builds the 128x4 table once at load — rows padded to 128, scale columns to 4, each tile laid out
+/// so a thread block's scales are contiguous — rather than a step paying for it.
+#[test]
+fn a_swizzled_scale_table_is_built_from_the_shards_linear_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    // One expert, 128 rows by 32 columns: sixteen packed bytes and two block scales a row.
+    let mut values = Vec::new();
+    let mut scales = Vec::new();
+    for row in 0..128u8 {
+        values.extend(std::iter::repeat_n(row, 16));
+        scales.extend_from_slice(&[row, row.wrapping_add(1)]);
+    }
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = vec![
+        (
+            "experts.0.down_proj.weight_packed",
+            DType::U8,
+            vec![128, 16],
+            values,
+        ),
+        (
+            "experts.0.down_proj.weight_scale",
+            DType::F8E4M3,
+            vec![128, 2],
+            scales,
+        ),
+        (
+            "experts.0.down_proj.weight_tensor_scale",
+            DType::F32,
+            vec![1],
+            0.5f32.to_le_bytes().to_vec(),
+        ),
+    ];
+    shard_typed(directory, "model.safetensors", &views);
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.down",
+                "experts",
+                &["down"],
+                1,
+                Nvfp4Names::diffusers(),
+                nn::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
+                ops::fp4::ScaleLayout::Swizzled128X4,
+                false,
+            )
+            .unwrap();
+    }
+    // Two scale columns pad to four, and 128 rows are one tile: 128 × 4 bytes.
+    let (key, bytes, ..) = &store.published[1];
+    assert_eq!(key.layout, WeightLayout::NVFP4_SCALES_SWIZZLED);
+    assert_eq!(bytes.len(), 128 * 4);
+    // Row `r`'s column-0 scale lands at `(r % 32) * 16 + ((r % 128) / 32) * 4`, and the tile's two
+    // padding columns are zero. Row 1's own scale value is 1; row 32's is 32, in the next group of
+    // thirty-two rows.
+    assert_eq!(bytes[16], 1);
+    assert_eq!(bytes[4], 32);
+    // Columns 2 and 3 of the tile are the padding: no block exists there, and a zero scale on a
+    // block that does not exist is what the artifact's own interleave writes.
+    assert_eq!(bytes[2], 0, "a padding column is a zero scale");
+    assert_eq!(bytes[3], 0, "a padding column is a zero scale");
+}

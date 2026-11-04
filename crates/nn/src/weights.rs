@@ -545,6 +545,33 @@ impl ValueLayout {
     }
 }
 
+/// One expert's linear block scales in the 128x4 layout the products read.
+///
+/// The launcher's own `computeSFIndex` (TensorRT-LLM's `fp8Op.h`) written out: rows padded to 128,
+/// scale columns padded to 4, and each `[128, 4]` tile laid out so that a thread block's scales are
+/// contiguous — column groups of four stride 512, thirty-two-row groups stride 16, groups of 128 rows
+/// stride `128 · padded_columns`. The padding is zero, which is a scale of zero on a block that does
+/// not exist.
+fn swizzled_scales(linear: &[u8], rows: u64, blocks: u64) -> Vec<u8> {
+    let padded_rows = rows.div_ceil(128) * 128;
+    let padded_columns = blocks.div_ceil(4) * 4;
+    let mut swizzled = vec![0_u8; (padded_rows * padded_columns) as usize];
+    for row in 0..padded_rows {
+        for column in 0..padded_columns {
+            if row >= rows || column >= blocks {
+                continue;
+            }
+            let index = (column % 4)
+                + (column / 4) * 512
+                + (row % 32) * 16
+                + ((row % 128) / 32) * 4
+                + (row / 128) * (128 * padded_columns);
+            swizzled[index as usize] = linear[(row * blocks + column) as usize];
+        }
+    }
+    swizzled
+}
+
 /// A calibrated NVFP4 matrix, as the `nvfp4_gemm` operator reads it.
 ///
 /// The two weights are the encoded fields of the checkpoint, retained like any other weight; the
@@ -1164,7 +1191,7 @@ impl<'a> WeightLoader<'a> {
         projections: &[&str],
         experts: u32,
         names: Nvfp4Names,
-        values: ValueLayout,
+        values_layout: ValueLayout,
         layout: ScaleLayout,
         input_scale: bool,
     ) -> Result<QuantizedStack> {
@@ -1259,13 +1286,18 @@ impl<'a> WeightLoader<'a> {
                     }
                     Some(_) => {}
                 }
-                let expected = layout.shape(rows_here, columns_here);
+                // The shard's table is the checkpoint's own arrangement — one block scale per
+                // sixteen elements, row-major — and the published one is the deployment's. A
+                // converted export that already holds the padded, interleaved table is refused here
+                // rather than published after a second pass over it.
+                let expected = ScaleLayout::Linear.shape(rows_here, columns_here);
                 if scales.shape != expected {
                     return Err(Error::weight(
                         &scales_name,
                         format!(
-                            "the {layout} block scales of a [{rows_here}, {columns_here}] matrix are \
-                             {:?}, not {:?}",
+                            "a checkpoint's block scales of a [{rows_here}, {columns_here}] matrix \
+                             are linear {:?}, not {:?}: the published {layout} table is this \
+                             loader's to build, not the export's to state",
                             expected.dims(),
                             scales.shape.dims()
                         ),
@@ -1304,15 +1336,15 @@ impl<'a> WeightLoader<'a> {
 
         let rows = rows.unwrap_or(0) * per;
         let columns = columns.unwrap_or(0);
-        let per_expert_scales = layout.shape(rows, columns);
+        let shard_scales = ScaleLayout::Linear.shape(rows, columns);
         let entry = scale_shape.map(|shape: Shape| shape.numel()).unwrap_or(0);
-        if per_expert_scales.numel() != entry * per {
+        if shard_scales.numel() != entry * per {
             return Err(Error::weight(
                 name,
                 format!(
-                    "a {layout} entry for {rows} rows of {columns} elements pads to {} blocks, and \
+                    "a linear entry for {rows} rows of {columns} elements is {} block scales, and \
                      {per} concatenated entries hold {entry} each",
-                    per_expert_scales.numel() / per.max(1)
+                    shard_scales.numel() / per.max(1)
                 ),
             ));
         }
@@ -1321,20 +1353,24 @@ impl<'a> WeightLoader<'a> {
         // once, at load. A product whose A operand is read with `useShuffledMatrix` cannot read a
         // shard's own row order, so a row count that is not a whole number of shuffle blocks has no
         // arrangement at all and is refused by name rather than published in an order nothing reads.
-        if let Some(block) = values.block()
+        if let Some(block) = values_layout.block()
             && !rows.is_multiple_of(block)
         {
             return Err(Error::weight(
                 name,
                 format!(
-                    "a {values:?} arrangement permutes {block}-row blocks, and this stack's                      matrices have {rows} rows"
+                    "a {values_layout:?} arrangement permutes {block}-row blocks, and this stack's                      matrices have {rows} rows"
                 ),
             ));
         }
-        let values_bytes = values.arrange(&values_bytes, count, rows, (columns / 2).max(1));
+        let values_bytes = values_layout.arrange(&values_bytes, count, rows, (columns / 2).max(1));
 
         let values_shape = Shape::new(&[count, rows, columns / 2]);
-        let scales_shape = Shape::new(&[count, per_expert_scales.dim(0), per_expert_scales.dim(1)]);
+        let scales_shape = Shape::new(&[
+            count,
+            layout.shape(rows, columns).dim(0),
+            layout.shape(rows, columns).dim(1),
+        ]);
         // `reciprocals` was collected expert-major, in the checkpoint's own reading order; the
         // published table is projection-major, one packed row per projection.
         let projections_shape = Shape::new(&[per, count]);
@@ -1356,7 +1392,7 @@ impl<'a> WeightLoader<'a> {
             WeightKey {
                 files: files.clone(),
                 dtype: DType::U8,
-                layout: values.layout(),
+                layout: values_layout.layout(),
                 region: WeightRegion {
                     tensors: std::iter::once(format!("{name}__nvfp4_values"))
                         .chain(fields.iter().cloned())
@@ -1372,6 +1408,23 @@ impl<'a> WeightLoader<'a> {
         // The stack's scale type is the checkpoint's own: an E4M3 field stays E4M3, and the model
         // puts it in the descriptor unchanged.
         let scale_dtype = scale_dtype.unwrap_or(DType::U8);
+        // One expert's linear table becomes the published arrangement: rows permuted the way the
+        // values' rows were when the values are shuffled (the scales are read beside the row), then
+        // padded and interleaved when the deployment's kernels read the swizzled 128x4 table.
+        let mut arranged_scales = Vec::with_capacity(scales_shape.numel() as usize);
+        let blocks = ScaleLayout::Linear.columns(columns);
+        for expert in 0..usize::try_from(count).unwrap_or(0) {
+            let entry = &scales_bytes
+                [expert * (rows * blocks) as usize..(expert + 1) * (rows * blocks) as usize];
+            let entry = values_layout.arrange(entry, 1, rows, blocks);
+            match layout {
+                ScaleLayout::Linear => arranged_scales.extend_from_slice(&entry),
+                ScaleLayout::Swizzled128X4 => {
+                    arranged_scales.extend_from_slice(&swizzled_scales(&entry, rows, blocks));
+                }
+            }
+        }
+        let scales_bytes = arranged_scales;
         let scales = self.publish_computed(
             WeightKey {
                 files: files.clone(),
