@@ -151,35 +151,38 @@ impl SwiGlu {
         self.width
     }
 
-    /// `out[r, c] = (value + bias)[r, c] · silu((gate + bias)[r, c])`; all three views are
+    /// `out[r, c] = silu((gate + gate_bias)[r, c]) · (value + value_bias)[r, c]`; the three views are
     /// `[rows, width]`.
+    ///
+    /// The gate comes first, as in [`GatedActivation`], so the two gated activations cannot be read
+    /// one for the other: `gate` is the branch the activation is applied to.
     pub fn forward(
         &self,
         f: &Forward,
-        value: TensorView,
         gate: TensorView,
+        value: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        self.run(f, value, gate, out, None)
+        self.run(f, gate, value, out, None)
     }
 
     /// The same activation, recording each program's largest magnitude into `partials`.
     pub fn forward_absmax(
         &self,
         f: &Forward,
-        value: TensorView,
         gate: TensorView,
+        value: TensorView,
         out: TensorView,
         partials: TensorView,
     ) -> Result<()> {
-        self.run(f, value, gate, out, Some(partials))
+        self.run(f, gate, value, out, Some(partials))
     }
 
     fn run(
         &self,
         f: &Forward,
-        value: TensorView,
         gate: TensorView,
+        value: TensorView,
         out: TensorView,
         partials: Option<TensorView>,
     ) -> Result<()> {
@@ -224,7 +227,8 @@ impl SwiGlu {
     }
 }
 
-/// `out = value · silu(gate)` over one packed `[value, gate]` projection.
+/// `out = silu(gate) · value` over one packed `[value, gate]` projection: the gate half is the one
+/// the activation applies to, as in [`GatedActivation`] and [`SwiGlu`].
 pub struct PackedSwiGlu {
     bias: Option<Weight>,
     absmax: bool,

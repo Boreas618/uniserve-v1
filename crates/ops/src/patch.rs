@@ -72,12 +72,56 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
+    /// A patch mapping, refusing a geometry no latent can have.
+    ///
+    /// A patch is `1×2×2`, so an odd side is not a request this operator can honour: it is a model
+    /// geometry bug, and it is refused here — before a key is composed and a package looked up —
+    /// rather than at launch, so the failure names the caller's geometry instead of arriving as a
+    /// missing kernel.
+    pub fn new(
+        dtype: DType,
+        channels: u32,
+        height: u32,
+        width: u32,
+        mode: Mode,
+        block: u32,
+        pdl: bool,
+    ) -> Result<Self> {
+        if channels == 0
+            || height == 0
+            || width == 0
+            || !height.is_multiple_of(2)
+            || !width.is_multiple_of(2)
+        {
+            return Err(Error::argument(
+                "patch",
+                format!(
+                    "a latent of {channels} channels and {height}×{width} has no 1×2×2 patch \
+                     raster: every side must be nonzero and even"
+                ),
+            ));
+        }
+        Ok(Self {
+            dtype,
+            channels,
+            height,
+            width,
+            mode,
+            block,
+            pdl,
+        })
+    }
+
     /// Values per packed row: `channels · 4`.
     pub fn row_width(&self) -> u64 {
         u64::from(self.channels) * 4
     }
 
     /// Packed rows per frame: `height/2 · width/2`.
+    ///
+    /// A launch's row count is exactly `frames · rows_per_frame()`; a destination with more rows
+    /// would leave its tail untouched, which reads as stale latents rather than as an error, so the
+    /// shape check is an equality and not a lower bound.
     pub fn rows_per_frame(&self) -> u64 {
         u64::from(self.height / 2) * u64::from(self.width / 2)
     }
@@ -247,6 +291,17 @@ mod tests {
         // Only the frame count differs between a 5-frame and a 121-frame request, and the key is
         // the same: the program derives `rows` from it at launch.
         assert_eq!(descriptor(Mode::Patchify), descriptor(Mode::Patchify));
+    }
+
+    #[test]
+    fn an_odd_side_is_refused_before_a_key_is_composed() {
+        // A canvas side is a multiple of 32 and a latent side is that over 16, so every raster a
+        // request can produce is even. An odd one is a geometry bug, refused here rather than
+        // arriving later as a missing kernel.
+        assert!(Descriptor::new(DType::BF16, 24, 48, 48, Mode::Patchify, BLOCK, false).is_ok());
+        assert!(Descriptor::new(DType::BF16, 24, 48, 21, Mode::Patchify, BLOCK, false).is_err());
+        assert!(Descriptor::new(DType::BF16, 24, 21, 48, Mode::Patchify, BLOCK, false).is_err());
+        assert!(Descriptor::new(DType::BF16, 0, 48, 48, Mode::Patchify, BLOCK, false).is_err());
     }
 
     #[test]

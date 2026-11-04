@@ -180,6 +180,7 @@ pub struct HostTensor {
 /// root with a shard set of its own is flat and behaves as it always has, and a root without one is
 /// read as the components its subdirectories hold.
 pub struct Checkpoint {
+    root: PathBuf,
     files: Vec<CheckpointFile>,
     tensors: BTreeMap<String, TensorLocation>,
     components: BTreeMap<String, Checkpoint>,
@@ -261,6 +262,7 @@ impl Checkpoint {
         }
 
         Ok(Self {
+            root: root.to_path_buf(),
             files,
             tensors: locations,
             components: BTreeMap::new(),
@@ -299,13 +301,22 @@ impl Checkpoint {
             });
         }
         Ok(Self {
+            root: root.to_path_buf(),
             files: Vec::new(),
             tensors: BTreeMap::new(),
             components,
         })
     }
 
-    /// Whether this is a pipeline root rather than one shard set.
+    /// The directory this checkpoint was opened with.
+    ///
+    /// A pipeline's components are opened under it, so a model's `load()` can reach each component
+    /// without a second copy of the path being threaded through the engine.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether this checkpoint is a pipeline of components rather than one model's shards.
     pub fn is_pipeline(&self) -> bool {
         !self.components.is_empty()
     }

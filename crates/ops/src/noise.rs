@@ -21,6 +21,14 @@
 //! yields; the normal's arithmetic is single precision, and the result rounds once into the output's
 //! type.
 //!
+//! A draw may also start at an **element offset** into that stream: the reference draws every
+//! condition, the video latent and the audio latent through one Philox stream, so a shard that owns
+//! part of a request's elements addresses the stream at the global flat index it starts at. An
+//! element index is `offset + i`, which means an odd offset is legal: it draws the high half of a
+//! word first, and there is no alignment rule to violate. Two draws at adjacent offsets reproduce
+//! one longer draw, which is what lets a rank draw its own slice and the batch still be the same
+//! stream.
+//!
 //! The key is the request's, and it arrives in one of two forms. **Rows** gives one i64 key per row,
 //! so a batch draws one independent stream per request. **Scalar** gives one `u64` key for the whole
 //! draw and addresses the buffer flattened: `pair = flat element index / 2`, so a value is a pure
@@ -126,6 +134,14 @@ pub struct NoiseArgs {
     pub stage: u32,
     /// The draw index within the token and stage.
     pub draw: u32,
+    /// The element of the stream the draw starts at: element `i` of this call is element
+    /// `offset + i` of the request's stream.
+    ///
+    /// Under `KeySource::Scalar` it is the flat index into the whole request's draw; under
+    /// `KeySource::Rows` it is the index within each row, so a row sharded across ranks starts each
+    /// piece at its own offset. An odd offset is legal: the first element then takes the high half
+    /// of a Philox word.
+    pub offset: u64,
 }
 
 /// Standard normal noise addressed by (key, element).
@@ -184,7 +200,9 @@ impl Op for PhiloxNoise {
             .u32(args.stage)
             .u32(args.draw)
             // Last, so the per-row form's leading arguments are the ones it always had.
-            .u64(args.key);
+            .u64(args.key)
+            // And the offset after it: an existing package that reads neither is correct at 0.
+            .u64(args.offset);
         kernel.launch(plan.grid, &mut arguments, stream)
     }
 
@@ -206,6 +224,17 @@ impl Op for PhiloxNoise {
             NoiseKind::Uniform => Tolerance::exact(),
         }
     }
+}
+
+/// The Philox word an element of a draw falls in, and which half of it: element `index` of a draw
+/// that starts at `offset` is element `offset + index` of the request's stream.
+///
+/// One program indexes one element by this, so an odd offset draws the high half of a word first and
+/// two draws at adjacent offsets reproduce one longer draw. It is the host statement of the rule the
+/// kernel program applies, and the tests below pin it to the chained-stream property.
+pub const fn word_and_half(offset: u64, index: u64) -> (u64, u32) {
+    let element = offset + index;
+    (element / 2, (element % 2) as u32)
 }
 
 /// How one launch addresses the draw: where the keys are, how many elements it covers and the grid.
@@ -304,7 +333,50 @@ mod tests {
             key,
             stage: 0,
             draw: 0,
+            offset: 0,
         }
+    }
+
+    #[test]
+    fn an_element_offset_zeroes_the_addressing_it_already_had() {
+        // A draw with no offset addresses the stream exactly as before: element i is the low half of
+        // word i/2 for even i and the high half for odd i.
+        for index in 0..8_u64 {
+            assert_eq!(word_and_half(0, index), (index / 2, (index % 2) as u32));
+        }
+    }
+
+    #[test]
+    fn a_draw_at_an_offset_is_the_slice_of_one_longer_draw() {
+        // The chained-stream property, for an even and an odd start: element i of a draw at offset k
+        // addresses the same word and half as element k + i of a draw at zero.
+        for offset in [6_u64, 7] {
+            for index in 0..5_u64 {
+                assert_eq!(
+                    word_and_half(offset, index),
+                    word_and_half(0, offset + index),
+                    "offset {offset}, element {index}"
+                );
+            }
+        }
+        // And an odd offset really does start mid-word rather than rounding down.
+        assert_eq!(word_and_half(7, 0), (3, 1));
+        assert_eq!(word_and_half(6, 0), (3, 0));
+    }
+
+    #[test]
+    fn two_draws_at_adjacent_offsets_are_one_draw() {
+        // A rank draws its own slice of one stream: video at 0..n, then audio at n.., equals the
+        // concatenated draw element for element.
+        let video = 5_u64;
+        let drawn: Vec<(u64, u32)> = (0..video)
+            .map(|index| word_and_half(0, index))
+            .chain((0..4).map(|index| word_and_half(video, index)))
+            .collect();
+        let one: Vec<(u64, u32)> = (0..video + 4)
+            .map(|index| word_and_half(0, index))
+            .collect();
+        assert_eq!(drawn, one);
     }
 
     #[test]

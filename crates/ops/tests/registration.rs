@@ -32,6 +32,25 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// Every `.md` and `.txt` file under `dir`, recursively: the notes the programs swarm reads.
+fn documents(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("{}: {error}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            documents(&path, out)?;
+        } else if path
+            .extension()
+            .is_some_and(|suffix| suffix == "md" || suffix == "txt")
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// The module names the source declares with a `mod` line.
 fn module_name(line: &str) -> Option<String> {
     let rest = line
@@ -112,6 +131,37 @@ fn every_declared_operator_is_registered_by_name() -> Result<(), String> {
         "the install table and the crate's operators disagree:\n  \
          declared but not registered: {unregistered:?}\n  \
          registered but not declared: {unknown:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn every_installed_operator_is_documented_for_the_programs() -> Result<(), String> {
+    // `notes/programs/*.md` is what the `programs` swarm builds a package from: an operator with no
+    // row there is a signature nobody can compile against. The check reads the repository's notes,
+    // and a build of this crate outside the repository has none to compare with.
+    let notes = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../notes/programs");
+    if !notes.is_dir() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    documents(&notes, &mut files)?;
+    let mut text = String::new();
+    for file in &files {
+        text.push_str(
+            &fs::read_to_string(file).map_err(|error| format!("{}: {error}", file.display()))?,
+        );
+        text.push('\n');
+    }
+
+    let undocumented: Vec<&str> = ops::operators()
+        .iter()
+        .copied()
+        .filter(|name| !text.contains(&format!("`{name}`")))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "installed but documented in none of notes/programs/*.md: {undocumented:?}"
     );
     Ok(())
 }
