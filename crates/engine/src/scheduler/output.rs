@@ -12,8 +12,8 @@
 //! accepted progress (cursors, encoder indices, denoising steps, phase) by the
 //! time `resolve` runs.
 
-use crate::scheduler::completion::CallCompletion;
 use super::*;
+use crate::scheduler::completion::CallCompletion;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::kv_cache::manager::AttentionManager;

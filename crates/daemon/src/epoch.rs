@@ -1137,14 +1137,23 @@ impl FilledPrograms {
         let mut kernels = BTreeMap::new();
         let attention = attention_programs(config);
         kernels.extend(attention);
-        kernels.insert(
-            KernelKey::all(operators::EXPERT_EXCHANGE),
-            Program {
-                backend: word(&config.moe_config.exchange),
-                revision: 0,
-                arguments: toml::Table::new(),
-            },
-        );
+        // The exchange slot is filled only when the deployment spreads its
+        // experts over ranks. At one rank the model's MoE block takes its local
+        // arm and launches no exchange at all (`nn::Moe::forward` routes
+        // through `forward_expert_parallel` only when an expert lives on
+        // another rank), so a slot filled here would pin a program no call
+        // reaches — and, worse, the Program Server would refuse the epoch for a
+        // package nothing runs.
+        if config.moe_config.expert_parallel {
+            kernels.insert(
+                KernelKey::all(operators::EXPERT_EXCHANGE),
+                Program {
+                    backend: word(&config.moe_config.exchange),
+                    revision: 0,
+                    arguments: toml::Table::new(),
+                },
+            );
+        }
         if let Some(backend) = &config.moe_runner_backend {
             // The grouped expert GEMM is two operators, gather and route,
             // and one program backend fills both (§9).
@@ -1168,7 +1177,52 @@ impl FilledPrograms {
             },
         }
     }
+
+    /// Refuses a program the deployment left at `auto`, naming the option that
+    /// would state it.
+    ///
+    /// A program is selected by its backend's name: a Program Server holds its
+    /// packages under `(operator, backend, revision)` and answers `Latest` by
+    /// that name alone, so `auto` resolves at no server — it is a
+    /// configuration literal, not a package. A deployment that leaves one of
+    /// these at `auto` has not said which program it means, and the refusal
+    /// says so here rather than as a missing package later.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the option to state for the first program left at `auto`.
+    pub fn stated(&self) -> Result<(), String> {
+        let option = |key: &KernelKey| match key.op.as_str() {
+            operators::PAGED_ATTENTION => "attention_backend",
+            operators::EXPERT_EXCHANGE => "moe_config.exchange",
+            operators::GATHER_GEMM | operators::ROUTE_GEMM => "moe_runner_backend",
+            _ => "the option that names its backend",
+        };
+        for (key, program) in &self.kernels {
+            if program.backend == AUTO_BACKEND {
+                return Err(format!(
+                    "the deployment leaves {} at `{AUTO_BACKEND}`, and a program is selected by \
+                     its backend's name: state the backend this deployment means (§5.1) — the \
+                     operator `{}` is filled by the package of that name at the Program Server",
+                    option(key),
+                    key.op
+                ));
+            }
+        }
+        if self.policy.backend == AUTO_BACKEND {
+            return Err(format!(
+                "the deployment leaves scheduler_config.policy at `{AUTO_BACKEND}`, and a \
+                 program is selected by its backend's name: state the scheduling policy this \
+                 deployment serves (§5.1, §7.7)"
+            ));
+        }
+        Ok(())
+    }
 }
+
+/// The backend name `auto`: a choice the deployment has not made yet, which no
+/// Program Server holds a package under.
+const AUTO_BACKEND: &str = "auto";
 
 /// The attention operator's programs: one entry for every phase when the
 /// per-phase backends differ, or a single entry whose phase is `None` when
@@ -2032,22 +2086,35 @@ mod tests {
         let config = ServeConfig::default();
         let programs = FilledPrograms::of(&config);
 
-        // One attention program for every phase, the expert exchange's
-        // backend, and no grouped expert GEMM until the configuration names
-        // one: prepare resolves it (§5.1).
+        // One attention program for every phase, and no expert exchange for a
+        // deployment whose experts all live on one rank: the model's MoE block
+        // takes its local arm and launches no exchange, so the slot is absent
+        // rather than filled with a program nothing calls (§5.1, §9). No
+        // grouped expert GEMM either, until the configuration names one.
         let attention = &programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)];
         assert_eq!(attention.backend, "auto");
         assert_eq!(attention.revision, 0, "no revision before prepare");
-        assert_eq!(
-            programs.kernels[&KernelKey::all(operators::EXPERT_EXCHANGE)].backend,
-            "alltoall"
-        );
-        for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
+        for operator in [
+            operators::EXPERT_EXCHANGE,
+            operators::GATHER_GEMM,
+            operators::ROUTE_GEMM,
+        ] {
             assert!(
                 !programs.kernels.contains_key(&KernelKey::all(operator)),
                 "an operator the configuration does not fill is absent"
             );
         }
+
+        // A deployment that spreads its experts over ranks does route through
+        // the exchange, and the slot states the backend its configuration
+        // names.
+        let mut parallel = ServeConfig::default();
+        parallel.moe_config.expert_parallel = true;
+        let programs = FilledPrograms::of(&parallel);
+        assert_eq!(
+            programs.kernels[&KernelKey::all(operators::EXPERT_EXCHANGE)].backend,
+            "alltoall"
+        );
 
         // The scheduling program's backend is the policy's name, and its
         // parameters are the values §7.7 assigns to it, as TOML strings.
@@ -2142,6 +2209,29 @@ mod tests {
                 "cutlass"
             );
         }
+    }
+
+    /// A program is selected by its backend's name, and `auto` names no
+    /// package: a deployment that leaves a program at `auto` is refused here,
+    /// with the option that states it, rather than at a Program Server that
+    /// has no such package (§5.1).
+    #[test]
+    fn a_program_left_at_auto_is_refused_by_the_option_that_states_it() {
+        let refused = FilledPrograms::of(&ServeConfig::default())
+            .stated()
+            .expect_err("the default attention backend is a choice, not a package");
+        assert!(
+            refused.contains("attention_backend") && refused.contains("auto"),
+            "{refused}"
+        );
+
+        let mut stated = ServeConfig::default();
+        stated.attention_backend = "trtllm".to_owned();
+        stated.moe_config.expert_parallel = true;
+        stated.moe_config.exchange = proto::request::ExpertExchange::AllToAll;
+        FilledPrograms::of(&stated)
+            .stated()
+            .expect("every program this deployment fills has a backend's name");
     }
 
     /// The update keeps the first failure it meets, not the last, and a

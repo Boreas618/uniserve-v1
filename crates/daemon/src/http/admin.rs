@@ -122,11 +122,7 @@ impl Admin {
     /// `retire`.
     ///
     pub(crate) fn new(shutdown: CancellationToken, retire: Arc<AtomicBool>) -> Arc<Self> {
-        Self::with_epochs(
-            shutdown,
-            retire,
-            Arc::new(crate::epoch::Epochs::new()),
-        )
+        Self::with_epochs(shutdown, retire, Arc::new(crate::epoch::Epochs::new()))
     }
 
     /// An admin over `epochs`, the records the node's leader keeps: there is

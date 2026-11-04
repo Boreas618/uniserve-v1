@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use engine::{PolicyProgram, PolicyReverted, ProcessLink};
 use proto::process::{
-    self, downstream, event, upstream, Command, Downstream, Event, Hello, Upstream, Welcome,
+    self, Command, Downstream, Event, Hello, Upstream, Welcome, downstream, event, upstream,
 };
 use proto::{Connection, Listener};
 
@@ -245,7 +245,9 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
     assert!(
         matches!(
             reports[0].kind,
-            Some(process::report::Kind::Switched(process::Switched { generation: 3 }))
+            Some(process::report::Kind::Switched(process::Switched {
+                generation: 3
+            }))
         ),
         "the switchover's report arrived first"
     );

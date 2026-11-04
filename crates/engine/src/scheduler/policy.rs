@@ -153,9 +153,10 @@ fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T
     let failure = |error: String| PolicyError::Load {
         message: format!("the policy argument `{name} = {value}` does not parse: {error}"),
     };
-    let parsed: toml::Value = value.trim().parse().map_err(|error: toml::de::Error| {
-        failure(error.to_string())
-    })?;
+    let parsed: toml::Value = value
+        .trim()
+        .parse()
+        .map_err(|error: toml::de::Error| failure(error.to_string()))?;
     parsed
         .try_into()
         .map_err(|error: toml::de::Error| failure(error.to_string()))
@@ -1967,7 +1968,10 @@ mod tests {
         assert_eq!(server.backend, "fcfs");
         assert_eq!(server.revision, 7);
         assert_eq!(server.arguments["max_batch"].as_integer(), Some(16));
-        assert_eq!(server.arguments["timeout"].as_integer(), Some(5_000_000_000));
+        assert_eq!(
+            server.arguments["timeout"].as_integer(),
+            Some(5_000_000_000)
+        );
         assert_eq!(server.arguments.len(), 2);
     }
 

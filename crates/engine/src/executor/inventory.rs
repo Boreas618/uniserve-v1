@@ -480,8 +480,7 @@ mod tests {
             components(&[("text", &[0])]),
             8192,
         );
-        let error =
-            ExecutorInfo::from_inventory(&[narrow, wide]).expect_err("two pools disagree");
+        let error = ExecutorInfo::from_inventory(&[narrow, wide]).expect_err("two pools disagree");
         let named = format!("{error:#}");
         assert!(
             named.contains("pool media") && named.contains("pool text"),
