@@ -1,6 +1,6 @@
 //! Launch descriptor resolution.
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use serde_json::{Value, json};
 use worker::config::{Device, WorkerLaunch, resolve};
 

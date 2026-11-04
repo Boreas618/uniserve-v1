@@ -73,7 +73,7 @@ use ::storage::{
     Access, Client, GpuLedger, Key, Placement, Role, Scope, StorageRecord, TensorRecord,
 };
 use anyhow::{Context, bail, ensure};
-use cuda::{DeviceAllocation, DeviceAttribute, DeviceId};
+use platform::{DeviceAllocation, DeviceAttribute, DeviceId};
 use rustix::event::{PollFd, PollFlags, poll};
 
 /// The budget a restored link regains per second, as a share of its

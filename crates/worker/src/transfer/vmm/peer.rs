@@ -8,7 +8,7 @@
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
+use platform::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
 
 use super::grants::{DescriptorGrants, EXPORT_NAME_BYTES};
 use super::handle::AllocationHandle;
