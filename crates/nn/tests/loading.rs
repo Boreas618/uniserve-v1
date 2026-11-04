@@ -831,3 +831,178 @@ fn an_export_over_a_base_shadows_per_tensor_across_roots() {
     assert_eq!(single.root(), export.as_path());
     assert!(single.component("text_encoder").is_err());
 }
+
+/// A name neither root holds is refused with the tensor and the roots, in precedence order: in a
+/// union spanning an export and a base, a bare "not found" is the report that costs an hour.
+#[test]
+fn a_missing_tensor_in_a_union_names_the_roots_it_searched() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let base = root.join("base");
+    let export = root.join("export");
+    for dir in [&base, &export] {
+        std::fs::create_dir_all(dir.join("transformer")).unwrap();
+        shard(
+            &dir.join("transformer"),
+            "model.safetensors",
+            &[("weight", vec![1], bf16(&[1.0]))],
+        );
+    }
+
+    let unioned = Checkpoint::open_roots(&[&export, &base]).unwrap();
+    let text = match unioned.read("layers.0.mlp.experts.0.up_proj.weight") {
+        Ok(_) => panic!("neither root holds that tensor"),
+        Err(error) => format!("{error}"),
+    };
+    assert!(
+        text.contains("layers.0.mlp.experts.0.up_proj.weight"),
+        "{text}"
+    );
+    let export_at = text.find("export").expect("the export is named");
+    let base_at = text.find("base").expect("the base is named");
+    assert!(
+        export_at < base_at,
+        "precedence order is the export's first: {text}"
+    );
+}
+
+/// Write a shard whose header is written by hand, so the test can name a dtype the safetensors
+/// crate's own `Dtype` cannot express — which is the whole reason the library reads headers itself.
+fn shard_with_header(dir: &Path, name: &str, header: &str, payload: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(payload);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// A calibrated checkpoint's header names FP8 and FP4 dtypes, which `safetensors` 0.3.3's `Dtype`
+/// has no variants for: the library reads the header itself and maps the format's names onto the
+/// types our operators speak, with the offsets the payload actually has.
+#[test]
+fn a_header_naming_fp8_and_fp4_opens_with_those_types() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    // Four tensors, laid out back to back: 16 packed bytes, 4 block scales, 2 bytes, 4 bf16s.
+    let payload: Vec<u8> = (0..48).map(|byte| byte as u8).collect();
+    let header = concat!(
+        r#"{"__metadata__":{"format":"pt"},"#,
+        r#""packed":{"dtype":"F4_E2M1","shape":[2,8],"data_offsets":[0,16]},"#,
+        r#""scales":{"dtype":"F8_E4M3","shape":[4],"data_offsets":[16,20]},"#,
+        r#""pair":{"dtype":"U8","shape":[2],"data_offsets":[20,22]},"#,
+        r#""weight":{"dtype":"BF16","shape":[2],"data_offsets":[22,26]}}"#
+    );
+    shard_with_header(root, "model.safetensors", header, &payload);
+
+    let checkpoint = Checkpoint::open(root).unwrap();
+    let packed = checkpoint.read("packed").unwrap();
+    assert_eq!(packed.dtype, DType::F4E2M1);
+    assert_eq!(packed.shape.dims(), &[2, 8]);
+    assert_eq!(packed.bytes, payload[0..16]);
+    let scales = checkpoint.read("scales").unwrap();
+    assert_eq!(scales.dtype, DType::F8E4M3);
+    assert_eq!(scales.bytes, payload[16..20]);
+    assert_eq!(checkpoint.read("pair").unwrap().dtype, DType::U8);
+    let weight = checkpoint.read("weight").unwrap();
+    assert_eq!(weight.dtype, DType::BF16);
+    assert_eq!(weight.bytes, payload[22..26]);
+}
+
+/// A dtype name the operator ABI has no type for is refused by name at open, not read as something
+/// it is not, and neither is an offset the payload cannot hold.
+#[test]
+fn a_header_the_abi_cannot_express_is_refused_by_name() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let payload = vec![0u8; 4];
+    shard_with_header(
+        root,
+        "model.safetensors",
+        r#"{"flag":{"dtype":"BOOL","shape":[1],"data_offsets":[0,1]}}"#,
+        &payload,
+    );
+    let text = match Checkpoint::open(root) {
+        Ok(_) => panic!("BOOL has no operator ABI type"),
+        Err(error) => format!("{error}"),
+    };
+    assert!(text.contains("BOOL"), "{text}");
+    assert!(text.contains("flag"), "the tensor is named too: {text}");
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    shard_with_header(
+        root,
+        "model.safetensors",
+        r#"{"weight":{"dtype":"BF16","shape":[8],"data_offsets":[0,64]}}"#,
+        &payload,
+    );
+    let text = match Checkpoint::open(root) {
+        Ok(_) => panic!("the payload is four bytes"),
+        Err(error) => format!("{error}"),
+    };
+    assert!(text.contains("claims bytes"), "{text}");
+}
+
+/// A real NVFP4 export stores its block scales as `F8_E4M3`, one byte per sixteen elements: the
+/// loader publishes exactly that type and does not require `U8`, which was a fixture's habit.
+#[test]
+fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut payload: Vec<u8> = Vec::new();
+    let mut header = String::from("{");
+    let mut offset = 0_u64;
+    for expert in 0..2 {
+        for projection in ["up", "gate"] {
+            let stem = format!("experts.{expert}.{projection}_proj");
+            for (suffix, dtype, bytes) in [
+                (".weight", "U8", 64_u64),
+                (".weight_scale", "F8_E4M3", 8),
+                (".weight_scale_2", "F32", 4),
+            ] {
+                payload.extend(std::iter::repeat_n(0x3c_u8, bytes as usize));
+                header.push_str(&format!(
+                    r#""{stem}{suffix}":{{"dtype":"{dtype}","shape":{},"data_offsets":[{offset},{}]}},"#,
+                    match suffix {
+                        ".weight" => "[2, 32]".to_owned(),
+                        ".weight_scale" => "[2, 4]".to_owned(),
+                        _ => "[1]".to_owned(),
+                    },
+                    offset + bytes,
+                ));
+                offset += bytes;
+                if suffix == ".weight_scale_2" {
+                    // A positive tensor scale: the fixture writes `0x3c3c3c3c`, a small positive f32.
+                    let start = payload.len() - 4;
+                    payload[start..].copy_from_slice(&0.5f32.to_le_bytes());
+                }
+            }
+        }
+    }
+    header.pop();
+    header.push('}');
+    shard_with_header(root, "model.safetensors", &header, &payload);
+
+    let checkpoint = Checkpoint::open(root).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let stack = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up_gate",
+            "experts",
+            &["up", "gate"],
+            2,
+            ops::fp4::ScaleLayout::Linear,
+        )
+        .unwrap();
+    assert_eq!(
+        stack.scales.dtype(),
+        DType::F8E4M3,
+        "the checkpoint's scale type is published unchanged"
+    );
+    assert_eq!(stack.values.dtype(), DType::U8);
+    assert_eq!(stack.scales.shape().dims(), &[2, 4, 4]);
+    assert_eq!(stack.global_scale.shape().dims(), &[2, 2]);
+}
