@@ -11,6 +11,9 @@
 //! - `request`: the server engine's `RequestStats`, once for each request an
 //!   scheduler accepted, when the request ends; the server's `StatsLogger`
 //!   reads its prompt and generation token counters.
+//! - `memory`: the main process's `Metrics.memory`, once a second while it
+//!   serves (`record_device_memory`): each device's allocator budget and the
+//!   bytes each of its pools has mapped.
 //!
 //! Every metric field is a `prometheus-client` handle whose clones share their
 //! underlying state, so updates through a field reach the clone held by the
@@ -30,11 +33,13 @@ use prometheus_client::registry::Registry;
 
 mod api_server;
 pub(crate) mod log_stats;
+mod memory;
 mod request;
 mod scheduler;
 pub(crate) mod stats;
 
 pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
+pub use memory::{DeviceLabels, MemoryMetrics, PoolLabels};
 pub use request::{FinishedReasonLabels, RequestMetrics};
 pub use scheduler::{
     EngineBackendLabels, EngineBlockingLabels, EngineComponentLabels, EngineDomainKindLabels,
@@ -129,6 +134,8 @@ pub struct Metrics {
     pub request: RequestMetrics,
     /// HTTP transport metric families.
     pub api_server: ApiServerMetrics,
+    /// Each device's allocator budget and the bytes its pools have mapped.
+    pub memory: MemoryMetrics,
 }
 
 impl Metrics {
@@ -138,12 +145,14 @@ impl Metrics {
         let scheduler = SchedulerMetrics::register(&mut registry);
         let request = RequestMetrics::register(&mut registry);
         let api_server = ApiServerMetrics::register(&mut registry);
+        let memory = MemoryMetrics::register(&mut registry);
 
         Self {
             registry,
             scheduler,
             request,
             api_server,
+            memory,
         }
     }
 

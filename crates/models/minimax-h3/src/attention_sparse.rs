@@ -13,6 +13,13 @@ use crate::{Error, Result};
 /// False until `vsa_compress_pooled` exists: the reference's branch 3 is a dense masked softmax over
 /// live tiles, and the placeholder in [`Sparse::forward`] is not it. Flipping this to true is part of
 /// the same commit that swaps the call, so the two can never disagree.
+///
+/// The op has two requirements the placeholder would hide, both from the design's kernel table
+/// (`specs/worker.md` 9, the FP32-attention row): the score matrix is a **product** of pooled queries
+/// and pooled keys, so it is a matmul rather than a reduction, and the softmax and the pooling run in
+/// **FP32** - only the rows it writes are rounded to the checkpoint's dtype. A BF16 compression would
+/// pass every shape check and differ from the reference in the branch that the sparse checkpoints
+/// lean on most.
 pub const COMPRESSION_COMPOSED: bool = false;
 
 /// One layer's sparse attention: four projections, the tile preparation, and both attentions.

@@ -35,8 +35,8 @@ pub mod input;
 mod interference;
 mod leader;
 pub mod metrics;
-pub mod model;
 pub mod migration;
+pub mod model;
 pub mod openai;
 pub mod options;
 pub mod output;
@@ -48,12 +48,12 @@ pub mod supervision;
 pub(crate) mod test_support;
 // The epoch layer lands beside `worlds`, which commit C deletes; nothing drives
 // the switch until the update layer that owns it lands too.
+pub mod observe;
 #[allow(
     dead_code,
     reason = "the switch lands before the update layer that drives it"
 )]
 pub(crate) mod updates;
-pub mod worlds;
 
 // The application layer's lowest modules are `crates/frontend`'s while the
 // application still serves inside the daemon (delivery item 2, stage A).

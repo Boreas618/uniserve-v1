@@ -537,16 +537,79 @@ pub struct Latents {
     pub audio: Option<TensorView>,
 }
 
+/// Where a piece of raw media anchors in the generated clip.
+///
+/// The reference's three roles, in the order the packed conditioning writes them: first-frame
+/// anchors, last-frame anchors, then references.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaRole {
+    /// Anchors the first generated frame.
+    FirstFrame,
+    /// Anchors the last generated frame.
+    LastFrame,
+    /// A reference the request describes.
+    Reference,
+}
+
+/// One piece of raw media a request's conditions are built from.
+///
+/// This is what [`Denoiser::prepare_conditioning`] encodes when the model owns its condition
+/// encoders: pixels before they are latents, samples before they are rows. A task with no conditions
+/// passes an empty slice.
+#[derive(Clone, Copy)]
+pub struct MediaInput {
+    /// Where the piece anchors, which decides where its rows sit in the packed conditioning.
+    pub role: MediaRole,
+    /// The packed rows the layout reserves for the piece's visual condition, as the request's own
+    /// layout counted them: one row per `1×2×2` patch of its latent baked.
+    ///
+    /// The conditioner checks the encoder's output against this rather than recomputing it. The
+    /// packing that the request was laid out under is the one statement of the arithmetic; a second
+    /// statement in the encoder's caller is how two counts of one thing drift apart.
+    pub rows: u32,
+    /// The packed rows the layout reserves for the piece's soundtrack, in the same sense.
+    pub audio_rows: u32,
+    /// `[channels, frames, height, width]` pixels, in the encoder's own channel order and
+    /// normalisation, when the condition is visual. One frame for a still, which is one latent
+    /// frame.
+    pub pixels: Option<TensorView>,
+    /// Samples in the encoder's shape, when the condition carries a soundtrack.
+    pub audio: Option<TensorView>,
+    /// The condition's anchoring draw: `[channels, frames, height, width]` at the piece's own latent
+    /// raster, FP32, when the piece is visual.
+    ///
+    /// The runner owns it, as it owns every draw of the request's noise stream - and it is drawn at
+    /// latent resolution, so the conditioner patchifies it rather than reading rows.
+    pub noise: Option<TensorView>,
+}
+
 /// What a denoiser conditions on at a step.
 ///
 /// The rows of every view follow the order the layout reserves: the encoded text first, then the
 /// request's conditions in the order `VideoRequest` counts them (first-frame anchors, last-frame
-/// anchors, references). A model that needs the roles reads them from the request it laid out, not
-/// from this value, so nothing request-shaped crosses the boundary.
+/// anchors, references).
+///
+/// The one request-shaped thing that crosses here is [`Conditioning::media`], the raw media a
+/// conditioner encodes. It has to: [`Denoiser::prepare_conditioning`] runs once per request, before
+/// any capture, where no request reaches it, and condition rows cannot be built from views that are
+/// already latents. Everything else a request carries stays out.
 #[derive(Clone, Copy)]
 pub struct Conditioning<'a> {
     /// `[rows, width]` encoded text.
     pub text: TensorView,
+    /// `[rows, width]` the text encoder's own features, when the model has a conditioner between the
+    /// encoder and the denoiser: [`Denoiser::prepare_conditioning`] folds this into `text`.
+    ///
+    /// Both buffers are the runner's, sized to the request's text capacity, and the conditioner runs
+    /// in place over `text`. `None` when the model has no conditioner, or for a task whose
+    /// conditioning is nothing but the encoder's features.
+    pub source: Option<TensorView>,
+    /// The raw media the request's conditions are built from, in the request's own order.
+    ///
+    /// [`Denoiser::prepare_conditioning`] encodes these and writes the condition rows of `text`;
+    /// empty when the task has no conditions, which is every `t2va` request. The runner owns the
+    /// buffers and the encoders' arena is its own forward, reset after the call.
+    pub media: &'a [MediaInput],
     /// `[rows, …]` encoded reference media, when the task has references.
     pub images: Option<TensorView>,
     /// `[rows, …]` encoded reference audio, when the task has audio references.
@@ -634,6 +697,21 @@ pub trait Denoiser {
     /// Fold `cond` into the latents the schedule starts from.
     fn prepare_latents<'a>(&self, f: &Forward, cond: Conditioning<'a>, out: Latents) -> Result<()>;
 
+    /// Fold the conditioner's output into `cond.text`, before the request's first evaluation.
+    ///
+    /// The executor calls this once per request, before it captures anything and outside a captured
+    /// replay: the launches are captured with everything else, so the forward must be capture-safe -
+    /// no host read, no synchronization, no allocation. `cond.source` is the buffer the conditioner
+    /// reads; `cond.text` is written in place over its own rows.
+    ///
+    /// The default does nothing: a model whose text encoder's features are everything its denoiser
+    /// reads has no conditioner. A model that has one overrides this, and leaves
+    /// [`Self::denoise`] reading `cond.text` alone.
+    fn prepare_conditioning(&self, f: &Forward, cond: Conditioning<'_>) -> Result<()> {
+        let _ = (f, cond);
+        Ok(())
+    }
+
     /// One denoising step: update `latents` in place with the model's velocity.
     fn denoise<'a>(
         &self,
@@ -694,6 +772,27 @@ pub trait Denoiser {
     fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> Result<()>;
 }
 
+/// One clip's place on a timeline, as the runner states it.
+///
+/// A decoder decodes one clip and stops; the clip's frames become the request's video only once they are
+/// placed, faded where they overlap the clip before them. These three numbers are what the runner knows
+/// and the model does not: how many of the clip's frames the timeline keeps, how many of those fade against
+/// the predecessor, and where the first kept frame goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Splice {
+    /// The frames of the clip's own decode the timeline keeps, counted from the clip's first frame.
+    ///
+    /// A clip a successor follows keeps the frames before its tail; the clip that ends the timeline keeps
+    /// its tail too, so this is the larger number for the last clip.
+    pub keep: u32,
+    /// How many of the kept frames fade against the predecessor, counted at the end of `keep`.
+    ///
+    /// Zero for the timeline's first clip, which has nothing to fade against.
+    pub overlap: u32,
+    /// The destination frame index of the clip's first kept frame.
+    pub first: u32,
+}
+
 /// A decoder that turns latents back into media.
 pub trait Decoder {
     /// The tables a decode of `layout` reads, in [`Self::prepare_layout`]'s order.
@@ -719,6 +818,28 @@ pub trait Decoder {
         state: &[TensorView],
         out: DecodedMedia,
     ) -> Result<()>;
+
+    /// Place one decoded clip on the timeline, fading it against its predecessor.
+    ///
+    /// `clip` is the clip's decoded raster; `previous` is the predecessor's own decode of the frames the
+    /// two share, absent for the timeline's first clip; `out.video` is the whole timeline's raster, which
+    /// the splice writes at `splice.first`. A decoder that decodes one clip and knows nothing of timelines
+    /// leaves this default, which refuses by the block kind's name so a runner that splices with the wrong
+    /// block hears which kind it called.
+    fn splice(
+        &self,
+        f: &Forward,
+        previous: Option<TensorView>,
+        clip: TensorView,
+        splice: Splice,
+        out: DecodedMedia,
+    ) -> Result<()> {
+        let _ = (f, previous, clip, splice, out);
+        Err(Error::shape(
+            "Decoder",
+            "this decoder splices no clips".to_owned(),
+        ))
+    }
 }
 
 /// An autoregressive token model.

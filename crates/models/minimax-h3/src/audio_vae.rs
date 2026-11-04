@@ -33,7 +33,9 @@ use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
 };
 use nn::weights::WeightRequest;
-use nn::{DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader};
+use nn::{
+    DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader,
+};
 
 /// One upsampling stage of the decoder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -331,6 +333,64 @@ impl Pcm {
     }
 }
 
+/// Every buffer one audio decode takes from `Forward::arena()`, in reservation order.
+///
+/// The decoder's `forward` reserves: the restoring and projecting pair, the input convolution's output,
+/// then per stage the upsampled signal, the running sum, and **one** set of four buffers the stage's three
+/// blocks take turns in (the block's running value, its two convolution outputs and the second's residual).
+/// The post activation's output and the mono signal the PCM step reads close the list. `frames` is the
+/// request's latent frame count, so every length grows by the rates.
+///
+/// The list matters because the arena never rewinds - its only rewind is the executor's per-forward
+/// `reset` - so every reservation in this walk accumulates and the sum is what a request needs. It is
+/// therefore large: at 207 latent frames each buffer of stages one to six is `[2, c, L]` with `c · L` near
+/// 1.32 M, about 10.6 MB, so those six stages carry most of the total against 0.12 GiB of weights. The
+/// remaining reduction is the shape-family one - `c · L` is within a factor of the patch area across the
+/// stages, so a set sized for the largest and viewed per stage would serve all seven - and it would make
+/// the plan a *bound* rather than a sum of distinct buffers. The stage loop states one shape per stage
+/// today, so this list states what is actually reserved.
+pub fn audio_arena(
+    config: &crate::AudioVaeConfig,
+    frames: u32,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let mut plan = Vec::new();
+    let mut push = |name: String, channels: u64, length: u64| {
+        plan.push(crate::decoding::Buffer {
+            name,
+            element: "f32",
+            elements: u64::from(PCM_CHANNELS) * channels * length,
+        });
+    };
+    let mut length = u64::from(frames);
+    push(
+        "restored".to_owned(),
+        u64::from(config.latent_channels),
+        length,
+    );
+    push("projected".to_owned(), u64::from(config.latent_dim), length);
+    push("input".to_owned(), u64::from(config.decoder_dim), length);
+    // The stage list the decoder itself builds, so the plan cannot disagree with the code about a
+    // channel count or a rate: both read this one derivation.
+    let stages = stages(config)?;
+    let mut channels = u64::from(config.decoder_dim);
+    for (index, stage) in stages.iter().enumerate() {
+        channels = u64::from(stage.channels_out);
+        length = length
+            .checked_mul(u64::from(stage.rate))
+            .ok_or_else(|| Error::config("an audio length overflows".to_owned()))?;
+        push(format!("stage{index}.upsampled"), channels, length);
+        push(format!("stage{index}.sum"), channels, length);
+        // One set for the stage's blocks, not one per block: a block overwrites all four before it
+        // reads them.
+        for part in ["running", "activated", "convolved", "residual"] {
+            push(format!("stage{index}.{part}"), channels, length);
+        }
+    }
+    push("post".to_owned(), channels, length);
+    push("mono".to_owned(), 1, length);
+    Ok(plan)
+}
+
 /// One logical parameter of the audio decoder and the checkpoint tensor that fills it.
 ///
 /// The names are composed from the sidecar's stage table, never transcribed: `parameter` is the
@@ -461,6 +521,18 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
         "decoder.conv_post".to_owned(),
     ));
     Ok(sources)
+}
+
+/// The four buffers one anti-aliased block works in, reserved once per stage and reused by its blocks.
+///
+/// All four are the stage's shape because a block's channels are its stage's; the block overwrites each
+/// before reading it, so the blocks of a stage take turns rather than each taking a share of the arena.
+#[derive(Clone, Copy)]
+struct BlockBuffers {
+    running: TensorView,
+    activated: TensorView,
+    convolved: TensorView,
+    residual: TensorView,
 }
 
 /// The anti-aliased multi-periodicity blocks one decoder stage holds.
@@ -704,8 +776,6 @@ struct DecoderStage {
 /// accumulating on the running value.
 struct DecoderBlock {
     steps: Vec<DecoderStep>,
-    /// The width the block runs at: its stage's output channels.
-    channels: u32,
 }
 
 /// One dilation step: an alias-free activation, the dilated convolution, a second activation and the
@@ -853,10 +923,9 @@ impl AudioDecoder {
                         second_activation,
                     });
                 }
-                stage_blocks.push(DecoderBlock {
-                    steps,
-                    channels: stage.channels_out,
-                });
+                // A block runs at its stage's width and needs no field of its own for it: the stage
+                // reserves the buffers and states the width they are sized by.
+                stage_blocks.push(DecoderBlock { steps });
             }
             built.push(DecoderStage {
                 upsample,
@@ -946,8 +1015,19 @@ impl AudioDecoder {
         length: u64,
     ) -> Result<TensorView> {
         let accumulated = self.buffer(f, stage.channels, length)?;
+        // The four buffers a block needs are the stage's shape, not the block's, so they are reserved
+        // once here and reused by every block: a block overwrites all four before it reads them (its
+        // first `ScaledAdd` writes `running` from the stage's input with `beta = 0`), while the running
+        // sum is a buffer of its own because it must survive the loop. Reserving them per block instead
+        // multiplied the decoder's arena by the block count, and the arena never rewinds.
+        let scratch = BlockBuffers {
+            running: self.buffer(f, stage.channels, length)?,
+            activated: self.buffer(f, stage.channels, length)?,
+            convolved: self.buffer(f, stage.channels, length)?,
+            residual: self.buffer(f, stage.channels, length)?,
+        };
         for (index, block) in stage.blocks.iter().enumerate() {
-            let block_out = self.block(f, block, input, length)?;
+            let block_out = self.block(f, block, input, scratch)?;
             // The first block initialises the sum; the rest add to it.
             let beta = if index == 0 { 0.0 } else { 1.0 };
             ScaledAdd.forward(f, rows(accumulated)?, rows(block_out)?, 1.0, beta)?;
@@ -970,17 +1050,20 @@ impl AudioDecoder {
         f: &Forward,
         block: &DecoderBlock,
         input: TensorView,
-        length: u64,
+        scratch: BlockBuffers,
     ) -> Result<TensorView> {
         if block.steps.is_empty() {
             return Err(Error::config("an audio block has no step".to_owned()));
         }
-        let running = self.buffer(f, block.channels, length)?;
-        // `beta = 0` initialises the running value from the stage's input without touching it.
+        let BlockBuffers {
+            running,
+            activated,
+            convolved,
+            residual,
+        } = scratch;
+        // `beta = 0` initialises the running value from the stage's input without touching it. Every
+        // block does this first, which is what makes one set of buffers reusable across the stage.
         ScaledAdd.forward(f, rows(running)?, rows(input)?, 1.0, 0.0)?;
-        let activated = self.buffer(f, block.channels, length)?;
-        let convolved = self.buffer(f, block.channels, length)?;
-        let residual = self.buffer(f, block.channels, length)?;
         for step in &block.steps {
             step.first_activation.forward(f, running, activated)?;
             step.first.forward(f, activated, convolved)?;
@@ -1383,6 +1466,66 @@ pub(crate) mod tests {
                 (32, 16, 2, 4, 1),
                 (16, 8, 2, 4, 1),
             ]
+        );
+    }
+
+    #[test]
+    fn the_audio_decoders_arena_names_every_buffer_it_reserves() {
+        let config = tests::audio_config();
+        let frames = 207;
+        let plan = audio_arena(&config, frames).expect("the plan");
+        // Three buffers before the stages (restore, project, input), six per stage (the upsampled signal,
+        // the running sum and the four the stage's blocks share), and the post activation and the mono
+        // signal.
+        assert_eq!(plan.len(), 3 + 6 * config.decoder_rates.len() + 2);
+        // The lengths follow the rates, so the last stage's buffers cover `frames · Π rates` samples.
+        let longest = stages(&config)
+            .expect("stages")
+            .iter()
+            .try_fold(u64::from(frames), |length, stage| {
+                length.checked_mul(u64::from(stage.rate))
+            })
+            .expect("the rates");
+        assert_eq!(longest, u64::from(frames) * 800);
+        let mono = plan.last().expect("the mono signal");
+        assert_eq!(mono.elements, u64::from(PCM_CHANNELS) * longest);
+        // The plan's per-stage channels and lengths are the decoder's own stage list, walked once -
+        // the same derivation `forward` reserves from, so a channel count cannot drift between them.
+        for (index, stage) in stages(&config).expect("stages").iter().enumerate() {
+            let entries: Vec<&crate::decoding::Buffer> = plan
+                .iter()
+                .filter(|buffer| buffer.name.starts_with(&format!("stage{index}.")))
+                .collect();
+            assert_eq!(entries.len(), 6, "stage {index} reserves six buffers");
+            for buffer in entries {
+                // `[2, channels, length]` f32, with the length already multiplied by every rate up to
+                // and including this stage's.
+                let length = stages(&config)
+                    .expect("stages")
+                    .iter()
+                    .take(index + 1)
+                    .try_fold(u64::from(frames), |length, stage| {
+                        length.checked_mul(u64::from(stage.rate))
+                    })
+                    .expect("the rates");
+                assert_eq!(
+                    buffer.elements,
+                    u64::from(PCM_CHANNELS) * u64::from(stage.channels_out) * length,
+                    "{}",
+                    buffer.name
+                );
+            }
+        }
+        // Every buffer is named once, and the total is the sum of what the walk reserves.
+        let mut names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        let total: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+        assert!(
+            total > 100 * 1024 * 1024,
+            "the walk reserves the stages' buffers: {total} B"
         );
     }
 

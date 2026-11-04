@@ -355,8 +355,15 @@ impl crate::updates::switch::Roster for Uncommanded {
         Ok(())
     }
 
-    fn spawn(&mut self, _spawn: proto::process::Spawn) -> Result<u32, String> {
-        Ok(1)
+    fn spawn(
+        &mut self,
+        _spawn: proto::process::Spawn,
+        _launch: &crate::engine::launch::Launch,
+    ) -> Result<crate::updates::switch::Spawned, String> {
+        Ok(crate::updates::switch::Spawned {
+            generation: _spawn.generation,
+            pid: 1,
+        })
     }
 
     fn stop(&mut self, _host: &str, _group: &str, _generation: Option<u64>) {}
