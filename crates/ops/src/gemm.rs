@@ -308,6 +308,9 @@ impl Op for Gemm {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // `k` products accumulated in the accumulation type and rounded once into the output: the
+        // standard bound with the reduction length, and `dot`'s square-root term because the
+        // products have mixed signs and a library is free to order the sum.
         Tolerance::dot(
             u64::from(descriptor.k),
             descriptor.accumulate,
