@@ -89,18 +89,20 @@ impl Patch {
         let frames = self.check_frames(latent, frames)?;
         let descriptor = patch::Descriptor {
             dtype: latent.dtype,
-            channels: self.channels,
-            height: self.height,
-            width: self.width,
             block: BLOCK,
             pdl: PDL,
         };
+        // The layer's raster travels with the call: the program reads it as words, so every canvas
+        // of an element type is one compiled module, and the layer's geometry never reaches a key.
         f.operate::<PatchOp>(
             &descriptor,
             patch::Args {
                 x: latent,
                 out: rows,
                 frames,
+                channels: self.channels,
+                height: self.height,
+                width: self.width,
             },
         )
     }
