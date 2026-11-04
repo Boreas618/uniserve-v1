@@ -1243,7 +1243,9 @@ impl VideoEncoder {
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use ops::conv::Conv3d as Conv3dOp;
-        use ops::frame::{FrameMoments as FrameMomentsOp, FrameNormPad as FrameNormPadOp};
+        use ops::frame::{
+            FrameMoments as FrameMomentsOp, FrameNormPad as FrameNormPadOp, FramePad as FramePadOp,
+        };
         use ops::posterior::Posterior as PosteriorOp;
         use ops::residual::ScaledAdd as ScaledAddOp;
 
@@ -1266,12 +1268,32 @@ impl VideoEncoder {
         // The head's sample: the moments and the noise, one operator.
         programs.launch::<PosteriorOp>(&Posterior::new().descriptor());
 
+        let reflect = matches!(
+            config.spatial_padding_mode,
+            crate::config::SpatialPadding::Reflect
+        );
+        // A pad's block split is its output's column count, so each extent's pad is its own row.
+        let pad = |programs: &mut Programs, columns: u64| {
+            let (block_pixels, block_channels) =
+                ops::frame::FramePadDescriptor::tiles_of(true, true, columns);
+            programs.launch::<FramePadOp>(&FramePad::descriptor_of(
+                dtype,
+                reflect,
+                block_pixels,
+                block_channels,
+            ));
+        };
+
         for (height, width) in rasters {
+            // The encoder reads one still or one clip, and the clip's length is the configuration's.
+            for frames in [1, stack.clip.frames] {
             let extents = stack.extents(Extent {
-                frames: stack.clip.frames,
+                frames,
                 height: *height,
                 width: *width,
             });
+            // The input convolution reads padded pixels and normalizes nothing of its own.
+            pad(&mut programs, u64::from(*width) + 2);
             // Each level's blocks run at the level's incoming extent and its incoming width.
             for (index, out) in stack.widths.iter().enumerate() {
                 let extent = extents[index];
@@ -1282,6 +1304,8 @@ impl VideoEncoder {
                 };
                 let pixels = u64::from(extent.height) * u64::from(extent.width);
                 let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
+                // The level's downsampler reads a padded frame of its own.
+                pad(&mut programs, u64::from(extent.width) + 2);
                 // Each block takes the statistics of its input and then the fused normalize-pad of the
                 // same frame; the classes follow from the frame and are deduplicated by `finish`.
                 for _ in 0..stack.blocks {
@@ -1328,6 +1352,7 @@ impl VideoEncoder {
                 true,
                 (u64::from(last.height) + 2) * (u64::from(last.width) + 2),
             ));
+            }
         }
 
         Ok(programs.finish())
@@ -2578,6 +2603,10 @@ mod tests {
         );
         assert_eq!(count("frame_norm_pad"), 1);
         assert!(
+            count("frame_pad") > 1,
+            "each extent's pad splits its blocks by its own column count: {programs:?}"
+        );
+        assert!(
             count("scaled_add") > 1,
             "each level's residual is its own width: {programs:?}"
         );
@@ -2588,19 +2617,21 @@ mod tests {
             );
         }
 
-        // A different raster is different residual programs — same frame-operator rows.
+        // A different raster is different residual programs and different pad classes — the pad's block
+        // split is its output's column count — while the statistics, the normalize-pad and the network's
+        // convolutions keep one row each.
         let other = VideoEncoder::programs(&config, &[(480, 448)]).expect("a narrower raster");
         assert_ne!(other, programs);
+        let fixed = |rows: &[(String, String)]| {
+            rows.iter()
+                .filter(|(name, _)| name != "scaled_add" && name != "frame_pad")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            other
-                .iter()
-                .filter(|(name, _)| name != "scaled_add")
-                .collect::<Vec<_>>(),
-            programs
-                .iter()
-                .filter(|(name, _)| name != "scaled_add")
-                .collect::<Vec<_>>(),
-            "a raster changes the residuals' extent and not the frame operators' rows"
+            fixed(&other),
+            fixed(&programs),
+            "a raster changes the residuals' extent and the pads' columns, not the frame statistics"
         );
     }
 

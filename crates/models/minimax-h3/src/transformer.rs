@@ -26,7 +26,7 @@ use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
-use nn::layers::{GatedActivation, GatedResidual, Linear, ModulatedRmsNorm, RmsNorm};
+use nn::layers::{GatedActivation, GatedResidual, Linear, ModulatedRmsNorm, RmsNorm, Silu};
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
@@ -567,6 +567,7 @@ impl Transformer {
         use ops::gemm::Gemm;
         use ops::modulation::GatedResidual as GatedResidualOp;
         use ops::modulation::ModulatedRmsNorm as ModulatedOp;
+        use ops::activation::Silu as SiluOp;
         use ops::norm::RmsNorm as RmsNormOp;
         use nn::layers::{Attention, Rotary};
         use ops::rope::Rotation;
@@ -598,6 +599,14 @@ impl Transformer {
             dtype,
         ));
         programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, dtype));
+
+        // The timestep embedding's activation: `Linear → SiLU → Linear` over one row per group at the
+        // modulation's hidden width. The projections are the shared `gemm` row, whose key is the element
+        // types and the epilogue, not the width.
+        programs.launch::<SiluOp>(&Silu::descriptor_of(
+            dtype,
+            config.time_hidden_dim,
+        ));
 
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
