@@ -1151,13 +1151,26 @@ impl SchedulerHandle {
     /// A command whose bookkeeping is the connection's — a consumer's position,
     /// a takeover — is answered with that reason: the engine's routing holds the
     /// request's stream, not a scheduler.
-    pub fn command(
+    pub fn request_command(
         &self,
         command: proto::request::wire::Command,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
         let _ = answer.send(self.commands.request_command(command));
         done
+    }
+
+    /// One command of the program-layer update (§2.3, §7.3), as this scheduler
+    /// applies it: the stages, at the boundary they name.
+    ///
+    /// A `Switchover` that names the step its expert group agreed is applied at
+    /// that step alone; one that arrives after it is refused rather than applied
+    /// at a boundary the other ranks did not take.
+    pub fn command(
+        &self,
+        command: ipc::ProgramCommand,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.program_command(command)
     }
 
     /// One of the epoch's engine commands, as this scheduler applies it (§7.3):
