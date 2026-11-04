@@ -12,9 +12,11 @@
 //!
 //! - `tokenizer`: the served checkpoint's tokenizer and incremental decoding;
 //! - `model`: the served checkpoint's files, configuration and family
-//!   profile.
+//!   profile;
+//! - `options`: the deployment-file values the application reads.
 
 pub mod model;
+pub mod options;
 pub mod tokenizer;
 
 #[cfg(any(test, feature = "testing"))]
