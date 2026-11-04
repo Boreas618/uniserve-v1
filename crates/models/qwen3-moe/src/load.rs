@@ -32,6 +32,7 @@ use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
 
 use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Qwen3Moe};
+use crate::representation::{Adopted, Representation, Role};
 use crate::{Activation, Config, Error, Partition, Result};
 
 /// Load a `Qwen3MoeForCausalLM` checkpoint from `root`.
@@ -84,6 +85,92 @@ pub fn load_encoded(
         },
         Quantization::Nvfp4(layout),
     )
+}
+
+/// Load a checkpoint in the representation it declares about itself.
+///
+/// A calibrated export states its representation in its metadata (`quantization_config` in
+/// `config.json`, or a sibling `hf_quant_config.json`); this entry point reads that statement and
+/// dispatches, so the encoding is the checkpoint's fact rather than the caller's guess. Two
+/// refusals happen before a tensor is opened:
+///
+/// - a representation this tree cannot serve at all (an algorithm, a method, or two files that
+///   disagree) — [`Representation::read`] names it;
+/// - a parameter the declaration quantizes whose *role* this model still builds dense. Reading such
+///   a parameter as dense would read packed E2M1 as a matrix and produce a model that runs and
+///   measures nothing, so it is refused by name instead.
+///
+/// `layout` is the deployment's: the block-scale layout its programs are compiled for, which an
+/// encoded checkpoint's stored layout must equal (the expert stacks refuse a mismatch themselves).
+pub fn load_checkpoint(
+    root: &Path,
+    partition: Partition,
+    loader: &mut WeightLoader<'_>,
+    options: LoadOptions,
+    layout: ScaleLayout,
+) -> Result<Qwen3Moe> {
+    let representation = Representation::read(root)?;
+    refuse_dense_parameters(root, &representation)?;
+    match representation {
+        Representation::Dense => load(root, partition, loader, options),
+        Representation::Nvfp4 { .. } => load_encoded(root, partition, loader, options, layout),
+    }
+}
+
+/// Refuse a declaration that quantizes a parameter this model builds as a dense module.
+///
+/// Every parameter of the model is asked, layer by layer, because an exclusion list is matched by
+/// module pattern and a pattern can exclude layer 0's projection without excluding layer 3's: one
+/// representative per role would miss exactly the checkpoints worth refusing.
+fn refuse_dense_parameters(root: &Path, representation: &Representation) -> Result<()> {
+    if !representation.is_encoded() {
+        return Ok(());
+    }
+    let config = Config::read(root)?;
+    let mut parameters: Vec<(&str, Role)> = vec![
+        ("model.embed_tokens.weight", Role::Embedding),
+        ("lm_head.weight", Role::Head),
+        ("model.norm.weight", Role::Norm),
+    ];
+    // The per-layer names, built once per layer rather than once per parameter: a layer contributes
+    // seven projections, two norms, two Q/K norms, the router and (when it is dense) three more.
+    let mut names: Vec<(String, Role)> = Vec::new();
+    for layer in 0..config.num_hidden_layers {
+        let base = format!("model.layers.{layer}");
+        for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            names.push((format!("{base}.self_attn.{projection}.weight"), Role::Projection));
+        }
+        for norm in ["input_layernorm", "post_attention_layernorm"] {
+            names.push((format!("{base}.{norm}.weight"), Role::Norm));
+        }
+        for norm in ["q_norm", "k_norm"] {
+            names.push((format!("{base}.self_attn.{norm}.weight"), Role::Norm));
+        }
+        if config.sparse(layer) {
+            names.push((format!("{base}.mlp.gate.weight"), Role::Router));
+        } else {
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                names.push((format!("{base}.mlp.{projection}.weight"), Role::Projection));
+            }
+        }
+    }
+    for (name, role) in names.iter().map(|(name, role)| (name.as_str(), *role)) {
+        parameters.push((name, role));
+    }
+    for (parameter, role) in parameters {
+        // A *quantized projection* is the one shape this entry point cannot serve yet: its packed
+        // product is keyed by the row count, which `keys()` has no input for. The refusal says so
+        // rather than reading the parameter as dense.
+        match representation.adopts(parameter, role)? {
+            Adopted::Source => {}
+            Adopted::Quantized => {
+                return Err(Error::Config(format!(
+                    "the checkpoint's calibration quantizes `{parameter}`, and this model builds it                      as a dense projection: the encoded projection path needs its packed product                      compiled per row count, which the key walk does not enumerate yet. Load a                      checkpoint whose calibration excludes the attention and dense-MLP projections,                      or wait for that half; reading it as dense would read packed E2M1 as a matrix"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// How a checkpoint stores its expert stacks.
