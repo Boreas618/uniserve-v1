@@ -564,7 +564,7 @@ pub struct Placement {
 /// translation happens, so a scheduler never needs to know how many devices a rank holds. It is a
 /// plain route on purpose: the phase list is fixed at spawn, so no lock, no schedule, no retry.
 pub struct Executors {
-    executors: Vec<crate::device::Executor>,
+    executors: Vec<Arc<crate::device::Executor>>,
 }
 
 impl Executors {
@@ -574,6 +574,16 @@ impl Executors {
     /// devices serving one phase is refused, because a batch could go to either and the two would
     /// disagree about the model's state.
     pub fn new(executors: Vec<crate::device::Executor>) -> Result<Self> {
+        Self::shared(executors.into_iter().map(Arc::new).collect())
+    }
+
+    /// The rank's devices, as the handles the rest of the process already holds.
+    ///
+    /// A main process holds one handle per device from the moment it spawns them: the control
+    /// thread reads their running jobs for the stall rule and their counters for the metrics,
+    /// and a scheduler submits through the same handles. Sharing them rather than moving them in
+    /// keeps one device one owner, and the phase check is the same one [`Executors::new`] makes.
+    pub fn shared(executors: Vec<Arc<crate::device::Executor>>) -> Result<Self> {
         let mut served: Vec<PhaseId> = Vec::new();
         for executor in &executors {
             for phase in executor.phases() {
@@ -589,7 +599,7 @@ impl Executors {
     }
 
     /// The device that serves `phase`.
-    fn route(&self, phase: PhaseId) -> Result<&crate::device::Executor> {
+    fn route(&self, phase: PhaseId) -> Result<&Arc<crate::device::Executor>> {
         self.executors
             .iter()
             .find(|executor| executor.serves(phase))
