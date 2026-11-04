@@ -5,7 +5,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/cuda",
+    "crates/platform",
     "crates/daemon",
     "crates/engine",
     "crates/frontend",
@@ -58,7 +58,7 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-cuda = { path = "crates/cuda" }
+platform = { path = "crates/platform" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 frontend = { path = "crates/frontend" }

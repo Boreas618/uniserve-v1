@@ -28,10 +28,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use cuda::cupti::pc_sampling::Taken;
-use cuda::cupti::pm_sampling::Sample;
-use cuda::cupti::range_profiler::Range;
-use cuda::cupti::records::Record;
+use platform::cupti::pc_sampling::Taken;
+use platform::cupti::pm_sampling::Sample;
+use platform::cupti::range_profiler::Range;
+use platform::cupti::records::Record;
 use rusqlite::{Connection, params};
 
 use crate::profiling::fences::FenceRecord;
@@ -444,7 +444,7 @@ impl File {
                 [(
                     name,
                     state,
-                    cuda::cupti::timestamp().unwrap_or(0) as i64,
+                    platform::cupti::timestamp().unwrap_or(0) as i64,
                     detail,
                 )],
             ),
@@ -585,7 +585,7 @@ impl File {
                     "INSERT INTO pc_take VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     [(
                         take,
-                        cuda::cupti::timestamp().unwrap_or(0) as i64,
+                        platform::cupti::timestamp().unwrap_or(0) as i64,
                         taken.total_samples as i64,
                         taken.dropped_samples as i64,
                         taken.non_user_samples as i64,
@@ -803,7 +803,7 @@ impl File {
 
 #[cfg(test)]
 mod tests {
-    use cuda::cupti::records::{Api, Kernel};
+    use platform::cupti::records::{Api, Kernel};
 
     use super::*;
 

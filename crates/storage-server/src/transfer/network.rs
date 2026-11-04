@@ -50,7 +50,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::storage::Client;
 use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registered};
-use cuda::DeviceId;
+use platform::DeviceId;
 
 use super::contexts::Hold;
 use super::lanes::{End, LaneKey, Piece, Runner};

@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 
 use tvm_ffi::Any;
 
-use cuda::{DeviceId, PrimaryContext};
+use platform::{DeviceId, PrimaryContext};
 use ipc::ComponentWeights;
 use ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 
@@ -1018,7 +1018,7 @@ impl Worker {
             graph_pools: self.graphs.pools(),
             capturable: self.capturable,
         };
-        let _control = cuda::cupti::blocking::Watched::enter();
+        let _control = platform::cupti::blocking::Watched::enter();
         let served = Service::new(
             executor,
             channel,
@@ -1219,7 +1219,7 @@ impl Worker {
             Interpreter::synchronize();
             drop(self.context);
             // Every owner has drained its streams; deferred frees can run.
-            record(cuda::reclaim::flush().map_err(|error| WorkerError::from(Error::from(error))));
+            record(platform::reclaim::flush().map_err(|error| WorkerError::from(Error::from(error))));
         }
         failure.map_or(Ok(()), Err)
     }
@@ -1430,11 +1430,11 @@ fn allocate_plugin_buffers(device: Device) -> Result<(Option<Handle>, BTreeMap<D
     let Device::Cuda(index) = device else {
         return Ok((None, BTreeMap::new()));
     };
-    let nvml = cuda::Nvml::init()?;
+    let nvml = platform::Nvml::init()?;
     let free = || -> Result<u64> { Ok(index.memory_info()?.free) };
     let process = || -> Result<u64> {
         nvml.process_storage(index).map_err(|error| match error {
-            cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
+            platform::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
                 "NVML reports no device storage for this process on {index}"
             )),
             error => Error::Cuda(error),
@@ -1667,7 +1667,7 @@ pub(crate) fn plan_rank(
     let Some(keys) = keys else {
         return Ok(::storage::manifest::weights::PlannedRank {
             gpu,
-            allocation_granularity: cuda::DeviceAllocation::granularity(cuda)? as u64,
+            allocation_granularity: platform::DeviceAllocation::granularity(cuda)? as u64,
             total_bytes: device_storage.total,
             free_bytes: device_storage.free,
             resident_bytes: 0,
@@ -1759,7 +1759,7 @@ pub(crate) fn plan_rank(
     }
     Ok(::storage::manifest::weights::PlannedRank {
         gpu,
-        allocation_granularity: cuda::DeviceAllocation::granularity(cuda)? as u64,
+        allocation_granularity: platform::DeviceAllocation::granularity(cuda)? as u64,
         total_bytes: device_storage.total,
         free_bytes: device_storage.free,
         resident_bytes: ledger.used() + transfer,

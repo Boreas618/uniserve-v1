@@ -74,7 +74,7 @@ use ::storage::protocol::{
 use ::storage::{Access, Client, Key, Placement, Role, Scope, StorageRecord, TensorRecord};
 use anyhow::{Context, bail, ensure};
 use clap::Parser as _;
-use cuda::{
+use platform::{
     CopyBatch, DeviceAllocation, DeviceAttribute, DeviceId, PinnedBuffer, ShareableHandle,
     SourceOrder, Stream,
 };

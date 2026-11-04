@@ -6,7 +6,7 @@
 //!
 //! 1. each process creates an [`Agent`] and registers the storage a transfer
 //!    reads or writes ([`Agent::register`]), device storage (including
-//!    storage `cuda::vmm` maps) or host storage, each region under a key of
+//!    storage `platform::vmm` maps) or host storage, each region under a key of
 //!    its own ([`Region::key`]) and for the access it needs ([`Access`]):
 //!    a READ's destination for reads and writes, a source mapped read-only
 //!    for reads alone;

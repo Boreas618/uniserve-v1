@@ -332,7 +332,7 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA device"]
     fn a_recorded_vmm_export_carries_its_event_once_the_job_recorded_it() -> Result<()> {
-        use cuda::{DeviceId, Stream};
+        use platform::{DeviceId, Stream};
 
         let stream = Stream::new(DeviceId(0))?;
         let capacity = Arc::new(TransferCapacity::new(1 << 24, 8)?);

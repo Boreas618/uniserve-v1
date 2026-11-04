@@ -12,7 +12,7 @@ pub(crate) use issue::HostFunction;
 pub(crate) use issue::{Fill, Issue, RowFill};
 pub(crate) use scratch::Scratches;
 
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 
 use crate::config::Device;
 use crate::{Error, Result};

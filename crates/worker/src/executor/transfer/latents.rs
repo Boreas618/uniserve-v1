@@ -487,7 +487,7 @@ mod tests {
             &params(pages),
             bank,
             0,
-            None::<&cuda::Stream>,
+            None::<&platform::Stream>,
         )?;
         locate_export(pool, export, publications, &mut output)?;
         output
