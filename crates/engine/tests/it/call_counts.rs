@@ -405,7 +405,7 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     );
 
     // The counters say what the world was asked: one observe and one dispatch
-    // per step, the trial's included, and nothing else per step.
+    // per step, and one evaluation of the decision set before the first of them.
     let progress = reached(&handle, 2);
     let usage = progress.usage.expect("the policy has served");
     assert!(
