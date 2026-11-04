@@ -55,8 +55,20 @@ pub(crate) fn run(args: &EngineArgs, lifeline: Option<i32>, log: &LogLevels) -> 
     // to the module it precompiled for this host.
     let policies: Option<Arc<dyn engine::PolicySource + Send + Sync>> =
         match args.program_server.as_deref() {
-            Some(socket) => Some(Arc::new(engine::ProgramSource::connect(socket)?)),
-            None => None,
+            Some(socket) => {
+                tracing::info!(
+                    socket = %socket.display(),
+                    "a scheduling policy's module is resolved through this node's Program Server"
+                );
+                Some(Arc::new(engine::ProgramSource::connect(socket)?))
+            }
+            None => {
+                tracing::info!(
+                    "no Program Server is stated for this epoch: a policy precopy will be refused \
+                     with the reason, and the epoch serves no policy"
+                );
+                None
+            }
         };
     engine::run_engine(&args.requests, &args.processes, args.engine, policies)?;
     Ok(ExitCode::SUCCESS)
