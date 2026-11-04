@@ -1108,17 +1108,12 @@ pub(crate) fn ones(
             format!("a residual coefficient of {dtype} has no whole-byte element"),
         )
     })?;
-    let value: Vec<u8> = match dtype {
-        nn::DType::F32 => 1.0_f32.to_le_bytes().to_vec(),
-        nn::DType::BF16 => (1.0_f32.to_bits() >> 16).to_le_bytes().to_vec(),
-        nn::DType::F16 => half_bits(1.0).to_le_bytes().to_vec(),
-        other => {
-            return Err(invalid(
-                "VisionTower",
-                format!("a residual coefficient of {other} is not a whole-byte float"),
-            ));
-        }
-    };
+    let value = one_element(dtype).ok_or_else(|| {
+        invalid(
+            "VisionTower",
+            format!("a residual coefficient of {dtype} is not a whole-byte float"),
+        )
+    })?;
     debug_assert_eq!(value.len(), usize::try_from(element).unwrap_or(0));
     let mut bytes = Vec::with_capacity(value.len() * usize::try_from(columns).unwrap_or(0));
     for _ in 0..columns {
@@ -1127,6 +1122,21 @@ pub(crate) fn ones(
     loader
         .constant(name, dtype, Shape::new(&[columns]), &bytes)
         .map_err(Error::from)
+}
+
+/// The little-endian bytes of `1.0` in `dtype`: exactly one element wide, or `None`.
+///
+/// The width is the whole contract here, because a caller multiplies this by a column count and
+/// hands the result to a shape: four bytes where the element type has two makes the constant twice
+/// the size its own shape says, which the loader refuses - so the cast to the element's integer type
+/// is load-bearing rather than cosmetic.
+pub(crate) fn one_element(dtype: nn::DType) -> Option<Vec<u8>> {
+    Some(match dtype {
+        nn::DType::F32 => 1.0_f32.to_le_bytes().to_vec(),
+        nn::DType::BF16 => ((1.0_f32.to_bits() >> 16) as u16).to_le_bytes().to_vec(),
+        nn::DType::F16 => half_bits(1.0).to_le_bytes().to_vec(),
+        _ => return None,
+    })
 }
 
 /// The FP16 bit pattern of a value in the normal range.
@@ -1146,6 +1156,29 @@ mod tests {
         crate::config::tests_support::released_config()
             .text_encoder
             .vision
+    }
+
+    /// A residual coefficient is one element wide in its own type.
+    ///
+    /// The tower's residual is a constant of ones, so nothing in the checkpoint can disagree with
+    /// its width: the only witness is the element type's own byte count, and a coefficient written
+    /// four bytes wide reads as a constant twice the size its shape declares.
+    #[test]
+    fn a_coefficient_is_one_element_wide() {
+        for dtype in [nn::DType::F32, nn::DType::BF16, nn::DType::F16] {
+            let bytes = one_element(dtype).expect("a whole-byte float");
+            assert_eq!(
+                u64::try_from(bytes.len()).expect("a small count"),
+                dtype.bytes().expect("whole bytes"),
+                "1.0 in {dtype}"
+            );
+        }
+        assert_eq!(
+            one_element(nn::DType::F32).expect("f32"),
+            1.0_f32.to_le_bytes()
+        );
+        assert_eq!(one_element(nn::DType::BF16).expect("bf16"), [0x80, 0x3f]);
+        assert_eq!(one_element(nn::DType::F16).expect("f16"), [0x00, 0x3c]);
     }
 
     /// Every tensor the tower reads is named once, and under the tower's own prefix.
