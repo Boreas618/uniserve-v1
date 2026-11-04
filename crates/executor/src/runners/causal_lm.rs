@@ -136,7 +136,11 @@ impl Staging {
             )));
         }
         let tokens = columns.rows.tokens();
-        let rows = columns.rows.calls.len();
+        // A batch has two counts and each of its columns belongs to one of them: the sampler's
+        // `slots` and `parameters` are per **row** (a verify call carries several rows for one
+        // call), and the commit table states one row per **call**.
+        let rows = columns.rows.rows();
+        let calls = columns.rows.calls.len();
         if tokens > bucket.tokens as usize || rows > bucket.rows as usize {
             return Err(Error::Invalid(format!(
                 "the batch's {rows} rows and {tokens} tokens do not fit bucket {bucket}"
@@ -173,6 +177,11 @@ impl Staging {
             .logits_rows
             .extend_from_slice(&columns.rows.logits_rows);
         self.rows.calls.extend_from_slice(&columns.rows.calls);
+        if self.rows.calls.is_empty() || rows > bucket_rows || calls > bucket_rows {
+            return Err(Error::Invariant(format!(
+                "the batch has {rows} rows in {calls} calls and does not fit {bucket_rows} rows"
+            )));
+        }
 
         // Row columns: the mechanism's rows, then rows that sample nothing and commit nothing.
         self.slots[..rows].copy_from_slice(&columns.slots[..rows]);
@@ -194,25 +203,35 @@ impl Staging {
             self.rows.logits_rows[index] = -1;
         }
 
-        // Padding tokens belong to the last call's token range, and padding rows are appended
-        // after it, each evaluating the padding token that follows.
-        let mut cursor = tokens;
-        let calls = self.rows.calls.len();
-        let _ = calls;
-        if let Some(last) = self.rows.calls.last_mut() {
-            if tokens < bucket_tokens {
-                last.rows.end = bucket_tokens as u32;
-                cursor = bucket_tokens;
+        // Padding tokens belong to the last row the batch staged - a row's token extent is the gap
+        // between its two `query_offsets` entries - and every row the bucket holds beyond the
+        // batch's own is a call of its own that owns that row and no token. A call's `rows` names
+        // rows of the batch's device columns and not tokens, so padding never widens a call's range
+        // past the row axis: a prefilling bucket has four rows and sixty-four tokens.
+        self.rows.query_offsets.truncate(rows + 1);
+        if self.rows.query_offsets.is_empty() {
+            return Err(Error::Invariant(format!(
+                "the batch states no query offsets for its {rows} rows"
+            )));
+        }
+        if tokens < bucket_tokens {
+            if let Some(last) = self.rows.query_offsets.last_mut() {
+                *last = bucket_tokens as i32;
             }
         }
-        while self.rows.calls.len() < bucket_rows {
-            let start = cursor as u32;
-            let end = if bucket.variant.is_decode() && cursor < bucket_tokens {
-                cursor += 1;
-                cursor as u32
-            } else {
-                start
-            };
+        while self.rows.query_offsets.len() <= bucket_rows {
+            let end = self
+                .rows
+                .query_offsets
+                .last()
+                .copied()
+                .ok_or_else(|| Error::Invariant("the batch states no query offsets".into()))?;
+            self.rows.query_offsets.push(end);
+        }
+        let mut owned = self.rows.calls.last().map(|call| call.rows.end).unwrap_or(0);
+        while (owned as usize) < bucket_rows {
+            let start = owned;
+            owned += 1;
             self.rows.calls.push(nn::BatchRow {
                 request: 0,
                 kind: if bucket.variant.is_decode() {
@@ -221,33 +240,40 @@ impl Staging {
                     nn::RowKind::Prefill
                 },
                 cache_group: 0,
-                rows: start..end,
+                rows: start..owned,
             });
         }
-        if self.rows.calls.is_empty() || calls > bucket_rows {
-            return Err(Error::Invariant(format!(
-                "the batch has {calls} calls and does not fit {bucket_rows} rows"
-            )));
-        }
 
-        // The commit table's padded rows keep their token state: a slot below zero. As with the
-        // rows, the table is copied into the staging's buffer rather than cloned per step.
+        // The commit table states one row per call. Its padded rows are inert rows by the
+        // operator's own sentinels - a slot and a task of -1 name no destination and sample
+        // nothing - so a padding row commits nothing and the graph may run over the whole bucket.
+        // As with the rows, the table is copied into the staging's buffer rather than cloned per
+        // step, so a step writes fixed addresses (4.5).
         self.commit.clear();
-        self.commit.extend_from_slice(&columns.commit);
         if !columns.commit.is_empty() {
-            let columns = columns.commit.len() / rows.max(1);
-            self.commit.resize(columns * bucket_rows, 0);
-            for column in 0..columns {
-                for row in rows..bucket_rows {
-                    self.commit[column * bucket_rows + row] = -1;
-                }
+            let fields = ops::commit::COMMIT_FIELDS;
+            if columns.commit.len() != fields * calls {
+                return Err(Error::Invariant(format!(
+                    "the commit table holds {} values, {fields} fields of {calls} calls",
+                    columns.commit.len()
+                )));
+            }
+            self.commit.extend_from_slice(&inert_commit(bucket_rows));
+            for field in 0..fields {
+                self.commit[field * bucket_rows..field * bucket_rows + calls]
+                    .copy_from_slice(&columns.commit[field * calls..(field + 1) * calls]);
             }
         }
         self.page_size = columns.page_size;
         self.max_kv_len = columns.max_kv_len;
         self.calls.clear();
         self.calls.extend_from_slice(call_ids);
-        self.calls.resize(bucket_rows, CallId(u64::MAX));
+        if self.calls.len() != calls {
+            return Err(Error::Invariant(format!(
+                "the batch states {} call ids for its {calls} calls",
+                self.calls.len()
+            )));
+        }
 
         self.staged = Some(bucket);
         Ok(bucket.shape())
@@ -527,6 +553,15 @@ fn commit_table(commit: &[i64], rows: usize, capacity: usize) -> Result<Vec<i32>
         )));
     }
     let mut table = vec![0_i32; fields * capacity];
+    // Rows past the batch's own are **inert**, not zero: a zero slot is slot 0, a real destination,
+    // so a launch that ever ran over the whole capacity would commit thirteen phantom tokens into
+    // the first slot the deployment serves. The staged table already pads its own rows with the
+    // operator's sentinels; this makes the tail inert as well, so the invariant survives whatever
+    // `count` a future launch passes (`ops::commit`'s two sentinels).
+    for row in rows.min(capacity)..capacity {
+        table[ops::commit::column::SLOT * capacity + row] = -1;
+        table[ops::commit::column::TASK * capacity + row] = -1;
+    }
     for field in 0..fields {
         for row in 0..rows.min(capacity) {
             let value = commit[field * rows + row];
@@ -1040,7 +1075,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             })
-            .ok_or_else(|| Error::State("the runner has no graph pools yet".into()))
+            .ok_or_else(|| Error::State("the runner has no graph pools yet"))
     }
 
     /// Installs the shadow harness, sized for the largest bucket's shadow set.
@@ -1177,12 +1212,44 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             // The buckets that launch this operator, whichever key they use: a program under a new
             // key of the same operator changes the launch structure of the buckets that launch the
             // operator at all, and only a walk over them can tell rebind from recapture (4.5).
-            for bucket in self.graphs.using(operator, self.generation.number()) {
-                // The paired forward runs first, and only where the two generations have a program
+            let mut launching = self.graphs.using(operator, self.generation.number());
+            // Whether the graphs could name the buckets that launch the operator. When they cannot,
+            // the walk is the only thing that knows, and the paired forward is not attempted: it
+            // needs a bucket that really launches the operator, and the graphs are exactly what
+            // cannot say which those are. The mechanism's own shadow batches (`Batches::shadow`)
+            // still compare the two kernels per operator, which is the check 7.3 step 2 asks for.
+            let named = !launching.is_empty();
+            if launching.is_empty() {
+                // No captured graph names the operator, which means the launch annotation was not
+                // reported when the bucket was captured. The graph cannot say which buckets launch
+                // it, so every serving bucket is prepared - and each walk recaptures, because
+                // there is no node to rebind - rather than the update quietly doing nothing.
+                launching = self.graphs.buckets(self.generation.number());
+                // An operator the serving generation already holds a kernel for is one its graphs
+                // launch, so a graph that names none of them was captured without the annotation.
+                // A genuinely new operator names no graph for the honest reason, and says nothing.
+                let existed = self
+                    .generation
+                    .iter()
+                    .any(|(name, _, _)| name == operator);
+                if existed && !launching.is_empty() {
+                    tracing::error!(
+                        %operator,
+                        "no captured graph names {operator}: the operator launches are not \
+                         annotated, so every serving bucket is recaptured rather than rebound"
+                    );
+                }
+            }
+            for bucket in launching {
+                // The paired forward runs first, and only where **both** generations have a program
                 // under this same key: a kernel cannot be compared with one of another descriptor
-                // (`Forward::operate` pairs on operator and key), so a new key's bucket is left to
-                // the walk, which recaptures it.
-                if next.kernel(operator, &key).is_ok() {
+                // (`Forward::operate` pairs on operator and key), so a key one of them does not hold
+                // - a new launch, or one whose descriptor changed - is left to the walk, which
+                // recaptures the bucket.
+                if named
+                    && next.kernel(operator, &key).is_ok()
+                    && self.generation.kernel(operator, &key).is_ok()
+                {
                     jobs.push(Job::Shadow {
                         runner: self.id,
                         operator,
@@ -1276,10 +1343,25 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.counters = Some(counters);
     }
 
-    fn discard(&mut self, generation: u64) {
+    fn discard(&mut self, generation: u64) -> Result<()> {
+        // A generation in service is not a prepared one: discarding it would take the graphs that
+        // serve batches away and leave the device able to answer nothing. The engine discards the
+        // update it abandoned on a drain, which is always newer than the serving generation, so a
+        // number that names either of the two live ones is a fault of the caller and is refused by
+        // name rather than obeyed.
+        let serving = self.generation.number();
+        let probation = self.previous.as_ref().map(|previous| previous.number());
+        if generation == serving || probation == Some(generation) {
+            return Err(Error::Invariant(format!(
+                "generation {generation} is one this runner serves (serving {serving}, probation {}) \
+                 and cannot be discarded",
+                probation.map(|number| number.to_string()).unwrap_or_else(|| "none".into())
+            )));
+        }
         // A prepared generation that never served: its graphs go, then their arena regions where
         // no other generation holds the bucket, in `Captured`'s order. The serving generation and
-        // probation's old one are keyed separately and are not touched.
+        // probation's old one are keyed separately and are not touched. What the capture recorded
+        // about that generation's annotation goes with it.
         let dropped = self.graphs.discard(generation);
         let dropped_count = dropped.len();
         for bucket in dropped
@@ -1307,12 +1389,14 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             generation,
             "discarded a prepared generation that never served"
         );
+        Ok(())
     }
 
     fn purge(&mut self, generation: u64) {
         // The graphs go first, then their arena regions: `Captured` guarantees that order, and a
         // region released under a live executable would be reused by the next generation's
-        // capture while the old graph still addressed it.
+        // capture while the old graph still addressed it. Exactly this generation's graphs go - a
+        // released generation may be numbered either side of the serving one.
         let dropped = self.graphs.purge(generation);
         let dropped_count = dropped.len();
         let mut released = 0u64;
@@ -1464,6 +1548,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let template = capture.end()?;
+        // The node table comes from the capture sink, and the template is the record of what was
+        // actually launched: the two can only be compared here. A graph that launched kernels and
+        // reported no node table serves batches correctly but cannot be rebound, because there is
+        // no node to set the new kernel's parameters on. It is recorded rather than refused - a
+        // programme update is what needs it, and `precopy` refuses there by name instead of letting
+        // the update silently do nothing.
         Ok(Walked { template, nodes })
     }
 
@@ -1479,6 +1569,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.generation_named(generation)?;
         let current = self.generation.number();
+        // Preparing a bucket for the generation it already serves from would replace a live graph
+        // under a batch that is running on it. `precopy` names the generation it prepares, and an
+        // update that changes nothing prepares no bucket at all, so this is a disagreement.
+        if generation == current {
+            return Err(Error::Invariant(format!(
+                "a rebind names bucket {bucket}'s serving generation {current} as the one it \
+                 prepares"
+            )));
+        }
         if self.graphs.captured(bucket, current).is_none() {
             return Err(Error::Invariant(format!(
                 "no graph of bucket {bucket} in generation {current}"
@@ -1488,17 +1587,31 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
-        if !served.same_structure(&walked.nodes)? {
+        // A walk with no node table means the operator launches were not annotated, so there is no
+        // node to set the new kernel's parameters on and a rebind would be the silent no-op the
+        // record exists to prevent. Recapturing is the design's other path (7.3 step 2) and is
+        // correct here: the template already carries the new kernels and their arguments.
+        let unannotated = walked.nodes.is_empty();
+        if unannotated || !served.same_structure(&walked.nodes)? {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments.
             let held = hold_kernels(&kernels, &walked.nodes)?;
             let recaptured = Captured::new(walked.template, walked.nodes, held)?;
             self.graphs.insert(bucket, generation, recaptured);
-            tracing::info!(
-                bucket = %bucket,
-                generation,
-                "the launch structure changed; recaptured the bucket instead of rebinding it"
-            );
+            if unannotated {
+                tracing::error!(
+                    bucket = %bucket,
+                    generation,
+                    "the walk reported no node table; recaptured the bucket rather than silently \
+                     rebinding nothing"
+                );
+            } else {
+                tracing::info!(
+                    bucket = %bucket,
+                    generation,
+                    "the launch structure changed; recaptured the bucket instead of rebinding it"
+                );
+            }
             return Ok(());
         }
         // The walk's launches are the same ones, in the same order, as the live graph's: pair
@@ -1556,7 +1669,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         })?;
         let mut harness = self.shadow.take().ok_or_else(|| {
             Error::State(
-                "the runner has no shadow harness: it is allocated when the runner is bound".into(),
+                "the runner has no shadow harness: it is allocated when the runner is bound",
             )
         })?;
         harness.reset();
@@ -1730,24 +1843,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ),
             )
         };
-        let row_slots = self.staging.slots(rows);
-        let mut states = Vec::with_capacity(rows);
-        for slot in row_slots {
-            // A padded row names no slot, so the commit table states nothing about it.
-            states.push(if *slot < 0 {
-                RowState::default()
-            } else {
-                let at = *slot as usize;
-                RowState {
-                    // For text the slot's trajectory position is the number of tokens it has
-                    // committed, which the table keeps in the sampling column; a latent
-                    // trajectory advances the same column one step at a time.
-                    step_index: length_at(sampling, at),
-                    cache_computed_len: length_at(logical, at),
-                    cache_visible_len: length_at(sampling, at),
-                }
-            });
-        }
+        let states = states_of(
+            self.staging.slots(rows),
+            self.staging.batch_rows(),
+            self.staging.calls().len(),
+            logical,
+            sampling,
+        );
         let calls = calls_output(
             ids,
             self.staging.logits_rows(),
@@ -1777,7 +1879,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let rows = bucket.rows as usize;
         let tokens = bucket.tokens as usize;
         if self.staging.staged().is_none() {
-            return Err(Error::State("a step needs a staged batch".into()));
+            return Err(Error::State("a step needs a staged batch"));
         }
         let batch = self.staging.batch_rows();
 
@@ -1992,7 +2094,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ) -> Result<()> {
         let Some(sampling) = &self.sampling else {
             return Err(Error::State(
-                "the runner has no sampler but the bucket samples".into(),
+                "the runner has no sampler but the bucket samples",
             ));
         };
         let rows = u64::from(bucket.rows);
@@ -2071,7 +2173,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .sampling
                 .as_ref()
                 .map(|sampling| sampling.counts)
-                .ok_or_else(|| Error::State("a sampling batch has no count table".into()))?,
+                .ok_or_else(|| Error::State("a sampling batch has no count table"))?,
             count: rows,
         };
         forward
@@ -2117,10 +2219,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
             parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
-            // An inert table, not an empty one: a row whose slot and task are `-1` commits
-            // nothing, and the launch is still recorded, so a serving replay of this bucket
-            // advances the slots it names.
-            commit: inert_commit(rows),
+            // An inert table, not an empty one, with one row per call: a row whose slot and task
+            // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
+            // this bucket runs the operator over the bucket's rows and advances nothing.
+            commit: inert_commit(1),
             page_size: 1,
             max_kv_len: 1,
         };
@@ -2197,8 +2299,48 @@ impl ops::capture::Sink for Recording {
 
 /// The non-negative length a per-slot table column holds for `slot`, or zero when the table has no
 /// such slot: a length is never negative, and a padded row names no slot at all.
-fn length_at(column: &[i32], slot: usize) -> u32 {
-    column.get(slot).copied().unwrap_or(0).max(0) as u32
+/// The state each call of a staged batch reports, from the commit table's readback.
+///
+/// The completion names one row per call and the state it carries is the call's **own row of the
+/// commit table**: the table is per call, while the sampler's `slots` column is per row, so a
+/// multi-row call reads the slot its rows share through the first row it owns. A call whose slot is
+/// below zero names no state at all and reports the default.
+fn states_of(
+    slots: &[i32],
+    rows: &nn::BatchRows,
+    calls: usize,
+    logical: &[i32],
+    sampling: &[i32],
+) -> Vec<RowState> {
+    let mut states = Vec::with_capacity(calls);
+    for index in 0..calls {
+        let row = rows
+            .calls
+            .get(index)
+            .map(|call| call.rows.start as usize)
+            .unwrap_or(0);
+        states.push(if slots.get(row).copied().unwrap_or(-1) < 0 {
+            RowState::default()
+        } else {
+            RowState {
+                // For text the call's trajectory position is the number of tokens it has committed,
+                // which the table keeps in the sampling column; a latent trajectory advances the
+                // same column one step at a time.
+                step_index: length_at(sampling, index),
+                cache_computed_len: length_at(logical, index),
+                cache_visible_len: length_at(sampling, index),
+            }
+        });
+    }
+    states
+}
+
+/// One row of a commit table column: the call at `row`, whose lengths a completion reports.
+///
+/// A row the table does not hold reads as zero rather than as a neighbour's value, so a batch that
+/// outgrew its bucket is a state of zero length and not another call's trajectory.
+fn length_at(column: &[i32], row: usize) -> u32 {
+    column.get(row).copied().unwrap_or(0).max(0) as u32
 }
 
 /// Names each call's tokens and trajectory position: the step's output in the mechanism's order
@@ -2209,6 +2351,11 @@ fn length_at(column: &[i32], slot: usize) -> u32 {
 /// commit table left each call's slot at. A call with no sampling row still gets an entry - it
 /// advanced, it just ended no prompt - and a sampling row outside every call is an invariant
 /// violation, because the mechanism's columns and its calls would then disagree about the batch.
+/// The completion of one step: one [`CallOutput`] per call, in the batch's call order.
+///
+/// `calls` and `states` are per **call**, and `ids` and `sampling_rows` are per *row* (the bucket's
+/// rows, one sampled id and one `logits_rows` entry each). A sample belongs to the call that owns
+/// its batch row; a row whose logits entry is negative contributes nothing.
 pub fn calls_output(
     ids: &[i32],
     sampling_rows: &[i32],
@@ -2235,13 +2382,26 @@ pub fn calls_output(
         .zip(states)
         .map(|(call, state)| CallOutput::completed(*call, Vec::new(), *state))
         .collect();
-    for (index, row) in sampling_rows.iter().copied().enumerate() {
-        // `logits_rows` names the token row that feeds `logits`; a negative entry is a row that
-        // samples nothing (a padded row, or a prefill chunk that ends no prompt).
-        if row < 0 {
+    for (index, logits_row) in sampling_rows.iter().copied().enumerate() {
+        // `logits_rows` names, for the batch row at `index`, the token row whose logits it samples
+        // from; a negative entry is a row that samples nothing (a padded row, or a prefill chunk
+        // that ends no prompt). The sample belongs to the **batch row**, which is the position -
+        // attributing it to the row it read its logits from would hand one request another
+        // request's token as soon as a batch's logits layout is not the identity.
+        if logits_row < 0 {
             continue;
         }
-        let row = row as u32;
+        let logits_row = logits_row as u32;
+        if !rows
+            .calls
+            .iter()
+            .any(|call| call.rows.contains(&logits_row))
+        {
+            return Err(Error::Invariant(format!(
+                "sampling row {logits_row} names a token row the batch does not hold"
+            )));
+        }
+        let row = index as u32;
         let (position, _) = rows
             .calls
             .iter()
@@ -2262,6 +2422,15 @@ pub fn calls_output(
 mod tests {
     use super::*;
 
+    /// A mechanism commit table of one row per call, column-major `[COMMIT_FIELDS][rows]`: the one
+    /// column a fixture states is the row's destination slot, and the rest keep zero.
+    fn committed(slots: &[i64]) -> Vec<i64> {
+        let rows = slots.len();
+        let mut table = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+        table[..rows].copy_from_slice(slots);
+        table
+    }
+
     fn decode_columns() -> BatchColumns {
         BatchColumns {
             rows: nn::BatchRows {
@@ -2270,17 +2439,25 @@ mod tests {
                 seq_lens: vec![4, 9],
                 query_offsets: vec![0, 1, 2],
                 logits_rows: vec![0, 1],
-                calls: vec![nn::BatchRow {
-                    request: 0,
-                    kind: nn::RowKind::Decode,
-                    cache_group: 0,
-                    rows: 0..2,
-                }],
+                calls: vec![
+                    nn::BatchRow {
+                        request: 0,
+                        kind: nn::RowKind::Decode,
+                        cache_group: 0,
+                        rows: 0..1,
+                    },
+                    nn::BatchRow {
+                        request: 1,
+                        kind: nn::RowKind::Decode,
+                        cache_group: 0,
+                        rows: 1..2,
+                    },
+                ],
             },
             input_ids: vec![7, 8],
             slots: vec![0, 1],
             parameters: vec![0.0; 2 * ops::sampler::PARAMETER_COLUMNS as usize],
-            commit: vec![0, 1],
+            commit: committed(&[0, 1]),
             page_size: 16,
             max_kv_len: 4096,
         }
@@ -2298,13 +2475,13 @@ mod tests {
                     request: 0,
                     kind: nn::RowKind::Prefill,
                     cache_group: 0,
-                    rows: 0..3,
+                    rows: 0..1,
                 }],
             },
             input_ids: vec![1, 2, 3],
             slots: vec![0],
             parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
-            commit: vec![0],
+            commit: committed(&[0]),
             page_size: 16,
             max_kv_len: 4096,
         }
@@ -2324,7 +2501,7 @@ mod tests {
         let bucket = Bucket::decode(4, Variant::DecodeGreedy);
         let staged = staging.stage(
             &decode_columns(),
-            &[CallId(5)],
+            &[CallId(4), CallId(5)],
             &Shape::decode(2, Variant::DecodeGreedy),
             bucket,
         )?;
@@ -2407,9 +2584,12 @@ mod tests {
             assert_eq!(descriptor.vocab, 1_024);
             assert_eq!(descriptor.index, DType::I32);
         }
-        // A catalog whose rows are all small needs one key.
-        let small = Buckets::causal_lm(&[1, 3], &[4], false);
-        assert_eq!(commit_descriptors(&small, 1_024).len(), 1);
+        // One key per block a catalog's rows fall into: rows 1 and 3 land in blocks 1 and 4, and a
+        // catalog whose rows share one block needs one key.
+        let two_blocks = Buckets::causal_lm(&[1, 3], &[4], false);
+        assert_eq!(commit_descriptors(&two_blocks, 1_024).len(), 2);
+        let one_block = Buckets::causal_lm(&[3], &[4], false);
+        assert_eq!(commit_descriptors(&one_block, 1_024).len(), 1);
     }
 
     /// A warm pose's commit table is inert and complete: every column is present, no row names a
@@ -2459,6 +2639,82 @@ mod tests {
         assert_eq!(&staging.input_ids(2), &[7, 8]);
         assert_eq!(staging.input_ids(4).len(), 4);
         Ok(())
+    }
+
+    /// A completion reports the commit table's row of its own call. The slot a call writes to is a
+    /// state slot, not a row of the table: a batch whose slots are numbered past its calls must not
+    /// read another call's lengths, nor a row the table does not hold.
+    #[test]
+    fn a_completion_reads_its_own_row_of_the_commit_table() {
+        let rows = nn::BatchRows {
+            positions: vec![1, 2],
+            slot_mapping: vec![0, 1],
+            seq_lens: vec![2, 3],
+            query_offsets: vec![0, 1, 2],
+            logits_rows: vec![0, 1],
+            calls: vec![
+                nn::BatchRow {
+                    request: 0,
+                    kind: nn::RowKind::Decode,
+                    cache_group: 0,
+                    rows: 0..1,
+                },
+                nn::BatchRow {
+                    request: 1,
+                    kind: nn::RowKind::Decode,
+                    cache_group: 0,
+                    rows: 1..2,
+                },
+            ],
+        };
+        // Slots 9 and 4 write state nine and four: neither is a row of the two-call table.
+        let states = states_of(&[9, 4], &rows, 2, &[3, 5], &[3, 6]);
+        assert_eq!(
+            states,
+            vec![
+                RowState {
+                    step_index: 3,
+                    cache_computed_len: 3,
+                    cache_visible_len: 3
+                },
+                RowState {
+                    step_index: 6,
+                    cache_computed_len: 5,
+                    cache_visible_len: 6
+                },
+            ]
+        );
+    }
+
+    /// A call that evaluates several rows reports one state, the one the commit table wrote for the
+    /// call, and a call whose slot names no state reports nothing.
+    #[test]
+    fn a_multi_row_call_reports_one_state_and_no_slot_reports_none() {
+        let rows = nn::BatchRows {
+            positions: vec![9, 10, 11],
+            slot_mapping: vec![0, 1, 2],
+            seq_lens: vec![1, 1, 1],
+            query_offsets: vec![0, 1, 2, 3],
+            logits_rows: vec![0, 1, 2],
+            calls: vec![nn::BatchRow {
+                request: 0,
+                kind: nn::RowKind::Verify,
+                cache_group: 0,
+                rows: 0..3,
+            }],
+        };
+        assert_eq!(
+            states_of(&[2, 2, 2], &rows, 1, &[7], &[11]),
+            vec![RowState {
+                step_index: 11,
+                cache_computed_len: 7,
+                cache_visible_len: 11
+            }]
+        );
+        assert_eq!(
+            states_of(&[-1], &rows, 1, &[7], &[11]),
+            vec![RowState::default()]
+        );
     }
 
     /// A batch larger than the bucket it planned is refused before any staging or launch.
@@ -2535,12 +2791,13 @@ mod sampled_output_tests {
         );
     }
 
-    /// A call whose rows sample nothing still completes: it advanced, it just ended no prompt. A
-    /// bucket with no sampling row states no call and measures nothing.
+    /// A call whose rows sample nothing still completes: it advanced, it just ended no prompt. The
+    /// readback still holds a token per bucket row - the sampler writes one whatever the row is -
+    /// and the row's `-1` is what discards it, so no call ever receives it.
     #[test]
     fn a_call_that_samples_nothing_still_completes() {
         let output = calls_output(
-            &[],
+            &[0],
             &[-1],
             &rows(&[(0, 0..4)]),
             &[CallId(1)],
