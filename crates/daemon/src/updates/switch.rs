@@ -124,11 +124,12 @@ pub(crate) trait Roster {
     fn command(&mut self, host: &str, generation: u64, command: process::Command);
     /// Commands the frontend to serve `epoch` from `requests`.
     fn serve(&mut self, epoch: u64, requests: &str);
-    /// Makes the previous epoch serve again on `host`: promote its parked
-    /// standby if one is alive, otherwise start a successor generation, claim
-    /// it, park it and promote it. A drained process is terminal (§2.3), so
-    /// nothing re-admits one; the epoch layer owns whichever of the two paths
-    /// applies, and the switch only waits for the epoch to report serving.
+    /// Starts a fresh generation of the previous epoch on `host` and brings
+    /// it to serving: spawn, claim, park, promote. After `Drain` the process
+    /// that served the previous epoch exits and is never revived (§7.4,
+    /// exec's answer), and its own standby was discarded at the drain, so
+    /// neither is promoted; the epoch layer owns what starting a successor
+    /// means on the host, and the switch waits for `serving`.
     fn resume(&mut self, host: &str, generation: u64, reason: &str);
     /// Takes the events that arrived since the last call.
     fn events(&mut self) -> Vec<Event>;
@@ -154,6 +155,22 @@ pub(crate) enum Phase {
     Purged,
     /// The update returned to the previous epoch.
     Abandoned,
+}
+
+impl Phase {
+    /// The phase as the status reports it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Promoting => "promoting",
+            Self::Serving => "serving",
+            Self::Probation => "probation",
+            Self::Committing => "committing",
+            Self::Reverting => "reverting",
+            Self::Purged => "purged",
+            Self::Abandoned => "abandoned",
+        }
+    }
 }
 
 /// One epoch switch.
@@ -193,11 +210,13 @@ pub(crate) struct Switch {
     parked: BTreeSet<String>,
     promoted: BTreeSet<String>,
     drained: BTreeSet<String>,
-    /// Hosts whose main process of the previous epoch exited during the
-    /// switch: their epoch is replaced before it can serve again.
-    previous_dead: BTreeSet<String>,
-    /// Hosts whose previous-epoch main process reported serving again.
+    /// Hosts whose previous-epoch main process reported serving again after
+    /// the return switch started it.
     serving: BTreeSet<String>,
+    /// Generations reported as the previous epoch's: a fresh generation is
+    /// minted above the target's spawn generation, so the number alone no
+    /// longer tells the two epochs apart.
+    previous_serving: BTreeSet<u64>,
     /// A restore waiting for the previous epoch to be replaced before the
     /// frontend is served it.
     pending_restore: Option<Failure>,
@@ -259,8 +278,8 @@ impl Switch {
             parked: BTreeSet::new(),
             promoted: BTreeSet::new(),
             drained: BTreeSet::new(),
-            previous_dead: BTreeSet::new(),
             serving: BTreeSet::new(),
+            previous_serving: BTreeSet::new(),
             pending_restore: None,
             committed: BTreeSet::new(),
             target_drained: BTreeSet::new(),
@@ -321,9 +340,10 @@ impl Switch {
 
     /// Whether `generation` names a main process of the target epoch: any
     /// generation from the one the switch spawned on, since a promoted or
-    /// relaunched child reports the next one.
+    /// relaunched child reports the next one, unless it was already reported
+    /// as the returning previous epoch's.
     fn is_target(&self, generation: u64) -> bool {
-        generation >= self.spawn_generation
+        generation >= self.spawn_generation && !self.previous_serving.contains(&generation)
     }
 
     /// Whether `generation` names a main process of the previous epoch.
@@ -426,12 +446,15 @@ impl Switch {
         if self.pending_restore.is_none() || generation < self.previous_generation {
             return;
         }
+        // A fresh generation is minted above the target's, so the number is
+        // recorded as the previous epoch's before any report could be read as
+        // the target's.
+        self.previous_serving.insert(generation);
         self.previous_generation = self.previous_generation.max(generation);
         self.serving.insert(host.to_owned());
-        if self.previous_dead.is_subset(&self.serving)
-            && let Some(failure) = self.pending_restore.take()
-        {
-            self.finish_restore(roster, &failure.reason);
+        let hosts: BTreeSet<String> = self.nodes.iter().map(|node| node.host.clone()).collect();
+        if hosts.is_subset(&self.serving) && self.pending_restore.take().is_some() {
+            self.finish_restore(roster);
         }
     }
 
@@ -512,7 +535,8 @@ impl Switch {
 
     /// Reverts a target that serves on probation: the target is drained so
     /// that it admits nothing and ends its requests as migratable, then the
-    /// previous epoch takes over again.
+    /// previous epoch takes over again (§7.4; a drained process exits and is
+    /// never revived).
     fn reverting(&mut self, roster: &mut impl Roster, failure: Failure) {
         self.update.fail(failure.clone());
         self.failure = Some(failure.clone());
@@ -532,25 +556,26 @@ impl Switch {
     /// Returns to the previous epoch after the frontend was told the target
     /// serves: the previous epoch admits again, the frontend serves it, and
     /// the target is stopped and retired.
+    /// Starts the return to the previous epoch: a drained process exits and
+    /// is never revived, so every host starts a fresh generation of the
+    /// previous epoch and the frontend is served it only once every host says
+    /// it serves (§7.4, exec's answer).
     fn restore(&mut self, roster: &mut impl Roster, failure: Failure) {
         self.update.fail(failure.clone());
         self.failure = Some(failure.clone());
-        if self.previous_dead.is_empty() {
-            // The epoch that served before the switchover still runs: it
-            // only has to admit again.
-            self.finish_restore(roster, &failure.reason);
-            return;
-        }
-        // Its successor must serve first: serving it before that would route
-        // requests to an epoch that is not running.
         self.pending_restore = Some(failure);
         self.phase = Phase::Reverting;
+        let reason = self
+            .failure
+            .as_ref()
+            .map(|failure| failure.reason.clone())
+            .unwrap_or_default();
+        self.resume(roster, &reason);
     }
 
-    /// Serves the previous epoch again once it is running, and drops the
-    /// target.
-    fn finish_restore(&mut self, roster: &mut impl Roster, reason: &str) {
-        self.resume(roster, reason);
+    /// Serves the previous epoch once every host reports it serves, and drops
+    /// the target.
+    fn finish_restore(&mut self, roster: &mut impl Roster) {
         roster.serve(self.previous, &self.requests);
         self.retire.push(self.target);
         let retire = std::mem::take(&mut self.retire);
@@ -565,32 +590,27 @@ impl Switch {
         self.phase = Phase::Abandoned;
     }
 
-    /// The previous epoch admits again after its drain. A host whose process
-    /// died is skipped: its replacement serves already.
+    /// Every host starts a fresh generation of the previous epoch: a drained
+    /// process exits and is never revived, and its old standby was discarded
+    /// at the drain, so nothing is promoted in its place.
     fn resume(&mut self, roster: &mut impl Roster, reason: &str) {
         for node in &self.nodes {
-            if self.previous_dead.contains(&node.host) {
-                continue;
-            }
             roster.resume(&node.host, self.previous_generation, reason);
         }
     }
 
-    /// Finishes a revert the target acknowledged.
+    /// The target finished draining: the previous epoch starts a fresh
+    /// generation on every host, and the frontend is served it when every
+    /// host reports serving.
     fn reverted(&mut self, roster: &mut impl Roster) {
-        self.record.status = Status::Purged;
-        self.epochs.record(self.target, self.record.clone());
-        self.update.revert();
-        self.resume(roster, "the update reverted");
-        roster.serve(self.previous, &self.requests);
-        self.retire.push(self.target);
-        let retire = std::mem::take(&mut self.retire);
-        let generation = self.target_generation();
-        for node in &self.nodes {
-            roster.stop(&node.host, &self.group, Some(generation));
-            let _ = roster.claim(&node.host, self.previous, &self.scopes(node), &retire);
-        }
-        self.phase = Phase::Abandoned;
+        let failure = self.failure.clone().unwrap_or_else(|| Failure {
+            kind: "reverted".to_owned(),
+            reason: String::new(),
+            device: None,
+        });
+        let reason = failure.reason.clone();
+        self.pending_restore = Some(failure);
+        self.resume(roster, &reason);
     }
 
     /// One event, in whatever phase it arrives.
@@ -665,20 +685,17 @@ impl Switch {
                 Phase::Preparing | Phase::Promoting => {
                     // The serving epoch's main process died: the standby
                     // promotion (§2.5) takes over. The switch itself stops.
-                    self.previous_dead.insert(host);
                     self.promotion_due = true;
                     self.failed(roster, failure);
                 }
                 Phase::Serving => {
                     // This host has nothing left to drain, and the epoch
                     // must be replaced before it could serve again.
-                    self.previous_dead.insert(host.clone());
                     self.promotion_due = true;
                     self.drained.insert(host);
                     self.progress(roster);
                 }
                 Phase::Probation | Phase::Committing | Phase::Reverting => {
-                    self.previous_dead.insert(host);
                     self.promotion_due = true;
                 }
                 _ => {}
@@ -687,10 +704,14 @@ impl Switch {
             match self.phase {
                 Phase::Preparing | Phase::Promoting => self.failed(roster, failure),
                 Phase::Serving => self.restore(roster, failure),
-                Phase::Probation => self.reverting(roster, failure),
-                Phase::Reverting => {
-                    // The previous epoch is to serve anyway: finish.
-                    self.reverted(roster);
+                // A dead target cannot be drained: the previous epoch's
+                // successor must serve instead.
+                Phase::Probation => self.restore(roster, failure),
+                Phase::Reverting if self.pending_restore.is_none() => {
+                    // The target's process ended instead of reporting its
+                    // drain: it is drained for this host all the same.
+                    self.target_drained.insert(host);
+                    self.progress(roster);
                 }
                 Phase::Committing => {
                     // The commit is an operator decision retained until it
@@ -1370,6 +1391,12 @@ mod tests {
         );
 
         switch.serving(&mut roster, "n0", 7);
+        assert_eq!(
+            switch.phase(),
+            Phase::Reverting,
+            "every host must report serving"
+        );
+        switch.serving(&mut roster, "n1", 8);
         assert_eq!(switch.phase(), Phase::Abandoned);
         assert_eq!(
             roster.serves,
@@ -1400,14 +1427,28 @@ mod tests {
         roster.scripted = vec![exit_event("n0", 6)];
         switch.advance(&mut roster);
 
-        assert_eq!(switch.phase(), Phase::Abandoned);
-        assert_eq!(roster.resumes.len(), 2, "the old epoch admits on each node");
+        assert_eq!(switch.phase(), Phase::Reverting);
+        assert_eq!(
+            roster.resumes.len(),
+            2,
+            "a fresh generation of the old epoch starts on each node"
+        );
         assert!(
             roster
                 .resumes
                 .iter()
                 .all(|(_, generation, _)| *generation == 5)
         );
+        assert!(
+            roster.serves.is_empty(),
+            "the frontend is served only once every node reports serving"
+        );
+
+        switch.serving(&mut roster, "n0", 7);
+        assert!(roster.serves.is_empty(), "one node is not every node");
+        switch.serving(&mut roster, "n1", 7);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
         assert_eq!(
             roster.serves,
             vec![(11, "unix:/run/requests.sock".to_owned())]
@@ -1478,6 +1519,15 @@ mod tests {
             ),
         ];
         switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Reverting);
+        assert!(
+            roster.serves.is_empty(),
+            "the previous epoch starts a fresh generation first"
+        );
+        assert_eq!(roster.resumes.len(), 2);
+        switch.serving(&mut roster, "n0", 7);
+        switch.serving(&mut roster, "n1", 7);
 
         assert_eq!(switch.phase(), Phase::Abandoned);
         assert_eq!(

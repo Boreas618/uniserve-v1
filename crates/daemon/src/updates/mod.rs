@@ -29,6 +29,7 @@ use crate::leader::UpdateError;
 use crate::options::ServeConfig;
 
 pub(crate) mod change;
+pub(crate) mod epoch;
 pub(crate) mod switch;
 
 use change::ApplyRequest;
