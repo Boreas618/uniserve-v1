@@ -176,7 +176,6 @@ fn strip_comments(text: &str) -> String {
             None => return out,
         }
     }
-    let mut rest = rest;
     while let Some(start) = rest.find("//") {
         out.push_str(&rest[..start]);
         match rest[start..].find('\n') {
@@ -482,10 +481,10 @@ fn field_size(header: &str, declaration: &str) -> Option<(usize, usize)> {
         let (size, align) = body_layout(header, kind, &declaration[open + 1..close])?;
         return Some((size, align));
     }
-    let mut words = declaration.split_whitespace();
+    let words = declaration.split_whitespace();
     let mut kind = String::new();
     let mut pointer = false;
-    while let Some(word) = words.next() {
+    for word in words {
         // A star is the type's, wherever C attached it: `*attrs` is a pointer
         // field whose declarator follows the star.
         if let Some(rest) = word.strip_prefix('*') {
