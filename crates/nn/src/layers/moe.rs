@@ -96,7 +96,7 @@ const ENCODE_CHUNK: u32 = 1024;
 
 /// The encoder's chunk is a whole number of scale blocks; a chunk that were not would have a partial
 /// block with no scale to name it.
-const _: () = assert!(ENCODE_CHUNK % BLOCK_ELEMENTS == 0);
+const _: () = assert!(ENCODE_CHUNK.is_multiple_of(BLOCK_ELEMENTS));
 
 /// The geometry one encoded expert step's buffers are sized from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -153,15 +153,15 @@ pub fn encoded_bytes(
         .max(grouped_workspace_bytes(routes, hidden));
     let mut total: u64 = 0;
     for bytes in [
-        tokens * (hidden / 2),        // the activation's packed codes, a byte per two codes
-        scales(tokens, hidden),       // its block scales
-        tokens * 4,                   // its per-token factor, F32
+        tokens * (hidden / 2),  // the activation's packed codes, a byte per two codes
+        scales(tokens, hidden), // its block scales
+        tokens * 4,             // its per-token factor, F32
         routes * intermediate * width_bytes, // FC1's gated rows, the hidden type
-        routes * (intermediate / 2),  // their packed codes
+        routes * (intermediate / 2), // their packed codes
         scales(routes, intermediate), // their block scales
-        routes * 4,                   // their per-token factor, F32
+        routes * 4,             // their per-token factor, F32
         routes * hidden * width_bytes, // FC2's rows, one per route
-        scratch,                      // the products' scratch
+        scratch,                // the products' scratch
     ] {
         // Each buffer starts on the arena's alignment, so the plan is the sum of the aligned
         // extents: the order the step reserves them in does not change the total.
@@ -961,12 +961,9 @@ impl Moe {
 
         // 5. FC1: the token-major gather product, one gated row per permuted route.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
-        let workspace = arena.tensor(DType::U8, Shape::new(&[self.workspace_bytes(rows).max(1)]))?;
-        let descriptor = self.gather_nvfp4_descriptor(
-            hidden.dtype,
-            DType::U8,
-            layout,
-        );
+        let workspace =
+            arena.tensor(DType::U8, Shape::new(&[self.workspace_bytes(rows).max(1)]))?;
+        let descriptor = self.gather_nvfp4_descriptor(hidden.dtype, DType::U8, layout);
         let args = GatherGemmNvfp4Args {
             hidden: values,
             hidden_scale: scales,
@@ -990,8 +987,9 @@ impl Moe {
         let gated_token_scale = arena.tensor(DType::F32, Shape::new(&[rows]))?;
         let second = self.quantize_descriptor(
             hidden.dtype,
-            u32::try_from(intermediate)
-                .map_err(|_| Error::shape("Moe", format!("{intermediate} intermediate elements")))?,
+            u32::try_from(intermediate).map_err(|_| {
+                Error::shape("Moe", format!("{intermediate} intermediate elements"))
+            })?,
             layout,
         );
         let args = QuantizeArgs {
