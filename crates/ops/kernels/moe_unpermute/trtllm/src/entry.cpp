@@ -21,11 +21,53 @@
 namespace {
 
 namespace cute_dsl = tensorrt_llm::kernels::cute_dsl;
-
 // The message an entry writes before it returns a nonzero status.
 int32_t refuse(uniserve_unpermute_call* call, const char* message) {
   std::snprintf(call->error, sizeof(call->error), "%s", message);
   return 1;
+}
+
+// The dtype dispatch, instantiated once per input convention: the artifact's kernel takes the
+// convention as a compile-time flag, and the call names it at run time.
+template <bool kExpanded>
+int32_t combine(const uniserve_unpermute_call* call, cudaStream_t stream, int32_t tokens,
+                int32_t top, int32_t hidden) {
+  constexpr bool kEnablePdl = true;
+    if (call->input_dtype == UNISERVE_DTYPE_BF16) {
+      if (call->scales_dtype == UNISERVE_DTYPE_F32) {
+        cute_dsl::moeUnpermute<__nv_bfloat16, float>(
+            static_cast<__nv_bfloat16 const*>(call->routes), static_cast<__nv_bfloat16*>(call->out),
+            call->expanded_to_permuted, static_cast<float const*>(call->scales), tokens, hidden, top,
+            kExpanded, kEnablePdl, stream);
+        return 0;
+      }
+      if (call->scales_dtype == UNISERVE_DTYPE_BF16) {
+        cute_dsl::moeUnpermute<__nv_bfloat16, __nv_bfloat16>(
+            static_cast<__nv_bfloat16 const*>(call->routes), static_cast<__nv_bfloat16*>(call->out),
+            call->expanded_to_permuted, static_cast<__nv_bfloat16 const*>(call->scales), tokens, hidden,
+            top, kExpanded, kEnablePdl, stream);
+        return 0;
+      }
+      return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves bf16 routes with f32 or bf16 scales");
+    }
+    if (call->input_dtype == UNISERVE_DTYPE_F16) {
+      if (call->scales_dtype == UNISERVE_DTYPE_F32) {
+        cute_dsl::moeUnpermute<__half, float>(
+            static_cast<__half const*>(call->routes), static_cast<__half*>(call->out),
+            call->expanded_to_permuted, static_cast<float const*>(call->scales), tokens, hidden, top,
+            kExpanded, kEnablePdl, stream);
+        return 0;
+      }
+      if (call->scales_dtype == UNISERVE_DTYPE_F16) {
+        cute_dsl::moeUnpermute<__half, __half>(
+            static_cast<__half const*>(call->routes), static_cast<__half*>(call->out),
+            call->expanded_to_permuted, static_cast<__half const*>(call->scales), tokens, hidden, top,
+            kExpanded, kEnablePdl, stream);
+        return 0;
+      }
+      return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves f16 routes with f32 or f16 scales");
+    }
+  return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves bf16 or f16 routes");
 }
 
 }  // namespace
@@ -52,45 +94,15 @@ extern "C" int32_t uniserve_moe_unpermute(const uniserve_unpermute_call* call, v
   const auto hidden = static_cast<int32_t>(call->hidden);
   const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
 
-  // The routes are indexed by `expanded_to_permuted`, so the kernel reads them
-  // as the permuted rows they are; the dependent launch is on, which is how the
-  // sort, the GEMMs and this combine overlap in one captured graph.
-  constexpr bool kInputIsExpanded = false;
-  constexpr bool kEnablePdl = true;
+  // The input's row convention is the call's, not this unit's: the dense product writes one row per
+  // expanded route and the encoded one writes permuted rows, so the module is compiled for one of
+  // them (`ops::moe::combine::Layout`, a descriptor field) and the entry dispatches on it.
+  const bool expanded = call->layout == 1;
 
-  if (call->input_dtype == UNISERVE_DTYPE_BF16) {
-    if (call->scales_dtype == UNISERVE_DTYPE_F32) {
-      cute_dsl::moeUnpermute<__nv_bfloat16, float>(
-          static_cast<__nv_bfloat16 const*>(call->routes), static_cast<__nv_bfloat16*>(call->out),
-          call->expanded_to_permuted, static_cast<float const*>(call->scales), tokens, hidden, top,
-          kInputIsExpanded, kEnablePdl, cuda_stream);
-      return 0;
-    }
-    if (call->scales_dtype == UNISERVE_DTYPE_BF16) {
-      cute_dsl::moeUnpermute<__nv_bfloat16, __nv_bfloat16>(
-          static_cast<__nv_bfloat16 const*>(call->routes), static_cast<__nv_bfloat16*>(call->out),
-          call->expanded_to_permuted, static_cast<__nv_bfloat16 const*>(call->scales), tokens, hidden,
-          top, kInputIsExpanded, kEnablePdl, cuda_stream);
-      return 0;
-    }
-    return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves bf16 routes with f32 or bf16 scales");
+  if (expanded) {
+    return combine<true>(call, cuda_stream, tokens, top, hidden);
   }
-  if (call->input_dtype == UNISERVE_DTYPE_F16) {
-    if (call->scales_dtype == UNISERVE_DTYPE_F32) {
-      cute_dsl::moeUnpermute<__half, float>(
-          static_cast<__half const*>(call->routes), static_cast<__half*>(call->out),
-          call->expanded_to_permuted, static_cast<float const*>(call->scales), tokens, hidden, top,
-          kInputIsExpanded, kEnablePdl, cuda_stream);
-      return 0;
-    }
-    if (call->scales_dtype == UNISERVE_DTYPE_F16) {
-      cute_dsl::moeUnpermute<__half, __half>(
-          static_cast<__half const*>(call->routes), static_cast<__half*>(call->out),
-          call->expanded_to_permuted, static_cast<__half const*>(call->scales), tokens, hidden, top,
-          kInputIsExpanded, kEnablePdl, cuda_stream);
-      return 0;
-    }
-    return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves f16 routes with f32 or f16 scales");
-  }
-  return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves bf16 or f16 routes");
+  return combine<false>(call, cuda_stream, tokens, top, hidden);
 }
+
+

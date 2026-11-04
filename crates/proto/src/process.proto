@@ -56,6 +56,32 @@ message Join {
 message Engine {
   // The deployment: the served model name.
   string deployment = 1;
+  // The engine number the daemon started this process under, which the launch
+  // file states as `engine` and the epoch layer addresses commands by. The
+  // daemon keys this connection by it, so a command reaches the process it
+  // names rather than the one that happened to connect in that order; zero
+  // states no number, and a daemon refuses it rather than guessing.
+  uint64 engine = 2;
+  // Which of a process's links this connection is. One main process has two:
+  // the process link, which receives the epoch's program-layer commands, the
+  // storage claim and the §7.3 reports, and the request link, which carries the
+  // epoch's requests and metrics. The two are separate sockets and both state
+  // the same engine number, so the number alone cannot tell them apart.
+  Interface interface = 3;
+}
+
+// The link of a main process a connection is.
+enum Interface {
+  // Not stated: the daemon keeps the connection under the order it accepted it
+  // in and refuses nothing, which is how every client that is not a main
+  // process connects.
+  INTERFACE_UNSPECIFIED = 0;
+  // The process link: the epoch's program-layer commands, its storage claim and
+  // its §7.3 reports travel here.
+  INTERFACE_PROCESS = 1;
+  // The request link: the epoch's requests, their events and its metrics travel
+  // here.
+  INTERFACE_REQUESTS = 2;
 }
 
 // The answer to a `Hello`.
@@ -492,6 +518,13 @@ message Report {
 
 message Precopied {
   uint64 generation = 1;
+  // The operators this update could not compare, each with the reason it could
+  // not be compared (a changed output shape or element type, a launch that
+  // carved no twin). Empty states every operator the update replaced was
+  // compared: the absence carries information, so no "all fine" entry is ever
+  // listed. A pass where every replaced operator is uncompared lists every one
+  // of them, because that update has no shadow evidence at all.
+  repeated string uncompared = 2;
 }
 
 // A parked standby's readiness (§2.5): its generation is the one it was

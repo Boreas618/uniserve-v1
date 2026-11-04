@@ -13,9 +13,11 @@
 // the CUstream of the device the executor drives.
 //
 // `rows` is [permuted_rows, intermediate], `weights` [experts, hidden,
-// intermediate] and `out` [expanded_rows, hidden]. The sort metadata holds
-// permuted_rows / tile entries in `tile_to_expert` and `tile_to_limit`, the
-// permuted_rows permuted-to-expanded map in `permuted_to_expanded`, and one tile
+// intermediate] and `out` [permuted_rows, hidden]: the product's row `p` is the
+// sort's permuted row `p`, the same row of gated activations the tile read. The sort
+// metadata holds permuted_rows / tile entries in `tile_to_expert` and `tile_to_limit`,
+// the permuted_rows permuted-to-expanded map in `permuted_to_expanded` (carried for the
+// wrapper's signature; the store is the identity, so nothing reads it), and one tile
 // count in `num_non_exiting_tiles`.
 struct uniserve_route_call {
   const void* rows;
@@ -29,7 +31,6 @@ struct uniserve_route_call {
   int64_t width;
   int64_t intermediate;
   int64_t experts;
-  int64_t expanded_rows;
   int64_t dtype;
   char error[512];
 };
@@ -46,9 +47,9 @@ enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_F4E2M1 = 7,
 };
 
-static_assert(offsetof(uniserve_route_call, error) == 104,
+static_assert(offsetof(uniserve_route_call, error) == 96,
               "the call's error message must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_route_call) == 616,
+static_assert(sizeof(uniserve_route_call) == 608,
               "the call must be the size of the operator's layout");
 
 // Launch the module's FC2 kernel. Returns 0, or a nonzero status with a

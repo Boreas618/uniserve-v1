@@ -42,8 +42,9 @@ def spec(fields, parameters, target):
     intermediate = int(fields["intermediate"])
     # The sort metadata and the row counts are runtime sizes; the compile
     # describes one representative problem big enough for every bucket.
+    # The rows are permuted in and out, so the wrapper's `m` (the activations' rows) and its output
+    # row count are the same height.
     permuted_rows = int(parameters["permuted_rows"])
-    expanded_rows = int(parameters["expanded_rows"])
     kernel = kernels.RouteGroupedGemmKernel(
         mma_tiler_mn=tiler,
         cluster_shape_mn=cluster,
@@ -64,7 +65,7 @@ def spec(fields, parameters, target):
             hidden,
             intermediate,
             experts,
-            expanded_rows,
+            permuted_rows,
         ],
         "options": {
             "tile_size": tiler[0],

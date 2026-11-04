@@ -63,7 +63,10 @@ pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows};
 pub use linear::{Linear, Nvfp4Linear};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
-pub use moe::{EncodedGeometry, Moe, TILE_ROWS, encoded_bytes};
+pub use moe::{
+    Buffer, EncodedStep, Group, Launch, Moe, MoeGeometry, TILE_ROWS, dense_bytes, encoded_bytes,
+    exchanged_bytes, exchanged_rows, router_bytes, routing_bytes, sort_bytes, step_bytes,
+};
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::activation::Activation;

@@ -43,6 +43,25 @@ pub trait Runner: Send {
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
+    /// The resident cache this runner reads, when it reads one: what a sleep gives back and a wake
+    /// maps again (2.5).
+    ///
+    /// The caller dedups by the handle's address, because two runners of one device may share one
+    /// cache and a second wake would reset units the first had just mapped.
+    fn cache(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        None
+    }
+
+    /// Hands the runner the device's record of the operators a program-layer update could not
+    /// compare (7.3 step 2).
+    ///
+    /// The record lives on the device executor because the control thread reports it when a
+    /// precopy finishes, and the runners themselves run on the device thread. A runner that
+    /// compares nothing ignores it.
+    fn attach_uncompared(&mut self, sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let _ = sink;
+    }
+
     /// Turns one shadow batch of the scheduler's `shadow` pass into the paired forwards it needs
     /// (7.3 step 2).
     ///
@@ -149,6 +168,23 @@ pub trait Runner: Send {
 
 /// One runner the device executor owns: its name, the phases it serves, and the runner itself.
 ///
+/// What binds a runner to the executor: its name, the phases it serves, and the device it issues
+/// on.
+///
+/// The four travel together - a runner is named once, serves a fixed set of phases, and issues
+/// every job on one device's one stream - so a constructor that took them apart could be called
+/// with answers that belong to different runners.
+pub struct Binding {
+    /// The executor's name for this runner.
+    pub id: RunnerId,
+    /// The phases it serves, in scheduler order.
+    pub phases: Vec<PhaseId>,
+    /// The device it computes on.
+    pub device: platform::DeviceId,
+    /// The stream every job it issues runs on.
+    pub stream: platform::Stream,
+}
+
 /// The device executor keeps these in [`RunnerId`] order and serves a batch through the runner
 /// whose phase it names.
 pub struct NamedRunner {

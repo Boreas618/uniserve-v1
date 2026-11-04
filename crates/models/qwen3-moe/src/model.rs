@@ -63,6 +63,14 @@ pub struct LoadOptions {
     /// has to know it: the encoded step's buffers are the plan's to reserve, and a plan built for
     /// dense experts would size an arena the encoded step writes past.
     pub experts_encoded: bool,
+    /// Tokens one rank's expert exchange carries, on a deployment whose experts are sharded.
+    ///
+    /// Zero on a single rank, which has no exchange. On a group it is the **load-time** bound the
+    /// plan is built with: a rank sorts `ranks · capacity` received rows over the experts it holds,
+    /// so the step's buffers are shaped by this number and not by the batch's token count. A request
+    /// is admitted within it; a batch larger than it is a deployment error rather than a buffer that
+    /// grows.
+    pub exchange_capacity: u64,
 }
 
 impl Default for LoadOptions {
@@ -73,6 +81,7 @@ impl Default for LoadOptions {
             attention_workspace_bytes: TRTLLM_WORKSPACE_BYTES,
             page_tokens: 64,
             experts_encoded: false,
+            exchange_capacity: 0,
         }
     }
 }
@@ -156,12 +165,22 @@ pub struct Plan {
     pub gathered: u64,
     /// Bytes of the attention program's workspace.
     pub workspace: u64,
-    /// Bytes the encoded expert step reserves in the routed layers; zero when the experts are dense
-    /// or no layer routes.
+    /// Bytes one routed layer's expert step reserves; zero when no layer routes.
     ///
     /// One reservation serves every routed layer, as the rest of the plan does: the step's buffers
-    /// are reused as the layer loop advances.
+    /// are released as the layer loop advances, so a plan is one layer deep.
+    ///
+    /// What it covers depends on the deployment, and the difference is not a constant. A single rank
+    /// reserves the router, the sort's metadata at the batch's height, and the permuted pair. An
+    /// expert-parallel rank reserves the router at the batch's height, the sort's metadata at the
+    /// **received** height (`ranks · capacity`) over the experts it holds, the pair at the rows that
+    /// height permutes to ([`Self::exchange_rows`]), and one **combined** row per received token
+    /// (`received · hidden · dtype`), which no single-rank path has.
     pub moe: u64,
+    /// The exchange this plan was sized for, when the model's experts are sharded.
+    pub exchange: Option<nn::layers::Group>,
+    /// The permuted rows an expert-parallel rank sorts over: zero on a single rank.
+    pub exchange_rows: u64,
 }
 
 impl Plan {
@@ -173,6 +192,36 @@ impl Plan {
         options: &LoadOptions,
         dtype: DType,
     ) -> Result<Self> {
+        // The exchange is a deployment, not a request: its rank count is the partition's and its
+        // capacity is the load option's, so the plan can reserve the group's worst case before any
+        // request exists. A sharded deployment that states no capacity has nothing to size with, and
+        // guessing one is how a buffer ends up smaller than the rows that reach it.
+        let exchange = match partition.expert_parallel {
+            1 => None,
+            ranks => {
+                if options.exchange_capacity == 0 {
+                    return Err(Error::Config(format!(
+                        "an expert-parallel deployment of {ranks} ranks states no exchange \
+                         capacity: the plan is sized from the deployment's bound, not from a request"
+                    )));
+                }
+                Some(nn::layers::Group {
+                    ranks: u64::try_from(ranks).map_err(|_| {
+                        Error::Config(format!("{ranks} ranks exceed a plan's row counts"))
+                    })?,
+                    capacity: options.exchange_capacity,
+                })
+            }
+        };
+        // The block's own geometry, which both the single-rank and the exchanged step are stated
+        // over: the vocabulary's expert count, and the tile the permutation packs in.
+        let geometry = nn::layers::MoeGeometry {
+            hidden: element(config.hidden_size, "hidden_size")?,
+            intermediate: element(config.moe_intermediate_size, "moe_intermediate_size")?,
+            top: element(config.num_experts_per_tok, "num_experts_per_tok")?,
+            experts: element(config.num_experts, "num_experts")?,
+            tile: u64::from(TILE_ROWS),
+        };
         Ok(Self {
             tokens,
             hidden: element(config.hidden_size, "hidden_size")?,
@@ -204,25 +253,39 @@ impl Plan {
                 0
             },
             workspace: options.attention_workspace_bytes,
-            moe: if options.experts_encoded && config.num_experts > 0 {
-                // The activation encoding's block scales are the CUTLASS product's plain layout.
-                nn::layers::encoded_bytes(
-                    tokens,
-                    nn::layers::EncodedGeometry {
-                        hidden: element(config.hidden_size, "hidden_size")?,
-                        intermediate: element(
-                            config.moe_intermediate_size,
-                            "moe_intermediate_size",
-                        )?,
-                        top: element(config.num_experts_per_tok, "num_experts_per_tok")?,
-                        experts: element(config.num_experts, "num_experts")?,
-                        tile: u64::from(TILE_ROWS),
-                    },
-                    ops::fp4::ScaleLayout::Linear,
-                    dtype,
-                )?
-            } else {
-                0
+            moe: match exchange {
+                None => {
+                    // One routed layer's whole step: the routing prefix, the permuted pair, and the
+                    // encoded planes when the checkpoint stores them encoded. Sized from the same
+                    // `max_permuted_rows` the runtime reserves, so plan and step cannot disagree. The
+                    // activation encoding's block scales are the CUTLASS product's plain layout.
+                    if config.num_experts > 0 {
+                        nn::layers::step_bytes(
+                            tokens,
+                            geometry,
+                            ops::fp4::ScaleLayout::Linear,
+                            dtype,
+                            options.experts_encoded,
+                        )?
+                    } else {
+                        0
+                    }
+                }
+                Some(group) => {
+                    // The exchanged step: the received rows over this rank's experts, and one
+                    // combined row per received token — the shape the single-rank step cannot state.
+                    if config.num_experts == 0 {
+                        return Err(Error::Config(
+                            "an expert-parallel deployment of a model with no experts".to_owned(),
+                        ));
+                    }
+                    nn::layers::exchanged_bytes(tokens, geometry, group, dtype)?
+                }
+            },
+            exchange,
+            exchange_rows: match exchange {
+                None => 0,
+                Some(group) => nn::layers::exchanged_rows(tokens, geometry, group)?,
             },
         })
     }
@@ -437,6 +500,15 @@ impl Qwen3Moe {
     ///
     /// `last` past the last layer is refused rather than clamped: a stage asking for layer 60 of a
     /// 48-layer model is a caller error, and clamping it would answer a different question.
+    ///
+    /// The answer is the **state** after layer `last` — the reference's `hidden_{last + 1}` — and
+    /// not the block's update, which is one fold short of it (see [`Self::fold`]).
+    ///
+    /// **Each call reserves the plan's step from `f`'s arena and leaves it reserved**, because the
+    /// answer lives in it: the rows a caller compares are the arena's own. A caller that runs two
+    /// measurements in a row — the same layer twice, or a layer and then its prefix — must take a
+    /// mark before the first and release it after it has read the first answer, or the second call
+    /// asks for a second step past the region's end.
     pub fn forward_through(
         &self,
         f: &Forward,
@@ -463,6 +535,250 @@ impl Qwen3Moe {
                 plan.hidden
             )));
         }
+        self.forward_from(
+            f,
+            batch,
+            cache,
+            hidden,
+            Run {
+                start: 0,
+                last,
+                stage: None,
+            },
+        )
+    }
+
+    /// The router's choice at one layer, from that layer's **post-attention state**.
+    ///
+    /// `state` is `residual + attention` for that layer — the tensor the forward's
+    /// `post_attention_norm` is given, `[tokens, hidden]` — and `ids`/`weights` are the caller's
+    /// `[tokens, top]` i32 and F32. This method runs that norm, then the router: no attention, no
+    /// expert, no fold, no other layer.
+    ///
+    /// **The state is the layer's post-attention one, not its input.** The model's MoE reads
+    /// `post_attention_norm(residual + attention)`, so a caller that passes the layer's input rows
+    /// asks about a router the forward never runs, and nothing here can refuse it: both are
+    /// `[tokens, hidden]` states. A reference builds the same vector from its hooks as
+    /// `hidden_{layer} + hidden_{layer+1}_attended`; with `--from`, that sum is what the harness
+    /// hands in. Above layer 0 the state exists only after the prefix.
+    ///
+    /// The ids are the checkpoint's expert indices, before the expert map, and a layer whose MLP is
+    /// dense has no router to answer from.
+    pub fn route(
+        &self,
+        f: &Forward,
+        state: TensorView,
+        layer: usize,
+        ids: TensorView,
+        weights: TensorView,
+    ) -> Result<()> {
+        let (tokens, plan) = self.state_shape(state, layer)?;
+        let normalized = f
+            .arena()
+            .tensor(state.dtype, Shape::new(&[tokens, plan.hidden]))?;
+        self.layers[layer].route(f, state, normalized, ids, weights)
+    }
+
+    /// The rows and plan a routing cut's `state` implies, refusing a layer the model does not have
+    /// and rows that are not `[tokens, hidden]` of the model's dtype.
+    fn state_shape(&self, state: TensorView, layer: usize) -> Result<(u64, Plan)> {
+        if layer >= self.layers.len() {
+            return Err(Error::Config(format!(
+                "layer {layer} was asked for but the model has {}",
+                self.layers.len()
+            )));
+        }
+        let tokens = state.rows();
+        let plan = self.plan(tokens)?;
+        if state.shape.rank() != 2
+            || state.shape.dim(0) != tokens
+            || state.shape.dim(1) != plan.hidden
+        {
+            return Err(Error::Config(format!(
+                "state is {:?}, [{tokens}, {}] expected",
+                state.shape.dims(),
+                plan.hidden
+            )));
+        }
+        if state.dtype != self.dtype {
+            return Err(Error::Config(format!(
+                "state is {}, the model is {}",
+                state.dtype, self.dtype
+            )));
+        }
+        Ok((tokens, plan))
+    }
+
+    /// The router's raw scores at one layer, from that layer's **post-attention state**.
+    ///
+    /// `state` is `residual + attention` for that layer — the tensor the forward's
+    /// `post_attention_norm` is given, `[tokens, hidden]`. This method runs that norm, then the
+    /// gate, and nothing else, so its scores are the forward's own router operand's. A reference
+    /// computes the same state from its own hooks as `hidden_{layer} + hidden_{layer+1}_attended`,
+    /// and with `--from` that is what the harness must hand in.
+    ///
+    /// **It is not the layer's input rows.** The router the model runs is fed the post-attention
+    /// normalization; a cut that normalized the layer's input would answer about a router no forward
+    /// executes, and its ids would agree with a reference's only as far as two correlated vectors do.
+    ///
+    /// `scores` receives `[tokens, experts]` of the state's dtype. One difference from the forward's
+    /// own path, and it is a rounding: the forward fuses the residual add into the norm, so its
+    /// normalized row is computed from the unrounded sum, while a caller that materializes
+    /// `residual + attention` first hands the norm the sum rounded to the model's dtype. That is one
+    /// rounding of a value both sides compute the same way, and it is the same one a reference
+    /// computing `hidden_{layer} + hidden_{layer+1}_attended` in its own dtype makes.
+    pub fn gate(
+        &self,
+        f: &Forward,
+        state: TensorView,
+        layer: usize,
+        scores: TensorView,
+    ) -> Result<()> {
+        let (tokens, plan) = self.state_shape(state, layer)?;
+        let normalized = f
+            .arena()
+            .tensor(state.dtype, Shape::new(&[tokens, plan.hidden]))?;
+        self.layers[layer].gate(f, state, normalized, scores)
+    }
+
+    /// Run layers `start..=last` on the caller's rows, and answer the state after `last` (with
+    /// `stage = None`) or that cut inside it.
+    ///
+    /// This is the clean-input measurement: the rows handed in become the run's residual stream, so
+    /// the first layer of the run normalizes them alone instead of adding a previous layer's output,
+    /// and nothing of `0..start` enters the answer's error. It is how a reference's own
+    /// `hidden_start` measures one layer or a range of them without inheriting a prefix's divergence.
+    ///
+    /// Two facts a caller needs. **The cache planes are per layer**, and a run touches only the
+    /// planes of the layers it runs: the keys and values the attention reads are the ones those
+    /// layers write from these rows, so a prefill needs a cache whose pages hold no other sequence's
+    /// rows and a decode needs the prefix already written into those same planes by an earlier run.
+    /// And **the answer carries the layers' own roundings, no more**: the state after `last` is the
+    /// fold of its block's update into the stream, computed by the same launch the next layer's input
+    /// norm runs, so a cut inside a layer and the state above it differ by one such fold.
+    pub fn forward_from(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        hidden: TensorView,
+        run: Run,
+    ) -> Result<TensorView> {
+        let (update, residual, buffers) = self.walk(f, batch, cache, hidden, run)?;
+        match run.stage {
+            Some(_) => Ok(update),
+            None => self.fold(f, update, residual, buffers.normalized),
+        }
+    }
+
+    /// The state after a layer: its block's update folded into the residual stream.
+    ///
+    /// This is the tensor the reference calls `hidden_{layer+1}` — the whole state a layer hands
+    /// the next one — and not the block's update, which is an order of magnitude smaller and on its
+    /// own is not a state at all. Comparing one against the other would read as a collapse at every
+    /// layer.
+    ///
+    /// The fold is the layer boundary's own operator, `add_rms_norm`, whose residual output is the
+    /// sum: a boundary has no separate add, and the run accumulates the stream with exactly this
+    /// launch at the next layer's input norm, so the state answered here is bit-identical to the
+    /// one the run produces. The normalization the operator fuses is computed and discarded; its
+    /// weights do not touch the sum.
+    /// The sum lands in `update` itself, which the operator may alias, and the normalization it
+    /// fuses is discarded into `scratch` — the last layer's dead `normalized` buffer — so the fold
+    /// costs no arena beyond the step the walk already reserved.
+    fn fold(
+        &self,
+        f: &Forward,
+        update: TensorView,
+        residual: TensorView,
+        scratch: TensorView,
+    ) -> Result<TensorView> {
+        self.layers[0]
+            .input_norm
+            .forward_with_residual(f, update, residual, update, scratch)
+            .map_err(Error::from)?;
+        Ok(update)
+    }
+
+    /// Run layers `0..=layer` and stop inside `layer` after `stage`, answering what it wrote there.
+    ///
+    /// The prefix is run in full, so the layer's residual stream and every operand are the ones the
+    /// whole run hands it: an in-layer walk whose prefix differed from the model's would answer a
+    /// question about a model nobody runs. The cuts sit *inside* the layer, so `MlpOut` is the
+    /// block's update and [`Self::forward_through`] is that update folded into the stream: the two
+    /// differ by the boundary's residual add. The cuts are one operator each, which is what lets a
+    /// reference post-hook on `input_layernorm`, on `self_attn`, on `post_attention_layernorm` and
+    /// on `mlp` be their counterparts.
+    ///
+    /// The prefix's error is the cut's error floor: what the cut shows is a divergence *on top of*
+    /// the state layers `0..layer` already produced, which is the walk's `hidden_{layer}` row. A cut
+    /// that looks clean at layer 30 therefore means "layer 30 adds nothing to a prefix that is
+    /// already off by the walk's error at 29", and never "layers 0..29 are right".
+    pub fn forward_substage(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        hidden: TensorView,
+        layer: usize,
+        stage: Substage,
+    ) -> Result<TensorView> {
+        self.forward_from(
+            f,
+            batch,
+            cache,
+            hidden,
+            Run {
+                start: 0,
+                last: layer,
+                stage: Some(stage),
+            },
+        )
+    }
+
+    /// Run layers `0..=last`, or `0..last` and then `last` up to `tail`, and answer the rows the
+    /// last run wrote together with the residual stream as it then stands.
+    ///
+    /// One loop serves the whole run, the layer walk and the in-layer walk. Three loops that
+    /// reserve the same buffers and add the residual in the same order are three chances to
+    /// disagree about the layer equations, and a bisection whose prefix differs from the model it
+    /// bisects answers nothing.
+    fn walk(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        hidden: TensorView,
+        run: Run,
+    ) -> Result<(TensorView, TensorView, Buffers)> {
+        let Run { start, last, stage } = run;
+        let tokens = batch.tokens();
+        let plan = self.plan(tokens)?;
+        if start > last || last >= self.layers.len() {
+            return Err(Error::Config(format!(
+                "layers {start}..={last} were asked for and the model has {}",
+                self.layers.len()
+            )));
+        }
+        if hidden.shape.rank() != 2
+            || hidden.shape.dim(0) != tokens
+            || hidden.shape.dim(1) != plan.hidden
+        {
+            return Err(Error::Config(format!(
+                "hidden is {:?}, [{tokens}, {}] expected",
+                hidden.shape.dims(),
+                plan.hidden
+            )));
+        }
+        if hidden.dtype != self.dtype {
+            return Err(Error::Config(format!(
+                "hidden is {}, the model is {}",
+                hidden.dtype, self.dtype
+            )));
+        }
+
+        // The two rotary factor tables are one forward's worth of trigonometry, shared by every
+        // layer: the positions and the head geometry do not change between them.
         let cosine = f
             .arena
             .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))?;
@@ -473,16 +789,34 @@ impl Qwen3Moe {
         let buffers = Buffers::reserve(f.arena, &plan, self.dtype)?;
         let mut residual = hidden;
         let mut input = hidden;
-        for (index, layer) in self.layers[..=last].iter().enumerate() {
-            layer.forward(
-                f, batch, cache, index, &buffers, residual, cosine, sine, input,
+        for (offset, layer) in self.layers[start..=last].iter().enumerate() {
+            let index = start + offset;
+            // One layer's scratch is dead once its launches are enqueued: the plan is one layer
+            // deep and the next layer is handed the same addresses, which is what a replayed graph
+            // expects. The layer-independent buffers above were reserved before this mark.
+            let mark = f.arena.mark();
+            let out = layer.forward(
+                f,
+                batch,
+                cache,
+                index,
+                offset == 0,
+                &buffers,
+                residual,
+                buffers.residual,
+                cosine,
+                sine,
+                input,
+                if index == last { stage } else { None },
             )?;
-            if index == 0 {
-                residual = buffers.residual;
-            }
-            input = buffers.update;
+            f.arena.release(mark);
+            // The first layer read the embedding in `hidden` and wrote the first sum into the
+            // plan's residual region; from here on the stream lives there and every layer
+            // accumulates it in place.
+            input = out;
+            residual = buffers.residual;
         }
-        Ok(input)
+        Ok((input, residual, buffers))
     }
 
     /// The model as the executor sees it: one causal-LM block named `backbone`.
@@ -516,7 +850,51 @@ impl Qwen3Moe {
 
 impl DecoderLayer {
     /// Run the layer: normalize (or add and normalize for later layers), attend, then route,
-    /// writing the layer's output into `update` and the new residual into `residual`.
+    /// writing the layer's output into `update` and the new residual into `residual_out`.
+    ///
+    /// `residual` and `residual_out` differ for the first layer only: its input residual is the
+    /// caller's `hidden` — the embedding — while its output must land in the plan's residual
+    /// region, where every later layer accumulates in place.
+    ///
+    /// `stop` cuts the layer short for an in-layer walk and answers the tensor that cut produces;
+    /// the sublayers it skips are not launched at all. With `stop = None` the answer is `update`,
+    /// the layer's output.
+    /// The router's raw scores at this layer: its post-attention norm, then its gate, and nothing
+    /// else.
+    ///
+    /// `state` is the layer's **post-attention state** — its residual plus its attention's output,
+    /// the tensor `post_attention_norm` is given in [`Self::forward`] — and not the layer's input.
+    /// The forward's MoE reads `post_attention_norm(state)`, so a cut that normalized the layer's
+    /// input instead would answer a question about a router the model never runs.
+    fn gate(
+        &self,
+        f: &Forward,
+        state: TensorView,
+        normalized: TensorView,
+        scores: TensorView,
+    ) -> Result<()> {
+        self.post_attention_norm.forward(f, state, normalized)?;
+        self.mlp.gate(f, normalized, scores)
+    }
+
+    /// The router's choice at this layer: its post-attention norm, then its router, and nothing
+    /// else.
+    ///
+    /// `state` is the layer's **post-attention state**, as in [`Self::gate`]: the same tensor the
+    /// forward's `post_attention_norm` is given, so the ids come from the same rows through the same
+    /// norm as the forward's and a reference's `layer.mlp.gate` output compares with them directly.
+    fn route(
+        &self,
+        f: &Forward,
+        state: TensorView,
+        normalized: TensorView,
+        ids: TensorView,
+        weights: TensorView,
+    ) -> Result<()> {
+        self.post_attention_norm.forward(f, state, normalized)?;
+        self.mlp.route(f, normalized, ids, weights)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the layer runs the reference's tuple through the plan's buffers"
@@ -526,17 +904,24 @@ impl DecoderLayer {
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
-        index: usize,
+        layer: usize,
+        first: bool,
         buffers: &Buffers,
         residual: TensorView,
+        residual_out: TensorView,
         cosine: TensorView,
         sine: TensorView,
         hidden: TensorView,
-    ) -> Result<()> {
+        stop: Option<Substage>,
+    ) -> Result<TensorView> {
         let normalized = buffers.normalized;
         let update = buffers.update;
 
-        if index == 0 {
+        // `first` is the first layer *of this run*, which is layer 0 for the whole model and layer
+        // `start` for a run that begins part way up: its input residual is the caller's rows, so it
+        // normalizes alone and the addition starts at the next layer. `layer` is the cache plane and
+        // the rotary table's layer, which is always the model's own index.
+        if first {
             self.input_norm
                 .forward(f, hidden, normalized)
                 .map_err(Error::from)?;
@@ -545,19 +930,29 @@ impl DecoderLayer {
                 .forward_with_residual(f, hidden, residual, residual, normalized)
                 .map_err(Error::from)?;
         }
+        if stop == Some(Substage::Normalized) {
+            return Ok(normalized);
+        }
 
         self.attention.forward(
-            f, batch, cache, index, buffers, normalized, cosine, sine, update,
+            f, batch, cache, layer, buffers, normalized, cosine, sine, update,
         )?;
+        if stop == Some(Substage::Attended) {
+            return Ok(update);
+        }
 
         self.post_attention_norm
-            .forward_with_residual(f, update, residual, residual, normalized)
+            .forward_with_residual(f, update, residual, residual_out, normalized)
             .map_err(Error::from)?;
+        if stop == Some(Substage::GateIn) {
+            return Ok(normalized);
+        }
 
         match &self.mlp {
             Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from),
             Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update),
-        }
+        }?;
+        Ok(update)
     }
 }
 
@@ -636,6 +1031,40 @@ impl AttentionLayer {
     }
 }
 
+impl Mlp {
+    /// The router's choice for this sublayer, on rows the layer's input norm already produced.
+    ///
+    /// A dense MLP has no router: the checkpoint's `mlp_only_layers` give such a layer a plain
+    /// gated MLP, so there are no expert ids to answer and this refuses rather than inventing them.
+    fn route(
+        &self,
+        f: &Forward,
+        normalized: TensorView,
+        ids: TensorView,
+        weights: TensorView,
+    ) -> Result<()> {
+        match self {
+            Mlp::Experts(moe) => moe.route(f, normalized, ids, weights).map_err(Error::from),
+            Mlp::Dense(_) => Err(Error::Config(
+                "this layer's MLP is dense: it chooses no experts, so it has no routing to answer"
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
+impl Mlp {
+    /// The router's raw scores for this sublayer, on rows the layer's input norm already produced.
+    fn gate(&self, f: &Forward, normalized: TensorView, scores: TensorView) -> Result<()> {
+        match self {
+            Mlp::Experts(moe) => moe.gate(f, normalized, scores).map_err(Error::from),
+            Mlp::Dense(_) => Err(Error::Config(
+                "this layer's MLP is dense: it has no gate to answer scores from".to_owned(),
+            )),
+        }
+    }
+}
+
 impl DenseMlp {
     /// `down(up · silu(gate))`.
     fn forward(
@@ -681,6 +1110,81 @@ fn headed(projection: TensorView, norm: &Weight) -> Result<Shape> {
     Ok(Shape::new(&[rows, columns / head_dim, head_dim]))
 }
 
+/// Which layers a walk runs, and whether it stops inside the last of them.
+///
+/// The two ends are named rather than passed side by side: `forward_from(start, last)` with adjacent
+/// `usize`s is a transposition waiting for a busy afternoon, and a run that silently executed
+/// `last..=start` would answer a question nobody asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Run {
+    /// The first layer the run executes.
+    pub start: usize,
+    /// The last layer it executes.
+    pub last: usize,
+    /// Where inside `last` it stops, or `None` to run that layer whole.
+    pub stage: Option<Substage>,
+}
+
+/// How far through one layer an in-layer walk goes.
+///
+/// A whole-run bisection answers which *layer* diverges; a layer is five operators deep and its
+/// output alone cannot say which of them. These are the cuts a layer can be stopped at, in the order
+/// the layer runs them, each naming the tensor the reference's module holds at that point:
+///
+/// - [`Substage::Normalized`] is `input_layernorm`'s output, residual add included for every layer
+///   after the first (the first's input residual is the embedding itself);
+/// - [`Substage::Attended`] is `self_attn`'s output, projected out and **before** the residual add;
+/// - [`Substage::GateIn`] is `post_attention_layernorm`'s output — the routing gate's operand, with
+///   the attention's residual add folded in — which is the tensor the reference's post-hook on that
+///   module holds and the one the router's weight is multiplied by;
+/// - [`Substage::MlpOut`] is the routed (or dense) block's output, **before** its residual add —
+///   transformers' `mlp` post-hook — and one fold short of the layer's output state, which is what
+///   `forward_through` answers and which no cut names because the layer walk already shows it.
+///
+/// Each cut is named after the reference tensor that answers it, and a cut exists only where such a
+/// tensor exists: a name ambiguous about the residual would produce a number that looks like
+/// evidence and is off by a vector the size of the stream (rms ~7.3 in this model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Substage {
+    /// The residual add and the input normalization.
+    Normalized,
+    /// The attention block's projection out, before the residual add.
+    Attended,
+    /// The post-attention normalization: the gate's operand (`post_attention_layernorm`).
+    GateIn,
+    /// The routed (or dense) block's output, before its residual add (`mlp`).
+    MlpOut,
+}
+
+impl Substage {
+    /// Every arm with its spelling, in the order a layer runs them.
+    ///
+    /// The spellings are the contract with a command line that names a stage: the model refuses
+    /// anything else, so a mistyped stage cannot silently run a different cut.
+    pub const NAMES: [&'static str; 4] = ["normalized", "attended", "gate_in", "mlp_out"];
+
+    /// The stage `name` asks for, or `None` when it names no cut.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "normalized" => Some(Self::Normalized),
+            "attended" => Some(Self::Attended),
+            "gate_in" => Some(Self::GateIn),
+            "mlp_out" => Some(Self::MlpOut),
+            _ => None,
+        }
+    }
+
+    /// The spelling of this stage, one of [`Self::NAMES`].
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normalized => "normalized",
+            Self::Attended => "attended",
+            Self::GateIn => "gate_in",
+            Self::MlpOut => "mlp_out",
+        }
+    }
+}
+
 impl CausalLm for Qwen3Moe {
     fn embed_input_ids(&self, f: &Forward, ids: TensorView, out: TensorView) -> nn::Result<()> {
         self.embedding
@@ -715,41 +1219,31 @@ impl CausalLm for Qwen3Moe {
             ))));
         }
 
-        // The two rotary factor tables are one forward's worth of trigonometry, shared by every
-        // layer: the positions and the head geometry do not change between them.
-        let cosine = f
-            .arena
-            .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))
-            .map_err(Error::from)
+        // The rotary tables, the buffers and the residual stream are `walk`'s to reserve: the whole
+        // run and a bisection must share one loop, or the bisection measures a different model.
+        let last =
+            self.layers.len().checked_sub(1).ok_or_else(|| {
+                capability(Error::Config("the model has no decoder layer".into()))
+            })?;
+        let (input, residual, _) = self
+            .walk(
+                f,
+                batch,
+                cache,
+                hidden,
+                Run {
+                    start: 0,
+                    last,
+                    stage: None,
+                },
+            )
             .map_err(capability)?;
-        let sine = f
-            .arena
-            .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))
-            .map_err(Error::from)
-            .map_err(capability)?;
-        self.factors(f, batch.positions, cosine, sine)
-            .map_err(capability)?;
-        let buffers = Buffers::reserve(f.arena, &plan, self.dtype).map_err(capability)?;
 
-        // The residual stream is the embedding's output for the first layer; every later layer's
-        // pre-norm adds the previous layer's output into it.
-        let mut residual = hidden;
-        let mut input = hidden;
-        for (index, layer) in self.layers.iter().enumerate() {
-            layer
-                .forward(
-                    f, batch, cache, index, &buffers, residual, cosine, sine, input,
-                )
-                .map_err(capability)?;
-            if index == 0 {
-                residual = buffers.residual;
-            }
-            input = buffers.update;
-        }
-
-        // The output norm: normalize the last layer's output with the summed residual.
+        // The output norm: the last layer's output added into the residual stream and normalized.
+        // The sum lands back in the stream, which is the last thing this forward needs from it, and
+        // `add_rms_norm` loads a whole row before storing any of it, so the alias is safe.
         self.norm
-            .forward_with_residual(f, input, residual, buffers.normalized, hidden)
+            .forward_with_residual(f, input, residual, residual, hidden)
             .map_err(Error::from)
             .map_err(capability)
     }
@@ -817,6 +1311,35 @@ impl std::fmt::Debug for Qwen3Moe {
 
 #[cfg(test)]
 mod tests {
+    /// The stage spellings are the contract with a command line: every name parses back to the
+    /// stage it names, in the layer's own order, and a name that is not one of them answers nothing
+    /// rather than a default. A bisection that silently ran a different cut would report the wrong
+    /// operator with full confidence.
+    #[test]
+    fn a_substage_name_round_trips_and_anything_else_is_refused() {
+        for (index, name) in Substage::NAMES.iter().enumerate() {
+            let stage = Substage::parse(name).expect("a declared name parses");
+            assert_eq!(stage.name(), *name);
+            assert_eq!(Substage::NAMES[index], stage.name());
+        }
+        assert_eq!(Substage::parse("normalized"), Some(Substage::Normalized));
+        assert_eq!(Substage::parse("attended"), Some(Substage::Attended));
+        assert_eq!(Substage::parse("gate_in"), Some(Substage::GateIn));
+        assert_eq!(Substage::parse("mlp_out"), Some(Substage::MlpOut));
+        for refused in [
+            "",
+            "norm",
+            "Normalized",
+            "attention",
+            "attn",
+            "moe",
+            "mlp",
+            "mlpout",
+        ] {
+            assert_eq!(Substage::parse(refused), None, "{refused:?} named no cut");
+        }
+    }
+
     use super::*;
     use crate::Activation;
 
@@ -923,10 +1446,11 @@ mod tests {
     }
 
     /// An encoded expert step's buffers are the plan's to reserve: the arena is sized from the
-    /// plan, and the step writes past a plan that forgot them. So the plan states them when the
-    /// checkpoint's experts were read as NVFP4, and nothing when they were dense.
+    /// plan, and the step writes past a plan that forgot them. A dense deployment reserves its
+    /// routing prefix and its permuted pair — the combine indexes that pair through the sort's map on
+    /// either path — and an encoded one adds its activation planes and the products' scratch.
     #[test]
-    fn an_encoded_expert_step_is_planned_and_a_dense_one_is_not() {
+    fn an_encoded_expert_step_is_planned_and_a_dense_one_reserves_less() {
         let config = config();
         let partition = Partition::single();
         let dense = Plan::new(
@@ -937,7 +1461,6 @@ mod tests {
             DType::BF16,
         )
         .unwrap();
-        assert_eq!(dense.moe, 0);
         let encoded = Plan::new(
             &config,
             &partition,
@@ -953,11 +1476,22 @@ mod tests {
         // tile per route, so the step reserves 15360 permuted rows rather than 120.
         let routes = 120 * 128;
         let down_rows = routes * 2048 * 2;
+        let gated_rows = routes * 768 * 2;
         assert!(
             encoded.moe >= down_rows,
             "the encoded step reserves {} bytes, the down product's rows alone are {down_rows}",
             encoded.moe
         );
+        // The permuted pair is permuted-height on both paths: the combine indexes it through the
+        // sort's map, so the dense path pays it too and the encoded path's addition is its
+        // activation planes.
+        assert!(
+            dense.moe >= down_rows + gated_rows,
+            "the dense step reserves {} bytes against the pair's {}",
+            dense.moe,
+            down_rows + gated_rows
+        );
+        assert!(encoded.moe > dense.moe);
         assert!(encoded.bytes(DType::BF16).unwrap() > dense.bytes(DType::BF16).unwrap());
     }
 
@@ -965,7 +1499,7 @@ mod tests {
     fn the_plan_bytes_follow_the_token_count() {
         let config = config();
         let partition = Partition::single();
-        let bytes = |tokens: u64| {
+        let plan = |tokens: u64| {
             Plan::new(
                 &config,
                 &partition,
@@ -974,14 +1508,20 @@ mod tests {
                 DType::BF16,
             )
             .unwrap()
-            .bytes(DType::BF16)
-            .unwrap()
         };
+        let one = plan(1);
+        let two = plan(2);
         // Per token: two F32 factor columns, three hidden buffers, three query-width buffers
         // (query, rotated query, attended output), three key/value-width buffers and the logits'
         // row. Two rank's worth of logits are planned only where a gather happens, and the single
         // rank plans none.
         let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 3 * 4096 * 2 + 3 * 512 * 2 + 151936 * 2;
-        assert_eq!(bytes(2) - bytes(1), per_token);
+        // The expert step grows with the batch as well, at the permutation's padded height rather
+        // than at `tokens · top`, so its own term is the difference the plan states for it.
+        let step = two.moe - one.moe;
+        assert_eq!(
+            two.bytes(DType::BF16).unwrap() - one.bytes(DType::BF16).unwrap(),
+            per_token + step
+        );
     }
 }

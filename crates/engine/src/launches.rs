@@ -147,7 +147,9 @@ pub fn plan_ranks(
     let config = EngineConfig::from_spec(spec)?;
     let arguments = SchedulerHandle::group_arguments(&config)?.arguments;
     let launches = device_launches(spec)?;
-    let processes = processes::ProcessClient::connect(process_address, &spec.deployment)?;
+    // Planning runs on the leader daemon's behalf and is not a main process: it states no engine
+    // number, so no program-layer command is ever addressed to this connection.
+    let processes = processes::ProcessClient::connect(process_address, &spec.deployment, 0)?;
     let claims = Claims::claim(&arguments, &processes)?;
     // Planning runs in the leader daemon, even when the target engine
     // will run elsewhere. Its registry must advertise the leader's host.
