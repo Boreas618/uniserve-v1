@@ -241,34 +241,6 @@ impl Layouts {
         Ok(packed)
     }
 
-    /// The most key tiles one query tile may read under this layout's sparse attention.
-    ///
-    /// A generated-video query tile keeps every dense tile of the prefix and, of each segment, that
-    /// segment's own keep count (`vsa/segments.py:196-204`). `kept_tiles` falls as the rate rises,
-    /// so the widest segment is the smaller of the configured rates; the bound is that plus the
-    /// prefix, which is what sizes the selection tables the sparse attention writes.
-    pub fn selected_bound(&self, layout: &Layout) -> Result<u32> {
-        let (sparsity, reference_keep) = match self.config.attention {
-            crate::config::AttentionKind::Sparse {
-                sparsity,
-                reference_keep,
-                ..
-            } => (sparsity, reference_keep),
-            crate::config::AttentionKind::Dense => {
-                return Err(Error::config(
-                    "a dense deployment selects no key tiles".to_owned(),
-                ));
-            }
-        };
-        let packed = self.segment_of(layout)?;
-        let extent = &packed.extent;
-        let video_tiles = extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2;
-        // `kept_tiles` takes a *sparsity*; a reference segment's rate is the fraction it keeps, so
-        // its sparsity is one minus that. The wider segment is the smaller sparsity.
-        let rate = reference_keep.map_or(sparsity, |keep| sparsity.min(1.0 - keep));
-        Ok(extent.dense_prefix_tiles() + packing::kept_tiles(rate, video_tiles))
-    }
-
     /// The layout a request is laid out in, without packing it.
     ///
     /// The capability asks for a layout and cannot refuse one, so this snaps the request the way
@@ -1908,32 +1880,5 @@ mod tests {
             .map(|chunk| i32::from_le_bytes(*chunk))
             .collect()
     }
-    #[test]
-    fn a_sparse_selection_reads_the_prefix_and_the_smaller_rate() {
-        let mut config = layouts().config;
-        config.attention = AttentionKind::sparse(TILE, 0.9, Some(0.1)).expect("two rates");
-        let rule = Layouts::new(config, layouts().arrangement).unwrap();
-        let layout = rule.cover(&request(22, 1344, 768));
-        let packed = rule.segment_of(&layout).unwrap();
-        let extent = &packed.extent;
-        let video = extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2;
-        assert_eq!(
-            rule.selected_bound(&layout).unwrap(),
-            extent.dense_prefix_tiles() + packing::kept_tiles(0.9, video)
-        );
-        // A reference segment keeps a tenth of its tiles and the generated video a tenth of its
-        // own, so both segments are equally wide and either bounds the selection.
-        assert_eq!(
-            packing::kept_tiles(1.0 - 0.1, video),
-            packing::kept_tiles(0.9, video)
-        );
-        assert!(rule.selected_bound(&layout).unwrap() > extent.dense_prefix_tiles());
-    }
 
-    #[test]
-    fn a_dense_deployment_selects_no_tiles() {
-        let rule = layouts();
-        let layout = rule.cover(&request(22, 1344, 768));
-        assert!(rule.selected_bound(&layout).is_err());
-    }
 }
