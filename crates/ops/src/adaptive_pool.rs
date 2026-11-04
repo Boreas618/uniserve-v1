@@ -155,10 +155,20 @@ impl Op for AdaptivePool {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // The fused mean is one division of one FP32 sum; the reference sums the heads and then the
-        // window, so a result may differ in the last bit of either accumulation.
+        // Each output is `heads · window` terms of the row summed in FP32 and divided once, where the
+        // window is what adaptive pooling gives one output: between `floor` and `ceil` of
+        // `width / output` positions, so the longest is used. The reference sums the heads and then
+        // the window, so the two differ only in the order of that one accumulation; with a narrow
+        // output type that term is decades below the output's own round-off (64 terms of FP32 are
+        // ~7.6e-6 relative against BF16's 3.9e-3), but the reduction length is stated as it is
+        // rather than folded away, because the bound must hold for an F32 output too, where it binds.
+        let window = u64::from(descriptor.width)
+            .div_ceil(u64::from(descriptor.output))
+            .max(1);
+        let reduction = u64::from(descriptor.heads) * window;
         let unit = descriptor.dtype.unit_roundoff() as f32;
-        Tolerance::rounding(2, DType::F32, descriptor.dtype).with_atol(8.0 * VALUE_ENVELOPE * unit)
+        Tolerance::rounding(reduction, DType::F32, descriptor.dtype)
+            .with_atol(8.0 * VALUE_ENVELOPE * unit)
     }
 }
 
@@ -202,5 +212,38 @@ mod tests {
             output: 512,
             ..descriptor
         };
+    }
+
+    #[test]
+    fn the_bound_is_the_whole_window_and_never_folded_to_two_terms() {
+        // The encoder's geometry: 8 heads × 8 pooled positions = 64 terms.
+        let encoder = Descriptor {
+            dtype: DType::F32,
+            heads: 8,
+            width: 256,
+            output: 32,
+            block: 256,
+            pdl: false,
+        };
+        let clamped = <AdaptivePool as Op>::tolerance(&encoder);
+        // For an F32 output the accumulation is what the bound is about: `2γ₆₄` of FP32, where the
+        // unit roundoff is half of `f32::EPSILON`.
+        let unit = f32::EPSILON / 2.0;
+        assert!(clamped.rtol >= 2.0 * 64.0 * unit * 0.9);
+        // A wider window per output is a longer reduction, so the bound cannot sit still.
+        let narrower = Descriptor {
+            output: 8,
+            ..encoder
+        };
+        assert!(
+            <AdaptivePool as Op>::tolerance(&narrower).rtol > clamped.rtol,
+            "pooling 32 positions per output is a longer sum than pooling 8"
+        );
+        // And the absolute term follows the output's own resolution.
+        let bf16 = Descriptor {
+            dtype: DType::BF16,
+            ..encoder
+        };
+        assert!(<AdaptivePool as Op>::tolerance(&bf16).atol > clamped.atol);
     }
 }
