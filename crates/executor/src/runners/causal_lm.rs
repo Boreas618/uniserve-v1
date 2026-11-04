@@ -2080,7 +2080,13 @@ pub fn sampled_output(
             token: ids[index] as u32,
         });
     }
-    Ok(BatchOutput { tokens })
+    // The per-call completions are the mechanism's completion path and are not filled here yet:
+    // the runner reports the sampled tokens only, and the mechanism's in-process filler refuses a
+    // serving batch whose calls reported nothing (4.4) rather than advancing a slot on them.
+    Ok(BatchOutput {
+        tokens,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
