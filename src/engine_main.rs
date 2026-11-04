@@ -781,11 +781,21 @@ impl MainProcess {
         // shadow region and the state group's snapshot are one reservation (4.5), and a second
         // computation here could disagree with the pool the allocator reserved.
         let scratch = graph.scratch;
+        // The shadow region alone: the twins allocate it, and the reservation beside it holds the
+        // state group's snapshot too (7.3, 4.5).
+        let shadow = graph.shadow;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
             let executor =
-                Executor::spawn(*device, runners, plan.events(), Arc::clone(&pools), scratch)?;
+                Executor::spawn(
+                    *device,
+                    runners,
+                    plan.events(),
+                    Arc::clone(&pools),
+                    scratch,
+                    shadow,
+                )?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
@@ -1558,19 +1568,43 @@ impl MainProcess {
             .all(|generation| generation.is_empty());
         let resolved;
         let mut candidates = Candidates::new();
-        let programs = if programs.is_empty() && never_installed {
-            let (programs, listed) = match self.listed_programs() {
-                Ok(resolved) => resolved,
-                Err(failure) => return self.abandon_precopy(generation, failure, reply),
-            };
-            tracing::info!(
-                operators = programs.len(),
-                alternative = listed.values().filter(|ordered| ordered.len() > 1).count(),
-                "the precopy named no kernel program: installing this host's built programs"
-            );
-            candidates = listed;
-            resolved = programs;
-            &resolved
+        let programs = if never_installed {
+            // A named program chooses its operator's implementation - its backend and revision -
+            // and never states the operator set: a deployment that pins one operator's kernel
+            // still runs every other operator its buckets launch. So the epoch's first generation
+            // takes this host's store as its set and the deployment's named programs overlaid on
+            // it by operator, which is the only reading under which `kernels=1` on a host that
+            // built twenty-seven launches a model rather than a fragment.
+            match self.listed_programs() {
+                Ok((mut listed, ordered)) => {
+                    let named = programs.len();
+                    overlay_named(&mut listed, programs);
+                    tracing::info!(
+                        operators = listed.len(),
+                        named,
+                        alternative = ordered.values().filter(|held| held.len() > 1).count(),
+                        "this host's built programs, with the deployment's named ones overlaid"
+                    );
+                    candidates = ordered;
+                    resolved = listed;
+                    &resolved
+                }
+                // The store describes nothing for this host's targets. With no named program there
+                // is nothing to install at all and the listing's own refusal is the answer; with a
+                // named one, the named set is installed and the walk reports what it cannot bind.
+                Err(failure) if programs.is_empty() => {
+                    return self.abandon_precopy(generation, failure, reply);
+                }
+                Err(failure) => {
+                    tracing::warn!(
+                        ?failure,
+                        named = programs.len(),
+                        "this host's store describes no program to overlay: installing what the \
+                         deployment named"
+                    );
+                    programs
+                }
+            }
         } else {
             programs
         };
@@ -1679,6 +1713,41 @@ impl MainProcess {
             candidates.insert(op, ordered);
         }
         Ok((programs, candidates))
+    }
+
+    /// One operator's program from this host's store, for a walk that named an operator the
+    /// deployment left unnamed.
+    ///
+    /// The store's listing is the authority for what this host can launch: its packages are the
+    /// modules built for this host's targets. The first candidate of the operator is taken - the
+    /// deployment expressed no preference, so the store's order decides - and `None` says the store
+    /// describes nothing for the operator, which the caller states as a missing package rather than
+    /// a missing key.
+    fn borrow_program(
+        &self,
+        operator: &str,
+    ) -> std::result::Result<Option<(program_server::program::ProgramSlot, Program)>, String> {
+        let listing = self.listing()?;
+        for (op, ordered) in select_programs(&listing.packages, &self.targets) {
+            if ops::operator_name(&op) != Some(operator) {
+                continue;
+            }
+            let Some((backend, revision)) = ordered.first() else {
+                continue;
+            };
+            return Ok(Some((
+                program_server::program::ProgramSlot {
+                    op,
+                    phase: None,
+                },
+                Program {
+                    backend: backend.clone(),
+                    revision: *revision,
+                    arguments: Default::default(),
+                },
+            )));
+        }
+        Ok(None)
     }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
@@ -2001,6 +2070,7 @@ impl MainProcess {
             tracing::warn!(
                 generation,
                 stage = entered,
+                waiting_on = %pending_work(&precopy.stage, &self.executors),
                 waited_s = precopy.since.elapsed().as_secs(),
                 "the precopy has stood in this stage past the watchdog's stall bound and nothing \
                  has answered: the Program Server, a device or a scheduler is the one to look at"
@@ -2069,6 +2139,27 @@ impl MainProcess {
                 self.after_modules(precopy, loaded)
             }
             PrecopyStage::Executors(submissions) => {
+                // A device that never answers is a process that serves nothing until the epoch
+                // ends: the stage is polled, so without this bound the only line it prints is the
+                // stall warning, and the run waits out the daemon's whole prepare bound to learn
+                // what the log already showed. Preparing an installed generation is a rebind or a
+                // recapture - seconds of capture and a pinned upload, never a compile - so a stage
+                // that has stood past twice the watchdog's stall bound is failed here by name,
+                // saying what never answered. Serving keeps what it had; the update does not.
+                if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
+                    let pending = pending_work(&precopy.stage, &self.executors);
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy {
+                            reason: format!(
+                                "this node's device never answered its preparation after {}s \
+                                 ({pending}): the device thread is the one to look at",
+                                precopy.since.elapsed().as_secs()
+                            ),
+                        },
+                        precopy.reply,
+                    );
+                }
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
@@ -2104,6 +2195,45 @@ impl MainProcess {
                                     precopy.reply,
                                 );
                             };
+                            // The walk can name an operator this generation holds no program for:
+                            // a deployment names the implementations it pins and says nothing about
+                            // the rest, so the rest come from this host's store - one borrow per
+                            // operator, and a store that describes none stops the update with a
+                            // sentence naming the package rather than a key.
+                            if !precopy.names(&operator) {
+                                match self.borrow_program(&operator) {
+                                    Ok(Some((slot, program))) => {
+                                        tracing::info!(
+                                            %operator,
+                                            backend = %program.backend,
+                                            revision = program.revision,
+                                            generation,
+                                            "the walk named an operator the deployment left \
+                                             unnamed: this host's store supplies it"
+                                        );
+                                        precopy.programs.insert(slot, program);
+                                    }
+                                    Ok(None) => {
+                                        return self.abandon_precopy(
+                                            generation,
+                                            UpdateFailure::Precopy {
+                                                reason: format!(
+                                                    "{operator} has no kernel in this host's \
+                                                     store and the deployment does not name one"
+                                                ),
+                                            },
+                                            precopy.reply,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        return self.abandon_precopy(
+                                            generation,
+                                            UpdateFailure::Precopy { reason: error },
+                                            precopy.reply,
+                                        );
+                                    }
+                                }
+                            }
                             if precopy
                                 .learned
                                 .get(&operator)
@@ -4065,6 +4195,33 @@ struct Precopy {
     stage: PrecopyStage,
 }
 
+/// Overlays the deployment's named programs on this host's store listing, by operator.
+///
+/// A named program chooses its operator's implementation - its backend, its revision and the
+/// arguments it was built with - and states nothing about the operators it does not name, so the
+/// two sets are united rather than substituted: the store stays the authority for every operator
+/// the deployment left unnamed. The named slot replaces every slot of its operator the listing
+/// holds, whatever phase either states.
+fn overlay_named(listed: &mut Programs, named: &Programs) {
+    for (slot, program) in named {
+        listed.retain(|held, _| held.op != slot.op);
+        listed.insert(slot.clone(), program.clone());
+    }
+}
+
+impl Precopy {
+    /// Whether this generation holds a program for `operator`.
+    ///
+    /// A program is named by a slot, and a slot names an operator and an optional phase, so the
+    /// question a walk asks - "does this generation have an implementation of this operator?" - is
+    /// answered by any slot of that operator, whatever phase it states.
+    fn names(&self, operator: &str) -> bool {
+        self.programs
+            .keys()
+            .any(|slot| ops::operator_name(&slot.op) == Some(operator))
+    }
+}
+
 /// The stage a precopy is in.
 enum PrecopyStage {
     /// The module-load lane builds, resolves and installs each device's
@@ -4155,6 +4312,56 @@ enum StageFailure {
 
 /// Whether every submission finished, and if not, why the first unfinished or
 /// failed one did not.
+/// What one stage is still waiting for, in one phrase.
+///
+/// A stage's name says where a hang is, not which of the stage's several waits it is: the module
+/// lane holds one task per device, the executor stage one submission per device, and the shadow
+/// stage one step per scheduler. The stall line prints the counts so a run names the wait that
+/// never answered without a second run built for the purpose.
+fn pending_work(stage: &PrecopyStage, executors: &[Arc<Executor>]) -> String {
+    match stage {
+        PrecopyStage::Modules(tasks) => {
+            let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
+            format!("{answered} of {} kernel load(s) answered", tasks.len())
+        }
+        PrecopyStage::Executors(submissions) => {
+            // The label alone says which stage stood; the device thread's own account says whether
+            // it is working (a capture in progress, a bucket being recaptured) or waiting on
+            // something outside it. A capture is open or it is not, and the two look identical
+            // from the control thread without this.
+            let mut pending = Vec::new();
+            for (rank, submission) in submissions.iter().enumerate() {
+                if submission.outcome().is_some() {
+                    continue;
+                }
+                let Some(executor) = executors.get(rank) else {
+                    pending.push(format!("rank {rank}: no executor"));
+                    continue;
+                };
+                let performing = executor
+                    .performing()
+                    .unwrap_or_else(|| "nothing".to_owned());
+                pending.push(format!(
+                    "rank {rank}: {performing}, {} open capture(s)",
+                    executor.capturing()
+                ));
+            }
+            format!(
+                "{} of {} device preparation(s) answered ({})",
+                submissions.len() - pending.len(),
+                submissions.len(),
+                pending.join("; ")
+            )
+        }
+        PrecopyStage::Shadow(answers) => {
+            let answered = answers.iter().filter(|answer| !answer.is_empty()).count();
+            format!("{answered} of {} shadow step(s) answered", answers.len())
+        }
+        // The driver replaces the stage with this before it looks at it, so it is never the wait.
+        PrecopyStage::Done => "no stage".to_owned(),
+    }
+}
+
 fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
     for submission in submissions {
         match submission.outcome() {
@@ -4423,6 +4630,48 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A named program chooses its operator's implementation and never states the operator set:
+    /// the generation's programs are the store's listing with the named ones overlaid by operator.
+    #[test]
+    fn a_named_program_replaces_its_operator_and_leaves_the_rest_of_the_listing() {
+        let slot = |op: &str| program_server::program::ProgramSlot {
+            op: op.to_owned(),
+            phase: None,
+        };
+        let program = |backend: &str, revision: u32| Program {
+            backend: backend.to_owned(),
+            revision,
+            arguments: Default::default(),
+        };
+
+        let mut listed = Programs::new();
+        listed.insert(slot("paged_attention"), program("fa4", 3));
+        listed.insert(slot("rms_norm"), program("reference", 1));
+        listed.insert(slot("softmax"), program("reference", 2));
+
+        let mut named = Programs::new();
+        named.insert(slot("paged_attention"), program("trtllm", 7));
+
+        overlay_named(&mut listed, &named);
+
+        assert_eq!(listed.len(), 3, "the overlay changed the operator set");
+        assert_eq!(
+            listed.get(&slot("paged_attention")).map(|held| held.backend.as_str()),
+            Some("trtllm"),
+            "the deployment's own choice did not replace the store's default"
+        );
+        assert_eq!(
+            listed.get(&slot("rms_norm")).map(|held| held.revision),
+            Some(1),
+            "an operator the deployment did not name was dropped"
+        );
+        assert_eq!(
+            listed.get(&slot("softmax")).map(|held| held.revision),
+            Some(2),
+            "an operator the deployment did not name was dropped"
+        );
+    }
+
     use program_server::protocol::{ListedModule, ListedPackage};
     use program_server::ModuleForm;
 
