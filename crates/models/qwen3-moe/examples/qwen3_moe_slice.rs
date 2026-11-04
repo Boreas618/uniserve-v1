@@ -752,6 +752,12 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // every key it composes resolves and that two identical runs agree. A digest that moves
         // between them is a race or an uninitialized buffer, which is worth knowing before a
         // numerical comparison blames the arithmetic.
+        // Every measurement reserves the plan's scratch - the attention program's 512 MiB workspace
+        // among it - and nothing returns it: the arena is a bump allocator sized for one forward,
+        // so a second measurement without a release asks for a second copy of the whole step and
+        // fails at `plan.bytes` past the first. The mark is taken once and released after each
+        // measurement has been read back to the host.
+        let mark = arena.mark();
         let mut digests = Vec::new();
         for run in 0..2 {
             let rows = measure(None)?;
@@ -762,6 +768,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 tokens_usize(&batch),
                 usize::try_from(plan.hidden).unwrap_or(0),
             )?;
+            arena.release(mark);
             digests.push(digest(&values));
             println!(
                 "block: layer {layer}, run {run}: {} rows of {} bf16 columns, digest {digests:?}",
@@ -807,6 +814,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                         model.forward_through(&forward, &batch, &cache, hidden, layer - 1)?;
                     stream.synchronize()?;
                     let values = download_bf16(&stream, prefix, rows, width)?;
+                    arena.release(mark);
                     let file = format!("hidden_{layer:02}.npy");
                     let stage = Walked {
                         file: &file,
@@ -827,6 +835,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 let out = measure(Some(cut))?;
                 stream.synchronize()?;
                 let values = download_bf16(&stream, out, rows, width)?;
+                arena.release(mark);
                 let file = format!("hidden_{:02}_{}.npy", layer + 1, cut_file(cut));
                 let label = format!("layer {layer}'s `{}` cut", cut.name());
                 let stage = Walked {
@@ -867,6 +876,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             let out = measure(None)?;
             stream.synchronize()?;
             let values = download_bf16(&stream, out, rows, width)?;
+            arena.release(mark);
             let file = format!("hidden_{:02}.npy", layer + 1);
             let stage = Walked {
                 file: &file,
