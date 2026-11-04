@@ -798,6 +798,7 @@ impl VideoDecoder {
                 per_head(rotated_query),
                 per_head(rotated_key),
             )?;
+            // One sequence: the clip's rows, its registers and its tail attended together.
             self.attention.attend_dense(
                 f,
                 per_head(rotated_query),
@@ -805,6 +806,8 @@ impl VideoDecoder {
                 per_head(value),
                 None,
                 None,
+                u32::try_from(rows)
+                    .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
                 attended,
             )?;
             layer.output.forward(f, attended, update)?;
