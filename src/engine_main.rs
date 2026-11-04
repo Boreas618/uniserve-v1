@@ -261,6 +261,20 @@ impl ProcessInterface {
                 welcome.refusal
             );
         }
+        // A process the daemon admits and lists no node for is a refusal too: the nodes are what the
+        // claim and every later request are answered by, so a welcome with none would let this
+        // process run on a deployment the daemon does not know it on.
+        if welcome.nodes.is_empty() {
+            bail!(
+                "the daemon admitted this main process but listed no node of the deployment, so \
+                 nothing here can be claimed or supervised"
+            );
+        }
+        tracing::info!(
+            nodes = welcome.nodes.len(),
+            build = %welcome.build,
+            "connected to the deployment's process interface"
+        );
         Ok(Self {
             connection,
             pending: std::collections::VecDeque::new(),
