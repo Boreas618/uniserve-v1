@@ -23,8 +23,8 @@ use std::process::ExitCode;
 use scheduling::Engine;
 use scheduling::guest::wire;
 use scheduling::guest::{
-    CallView, Duration, Event, ExpertLoad, Init, Limits, Plan, RankView, ReplicaView, RequestView,
-    Room, Shortage, Snapshot, Storage,
+    CallView, Duration, Event, ExpertLoad, Init, Limits, Plan, RankView, ReplicaView, RequestId,
+    RequestView, Room, Shortage, Snapshot, Storage,
 };
 use serde::de::DeserializeOwned;
 
@@ -82,6 +82,10 @@ fn run(path: &str, precompile: bool) -> Result<(), Box<dyn Error>> {
         limits.timeout.0
     );
 
+    // An arrival each, then a resident request's view changing: a policy that
+    // sizes a chunk from the prefilled prefix, as `fcfs` does, reads it from
+    // `Updated` (§4.4: a resident request's changing view reaches the policy
+    // as a state change, not as a per-step dump of every resident).
     policy.observe(&[
         Event::Arrived {
             request: request(1)?,
@@ -89,12 +93,21 @@ fn run(path: &str, precompile: bool) -> Result<(), Box<dyn Error>> {
         Event::Arrived {
             request: request(2)?,
         },
+        Event::Admitted {
+            request: RequestId(1),
+        },
+        Event::Updated {
+            request: updated(1, 128, 64)?,
+        },
+        Event::Updated {
+            request: updated(1, 128, 128)?,
+        },
         Event::Stepped {
             step: 0,
             duration: Duration(0),
         },
     ])?;
-    println!("observe: 3 events");
+    println!("observe: 6 events");
 
     let room = Room {
         step: 1,
@@ -158,6 +171,18 @@ fn snapshot() -> Result<Snapshot, Box<dyn Error>> {
             "phases": [{"id":1,"kind":{"kind":"prefill"},"block":0}],
             "ranks": [{"index":0,"in_flight":0},{"index":1,"in_flight":0}]
         }"#,
+    )
+}
+
+/// One resident token request whose prompt is `prompt` tokens long and whose
+/// prefix cache holds `prefilled` of them.
+fn updated(id: u64, prompt: u32, prefilled: u32) -> Result<RequestView, Box<dyn Error>> {
+    decode(
+        format!(
+            r#"{{"id":{id},"state":{{"state":"resident"}},"class":{{"class":"token"}},
+                 "phase":1,"prompt_tokens":{prompt},"cached_prefix_tokens":{prefilled}}}"#
+        )
+        .as_bytes(),
     )
 }
 
