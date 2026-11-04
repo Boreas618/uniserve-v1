@@ -157,6 +157,36 @@ impl Buffer {
     }
 }
 
+/// The clip-latent row of every voxel of every tile, in tile order then voxel order.
+///
+/// A tile is a rectangle of the clip's latent raster — every frame, a run of rows and a run of columns —
+/// so its voxels are a subset of the clip's, and a tile's rows cannot be a strided view of the clip's
+/// when the tile is narrower than the raster. This table names them: the runner gathers each tile's
+/// `[voxels_tile, latent_channels]` block out of the clip's one `[frames·h·w, latent_channels]` latent
+/// with `nn::layers::Rows`, which is model layout arithmetic, uploaded once per layout.
+///
+/// `tiles` are in grid order ([`Tiles::tiles`]), and each tile contributes
+/// `frames · (rows_end − rows_start) · (columns_end − columns_start)` entries: the row index
+/// `((frame · h + row) · w + column)` of each of its voxels. The concatenation is a permutation of
+/// `0..frames · h · w`, because the tiles partition the raster.
+pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> Vec<i32> {
+    let height = u64::from(canvas.height);
+    let width = u64::from(canvas.width);
+    let mut rows = Vec::with_capacity(canvas.voxels() as usize);
+    for tile in tiles {
+        let (first_row, last_row) = tile.latent_rows;
+        let (first_column, last_column) = tile.latent_columns;
+        for frame in 0..u64::from(canvas.frames) {
+            for row in u64::from(first_row)..u64::from(last_row) {
+                for column in u64::from(first_column)..u64::from(last_column) {
+                    rows.push(((frame * height + row) * width + column) as i32);
+                }
+            }
+        }
+    }
+    rows
+}
+
 /// The scratch one video clip's decode needs, one entry per distinct lifetime.
 ///
 /// A clip decodes every tile of its grid in one call (`TiledDecoder.decode` batches them), so the
@@ -716,6 +746,27 @@ mod tests {
             track.window(track.latent_frames - 5, track.latent_frames),
             (track.latent_frames - 35, track.latent_frames)
         );
+    }
+
+    #[test]
+    fn the_tile_rows_name_every_clip_voxel_once() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = Canvas::clip(&config, 48, 84);
+        let grid = Tiles::of(&config, &canvas)
+            .expect("the grid")
+            .tiles(&config, &canvas);
+        let rows = tile_rows(&canvas, &grid);
+        assert_eq!(rows.len() as u64, canvas.voxels());
+        // The tiles partition the raster, so the table is a permutation of the clip's rows.
+        let mut seen = vec![false; rows.len()];
+        for row in &rows {
+            assert!(!seen[*row as usize], "row {row} is named twice");
+            seen[*row as usize] = true;
+        }
+        assert!(seen.iter().all(|row| *row));
+        // A tile's block is its own rectangle: the first three voxels are the first row's first three
+        // columns of the first frame, so the tile's rows begin at the raster's origin.
+        assert_eq!(rows[0..3].to_vec(), vec![0, 1, 2]);
     }
 
     #[test]
