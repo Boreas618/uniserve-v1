@@ -40,12 +40,17 @@
 //
 // # The descriptor
 //
-// The mask is compiled in (`UNISERVE_CAUSAL`, from the descriptor's `mask` field):
-// a causal module refuses a dense call and the other way round. The history window
-// is not compiled in — it is a bound the call carries (`window_left`), applied by
-// the masking kernel — so one module serves a windowed and an unwindowed call of
-// the same descriptor. Everything else the descriptor names (heads, head width,
-// the length cap) arrives in the call and is checked here.
+// Two of the descriptor's fields are compiled in. The mask (`UNISERVE_CAUSAL`): a
+// causal module refuses a dense call and the other way round. And the sequence
+// layout (`UNISERVE_SEQUENCES`): `ops` prints `cu_seq_lens` only for the form whose
+// launch carries no `[batch + 1]` offsets, and that form attends one sequence —
+// `[0, q_tokens)` against `[0, kv_tokens)` — so a module built for it reads no
+// table and never branches on a null pointer, and the scheduled batch form never
+// sees a call without one. The history window is not compiled in: it is a bound the
+// call carries (`window_left`), applied by the masking kernel, so one module serves
+// a windowed and an unwindowed call. Nothing else is compiled from the descriptor —
+// the heads and the head width arrive in the call and are checked here, and a
+// launch's extents are the launch's, not the program's.
 
 #include <cublasLt.h>
 #include <cuda_runtime.h>
@@ -71,6 +76,13 @@
 // 0: the dense mask, every key of the sequence visible. 1: the causal mask.
 #ifndef UNISERVE_CAUSAL
 #define UNISERVE_CAUSAL 0
+#endif
+// 1: the launch carries `[batch + 1]` sequence offsets. 0: it carries none, and the
+// module attends one sequence — `[0, q_tokens)` against `[0, kv_tokens)`. The two are
+// separate compilations, so this module never branches on a missing table and never
+// reads a null pointer.
+#ifndef UNISERVE_SEQUENCES
+#define UNISERVE_SEQUENCES 1
 #endif
 
 namespace {
@@ -374,6 +386,10 @@ __device__ float reduce_sum(float value, float* shared) {
 /// product over all of the call's keys reads nothing of another sequence. A tile
 /// row past the packed token count is no row of the tensor: it is zeroed and its
 /// output is never written.
+///
+/// `kOffsets` is the descriptor's `cu_seq_lens`: a module compiled for the launch
+/// that carries no table reads its one row range from the call's extents instead.
+template <bool kOffsets>
 __global__ void mask_softmax_kernel(float* tile, int64_t columns,
                                    const int32_t* cu_q, const int32_t* cu_k,
                                    int batch, int64_t first_row, int64_t q_tokens,
@@ -388,10 +404,16 @@ __global__ void mask_softmax_kernel(float* tile, int64_t columns,
     return;
   }
 
-  const int sequence = sequence_of(cu_q, batch, row);
-  const int64_t first_key = cu_k[sequence];
-  const int64_t keys = static_cast<int64_t>(cu_k[sequence + 1]) - first_key;
-  const int64_t local = row - cu_q[sequence];
+  // One sequence without offsets: every query row attends the whole key extent.
+  int64_t first_key = 0;
+  int64_t keys = columns;
+  int64_t local = row;
+  if constexpr (kOffsets) {
+    const int sequence = sequence_of(cu_q, batch, row);
+    first_key = cu_k[sequence];
+    keys = static_cast<int64_t>(cu_k[sequence + 1]) - first_key;
+    local = row - cu_q[sequence];
+  }
   // The visible keys of the row, as offsets into its sequence's keys: the causal
   // mask ends at the row's own position, and a history window begins the same
   // distance to the left of it.
@@ -466,10 +488,24 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
   const cudaStream_t queue = reinterpret_cast<cudaStream_t>(stream);
 
   if (call->out == nullptr || call->query == nullptr || call->key == nullptr ||
-      call->value == nullptr || call->cu_seq_lens_q == nullptr ||
-      call->cu_seq_lens_k == nullptr) {
+      call->value == nullptr) {
     return fail(call, "the call leaves one of its buffers null");
   }
+#if UNISERVE_SEQUENCES == 1
+  if (call->cu_seq_lens_q == nullptr || call->cu_seq_lens_k == nullptr) {
+    return fail(call, "this module reads the call's sequence offsets, which are null");
+  }
+#else
+  // The no-offsets form's program has no ports for the tables (model's
+  // `dense.rs::sequence_layout`): a launch that carries one is not this program's.
+  if (call->cu_seq_lens_q != nullptr || call->cu_seq_lens_k != nullptr) {
+    return fail(call, "this module attends one sequence and reads no offsets");
+  }
+  if (call->batch != 1) {
+    return fail(call, "this module attends one sequence; the call names %lld",
+                static_cast<long long>(call->batch));
+  }
+#endif
   if (call->dtype_query != kFloat32 || call->dtype_key_value != kFloat32 ||
       call->dtype_output != kFloat32) {
     return fail(call,
@@ -642,7 +678,7 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
                     static_cast<long long>(at), static_cast<long long>(head),
                     cublas_status(status));
       }
-      mask_softmax_kernel<<<kTileQ, kThreads, 0, queue>>>(
+      mask_softmax_kernel<UNISERVE_SEQUENCES == 1><<<kTileQ, kThreads, 0, queue>>>(
           weights, call->kv_tokens, call->cu_seq_lens_q, call->cu_seq_lens_k,
           static_cast<int>(call->batch), first_row, call->q_tokens,
           call->window_left, UNISERVE_CAUSAL);
