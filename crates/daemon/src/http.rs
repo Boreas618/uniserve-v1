@@ -317,6 +317,22 @@ async fn serve_on(
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
+    // The responses the daemon this one replaced handed over go on here: each
+    // connection writes the bytes the predecessor did not write and then goes
+    // on with the resumed body (design §7.5.1 step 4).
+    for stream in crate::restart::streams::take_adopted() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            crate::restart::streams::adopted(std::slice::from_ref(&stream));
+            let request_id = stream.request_id.clone();
+            let error = conn::adopt(stream.descriptor, stream.http, stream.body, app).await.err();
+            if let Some(error) = error {
+                tracing::warn!(%request_id, %error, "a handed-over connection ended");
+            }
+            crate::restart::streams::finished(&request_id);
+        });
+    }
+
     let serving = conn::serve(listener, app, accepting.clone());
     let drain = async {
         serving.await.context("HTTP server failed")?;
