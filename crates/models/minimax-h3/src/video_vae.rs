@@ -1407,6 +1407,15 @@ pub(crate) mod tests {
         }
         // The one table a layout declares is the one this decoder reads, and its descriptor is the
         // extent the layout states - the adapter adds no arithmetic of its own.
+        //
+        // Two different quantities live in this one table, and three rounds were spent on this test
+        // for want of saying so. Its **rows** are a row per row of the largest tile - the tile's voxels
+        // plus the four register rows and the trailing zero row, 1,792 + 5 = 1,797 on every canvas - and
+        // one clip's rows are the whole of it, because how many clips a request has is the runner's and
+        // the splice's question, never this table's. Its **three** is the coordinate axis, which is a
+        // dimension of its own: the values are `3 · rows` in a flat buffer and `[3, rows]` as declared,
+        // so the twenty-four-radian frame row of each axis is contiguous. Neither number is a frame
+        // count and neither multiplies the other.
         let layout = nn::capability::Layout {
             video: nn::capability::LatentShape {
                 channels: config.latent_channels,
@@ -1423,7 +1432,10 @@ pub(crate) mod tests {
             table_specs(&config, layout.video.height, layout.video.width).expect("specs");
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].name, "video_positions");
-        assert_eq!(declared[0].shape.dim(1), 3 * tile.rows());
+        // `[3, rows]`: the coordinate axis first, then one row per row of the largest tile.
+        assert_eq!(declared[0].shape.rank(), 2);
+        assert_eq!(declared[0].shape.dim(0), 3);
+        assert_eq!(declared[0].shape.dim(1), tile.rows());
         assert_eq!(declared[0].dtype, DType::F32);
     }
 
