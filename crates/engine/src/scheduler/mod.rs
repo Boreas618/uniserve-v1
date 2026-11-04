@@ -520,6 +520,13 @@ pub struct Scheduler {
     /// `Cached`/`Freed` announcements of each step: the table `Live` checks a
     /// named page against, without a step walking the prefix cache.
     pages: std::collections::BTreeMap<scheduling::guest::PageId, scheduling::guest::PageView>,
+    /// The resident requests that hold a row of the request pool: what
+    /// `Room::slots` subtracts from the pool's rows.
+    ///
+    /// Maintained where a request's allocations are installed (admission) and
+    /// taken (the end of its execution), because a step must not walk the
+    /// residents to count them (design §4.4).
+    rows_held: usize,
     /// Whether `pages` was built yet. It is built on the first step that
     /// announces a change, from `views::page_index`, which is the one walk.
     pages_seeded: bool,

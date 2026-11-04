@@ -222,6 +222,7 @@ impl Scheduler {
             running_media: HashMap::new(),
             speculation_meter: Default::default(),
             retiring_requests: HashMap::new(),
+            rows_held: 0,
             transfer_capacity,
             latent_dtype,
             engine_id: 1,
