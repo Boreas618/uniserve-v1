@@ -733,6 +733,9 @@ impl Attention {
         out: TensorView,
         workspace: TensorView,
     ) -> Result<()> {
+        // The batch's own parts are read by pointer arithmetic inside the programs, so they are
+        // checked against each other once here, before any of them is addressed.
+        batch.check()?;
         let planes = cache.planes(group, 0)?;
         let group_view = cache.group(group)?;
         if group_view.page_size != self.page_size || batch.page_size != self.page_size {
