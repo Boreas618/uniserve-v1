@@ -40,8 +40,8 @@ use tracing::{info, warn};
 use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
-use crate::input::processor::LoadModel as _;
 use crate::input::media::MediaConnector;
+use crate::input::processor::LoadModel as _;
 use crate::input::readout::ReadoutEncoder;
 use crate::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
 use crate::input::{
@@ -1358,6 +1358,13 @@ impl Leader {
             return Err(UpdateError::Refused(
                 "an epoch switch is running: one update at a time".to_owned(),
             ));
+        }
+        // Nor does a program-layer change replace one that is still on
+        // probation: the epoch's last resort is the generation that served
+        // before it, and it stays so until the commit or the revert (§7.2,
+        // §7.3 step 4).
+        if self.epochs().program_in_flight() {
+            return Err(UpdateError::InProgress);
         }
         let current = self.serving_config()?;
         let Some(update) = self.route(&current, target, false).await? else {
