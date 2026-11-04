@@ -1,0 +1,33 @@
+[package]
+name = "scheduling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The host side of the scheduling interface: a policy module run in the scheduler thread under wasmtime."
+
+[dependencies]
+# The interface, its wire format and the guest side of the call convention.
+scheduling-guest = { path = "guest" }
+serde.workspace = true
+thiserror.workspace = true
+# Executes a policy module in the scheduler thread. Only the JIT, the runtime
+# and `std` are needed: no WASI, no component model, no async.
+wasmtime = { version = "50.0.1", default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "std",
+] }
+
+[dev-dependencies]
+# Toy policies in the tests are written as inline `wat`, so the text parser is
+# needed where they are compiled and nowhere else.
+wasmtime = { version = "50.0.1", default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "std",
+    "wat",
+] }
+
+[lints]
+workspace = true
