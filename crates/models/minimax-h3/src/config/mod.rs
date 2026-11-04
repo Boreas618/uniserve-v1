@@ -421,8 +421,8 @@ pub(crate) mod tests_support {
             "resblock_kernel_sizes": [3, 7, 11],
             "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
             "sampling_rate": 32000,
-            "latents_mean": [0.0, 0.0],
-            "latents_std": [1.0, 1.0],
+            "latents_mean": vec![0.0_f64; 32],
+            "latents_std": vec![1.0_f64; 32],
         })
     }
 
@@ -548,7 +548,8 @@ mod tests {
             )
             .expect("the grid")
         );
-        assert_eq!(denoiser.canvases, Some(&NAMED_CANVASES[..]));
+        assert_eq!(denoiser.canvases, None);
+        assert_eq!(denoiser.offered_canvases(), &NAMED_CANVASES[..]);
         assert!(config.only_denoiser().is_none());
     }
 
@@ -620,7 +621,8 @@ mod tests {
         clock.audio_vae["sampling_rate"] = json("44100");
         let error = Config::normalize(&layout, &clock).expect_err("a different sample clock");
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("sampling")),
+            matches!(error, Error::Config(ref problem)
+                if problem.contains("44100") && problem.contains("32000 Hz")),
             "{error}"
         );
 

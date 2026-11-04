@@ -202,7 +202,7 @@ mod tests {
             tensor_parallel: 3,
             tensor_rank: 2,
         };
-        assert_eq!(partition.vocabulary_shard(151_936), (101_291, 101_291));
+        assert_eq!(partition.vocabulary_shard(151_936), (101_292, 151_936));
         let partition = Partition {
             ulysses_degree: 1,
             tensor_parallel: 2,

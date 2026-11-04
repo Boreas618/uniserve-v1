@@ -205,9 +205,8 @@ mod tests {
         for directory in components {
             let path = root.path().join(directory);
             std::fs::create_dir_all(&path).expect("create");
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&0_u64.to_le_bytes());
             let header = r#"{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
+            let mut bytes = Vec::new();
             bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
             bytes.extend_from_slice(header.as_bytes());
             bytes.extend_from_slice(&[0_u8; 4]);

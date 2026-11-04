@@ -14,7 +14,7 @@
 use nn::VideoTask;
 use serde_json::{Map, Value};
 
-use super::canvas::{Canvas, DMD_CANVASES};
+use super::canvas::{Canvas, DMD_CANVASES, NAMED_CANVASES};
 use super::field;
 use crate::{Error, Result};
 
@@ -186,10 +186,10 @@ pub enum AttentionKind {
         /// Rows of one tile, one video tile shape of the segment packing.
         tile: u32,
         /// The fraction of key tiles a generated-video query tile does not read.
-        sparsity: f32,
+        sparsity: f64,
         /// The fraction of its own key tiles a reference-video query keeps, when the network has
         /// reference videos.
-        reference_keep: Option<f32>,
+        reference_keep: Option<f64>,
     },
 }
 
@@ -201,7 +201,7 @@ impl AttentionKind {
     pub const DENSE: Self = Self::Dense;
 
     /// Sparse attention over `tile`-row tiles.
-    pub fn sparse(tile: u32, sparsity: f32, reference_keep: Option<f32>) -> Result<Self> {
+    pub fn sparse(tile: u32, sparsity: f64, reference_keep: Option<f64>) -> Result<Self> {
         if !SPARSE_TILE_ROWS.iter().any(|(rows, _)| *rows == tile) {
             return Err(Error::config(format!(
                 "H3 sparse attention tiles hold {} rows, got {tile}",
@@ -380,6 +380,14 @@ pub struct DenoiserConfig {
 }
 
 impl DenoiserConfig {
+    /// The canvases a deployment may prepare layouts for.
+    ///
+    /// A checkpoint that generates only some canvases offers those; one that follows the canvas
+    /// rule offers every named aspect ratio's canvas at the class's short edge.
+    pub fn offered_canvases(&self) -> &'static [Canvas] {
+        self.canvases.unwrap_or(&NAMED_CANVASES)
+    }
+
     /// One DiT with the schedule and attention the checkpoint states for it.
     pub fn new(
         transformer: TransformerConfig,

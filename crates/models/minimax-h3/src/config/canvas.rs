@@ -162,9 +162,15 @@ pub const DMD_CANVASES: [Canvas; 12] = [
 impl Canvas {
     /// Whether this canvas's raster is the ruled one for its class and ratio.
     pub fn is_ruled(&self) -> bool {
-        self.width.min(self.height) == self.short_edge
-            && self.width % super::CANVAS_MULTIPLE == 0
+        // Both sides on the VAE's 32-pixel grid, and the raster's ratio the one the request names
+        // within the one 32-pixel step the rule rounds: the short edge starts at the class's and
+        // the area is capped, so a wide ratio's short side is shorter than the class's edge.
+        let (aspect_width, aspect_height) = (i64::from(self.aspect.0), i64::from(self.aspect.1));
+        let (width, height) = (i64::from(self.width), i64::from(self.height));
+        self.width % super::CANVAS_MULTIPLE == 0
             && self.height % super::CANVAS_MULTIPLE == 0
+            && (width * aspect_height - height * aspect_width).abs()
+                <= i64::from(super::CANVAS_MULTIPLE) * aspect_width.max(aspect_height)
     }
 }
 

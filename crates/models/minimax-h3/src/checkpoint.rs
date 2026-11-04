@@ -122,10 +122,10 @@ pub struct SparseContract {
     /// Rows of one spatiotemporal tile.
     pub tile: u32,
     /// The fraction of key tiles a generated-video query tile does not read.
-    pub sparsity: f32,
+    pub sparsity: f64,
     /// The fraction of its own key tiles a reference-video query keeps, when the student has
     /// reference videos.
-    pub reference_keep: Option<f32>,
+    pub reference_keep: Option<f64>,
 }
 
 /// One recognized checkpoint: the DiT partitions it holds with the tasks each serves, the contract
@@ -256,8 +256,8 @@ impl Contract {
                 ));
             }
         };
-        let video_shift = number(object, "video_scheduler_shift")?;
-        let audio_shift = number(object, "audio_scheduler_shift")?;
+        let video_shift = single(object, "video_scheduler_shift")?;
+        let audio_shift = single(object, "audio_scheduler_shift")?;
         let schedule = Self::schedule(object)?;
         let attention = SparseContract {
             tile: integer(object, "vsa_tile_size")?,
@@ -268,7 +268,7 @@ impl Contract {
                     Error::checkpoint(
                         "fastvideo_inference.json vsa_ref_keep_rate must be a number".to_owned(),
                     )
-                })? as f32),
+                })?),
             },
         };
         Ok(Self {
@@ -334,7 +334,7 @@ impl Contract {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(ContractSchedule::Nodes {
                     nodes,
-                    max_t: number(object, "grid_max_t")?,
+                    max_t: single(object, "grid_max_t")?,
                 })
             }
             (Some(_), Some(_)) => Err(Error::checkpoint(
@@ -467,15 +467,24 @@ fn integer(object: &Map<String, Value>, key: &str) -> Result<u32> {
 }
 
 /// A JSON object's `key` as a finite number.
-fn number(object: &Map<String, Value>, key: &str) -> Result<f32> {
+/// One number a contract states, in the FP64 the sidecar writes and the reference computes in.
+///
+/// The sparsity's `ceil((1 - sparsity) * tiles)` is a tile count, so narrowing to FP32 would
+/// change it: FP32 0.9 widened back is greater than 0.9, and a ten-tile segment then keeps two
+/// tiles instead of one.
+fn number(object: &Map<String, Value>, key: &str) -> Result<f64> {
     object
         .get(key)
         .and_then(Value::as_f64)
-        .map(|value| value as f32)
         .filter(|value| value.is_finite())
         .ok_or_else(|| {
             Error::checkpoint(format!("fastvideo_inference.json states no number {key}"))
         })
+}
+
+/// One number a contract states as an FP32 quantity (the schedule's shifts).
+fn single(object: &Map<String, Value>, key: &str) -> Result<f32> {
+    Ok(number(object, key)? as f32)
 }
 
 #[cfg(test)]
@@ -587,7 +596,7 @@ mod tests {
         );
         let error = Layout::detect(empty.path()).expect_err("no DiT is present");
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("no DiT partition"))
+            matches!(error, Error::Checkpoint(ref problem) if problem.contains("no DiT partition"))
         );
     }
 
@@ -596,7 +605,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let error = Layout::detect(root.path()).expect_err("an empty root is not a checkpoint");
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("model_index.json")),
+            matches!(error, Error::Checkpoint(ref problem) if problem.contains("model_index.json")),
             "{error}"
         );
     }
@@ -683,7 +692,7 @@ mod tests {
                 max_t: 0.999
             }
         );
-        assert_eq!(contract.attention.reference_keep, Some(0.1_f32));
+        assert_eq!(contract.attention.reference_keep, Some(0.1));
     }
 
     #[test]
@@ -697,7 +706,7 @@ mod tests {
         );
         let error = Layout::detect(root.path()).expect_err("t2v is not served");
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("t2v")),
+            matches!(error, Error::Checkpoint(ref problem) if problem.contains("t2v")),
             "{error}"
         );
     }
@@ -713,7 +722,7 @@ mod tests {
         );
         let error = Layout::detect(root.path()).expect_err("no schedule is stated");
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("dmd_denoising_steps")),
+            matches!(error, Error::Checkpoint(ref problem) if problem.contains("dmd_denoising_steps")),
             "{error}"
         );
     }
@@ -752,7 +761,7 @@ mod tests {
             .err()
             .expect("without the base the text encoder is missing");
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("text_encoder/config.json")),
+            matches!(error, Error::Checkpoint(ref problem) if problem.contains("text_encoder/config.json")),
             "{error}"
         );
     }

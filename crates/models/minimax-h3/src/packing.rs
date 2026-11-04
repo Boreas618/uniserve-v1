@@ -243,8 +243,8 @@ pub fn segment_tiles(segment: &Segment, tile: u32) -> Result<u32> {
 ///
 /// `ceil((1 - sparsity) * tiles)`, at least one and at most every tile, in the reference's
 /// double-precision arithmetic.
-pub fn kept_tiles(sparsity: f32, tiles: u32) -> u32 {
-    let keep = (1.0 - f64::from(sparsity)) * f64::from(tiles);
+pub fn kept_tiles(sparsity: f64, tiles: u32) -> u32 {
+    let keep = (1.0 - sparsity) * f64::from(tiles);
     (keep.ceil() as u32).clamp(1, tiles.max(1))
 }
 
@@ -906,7 +906,7 @@ impl SegmentExtent {
     /// Dense tiles attend every tile, and so may any tile before the generated video, which can be
     /// a reference segment. A generated video query attends the live dense tiles, which all precede
     /// it, and [`kept_tiles`] of its own tiles. Tiles after the video are empty.
-    pub fn key_bounds(&self, sparsity: f32) -> Vec<u32> {
+    pub fn key_bounds(&self, sparsity: f64) -> Vec<u32> {
         let tiles = self.padded_tokens / self.tile;
         let start = self.video_start() / self.tile;
         let video = self.video_tiles;
@@ -1071,7 +1071,7 @@ fn video_segment(
         let slot = first_tile as usize + index;
         block_sizes[slot] = *size;
         tile_segments[slot] = tile_counts.len() as i32;
-        let start = first_tile + index as u32 * tile;
+        let start = first_tile * tile + index as u32 * tile;
         packed.extend(start..start + size);
     }
     tile_counts.push(order.sizes.len() as u32);
@@ -1106,8 +1106,8 @@ pub fn segment_tables(
     num_text_tokens: u32,
     segments: &[Segment],
     vision_spans: VisionSpans<'_>,
-    sparsity: f32,
-    reference_keep: Option<f32>,
+    sparsity: f64,
+    reference_keep: Option<f64>,
 ) -> Result<SegmentTables> {
     let extent = &packing.extent;
     let tile = extent.tile;
@@ -1579,9 +1579,11 @@ mod tests {
         for index in 0..1935u32 {
             let row = (plan.prefix_start() + index) as usize;
             assert_eq!(tables.position_ids[row], [f64::from(index), 0.0, 0.0]);
-            assert_eq!(tables.token_tags[row], Tag::Text as i32);
             assert_eq!(tables.prefix_index[row], index as i32);
             assert_eq!(tables.groups[row], Group::Video as i32);
+            if !(5..10).contains(&index) {
+                assert_eq!(tables.token_tags[row], Tag::Text as i32);
+            }
         }
         for row in plan.prefix_start() + 5..plan.prefix_start() + 10 {
             assert_eq!(tables.token_tags[row as usize], Tag::Video as i32);
@@ -2070,14 +2072,16 @@ mod tests {
             },
         ];
         let segments = condition_segments(&conditions, &target).expect("four conditions");
+        // Keyframes first in request order, then the references in request order: the audio track
+        // is condition 0 and the reference video condition 2.
         let kinds: Vec<_> = segments.iter().map(|segment| segment.kind).collect();
         assert_eq!(
             kinds,
             [
                 SegmentKind::Keyframe,
                 SegmentKind::Keyframe,
-                SegmentKind::Video,
-                SegmentKind::Audio
+                SegmentKind::Audio,
+                SegmentKind::Video
             ]
         );
         // The keyframes keep their request order, and their condition index with it.
@@ -2085,11 +2089,11 @@ mod tests {
         assert_eq!(segments[0].anchor, Some(Anchor::LastFrame));
         assert_eq!(segments[1].condition, 3);
         assert_eq!(segments[1].anchor, Some(Anchor::FirstFrame));
-        assert_eq!(segments[2].condition, 2);
-        assert_eq!(segments[2].visual.expect("pixels").frames, 37);
-        assert_eq!(segments[3].condition, 0);
-        assert_eq!(segments[3].audio_frames, 124);
-        assert_eq!(segments[3].audio_rows(), 248);
+        assert_eq!(segments[2].condition, 0);
+        assert_eq!(segments[2].audio_frames, 124);
+        assert_eq!(segments[2].audio_rows(), 248);
+        assert_eq!(segments[3].condition, 2);
+        assert_eq!(segments[3].visual.expect("pixels").frames, 37);
 
         // A one-frame reference is an image, and an image carries no audio.
         let image = Condition {
@@ -2139,22 +2143,35 @@ mod tests {
         let clips = 7;
         assert_eq!(clips * CLIP_LATENTS * tokens + 2 * tokens, 37 * tokens);
 
-        // Dense packing keeps the raster order, so each clip's rows are its own range.
+        // Dense packing keeps the raster order, so each clip's rows are its own contiguous range
+        // and consecutive clips share the two latent frames the later one re-reads.
         let dense = clip_rows(AttentionKind::Dense, 124, &canvas).expect("a plan");
         assert_eq!(dense.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
-        assert_eq!(dense[0], 0);
-        assert_eq!(dense[7 * tokens as usize], CLIP_LATENTS * tokens);
-        assert!(dense.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        for clip in 0..clips {
+            let begin = (clip * CLIP_DECODE_LATENTS * tokens) as usize;
+            let span = (CLIP_DECODE_LATENTS * tokens) as usize;
+            let first = (clip * CLIP_LATENTS * tokens) as usize;
+            assert_eq!(dense[begin], first as u32);
+            assert!(
+                dense[begin..begin + span]
+                    .windows(2)
+                    .all(|pair| pair[1] == pair[0] + 1)
+            );
+        }
 
         // A sparse layout permutes the rows, and the clips still cover every row once.
         let attention = AttentionKind::sparse(64, 0.8, None).expect("sparse");
         let order = video_order(attention, 124, &canvas).expect("a plan");
         let sparse = clip_rows(attention, 124, &canvas).expect("a plan");
         assert_eq!(sparse.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
+        // Every row a clip decodes reads one of that clip's own latent frames, and the clips
+        // together cover the sequence once per latent frame plus the overlaps.
         let mut every = sparse.clone();
         every.sort_unstable();
-        assert_eq!(every, (0..37 * tokens).collect::<Vec<_>>());
-        // Every row a clip decodes reads one of that clip's own latent frames.
+        let mut covered = every.clone();
+        covered.dedup();
+        assert_eq!(covered, (0..37 * tokens).collect::<Vec<_>>());
+        assert_eq!(every.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
         for (index, packed) in sparse.iter().enumerate() {
             let clip = index as u32 / (CLIP_DECODE_LATENTS * tokens);
             let raster_row = order[*packed as usize];
