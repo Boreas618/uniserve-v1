@@ -111,7 +111,9 @@ impl Stack {
             ));
         }
         if config.latent_channels == 0 {
-            return Err(Error::config("the video VAE has no latent channel".to_owned()));
+            return Err(Error::config(
+                "the video VAE has no latent channel".to_owned(),
+            ));
         }
         for (index, stride) in config
             .temporal_downsample_factors
@@ -227,7 +229,9 @@ impl Grid {
             .find(|index| owned[*index] < stop)
             .ok_or_else(|| Error::config("the band ends before the first tile".to_owned()))?;
         let begin = match first.checked_sub(1) {
-            Some(above) if start < owned[first] + self.rows.overlaps[above] / SPATIAL_RATIO => above,
+            Some(above) if start < owned[first] + self.rows.overlaps[above] / SPATIAL_RATIO => {
+                above
+            }
             _ => first,
         };
         Ok((begin, last))
@@ -251,9 +255,9 @@ impl Grid {
 pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
     let mut values = [0.0f32; 3];
     for (channel, byte) in pixel.iter().enumerate() {
-        values[channel] =
-            (f32::from(*byte) / crate::output::BYTE_MAX - crate::output::PIXEL_MEAN[channel])
-                / crate::output::PIXEL_STD[channel];
+        values[channel] = (f32::from(*byte) / crate::output::BYTE_MAX
+            - crate::output::PIXEL_MEAN[channel])
+            / crate::output::PIXEL_STD[channel];
     }
     values
 }
@@ -464,8 +468,16 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 
     // `network` is the checkpoint's `encoder.block` sequence: the input convolution, one entry per
     // stage, a Snake, and the output convolution.
-    normalized(&mut sources, "input.weight".to_owned(), "encoder.block.0".to_owned());
-    region(&mut sources, "input.bias".to_owned(), "encoder.block.0.bias".to_owned());
+    normalized(
+        &mut sources,
+        "input.weight".to_owned(),
+        "encoder.block.0".to_owned(),
+    );
+    region(
+        &mut sources,
+        "input.bias".to_owned(),
+        "encoder.block.0.bias".to_owned(),
+    );
     // Three residual units per stage, at dilations 1, 3 and 9; the dilation names the branch in the
     // plan, not a parameter.
     let units = 3;
@@ -560,7 +572,13 @@ mod tests {
     #[test]
     fn a_pixel_normalizes_and_quantizes_back_to_itself() {
         let rgb = crate::output::Rgb::of(1, 1, 1);
-        for pixel in [[0u8, 0, 0], [255, 255, 255], [124, 116, 104], [1, 2, 3], [200, 10, 77]] {
+        for pixel in [
+            [0u8, 0, 0],
+            [255, 255, 255],
+            [124, 116, 104],
+            [1, 2, 3],
+            [200, 10, 77],
+        ] {
             let restored = rgb.quantize(normalize(pixel));
             for (channel, (got, want)) in restored.iter().zip(pixel.iter()).enumerate() {
                 assert!(
@@ -585,12 +603,18 @@ mod tests {
         });
         // 17 frames, then 17, 9, 5, 5, 5, 5: one 17-frame clip is five latent frames.
         assert_eq!(
-            extents.iter().map(|extent| extent.frames).collect::<Vec<_>>(),
+            extents
+                .iter()
+                .map(|extent| extent.frames)
+                .collect::<Vec<_>>(),
             vec![17, 17, 9, 5, 5, 5, 5]
         );
         // 256 pixels halve four times: the 16-pixel compression.
         assert_eq!(
-            extents.iter().map(|extent| extent.height).collect::<Vec<_>>(),
+            extents
+                .iter()
+                .map(|extent| extent.height)
+                .collect::<Vec<_>>(),
             vec![256, 128, 64, 32, 16, 16, 16]
         );
         assert_eq!(stack.moments(extents[0]).frames, 5);

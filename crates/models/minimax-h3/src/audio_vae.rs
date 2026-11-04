@@ -154,8 +154,7 @@ impl Resample {
 
     /// The samples the upsampling direction's transposed convolution emits before the crop.
     pub fn transposed_length(&self, length: u32) -> u32 {
-        (u64::from(length) + 2 * u64::from(self.pad) - 1) as u32 * self.ratio
-            + self.kernel
+        (u64::from(length) + 2 * u64::from(self.pad) - 1) as u32 * self.ratio + self.kernel
     }
 
     /// The padding of the downsampling direction's convolution: `[pad_left, pad_right]`.
@@ -275,8 +274,7 @@ pub fn receptive_field(config: &AudioVaeConfig) -> Result<u32> {
     // samples.
     let activation_spread = |rate: f64| -> f64 {
         let up = (f64::from(activation.kernel) / f64::from(activation.ratio)).ceil() - 1.0;
-        up / rate
-            + (f64::from(activation.kernel) - 1.0) / (rate * f64::from(activation.ratio))
+        up / rate + (f64::from(activation.kernel) - 1.0) / (rate * f64::from(activation.ratio))
     };
 
     spread += convolution(7, 1, rate);
@@ -386,16 +384,25 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
             "upsample.filter",
             "downsample.lowpass.filter",
         ] {
-            sources.push(region(format!("{parameter}.{field}"), format!("{base}.{field}")));
+            sources.push(region(
+                format!("{parameter}.{field}"),
+                format!("{base}.{field}"),
+            ));
         }
     };
 
-    sources.push(normalized("input.weight".to_owned(), "dec_in_proj".to_owned()));
+    sources.push(normalized(
+        "input.weight".to_owned(),
+        "dec_in_proj".to_owned(),
+    ));
     sources.push(region(
         "input.bias".to_owned(),
         "dec_in_proj.bias".to_owned(),
     ));
-    sources.push(normalized("pre.weight".to_owned(), "decoder.conv_pre".to_owned()));
+    sources.push(normalized(
+        "pre.weight".to_owned(),
+        "decoder.conv_pre".to_owned(),
+    ));
     sources.push(region(
         "pre.bias".to_owned(),
         "decoder.conv_pre.bias".to_owned(),
@@ -407,7 +414,10 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
             format!("stages.{index}.upsample.weight"),
             base.clone(),
         ));
-        sources.push(region(format!("stages.{index}.upsample.bias"), format!("{base}.bias")));
+        sources.push(region(
+            format!("stages.{index}.upsample.bias"),
+            format!("{base}.bias"),
+        ));
         // Three anti-aliased multi-periodicity blocks per stage, in the reference's order.
         for block in 0..BLOCKS_PER_STAGE {
             let base = format!("decoder.resblocks.{}", index * BLOCKS_PER_STAGE + block);
@@ -441,7 +451,10 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
         "post".to_owned(),
         "decoder.activation_post".to_owned(),
     );
-    sources.push(normalized("output.weight".to_owned(), "decoder.conv_post".to_owned()));
+    sources.push(normalized(
+        "output.weight".to_owned(),
+        "decoder.conv_post".to_owned(),
+    ));
     Ok(sources)
 }
 
@@ -778,10 +791,7 @@ pub(crate) mod tests {
         let samples: Vec<u32> = buffers.iter().map(|buffer| buffer.samples).collect();
         assert_eq!(samples, vec![1, 5, 25, 50, 100, 200, 400, 800, 800]);
         let channels: Vec<u32> = buffers.iter().map(|buffer| buffer.channels).collect();
-        assert_eq!(
-            channels,
-            vec![2048, 1024, 512, 256, 128, 64, 32, 16, 1]
-        );
+        assert_eq!(channels, vec![2048, 1024, 512, 256, 128, 64, 32, 16, 1]);
         // A whole second of audio is forty latent frames and 32000 samples.
         let buffers = workspace(&config, 40).expect("workspace");
         assert_eq!(buffers.last().expect("the output").samples, 32000);
@@ -795,10 +805,7 @@ pub(crate) mod tests {
         let table = blocks(&config).expect("the blocks");
         // Seven stages of three blocks: BigVGAN's 21, with 126 convolutions between them.
         assert_eq!(table.len(), 21);
-        let convolutions: usize = table
-            .iter()
-            .map(|block| block.branches.len() * 2)
-            .sum();
+        let convolutions: usize = table.iter().map(|block| block.branches.len() * 2).sum();
         assert_eq!(convolutions, 126);
         let first = &table[0];
         assert_eq!((first.stage, first.index), (0, 0));

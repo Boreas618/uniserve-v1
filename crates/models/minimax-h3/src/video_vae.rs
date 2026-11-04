@@ -116,12 +116,7 @@ impl Seams {
     ///
     /// The extent, the tile and the overlap must be multiples of the alignment, which is the
     /// decoder's spatial compression: a tile reads whole latent columns.
-    pub fn split(
-        length: u32,
-        tile: u32,
-        overlap: u32,
-        alignment: u32,
-    ) -> Result<Self> {
+    pub fn split(length: u32, tile: u32, overlap: u32, alignment: u32) -> Result<Self> {
         if length == 0 || tile == 0 || alignment == 0 {
             return Err(Error::config(
                 "a tile split needs a positive extent, tile and alignment".to_owned(),
@@ -149,8 +144,7 @@ impl Seams {
 
         // The fewest tiles whose minimum-overlap coverage reaches the extent.
         let mut count = length.div_ceil(tile);
-        while u64::from(tile) * u64::from(count)
-            - u64::from(overlap) * u64::from(count - 1)
+        while u64::from(tile) * u64::from(count) - u64::from(overlap) * u64::from(count - 1)
             < u64::from(length)
         {
             count += 1;
@@ -260,14 +254,13 @@ impl Tiles {
         for row in 0..self.rows.len() {
             for column in 0..self.columns.len() {
                 let (row_start, row_end) = self.rows.latent(row, canvas.height, ratio);
-                let (column_start, column_end) =
-                    self.columns.latent(column, canvas.width, ratio);
-                let above = row.checked_sub(1).map_or(0, |previous| {
-                    self.rows.overlap(previous).unwrap_or(0)
-                });
-                let left = column.checked_sub(1).map_or(0, |previous| {
-                    self.columns.overlap(previous).unwrap_or(0)
-                });
+                let (column_start, column_end) = self.columns.latent(column, canvas.width, ratio);
+                let above = row
+                    .checked_sub(1)
+                    .map_or(0, |previous| self.rows.overlap(previous).unwrap_or(0));
+                let left = column
+                    .checked_sub(1)
+                    .map_or(0, |previous| self.columns.overlap(previous).unwrap_or(0));
                 tiles.push(Tile {
                     row,
                     column,
@@ -457,7 +450,14 @@ pub(crate) mod tests {
     fn the_768p_16_by_9_canvas_splits_as_the_reference_does() {
         // 1344 × 768 pixels: seven columns and four rows, the slack spread over the first seams.
         let width = Seams::split(1344, TILE_PIXELS, MINIMUM_OVERLAP, 16).expect("columns");
-        assert_eq!(width, seams(&[0, 176, 352, 528, 704, 896, 1088], &[80, 80, 80, 80, 64, 64], 1344));
+        assert_eq!(
+            width,
+            seams(
+                &[0, 176, 352, 528, 704, 896, 1088],
+                &[80, 80, 80, 80, 64, 64],
+                1344
+            )
+        );
         let height = Seams::split(768, TILE_PIXELS, MINIMUM_OVERLAP, 16).expect("rows");
         assert_eq!(height, seams(&[0, 160, 336, 512], &[96, 80, 80], 768));
     }
@@ -474,7 +474,10 @@ pub(crate) mod tests {
             // The whole raster is covered: each start is the previous end less its overlap.
             for index in 1..split.len() {
                 let previous_end = split.starts[index - 1] + split.lengths[index - 1];
-                assert_eq!(split.starts[index] + split.overlaps[index - 1], previous_end);
+                assert_eq!(
+                    split.starts[index] + split.overlaps[index - 1],
+                    previous_end
+                );
             }
         }
     }
@@ -563,7 +566,10 @@ pub(crate) mod tests {
         // The decode emits 28 frames and the splice keeps 25 of them: 25 = 17 + 3 + 5.
         let native = config.clip_length + config.token_drop + crate::decoding::OVERLAP_FRAMES;
         assert_eq!(native, 25);
-        assert_eq!(decode_latents(&config) * config.temporal_compression() - native, 3);
+        assert_eq!(
+            decode_latents(&config) * config.temporal_compression() - native,
+            3
+        );
         let canvas = Canvas::clip(&config, 16, 16);
         assert_eq!(canvas.frames, 7);
         assert_eq!(canvas.frames_out(&config), 28);
@@ -645,7 +651,9 @@ pub(crate) mod tests {
                 }
             })
             .collect();
-        assert!(checkpoint.contains(&"decoder.transformer_blocks.35.ff.net.0.proj.weight".to_owned()));
+        assert!(
+            checkpoint.contains(&"decoder.transformer_blocks.35.ff.net.0.proj.weight".to_owned())
+        );
         assert!(checkpoint.contains(&"decoder.proj_out.bias".to_owned()));
         // No parameter and no checkpoint tensor is named twice.
         for list in [names, checkpoint.iter().map(String::as_str).collect()] {
