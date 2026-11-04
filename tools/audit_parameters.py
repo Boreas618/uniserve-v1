@@ -1,20 +1,24 @@
-"""Check every operator's packed parameters against the module its package would build.
+"""Check an operator's packed parameters against the parameters its module actually takes.
 
-A launch hands the driver one pointer per parameter, in order, and stops at the module's count: an
-extra trailing word is inert, but a word that is missing or of the wrong kind shifts every parameter
-after it, so a scalar is read where the program expects a device address. Nothing catches that before
-the launch because Triton's metadata record carries no signature (`ops::CubinMetadata` reads one when a
-package writes it, and none does yet), so this script makes the same comparison on the host.
+A launch hands the driver one pointer per parameter and no count of its own: the driver reads as many
+values as the cubin declares. Two facts make that dangerous, and neither is checked before the launch.
 
-For each fixture row it reads the operator's packed words from its `launch` in `crates/ops/src` and the
-module's runtime signature by *executing* the package's own `build.py` `spec()` with the row's key --
-so the signature is the one the compile script would hand the driver, constexprs removed.
+* **A Triton module takes two parameters beyond its declared signature.** The compiler's launcher
+  appends a global scratch address and a profile scratch address, and the cubin declares both whatever
+  their sizes are, so `embedding`'s seven-parameter signature is nine parameters in its PTX.
+* **A packed word the module does not declare does not sit idle.** It takes the position of a parameter
+  that follows it, so the driver reads a flag or a width where a device address belongs.
+
+The ground truth here is the PTX: the package's `build.py` `spec()` is executed for the fixture key and
+the module compiled (no GPU needed), and the `.param` lines are counted. The operator's packed words are
+read from its `launch` in `crates/ops/src`, separating the words it always packs from those it packs
+only under a condition (`rotary_factors` appends its section widths only for a sectioned rotation), so
+the comparison is a range rather than a number.
 
     python3 tools/audit_parameters.py [--fixture notes/programs/qwen3-moe-keys.txt]
 
-A row whose package cannot be imported on this host (a cutlass or cute package, or one whose driver is
-not `_compile`) is reported as unchecked rather than as passing: those packages take a `#[repr(C)]`
-call struct instead of a parameter array, and the comparison below does not apply to them.
+Rows whose package cannot be imported here (cutlass, cute and native packages, whose contract is a
+`#[repr(C)]` call structure) are reported as unchecked rather than as passing.
 """
 
 import argparse
@@ -27,8 +31,11 @@ import tomllib
 OPS = pathlib.Path("crates/ops/src")
 KERNELS = pathlib.Path("crates/ops/kernels")
 
+#: The parameters the compiler's launcher appends to every Triton kernel.
+IMPLICIT = 2
+
 #: How each packing method's argument is read by the driver.
-KINDS = {"view": "ptr", "pointer": "ptr", "scratch": "scratch"}
+PACKING = re.compile(r"\.(view|pointer|u64|u32|i32|i64|f32|flag|scratch)\(")
 
 
 def impl_blocks(text):
@@ -46,7 +53,7 @@ def impl_blocks(text):
 
 
 def packed(operator):
-    """The words an operator packs, in order, and the file it packs them in."""
+    """How many words an operator packs: (always, at most), and the file it packs them in."""
     for path in OPS.rglob("*.rs"):
         text = path.read_text()
         if f'"{operator}"' not in text:
@@ -60,40 +67,74 @@ def packed(operator):
             launch = body[match.start() :]
             following = re.search(r"\n    fn ", launch)
             launch = launch[: following.start()] if following else launch
-            kinds = [
-                KINDS.get(call.group(1), "scalar")
-                for call in re.finditer(
-                    r"\.(view|pointer|u64|u32|i32|i64|f32|flag|scratch)\(", launch
-                )
-            ]
-            return kinds, path
-    return None, None
+            depth = 0
+            always = conditional = 0
+            for index, character in enumerate(launch):
+                if character == "{":
+                    depth += 1
+                elif character == "}":
+                    depth -= 1
+                elif character == "." and PACKING.match(launch, index):
+                    # The launch function's body is depth 1; anything deeper is inside an `if`.
+                    if depth <= 1:
+                        always += 1
+                    else:
+                        conditional += 1
+            return always, always + conditional, path
+    return None, None, None
 
 
-def signature(operator, key):
-    """The module's runtime signature, from the build script that would produce it."""
+def module_parameters(operator, key):
+    """The parameter count a module's PTX declares, and its declared signature's length."""
     for manifest_path in KERNELS.glob(f"{operator}/*/package.toml"):
         source = manifest_path.parent / "src"
+        if not (source / "build.py").exists():
+            continue
         manifest = tomllib.loads(manifest_path.read_text())
         dimensions = manifest.get("kernel", {}).get("descriptors", {}).get("dimensions", {})
         sys.path.insert(0, str(source))
         try:
             sys.modules.pop("_compile", None)
-            spec = importlib.util.spec_from_file_location(
-                f"build_{operator}_{manifest_path.parent.parent.name}", source / "build.py"
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            spec_module = importlib.util.spec_from_file_location("build", source / "build.py")
+            module = importlib.util.module_from_spec(spec_module)
+            spec_module.loader.exec_module(module)
             import _compile
 
             fields = _compile.parse_key(key, dimensions)
             described = module.spec(fields, manifest.get("parameters", {}), "sm_100a")
-            return [(name, ty) for name, ty in described["signature"].items() if ty != "constexpr"]
-        except Exception as error:  # noqa: BLE001 - any failure means "not checked", not "passes"
-            return f"{type(error).__name__}: {error}"
+            import triton
+            from triton.backends.compiler import GPUTarget
+            from triton.compiler.compiler import ASTSource
+
+            compiled = triton.compile(
+                ASTSource(
+                    described["kernel"], described["signature"], described["constexprs"]
+                ),
+                target=GPUTarget("cuda", 100, 32),
+                options=described["options"],
+            )
+            declared = sum(
+                1 for ty in described["signature"].values() if ty != "constexpr"
+            )
+            parameters = sum(
+                1
+                for line in compiled.asm["ptx"].splitlines()
+                if line.strip().startswith(".param")
+            )
+            return parameters, declared
+        except SystemExit as error:
+            # The package's own key reader refused the key: the row is not covered by that package, so
+            # there is no module to compare against.
+            return f"not covered: {error}", None
+        except KeyError:
+            # A package whose build script describes its module another way (a `#[repr(C)]` call
+            # structure rather than a parameter list) has no signature to compare against.
+            return "no parameter signature in this package", None
+        except Exception as error:  # noqa: BLE001 - "not checked" is not "passes"
+            return f"{type(error).__name__}: {error}", None
         finally:
             sys.path.remove(str(source))
-    return None
+    return None, None
 
 
 def main():
@@ -105,29 +146,38 @@ def main():
         line.split("\t")
         for line in pathlib.Path(arguments.fixture).read_text().strip().split("\n")
     ]
-    checked = mismatched = 0
+    print(f"# {len(rows)} keys of {arguments.fixture}")
+    checked = bad = 0
     for operator, key in rows:
-        kinds, rust = packed(operator)
-        if kinds is None:
-            print(f"  ?  {operator:16} no `impl Op` in {OPS} ({rust})")
+        always, most, rust = packed(operator)
+        if always is None:
+            print(f"  ?  {operator:18} no `impl Op` in {OPS} ({rust})")
             continue
-        module = signature(operator, key)
-        if isinstance(module, str):
-            print(f"  !  {operator:16} not checked: {module}")
+        parameters, declared = module_parameters(operator, key)
+        if isinstance(parameters, str):
+            print(f"  !  {operator:18} not checked: {parameters}")
             continue
-        if module is None:
-            print(f"  ?  {operator:16} no package")
+        if parameters is None:
+            print(f"  ?  {operator:18} no package")
             continue
         checked += 1
-        expected = ["ptr" if ty.startswith("*") else "scalar" for _, ty in module]
-        head, tail = kinds[: len(expected)], kinds[len(expected) :]
-        if head == expected:
-            print(f"OK  {operator:16} {len(kinds)} words, module {len(expected)}, tail {tail}")
+        problems = []
+        if parameters != declared + IMPLICIT:
+            problems.append(
+                f"module declares {declared} but takes {parameters}: not {IMPLICIT} implicit"
+            )
+        # The operator's words plus the two the launcher appends are what the driver reads.
+        if not always + IMPLICIT <= parameters <= most + IMPLICIT:
+            problems.append(
+                f"module takes {parameters}, operator packs {always + IMPLICIT}..{most + IMPLICIT}"
+            )
+        if problems:
+            bad += 1
+            print(f"BAD {operator:18} {'; '.join(problems)}")
         else:
-            mismatched += 1
-            print(f"BAD {operator:16} module wants {expected}, operator packs {head}")
-    print(f"\n{checked} checked, {mismatched} misaligned, {len(rows) - checked} not checked")
-    return 1 if mismatched else 0
+            print(f"OK  {operator:18} packs {always}..{most}, module takes {parameters}")
+    print(f"\n{checked} checked, {bad} misaligned, {len(rows) - checked} not checked")
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
