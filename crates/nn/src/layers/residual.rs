@@ -142,6 +142,52 @@ impl ScaledResidual {
 
         f.operate::<residual::ScaledResidual>(&descriptor, args)
     }
+
+    /// Fold `update` into `hidden` with a scale the caller brings: `[1]` or `[columns]`.
+    ///
+    /// A diffusion solver's step scales the residual stream by one device scalar per
+    /// `(layout, step)` that the runner uploads, so the scale cannot be the layer's retained weight.
+    /// The operator reads one element as a factor for every channel and a whole row as the
+    /// per-channel weights, so both forms are one program and neither moves a key; the width stays
+    /// the layer's, from the weight it was built with (specs/worker.md 9, 求解器).
+    pub fn forward_with_scale(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        update: TensorView,
+        scale: TensorView,
+    ) -> Result<()> {
+        let columns = self.scale.shape().numel();
+        if hidden.shape.rank() != 2 || hidden.shape.last() != columns {
+            return Err(Error::shape(
+                "ScaledResidual::forward_with_scale",
+                format!("{:?} is not [rows, {columns}]", hidden.shape.dims()),
+            ));
+        }
+        if scale.shape.numel() != 1 && scale.shape.numel() != columns {
+            return Err(Error::shape(
+                "ScaledResidual::forward_with_scale",
+                format!(
+                    "{} scale elements for {columns} channels; one element is the broadcast form",
+                    scale.shape.numel()
+                ),
+            ));
+        }
+        let descriptor = residual::ScaledResidualDescriptor {
+            dtype: hidden.dtype,
+            columns: columns as u32,
+            block: BLOCK,
+            update_bias: self.bias.is_some(),
+        };
+        let args = residual::ScaledResidualArgs {
+            hidden,
+            update,
+            update_bias: self.bias.as_ref().map(Weight::view),
+            scale,
+        };
+
+        f.operate::<residual::ScaledResidual>(&descriptor, args)
+    }
 }
 
 /// `hidden += (update + bias) · scale; out = rms(hidden) · weight`.
