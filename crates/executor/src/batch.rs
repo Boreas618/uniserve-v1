@@ -179,6 +179,16 @@ pub struct Batch {
     /// fresh prefix carries no allocation, and one that reuses a cached prefix cannot be served
     /// correctly without it (`ipc::batch::CacheUnitAllocation`).
     pub cache_units: Vec<ipc::CacheUnitAllocation>,
+    /// The batch's slot rows: one `ipc::BlockTable` per request slot and cache group, as the
+    /// mechanism's own allocation of pages states them.
+    ///
+    /// The executor installs these into the cache's pooled table before the replay, because the
+    /// gather that builds the attention kernels' block-table column reads **row `slot` of that
+    /// table**. The row is the only place a request's pages live for the gather: a batch whose rows
+    /// are not installed gathers whatever the slot held before - zeros, or another request's pages -
+    /// and the graph then runs clean against the wrong memory. That failure looks like a model
+    /// defect rather than a cache one, so it is refused at submit rather than left to the graph.
+    pub block_tables: Vec<ipc::BlockTable>,
 }
 
 /// The commit table's own definition, so a producer outside this crate writes its rows against
