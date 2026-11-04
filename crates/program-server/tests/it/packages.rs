@@ -539,3 +539,31 @@ fn the_convolutions_are_one_source_in_three_packages() {
         );
     }
 }
+
+/// `rms_norm` and `add_rms_norm` are one row reduction with one difference, so one check
+/// script serves both and the two packages must carry the same bytes of it: whoever edits
+/// the reference, the interpreter's truncation or a case edits both or the copies diverge
+/// and one operator's evidence quietly stops being the other's.
+#[test]
+fn the_two_row_normalizations_share_one_check() {
+    let script = ["rms_norm", "add_rms_norm"].map(|op| {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ops/kernels")
+            .join(op)
+            .join("triton/test/row_norm_check.py");
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "{op}'s row-normalization check is not readable at {}: {error}",
+                path.display()
+            )
+        })
+    });
+    assert!(
+        script[0] == script[1],
+        "row_norm_check.py differs between rms_norm and add_rms_norm"
+    );
+    assert!(
+        script[0].contains("--op") && script[0].contains("add_rms_norm"),
+        "the shared check names both operators on its command line"
+    );
+}
