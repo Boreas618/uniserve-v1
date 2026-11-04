@@ -128,10 +128,10 @@ PLUGIN_ENTRY_POINTS = (
 # refuses the epoch by the first kernel it lacks.
 #
 # ``FilledPrograms::of`` (``crates/daemon/src/epoch.rs``) fills paged attention
-# with the attention program's backend, and the expert exchange with
-# ``moe_config.exchange`` — ``alltoall`` by default, for every deployment, since
-# the slot is filled whether or not the model routes. ``moe_runner_backend`` is
-# unset here, so no grouped expert GEMM is filled.
+# with the attention program's backend; ``moe_runner_backend`` is unset here, so
+# no grouped expert GEMM is filled, and the expert exchange is filled only for
+# an expert-parallel deployment — the model launches no exchange when every
+# expert is local, so this one-rank deployment names no such program.
 #
 # A program's backend is a package's name: the Program Server selects a program
 # by the backend its manifest declares, and no package is named ``auto``. The
@@ -139,10 +139,7 @@ PLUGIN_ENTRY_POINTS = (
 # it is the one design 9's default choice resolves to for this shape — BF16, no
 # window, head_dim 128, 64-token pages, one rank: trtllm-gen.
 POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
-KERNEL_PACKAGES = (
-    "crates/ops/kernels/paged_attention/trtllm",
-    "crates/ops/kernels/expert_exchange/alltoall",
-)
+KERNEL_PACKAGES = ("crates/ops/kernels/paged_attention/trtllm",)
 
 #: The socket of the module's Program Server, which every deployment of this
 #: file reaches through ``--program-server``. Set by :func:`program_server`.
