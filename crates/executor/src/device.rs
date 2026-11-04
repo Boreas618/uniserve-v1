@@ -12,18 +12,17 @@
 //! `switchover` and `purge`, which take effect at batch boundaries (7.3).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ops::Generation;
 use platform::DeviceId;
 
 use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
-use crate::completion::Outcome;
-use crate::job::{Command, JobQueue, jobs_of, kind_of, phase_of};
+use crate::job::{Command, JobQueue, jobs_of, phase_of};
 use crate::runner::{NamedRunner, RunnerId};
 use crate::arena::Pools;
-use crate::stream::Streams;
 use crate::stream::events::{DRAIN_LIMIT, EventPool, JobId, drain_event};
 use crate::{Error, Result};
 
@@ -34,6 +33,56 @@ pub struct Executor {
     thread: Option<JoinHandle<()>>,
     /// The device's graph pools, shared by every runner that issues here (4.1).
     pools: Arc<std::sync::Mutex<Pools>>,
+    /// What the device has done since it started, for the metrics report (7.3).
+    counters: Arc<SharedCounters>,
+}
+
+/// What a device has done since it started: the metrics report's counters (7.3).
+///
+/// `kernel_launches` counts the kernels of every replayed graph, summed over the device's runners;
+/// it is what the report's `kernel_launches` carries. `device_ns` is the time the device thread
+/// spent inside issued work, which is device time because the executor synchronizes after each
+/// job and nothing else issues on this device's streams (2.4); with CUPTI profiling on, the
+/// profiler's own kernel time replaces this figure in the report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// Kernel launches issued, summed over every runner of the device.
+    pub kernel_launches: u64,
+    /// Device time spent in those launches, in nanoseconds.
+    pub device_ns: u64,
+}
+
+/// The same counters as the device thread and its runners add to them.
+///
+/// Both are monotonic sums, so a reader on the control thread may take a reading while the device
+/// thread adds to it: each field is one atomic add and one atomic load. A runner receives it from
+/// [`Runner::attach_counters`](crate::runner::Runner::attach_counters) and adds the launches of
+/// every replay; the device thread adds its own time around each job.
+#[derive(Debug, Default)]
+pub struct SharedCounters {
+    kernel_launches: AtomicU64,
+    device_ns: AtomicU64,
+}
+
+impl SharedCounters {
+    /// Adds `launches` kernel launches.
+    pub fn launches(&self, launches: u64) {
+        self.kernel_launches.fetch_add(launches, Ordering::Relaxed);
+    }
+
+    /// Adds device time spent in one job.
+    fn time(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.device_ns.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// The counters as the metrics report reads them.
+    fn read(&self) -> Counters {
+        Counters {
+            kernel_launches: self.kernel_launches.load(Ordering::Relaxed),
+            device_ns: self.device_ns.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// The device's graph storage, as the engine sizes it before the executor starts.
@@ -56,7 +105,6 @@ impl Executor {
     pub fn spawn(
         device: DeviceId,
         mut runners: Vec<NamedRunner>,
-        streams: Streams,
         events: Arc<EventPool>,
         graph: GraphStorage,
     ) -> Result<Self> {
@@ -68,15 +116,17 @@ impl Executor {
             graph.budget,
             graph.streams,
         )?));
+        let counters = Arc::new(SharedCounters::default());
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
+            named.runner.attach_counters(Arc::clone(&counters));
         }
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
             device,
             runners,
-            streams,
             queue: Arc::clone(&queue),
+            counters: Arc::clone(&counters),
             sticky: None,
         };
         let thread_queue = Arc::clone(&queue);
@@ -93,6 +143,7 @@ impl Executor {
             queue,
             thread: Some(thread),
             pools,
+            counters,
         })
     }
 
@@ -170,17 +221,25 @@ impl Executor {
         Ok(submission)
     }
 
-    /// The device's graph pools' books: reserved and mapped bytes against the budget (4.1).
-    pub fn pools_metrics(&self) -> crate::arena::PoolMetrics {
-        self.pools
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .metrics()
+    /// The device's graph pools as their ledger books them: the reserved range, the bytes mapped
+    /// and the budget they are booked against (4.1, item 5's invariant).
+    ///
+    /// This is the device's figure and not a sum over its runners: one `Pools` is shared by every
+    /// runner on the device, so summing runners would count the same mapping twice. The pools are
+    /// created when the executor starts, so this is `Some` from then on; the answer stays an
+    /// `Option` for a caller that reads a device it has not yet started serving.
+    pub fn pool_metrics(&self) -> Option<crate::arena::PoolMetrics> {
+        Some(
+            self.pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .metrics(),
+        )
     }
 
-    /// The device's memory report: the budget and the mapped bytes of every pool kind.
-    pub fn memory(&self) -> crate::arena::PoolMetrics {
-        self.pools_metrics()
+    /// What the device has done since it started: kernel launches and device time (7.3).
+    pub fn counters(&self) -> Counters {
+        self.counters.read()
     }
 
     /// What the control thread's watchdog reads: the command in flight and how long it took (2.4).
@@ -298,8 +357,9 @@ pub enum Probe {
 struct Device {
     device: DeviceId,
     runners: Vec<NamedRunner>,
-    streams: Streams,
     queue: Arc<JobQueue>,
+    /// What the device thread has done, shared with the handle the control thread reads.
+    counters: Arc<SharedCounters>,
     /// The context's first sticky error, once one has been seen (2.4).
     ///
     /// A sticky error is not recoverable: every launch after it fails, so the executor issues
@@ -464,8 +524,10 @@ impl Device {
             let runner = job
                 .runner()
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
+            let started = Instant::now();
             let produced = self.runner_mut(runner)?.runner.serve(&job)?;
             self.synchronize()?;
+            self.counters.time(started.elapsed());
             if !produced.tokens.is_empty() {
                 if !output.tokens.is_empty() {
                     return Err(Error::Invariant(
@@ -478,12 +540,17 @@ impl Device {
         Ok(output)
     }
 
-    /// Waits for this device's primary stream, which is where the runner's work was issued.
+    /// Waits for the streams this device's runners issued on.
+    ///
+    /// A runner owns the stream its graphs replay on, so waiting on those is exactly waiting for
+    /// this device's issued work; the executor has no stream of its own to add.
     fn synchronize(&self) -> Result<()> {
-        match self.streams.stream_for(self.device) {
-            Some(stream) => stream.synchronize(),
-            None => Ok(()),
+        for named in &self.runners {
+            if let Some(stream) = named.runner.stream() {
+                stream.synchronize()?;
+            }
         }
+        Ok(())
     }
 
     /// The runner that serves `phase`.
@@ -506,15 +573,3 @@ impl Device {
     }
 }
 
-/// The kind of a command, for a caller that reports on it.
-pub(crate) fn kind(command: &Command) -> JobKind {
-    kind_of(command)
-}
-
-/// The outcome of a submission that ended with `result`.
-pub(crate) fn outcome(result: Result<BatchOutput>) -> Outcome<BatchOutput> {
-    match result {
-        Ok(output) => Outcome::Success(output),
-        Err(error) => Outcome::Failed(Arc::new(error)),
-    }
-}

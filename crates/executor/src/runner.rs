@@ -32,6 +32,14 @@ pub trait Runner: Send {
     /// The phases this runner serves, as the scheduler addresses them (4.5).
     fn phases(&self) -> &[PhaseId];
 
+    /// The stream this runner issues its work on, when it has one.
+    ///
+    /// The executor waits on the runners' streams after each job: a runner owns the stream its
+    /// graphs replay on, and the executor has none of its own.
+    fn stream(&self) -> Option<&platform::Stream> {
+        None
+    }
+
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
@@ -83,6 +91,15 @@ pub trait Runner: Send {
     /// storage. The device executor calls this when it starts.
     fn attach_pools(&mut self, pools: std::sync::Arc<std::sync::Mutex<crate::arena::Pools>>) {
         let _ = pools;
+    }
+
+    /// Gives the runner the device's counters, when its work adds to them.
+    ///
+    /// The device executor calls this when it starts, beside [`Runner::attach_pools`]. A runner
+    /// that launches kernels adds their number here as it replays, so the metrics report's
+    /// `kernel_launches` is the device's figure and not a per-runner estimate.
+    fn attach_counters(&mut self, counters: std::sync::Arc<crate::device::SharedCounters>) {
+        let _ = counters;
     }
 
     /// Performs one job this runner returned from `submit` or `precopy`, on the device executor's

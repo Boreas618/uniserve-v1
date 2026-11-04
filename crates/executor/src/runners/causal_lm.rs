@@ -524,6 +524,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// runner of this device (one pool per device, never per runner); the executor attaches them
     /// before the first capture.
     pools: Option<Arc<std::sync::Mutex<Pools>>>,
+    /// The device's counters, when the executor handed them over (7.3's metrics).
+    counters: Option<Arc<crate::device::SharedCounters>>,
     /// The host columns of the batch being staged.
     staging: Staging,
     /// The device the runner computes on.
@@ -585,6 +587,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             buckets,
             graphs: Graphs::new(),
             pools: None,
+            counters: None,
             staging,
             device,
             stream,
@@ -658,6 +661,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
 impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     fn phases(&self) -> &[PhaseId] {
         &self.phases
+    }
+
+    fn stream(&self) -> Option<&platform::Stream> {
+        Some(&self.stream)
     }
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
@@ -808,6 +815,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.pools = Some(pools);
     }
 
+    fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
+        self.counters = Some(counters);
+    }
+
     fn pool_metrics(&self) -> PoolMetrics {
         self.pool().map(|pools| pools.metrics()).unwrap_or_default()
     }
@@ -865,6 +876,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     ))
                 })?;
                 captured.launch(&stream)?;
+                if let Some(counters) = &self.counters {
+                    counters.launches(captured.kernel_nodes());
+                }
                 // The sampled tokens are read back now, before the submission completes: the
                 // mechanism builds the next step's input ids from them (4.4).
                 self.read_sampled(*bucket)
@@ -897,11 +911,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 }
 
 impl<M: CausalLm> CausalLmRunner<M> {
-    /// The stream the executor issues this runner's work on.
-    pub fn stream(&self) -> &platform::Stream {
-        &self.stream
-    }
-
     /// The pool stream this runner's graphs are planned and replayed on.
     ///
     /// A graph pool is per stream (4.5), and two runners on one device fork their own streams, so
