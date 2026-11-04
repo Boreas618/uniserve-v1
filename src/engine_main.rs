@@ -521,6 +521,16 @@ pub(crate) struct MainProcess {
     /// answers a submission with the stream of what the request produced, and this process is what
     /// carries those events back to the daemon (§2.3). A stream leaves when its request ends.
     streams: Vec<(u64, engine::EventRx)>,
+    /// Whether this process admits and executes: a drain parks every scheduler, and only the
+    /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2).
+    serving: bool,
+    /// What each scheduler parked with, in `schedulers` order: kept from the drain to the resume,
+    /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
+    /// again.
+    parked: Option<Vec<engine::ParkedCache>>,
+    /// The frontend's admission gate, the `/admin/pause_generation` of §2.3: submissions are
+    /// refused while it is held, and no request in flight is ended by it.
+    paused: bool,
 }
 
 impl MainProcess {
@@ -665,6 +675,12 @@ impl MainProcess {
             process,
             stopping: false,
             streams: Vec::new(),
+            // The epoch serves from the end of `start` until the daemon drains it; a process the
+            // daemon spawned as a standby parks itself at the end of `start` instead, and the
+            // `Promote` that follows resumes it (2.5).
+            serving: true,
+            parked: None,
+            paused: false,
         })
     }
 
@@ -895,6 +911,20 @@ impl MainProcess {
                 // batch is formed (§2.3).
                 for wire in submit.requests {
                     let id = wire.id;
+                    // A drained epoch and a held gate admit nothing (§2.3): the refusal is retryable
+                    // and the request is the frontend's to resubmit when the epoch serves again.
+                    if !self.serving || self.paused {
+                        self.reject(
+                            id,
+                            proto::request::RejectionKind::Overloaded,
+                            if self.paused {
+                                "the frontend's admissions are held".to_owned()
+                            } else {
+                                "the epoch is drained and serves nothing".to_owned()
+                            },
+                        );
+                        continue;
+                    }
                     let request = match proto::request::Request::from_wire(wire) {
                         Ok(request) => request,
                         Err(error) => {
@@ -952,48 +982,43 @@ impl MainProcess {
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
         let current = self.update.current();
-        // A drain is the epoch layer's, and it answers the daemon: the frontend admits nothing
-        // from the boundary the schedulers reached, and the facts of the requests in flight are
-        // kept for the `Serve` that resumes this process on another request address (§2.3).
-        let draining = match &command.kind {
-            Some(proto::process::command::Kind::Drain(drain)) => Some(drain.epoch),
-            _ => None,
-        };
         let Some(program) = ProgramCommand::from_command(command.clone(), current)? else {
-            // Park, Promote, Drain, Pause, Serve and Shutdown are the epoch layer's: every scheduler
-            // applies them at its own next boundary, and answers when it did (§2.5, §7.3 step 6).
-            for scheduler in &self.schedulers {
-                answer(
-                    scheduler.engine_command(command.clone()),
-                    self.watchdog.stall_bound(),
-                    "an engine command",
-                )?;
-            }
-            // Two of those commands have an answer the daemon waits for, and no scheduler can give
-            // it: a parked standby is promoted only after the process says it parked, and the
-            // frontend is switched only after it says it was promoted (proto process.proto's
-            // `Parked` and `Promoted`). The schedulers applying the command is half of it; the
-            // report is the epoch layer's and this is where the process has both facts in hand.
-            let report = match &command.kind {
-                Some(proto::process::command::Kind::Drain(_)) => draining.map(|epoch| {
-                    proto::process::report::Kind::Drained(proto::process::Drained { epoch })
-                }),
+            // The rest are this process's own lifecycle, and no scheduler's: sched's handle
+            // answers every one of them with exactly that (a park, promote, drain, serve or pause
+            // is the engine process's own command). Forwarding them there and ending the epoch on
+            // the refusal is how a drain used to end the epoch it was meant to keep alive.
+            match command.kind {
+                Some(proto::process::command::Kind::Drain(drain)) => self.drain(drain.epoch)?,
+                Some(proto::process::command::Kind::Serve(serve)) => self.resume(serve)?,
+                Some(proto::process::command::Kind::Pause(pause)) => {
+                    self.paused = pause.paused;
+                }
+                // A standby parks and is then promoted in place (§2.5). Both commands park and
+                // resume the schedulers, and each has an answer the daemon's epoch layer waits
+                // for: it promotes a child only after `Parked`, and switches the frontend only
+                // after `Promoted`.
                 Some(proto::process::command::Kind::Park(_)) => {
-                    Some(proto::process::report::Kind::Parked(proto::process::Parked {
-                        generation: current,
-                    }))
+                    self.park_schedulers("parking for a promotion")?;
+                    self.send_report(proto::process::Report {
+                        kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
+                            generation: current,
+                        })),
+                    });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
-                    Some(proto::process::report::Kind::Promoted(
-                        proto::process::Promoted {
-                            generation: current,
-                        },
-                    ))
+                    self.resume_schedulers()
+                        .context("promoting this process in place")?;
+                    self.send_report(proto::process::Report {
+                        kind: Some(proto::process::report::Kind::Promoted(
+                            proto::process::Promoted {
+                                generation: current,
+                            },
+                        )),
+                    });
                 }
-                _ => None,
-            };
-            if let Some(kind) = report {
-                self.send_report(proto::process::Report { kind: Some(kind) });
+                // The five program commands were converted above; a command that states no kind
+                // states nothing to apply.
+                _ => {}
             }
             return Ok(None);
         };
@@ -1517,6 +1542,77 @@ impl MainProcess {
         self.retired.clear();
         self.commit_policy(generation);
         Ok(ProgramStatus::Committed { generation })
+    }
+
+    /// §2.3, §7.4 step 2: the epoch drains at the boundary its schedulers reach, and the process
+    /// goes on living.
+    ///
+    /// Every scheduler parks: its migratable requests end with their facts kept, the others finish,
+    /// and it executes nothing more. What it parks with is kept, so the `Serve` that names the epoch
+    /// again resumes it in place instead of reading its pages back. Weights and storage stay mapped
+    /// and the threads stay up - a drain is not an exit, and the daemon's `Serve` is what ends it.
+    fn drain(&mut self, epoch: u64) -> Result<()> {
+        self.park_schedulers("draining the epoch")?;
+        self.send_report(proto::process::Report {
+            kind: Some(proto::process::report::Kind::Drained(
+                proto::process::Drained { epoch },
+            )),
+        });
+        Ok(())
+    }
+
+    /// §2.3: epoch `serve.epoch` serves from now on, at this process.
+    ///
+    /// A process that drained resumes the schedulers it parked, with the cache it parked with; one
+    /// that never drained already serves and has nothing to resume. The request address in the
+    /// command is the one this process bound at launch: the daemon names it so that the frontend
+    /// submits to the right place, not so that a process moves its socket.
+    fn resume(&mut self, serve: proto::process::Serve) -> Result<()> {
+        if self.parked.is_some() {
+            self.resume_schedulers()
+                .with_context(|| format!("resuming epoch {}", serve.epoch))?;
+        }
+        self.serving = true;
+        Ok(())
+    }
+
+    /// Parks every scheduler, keeping what each parks with for the resume.
+    ///
+    /// Each park is bounded by the watchdog's stall bound, the same rule the scheduler stage calls
+    /// follow (§2.4): a scheduler that cannot park is a stall the epoch has to name rather than a
+    /// control thread that waits forever.
+    fn park_schedulers(&mut self, what: &str) -> Result<()> {
+        let bound = self.watchdog.stall_bound();
+        let mut parked = Vec::with_capacity(self.schedulers.len());
+        for scheduler in &self.schedulers {
+            match scheduler.park(false).recv_timeout(bound) {
+                Ok(Ok(cache)) => parked.push(cache),
+                Ok(Err(reason)) => bail!("{what}: a scheduler did not park: {reason}"),
+                Err(error) => bail!("{what}: a scheduler did not park within {bound:?}: {error}"),
+            }
+        }
+        self.parked = Some(parked);
+        self.serving = false;
+        Ok(())
+    }
+
+    /// Resumes every scheduler with the cache it parked with: the pages it still holds are reused
+    /// and the facts the drain kept are resubmitted by the frontend (§2.3).
+    fn resume_schedulers(&mut self) -> Result<()> {
+        let Some(parked) = self.parked.take() else {
+            self.serving = true;
+            return Ok(());
+        };
+        for (scheduler, cache) in self.schedulers.iter().zip(parked) {
+            // A resumed epoch recomputes from the tokens the frontend resubmits rather than lending
+            // from a predecessor: it is the same world, and the requests it ended at the drain are
+            // new requests to it.
+            scheduler
+                .promote(cache, true, false)
+                .context("resuming a scheduler")?;
+        }
+        self.serving = true;
+        Ok(())
     }
 
     /// §7.3 step 4: revert to the generation serving before the update. The old
