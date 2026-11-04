@@ -475,6 +475,7 @@ impl Leader {
             daemon,
             config.host_identity.clone(),
             config.served_model_name().to_owned(),
+            config.program_server.clone(),
         )?);
         let specs = engine::EngineConfig::replica_specs(&prepared.spec)?;
         let clients =
