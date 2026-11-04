@@ -1854,11 +1854,13 @@ mod tests {
         // the residency the live step will have made; without that, a mid-flight
         // install whose first plan admits and runs a request could never pass
         // probation.
-        let mut queued = request(1, RequestState::Queued);
-        // A queued request's prompt is known from its submission; the plan
-        // admits it and runs its first chunk from the prompt's start.
-        queued.prompt_tokens = 4;
-        queued.prefill_tokens = 4;
+        // A queued view states no prompt length and no prefilled count: the run
+        // reported exactly that, "a 4-token prefill chunk with 0 prompt tokens
+        // left". The plan admits the request and runs its first chunk anyway,
+        // because the step applies admission before it checks the work, so a
+        // tree that measures the chunk against the queued view refuses this
+        // plan and fails here.
+        let queued = request(1, RequestState::Queued);
         let live = live(vec![queued], vec![RequestId(1)], &[(0, PhaseKind::Prefill)]);
         let work = Work {
             request: RequestId(1),
