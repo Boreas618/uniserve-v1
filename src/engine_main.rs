@@ -379,6 +379,7 @@ fn claim(
     process: &mut ProcessInterface,
     launch: &Launch,
     host: &str,
+    host_kv_cache: bool,
 ) -> Result<ipc::StorageLaunch> {
     let request = proto::process::Request {
         id: 1,
@@ -407,12 +408,18 @@ fn claim(
         socket: claimed.socket,
         deployment: launch.deployment.clone(),
         claim: claim_token(&claimed.claim)?,
-        // The host KV cache is the deployment's, and a rank whose storage another host reaches is
-        // told so by the answer's `tcp`; the rest of the launch is the epoch's.
-        host_kv_cache: false,
+        // The host KV cache is the deployment's decision, from the build config: a rank whose
+        // deployment keeps a host tier maps a page pool per cache group, and one that does not
+        // maps nothing. Stating `false` for a deployment that asked for it would size the world's
+        // host KV cache with no rank holding a page of it.
+        host_kv_cache,
         tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
         peers: Vec::new(),
         world: launch.world,
+        // The standby role is the epoch layer's (§2.5, §7.4): a standby maps its scope's storage
+        // read-only until it is promoted. Nothing the launch file states tells this process it is
+        // one, and claiming writable storage as a standby would give the scope two writers - so the
+        // role has to be stated before this process ever starts as a standby.
         standby: false,
         standby_storage: ipc::StandbyStorage::Auto,
     })
@@ -553,7 +560,9 @@ impl MainProcess {
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
         // the model loads, and keeps what it maps for the epoch's life.
-        let storage = claim(&mut process, launch, &epoch.host)?;
+        // A host tier is the build config's, and it needs prefix caching to have pages to keep.
+        let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
+        let storage = claim(&mut process, launch, &epoch.host, host_kv_cache)?;
         let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
             .context("connecting to the Storage Server")?;
         // A weight's region is one device's address, so the store maps on the device this rank's
