@@ -70,7 +70,7 @@ pub use cudnn::{
 pub use device::{
     Device, DeviceAttribute, DeviceId, DeviceUuid, MemoryInfo, profiler_start, profiler_stop,
 };
-pub use dtype::DType;
+pub use dtype::DataType;
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
 pub use graph::{

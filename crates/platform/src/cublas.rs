@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use libloading::Library;
 
 use crate::driver::Handle;
-use crate::{DType, Device, DeviceId, Error, Result, Stream};
+use crate::{DataType, Device, DeviceId, Error, Result, Stream};
 
 const LIBCUBLASLT: &str = "libcublasLt.so.13";
 
@@ -77,12 +77,12 @@ pub struct MatrixLayout {
     pub batch: u64,
     /// Distance in elements between two batches; ignored when `batch` is 1.
     pub batch_stride: i64,
-    pub dtype: DType,
+    pub dtype: DataType,
 }
 
 impl MatrixLayout {
     /// A contiguous column-major `rows × cols` matrix, one batch.
-    pub fn column_major(rows: u64, cols: u64, dtype: DType) -> Self {
+    pub fn column_major(rows: u64, cols: u64, dtype: DataType) -> Self {
         Self {
             rows,
             cols,
@@ -95,7 +95,7 @@ impl MatrixLayout {
 
     /// A contiguous row-major `rows × cols` matrix, one batch, stored as the
     /// column-major `cols × rows` matrix.
-    pub fn row_major(rows: u64, cols: u64, dtype: DType) -> Self {
+    pub fn row_major(rows: u64, cols: u64, dtype: DataType) -> Self {
         Self {
             rows: cols,
             cols: rows,
@@ -154,7 +154,7 @@ pub struct MatmulDescriptor {
 impl MatmulDescriptor {
     /// A row-major `m × k` times `k × n` multiplication of `dtype` into
     /// `dtype`: `D = A · B`, with `C` aliasing `D` under `beta = 0`.
-    pub fn row_major(m: u64, n: u64, k: u64, dtype: DType, compute: ComputeType) -> Self {
+    pub fn row_major(m: u64, n: u64, k: u64, dtype: DataType, compute: ComputeType) -> Self {
         Self {
             compute,
             a: MatrixLayout::row_major(m, k, dtype),
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn row_major_layouts_describe_the_transposed_matrices() {
-        let descriptor = MatmulDescriptor::row_major(4, 6, 3, DType::Bf16, ComputeType::F32);
+        let descriptor = MatmulDescriptor::row_major(4, 6, 3, DataType::Bf16, ComputeType::F32);
 
         assert_eq!(
             descriptor.a,
@@ -823,7 +823,7 @@ mod tests {
                 stride: 3,
                 batch: 1,
                 batch_stride: 0,
-                dtype: DType::Bf16,
+                dtype: DataType::Bf16,
             }
         );
         assert_eq!((descriptor.b.rows, descriptor.b.cols), (6, 3));
@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn an_empty_matrix_is_rejected_before_any_driver_call() {
-        let mut descriptor = MatmulDescriptor::row_major(4, 6, 3, DType::F32, ComputeType::F32);
+        let mut descriptor = MatmulDescriptor::row_major(4, 6, 3, DataType::F32, ComputeType::F32);
         descriptor.b.rows = 0;
 
         let error = descriptor.check().expect_err("an empty matrix is rejected");
@@ -850,9 +850,9 @@ mod tests {
 
     #[test]
     fn the_data_types_are_the_cuda_codes() {
-        assert_eq!(DType::F32.cuda(), 0);
-        assert_eq!(DType::Bf16.cuda(), 14);
-        assert_eq!(DType::F16.cuda(), 2);
+        assert_eq!(DataType::F32.cuda(), 0);
+        assert_eq!(DataType::Bf16.cuda(), 14);
+        assert_eq!(DataType::F16.cuda(), 2);
         assert_eq!(ComputeType::F32.raw(), 68);
         assert_eq!(ComputeType::Tf32.raw(), 77);
         assert_eq!(ComputeType::Bf16.raw(), 75);

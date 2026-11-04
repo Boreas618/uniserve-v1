@@ -6,7 +6,7 @@ use std::ffi::c_void;
 
 use ffi::{Handle, RawUniqueId, api};
 
-use crate::{DType, DeviceId, Error, PrimaryContext, Result, Stream};
+use crate::{DataType, DeviceId, Error, PrimaryContext, Result, Stream};
 
 /// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
 /// storage.
@@ -149,7 +149,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DType,
+        dtype: DataType,
         op: ReduceOp,
         stream: &Stream,
     ) -> Result<()> {
@@ -180,7 +180,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DType,
+        dtype: DataType,
         op: ReduceOp,
         stream: &Stream,
     ) -> Result<()> {
@@ -210,7 +210,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DType,
+        dtype: DataType,
         stream: &Stream,
     ) -> Result<()> {
         let api = api()?;
@@ -239,7 +239,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DType,
+        dtype: DataType,
         stream: &Stream,
     ) -> Result<()> {
         let api = api()?;
@@ -268,7 +268,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DType,
+        dtype: DataType,
         root: i32,
         stream: &Stream,
     ) -> Result<()> {
@@ -296,7 +296,7 @@ impl Communicator {
         &mut self,
         data: u64,
         count: usize,
-        dtype: DType,
+        dtype: DataType,
         peer: i32,
         stream: &Stream,
     ) -> Result<()> {
@@ -323,7 +323,7 @@ impl Communicator {
         &mut self,
         data: u64,
         count: usize,
-        dtype: DType,
+        dtype: DataType,
         peer: i32,
         stream: &Stream,
     ) -> Result<()> {
