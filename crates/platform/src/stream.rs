@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::allocator::DevicePtr;
 use crate::driver::{ContextScope, Handle, driver, in_context};
 use crate::event::Event;
 use crate::{DeviceId, Error, PrimaryContext, Result};
@@ -27,6 +28,46 @@ pub enum CaptureStatus {
     /// Capture began but was invalidated; `cuStreamEndCapture` must still run.
     Invalidated,
 }
+
+/// What a stream's write of a 32-bit flag orders (`CUstreamWriteValue_flags`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteValue {
+    /// The write is an ordering point: a stream waiting on the flag observes
+    /// every write the writing stream issued before it.
+    Ordered,
+    /// The write may be reordered among the stream's own writes
+    /// (`CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER`).
+    Reordered,
+}
+
+/// The condition that releases a stream's wait on a 32-bit flag
+/// (`CUstreamWaitValue_flags`).
+///
+/// The remaining operations the driver offers are left out on purpose:
+/// `CU_STREAM_WAIT_VALUE_NOR` needs a device capability query and is
+/// deprecated in favour of the memory-operation API, and
+/// `CU_STREAM_WAIT_VALUE_FLUSH` is for remote writes over a fabric, which this
+/// crate does not carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitValue {
+    /// Releases when the flag is at least `value`, compared signed
+    /// (`CU_STREAM_WAIT_VALUE_GEQ`).
+    AtLeast,
+    /// Releases when the flag equals `value` (`CU_STREAM_WAIT_VALUE_EQ`).
+    Equal,
+    /// Releases when any bit of `value` is set in the flag
+    /// (`CU_STREAM_WAIT_VALUE_AND`).
+    AnyBitSet,
+}
+
+/// `CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER`.
+pub(crate) const CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER: u32 = 0x1;
+/// `CU_STREAM_WAIT_VALUE_GEQ`.
+pub(crate) const CU_STREAM_WAIT_VALUE_GEQ: u32 = 0x0;
+/// `CU_STREAM_WAIT_VALUE_EQ`.
+pub(crate) const CU_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
+/// `CU_STREAM_WAIT_VALUE_AND`.
+pub(crate) const CU_STREAM_WAIT_VALUE_AND: u32 = 0x2;
 
 /// A handle to a CUDA stream this process created, or to one borrowed from
 /// another owner.
@@ -276,6 +317,60 @@ impl Stream {
         driver.check(
             unsafe { (driver.stream_wait_event)(self.raw, handle.raw(), flags) },
             "cuStreamWaitEvent",
+        )
+    }
+
+    /// Writes `value` into the 32-bit flag at `address` in stream order
+    /// (`cuStreamWriteValue32`).
+    ///
+    /// This is how one stream tells another that the work before this point is
+    /// done, without a host round trip. `Ordered` makes the write an ordering
+    /// point: a stream that waits on the flag sees every write this stream
+    /// issued before it. `Reordered` permits the write to move among this
+    /// stream's writes and is only correct when nothing but the flag itself
+    /// depends on the ordering.
+    ///
+    /// `address` is device memory of this stream's device or host memory mapped
+    /// into it, and it must hold a 32-bit aligned value that stays valid until
+    /// the write runs — for a captured graph, until every replay does.
+    pub fn write_value32(&self, address: DevicePtr, value: u32, kind: WriteValue) -> Result<()> {
+        let flags = match kind {
+            WriteValue::Ordered => 0,
+            WriteValue::Reordered => CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER,
+        };
+
+        let driver = driver()?;
+        // SAFETY: the caller keeps the flag valid until the write runs, and the
+        // stream owns the ordering of its own work.
+        driver.check(
+            unsafe { (driver.stream_write_value32)(self.raw, address.address(), value, flags) },
+            "cuStreamWriteValue32",
+        )
+    }
+
+    /// Holds later work on this stream until the 32-bit flag at `address`
+    /// satisfies `kind` against `value` (`cuStreamWaitValue32`).
+    ///
+    /// Work ordered after this call does not run, and its reads do not observe
+    /// the flag's writer's writes, until the condition holds. A waiting stream
+    /// blocks on the device: nothing on the host polls, and the flag may be
+    /// written by a kernel or by another stream's [`Stream::write_value32`].
+    ///
+    /// `address` must hold a 32-bit aligned value that stays valid until the
+    /// wait is satisfied; a wait whose flag is never written blocks the stream
+    /// for as long as the stream lives.
+    pub fn wait_value32(&self, address: DevicePtr, value: u32, kind: WaitValue) -> Result<()> {
+        let flags = match kind {
+            WaitValue::AtLeast => CU_STREAM_WAIT_VALUE_GEQ,
+            WaitValue::Equal => CU_STREAM_WAIT_VALUE_EQ,
+            WaitValue::AnyBitSet => CU_STREAM_WAIT_VALUE_AND,
+        };
+
+        let driver = driver()?;
+        // SAFETY: the caller keeps the flag valid until the wait is satisfied.
+        driver.check(
+            unsafe { (driver.stream_wait_value32)(self.raw, address.address(), value, flags) },
+            "cuStreamWaitValue32",
         )
     }
 
