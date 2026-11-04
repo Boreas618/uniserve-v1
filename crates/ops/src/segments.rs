@@ -1053,9 +1053,23 @@ impl Op for VsaScores {
             ));
         }
         let query_tiles = args.pooled_query.shape.dim(1);
-        let key_tiles = args.pooled_key.shape.dim(1);
+        args.pooled_key.require_rank(Self::NAME, 3)?;
         args.pooled_key
-            .require_shape(Self::NAME, Shape::new(&[heads, key_tiles, width]))?;
+            .require_row(Self::NAME, descriptor.dtype, width)?;
+        // Both operands name the same heads and the same contraction: a key pooled over another
+        // width would contract against the wrong features and produce plausible scores.
+        if args.pooled_key.shape.dim(0) != heads || args.pooled_key.shape.dim(2) != width {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled key is [{}, {}, {}], the query's heads and width are [{heads}, _,                      {width}]",
+                    args.pooled_key.shape.dim(0),
+                    args.pooled_key.shape.dim(1),
+                    args.pooled_key.shape.dim(2)
+                ),
+            ));
+        }
+        let key_tiles = args.pooled_key.shape.dim(1);
         if args.pooled_key.dtype != descriptor.dtype {
             return Err(Error::argument(
                 Self::NAME,
