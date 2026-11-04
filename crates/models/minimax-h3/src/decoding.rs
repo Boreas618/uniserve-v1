@@ -2,7 +2,8 @@
 //! the layout each decoder hands the media stage.
 //!
 //! `uniserve/models/minimax_h3/decoding.py` and `output.py` are the reference. The video VAE decodes
-//! one clip at a time and the model splices the clips into a timeline; the audio VAE decodes one
+//! one clip at a time and [`crate::output::VideoPostprocessor`] splices the clips into a timeline; the
+//! audio VAE decodes one
 //! channel-major stereo latent timeline. This module owns that arithmetic and the output layouts, and
 //! nothing that touches a device: the packed latents, the decoded clip frames and the PCM are borrowed
 //! views the executor hands in and out.
@@ -20,8 +21,10 @@
 //! [`crate::output`] states the two rasters and their quantization — the video's `[frames, height,
 //! width, 3]` bytes and the audio's `[samples, 2]` integers — because they are the media stage's
 //! contract rather than this plan's. What belongs here is the arithmetic that decides *which* frames
-//! and *which* samples go where: the clip splice, the overlap the predecessor lends, and the halo a
-//! decoded audio window carries.
+//! and *which* samples go where: a clip's body and overlap, the halo a decoded audio window carries.
+//! The splice itself - drop the padding frames, fade the overlap, write the bytes - is the
+//! postprocessor's, because it is the component's second entry point (`video_postprocessor.forward`)
+//! and it reads the predecessor's tail, which a single clip's decode never sees.
 
 use crate::config::VideoVaeConfig;
 use crate::video_vae::{Canvas, Tile, Tiles};
@@ -590,44 +593,6 @@ impl ClipDecoder {
             )));
         }
         self.rgb.forward(f, blended, out)?;
-        Ok(())
-    }
-
-    /// Assemble the clips into the request's frame range, and say what is still refused.
-    ///
-    /// A video of one clip — 22 frames, the shortest `17n + 5` — assembles completely: its raster is
-    /// quantized into the request's bytes and nothing is blended. A video of more clips needs the
-    /// five-frame tail between consecutive clips faded on the **frames** axis, which
-    /// `nn::layers::CrossFade` does not take (it takes rows and columns, M1229); the last clip has no
-    /// successor and quantizes like the first, so the refusal names exactly the clips that have a
-    /// predecessor's tail.
-    ///
-    /// Each entry is `(the clip's blended raster, its slice of the request's byte raster)`, in
-    /// timeline order.
-    pub fn splice(&self, f: &Forward, clips: &[(TensorView, TensorView)]) -> Result<()> {
-        if clips.is_empty() {
-            return Err(Error::config(
-                "a video has at least one clip to assemble".to_owned(),
-            ));
-        }
-        if clips.len() > 2 {
-            return Err(Error::config(format!(
-                "{} clips are one more than this path can assemble: the frames-axis blend is missing \
-                 only for the tails, but every interior clip has two",
-                clips.len()
-            )));
-        }
-        // The first clip has no predecessor, and the last has no tail to fade: with two clips the tail
-        // is still missing, so the refusal stays honest by naming it.
-        self.quantize(f, clips[0].0, clips[0].1)?;
-        if let Some((blended, out)) = clips.get(1) {
-            let _ = (blended, out);
-            return Err(Error::config(
-                "the first clip is quantized and the second's tail is not: a five-frame fade on the \
-                 frames axis needs nn::layers::CrossFade to take axis 1 (M1229)"
-                    .to_owned(),
-            ));
-        }
         Ok(())
     }
 }
