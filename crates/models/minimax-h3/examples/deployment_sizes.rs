@@ -34,13 +34,13 @@ const STAGES: &[Stage] = &[
     Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 0, tables: 0 },
+    Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 54432, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner)", weights: 41953, constants: 1946, arena: 1550, tables: 14 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 0, tables: 0 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 54432, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 1470, tables: 12 },
     Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
@@ -213,6 +213,30 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
+    // A reference clip's tile grid, so the loop's multiplication is visible beside the per-tile plan.
+    for (height, width) in [(768_u32, 1344_u32), (672, 1536)] {
+        let encoder = minimax_h3::tiled_encode::ClipEncoder::new(height, width)?;
+        let plan = encoder.plan();
+        println!(
+            "encoder grid {width}x{height}: {} tiles, per tile {} MiB, whole loop {} MiB",
+            plan.tiles.len(),
+            1701,
+            1701 * plan.tiles.len() as u64
+        );
+    }
+    // The video encoder reads one tile per call, so its plan is stated per tile; the driver's loop
+    // must hoist it or the arena is reserved once per tile.
+    for (width, height) in [(256_u32, 64_u32), (512, 128)] {
+        let raster = minimax_h3::encoding::Extent { frames: 25, height, width };
+        let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
+        let bytes: u64 = plan.iter().map(|buffer| buffer.elements * 4).sum();
+        println!(
+            "encoder tile {width}x{height} px: {} buffers, {} bytes = {} MiB",
+            plan.len(),
+            bytes,
+            bytes / (1 << 20)
+        );
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
     let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
