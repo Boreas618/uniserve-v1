@@ -153,15 +153,25 @@ impl Schedule {
         Ok((video - 1) as u32)
     }
 
-    /// The noise level one modality starts from: its first sigma point.
+    /// The level a draw is scaled to before the first evaluation, when the grid asks for one.
     ///
-    /// A parallel-decoding student scales its initial draw by this level, because its first node is
-    /// not unit noise; the released and distilled grids start from unit noise.
-    pub fn start_sigma(&self, modality: Modality) -> Result<f32> {
-        self.sigmas(modality)
+    /// **Only a parallel-decoding (`PddGrid`) schedule scales its draw** - `denoiser.py:1103-1112`
+    /// multiplies the patched state by `sigmas[0]` exactly when `isinstance(config.schedule,
+    /// PddGrid)`, and the released and distilled grids start from unit noise. Gating on the grid's
+    /// kind and not on the number matters: a distilled grid's first sigma is also below one
+    /// (`max_t` is 0.999), so a value test would scale a draw the reference leaves alone - a 0.1%
+    /// offset in the initial sample of every distilled request, which no shape and no type refuses.
+    ///
+    /// `None` means the draw is the start: either the level is exactly one, or the grid does not
+    /// scale at all.
+    pub fn start_sigma(&self, modality: Modality) -> Result<Option<f32>> {
+        let sigma = self
+            .sigmas(modality)
             .first()
             .copied()
-            .ok_or_else(|| Error::checkpoint("H3 schedule has no sigma point".to_owned()))
+            .ok_or_else(|| Error::checkpoint("H3 schedule has no sigma point".to_owned()))?;
+        let scales = matches!(self.spec.grid, ScheduleGrid::Blocks { .. });
+        Ok((scales && sigma != 1.0).then_some(sigma))
     }
 
     /// The steps of one modality, as the executor schedules them: evaluation `i` runs from
@@ -490,10 +500,12 @@ mod tests {
         // modalities.
         let video = schedule
             .start_sigma(Modality::Video)
-            .expect("a start level");
+            .expect("a start level")
+            .expect("a parallel-decoding grid scales its draw");
         let audio = schedule
             .start_sigma(Modality::Audio)
-            .expect("a start level");
+            .expect("a start level")
+            .expect("a parallel-decoding grid scales its draw");
         assert!((video - 0.999).abs() < 1e-6);
         assert!((audio - 0.999).abs() < 1e-6);
     }
