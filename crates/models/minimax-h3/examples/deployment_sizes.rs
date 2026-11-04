@@ -52,7 +52,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_978,
+        arena: 5_619,
         tables: 3,
     },
     Stage {
@@ -85,7 +85,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_978,
+        arena: 5_619,
         tables: 3,
     },
     Stage {
@@ -127,7 +127,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_978,
+        arena: 5_619,
         tables: 3,
     },
     Stage {
@@ -168,7 +168,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_978,
+        arena: 5_619,
         tables: 3,
     },
     Stage {
@@ -201,7 +201,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_978,
+        arena: 5_619,
         tables: 3,
     },
     Stage {
@@ -334,10 +334,11 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
             .sum();
         println!(
-            "decode plan {}x{}: {}",
+            "decode plan {}x{}: {} bytes = {} MiB",
             canvas.width,
             canvas.height,
-            mib(arena / (1 << 20))
+            arena,
+            arena / (1 << 20)
         );
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
