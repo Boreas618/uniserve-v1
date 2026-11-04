@@ -159,6 +159,14 @@ pub struct KvPlanes {
     pub key_initialized: TensorView,
     /// `[pages, 1, 1, 1]` i32, one flag per page of `value`.
     pub value_initialized: TensorView,
+    /// `[pages, 1, 1, 1]` f32: each page's key scale, present exactly when `key` is FP8.
+    ///
+    /// An FP8 cache stores a page divided by its own scale and the attention kernel multiplies it
+    /// back in FP32. The scale is one *layer's*: two layers of one group keep their caches apart and
+    /// each carries its own, which is why it is here and not with the group's geometry.
+    pub key_scale: Option<TensorView>,
+    /// `[pages, 1, 1, 1]` f32: each page's value scale, present exactly when `value` is FP8.
+    pub value_scale: Option<TensorView>,
 }
 
 /// The cache of one attention group: how rows address pages and where the pages are.
@@ -168,13 +176,11 @@ pub struct KvGroup<'a> {
     pub block_tables: TensorView,
     /// Tokens per page; the same as the batch's `page_size`.
     pub page_size: u32,
-    /// Element type of the planes (BF16, or FP8 for an FP8 cache).
+    /// Element type of the group's pages: BF16, or FP8 for a group whose every layer is FP8.
+    ///
+    /// The scales are per layer ([`KvPlanes::key_scale`], [`KvPlanes::value_scale`]); a mixed group
+    /// states its pages' type here and each layer states its own scales.
     pub dtype: DType,
-    /// `[pages, 1, 1, 1]` f32: each page's key scale, required for an FP8 cache and absent
-    /// otherwise. The page holds `key / scale`; the attention kernel multiplies it back in FP32.
-    pub key_scales: Option<TensorView>,
-    /// `[pages, 1, 1, 1]` f32: each page's value scale, as `key_scales`.
-    pub value_scales: Option<TensorView>,
     /// One entry per layer that reads this group, in model order.
     pub layers: &'a [KvPlanes],
 }
