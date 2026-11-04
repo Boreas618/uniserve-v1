@@ -54,7 +54,7 @@ use crate::audio_vae::Binder;
 /// `nn.LayerNorm`'s default epsilon, which the reference's audio projection does not override.
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
-use crate::video_vae::{MINIMUM_OVERLAP, Seams, TILE_PIXELS};
+use crate::video_vae::{Seams, MINIMUM_OVERLAP, TILE_PIXELS};
 use crate::{Error, Result};
 
 /// The spatial compression of the video encoder: input pixels per latent position.
@@ -448,19 +448,35 @@ impl AudioStack {
         lengths
     }
 
-    /// The latent frames a track of `samples` encodes to, which must be a whole number of frames.
+    /// The latent frames a track of `samples` encodes to, and the length the stack must be given.
     pub fn latent_frames(&self, samples: u32) -> Result<u32> {
-        if !samples.is_multiple_of(self.samples_per_latent) {
-            return Err(Error::config(format!(
-                "{samples} samples are not whole {} sample latent frames",
-                self.samples_per_latent
-            )));
-        }
-        self.lengths(samples)
-            .last()
-            .copied()
-            .ok_or_else(|| Error::config("the audio encoder's stack has no stage".to_owned()))
+        let frames = audio_latent_frames(u64::from(samples), u64::from(self.samples_per_latent))?;
+        u32::try_from(frames)
+            .map_err(|_| Error::config(format!("{samples} samples exceed a latent frame count")))
     }
+}
+
+/// The latent frames a track of `samples` encodes to: `ceil(samples / hop)`.
+///
+/// One statement of the rule, because two callers need it: the stack's geometry and the encoder's own
+/// output extent. The ceiling is the reference's (`encoding.py:244`), and it is a ceiling because its
+/// `unpack_samples` right-pads the track with zeros to [`padded_samples`] first, so every strided
+/// convolution divides exactly and the last latent frame reads those zeros.
+pub fn audio_latent_frames(samples: u64, hop: u64) -> Result<u64> {
+    if samples == 0 || hop == 0 {
+        return Err(Error::config(
+            "an audio track of no samples encodes to no latent frames".to_owned(),
+        ));
+    }
+    Ok(samples.div_ceil(hop))
+}
+
+/// The length the encoder must be given for a track of `samples`: the ceiling's own multiple.
+///
+/// The padding is [`audio_latent_frames`]' multiple less the track, so a whole-frame track is unchanged
+/// and any other is right-padded with zeros exactly as the reference's `unpack_samples` does.
+pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
+    Ok(audio_latent_frames(samples, hop)? * hop)
 }
 
 /// Every parameter of the audio encoder, with the checkpoint keys that fill it.
@@ -610,12 +626,12 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 // The video encoder's device path.
 // ---------------------------------------------------------------------------------------------
 
-use nn::Forward;
 use nn::layers::{
     AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
     GatedActivation, LayerNorm, Linear, ScaledAdd, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::Forward;
 use nn::{DType, Shape, TensorView};
 
 /// One causal convolution of the encoder and the normalization that feeds it.
@@ -1122,23 +1138,15 @@ struct GeGlu {
 }
 
 impl AudioEncoder {
-    /// The latent frames `samples` samples encode to.
+    /// The latent frames `samples` samples encode to: `ceil(samples / hop)`.
     ///
-    /// A whole number of latent frames is required, and this is the one place the H3 encoder is
-    /// stricter than the reference's declaration: `encoding.py:244` sizes the output as
-    /// `ceil(samples / latent_rate)`, while its own strided convolutions compute
-    /// `floor((length + 2·ceil(stride/2) − 2·stride) / stride) + 1` per stage, which for the rates
-    /// `2, 4, 4, 5, 5` reaches `samples / 800` only when that division is exact. A reference track of
-    /// any other length would therefore have a declared row that no stage writes; here it is a named
-    /// error instead, and every length the reference can actually encode is accepted unchanged.
+    /// This is the reference's rule (`encoding.py:244`) and the reason it is a ceiling is the pad its
+    /// own `unpack_samples` applies first: a track that is not a whole number of latent frames is
+    /// **right-padded with zeros** to `ceil(samples / hop) · hop`, so every stage's strided convolution
+    /// divides exactly and the last latent frame reads those zeros. A track of any positive length
+    /// therefore encodes, and [`Self::encode`] states what it needs to do the same.
     pub fn frames(&self, samples: u64) -> Result<u64> {
-        let hop = self.hop();
-        if samples == 0 || !samples.is_multiple_of(hop) {
-            return Err(Error::config(format!(
-                "{samples} samples is not a whole number of {hop}-sample latent frames"
-            )));
-        }
-        let frames = samples / hop;
+        let frames = audio_latent_frames(samples, self.hop())?;
         if frames > u64::from(LONGEST_TRACK) {
             return Err(Error::config(format!(
                 "{frames} latent frames exceed the {LONGEST_TRACK}-frame track the encoder's \
@@ -1282,6 +1290,20 @@ impl AudioEncoder {
         let batch = shape.dim(0);
         let length = shape.dim(2);
         let frames = self.frames(length)?;
+        // The network's stages divide the length exactly, so a track that is not a whole number of
+        // latent frames is right-padded with zeros to one, which is what the reference's
+        // `unpack_samples` does before it convolves. Writing that pad needs a zero-fill the operator set
+        // does not have yet (a `zero_pad` over the trailing axis); until it exists this is refused by
+        // name rather than truncated, because truncating drops the last latent frame.
+        let hop = self.hop();
+        if !length.is_multiple_of(hop) {
+            let padded = padded_samples(length, hop)?;
+            return Err(Error::config(format!(
+                "{length} samples is not a whole number of {hop}-sample latent frames: the reference \
+                 right-pads the track with zeros to {padded} samples and this build has no zero-fill \
+                 program"
+            )));
+        }
         if frames > u64::from(self.frames) {
             return Err(Error::config(format!(
                 "a {frames}-frame track is longer than the {} the deployment declared",
@@ -1748,8 +1770,11 @@ mod tests {
         assert_eq!(stack.lengths(1600), vec![1600, 800, 200, 50, 10, 2]);
         assert_eq!(stack.latent_frames(800).expect("one frame"), 1);
         assert_eq!(stack.latent_frames(24000).expect("thirty frames"), 30);
-        // A partial frame is refused: the encoder's output is whole latent frames.
-        assert!(stack.latent_frames(801).is_err());
+        // A partial frame rounds up, and the length the network is given is the ceiling's own multiple:
+        // the reference right-pads the track with zeros, so nothing is dropped.
+        assert_eq!(stack.latent_frames(801).expect("rounds up"), 2);
+        assert_eq!(padded_samples(801, 800).expect("padded"), 1600);
+        assert_eq!(padded_samples(1600, 800).expect("whole"), 1600);
         // Each stage doubles the width from the input convolution's.
         assert_eq!(stack.widths, vec![128, 256, 512, 1024, 2048]);
         assert_eq!(stack.latent_dim, 2048);
