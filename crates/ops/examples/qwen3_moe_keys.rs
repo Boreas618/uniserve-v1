@@ -356,7 +356,9 @@ fn main() {
         "argmax".to_owned(),
         key(&ops::sampler::ArgMaxDescriptor {
             dtype: DType::F32,
-            width: CANDIDATE_WIDTH,
+            // Greedy reads the row the head shaped, so the width is the vocabulary and not the
+            // candidate width the top-k chain keeps (`nn::Sampler::greedy` passes `self.vocabulary`).
+            width: VOCABULARY,
             ids: DType::I32,
             pdl: PDL,
         }),
