@@ -47,6 +47,7 @@ pub use text::{
 pub use video_vae::{SpatialPadding, VideoVaeConfig};
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
+use crate::encoding::Clip;
 use crate::{Error, Result};
 
 /// Frames per second of a generated video.
@@ -181,7 +182,9 @@ impl Config {
                     )?,
                 ),
             };
-            let denoiser = DenoiserConfig::new(transformer, schedule, attention, tasks.clone())?;
+            let clip = Clip::of(&video_vae)?;
+            let denoiser =
+                DenoiserConfig::new(transformer, schedule, attention, tasks.clone(), clip)?;
             denoisers.insert(*dit, denoiser);
         }
 

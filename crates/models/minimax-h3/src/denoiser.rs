@@ -133,11 +133,16 @@ impl Layouts {
             .iter()
             .map(|condition| {
                 condition.frame.map_or(0, |frame| {
-                    let frames = if frame.num_frames <= 1 {
-                        1
-                    } else {
-                        packing::video_latent_frames(frame.num_frames).unwrap_or(0)
-                    };
+                    // A condition is cut into clips, so its latent count is the encoder's rule
+                    // ([`crate::encoding::Clip::latent_frames`]), not the generated timeline's:
+                    // a 30-frame reference is 7 latent frames, and counting 0 - which the
+                    // generated rule does, since 30 is not `17n + 5` - would shift every later
+                    // draw of the request by the condition's whole volume.
+                    let frames = self
+                        .config
+                        .clip
+                        .latent_frames(frame.num_frames)
+                        .unwrap_or(0);
                     match packing::latent_raster(&frame.canvas) {
                         Ok(raster) => {
                             u64::from(frames)
@@ -2417,6 +2422,11 @@ mod tests {
             attention: AttentionKind::DENSE,
             tasks: vec![nn::capability::VideoTask::TextToVideoAudio],
             canvases: None,
+            clip: crate::encoding::Clip {
+                frames: 17,
+                latents: 5,
+                token_drop: 3,
+            },
         };
         Layouts::new(
             config,
@@ -2678,6 +2688,40 @@ mod tests {
         assert_eq!(
             layouts().condition_elements(&conditions, &canvas),
             48 * 84 * 24
+        );
+    }
+
+    #[test]
+    fn a_reference_clip_draws_the_latent_frames_the_encoder_cuts_it_into() {
+        // A reference clip that is not a whole number of the generated timeline's clips is still a
+        // condition: the encoder cuts it into 17-frame clips and drops the last one's tail, so 30
+        // frames are 7 latent frames. Counting it with the generated rule would give 0 - 30 is not
+        // `17n + 5` - and every later draw of the request would move by the whole condition.
+        let canvas = crate::config::Canvas {
+            short_edge: 768,
+            aspect: (16, 9),
+            width: 1344,
+            height: 768,
+        };
+        let conditions = [packing::Condition {
+            role: packing::Role::Reference,
+            frame: Some(packing::Frame {
+                canvas,
+                num_frames: 30,
+            }),
+            audio_samples: 0,
+        }];
+        let rule = layouts();
+        let raster = packing::latent_raster(&canvas).expect("the canvas' raster");
+        let latents = rule
+            .config
+            .clip
+            .latent_frames(30)
+            .expect("a clip of 30 frames");
+        assert!(latents > 1, "the condition is more than a still");
+        assert_eq!(
+            rule.condition_elements(&conditions, &canvas),
+            latents * raster.height * raster.width * rule.config.transformer.video_channels
         );
     }
 
