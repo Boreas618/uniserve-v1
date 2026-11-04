@@ -46,13 +46,15 @@ import numpy as np
 
 #: The three cuts a layer is walked through, in the order the layer runs them. A reference that sets
 #: `hidden_NN_normalized.npy` and the two after it lets one layer be read operator by operator.
-CUTS = ["normalized", "attended", "mlp_out"]
+CUTS = ["normalized", "attended", "router_ids", "router_weights", "mlp_out"]
 
 #: The reference's own module at which each cut's tensor is read, so a cut's file name states which
 #: site wrote it and a comparison never rests on two hands agreeing what a word means.
 CUT_SITES = [
     ("normalized", "input_layernorm's output (its residual add is already in it)"),
     ("attended", "self_attn's output, element [0], before the residual add"),
+    ("router_ids", "the router's selected experts, as ids - compared exactly, never by rms"),
+    ("router_weights", "the router's renormalized weights, in the reference's own dtype (bf16)"),
     ("mlp_out", "mlp's output, before the residual add"),
 ]
 
@@ -60,11 +62,15 @@ CUT_SITES = [
 def load(path):
     if not path.exists():
         return None
-    return np.load(path).astype(np.float64)
+    # The dtype is kept: a router's ids are indices and their comparison is exact, which a cast to
+    # float would silently turn into a relative one.
+    return np.load(path)
 
 
 def measure(actual, expected):
     """The worst element relative to the layer's own magnitude, and the bulk's relative rms."""
+    actual = actual.astype(np.float64)
+    expected = expected.astype(np.float64)
     scale = np.max(np.abs(expected))
     peak = np.max(np.abs(actual - expected))
     rel = float(peak / scale) if scale > 0 else float(peak)
@@ -76,6 +82,8 @@ def measure(actual, expected):
 
 def per_row(actual, expected):
     """Each row's own `max|a - b| / max|b|`, so a fault confined to some positions is visible."""
+    actual = actual.astype(np.float64)
+    expected = expected.astype(np.float64)
     scale = np.max(np.abs(expected), axis=1, keepdims=True)
     scale[scale == 0] = 1.0
     return np.max(np.abs(actual - expected) / scale, axis=1)
@@ -257,6 +265,23 @@ def main():
         if actual.shape != expected.shape:
             print(f"{path.name:<16} {str(actual.shape):<12} shape differs from {expected.shape}")
             if first is None:
+                first = path.name
+            continue
+        if expected.dtype.kind in "iu":
+            # An index is not a quantity: nothing about `17` is "3% away" from `18`. It is equal or
+            # it is not, and the only informative summary is how many differ and where.
+            differ = np.argwhere(actual != expected)
+            total = expected.size
+            if differ.size == 0:
+                reading = "every index agrees"
+            else:
+                row = tuple(int(value) for value in differ[0])
+                reading = (
+                    f"{differ.shape[0]} of {total} differ; first at {row}: "
+                    f"{int(actual[row])} against the reference's {int(expected[row])}"
+                )
+            print(f"{path.name:<16} {str(expected.shape):<12} {'exact':>10} {'-':>10} {'-':>10}  {reading}")
+            if differ.size and first is None:
                 first = path.name
             continue
         rel, rms = measure(actual, expected)
