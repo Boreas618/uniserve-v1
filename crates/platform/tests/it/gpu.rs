@@ -2017,3 +2017,211 @@ fn a_transposed_convolution_matches_the_definition_of_a_conv_transpose1d() {
 
     assert_close(&observed, &expected);
 }
+
+/// One logical 5-D tensor (batch, channels, depth, height, width) laid out the
+/// way `torch.channels_last_3d` lays it out: the channel of an element is
+/// adjacent to it and the batch strides over the rest.
+fn channels_last_3d(values: &[f32], dims: [usize; 5]) -> Vec<f32> {
+    let [batch, channels, depth, height, width] = dims;
+    let mut laid_out = vec![0.0f32; values.len()];
+    for n in 0..batch {
+        for c in 0..channels {
+            for d in 0..depth {
+                for h in 0..height {
+                    for w in 0..width {
+                        let logical =
+                            ((n * channels + c) * depth + d) * height * width + h * width + w;
+                        let offset =
+                            ((n * depth + d) * height * width + h * width + w) * channels + c;
+                        laid_out[offset] = values[logical];
+                    }
+                }
+            }
+        }
+    }
+    laid_out
+}
+
+/// The logical order of a tensor laid out the way `torch.channels_last_3d`
+/// lays it out, the inverse of [`channels_last_3d`].
+fn logical_3d(values: &[f32], dims: [usize; 5]) -> Vec<f32> {
+    let [batch, channels, depth, height, width] = dims;
+    let mut logical = vec![0.0f32; values.len()];
+    for n in 0..batch {
+        for c in 0..channels {
+            for d in 0..depth {
+                for h in 0..height {
+                    for w in 0..width {
+                        let offset =
+                            ((n * depth + d) * height * width + h * width + w) * channels + c;
+                        let logical_offset =
+                            ((n * channels + c) * depth + d) * height * width + h * width + w;
+                        logical[logical_offset] = values[offset];
+                    }
+                }
+            }
+        }
+    }
+    logical
+}
+
+/// The definition of a three-dimensional cross-correlation, computed on the
+/// host: `y[n][k][d][h][w] = sum over c, (j1, j2, j3) of
+/// x[n][c][d·s − p + j1·dil][h·s − p + j2·dil][w·s − p + j3·dil] · w[k][c][j]`,
+/// with a zero outside the input.
+#[allow(clippy::too_many_arguments)]
+fn forward_reference_3d(
+    x: &[f32],
+    x_dims: [usize; 5],
+    w: &[f32],
+    w_dims: [usize; 5],
+    y_dims: [usize; 5],
+    padding: usize,
+) -> Vec<f32> {
+    let [batch, channels, depth, height, width] = x_dims;
+    let [_, filters, kernel_d, kernel_h, kernel_w] = w_dims;
+    let [_, _, out_d, out_h, out_w] = y_dims;
+    let mut y = vec![0.0f32; batch * filters * out_d * out_h * out_w];
+    for n in 0..batch {
+        for k in 0..filters {
+            for od in 0..out_d {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut total = 0.0f64;
+                        for c in 0..channels {
+                            for jd in 0..kernel_d {
+                                let d = od as i64 + padding as i64 - jd as i64;
+                                if d < 0 || d >= depth as i64 {
+                                    continue;
+                                }
+                                for jh in 0..kernel_h {
+                                    let h = oh as i64 + padding as i64 - jh as i64;
+                                    if h < 0 || h >= height as i64 {
+                                        continue;
+                                    }
+                                    for jw in 0..kernel_w {
+                                        let w_index = ow as i64 + padding as i64 - jw as i64;
+                                        if w_index < 0 || w_index >= width as i64 {
+                                            continue;
+                                        }
+                                        let value = x[(((n * channels + c) * depth + d as usize)
+                                            * height
+                                            + h as usize)
+                                            * width
+                                            + w_index as usize];
+                                        let weight = w[(((k * channels + c) * kernel_d + jd)
+                                            * kernel_h
+                                            + jh)
+                                            * kernel_w
+                                            + jw];
+                                        total += f64::from(value) * f64::from(weight);
+                                    }
+                                }
+                            }
+                        }
+                        y[(((n * filters + k) * out_d + od) * out_h + oh) * out_w + ow] =
+                            total as f32;
+                    }
+                }
+            }
+        }
+    }
+    y
+}
+
+/// cuDNN runs the video VAE's layout: a `Conv3d` whose filter and tensors are
+/// laid out `channels_last_3d` — cuDNN's NHWC — computes the same definition
+/// as the contiguous case, so the description's explicit strides are what
+/// makes the VAE expressible.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_channels_last_convolution_matches_the_definition_of_a_conv3d() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let cudnn = Cudnn::new(&device).unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+
+    let x_dims = [1usize, 2, 2, 3, 3];
+    let w_dims = [2usize, 2, 3, 3, 3];
+    let y_dims = [1usize, 2, 2, 3, 3];
+    let padding = 1usize;
+    let kernel = w_dims[2..].to_vec();
+
+    // Logical tensors, then the layout the model keeps them in.
+    let logical_x: Vec<f32> = (0..x_dims.iter().product())
+        .map(|i| (i % 7) as f32 * 0.25 - 0.75)
+        .collect();
+    let logical_w: Vec<f32> = (0..w_dims.iter().product())
+        .map(|i| ((i * 3) % 5) as f32 * 0.25 - 0.5)
+        .collect();
+    let expected = forward_reference_3d(&logical_x, x_dims, &logical_w, w_dims, y_dims, padding);
+    let x = channels_last_3d(&logical_x, x_dims);
+    let w = channels_last_3d(&logical_w, w_dims);
+
+    // Channels-last strides: the channel of an element is one step away, and
+    // the batch strides over the whole channel-last image.
+    let [batch, channels, depth, height, width] = x_dims;
+    let image = depth * height * width;
+    let x_strides = vec![
+        (image * channels) as i64,
+        1,
+        (height * width * channels) as i64,
+        (width * channels) as i64,
+        channels as i64,
+    ];
+    let [filters, _, kd, kh, kw] = w_dims;
+    let filter_strides = vec![
+        (kd * kh * kw * channels) as i64,
+        1,
+        (kh * kw * channels) as i64,
+        (kw * channels) as i64,
+        channels as i64,
+    ];
+    let y_strides = vec![
+        (y_dims[2] * y_dims[3] * y_dims[4] * y_dims[1]) as i64,
+        1,
+        (y_dims[3] * y_dims[4] * y_dims[1]) as i64,
+        (y_dims[4] * y_dims[1]) as i64,
+        y_dims[1] as i64,
+    ];
+    let tensor = |dims: [usize; 5], strides: Vec<i64>, dtype: DataType| Tensor {
+        dims: dims.iter().map(|&dim| dim as i64).collect(),
+        strides,
+        dtype,
+    };
+    let convolution = Convolution::new(
+        tensor(x_dims, x_strides, DataType::F32),
+        tensor(w_dims, filter_strides, DataType::F32),
+        tensor(y_dims, y_strides, DataType::F32),
+        vec![padding as i64; 3],
+        vec![1; 3],
+        vec![1; 3],
+    );
+    assert_eq!(convolution.rank(), 3);
+    assert_eq!((batch, channels, filters, kernel), (1, 2, 2, vec![3, 3, 3]));
+
+    let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
+    // The output comes back in the channels-last order its descriptor names;
+    // the comparison is made in the logical order the definition uses.
+    assert_close(&logical_3d(&observed, y_dims), &expected);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_sticky_error_probe_answers_from_another_thread() {
+    let _driver = exclusive_driver();
+    let context = PrimaryContext::retain(DEVICE).unwrap();
+    // Warm the probe on this thread, where the context is current.
+    assert!(context.sticky_error().unwrap().is_none());
+    // The control thread probes a device whose context it has never entered.
+    let elsewhere = context.clone();
+    let poisoned =
+        std::thread::spawn(move || elsewhere.sticky_error().map(|error| error.is_some()))
+            .join()
+            .unwrap()
+            .unwrap();
+    assert!(
+        !poisoned,
+        "a healthy context must not read as sticky from a thread that has not entered it"
+    );
+}
