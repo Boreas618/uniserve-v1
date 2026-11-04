@@ -1184,11 +1184,14 @@ dependencies = [
  "crossbeam-channel",
  "daemon",
  "engine",
+ "executor",
  "fnv",
  "ipc",
  "libc",
  "models",
+ "nn",
  "png",
+ "program-server",
  "proto",
  "scheduling",
  "serde",
@@ -3730,6 +3733,13 @@ dependencies = [
 
 [[package]]
 name = "scheduling-policy-fcfs"
+version = "2.0.0"
+dependencies = [
+ "scheduling-guest",
+]
+
+[[package]]
+name = "scheduling-policy-fixture"
 version = "2.0.0"
 dependencies = [
  "scheduling-guest",
