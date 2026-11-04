@@ -225,13 +225,25 @@ mod tests {
         }
     }
 
-    /// The identity of a checkpoint file the test writes once per name, so two names are two
-    /// checkpoint files and the same name is one file read twice (`FileIdentity::of` is the only
-    /// constructor, and it derives the identity from the file itself).
+    /// The identity of a checkpoint file, as a Hugging Face cache stores it.
+    ///
+    /// A file under `blobs/` is identified by its name alone, so the fixture states identity
+    /// without waiting for a write to settle: `FileIdentity::of` gives a file younger than a second
+    /// an identity that matches no later read, and a checkpoint under test must not depend on that.
     fn identity(name: &str) -> FileIdentity {
-        let directory = std::env::temp_dir().join("uniserve-weight-key-tests");
+        let directory = std::env::temp_dir()
+            .join("uniserve-weight-key-tests")
+            .join("blobs");
         std::fs::create_dir_all(&directory).expect("a temporary directory");
-        let path = directory.join(name);
+        // A blob's name is a 64-digit hexadecimal content hash; the content is the fixture's own.
+        let digest: String = name
+            .bytes()
+            .flat_map(|byte| format!("{byte:02x}").into_bytes())
+            .map(char::from)
+            .take(64)
+            .collect();
+        let blob = format!("{digest:0<64}");
+        let path = directory.join(blob);
         if !path.exists() {
             std::fs::write(&path, name).expect("a temporary checkpoint file");
         }
