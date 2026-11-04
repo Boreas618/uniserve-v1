@@ -371,6 +371,16 @@ impl Partition {
                 self.ulysses_degree
             )));
         }
+        // Both DiT partitions are the `denoiser` block - they are the same capability over two
+        // checkpoints, and the task picks one - so a rank that held both would register it twice.
+        if self.blocks.contains(Component::Transformer)
+            && self.blocks.contains(Component::TransformerRef)
+        {
+            return Err(Error::config(
+                "a rank cannot hold both the base and the reference denoiser: they are one block"
+                    .to_owned(),
+            ));
+        }
         if self.text_rows == 0 || self.condition_rows == 0 {
             return Err(Error::config(
                 "a deployment's text and condition row capacities are positive".to_owned(),
@@ -542,5 +552,22 @@ mod tests {
             assert!(!component.block().is_empty());
             assert!(!component.name().is_empty());
         }
+    }
+
+    #[test]
+    fn a_rank_holds_one_denoiser() {
+        let config = crate::config::tests_support::released_config();
+        let both = Partition {
+            blocks: Components::of([Component::Transformer, Component::TransformerRef])
+                .with(Component::TextEncoder),
+            ..Partition::single()
+        };
+        let refused = both.validate(&config).expect_err("two denoisers");
+        assert!(refused.to_string().contains("one block"), "{refused}");
+        let one = Partition {
+            blocks: Components::of([Component::Transformer]).with(Component::TextEncoder),
+            ..Partition::single()
+        };
+        one.validate(&config).expect("one denoiser");
     }
 }
