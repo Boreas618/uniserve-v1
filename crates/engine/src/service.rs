@@ -186,8 +186,11 @@ impl Generations {
     /// same content, or the next unused number for a content not prepared yet.
     ///
     /// A repeated precopy of the same program is the same generation - the
-    /// daemon repeats a precopy it did not see answered - so it neither prepares
-    /// the program twice nor takes a second number for it.
+    /// daemon repeats a precopy it did not see answered - so it takes no second
+    /// number for it. Whether it prepares again is the precopy's decision: a
+    /// program the policy no longer holds is prepared again under the number it
+    /// already has, because `Precopied` promises that a switchover to it can
+    /// follow.
     fn number_of(&mut self, key: &ProgramKey) -> u64 {
         match self.named.iter().find(|(_, named)| *named == key) {
             Some((number, _)) => *number,
@@ -436,25 +439,26 @@ impl Routing {
     /// while `batches` counts every batch every rank finalized, which is larger
     /// because a step submits one batch per (phase, component). `tokens` sums
     /// the tokens the workers' forwards carried, `queue` is each rank's waiting
-    /// depth, and `policy_fuel` and `policy_calls` come from the policy
-    /// instances (§12). The device's counters and the allocators' figures are
-    /// not this thread's: they come with the executor's `counters()` and the
-    /// allocators' reports.
+    /// depth, and `policy_fuel` and `policy_calls` are the instances' own
+    /// figures, summed by [`policy_usage`] (§12). The device's counters and the
+    /// allocators' figures are not this thread's: they come with the executor's
+    /// `counters()` and the allocators' reports.
     fn metrics(&self) -> wire::Metrics {
         let mut metrics = wire::Metrics::default();
-        let mut usage = self.route_usage();
+        let mut reported: Vec<Option<PolicyUsage>> = Vec::with_capacity(self.slots.len());
         for (index, slot) in self.slots.iter().enumerate() {
-            if let Ok(progress) = slot
+            let progress = slot
                 .handle
                 .progress()
                 .recv_timeout(std::time::Duration::from_millis(200))
-            {
-                metrics.steps = metrics.steps.max(progress.step);
-                if let Some(cost) = progress.usage {
-                    usage.calls += cost.calls;
-                    usage.fuel += cost.fuel;
-                }
-            }
+                .ok();
+            metrics.steps = metrics
+                .steps
+                .max(progress.as_ref().map_or(0, |progress| progress.step));
+            // A scheduler that did not answer this tick, and one that has no
+            // policy yet, states no cost: the frame undercounts that rank's
+            // cumulative figure until the rank answers again.
+            reported.push(progress.and_then(|progress| progress.usage));
             let stats = slot.handle.stats();
             metrics.batches += stats.general.steps.load(Ordering::Relaxed);
             metrics.tokens += crate::lock(&stats.worker.forward_mode_tokens)
@@ -466,6 +470,7 @@ impl Routing {
                     .unwrap_or(u32::MAX),
             });
         }
+        let usage = policy_usage(self.route_usage(), reported);
         metrics.policy_fuel = usage.fuel;
         metrics.policy_calls = usage.calls;
         metrics
@@ -2108,9 +2113,13 @@ fn forward_events(
                     // the epoch's current one (§7.3). A scheduler's report is
                     // named here, since a scheduler does not know its index.
                     //
-                    // The report is an engine-level event, not a request's: it
-                    // waits for the process interface's report frame, and until
-                    // that frame carries it this log is where a revert is seen.
+                    // The report is an engine-level event, not a request's. A
+                    // scheduler is asked for its report on one tick and its
+                    // answer is read on a later one, so a tick never waits on a
+                    // scheduler; the control thread's own instance keeps its
+                    // reports where it failed them. Each one goes to the daemons
+                    // as the process interface's report frame, and the log line
+                    // is this process's own record of it.
                     let mut reverted: Vec<PolicyReverted> = Vec::new();
                     {
                         let mut asked = crate::lock(&routing.policy_reports);
@@ -2558,6 +2567,24 @@ fn report_policy(report: proto::process::Report) {
     }
 }
 
+/// The epoch's policy cost (§12): the control thread's route instance and every
+/// scheduler's, summed. A scheduler that has no policy yet adds nothing.
+///
+/// Each figure is cumulative per instance and a switchover carries a
+/// scheduler's total forward, so the sum over the schedulers only grows.
+fn policy_usage(
+    route: PolicyUsage,
+    schedulers: impl IntoIterator<Item = Option<PolicyUsage>>,
+) -> PolicyUsage {
+    schedulers
+        .into_iter()
+        .flatten()
+        .fold(route, |sum, usage| PolicyUsage {
+            calls: sum.calls + usage.calls,
+            fuel: sum.fuel + usage.fuel,
+        })
+}
+
 /// §7.3's precondition, or the failure that answers a command with none.
 /// The answer to a precopy that prepared `generation` (§7.3 step 2): the
 /// daemon's own number, echoed back.
@@ -2782,14 +2809,23 @@ fn apply_process_command(
                 program.revision,
                 program.stated.clone(),
             );
-            let (generation, prepared) = {
+            let (generation, held) = {
                 let mut generations = crate::lock(generations);
-                let known = generations.named.values().any(|named| *named == key);
-                (generations.number_of(&key), known)
+                let number = generations.number_of(&key);
+                // The policy holds this program where a switchover needs it
+                // when it is the prepared candidate, or the content now serving
+                // - a switchover to that one only renames what serves.
+                let held = generations.candidate.as_ref() == Some(&key)
+                    || generations
+                        .serving
+                        .as_ref()
+                        .is_some_and(|(_, serving)| *serving == key);
+                (number, held)
             };
-            // A program this engine already prepared is answered with its number
-            // and not prepared again.
-            if prepared {
+            // Nothing is prepared twice and the number stands: `Precopied`
+            // promises a switchover to the number can follow, so a program the
+            // engine holds is answered as it is.
+            if held {
                 return Some(precopied(generation));
             }
             let Some(policies) = policies else {
@@ -2823,7 +2859,8 @@ fn apply_process_command(
                     kind: Some(report::Kind::Fault(proto::process::Fault {
                         kind: "policy_switchover".to_owned(),
                         reason: format!(
-                            "generation {generation} was not prepared on this main process"
+                            "switchover failed: generation {generation} was not prepared on \
+                             this main process"
                         ),
                         device: 0,
                     })),
@@ -2847,9 +2884,7 @@ fn apply_process_command(
             if already {
                 {
                     let mut generations = crate::lock(generations);
-                    generations.previous = generations
-                        .serving
-                        .replace((generation, key));
+                    generations.previous = generations.serving.replace((generation, key));
                 }
                 policy.record_generation(generation);
                 return Some(switched(generation));
@@ -2861,8 +2896,8 @@ fn apply_process_command(
                     kind: Some(report::Kind::Fault(proto::process::Fault {
                         kind: "policy_switchover".to_owned(),
                         reason: format!(
-                            "generation {generation} is not the policy this main process prepared \
-                             last"
+                            "switchover failed: generation {generation} is not the policy this \
+                             main process prepared last"
                         ),
                         device: 0,
                     })),
@@ -2874,16 +2909,17 @@ fn apply_process_command(
             let mut generations = crate::lock(generations);
             match policy.switchover(generation) {
                 Ok(()) => {
-                    generations.previous = generations
-                        .serving
-                        .replace((generation, key));
+                    generations.previous = generations.serving.replace((generation, key));
                     generations.candidate = None;
                     Some(switched(generation))
                 }
                 Err(reason) => Some(proto::process::Report {
                     kind: Some(report::Kind::Fault(proto::process::Fault {
                         kind: "policy_switchover".to_owned(),
-                        reason,
+                        // The policy states why; the fault states what it was
+                        // asked to do. A daemon log then says which command
+                        // failed without the reader inferring it from the class.
+                        reason: format!("switchover failed: {reason}"),
                         device: 0,
                     })),
                 }),
@@ -2922,7 +2958,9 @@ fn apply_process_command(
             Err(reason) => Some(proto::process::Report {
                 kind: Some(report::Kind::Fault(proto::process::Fault {
                     kind: "policy_revert".to_owned(),
-                    reason,
+                    // The operation, then the policy's own words, as a failed
+                    // switchover states them.
+                    reason: format!("revert failed: {reason}"),
                     device: 0,
                 })),
             }),
@@ -2953,10 +2991,22 @@ fn apply_process_command(
                 generations.previous = None;
             }
             let forgotten = generations.named.remove(&generation);
+            // A candidate the purged number named is dropped with it: the purge
+            // forgets the generation, so a policy prepared under it is not one a
+            // switchover may still put in.
+            let purged_candidate = forgotten
+                .as_ref()
+                .is_some_and(|key| generations.candidate.as_ref() == Some(key));
+            if purged_candidate {
+                generations.candidate = None;
+            }
             let drop_modules = forgotten
-                .map(|key| !generations.still_named(&key))
-                .unwrap_or(false);
+                .as_ref()
+                .is_some_and(|key| !generations.still_named(key));
             drop(generations);
+            if purged_candidate {
+                policy.discard();
+            }
             if drop_modules {
                 if let Err(reason) = policy.purge() {
                     return Some(proto::process::Report {
@@ -3044,7 +3094,10 @@ mod tests {
         fn done(&self, name: &str) -> Result<(), String> {
             crate::lock(&self.calls).push(name.to_owned());
             match self.fails {
-                Some(at) if at == name => Err(format!("{name} failed")),
+                // A stage names the generation it applied at, so the failure a
+                // test asks for is matched by the call's name, not the whole
+                // record.
+                Some(at) if name.starts_with(at) => Err(format!("{at} failed")),
                 _ => Ok(()),
             }
         }
@@ -3103,6 +3156,26 @@ mod tests {
                 proto::process::Precopy {
                     kernels,
                     policy: Some(program()),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn precopy_of(
+        backend: &str,
+        revision: u32,
+        kernels: Vec<proto::process::KernelProgram>,
+    ) -> proto::process::Command {
+        proto::process::Command {
+            kind: Some(proto::process::command::Kind::Precopy(
+                proto::process::Precopy {
+                    kernels,
+                    policy: Some(proto::process::Program {
+                        backend: backend.to_owned(),
+                        revision,
+                        arguments: Default::default(),
+                    }),
                     ..Default::default()
                 },
             )),
@@ -3267,7 +3340,10 @@ mod tests {
             Kind::Precopied(precopied) => precopied.generation,
             other => panic!("a precopy is answered by Precopied, not {other:?}"),
         };
-        assert!(matches!(answered(run(switchover(prepared))), Kind::Switched(_)));
+        assert!(matches!(
+            answered(run(switchover(prepared))),
+            Kind::Switched(_)
+        ));
         match answered(run(purge(prepared))) {
             Kind::Fault(fault) => {
                 assert_eq!(fault.kind, "policy_purge");
@@ -3298,7 +3374,10 @@ mod tests {
             Kind::Precopied(precopied) => precopied.generation,
             other => panic!("a precopy is answered by Precopied, not {other:?}"),
         };
-        assert!(matches!(answered(run(switchover(first))), Kind::Switched(_)));
+        assert!(matches!(
+            answered(run(switchover(first))),
+            Kind::Switched(_)
+        ));
         // The next program is a generation of its own.
         let next = proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
@@ -3318,7 +3397,10 @@ mod tests {
             other => panic!("a new program is answered by Precopied, not {other:?}"),
         };
         assert_ne!(second, first, "another program is another generation");
-        assert!(matches!(answered(run(switchover(second))), Kind::Switched(_)));
+        assert!(matches!(
+            answered(run(switchover(second))),
+            Kind::Switched(_)
+        ));
 
         // Purging the generation before the serving one drops its module, and
         // its number is never handed out again: an old switchover cannot
@@ -3327,7 +3409,9 @@ mod tests {
         assert!(matches!(answered(run(purge(first))), Kind::Purged(_)));
         assert_eq!(policy.calls().len(), calls + 1, "the module was dropped");
         match answered(run(switchover(first))) {
-            Kind::Fault(fault) => assert!(fault.reason.contains("not prepared"), "{}", fault.reason),
+            Kind::Fault(fault) => {
+                assert!(fault.reason.contains("not prepared"), "{}", fault.reason)
+            }
             other => panic!("a forgotten generation is answered by Fault, not {other:?}"),
         }
         // Preparing that program again takes a fresh number, never the old one.
@@ -3360,6 +3444,92 @@ mod tests {
             precopy(Vec::new()),
         ));
         assert_eq!(policy.calls().len(), before, "nothing was prepared twice");
+    }
+
+    #[test]
+    fn a_purge_drops_the_policy_a_precopy_prepared_under_that_number() {
+        use proto::process::report::Kind;
+
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+        let first = |report| match answered(report) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+
+        let one = first(run(precopy(Vec::new())));
+        assert!(matches!(answered(run(switchover(one))), Kind::Switched(_)));
+        let two = first(run(precopy_of("priority", 5, Vec::new())));
+        assert_ne!(two, one, "a program prepared under its own number");
+
+        // The update is withdrawn before its switchover: the purge forgets the
+        // number, and the policy prepared under it is dropped rather than left
+        // waiting to be put in.
+        assert!(matches!(
+            answered(run(purge(two))),
+            Kind::Purged(purged) if purged.generation == two
+        ));
+        assert!(
+            policy.calls().iter().any(|call| call == "discard"),
+            "the prepared policy is dropped with its number"
+        );
+        // Its number names nothing any more, so a switchover to it is refused.
+        assert!(matches!(
+            answered(run(switchover(two))),
+            Kind::Fault(fault) if fault.reason.contains("was not prepared")
+        ));
+    }
+
+    #[test]
+    fn a_precopy_of_a_program_the_engine_named_before_prepares_it_again() {
+        use proto::process::report::Kind;
+
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+        let first = |report| match answered(report) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+
+        // One program prepared and switched in, then a second prepared and
+        // switched in over it: the first is named by the engine, and the policy
+        // holds neither it nor its number's content as what serves.
+        let one = first(run(precopy(Vec::new())));
+        assert!(matches!(answered(run(switchover(one))), Kind::Switched(_)));
+        let two = first(run(precopy_of("priority", 5, Vec::new())));
+        assert!(matches!(answered(run(switchover(two))), Kind::Switched(_)));
+        let prepared = policy
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "precopy")
+            .count();
+        assert_eq!(prepared, 2, "two programs prepared");
+
+        // The first program again: its number stands, and it is prepared
+        // again, because the switchover the answer promises must be able to
+        // follow it.
+        assert_eq!(
+            first(run(precopy(Vec::new()))),
+            one,
+            "the number the program already has"
+        );
+        assert_eq!(
+            policy
+                .calls()
+                .iter()
+                .filter(|call| call.as_str() == "precopy")
+                .count(),
+            prepared + 1,
+            "the policy prepared it again rather than promising a switchover it could not take"
+        );
+        assert!(
+            matches!(answered(run(switchover(one))), Kind::Switched(switched) if switched.generation == one),
+            "the switchover the precopy promised applies"
+        );
     }
 
     #[test]
@@ -3453,19 +3623,25 @@ mod tests {
     fn a_failed_switchover_or_revert_is_a_fault() {
         use proto::process::report::Kind;
 
-        let switchover_policy = Recording::failing("switchover");
+        let policy = Recording::failing("switchover");
         let generations = Mutex::new(Generations::default());
         let store = store();
-        let report = apply_process_command(
-            &switchover_policy,
-            &generations,
-            Some(&store),
-            switchover(4),
-        );
-        match answered(report) {
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+
+        // A switchover names the generation a precopy answered, so the failure
+        // here is the stage's own, not a number the engine never prepared.
+        let prepared = match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+        match answered(run(switchover(prepared))) {
             Kind::Fault(fault) => {
                 assert_eq!(fault.kind, "policy_switchover");
-                assert!(fault.reason.contains("switchover failed"));
+                assert!(
+                    fault.reason.contains("switchover failed"),
+                    "{}",
+                    fault.reason
+                );
             }
             other => panic!("a failed switchover is answered by Fault, not {other:?}"),
         }
@@ -3499,6 +3675,27 @@ mod tests {
             }
         }
         assert!(policy.calls().is_empty());
+    }
+
+    #[test]
+    fn the_epochs_policy_cost_is_the_route_instance_and_every_scheduler() {
+        let usage = |calls, fuel| PolicyUsage { calls, fuel };
+        // A scheduler that has no policy yet states nothing and adds nothing,
+        // and the control thread's route instance is part of the epoch's cost
+        // whether or not any scheduler serves.
+        assert_eq!(
+            policy_usage(
+                usage(3, 300),
+                vec![Some(usage(2, 20)), None, Some(usage(4, 40))]
+            ),
+            usage(9, 360),
+            "every instance's calls and fuel, summed"
+        );
+        assert_eq!(
+            policy_usage(usage(1, 10), Vec::new()),
+            usage(1, 10),
+            "the route instance alone is still the epoch's cost"
+        );
     }
 
     #[test]

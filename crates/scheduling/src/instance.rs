@@ -23,8 +23,8 @@ use scheduling_guest::view::{
 use scheduling_guest::wire::{self, Call};
 use wasmtime::{Instance, Memory, Store, Trap, TypedFunc};
 
-use crate::error::PolicyError;
 use crate::Engine;
+use crate::error::PolicyError;
 
 /// Fuel one call may consume unless the mechanism gives another budget.
 ///
@@ -52,6 +52,58 @@ pub struct PolicyInstance {
     fuel_consumed: u64,
     /// The call whose failure ended this instance, if one did.
     failed: Option<Call>,
+    /// The calls that reached the module, by decision (§4.4).
+    cost: PolicyCost,
+}
+
+/// The calls one instance has made, by decision (design §4.4's rule that a step
+/// costs one `observe` and one `dispatch` whatever they answer, and §12's
+/// measurement of what a policy costs).
+///
+/// The mechanism counts a step's calls; this counts an instance's, so the two
+/// can be told apart: the trial a precopy runs is an instance's, a revert
+/// instantiates another, and a test pinning the mechanism's call discipline
+/// reads these rather than a stub.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PolicyCost {
+    calls: [u64; Call::ALL.len()],
+}
+
+impl PolicyCost {
+    /// How many times `call` reached the module.
+    pub fn calls(&self, call: Call) -> u64 {
+        Self::index_of(call).map_or(0, |index| self.calls[index])
+    }
+
+    /// Every call and its count, in the order a policy's life makes them.
+    pub fn each(&self) -> impl Iterator<Item = (Call, u64)> + '_ {
+        Call::ALL.iter().copied().zip(self.calls.iter().copied())
+    }
+
+    /// Counts one call into the module.
+    fn count(&mut self, call: Call) {
+        if let Some(index) = Self::index_of(call) {
+            self.calls[index] += 1;
+        }
+    }
+
+    fn index_of(call: Call) -> Option<usize> {
+        Call::ALL.iter().position(|each| *each == call)
+    }
+}
+
+impl std::ops::Add for PolicyCost {
+    type Output = Self;
+
+    /// The calls of two spans of one policy's life, summed decision by
+    /// decision: an epoch that replaced its instance keeps what both were
+    /// asked, which is what makes "what this epoch's policy has cost" a
+    /// number and not the last instance's.
+    fn add(self, other: Self) -> Self {
+        Self {
+            calls: std::array::from_fn(|index| self.calls[index] + other.calls[index]),
+        }
+    }
 }
 
 /// The module's exports the call protocol needs.
@@ -167,6 +219,7 @@ impl PolicyInstance {
             call_fuel: DEFAULT_CALL_FUEL,
             fuel_consumed: 0,
             failed: None,
+            cost: PolicyCost::default(),
         };
         let instantiation = Instantiation {
             parameters: parameters.clone(),
@@ -196,6 +249,15 @@ impl PolicyInstance {
     /// step's duration.
     pub const fn fuel_consumed(&self) -> u64 {
         self.fuel_consumed
+    }
+
+    /// The calls that reached the module, by decision.
+    ///
+    /// A call made on an instance whose earlier call failed does not reach the
+    /// module, so it is not counted: the counter states what the policy was
+    /// asked, not what the mechanism tried.
+    pub const fn cost(&self) -> PolicyCost {
+        self.cost
     }
 
     /// The limits the policy declared at instantiation, already checked against
@@ -326,6 +388,7 @@ impl PolicyInstance {
         if let Some(failed) = self.failed {
             return Err(PolicyError::Poisoned { call: failed });
         }
+        self.cost.count(call);
         match body(self) {
             Ok(value) => Ok(value),
             Err(error) => {

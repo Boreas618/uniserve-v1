@@ -1051,6 +1051,10 @@ const KERNELS: &str = "\
 .version 8.0\n\
 .target sm_90\n\
 .address_size 64\n\
+.visible .entry nothing()\n\
+{\n\
+    ret;\n\
+}\n\
 .visible .entry report(.param .u64 out)\n\
 {\n\
     .reg .u64 %rd<4>;\n\
@@ -1190,6 +1194,57 @@ fn libraries_load_a_binary_image_and_launch_its_kernel() {
     stream.synchronize().unwrap();
 
     assert_eq!(words(&host), vec![3; 8]);
+}
+
+/// A function reports the parameters of its own signature as the driver
+/// declares them: the byte offset each value sits at in the packed layout a
+/// captured kernel node stores, and the bytes it occupies. A caller that
+/// publishes an entry point to another process takes the declaration from the
+/// driver instead of copying a header.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_function_reports_the_parameters_of_its_signature() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = Library::load(&device, KERNELS.as_bytes()).unwrap();
+
+    // `write(.param .u64 out, .param .u32 value)`: eight bytes, then four.
+    let write = library.kernel("write").unwrap();
+    let parameters = write.parameters().unwrap();
+    let layout: Vec<(usize, usize)> = parameters
+        .iter()
+        .map(|parameter| (parameter.offset(), parameter.size()))
+        .collect();
+    assert_eq!(layout, vec![(0, 8), (8, 4)]);
+    assert_eq!(write.parameter(1).unwrap(), Some(parameters[1]));
+    assert_eq!(write.parameter(2).unwrap(), None);
+
+    // `report(.param .u64 out)`: one eight-byte parameter.
+    let report = library.kernel("report").unwrap();
+    let declared = report.parameters().unwrap();
+    let layout: Vec<(usize, usize)> = declared
+        .iter()
+        .map(|parameter| (parameter.offset(), parameter.size()))
+        .collect();
+    assert_eq!(layout, vec![(0, 8)]);
+
+    // A kernel that takes nothing reports an empty signature rather than
+    // failing at the end of its walk.
+    let nothing = library.kernel("nothing").unwrap();
+    assert!(nothing.parameters().unwrap().is_empty());
+    assert_eq!(nothing.parameter(0).unwrap(), None);
+
+    // The declaration comes from the loaded image, not from the PTX text: a
+    // kernel of a cubin image reports the same layout.
+    let fatbin = Library::load(&device, include_bytes!("../fixtures/add_constant.fatbin")).unwrap();
+    let add_constant = fatbin.kernel("add_constant").unwrap();
+    let layout: Vec<(usize, usize)> = add_constant
+        .parameters()
+        .unwrap()
+        .iter()
+        .map(|parameter| (parameter.offset(), parameter.size()))
+        .collect();
+    assert_eq!(layout, vec![(0, 8), (8, 4)]);
 }
 
 /// One launch carries a three-dimensional grid and block, the dynamic

@@ -210,7 +210,9 @@ impl<'a> Forward<'a> {
         });
         let Some(shadow) = shadow else {
             let kernel = self.kernels.op::<O>(descriptor)?;
-            return O::launch(kernel, descriptor, args, self.stream).map_err(Error::from);
+            O::launch(kernel, descriptor, args, self.stream).map_err(Error::from)?;
+            Self::record::<O>(descriptor);
+            return Ok(());
         };
         // Record the bound the pair is compared with before resolving either kernel, so a harness
         // reads it even when one of the two generations lacks this descriptor.
@@ -222,8 +224,23 @@ impl<'a> Forward<'a> {
         // previous program then writes the real outputs, which the forward continues on.
         let redirected = O::shadow(args, &mut twins, self.stream);
         O::launch(current, descriptor, redirected, self.stream).map_err(Error::from)?;
+        Self::record::<O>(descriptor);
         drop(twins);
-        O::launch(previous, descriptor, args, self.stream).map_err(Error::from)
+        O::launch(previous, descriptor, args, self.stream).map_err(Error::from)?;
+        Self::record::<O>(descriptor);
+        Ok(())
+    }
+
+    /// Tell the capture sink, when one is installed, that `O`'s program just launched.
+    ///
+    /// A capture records the graph nodes each operator launch added, and a program update rebinds
+    /// one operator's parameters at a time through that table (`specs/worker.md` 4.5). The key is
+    /// formatted only when a sink will read it: every launch of a serving step passes through here,
+    /// and a capture is the exception, not the rule.
+    fn record<O: Op>(descriptor: &O::Descriptor) {
+        if ops::capture::installed() {
+            ops::capture::launched(O::NAME, &ops::descriptor::key(descriptor));
+        }
     }
 
     /// The kernels generation this forward launches against.
