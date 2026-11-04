@@ -356,11 +356,18 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
         "the request's first call is its prefill, not a later phase: {}",
         first.shape.variant.name()
     );
+    // The prefill comes first in submission order: the request's prompt is
+    // written before any token of it is decoded.
+    let decoded_first = handed
+        .iter()
+        .position(|batch| batch.shape.variant.name().starts_with("decode"));
     assert!(
-        !handed.iter().any(
-            |batch| batch.shape.variant.name().starts_with("decode") && batch.id.0 < first.id.0
-        ),
-        "no decode was handed before the prefill"
+        decoded_first.is_none_or(|index| index > 0),
+        "a decode was handed before the prefill: {:?}",
+        handed
+            .iter()
+            .map(|batch| batch.shape.variant.name())
+            .collect::<Vec<_>>()
     );
     handle.shutdown();
 }
