@@ -569,4 +569,33 @@ mod tests {
             ],
         );
     }
+
+    /// The structures this crate hands the driver are sized from the headers
+    /// too, where the header declares them in a form the scanner reads.
+    ///
+    /// The rest — the launch configuration, the node parameters, the attribute
+    /// union, the allocation property — carry unions and multi-line
+    /// documentation that the scanner does not read, so their layouts are the
+    /// device tests' business: a field in the wrong place there produces a
+    /// refused launch or a wrong grid, which the GPU tests see.
+    #[test]
+    fn the_driver_structures_are_sized_by_the_headers() {
+        use crate::header::struct_size;
+        for (name, size) in [
+            ("CUipcEventHandle", std::mem::size_of::<RawIpcEventHandle>()),
+            ("CUmemLocation", std::mem::size_of::<MemLocation>()),
+            ("CUmemAccessDesc", std::mem::size_of::<MemAccessDesc>()),
+            ("CUtensorMap", std::mem::size_of::<TensorMap>()),
+        ] {
+            match struct_size("cuda.h", name) {
+                Some(header) => assert_eq!(
+                    header, size,
+                    "{name}: cuda.h lays it out in {header} bytes, this crate in {size}"
+                ),
+                None => eprintln!(
+                    "skipped: cuda.h does not declare {name} in a form this scanner reads"
+                ),
+            }
+        }
+    }
 }

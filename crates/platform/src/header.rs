@@ -235,33 +235,114 @@ pub(crate) fn assert_constants(header: &str, constants: &[(&str, i64)]) {
 /// by name); the first field it cannot size makes it answer `None`, which the
 /// caller reports as a skipped comparison rather than a failure.
 pub(crate) fn struct_size(header: &str, name: &str) -> Option<usize> {
-    let text = text(header)?;
-    let body = struct_body(&text, name)?;
-    let mut offset = 0usize;
-    let mut alignment = 1usize;
-    for field in fields(&body) {
-        let (size, align) = field_size(header, &field)?;
-        offset = offset.next_multiple_of(align) + size;
-        alignment = alignment.max(align);
-    }
-    Some(offset.next_multiple_of(alignment))
+    struct_layout(header, name).map(|(size, _)| size)
 }
 
-/// The text between the braces of `struct name { … }`, or of the anonymous
-/// struct a `typedef` closes with `} name;`.
-fn struct_body(text: &str, name: &str) -> Option<String> {
-    let start = match text.find(&format!("struct {name} {{")) {
-        Some(start) => start,
+/// The size and alignment of a C struct, mirroring the C rules: each field
+/// starts at the next multiple of its own alignment, and the struct's size is
+/// rounded up to its own.
+pub(crate) fn struct_layout(header: &str, name: &str) -> Option<(usize, usize)> {
+    let text = text(header)?;
+    let (kind, body) = block(text, name)?;
+    body_layout(header, kind, &body)
+}
+
+/// The size and alignment of a block of declarations, as its kind lays them
+/// out: a struct one after another, a union over the same address.
+fn body_layout(header: &str, kind: Kind, body: &str) -> Option<(usize, usize)> {
+    match kind {
+        Kind::Enum => Some((4, 4)),
+        Kind::Struct => {
+            let mut offset = 0usize;
+            let mut alignment = 1usize;
+            for field in fields(body) {
+                let (size, align) = field_size(header, &field)?;
+                offset = offset.next_multiple_of(align) + size;
+                alignment = alignment.max(align);
+            }
+            Some((offset.next_multiple_of(alignment), alignment))
+        }
+        Kind::Union => {
+            let mut size = 0usize;
+            let mut alignment = 1usize;
+            for field in fields(body) {
+                let (member, align) = field_size(header, &field)?;
+                size = size.max(member);
+                alignment = alignment.max(align);
+            }
+            Some((size.next_multiple_of(alignment), alignment))
+        }
+    }
+}
+
+/// What a `typedef`'s closing brace introduces.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Kind {
+    Struct,
+    Enum,
+    Union,
+}
+
+/// The kind and body of `typedef … { … } name;` or `struct name { … }`.
+fn block(text: &str, name: &str) -> Option<(Kind, String)> {
+    if let Some(start) = text.find(&format!("struct {name} {{")) {
+        let open = start + text[start..].find('{')?;
+        return matching_brace(text, open).map(|body| (Kind::Struct, body));
+    }
+    // `typedef struct { … } Name;`, and `typedef struct CUname_st { … }
+    // Name;`, whose tag differs from the name the caller knows.
+    let close = match text.find(&format!("}} {name};")) {
+        Some(close) => close,
         None => {
-            // `typedef struct { … } Name;`: the body ends at the closing brace
-            // that the name follows, and begins at the nearest `struct` before
-            // it.
-            let close = text.find(&format!("}} {name};"))?;
-            let before = &text[..close];
-            before.rfind("struct")?
+            // CUDA's headers version their typedefs: the structure closes
+            // with `} CUmemLocation_v1;`, and the name the caller knows is the
+            // alias declared after it.
+            return block(text, alias_target(text, name)?);
         }
     };
-    let open = start + text[start..].find('{')?;
+    let open = matching_open_brace(text, close)?;
+    // The line the brace stands on says what kind of block it opens.
+    let before = text[..open].rsplit('\n').next().unwrap_or("").trim_end();
+    let word = before
+        .rsplit(|character: char| character.is_whitespace() || character == '*')
+        .find(|word| !word.is_empty())
+        .unwrap_or("");
+    let kind = if before.contains("union ") {
+        Kind::Union
+    } else if before.ends_with("enum") || before.contains("enum ") || word == "enum" {
+        Kind::Enum
+    } else {
+        Kind::Struct
+    };
+    Some((kind, text[open + 1..close].to_owned()))
+}
+
+/// The type `typedef Target Name;` aliases `Name` to.
+fn alias_target<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let suffix = format!(" {name};");
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("typedef ") else {
+            continue;
+        };
+        let Some(target) = rest.strip_suffix(&suffix) else {
+            continue;
+        };
+        if !target.contains(' ') || target.trim_end().ends_with('*') {
+            return Some(target.trim_end());
+        }
+    }
+    None
+}
+
+/// The body between the brace at `open` and its match.
+fn matching_brace(text: &str, open: usize) -> Option<String> {
+    let close = matching_close(text, open)?;
+    Some(text[open + 1..close].to_owned())
+}
+
+/// The index of the brace that closes the one at `open`.
+fn matching_close(text: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (index, character) in text[open..].char_indices() {
         match character {
@@ -269,8 +350,26 @@ fn struct_body(text: &str, name: &str) -> Option<String> {
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(text[open + 1..open + index].to_owned());
+                    return Some(open + index);
                 }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The index of the brace that opens the block `close` ends.
+fn matching_open_brace(text: &str, close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, character) in text[..close].char_indices().rev() {
+        match character {
+            '}' => depth += 1,
+            '{' => {
+                if depth == 0 {
+                    return Some(index);
+                }
+                depth -= 1;
             }
             _ => {}
         }
@@ -299,12 +398,9 @@ fn fields(body: &str) -> Vec<String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let body = strip_comments(&body);
     body.lines()
-        .map(|line| match line.find("/*") {
-            Some(at) => line[..at].to_owned(),
-            None => line.to_owned(),
-        })
-        .filter(|line| !line.contains("//"))
+        .map(|line| line.to_owned())
         .collect::<Vec<_>>()
         .join(" ")
         .split(';')
@@ -316,9 +412,31 @@ fn fields(body: &str) -> Vec<String> {
 /// The size and alignment of one C declaration, from its type and any array
 /// extent or bit field on the name.
 fn field_size(header: &str, declaration: &str) -> Option<(usize, usize)> {
+    // `struct { … } name` / `union { … } name` written in place: size the
+    // body, then apply the array extent on the name.
+    if let Some(open) = declaration.find('{') {
+        let close = matching_close(declaration, open)?;
+        let kind = if declaration[..open].contains("union ") {
+            Kind::Union
+        } else {
+            Kind::Struct
+        };
+        let (size, align) = body_layout(header, kind, &declaration[open + 1..close])?;
+        return Some((size, align));
+    }
     let mut words = declaration.split_whitespace();
     let mut kind = String::new();
+    let mut pointer = false;
     while let Some(word) = words.next() {
+        // A star is the type's, wherever C attached it: `*attrs` is a pointer
+        // field whose declarator follows the star.
+        if let Some(rest) = word.strip_prefix('*') {
+            pointer = true;
+            if !rest.is_empty() {
+                break;
+            }
+            continue;
+        }
         // A type ends at the identifier that starts the declarator: the first
         // word the primitive types below do not claim.
         let primitive = matches!(
@@ -334,9 +452,7 @@ fn field_size(header: &str, declaration: &str) -> Option<(usize, usize)> {
                 | "void"
                 | "size_t"
                 | "const"
-                | "*"
                 | "struct"
-                | "CU"
         ) || word.starts_with("CU")
             || word.starts_with("unsigned")
             || word.starts_with("cuda")
@@ -347,7 +463,8 @@ fn field_size(header: &str, declaration: &str) -> Option<(usize, usize)> {
         kind.push_str(word);
         kind.push(' ');
     }
-    let kind = kind.trim();
+    let kind = kind.trim().to_owned();
+    let kind: &str = if pointer { "*" } else { &kind };
     let (size, align) = match kind {
         "unsigned int" | "int" | "unsigned" | "signed int" | "float" => (4, 4),
         "char" | "signed char" | "unsigned char" | "bool" => (1, 1),
@@ -362,10 +479,16 @@ fn field_size(header: &str, declaration: &str) -> Option<(usize, usize)> {
         "double" => (8, 8),
         _ if kind.ends_with('*') => (8, 8),
         _ => {
-            // A nested struct this crate mirrors, by name.
+            // A nested struct this crate mirrors, by name, or an enumeration,
+            // which C spells as an int.
             let name = kind.strip_prefix("struct ").unwrap_or(kind);
-            let nested = struct_size(header, name)?;
-            (nested, 8)
+            if alias_target(text(header)?, name).is_some_and(|target| target.ends_with('*')) {
+                return Some((8, 8));
+            }
+            struct_layout(header, name).or_else(|| {
+                let (kind, body) = block(text(header)?, name)?;
+                body_layout(header, kind, &body)
+            })?
         }
     };
     // A fixed array multiplies the size: `unsigned int reserved[3]`, whose
@@ -428,7 +551,10 @@ fn text(header: &str) -> Option<&'static str> {
         .map(|directory| directory.join(header))
         .find(|path| path.is_file())
         .and_then(|path| std::fs::read_to_string(path).ok())
-        .map(|text| &*Box::leak(text.into_boxed_str()));
+        // The comments come out once, here: `cuda.h` repeats enumerations
+        // inside its documentation, and a copy in a comment must never be
+        // read as the definition.
+        .map(|text| &*Box::leak(strip_comments(&text).into_boxed_str()));
     cache.insert(header.to_owned(), found);
     found
 }
