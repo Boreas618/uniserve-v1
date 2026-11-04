@@ -173,6 +173,34 @@ def main():
         if line.strip() and not line.startswith("#")
     ]
 
+    # A key names one program, so exactly one package may claim it. Two packages claiming one key
+    # would let two hosts that build the same fixture store different modules under the same name,
+    # with nothing in the build log saying so — and the loader, which keys modules by (operator, key),
+    # would then run whichever the directory walk offered last. The claim is checked over the whole
+    # fixture before anything compiles, because a build that succeeds differently on another host is
+    # worse than one that stops.
+    claims = {}
+    for op, key in rows:
+        claiming = [
+            package for package in packages.get(op, [])
+            if covers(package, key)
+            and args.target in package["manifest"]["kernel"]["architectures"]
+        ]
+        if len(claiming) > 1:
+            claims.setdefault((op, key), []).append(claiming)
+    if claims:
+        report = []
+        for (op, key), _ in sorted(claims.items()):
+            directories = " and ".join(
+                str(package["root"]) for package in packages[op] if covers(package, key)
+                and args.target in package["manifest"]["kernel"]["architectures"]
+            )
+            report.append(f"  {op}\t{key}\n    claimed by {directories}")
+        sys.exit(
+            "the store cannot be built: a key must name one program, and these name two or more\n"
+            + "\n".join(report)
+        )
+
     built, skipped = [], []
     for op, key in rows:
         candidates = [

@@ -9,10 +9,10 @@
 //! The layers own the learned parameters and the epsilon; the residual, the block's update and the
 //! output are the caller's views, because the residual stream is shared by every layer of a block.
 
-use ops::TensorView;
 use ops::residual::{
     self, ScaledResidualLayerNorm as LayerNormOp, ScaledResidualRmsNorm as RmsNormOp,
 };
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -124,15 +124,28 @@ impl ScaledResidual {
         Ok(Self { scale, bias })
     }
 
-    /// Fold `update` into `hidden`, both `[rows, columns]`; `hidden` is written in place.
-    pub fn forward(&self, f: &Forward, hidden: TensorView, update: TensorView) -> Result<()> {
-        let columns = self.scale.shape().numel() as u32;
-        let descriptor = residual::ScaledResidualDescriptor {
-            dtype: hidden.dtype,
-            columns,
+    /// The descriptor one launch takes, for a walk that asks a model which programs it launches with
+    /// no device.
+    ///
+    /// `dtype` is the caller's: the hidden states' element type is the deployment's, while the
+    /// layer's width and its bias's presence are its own.
+    pub fn descriptor(&self, dtype: DType) -> Result<residual::ScaledResidualDescriptor> {
+        Ok(residual::ScaledResidualDescriptor {
+            dtype,
+            columns: u32::try_from(self.scale.shape().numel()).map_err(|_| {
+                Error::shape(
+                    "ScaledResidual",
+                    "a row wider than a descriptor holds".to_owned(),
+                )
+            })?,
             block: BLOCK,
             update_bias: self.bias.is_some(),
-        };
+        })
+    }
+
+    /// Fold `update` into `hidden`, both `[rows, columns]`; `hidden` is written in place.
+    pub fn forward(&self, f: &Forward, hidden: TensorView, update: TensorView) -> Result<()> {
+        let descriptor = self.descriptor(hidden.dtype)?;
         let args = residual::ScaledResidualArgs {
             hidden,
             update,
@@ -173,17 +186,7 @@ impl ScaledResidual {
                 ),
             ));
         }
-        let descriptor = residual::ScaledResidualDescriptor {
-            dtype: hidden.dtype,
-            columns: u32::try_from(columns).map_err(|_| {
-                Error::shape(
-                    "ScaledResidual::forward_with_scale",
-                    "a row wider than a descriptor holds".to_owned(),
-                )
-            })?,
-            block: BLOCK,
-            update_bias: self.bias.is_some(),
-        };
+        let descriptor = self.descriptor(hidden.dtype)?;
         let args = residual::ScaledResidualArgs {
             hidden,
             update,
@@ -251,6 +254,19 @@ impl ScaledResidualRmsNorm {
     ///
     /// `hidden`, `update` and `out` are `[rows, columns]` in the activation element type; `partials`
     /// is `[rows]` FP32 and is required exactly when the layer records the magnitude.
+    /// The descriptor one launch takes, for a walk without a device; see
+    /// [`ScaledResidual::descriptor`].
+    pub fn descriptor(&self, dtype: DType) -> residual::ScaledResidualRmsNormDescriptor {
+        let columns = self.columns();
+        residual::ScaledResidualRmsNormDescriptor {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            update_bias: self.bias.is_some(),
+            absmax: self.absmax,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -265,14 +281,7 @@ impl ScaledResidualRmsNorm {
                 "the magnitude buffer is present exactly when the layer records it".to_owned(),
             ));
         }
-        let columns = self.columns();
-        let descriptor = residual::ScaledResidualRmsNormDescriptor {
-            dtype: hidden.dtype,
-            columns,
-            tile: row_tile(columns),
-            update_bias: self.bias.is_some(),
-            absmax: self.absmax,
-        };
+        let descriptor = self.descriptor(hidden.dtype);
         let args = residual::ScaledResidualRmsNormArgs {
             hidden,
             update,
@@ -344,6 +353,19 @@ impl ScaledResidualLayerNorm {
     }
 
     /// Fold `update` into `hidden` and normalize it into `out`.
+    /// The descriptor one launch takes, for a walk without a device; see
+    /// [`ScaledResidual::descriptor`].
+    pub fn descriptor(&self, dtype: DType) -> residual::ScaledResidualLayerNormDescriptor {
+        let columns = self.columns();
+        residual::ScaledResidualLayerNormDescriptor {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            update_bias: self.update_bias.is_some(),
+            absmax: self.absmax,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -358,14 +380,7 @@ impl ScaledResidualLayerNorm {
                 "the magnitude buffer is present exactly when the layer records it".to_owned(),
             ));
         }
-        let columns = self.columns();
-        let descriptor = residual::ScaledResidualLayerNormDescriptor {
-            dtype: hidden.dtype,
-            columns,
-            tile: row_tile(columns),
-            update_bias: self.update_bias.is_some(),
-            absmax: self.absmax,
-        };
+        let descriptor = self.descriptor(hidden.dtype);
         let args = residual::ScaledResidualLayerNormArgs {
             hidden,
             update,
@@ -391,6 +406,29 @@ impl ScaledResidualLayerNorm {
 pub struct ScaledAdd;
 
 impl ScaledAdd {
+    /// The descriptor one launch takes, for a walk without a device.
+    ///
+    /// The two operands' element types are the caller's — a BF16 trajectory stepped by an FP32
+    /// velocity is the intended pairing — and the width is the operands', so both are arguments.
+    pub fn descriptor(
+        &self,
+        target: DType,
+        source: DType,
+        columns: u64,
+    ) -> Result<residual::ScaledAddDescriptor> {
+        Ok(residual::ScaledAddDescriptor {
+            target,
+            source,
+            columns: u32::try_from(columns).map_err(|_| {
+                Error::shape(
+                    "ScaledAdd",
+                    "more columns than a descriptor holds".to_owned(),
+                )
+            })?,
+            block: BLOCK,
+        })
+    }
+
     /// `target ← β · target + α · source` over `[rows, columns]`, writing `target` in place.
     pub fn forward(
         &self,
@@ -406,17 +444,7 @@ impl ScaledAdd {
                 format!("{:?} with {:?}", target.shape.dims(), source.shape.dims()),
             ));
         }
-        let descriptor = residual::ScaledAddDescriptor {
-            target: target.dtype,
-            source: source.dtype,
-            columns: u32::try_from(target.shape.last()).map_err(|_| {
-                Error::shape(
-                    "ScaledAdd",
-                    "more columns than a descriptor holds".to_owned(),
-                )
-            })?,
-            block: BLOCK,
-        };
+        let descriptor = self.descriptor(target.dtype, source.dtype, target.shape.last())?;
         f.operate::<residual::ScaledAdd>(
             &descriptor,
             residual::ScaledAddArgs {
@@ -426,5 +454,27 @@ impl ScaledAdd {
                 beta,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The solver's step is typed by its two operands and its width is the operands', so a width a
+    /// descriptor cannot hold is refused by the accessor rather than truncated by the launch.
+    #[test]
+    fn a_step_wider_than_a_descriptor_holds_is_refused() {
+        assert_eq!(
+            ScaledAdd
+                .descriptor(DType::BF16, DType::F32, 2048)
+                .unwrap()
+                .columns,
+            2048
+        );
+        let refusal = ScaledAdd
+            .descriptor(DType::BF16, DType::F32, u64::from(u32::MAX) + 1)
+            .expect_err("a width past u32 has no descriptor");
+        assert!(format!("{refusal}").contains("more columns"), "{refusal}");
     }
 }

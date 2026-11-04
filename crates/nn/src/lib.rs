@@ -61,7 +61,7 @@ pub use capability::{
     ImageInput, ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind, Seed, StateTable,
     Step, TokenBatch, VideoRequest, VideoTask,
 };
-pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
+pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
 pub use exchange::ExchangeViews;
 pub use forward::{Arena, Forward};
@@ -81,6 +81,6 @@ pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tensor::Backing;
 pub use weights::{
-    HostStore, Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Weight, WeightKey,
-    WeightLayout, WeightLoader,
+    HostStore, Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, ValueLayout, Weight,
+    WeightKey, WeightLayout, WeightLoader,
 };

@@ -31,7 +31,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -212,7 +212,12 @@ impl Op for TopkSoftmax {
                 arguments.pointer(pointer).i32(scale_kind);
             }
             None => {
-                arguments.u64(0).i32(scale_kind);
+                // The module's parameter is a device address whatever the scale kind says: an
+                // absent scale is a **null pointer** with the kind telling the program not to read
+                // it, not a scalar zero. The driver takes one machine word per parameter and the
+                // module declares a pointer there, so a scalar in that slot is refused before the
+                // launch — and if it were not, the program would read address zero.
+                arguments.pointer(DevicePtr::new(0)).i32(scale_kind);
             }
         }
         arguments.view(args.ids).view(args.weights);

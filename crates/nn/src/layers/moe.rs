@@ -26,9 +26,8 @@ use ops::fp4::ScaleLayout;
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
 use ops::moe::grouped::{
-    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4,
-    GatherGemmNvfp4Args, GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor,
-    RouteGemmNvfp4, RouteGemmNvfp4Args, RouteGemmNvfp4Descriptor,
+    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4Descriptor,
+    RouteGemm, RouteGemmArgs, RouteGemmDescriptor, RouteGemmNvfp4Descriptor,
 };
 use ops::moe::routing::{
     ExpertGather, GatherArgs, GatherDescriptor, TopkArgs, TopkDescriptor, TopkSoftmax,
@@ -41,14 +40,30 @@ use crate::forward::Forward;
 use crate::layers::Linear;
 use crate::weights::{QuantizedStack, Weight};
 
-/// Scratch the encoded expert products are handed.
+/// The scratch one grouped product of `routes` permuted rows and `width` columns needs, in bytes.
 ///
-/// The size the trtllm-gen batched-GEMM tactic actually needs is the artifact's, so this is a *floor*
-/// rather than a promise: the entry computes its own requirement from the call and allocates a larger
-/// buffer when this one is short, which costs one allocation instead of a wrong result. Sizing it for
-/// the largest Qwen3-MoE case we serve (128 experts, 8 routes, 7168 hidden) keeps the launch path
-/// allocation-free, which is what a captured graph needs.
-const MOE_WORKSPACE_BYTES: u64 = 16 << 20;
+/// The artifact states it, so it is read rather than guessed: `getWorkspaceSizesInBytes`
+/// (`trtllmGen_bmm_export/BatchedGemmInterface.h`) sums the gated activation's row-max planes, its
+/// tile bars and the persistent scheduler's counter, each of the first two padded to a kibibyte.
+/// `routes` is padded to whole MMA tiles because the program walks whole tiles.
+///
+/// The size is a property of the plan, not of the step: it is computed from the route count the plan
+/// states, so every replay of a captured bucket reserves the same number of bytes and nothing in a
+/// step grows a buffer.
+fn grouped_workspace_bytes(routes: u64, width: u64) -> u64 {
+    let token_tile = u64::from(MMA_TILE.0) * u64::from(MMA_CLUSTER.0);
+    let padded = routes.max(1).div_ceil(token_tile) * token_tile;
+    // One FP32 row maximum per 128 elements of the padded tile grid.
+    let row_max = width * padded / 128 * 4;
+    // One half-word of tile bars per (token tile, width tile) pair.
+    let bars = (padded / token_tile) * width.div_ceil(u64::from(MMA_TILE.1)) / 2 * 4;
+    pad_1k(row_max) + pad_1k(bars) + 4
+}
+
+/// `bytes` rounded up to a kibibyte, the artifact's padding of one workspace plane.
+const fn pad_1k(bytes: u64) -> u64 {
+    bytes.div_ceil(1024) * 1024
+}
 
 /// The tile geometry the grouped products' packages are compiled for.
 ///
@@ -304,19 +319,20 @@ impl Moe {
                     }
                 }
                 // The tensor scales are the checkpoint's per expert and per projection: the fused
-                // up/gate stack carries two scalars per expert and the down stack one. A table of
-                // another shape would dequantize one projection with another's scale, which is a
-                // wrong product with nothing to show for it, so it is refused here.
+                // up/gate stack carries two scalars per expert and the down stack one. They are
+                // published one packed table per projection, which is what the product reads, and a
+                // table of another shape would dequantize one projection with another's scale, which
+                // is a wrong product with nothing to show for it, so it is refused here.
                 for (name, stack, projections) in [
                     ("up/gate", &up_gate.global_scale, 2),
                     ("down", &down.global_scale, 1),
                 ] {
-                    if stack.shape().dims() != [u64::from(local), projections] {
+                    if stack.shape().dims() != [projections, u64::from(local)] {
                         return Err(Error::shape(
                             "Moe",
                             format!(
-                                "the {name} tensor scales are {:?}, [{local}, {projections}] \
-                                 expected: one per expert and projection",
+                                "the {name} tensor scales are {:?}, [{projections}, {local}] \
+                                 expected: one packed table per projection",
                                 stack.shape().dims()
                             ),
                         ));
@@ -677,6 +693,18 @@ impl Moe {
         }
     }
 
+    /// The scratch one launch of the encoded products needs, for `routes` permuted rows.
+    ///
+    /// One buffer serves both products — they run one after the other on the stream and neither keeps
+    /// a view past its launch — so the answer is the larger of the two products' requirements: the
+    /// gated first product writes `2 · intermediate` columns, the second `hidden`.
+    pub fn workspace_bytes(&self, routes: u64) -> u64 {
+        let width = u64::from(self.intermediate).saturating_mul(2);
+        let first = grouped_workspace_bytes(routes, width);
+        let second = grouped_workspace_bytes(routes, u64::from(self.hidden));
+        first.max(second)
+    }
+
     /// The first product's descriptor over an encoded stack: the block scale's element type and the
     /// scale layout are the weights', so they are arguments.
     pub fn gather_nvfp4_descriptor(
@@ -743,69 +771,44 @@ impl Moe {
                 "Moe::forward_encoded: the block's experts are dense".to_owned(),
             ));
         };
-        let hidden_width = u64::from(self.hidden);
-        let intermediate = u64::from(self.intermediate);
-        let arena = f.arena();
+        let _ = (up_gate, down, out);
 
-        // 1-3. The same prefix the dense block runs.
+        // 1-3. The routing prefix is the dense block's, and it is what states the route count every
+        // later step of the block is sized from.
         let routes = self.route(f, hidden)?;
 
-        // The two encoded products take scratch the program uses for its own bookkeeping. The size is
-        // the artifact's, not ours: both keys are trtllm-gen modules, and their entry computes what its
-        // tactic needs and grows this buffer itself when it is short. What a caller buys by sizing it
-        // is that no launch allocates. One buffer serves both products because they run one after the
-        // other on this stream and neither keeps a view past its launch.
-        let workspace = arena.tensor(DType::U8, Shape::new(&[MOE_WORKSPACE_BYTES]))?;
-
-        // 4. FC1 over the packed up/gate stack: the gated product of each permuted row.
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
-        let first =
-            self.gather_nvfp4_descriptor(hidden.dtype, up_gate.scales.dtype(), up_gate.layout);
-        let args = GatherGemmNvfp4Args {
-            hidden,
-            weights: up_gate.values.view(),
-            scales: up_gate.scales.view(),
-            global_scale: up_gate.global_scale.view(),
-            ids: routes.local_ids,
-            tile_to_expert: routes.tile_to_expert,
-            tile_to_limit: routes.tile_to_limit,
-            permuted_to_expanded: routes.permuted_to_expanded,
-            num_non_exiting_tiles: routes.num_non_exiting_tiles,
-            out: gated,
-            workspace,
-        };
-
-        f.operate::<GatherGemmNvfp4>(&first, args)?;
-
-        // 5. FC2 over the packed down stack: one hidden row per route.
-        let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
-        let second = self.route_nvfp4_descriptor(hidden.dtype, down.scales.dtype(), down.layout);
-        let args = RouteGemmNvfp4Args {
-            hidden: gated,
-            weights: down.values.view(),
-            scales: down.scales.view(),
-            global_scale: down.global_scale.view(),
-            ids: routes.local_ids,
-            tile_to_expert: routes.tile_to_expert,
-            tile_to_limit: routes.tile_to_limit,
-            permuted_to_expanded: routes.permuted_to_expanded,
-            num_non_exiting_tiles: routes.num_non_exiting_tiles,
-            out: products,
-            workspace,
-        };
-
-        f.operate::<RouteGemmNvfp4>(&second, args)?;
-
-        // 6. Sum the routes back in FP32 and round once to the hidden dtype.
-        let combine = self.combine_descriptor(products.dtype, out.dtype);
-        let args = UnpermuteArgs {
-            routes: products,
-            expanded_to_permuted: routes.expanded_to_permuted,
-            scales: routes.weights,
-            out,
-        };
-
-        f.operate::<MoeUnpermute>(&combine, args)
+        // 4-6 are not the dense block's, and they are refused here rather than half-built. The
+        // encoded products read E2M1 activations with their own block scales, one FP8 scale per
+        // sixteen elements of the contraction, so each product's activation operand is produced by
+        // `nvfp4_quantize` rather than by the caller: `expert_gather` (`[tokens, hidden]` → the
+        // expanded route rows) → `nvfp4_quantize` → `gather_gemm_nvfp4`, then the gated epilogue →
+        // `nvfp4_quantize` → `route_gemm_nvfp4` → `moe_unpermute`. Two facts of that chain are not
+        // this layer's to settle:
+        //
+        // 1. **The row expansion has no operator.** `expert_gather` maps route ids through the
+        //    expert-parallel table; nothing in the store gathers `[tokens, width]` rows into the
+        //    expanded `[routes, width]` buffer the encoded products require. The dense pair gathers
+        //    its own A inside the product through `permuted_to_expanded`, which is why its operand
+        //    stays `[tokens, hidden]` and why it needs no such step.
+        // 2. **The encoder's one scalar** is the artifact's constant `1 / (448 · 6)`, folded into the
+        //    block scales rather than passed per request: it belongs in `nvfp4_quantize`'s
+        //    descriptor, and a layer that synthesised a device value for it would be inventing a
+        //    number the design puts elsewhere.
+        //
+        // The scratch the two products need is already stated by [`Self::workspace_bytes`] over the
+        // plan's route count, so nothing else in the step waits on this.
+        Err(Error::Unsupported(format!(
+            "Moe::forward_encoded: the encoded expert products read E2M1 activations, and this \
+             block does not encode them — the expanded-row gather the encoded operand needs has no \
+             operator in the store, and the encoder's global scale is the artifact's constant \
+             1/(448·6), which belongs in `nvfp4_quantize`'s descriptor rather than in a layer. The \
+             block's {} experts and {} hidden elements are built, its scratch is {} bytes for {} \
+             routes, and the dense path is unaffected",
+            self.experts,
+            self.hidden,
+            self.workspace_bytes(routes.rows),
+            routes.rows
+        )))
     }
 
     /// `out = Σ_routes weight · expert(hidden)` over an expert-parallel group.
@@ -1172,7 +1175,7 @@ pub(super) mod tests {
         let stack = |rows: u64, columns: u64, projections: u64| QuantizedStack {
             values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
-            global_scale: weight(DType::F32, &[u64::from(experts), projections]),
+            global_scale: weight(DType::F32, &[projections, u64::from(experts)]),
             layout: ops::fp4::ScaleLayout::Linear,
             input_scale: None,
         };
@@ -1187,6 +1190,23 @@ pub(super) mod tests {
             true,
             None,
         )
+    }
+
+    /// The scratch is the plan's, computed from the artifact's arithmetic: a bucket of 8 routes over
+    /// 128 experts costs the row-max planes and tile bars of the wider product, and a bucket twice as
+    /// wide costs more. What it must not be is a floor: the size the largest Qwen3-MoE case needs is
+    /// far below the sixteen mebibytes an earlier constant reserved for it.
+    #[test]
+    fn the_scratch_is_sized_from_the_route_count_and_not_from_a_floor() {
+        let quantized = quantized_block(2048, 768).unwrap();
+        let small = quantized.workspace_bytes(8);
+        let large = quantized.workspace_bytes(4096);
+        assert!(small > 0);
+        assert!(large > small, "{large} is not more than {small}");
+        // Both planes are kibibyte-padded and the scheduler's counter is four bytes, so every size
+        // the plan can ask for is congruent to four modulo a kibibyte.
+        assert_eq!(small % 1024, 4, "{small}");
+        assert!(large < 16 << 20, "{large} exceeds the floor it replaced");
     }
 
     #[test]
@@ -1217,7 +1237,7 @@ pub(super) mod tests {
         let stack = |rows: u64, columns: u64, projections: u64| QuantizedStack {
             values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
-            global_scale: weight(DType::F32, &[u64::from(experts), projections]),
+            global_scale: weight(DType::F32, &[projections, u64::from(experts)]),
             layout: ops::fp4::ScaleLayout::Linear,
             input_scale: None,
         };
