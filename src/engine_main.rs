@@ -668,8 +668,9 @@ impl MainProcess {
             // never does (§2.4).
             //
             // §4.5's warmup is not here: the epoch's first generation holds no kernel until the
-            // daemon's precopy fills it, so there is no bucket to warm. It runs at the first
-            // switchover, which is the boundary the first request is served at.
+            // daemon's precopy fills it - and a precopy that names no kernel (the startup switch)
+            // fills it from the store's built programs - so there is no bucket to warm yet. It runs
+            // at the first switchover, which is the boundary the first request is served at.
             let shadow = executor.set_shadow()?;
             device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
