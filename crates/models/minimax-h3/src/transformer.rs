@@ -26,11 +26,37 @@ use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
-use nn::layers::{GatedResidual, Linear, ModulatedRmsNorm, PackedSwiGlu, RmsNorm};
+use nn::layers::{GatedActivation, GatedResidual, Linear, ModulatedRmsNorm, RmsNorm};
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
+
+/// The two halves of a packed `[value, gate]` projection, as strided views without a copy.
+///
+/// The checkpoint fuses the feed-forward's value half first and its gate half second, and the
+/// reference projects it once and then reads `branches["up"]` and `branches["gate"]`
+/// (`transformer.py:141-153`). The stepwise activation takes the halves as separate operands, so
+/// they are views of the packed buffer: `value` at element zero, `gate` one half along, and both
+/// rows striding over the packed row.
+pub(crate) fn projection_halves(projection: TensorView) -> (TensorView, TensorView) {
+    let width = projection.last() / 2;
+    let shape = Shape::new(&[projection.rows(), width]);
+    let strides = projection.strides;
+    let value = TensorView::with_strides(
+        projection.element(&[0, 0]),
+        projection.dtype,
+        shape,
+        strides,
+    );
+    let gate = TensorView::with_strides(
+        projection.element(&[0, width]),
+        projection.dtype,
+        shape,
+        strides,
+    );
+    (value, gate)
+}
 
 /// The rotary width of one head's three axes: 16 frequencies per axis, 32 channels each.
 pub const ROTATED_AXES: [u32; 3] = [32, 32, 32];
@@ -42,7 +68,9 @@ pub struct Layer {
     attention: attention::Layer,
     gate_up: Linear,
     down: Linear,
-    swiglu: PackedSwiGlu,
+    /// The stepwise gated activation: the reference evaluates `silu(gate)` and the product
+    /// with one rounding each (`transformer.py:84-88`, `Rounding.STEPWISE`).
+    gated: GatedActivation,
     eps: f32,
 }
 
@@ -79,7 +107,7 @@ impl Layer {
                 hidden,
             )?,
             down: projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?,
-            swiglu: PackedSwiGlu::new(None)?,
+            gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             eps: config.norm_eps,
         })
     }
@@ -136,7 +164,12 @@ impl Layer {
         let packed = scratch.packed;
         let mlp = scratch.mlp;
         self.gate_up.forward(f, normalized, packed)?;
-        self.swiglu.forward(f, packed, mlp, None)?;
+        // The reference's activation is stepwise here (`transformer.py:84-88`), so the packed
+        // projection is read as its two halves and gated with one rounding each - the video
+        // decoder's SwiGLU is the same projection with the fused recipe, and that is why the
+        // rounding is stated per site rather than per operator.
+        let (value, gate) = projection_halves(packed);
+        self.gated.forward(f, gate, value, mlp)?;
         self.down.forward(f, mlp, update)?;
         Ok(GatedResidual::new(gate_mlp)?.forward(f, out, update, rows)?)
     }
