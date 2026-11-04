@@ -27,7 +27,7 @@
 //! fails the request instead of misaligning its rows.
 //!
 //! The three host resamplers reproduce the reference implementations'
-//! mathematics: Pillow's LANCZOS resize ([`resample::lanclos_resize`]),
+//! mathematics: Pillow's LANCZOS resize ([`resample::lanczos_resize`]),
 //! torchvision's antialiased bicubic resize ([`resample::bicubic_antialias_u8`]
 //! and [`resample::bicubic_antialias_f32`]), and torchaudio's sinc resample
 //! ([`resample::sinc_resample`]).

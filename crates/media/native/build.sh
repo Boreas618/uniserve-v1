@@ -58,7 +58,7 @@ if [ ! -f "$PREFIX/lib/libavcodec.so" ] || [ ! -f "$PREFIX/lib/libx264.so" ]; th
       cd "$build/ffmpeg"
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
         --prefix="$PREFIX" \
-        --enable-shared --disable-static \
+        --enable-shared --disable-static --enable-rpath \
         --enable-gpl --enable-libx264 --enable-version3 \
         --disable-doc --disable-debug --disable-ffplay --disable-autodetect \
         --enable-zlib
