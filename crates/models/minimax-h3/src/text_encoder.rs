@@ -53,7 +53,7 @@ use crate::decoding::Buffer;
 use crate::load::Component;
 use crate::partition::Partition;
 use crate::positions::{self, Mrope};
-use crate::vision::{Geometry, ImageTables, Outputs, ROPE_THETA, VisionTower, ones};
+use crate::vision::{BlockRows, ImageTables, Outputs, ROPE_THETA, VisionTower, ones};
 use crate::{Error, Result};
 
 /// The language layers' gate: the checkpoint states `hidden_act: "silu"` and H3 fixes it.
@@ -118,12 +118,12 @@ impl Plan {
         let mut time = Vec::with_capacity(grids.len());
         let mut merged = 0_u32;
         for &grid in grids {
-            let geometry = Geometry::of(&config.vision, grid)?;
-            merged = merged.checked_add(geometry.merged).ok_or_else(|| {
+            let rows = BlockRows::of(&config.vision, grid)?;
+            merged = merged.checked_add(rows.merged).ok_or_else(|| {
                 Error::config("the images merge to more than a u32 of rows".to_owned())
             })?;
-            images.push(geometry.patches);
-            time.push(geometry.time);
+            images.push(rows.patches);
+            time.push(rows.time);
         }
         Ok(Self {
             rows: tokens,
@@ -1059,7 +1059,7 @@ impl TextEncoder {
                     ))
                 })?;
             }
-            let rows = u64::from(image_tables.geometry.merged);
+            let rows = u64::from(image_tables.rows.merged);
             for table in 0..self.tower.deepstack_features() {
                 deepstack.push(Buffers::rows_of(
                     buffers.deepstack,
@@ -1329,8 +1329,8 @@ fn write_state(
         return Ok(());
     }
 
-    let side = Geometry::position_grid(vision)?;
-    let head_dim = Geometry::head_dim(vision)?;
+    let side = BlockRows::position_grid(vision)?;
+    let head_dim = BlockRows::head_dim(vision)?;
     let rotary = positions::VisionRotary::new(head_dim)?;
     let frequencies = positions::inverse_frequencies(head_dim / 2, ROPE_THETA)?;
     let mut index = Vec::new();
@@ -1444,7 +1444,7 @@ fn table_specs(
     // states 1152 elements over 16 heads, so the factors carry 36 frequencies rather than the text
     // stack's 64. The division is total here (this function reports nothing) and any configuration
     // that does not divide is refused by `write_state`, which derives the same width through
-    // `Geometry::head_dim`.
+    // `BlockRows::head_dim`.
     let tower_columns = u64::from(config.vision.hidden_size / config.vision.num_heads.max(1) / 2);
     let table =
         |name: &'static str, dtype: nn::DType, shape: Shape| StateTable { name, dtype, shape };
@@ -1954,8 +1954,8 @@ mod tests {
     fn an_images_tables_are_one_time_steps_samples_repeated_over_its_grid() {
         let config = config();
         let merge = config.vision.spatial_merge_size;
-        let side = Geometry::position_grid(&config.vision).expect("a square table");
-        let head_dim = Geometry::head_dim(&config.vision).expect("a head width");
+        let side = BlockRows::position_grid(&config.vision).expect("a square table");
+        let head_dim = BlockRows::head_dim(&config.vision).expect("a head width");
         // One 4x6 image block: 24 patches, 6 merged rows, after three prompt tokens.
         let ids = [7, 8, 9, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, 10];
         let layout = EncoderLayout {
@@ -2106,7 +2106,7 @@ mod tests {
         // Both calls' rows are in the same tables: forty-eight patches of taps, factors and
         // sequence lengths, the image's one single-step sequence first. The factors carry the
         // tower's own head width, not the language model's.
-        let tower_head = Geometry::head_dim(&config.vision).expect("a head width");
+        let tower_head = BlockRows::head_dim(&config.vision).expect("a head width");
         assert_eq!(out[2].len(), 48 * positions::POSITION_TAPS as usize * 4);
         assert_eq!(out[4].len(), 48 * (tower_head / 2) as usize * 4);
         let lengths = (0..5).map(|row| i32_at(&out[6], row)).collect::<Vec<_>>();
