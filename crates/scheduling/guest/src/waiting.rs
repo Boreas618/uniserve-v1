@@ -169,6 +169,7 @@ mod tests {
             reservation_units: 0,
             prefetch_tokens: 0,
             refill_tokens: None,
+            remaining_tokens: 0,
             migratable: true,
             cache_rank: None,
         }

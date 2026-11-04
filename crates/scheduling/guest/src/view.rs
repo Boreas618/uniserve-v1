@@ -138,6 +138,10 @@ pub struct RequestView {
     /// its draft cache has no gap.
     #[serde(default)]
     pub refill_tokens: Option<u32>,
+    /// Tokens the request may still generate (`max_und_tokens` less what it
+    /// generated), which a refill's worth is judged against.
+    #[serde(default)]
+    pub remaining_tokens: u32,
     /// Whether the request resumed from generated tokens (a migrated or
     /// preempted request), so ending it as migratable and resubmitting it
     /// loses nothing. Only such a request may be a `Victim::Request`.
@@ -197,6 +201,12 @@ pub enum PhaseKind {
     /// A phase kind this policy does not know.
     #[serde(other)]
     Other,
+}
+
+impl Default for PhaseKind {
+    fn default() -> Self {
+        Self::Other
+    }
 }
 
 /// The four classes work is assembled in (design §4.4, `fcfs`).
@@ -335,7 +345,9 @@ pub struct ReplicaView {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallView {
     pub request: RequestId,
+    #[serde(default)]
     pub phase: PhaseId,
+    #[serde(default)]
     pub kind: PhaseKind,
 }
 

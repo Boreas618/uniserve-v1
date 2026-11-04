@@ -123,7 +123,7 @@ pub struct Warming {
 }
 
 /// Which storage is short.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "storage", rename_all = "snake_case")]
 pub enum Storage {
     /// Device KV cache units.
@@ -133,6 +133,7 @@ pub enum Storage {
     /// Encoder cache.
     EncoderEntries,
     /// A storage this policy does not know.
+    #[default]
     #[serde(other)]
     Other,
 }
@@ -140,8 +141,10 @@ pub enum Storage {
 /// A shortage the mechanism asks the policy to relieve (design §4.4).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Shortage {
+    #[serde(default)]
     pub kind: Storage,
     /// Units, pages or entries needed.
+    #[serde(default)]
     pub need: u64,
 }
 

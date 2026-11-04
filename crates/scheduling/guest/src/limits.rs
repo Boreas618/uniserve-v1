@@ -54,18 +54,40 @@ pub struct Parameters {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Limits {
     /// Tokens of one prefill chunk.
+    #[serde(default = "default_chunked_prefill_size")]
     pub chunked_prefill_size: u32,
     /// The waiting queue's bound; `None` queues without bound.
+    #[serde(default)]
     pub max_queued_requests: Option<usize>,
     /// Calls per step.
+    #[serde(default = "default_max_batch")]
     pub max_batch: usize,
     /// Tokens per step.
+    #[serde(default = "default_chunked_prefill_size")]
     pub max_num_batched_tokens: u32,
     /// The smallest prefix-hit deepening the policy asks for.
+    #[serde(default = "default_prefetch_min_tokens")]
     pub prefetch_min_tokens: u32,
     /// How long a resident request may go without progressing before the
     /// policy has starved it.
+    #[serde(default = "default_timeout")]
     pub timeout: Nanos,
+}
+
+fn default_chunked_prefill_size() -> u32 {
+    8192
+}
+
+fn default_max_batch() -> usize {
+    128
+}
+
+fn default_prefetch_min_tokens() -> u32 {
+    256
+}
+
+fn default_timeout() -> Nanos {
+    Nanos(30_000_000_000)
 }
 
 impl Default for Limits {
