@@ -825,6 +825,10 @@ fn main() {
         "frame_moments",
         ops::frame::FrameMomentsDescriptor {
             dtype: DType::F32,
+            // The encoder's widest frame: four channels per group over a 1344x768 raster. The class
+            // is a declared bound and not a compilation, so it does not reach the key - the launch
+            // refuses a frame outside it.
+            reduction: ops::frame::frame_reduction_class(4, 1344 * 768),
             epsilon: ops::descriptor::Float::from(1e-6_f32),
         }
         .to_string(),
@@ -838,6 +842,7 @@ fn main() {
             "frame_norm_pad",
             ops::frame::FrameNormPadDescriptor {
                 dtype: DType::F32,
+                reduction: ops::frame::frame_reduction_class(4, 1344 * 768),
                 channels_last: false,
                 centered: false,
                 single_pixel,
