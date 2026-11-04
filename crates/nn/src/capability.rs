@@ -378,6 +378,14 @@ pub struct Layout {
     pub text_rows: u32,
     /// Condition rows of the reference media.
     pub condition_rows: u32,
+    /// Elements of every condition's initial-noise draw, in request order.
+    ///
+    /// The reference draws one chained stream — conditions, then video, then audio — and a model
+    /// can derive the video and audio counts from [`Self::video`] and [`Self::audio`] but not the
+    /// conditions': those are drawn at each condition's own unpacked latent shape before any
+    /// packing, which is not what [`Self::condition_rows`] counts. Zero for a request with no
+    /// conditions.
+    pub condition_elements: u32,
 }
 
 /// The extents of one latent tensor.
@@ -636,4 +644,74 @@ pub trait CausalLm {
     /// `hidden` is the `[rows, hidden]` view of the rows named by `TokenBatch::logits_rows`; the
     /// executor gathered them. `out` is `[rows, vocabulary]`.
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn latent(channels: u32, frames: u32, height: u32, width: u32) -> LatentShape {
+        LatentShape {
+            channels,
+            frames,
+            height,
+            width,
+        }
+    }
+
+    /// The conditions' draw elements are the sum of their own unpacked latent shapes, which is
+    /// what the chained noise stream counts — not the packed rows `condition_rows` names.
+    #[test]
+    fn a_layout_states_the_condition_elements_of_the_chained_stream() {
+        let none = Layout {
+            video: latent(16, 13, 24, 40),
+            audio: Some(latent(8, 96, 1, 1)),
+            text_rows: 512,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        assert_eq!(none.condition_elements, 0);
+
+        let conditions = [
+            ConditionShape {
+                role: ConditionRole::FirstFrame,
+                frames: 1,
+                height: 480,
+                width: 832,
+                audio_samples: 0,
+            },
+            ConditionShape {
+                role: ConditionRole::Reference,
+                frames: 5,
+                height: 480,
+                width: 832,
+                audio_samples: 24_000,
+            },
+        ];
+        // A packed latent's extents: 8× compression spatially, 4 temporally after the first frame.
+        let elements: u32 = conditions
+            .iter()
+            .map(|condition| {
+                let frames = condition.frames.div_ceil(4).max(1);
+                16 * frames * (condition.height / 8) * (condition.width / 8)
+            })
+            .sum();
+        let layout = Layout {
+            video: none.video,
+            audio: none.audio,
+            text_rows: none.text_rows,
+            condition_rows: 6144,
+            condition_elements: elements,
+        };
+        assert_eq!(layout.condition_elements, elements);
+        // The stream the draw walks: conditions, then video, then audio.
+        let video_elements =
+            layout.video.channels * layout.video.frames * layout.video.height * layout.video.width;
+        let audio = layout.audio.unwrap();
+        let audio_elements = audio.channels * audio.frames * audio.height * audio.width;
+        assert_eq!(
+            layout.condition_elements + video_elements + audio_elements,
+            elements + 16 * 13 * 24 * 40 + 8 * 96
+        );
+    }
 }
