@@ -41,6 +41,7 @@ pub mod openai;
 pub mod options;
 pub mod output;
 pub mod profiling;
+pub mod program_restart;
 pub mod restart;
 pub mod standby;
 pub mod supervision;
@@ -48,7 +49,10 @@ pub mod supervision;
 pub(crate) mod test_support;
 // The epoch layer lands beside `worlds`, which commit C deletes; nothing drives
 // the switch until the update layer that owns it lands too.
-#[allow(dead_code, reason = "the switch lands before the update layer that drives it")]
+#[allow(
+    dead_code,
+    reason = "the switch lands before the update layer that drives it"
+)]
 pub(crate) mod updates;
 pub mod worlds;
 
