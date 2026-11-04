@@ -330,12 +330,12 @@ impl Projections {
         // the run's first stop was exactly this: an FP32 activation against whatever type the
         // deployment's loader happened to publish.
         //
-        // The timestep pair is read at the reference's own type. The modulation pair is read at FP32
-        // too, which is **a declared deviation**: the reference holds those weights and their tables
-        // in BF16 at the released preset, and reaching that needs the activation of the first pair
-        // converted from FP32 to BF16 before the second pair reads it - one convert, which no
-        // operator here has yet. FP32 with one type throughout is the same arithmetic in a wider
-        // type; a BF16 activation meeting an FP32 weight would be a pair no library computes.
+        // So the timestep pair is pinned FP32 and the modulation projections take the deployment's
+        // type (`None`: the loader's own policy), which is the stack's - the pair differ exactly as
+        // the reference's do. `compute` then crosses between them **once**, narrowing the timestep
+        // activation into the modulation type; the tables follow the projections, so a block's
+        // modulation and its activation are one type, and at a deployment that states FP32 the two
+        // halves coincide and the crossing is skipped.
         let hidden = u64::from(config.hidden_size);
         let time_dim = u64::from(config.time_dim);
         let time_hidden = u64::from(config.time_hidden_dim);
