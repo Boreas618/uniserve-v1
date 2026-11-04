@@ -40,13 +40,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream};
 
 use super::plan::CachePlan;
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::{
     ExclusiveSpec, ExclusiveStorage, Retained, SegmentPart, SegmentedSpec,
 };
 use crate::stream::{Issue, RowFill};
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.
@@ -1097,6 +1097,54 @@ impl CachePlanes {
             ],
             &[row, row, i64::from(plan.head_dim), 1],
         )
+    }
+
+    /// Tokens one page of `group` holds, which every per-page view is sized by.
+    pub fn page_size(&self, group: usize) -> Result<u32> {
+        self.plan
+            .groups
+            .get(group)
+            .map(|plan| plan.block_size)
+            .ok_or_else(|| Error::Invalid(format!("cache group {group} is not in the plan")))
+    }
+
+    /// The pages `group` holds: the units it was allocated, over the units one
+    /// page of it occupies.
+    ///
+    /// A page is `block_size` tokens of every resident layer of the group; its
+    /// units are those the group's layers lie in, so the page count is the
+    /// allocated units divided by that.
+    pub fn pages(&self, group: usize) -> Result<u32> {
+        let plan = self
+            .plan
+            .groups
+            .get(group)
+            .ok_or_else(|| Error::Invalid(format!("cache group {group} is not in the plan")))?;
+        if plan.units_per_page == 0 {
+            return Err(Error::Invariant(format!(
+                "cache group {group} holds no unit per page"
+            )));
+        }
+        Ok(self.num_units / plan.units_per_page)
+    }
+
+    /// The element type `group`'s planes hold, as a kernel operand type.
+    ///
+    /// A plane whose storage element no kernel operand describes is an error
+    /// naming that plane, never a widening: a kernel must not read storage as
+    /// a type it does not hold.
+    pub fn dtype(&self, group: usize) -> Result<ops::DType> {
+        let plan = self
+            .plan
+            .groups
+            .get(group)
+            .ok_or_else(|| Error::Invalid(format!("cache group {group} is not in the plan")))?;
+        plan.dtype.to_ops().ok_or_else(|| {
+            Error::Invalid(format!(
+                "cache group {group} holds storage element {:?}, which no kernel operand type describes",
+                plan.dtype
+            ))
+        })
     }
 
     /// One unit's FP8 scale of `field` in `column`, as `[1, 1, 1, 1]`.

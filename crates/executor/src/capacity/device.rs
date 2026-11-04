@@ -185,7 +185,7 @@ impl DeviceBudget {
 /// What a warm rank books on one device: the items of its process the
 /// Storage Server cannot see.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeviceBooking {
+pub struct DeviceBooking {
     pub device: DeviceId,
     /// The device's total storage.
     pub total: u64,
