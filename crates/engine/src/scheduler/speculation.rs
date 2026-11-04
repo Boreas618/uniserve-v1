@@ -21,7 +21,7 @@
 //! writing the entries of their own positions ([`DraftCache::tail`]); a
 //! refill evaluates the target model again over the positions before them,
 //! in chunks of the prefill budget a step leaves idle, when the refill
-//! policy finds it worth its cost ([`crate::scheduler::RefillPolicy`]).
+//! policy finds it worth its cost (`Plan::refill`).
 //! Once the refill reaches the entries the request wrote itself, its draft
 //! cache is complete and it speculates.
 //!
@@ -80,7 +80,7 @@ impl MeasuredStep {
 /// What the world measures of speculation, as moving averages over recent
 /// observations: the speedup a speculating request gets and the cost of a
 /// refilled token, in decode steps, which the refill policy weighs
-/// ([`crate::scheduler::RefillPolicy`]).
+/// (`Plan::refill`).
 ///
 /// A verification carrying drafts commits `s` tokens on average; the
 /// worker's step takes `v` with drafts and `d` without, and `p` per prompt
@@ -372,43 +372,6 @@ impl Scheduler {
             .then_some(state.draft.valid as usize)
     }
 
-    /// Whether `id` is due a refill of its missing draft cache: it decodes,
-    /// has no call in flight, and the refill policy finds evaluating the
-    /// positions before the entries it wrote itself worth the decode steps
-    /// speculation saves over the tokens it may still generate.
-    pub(in crate::scheduler) fn refill_due(&self, id: RequestId) -> bool {
-        if !self.speculates() || self.inflight.has_pending_calls(id) {
-            return false;
-        }
-        let Some(state) = self.running.get(&id) else {
-            return false;
-        };
-        let visible = state.cache_visible_len;
-        if state.phase != Phase::DecodeUnd
-            || !state.worker_registered
-            || state.terminal_intent.is_terminal()
-            || state.round_closing
-            || state.draft.complete(visible)
-            || state.num_computed_prompt_tokens < state.req.prompt_token_ids.len() as u32
-        {
-            return false;
-        }
-        let tokens = state
-            .draft
-            .refill_end(visible)
-            .saturating_sub(state.draft.valid);
-        let remaining = state
-            .req
-            .max_und_tokens
-            .saturating_sub(state.num_generated_tokens);
-        tokens > 0
-            && self.config.refill.worth(
-                self.speculation_meter.speedup(),
-                self.speculation_meter.token_cost(),
-                remaining,
-                tokens as usize,
-            )
-    }
 
     /// Plans the next chunk of `id`'s refill within `budget` tokens.
     ///

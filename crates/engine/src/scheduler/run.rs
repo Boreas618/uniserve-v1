@@ -326,7 +326,6 @@ impl Scheduler {
             // The draft limit is the world's; the refill policy is a
             // scheduling choice.
             draft_tokens: self.config.draft_tokens,
-            refill: limits.refill,
             graph_tiers,
         };
         tracing::info!(config = ?self.config, "the scheduler took new limits");

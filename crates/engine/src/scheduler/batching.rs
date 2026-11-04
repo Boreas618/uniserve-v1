@@ -162,14 +162,13 @@ impl Scheduler {
             .running
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
-        self.placement
-            .worker_target(
-                self.executor.as_ref(),
-                &self.info,
-                request_key,
-                call.kind,
-                &placement::Choice::Existing,
-            )?;
+        self.placement.worker_target(
+            self.executor.as_ref(),
+            &self.info,
+            request_key,
+            call.kind,
+            &placement::Choice::Existing,
+        )?;
 
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {

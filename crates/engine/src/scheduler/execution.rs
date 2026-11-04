@@ -508,13 +508,9 @@ impl Scheduler {
             return;
         };
         let device_hit = hit.cached_tokens.min(state.req.prompt_token_ids.len());
-        if let admission::HostHit::Serving(boundary) = admission::host_prefix(
-            &mut self.kv_offload,
-            state,
-            &target,
-            device_hit,
-            usize::MAX,
-        ) {
+        if let admission::HostHit::Serving(boundary) =
+            admission::host_prefix(&mut self.kv_offload, state, &target, device_hit, usize::MAX)
+        {
             self.recorder.prefix_hit(
                 scheduling::guest::RequestId(id.0),
                 u32::try_from(device_hit).unwrap_or(u32::MAX),
