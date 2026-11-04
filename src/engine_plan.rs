@@ -632,8 +632,11 @@ pub(crate) fn rank_report(
             ipc::CallKind::Forward(ipc::ForwardMode::Decode),
         ],
         media_components: std::collections::BTreeMap::new(),
+        // The component this rank holds, named as the placement names it (`schedulers` places one
+        // component over every rank). The scheduler routes a call by component name, so a rank that
+        // advertised a name of its own would hold nothing any pool asks for.
         components: vec![ipc::ComponentInfo {
-            name: "backbone".to_owned(),
+            name: ipc::DEFAULT_COMPONENT.to_owned(),
             outputs: Vec::new(),
         }],
     })
