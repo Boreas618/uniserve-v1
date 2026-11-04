@@ -3,7 +3,6 @@
 
 pub mod events;
 pub mod issue;
-pub mod recorded;
 
 pub use events::{DRAIN_LIMIT, Deferral, Deferred, EventPool, JobId, Submitter, drain_event};
 pub use issue::{Fill, HostFunction, Issue, RowFill};

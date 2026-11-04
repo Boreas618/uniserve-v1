@@ -1,13 +1,13 @@
 //! Read leases of committed products.
 
 use super::*;
-use crate::tensor::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
+use crate::tensor::MemoryKind;
 use crate::{Error, Result};
-use platform::{DeviceId, Event, Stream};
 use ipc::CallId;
 use ipc::TensorRef;
+use platform::{DeviceId, Event, Stream};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};

@@ -1,13 +1,13 @@
 //! A product's buffer: its views, metadata and shape.
 
 use super::*;
-use crate::tensor::{DType, MemoryKind};
 use crate::memory::allocation::StorageView;
-use crate::transfer::{ReadRef, Retirement};
 use crate::memory::buffer::BufferBinding;
+use crate::tensor::{DType, MemoryKind};
+use crate::transfer::{ReadRef, Retirement};
 use crate::{Error, Result};
-use platform::Event;
 use ipc::{BufferId, DimBound, TensorRef};
+use platform::Event;
 use std::collections::HashMap;
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Mutex, MutexGuard};

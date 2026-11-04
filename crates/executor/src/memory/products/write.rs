@@ -1,13 +1,13 @@
 //! Binding a batch's outputs and writing products.
 
 use super::*;
-use crate::tensor::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
+use crate::tensor::MemoryKind;
 use crate::transfer::{Spans, copy_planner};
 use crate::{Error, Result};
-use platform::SourceOrder;
 use ipc::{BufferAllocation, BufferId, RequestKey, TensorRef};
+use platform::SourceOrder;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;

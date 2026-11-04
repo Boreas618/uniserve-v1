@@ -49,16 +49,16 @@ use read::*;
 use relay::*;
 use write::*;
 
-use crate::tensor::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::memory::buffer::BufferPool;
-use crate::stream::Issue;
-use crate::transfer::exports::{self, Location};
 use crate::stream::EventPool;
+use crate::stream::Issue;
+use crate::tensor::MemoryKind;
+use crate::transfer::exports::{self, Location};
 use crate::{Error, Result, lock};
-use platform::Event;
 use ipc::CallId;
 use ipc::{BufferId, RequestKey, TensorRef};
+use platform::Event;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 

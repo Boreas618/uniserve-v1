@@ -20,7 +20,7 @@
 
 mod access;
 pub(super) mod block_tables;
-pub mod conversion;
+pub(crate) mod conversion;
 pub(crate) mod host;
 mod imports;
 mod manifest;

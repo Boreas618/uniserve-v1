@@ -1,9 +1,9 @@
 //! Scalar products and their writes.
 
 use super::*;
-use crate::tensor::{DType, MemoryKind};
 use crate::memory::allocation::StorageView;
 use crate::stream::{Fill, Issue};
+use crate::tensor::{DType, MemoryKind};
 use crate::{Error, Result};
 use platform::{CopyBatch, SourceOrder};
 use std::collections::HashSet;
