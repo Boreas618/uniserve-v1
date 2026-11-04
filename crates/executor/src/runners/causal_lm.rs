@@ -401,6 +401,8 @@ struct Columns {
     /// The rows the largest bucket holds.
     rows: usize,
     positions: Column,
+    /// `[tokens]` i32 the input ids, which the model embeds into the forward's hidden states.
+    input_ids: Column,
     slot_mapping: Column,
     seq_lens: Column,
     query_offsets: Column,
@@ -430,6 +432,7 @@ impl Columns {
             tokens: tokens as usize,
             rows: rows as usize,
             positions: Column::new(device, DType::I32, tokens)?,
+            input_ids: Column::new(device, DType::I32, tokens)?,
             slot_mapping: Column::new(device, DType::I32, tokens)?,
             seq_lens: Column::new(device, DType::I32, rows)?,
             query_offsets: Column::new(device, DType::I32, rows + 1)?,
@@ -1331,7 +1334,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .div_ceil(self.geometry.page_size.max(1))
             .max(1);
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+        let ids = self.input_ids(bucket);
         self.with_kv(&slots, Some(pages), |cache| {
+            self.model
+                .embed_input_ids(&forward, ids, hidden)
+                .map_err(|error| Error::Interface(error.to_string()))?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
                 .map_err(|error| Error::Interface(error.to_string()))
@@ -1412,6 +1419,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
         encode_i32(&mut self.encoded, &batch.positions[..tokens]);
         self.columns.positions.write(&self.encoded)?;
+        // The ids travel with the batch: `nn::CausalLm::forward` runs the stack over hidden states
+        // the model already holds, so embedding them is the runner's step, not the model's.
+        encode_i32(&mut self.encoded, self.staging.input_ids(tokens));
+        self.columns.input_ids.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
         self.columns.slot_mapping.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.seq_lens[..rows]);
@@ -1443,6 +1454,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
         for column in [
             &self.columns.positions,
+            &self.columns.input_ids,
             &self.columns.slot_mapping,
             &self.columns.seq_lens,
             &self.columns.query_offsets,
@@ -1455,6 +1467,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             column.upload(&self.stream)?;
         }
         Ok(())
+    }
+
+    /// The bucket's extent of the input ids, which the forward embeds before the stack.
+    fn input_ids(&self, bucket: Bucket) -> TensorView {
+        self.columns.input_ids.extent(0..u64::from(bucket.tokens))
     }
 
     /// The device-side `TokenBatch` of `bucket`: the bucket's extent of each column.
@@ -1543,7 +1560,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
         )?;
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+        let ids = self.input_ids(bucket);
         self.with_kv(&slots, None, |cache| {
+            self.model
+                .embed_input_ids(&forward, ids, hidden)
+                .map_err(|error| Error::Interface(error.to_string()))?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
                 .map_err(|error| Error::Interface(error.to_string()))?;
@@ -1841,6 +1862,37 @@ mod tests {
         )?;
         assert_eq!(staged.tokens, 64);
         assert_eq!(&staging.batch_rows().slot_mapping[3..], &[-1i32; 61]);
+        Ok(())
+    }
+
+    /// The staged ids are the batch's, in order, padded after them: the forward embeds these, so a
+    /// row's embedding comes from its own token and a padding token embeds nothing a request sees.
+    #[test]
+    fn the_staged_ids_are_the_batchs_in_order() -> Result<()> {
+        let buckets = Buckets::new([
+            Bucket::decode(4, Variant::DecodeGreedy),
+            Bucket::prefill(4, 64, Variant::PrefillOutput),
+        ]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+
+        staging.stage(
+            &prefill_columns(),
+            &[CallId(3)],
+            &Shape::prefill(1, 3, Variant::PrefillOutput),
+            Bucket::prefill(4, 64, Variant::PrefillOutput),
+        )?;
+        assert_eq!(&staging.input_ids(3), &[1, 2, 3]);
+
+        // A decode's two rows keep their tokens and its padding rows carry none of them.
+        staging.stage(
+            &decode_columns(),
+            &[CallId(4), CallId(5)],
+            &Shape::decode(2, Variant::DecodeGreedy),
+            Bucket::decode(4, Variant::DecodeGreedy),
+        )?;
+        assert_eq!(&staging.input_ids(2), &[7, 8]);
+        assert_eq!(staging.input_ids(4).len(), 4);
         Ok(())
     }
 
