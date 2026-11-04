@@ -127,7 +127,9 @@ pub struct RequestView {
     /// prefill or refill chunk (a denoising step is charged its latent units
     /// times its guidance branches, a verification one token plus its drafts,
     /// any other call its bound). A prefill or refill chunk is charged the
-    /// chunk the policy sizes instead.
+    /// chunk the policy sizes instead, and a prefill with nothing left to
+    /// ingest — a close cache, a feedback state, a block's commit — is charged
+    /// the one position it writes, since there is no chunk to size.
     #[serde(default)]
     pub next_tokens: u32,
     /// The worst-case device KV units the request reserves when it is
