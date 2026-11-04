@@ -732,6 +732,21 @@ fn main() {
         .to_string(),
     );
 
+    // ---- The audio encoder's frame/channel swap, in the audio VAEs' own FP32.
+    //
+    // `AudioVAEEncoder` holds `[batch, channels, frames]` and its attention attends over frames, so
+    // frames move to the leading axis before the qkv projection and back after it. Both extents are
+    // launch values, so one row covers every clip length.
+    push(
+        "transpose",
+        ops::transpose::Descriptor {
+            dtype: DType::F32,
+            block: ops::transpose::TILE,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
     // Gaps this file does not fill, named rather than invented:
     // - `bias_add`: the channel list per call site follows the stage widths above, but the call sites
     //   are the decoder's and the video VAE's own composition, which is h3's to state.
