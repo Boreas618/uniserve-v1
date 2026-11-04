@@ -380,6 +380,12 @@ impl Layouts {
     /// share one set. Every table is one the forward reads; none is a host value the executor would
     /// otherwise have to pass through a launch.
     pub fn table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        if matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        ) {
+            return self.segment_table_specs(layout);
+        }
         let packing = self.packing_of(layout)?;
         let rows = u64::from(packing.padded_tokens);
         let video = u64::from(packing.video_rows);
@@ -449,6 +455,196 @@ impl Layouts {
         Ok(tables)
     }
 
+    /// The tables a sparse layout needs, in the order [`Layouts::write_state`] fills them.
+    ///
+    /// A sparse layout holds four tables a dense one does not - the tile sizes, each tile's video
+    /// segment, each segment's first tile, and the key tiles a query keeps - and neither of the dense
+    /// attention's two sequence-length tables: the sparse attention reads its tiles, not one run.
+    fn segment_table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        let packed = self.segment_of(layout)?;
+        let extent = &packed.extent;
+        let rows = u64::from(extent.padded_tokens);
+        let tiles = u64::from(extent.padded_tokens / extent.tile);
+        let video = u64::from(extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2);
+        let audio = u64::from(extent.audio_rows);
+        let mut tables = vec![
+            StateTable {
+                name: "audio_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[audio]),
+            },
+            StateTable {
+                name: "video_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[video]),
+            },
+            StateTable {
+                name: "groups",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "modulation_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "position_ids",
+                dtype: DType::F32,
+                shape: Shape::new(&[3, rows]),
+            },
+            StateTable {
+                name: "prefix_index",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "segment_keep",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+            StateTable {
+                name: "segment_starts",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+            StateTable {
+                name: "step",
+                dtype: DType::I32,
+                shape: Shape::new(&[1]),
+            },
+            StateTable {
+                name: "tile_segments",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+            StateTable {
+                name: "token_tags",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "variable_block_sizes",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+        ];
+        tables.sort_by_key(|table| table.name);
+        Ok(tables)
+    }
+
+    /// Fill a sparse layout's tables: the tile packing's own indices and the segment tables.
+    fn write_segment_state(
+        &self,
+        request: &VideoRequest<'_>,
+        layout: &Layout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()> {
+        let (sparsity, reference_keep) = match self.config.attention {
+            crate::config::AttentionKind::Sparse {
+                sparsity,
+                reference_keep,
+                ..
+            } => (sparsity, reference_keep),
+            crate::config::AttentionKind::Dense => {
+                return Err(Error::config(
+                    "a dense deployment holds no segment tables".to_owned(),
+                ));
+            }
+        };
+        let packing = self.segment_of(layout)?;
+        let frames = frame_count(layout.video.frames)?;
+        let canvas = canvas_of_latents(layout)?;
+        if request.text_tokens < 1 || request.text_tokens > packing.extent.text_rows {
+            return Err(Error::config(format!(
+                "a prompt of {} rows does not fit a text capacity of {}",
+                request.text_tokens, packing.extent.text_rows
+            )));
+        }
+        let conditions = conditions_of(request);
+        let segments = packing::condition_segments(&conditions, &canvas)?;
+        let tables = packing::segment_tables(
+            &packing,
+            frames,
+            &canvas,
+            request.text_tokens,
+            &segments,
+            // The prompt's vision rows arrive with `VideoRequest`'s condition shapes.
+            &[],
+            sparsity,
+            reference_keep,
+        )?;
+        let rows = tables.groups.len();
+        if rows != packing.extent.padded_tokens as usize {
+            return Err(Error::config(format!(
+                "{rows} table rows for {} packed rows",
+                packing.extent.padded_tokens
+            )));
+        }
+        let tiles = tables.variable_block_sizes.len();
+        let specs = self.segment_table_specs(layout)?;
+        let sizes: Vec<i32> = tables
+            .variable_block_sizes
+            .iter()
+            .map(|size| *size as i32)
+            .collect();
+        let audio: Vec<i32> = packing.audio_indices().map(|row| row as i32).collect();
+        let video: Vec<i32> = packing
+            .video_indices
+            .iter()
+            .map(|row| *row as i32)
+            .collect();
+        let filled: [(&str, Vec<u8>); 10] = [
+            ("audio_indices", integers(&audio)),
+            ("video_indices", integers(&video)),
+            ("groups", integers(&tables.groups)),
+            (
+                "modulation_indices",
+                modulation_indices(&tables.groups, &tables.token_tags),
+            ),
+            ("position_ids", coordinates(&tables.position_ids)),
+            ("prefix_index", integers(&tables.prefix_index)),
+            ("segment_keep", integers(&tables.segment_keep)),
+            ("segment_starts", integers(&tables.segment_starts)),
+            ("tile_segments", integers(&tables.tile_segments)),
+            ("token_tags", integers(&tables.token_tags)),
+        ];
+        for (name, bytes) in filled {
+            let position = specs
+                .iter()
+                .position(|table| table.name == name)
+                .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
+            let buffer = out
+                .get_mut(position)
+                .ok_or_else(|| Error::config(format!("the executor holds no buffer for {name}")))?;
+            if buffer.len() != bytes.len() {
+                return Err(Error::config(format!(
+                    "{name} is {} bytes, its buffer {}",
+                    bytes.len(),
+                    buffer.len()
+                )));
+            }
+            buffer.copy_from_slice(&bytes);
+        }
+        let position = specs
+            .iter()
+            .position(|table| table.name == "variable_block_sizes")
+            .ok_or_else(|| Error::config("the block-size table is missing".to_owned()))?;
+        let buffer = out
+            .get_mut(position)
+            .ok_or_else(|| Error::config("the executor holds no block-size buffer".to_owned()))?;
+        let bytes = integers(&sizes);
+        if buffer.len() != bytes.len() || tiles != sizes.len() {
+            return Err(Error::config(format!(
+                "variable_block_sizes is {} bytes for {tiles} tiles, its buffer {}",
+                bytes.len(),
+                buffer.len()
+            )));
+        }
+        buffer.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// Write one request's tables, in [`Layouts::state_tables`]' order.
     ///
     /// The bytes are host bytes in each table's own element type: the executor uploads them once
@@ -461,6 +657,12 @@ impl Layouts {
         layout: &Layout,
         out: &mut [Vec<u8>],
     ) -> Result<()> {
+        if matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        ) {
+            return self.write_segment_state(request, layout, out);
+        }
         let packing = self.packing_of(layout)?;
         let text_tokens = request.text_tokens;
         if text_tokens > layout.text_rows {
@@ -1301,10 +1503,64 @@ mod tests {
         }
     }
 
+    const TILE: u32 = 64;
+
     fn sparse_layouts() -> Layouts {
         let mut config = layouts().config;
-        config.attention = AttentionKind::sparse(64, 0.8, None).unwrap();
+        config.attention = AttentionKind::sparse(TILE, 0.8, None).unwrap();
         Layouts::new(config, layouts().arrangement).unwrap()
+    }
+
+    #[test]
+    fn a_sparse_layout_declares_its_tile_tables_and_fills_them() {
+        let rule = sparse_layouts();
+        let mut request = request(121, 1344, 768);
+        request.text_tokens = 12;
+        let (layout, _) = rule.layout(&request).unwrap();
+        let specs = rule.table_specs(&layout).unwrap();
+        let names: Vec<&str> = specs.iter().map(|table| table.name).collect();
+        // The four tile tables, and neither of the dense attention's sequence-length tables.
+        for name in [
+            "variable_block_sizes",
+            "tile_segments",
+            "segment_starts",
+            "segment_keep",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
+        assert!(!names.contains(&"cu_seq_lens_k"));
+        assert!(!names.contains(&"cu_seq_lens_q"));
+        let tile = u64::from(TILE);
+        let rows = specs
+            .iter()
+            .find(|table| table.name == "groups")
+            .map(|table| table.shape.dim(0))
+            .expect("the group table");
+        assert_eq!(rows % tile, 0);
+        for name in ["variable_block_sizes", "segment_keep", "tile_segments"] {
+            let table = specs.iter().find(|table| table.name == name).unwrap();
+            assert_eq!(table.shape.dim(0), rows / tile, "{name}");
+        }
+        // The tables fill, and every block size is at most one tile's rows.
+        let mut out: Vec<Vec<u8>> = specs
+            .iter()
+            .map(|table| {
+                vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
+            })
+            .collect();
+        rule.write_state(&request, &layout, &mut out).unwrap();
+        let sizes = specs
+            .iter()
+            .position(|table| table.name == "variable_block_sizes")
+            .unwrap();
+        let block_sizes = decode_i32(&out[sizes]);
+        assert_eq!(block_sizes.len() as u64, rows / tile);
+        assert!(
+            block_sizes
+                .iter()
+                .all(|size| 0 <= *size && *size as u64 <= tile)
+        );
+        assert!(block_sizes.iter().any(|size| *size > 0));
     }
 
     #[test]
