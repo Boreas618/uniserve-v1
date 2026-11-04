@@ -20,6 +20,17 @@
 //! is no key. [`Kind::Sparse`] is FastH3's video sparse attention over the segment packing; it is
 //! composed from `nn::layers::VsaTiles` and `nn::layers::SegmentAttention` and lands with them
 //! (see `crate::transformer`'s note on the sparse preset).
+//!
+//! ## Precision
+//!
+//! The dense attention runs in the checkpoint's own representation - BF16 activations with FP32
+//! accumulation inside the fused kernels - which is the FlashAttention row of the design's numerics
+//! table; nothing here declares an FP32 attention and no layer casts to one. The sparse path's
+//! **compression** branch is the other row: the design requires FP32 there (cuBLASLt SGEMM plus a
+//! softmax program), and the reference computes its tile means, scores and weighting in FP32
+//! throughout (`uniserve/nn/attention/vsa/segments.py:60-77`, `:429-468`), so that branch declares
+//! FP32 when it lands - in its layer's dtype and in this doc - while the fine sparse attention over
+//! the prepared rows stays in the checkpoint's dtype like the dense one.
 
 use nn::layers::{Attention, Linear, Rotary, Rotation, Sections, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
