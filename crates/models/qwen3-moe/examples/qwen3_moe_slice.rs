@@ -671,15 +671,19 @@ fn decode_arena_bytes(
         .saturating_add(pages)
         .saturating_add(64)
         .saturating_mul(4);
-    // A generation's arena carries a zero count row and a shaped row, each one vocabulary wide, and
-    // the shaped row is claimed and released per step. Four rows' worth leaves room for both plus the
-    // step's own small tensors without a second reservation.
+    // A generation's arena must hold the prefill's step and one decode step at once, because the
+    // prefill's answer is read while its reservation is still held, plus a zero count row and a
+    // shaped row, each one vocabulary wide, of which the shaped row is claimed and released per
+    // step. The second step's workspace is the plan's own, which the attention program's 512 MiB
+    // dominates; naming it here is what makes an arena that is one step short fail at the region's
+    // stated size and not at an offset nobody can interpret.
     let sampling_bytes = match sampling {
         true => u64::try_from(config.vocab_size)
             .unwrap_or(0)
             .saturating_mul(4)
             .saturating_mul(4)
-            .saturating_add(16_384),
+            .saturating_add(16_384)
+            .saturating_add(plan.workspace),
         false => 0,
     };
     let mut total = 0_u64;
@@ -1174,6 +1178,16 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         }
     }
 
+    // A step of the forward reserves the plan's own scratch - the attention program's workspace
+    // among it - and nothing returns it. A generation step runs the same forward again, so the mark
+    // is taken here and released once the last row's values are on the host; without it the second
+    // step asks for the whole step a second time past the region's end. The logits plane is
+    // allocated before the mark because every step reads into it and it must outlive the release.
+    let logits = arena.tensor(
+        DType::F32,
+        Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
+    )?;
+    let prefill = arena.mark();
     model.forward(&forward, &batch, &cache, hidden)?;
     // The run's output norm writes into `hidden`, so this is the state a reference's last file
     // holds: the output after the final norm, which no layer's own output is.
@@ -1200,10 +1214,6 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     if !misaligned {
         summarize(&table, config.num_hidden_layers);
     }
-    let logits = arena.tensor(
-        DType::F32,
-        Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
-    )?;
     let last_row = TensorView::new(
         DevicePtr::new(hidden.ptr.address() + (count - 1) * plan.hidden * 2),
         DType::BF16,
@@ -1215,6 +1225,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The last row's log-softmax, on the host, and its ten best tokens.
     let vocabulary = config.vocab_size;
     let values = download_f32(&stream, logits, vocabulary)?;
+    arena.release(prefill);
     if let Some(dir) = args.dump.as_deref() {
         write_npy(&dir.join("logits.npy"), &values, 1, vocabulary)?;
         println!("dump: logits.npy is the last row, 1 x {vocabulary} f32");
@@ -1229,7 +1240,16 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     }
     if args.generate.is_some() {
         generate(
-            args, &forward, &stream, &arena, &model, &cache, &batch, logits, values,
+            args,
+            &forward,
+            &stream,
+            &arena,
+            &model,
+            &cache,
+            &batch,
+            &block_table,
+            logits,
+            values,
         )?;
     }
     Ok(())
@@ -1250,6 +1270,7 @@ fn generate(
     model: &qwen3_moe::Qwen3Moe,
     cache: &KvView<'_>,
     batch: &TokenBatch,
+    block_table: &[i32],
     logits: TensorView,
     prompt: Vec<f32>,
 ) -> Result<()> {
@@ -1316,9 +1337,17 @@ fn generate(
     // slot that drifts by one is invisible in an id list that happens to be right, and this is the
     // line that makes the drift visible.
     let last = start.saturating_add(u64::try_from(steps.saturating_sub(1)).unwrap_or(0));
+    let page_size = u64::from(batch.page_size);
+    // The slot a token writes is the one the attention will read for it: the page its sequence's
+    // table names, times the page size, plus the position's offset inside that page. It is one
+    // number derived twice - here, and by `kv_write` from the same table - so a mismatch is a write
+    // nobody reads, which shows up as a repeated token rather than as an error.
+    let first_slot = slot_for(start, page_size, block_table)?;
+    let last_slot = slot_for(last, page_size, block_table)?;
     println!(
-        "generate: step k (k = 0..{}) appends position {start}+k, writes slot {start}+k, \
-         seq_len {}+k; positions {start}..{last}, slots {start}..{last}, page capacity {capacity}",
+        "generate: step k (k = 0..{}) appends position {start}+k at slot \
+         page_table[position/{page_size}]*{page_size} + position%{page_size}, seq_len {}+k; \
+         positions {start}..{last}, slots {first_slot}..{last_slot}, page capacity {capacity}",
         steps.saturating_sub(1),
         start.saturating_add(1),
     );
@@ -1330,11 +1359,12 @@ fn generate(
         // The prompt's row answers the token at position `start`; a decode step's row answers the
         // one after it, so the position of this step's token is `start + step`.
         let position = start.saturating_add(u64::try_from(step).unwrap_or(0));
+        let slot = slot_for(position, page_size, block_table)?;
         check_continuation(
             start,
             step,
             position,
-            position,
+            slot,
             position.saturating_add(1),
             capacity,
         )?;
@@ -1374,7 +1404,7 @@ fn generate(
         }
         let best = top_logprobs(&row, 5);
         println!(
-            "generate: step {} of {steps}: position {position}, slot {position}, seq_len {}, token \
+            "generate: step {} of {steps}: position {position}, slot {slot}, seq_len {}, token \
              {chosen} ({source})",
             step + 1,
             position.saturating_add(1)
@@ -1421,12 +1451,29 @@ fn generate(
         }
         // The decode step: this token enters the cache at its own position, and the batch carries
         // one query row whose sequence length counts the tokens already cached.
-        let position = i32::try_from(position).unwrap_or(-1);
+        // A row that carries no slot writes no keys and is attended over as if it were not there,
+        // which reads as a repeated token and not as an error. This batch has one token, so a slot
+        // it cannot express is a refusal and not a wrap: `-1` is the value that makes `kv_write`
+        // skip the write.
+        let position = i32::try_from(position).map_err(|_| {
+            Failure::message(format!(
+                "position {position} does not fit a batch's i32 positions"
+            ))
+        })?;
+        let slot = i32::try_from(slot).map_err(|_| {
+            Failure::message(format!(
+                "slot {slot} does not fit a batch's i32 slot mapping"
+            ))
+        })?;
+        if position < 0 || slot < 0 {
+            return Err(Failure::message(format!(
+                "a decode step at position {position} carries slot {slot}: a negative slot writes \
+                 no keys, and a one-token row that writes nothing attends the prompt alone"
+            )));
+        }
         let ids = upload_i32(stream, arena, &[chosen])?;
         let positions = upload_i32(stream, arena, &[position])?;
-        // The KV contract's own line: a token's slot is the token's position, not a counter, and a
-        // counter here would write this token's keys over another token's page.
-        let slots = upload_i32(stream, arena, &[position])?;
+        let slots = upload_i32(stream, arena, &[slot])?;
         let seq_lens = upload_i32(stream, arena, &[position.saturating_add(1)])?;
         let query_offsets = upload_i32(stream, arena, &[0, 1])?;
         let logits_rows = upload_i32(stream, arena, &[0])?;
@@ -1577,7 +1624,7 @@ fn check_continuation(
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax_over, check_continuation};
+    use super::{argmax_over, check_continuation, slot_for};
 
     /// The line a continuation's batch must satisfy, on the numbers a prompt of fifteen tokens
     /// produces: the first generated token is the one at position 15, its sequence length is 16, and
@@ -1618,12 +1665,61 @@ mod tests {
         assert!(refused.to_string().contains("no page"), "{refused}");
     }
 
+    /// The slot a decode writes is the page table's own arithmetic: the page's unit times the page
+    /// size plus the offset. An identity table makes it the position, which is why a slot that
+    /// drifts is invisible until a sequence spans two non-adjacent pages.
+    #[test]
+    fn the_slot_is_the_page_tables_arithmetic() {
+        assert_eq!(slot_for(15, 64, &[0]).unwrap(), 15);
+        // Position 70 is offset 6 of the sequence's second page, and that page is unit 3.
+        assert_eq!(slot_for(70, 64, &[0, 3]).unwrap(), 3 * 64 + 6);
+    }
+
+    /// A page that is not a page writes no keys, so it is refused rather than skipped.
+    #[test]
+    fn a_page_out_of_the_table_is_refused() {
+        let refused = slot_for(15, 64, &[]).expect_err("no pages");
+        assert!(
+            refused.to_string().contains("page table names"),
+            "{refused}"
+        );
+        let refused = slot_for(15, 64, &[-1]).expect_err("page -1");
+        assert!(refused.to_string().contains("no cache"), "{refused}");
+    }
+
     /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
     #[test]
     fn the_argmax_takes_the_first_largest() {
         assert_eq!(argmax_over(&[0.5, 2.0, 2.0, -1.0]), 1);
         assert_eq!(argmax_over(&[-3.0, -2.0, -4.0]), 1);
     }
+}
+
+/// The slot a token at `position` occupies: its sequence's page from the table, times the page size,
+/// plus the position's offset in that page.
+///
+/// This is the number `kv_write` computes from the same two inputs, so printing it beside the
+/// position is what separates "the write landed where the read looks" from "the write landed
+/// elsewhere and the attention read the prompt alone". A page the table does not name, and a page
+/// named `-1`, are refusals: both are a token with no cache.
+fn slot_for(position: u64, page_size: u64, block_table: &[i32]) -> Result<u64> {
+    let unit = position / page_size;
+    let index = usize::try_from(unit).unwrap_or(usize::MAX);
+    let entry = block_table.get(index).ok_or_else(|| {
+        Failure::message(format!(
+            "position {position} lives in page {unit}, and the page table names {} page(s)",
+            block_table.len()
+        ))
+    })?;
+    let page = u64::try_from(*entry).map_err(|_| {
+        Failure::message(format!(
+            "page {unit} of the page table names {entry}: a page that is not a page is a token \
+             with no cache"
+        ))
+    })?;
+    Ok(page
+        .saturating_mul(page_size)
+        .saturating_add(position % page_size))
 }
 
 /// The largest value's first index, on the host.
