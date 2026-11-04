@@ -25,6 +25,6 @@
 //! [`ServeOptions::devices`](program_server::command::ServeOptions::devices)
 //! instead.
 
-pub use program_server::command::{
+pub(crate) use program_server::command::{
     Action, Options, ServeOptions, command, default_socket, options, run,
 };
