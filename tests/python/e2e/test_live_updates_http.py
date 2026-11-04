@@ -1269,10 +1269,15 @@ def _restart_with_a_json_body(
         300,
         "the successor did not finish the handed-over body",
     )
+    # The streaming restart's records are in this same log — every daemon of
+    # the run inherits one — so the pause under test is the one whose
+    # successor is this restart's: the earlier freezes named another.
     records = _handoff_records(log)
-    frozen = records["frozen"]
-    adopted = records["adopted"]
-    finished = records["finished"]
+    frozen = [
+        record for record in records["frozen"] if record["successor_pid"] == successor
+    ]
+    adopted = [record for record in records["adopted"] if record["pid"] == successor]
+    finished = [record for record in records["finished"] if record["pid"] == successor]
     assert len(frozen) == 1, frozen
     assert frozen[0]["adopted"], frozen
     assert frozen[0]["successor_pid"] == successor, frozen
