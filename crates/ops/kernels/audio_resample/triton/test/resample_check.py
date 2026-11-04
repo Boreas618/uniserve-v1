@@ -34,6 +34,13 @@ a one-sample-wide input, and an input whose length the ratio does not divide.
 
 A `bf16` run under Triton's interpreter truncates its reference the way the interpreter
 truncates narrow stores: the value's own mantissa, with no narrower type in between.
+
+**The mutation this check was built against is the filter shifted by one tap**
+(`filter[tap + 1]`), and it is caught at both phases and in both directions: 6 of 6 elements
+outside the bound at `ratio 6, kernel 12` downsampling, 16 of 16 at `ratio 2, kernel 24`,
+158 of 192 and 64 of 64 upsampling. That matters because a check of a convolution whose
+reference shares the kernel's indexing cannot see the error at all, and the pair is what
+settles it.
 """
 
 import argparse
