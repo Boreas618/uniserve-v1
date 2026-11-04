@@ -551,6 +551,19 @@ impl Moe {
             .map_err(|_| Error::shape("Moe", "a hidden width above u32::MAX".to_owned()))?;
         let intermediate = u32::try_from(intermediate)
             .map_err(|_| Error::shape("Moe", "an expert width above u32::MAX".to_owned()))?;
+        // The router reads the same rows the experts do, so its contraction length is the hidden
+        // width the stacks just stated. A block whose router disagrees is a loading defect that would
+        // otherwise surface as the router's own launch refusing its operand, three operators into a
+        // forward and with none of the block's numbers in the message.
+        if router.k() != hidden {
+            return Err(Error::shape(
+                "Moe",
+                format!(
+                    "the router contracts {} elements and the experts' rows are {hidden} wide",
+                    router.k()
+                ),
+            ));
+        }
         if let Some(map) = map
             && map.shape().numel() != u64::from(experts)
         {
