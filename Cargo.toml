@@ -4,6 +4,7 @@ members = [
     "crates/cuda",
     "crates/daemon",
     "crates/engine",
+    "crates/executor",
     "crates/ipc",
     "crates/manager",
     "crates/models",
@@ -26,6 +27,7 @@ readme = "README.md"
 cuda = { path = "crates/cuda" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
+executor = { path = "crates/executor" }
 ipc = { path = "crates/ipc" }
 models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
