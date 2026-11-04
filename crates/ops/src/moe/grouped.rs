@@ -628,7 +628,7 @@ pub struct GatherGemmNvfp4Args {
     pub scales: TensorView,
     /// `[experts]` f32: the reciprocal of each expert's tensor scale, as the loader carries it.
     pub global_scale: TensorView,
-    /// `[routes]` i32: the expert each gathered row belongs to.
+    /// `[tokens, top]` i32: the experts each token's routes selected.
     pub ids: TensorView,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: TensorView,
@@ -645,18 +645,15 @@ pub struct GatherGemmNvfp4Args {
 /// The routed first matrix over a packed, block-scaled expert stack.
 pub struct GatherGemmNvfp4;
 
-impl Op for GatherGemmNvfp4 {
-    const NAME: &'static str = "gather_gemm_nvfp4";
-
-    type Descriptor = GatherGemmNvfp4Descriptor;
-    type Args<'a> = GatherGemmNvfp4Args;
-
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+impl GatherGemmNvfp4 {
+    /// The launch's shape and geometry rules, separated from the launch itself so a host test can
+    /// state them without a device.
+    ///
+    /// Answers the contraction, the expert width and the permuted row count the launch needs.
+    pub(crate) fn validate(
+        descriptor: &GatherGemmNvfp4Descriptor,
+        args: &GatherGemmNvfp4Args,
+    ) -> Result<(u64, u64, u64)> {
         let hidden = u64::from(descriptor.hidden);
         let intermediate = u64::from(descriptor.intermediate);
         let experts = u64::from(descriptor.experts);
@@ -698,15 +695,35 @@ impl Op for GatherGemmNvfp4 {
                 ),
             ));
         }
-        // The scales cover the packed field one block per sixteen elements; a table that does not
-        // cover it is a checkpoint the loader should have refused, and a launch that trusted it
-        // would read whatever follows.
-        let blocks = (2 * intermediate).div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
-        let covered: u64 = args.scales.shape.dims().iter().product();
-        if covered < experts * blocks {
+        // Two E2M1 codes share a byte along the contraction, so an odd one names a stack that cannot
+        // exist; and the block scales cover the contraction in blocks of sixteen, one block per output
+        // row, so a contraction that is not whole blocks leaves a partial block whose scale the
+        // checkpoint does not store.
+        let block_elements = u64::from(crate::fp4::BLOCK_ELEMENTS);
+        if !hidden.is_multiple_of(2) {
             return Err(Error::argument(
                 Self::NAME,
-                format!("{covered} block scales do not cover {experts} experts of {blocks} blocks"),
+                format!("a contraction of {hidden} is odd, and two E2M1 codes share a byte"),
+            ));
+        }
+        if !hidden.is_multiple_of(block_elements) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a contraction of {hidden} is not whole {block_elements}-element scale blocks"
+                ),
+            ));
+        }
+        let blocks_per_row = hidden / block_elements;
+        let scale_rows = 2 * intermediate;
+        let covered: u64 = args.scales.shape.dims().iter().product();
+        if covered < experts * scale_rows * blocks_per_row {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{covered} block scales do not cover {experts} experts of {scale_rows} rows by \
+                     {blocks_per_row} blocks"
+                ),
             ));
         }
         args.global_scale
@@ -720,7 +737,14 @@ impl Op for GatherGemmNvfp4 {
                 ),
             ));
         }
-        args.ids.require_shape(Self::NAME, Shape::new(&[routes]))?;
+        // `routes` is the permuted row count -- the output's rows, which the sort pads to whole tiles
+        // -- while the activations are the caller's *token* rows and `ids` holds one row of routes per
+        // token. The program gathers through `permuted_to_expanded`, as the dense product does, so
+        // checking the activations against the permuted count would refuse every launch whose sort
+        // pads anything.
+        let tokens = args.hidden.rows();
+        args.ids
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
         for (name, view) in [
@@ -735,7 +759,7 @@ impl Op for GatherGemmNvfp4 {
             }
         }
         args.hidden
-            .require_shape(Self::NAME, Shape::new(&[routes, hidden]))?;
+            .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
         args.hidden
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
         if top == 0 {
@@ -744,6 +768,23 @@ impl Op for GatherGemmNvfp4 {
                 "a launch with no routes per token packs no rows".to_owned(),
             ));
         }
+        Ok((hidden, intermediate, routes))
+    }
+}
+
+impl Op for GatherGemmNvfp4 {
+    const NAME: &'static str = "gather_gemm_nvfp4";
+
+    type Descriptor = GatherGemmNvfp4Descriptor;
+    type Args<'a> = GatherGemmNvfp4Args;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (_, intermediate, routes) = Self::validate(descriptor, &args)?;
 
         // The activation is compiled into the program (it is in the key), so no launch value names
         // it; what a launch carries is the geometry the grid and the addressing need.
@@ -771,7 +812,18 @@ impl Op for GatherGemmNvfp4 {
         // One block per (expert tile, column tile) of the gated product, the geometry the package
         // compiled for: the tile and cluster are the descriptor's, so the grid is a function of the
         // problem rather than of a backend's tactic.
-        let tiles = args.num_non_exiting_tiles.rows().max(1);
+        // Axis 0 is the *tile buffer's* count, a launch-fixed geometry: one block per tile the sort
+        // could produce, each returning immediately when its index is past the live count on the
+        // device. Reading `num_non_exiting_tiles` here would be a host read of a device value, and
+        // `[1]` means the launch would always compute one tile.
+        let tiles = args
+            .tile_to_expert
+            .shape
+            .dims()
+            .first()
+            .copied()
+            .unwrap_or(1)
+            .max(1);
         kernel.launch(
             LaunchGrid::new([
                 tiles,
@@ -1115,7 +1167,18 @@ impl Op for RouteGemmNvfp4 {
             .u32(descriptor.tile.1)
             .u32(descriptor.cluster.0)
             .u32(descriptor.cluster.1);
-        let tiles = args.num_non_exiting_tiles.rows().max(1);
+        // Axis 0 is the *tile buffer's* count, a launch-fixed geometry: one block per tile the sort
+        // could produce, each returning immediately when its index is past the live count on the
+        // device. Reading `num_non_exiting_tiles` here would be a host read of a device value, and
+        // `[1]` means the launch would always compute one tile.
+        let tiles = args
+            .tile_to_expert
+            .shape
+            .dims()
+            .first()
+            .copied()
+            .unwrap_or(1)
+            .max(1);
         kernel.launch(
             LaunchGrid::new([tiles, hidden.div_ceil(u64::from(descriptor.tile.1)), 1])?,
             &mut arguments,
@@ -1140,5 +1203,91 @@ impl Op for RouteGemmNvfp4 {
         let atol =
             (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
         Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
+    }
+}
+
+#[cfg(test)]
+mod nvfp4_launch_tests {
+    use super::*;
+
+    fn table(dtype: DType, dims: &[u64]) -> TensorView {
+        TensorView::new(crate::tensor::DevicePtr::new(0), dtype, Shape::new(dims))
+    }
+
+    fn fc1() -> GatherGemmNvfp4Descriptor {
+        GatherGemmNvfp4Descriptor {
+            hidden: 2048,
+            intermediate: 768,
+            experts: 128,
+            top: 8,
+            activation: Activation::Silu,
+            dtype: DType::BF16,
+            scale: DType::F8E4M3,
+            layout: ScaleLayout::Swizzled128X4,
+            tile: (128, 128),
+            cluster: (1, 1),
+        }
+    }
+
+    /// The shapes a colocated block launches with: 3 tokens, 8 routes each, and a sort that padded
+    /// the permuted rows past `tokens · top`.
+    fn fc1_args() -> GatherGemmNvfp4Args {
+        GatherGemmNvfp4Args {
+            hidden: table(DType::BF16, &[3, 2048]),
+            weights: table(DType::U8, &[128, 1536, 1024]),
+            scales: table(DType::F8E4M3, &[128, 1536, 128]),
+            global_scale: table(DType::F32, &[128]),
+            ids: table(DType::I32, &[3, 8]),
+            tile_to_expert: table(DType::I32, &[2]),
+            tile_to_limit: table(DType::I32, &[2]),
+            permuted_to_expanded: table(DType::I32, &[32]),
+            num_non_exiting_tiles: table(DType::I32, &[1]),
+            out: table(DType::BF16, &[32, 768]),
+        }
+    }
+
+    #[test]
+    fn the_activations_are_the_token_rows_and_the_output_the_permuted_ones() {
+        // Builder01's M963: `routes` (the output's rows) is the sort's padded count and is never the
+        // activation count. The invariant is `ids = [tokens, top]`, `hidden = [tokens, hidden]` and
+        // `permuted_to_expanded = [routes]`, which is what the program gathers through.
+        let descriptor = fc1();
+        let args = fc1_args();
+        assert_eq!(args.hidden.rows(), 3);
+        assert_eq!(args.out.rows(), 32);
+        assert_eq!(args.ids.shape.dims(), &[3, 8]);
+        assert_eq!(args.permuted_to_expanded.shape.dims()[0], 32);
+        // The scales cover one block per output row along the contraction, not one row's worth.
+        assert_eq!(args.scales.shape.dims(), &[128, 1536, 128]);
+        assert_eq!(descriptor.hidden / crate::fp4::BLOCK_ELEMENTS, 128);
+        // And the weight stack is the packed field, half the contraction wide.
+        assert_eq!(args.weights.shape.dims(), &[128, 1536, 1024]);
+    }
+
+    #[test]
+    fn an_odd_contraction_and_a_partial_block_are_refused_by_name() {
+        // An odd contraction with a weight stack that matches it: the geometry rule is what refuses,
+        // not the shape check that happens to fire first.
+        let mut odd = fc1();
+        odd.hidden = 2047;
+        let mut odd_args = fc1_args();
+        odd_args.weights = table(DType::U8, &[128, 1536, 1023]);
+        let error = GatherGemmNvfp4::validate(&odd, &odd_args).unwrap_err();
+        assert!(format!("{error}").contains("odd"), "{error}");
+
+        let mut partial = fc1();
+        partial.hidden = 2040;
+        let mut partial_args = fc1_args();
+        partial_args.weights = table(DType::U8, &[128, 1536, 1020]);
+        let error = GatherGemmNvfp4::validate(&partial, &partial_args).unwrap_err();
+        assert!(format!("{error}").contains("scale blocks"), "{error}");
+    }
+
+    #[test]
+    fn a_scale_cover_short_by_one_block_is_refused() {
+        let mut args = fc1_args();
+        args.scales = table(DType::F8E4M3, &[127, 1536, 128]);
+        let error = GatherGemmNvfp4::validate(&fc1(), &args).unwrap_err();
+        assert!(format!("{error}").contains("do not cover"));
     }
 }
