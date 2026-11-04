@@ -1690,6 +1690,20 @@ impl MainProcess {
 
     /// Stops every thread in dependency order and releases the owners (§2.4).
     fn close(&mut self) {
+        // §2.3: a shutdown finishes every request in flight as aborted, and the daemon learns that
+        // from the request's own event - a connection that closes under it says only that the
+        // process ended, not which request was lost with it.
+        for (request, _) in std::mem::take(&mut self.streams) {
+            let event = proto::request::wire::Event {
+                request,
+                kind: Some(proto::request::wire::event::Kind::Error(
+                    proto::request::wire::Failed {
+                        message: "the epoch was shut down with this request in flight".to_owned(),
+                    },
+                )),
+            };
+            self.send_event(proto::request::wire::from_engine::Kind::Event(event));
+        }
         for executor in std::mem::take(&mut self.executors) {
             if let Err(error) = executor.close() {
                 tracing::warn!(%error, "closing a device executor failed");
