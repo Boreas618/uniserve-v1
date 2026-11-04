@@ -1,0 +1,34 @@
+# The log_softmax operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program scores one row in three streaming passes; the row count comes from
+# the grid, so one module serves every row count.
+
+op = "log_softmax"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/log_softmax.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_fp32_columns_151936_tile_4096_pdl_true`.
+[kernel.descriptors]
+dimensions = { dtype = ["fp32", "bf16", "fp16"], columns = ["151936", "152064", "248320", "2048", "128"], tile = ["1024", "2048", "4096", "8192"], pdl = ["true", "false"] }
+
+[parameters]

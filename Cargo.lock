@@ -2974,6 +2974,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "program-server"
+version = "2.0.0"
+dependencies = [
+ "clap",
+ "libc",
+ "prost",
+ "prost-build",
+ "protox",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "prometheus-client"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

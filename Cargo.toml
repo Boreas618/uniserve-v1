@@ -8,6 +8,7 @@ members = [
     "crates/manager",
     "crates/models",
     "crates/nixl",
+    "crates/program-server",
     "crates/proto",
     "crates/scheduling",
     "crates/scheduling/guest",
@@ -33,6 +34,7 @@ engine = { path = "crates/engine" }
 ipc = { path = "crates/ipc" }
 models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
+program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
 scheduling-guest = { path = "crates/scheduling/guest" }
