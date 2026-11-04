@@ -45,6 +45,7 @@ use nn::layers::{
 use nn::model::{Block, BlockName, Model};
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, TensorView};
+use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
 
@@ -426,7 +427,7 @@ impl Qwen3Moe {
     pub fn into_model(self) -> Model {
         Model::new(vec![(
             BlockName::new("backbone"),
-            Block::CausalLm(Box::new(self)),
+            Block::CausalLm(Arc::new(self)),
         )])
     }
 
