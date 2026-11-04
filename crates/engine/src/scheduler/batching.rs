@@ -28,6 +28,7 @@
 //! within the rows a worker stages per call (`PassRows`).
 
 mod call;
+mod columns;
 mod plan;
 mod slots;
 

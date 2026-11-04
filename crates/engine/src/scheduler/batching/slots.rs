@@ -129,7 +129,18 @@ pub(crate) fn query_offsets(query_lens: &[u32]) -> Option<Vec<i32>> {
 pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
     let first = u32::try_from(call.coordinates.logical_position).ok()?;
     let tokens = u32::try_from(call.input_token_ids.len()).ok()?;
-    let mut positions = Vec::with_capacity(call.input_token_ids.len());
+    positions_of(first, tokens)
+}
+
+/// The absolute positions of `tokens` query tokens a call evaluates, starting at
+/// its first token's logical position.
+///
+/// The token count is the caller's, not `input_token_ids.len()`: a call whose
+/// rows embed no host token (a decode keeps its token in the mechanism's own
+/// request state) still evaluates one position per row, so the count comes from
+/// the call's forward rows.
+pub(crate) fn positions_of(first: u32, tokens: u32) -> Option<Vec<i32>> {
+    let mut positions = Vec::with_capacity(usize::try_from(tokens).ok()?);
     for offset in 0..tokens {
         positions.push(i32::try_from(first.checked_add(offset)?).ok()?);
     }
@@ -159,6 +170,24 @@ pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
 /// contiguous row order of one batch, or when a sampling prefill has no row —
 /// a batch must not ask a kernel to sample a row it does not have.
 pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Vec<i32>> {
+    logits_rows_of(
+        calls
+            .iter()
+            .map(|call| (call.kind, !call.consumer_slots.is_empty())),
+        rows,
+    )
+}
+
+/// [`logits_rows`] over the facts it reads from a call, so a batch can answer it
+/// without materialising the calls.
+///
+/// `samples` says whether the call's rows are sampled by a consumer; a call with
+/// none leaves `-1` on every row of its span.
+pub(crate) fn logits_rows_of(
+    calls: impl Iterator<Item = (ipc::CallKind, bool)>,
+    rows: &[Range<u32>],
+) -> Option<Vec<i32>> {
+    let calls: Vec<(ipc::CallKind, bool)> = calls.collect();
     if calls.len() != rows.len() {
         return None;
     }
@@ -170,13 +199,13 @@ pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Ve
         total = usize::try_from(span.end).ok()?;
     }
     let mut logits = vec![-1i32; total];
-    for (call, span) in calls.iter().zip(rows) {
-        if call.consumer_slots.is_empty() {
+    for ((kind, samples), span) in calls.into_iter().zip(rows) {
+        if !samples {
             continue;
         }
         let start = usize::try_from(span.start).ok()?;
         let end = usize::try_from(span.end).ok()?;
-        match call.kind {
+        match kind {
             ipc::CallKind::Forward(ipc::ForwardMode::Prefill) => {
                 let last = end.checked_sub(1).filter(|last| *last >= start)?;
                 logits[last] = i32::try_from(last).ok()?;
