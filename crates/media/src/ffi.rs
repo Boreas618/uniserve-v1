@@ -36,9 +36,12 @@ pub(crate) struct MediaInfo {
     pub(crate) video_duration_us: i64,
 }
 
-/// One audio track decoded to planar float at its native rate and layout.
+/// One audio track decoded to planar float at its stream's declared rate and
+/// layout.
 pub(crate) struct DecodedAudio {
-    /// Samples per second of the decoded track.
+    /// The stream's declared rate, which is also the converter's output rate.
+    /// An HE-AAC track's frames decode at twice this rate and are converted
+    /// back down, as the reference resampler does.
     pub(crate) rate: u32,
     /// Channel count; the planes are contiguous, one after another.
     pub(crate) channels: usize,
@@ -110,9 +113,17 @@ fn last_error() -> String {
 }
 
 /// Turns a shim return code into a result, reading the message it left.
+///
+/// The shim reports a failure of the media itself (a unit without a video
+/// stream, a track without audio) with its own code, which is a plan
+/// violation here, as those failures were `ValueError` at the Python
+/// boundary this crate replaces.
 fn check(code: c_int) -> Result<()> {
+    const PLAN: c_int = -2;
     if code == 0 {
         Ok(())
+    } else if code == PLAN {
+        Err(Error::Plan(last_error()))
     } else {
         Err(Error::Codec(last_error()))
     }
@@ -197,6 +208,9 @@ pub(crate) fn encode_audio_track(pcm: &[i16], samples: u32, rate: u32) -> Result
 pub(crate) struct OpenMuxer {
     pointer: *mut Muxer,
 }
+
+// SAFETY: the handle owns an AVFormatContext and the streams inside it. FFmpeg contexts have no thread affinity, and the session holding the handle is guarded by a Mutex whose every use takes the lock, so moving the handle between threads transfers exclusive ownership.
+unsafe impl Send for OpenMuxer {}
 
 impl OpenMuxer {
     /// Opens an assembly whose streams match `first_unit`'s video stream and
