@@ -26,6 +26,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { target = ["bf16", "f16", "f32"], source = ["bf16", "f16", "f32"], columns = ["32", "96", "5376"], block = ["1024"] }
+dimensions = { target = ["bf16", "f16", "f32"], source = ["bf16", "f16", "f32"], columns = ["32", "96", "2688", "5376"], block = ["1024"] }
 
 [parameters]

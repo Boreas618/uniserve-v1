@@ -108,6 +108,10 @@ const ACTIVATION_KERNEL: u32 = 12;
 /// The transformer's hidden width (`hidden_size`).
 const HIDDEN: u32 = 5376;
 
+/// The DiT's timestep embedding width, `time_dim` (`checkpoint/config.json`): the AdaLN cache's
+/// tables and the one cast that narrows the timestep activation into them are this wide.
+const TIME_DIM: u32 = 2688;
+
 /// The rotary geometry: 16 frequencies per position axis over three axes (time, height, width),
 /// so the leading 96 channels of each 128-channel head rotate and the trailing 32 do not.
 const ROPE_FREQ_DIM: u32 = 16;
@@ -726,6 +730,23 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // Three widths: the patchified rows before the video input projection (96 columns), the hidden
     // rows before the output projection (5376), and the audio latent's own rows before the audio
     // input projection (32) - the one projection whose input is narrower than a patch.
+    // The AdaLN cache's narrowing at `dtype = "auto"`: the reference casts the timestep activation to
+    // the weight's type before the modulation projections (`weights.py:210-224`), so the cache is BF16
+    // while the timestep pair arrives FP32 - one cast of `[groups, time_dim = 2688]`, and a
+    // `ScaledAdd` with `alpha = 1, beta = 0` is that cast. Nothing at a stated FP32 deployment
+    // narrows here, so only the pass whose deployment is narrower emits the row.
+    if deployment != DType::F32 {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target: deployment,
+                source: DType::F32,
+                columns: TIME_DIM,
+                block: 1024,
+            }
+            .to_string(),
+        );
+    }
     for columns in [32, 96, HIDDEN] {
         push(
             "scaled_add",
