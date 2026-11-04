@@ -50,7 +50,7 @@ def manifest_values(path: pathlib.Path) -> dict[str, set[str]]:
     return values
 
 
-def expectations(config: dict) -> list[tuple[str, str, str, str]]:
+def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, str]]:
     """(package, field, value, reason) for every value this block passes into a descriptor."""
     heads = config["num_attention_heads"]
     head_dim = config["attention_head_dim"]
@@ -65,9 +65,14 @@ def expectations(config: dict) -> list[tuple[str, str, str, str]]:
     rows: list[tuple[str, str, str, str]] = []
     add = rows.append
 
-    # The attention is FP32 SGEMM only for the consumers that hold FP32 activations; the DiT's
-    # dense attention is BF16 and binds `fa4`, whose key carries the rank's head counts.
-    for degree in (1, 2):
+    # The Ulysses degrees the deployments are meant to run. `Partition::validate` accepts any power of
+    # two that divides the head count - for this DiT that is 1, 2, 4 and 8 - so a degree outside this
+    # list is a legal partition that would refuse at its first attention launch; the caller is told so
+    # once, below, rather than the tool failing for cells no deployment asks for.
+    #
+    # The attention is FP32 SGEMM only for the consumers that hold FP32 activations; the DiT's dense
+    # attention is BF16 and binds `fa4`, whose key carries the rank's head counts.
+    for degree in degrees:
         if heads % degree == 0:
             for field in ("q_heads", "kv_heads"):
                 add(
@@ -125,7 +130,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
     parser.add_argument("--kernels", default="crates/ops/kernels")
+    parser.add_argument(
+        "--ulysses",
+        default="1,2",
+        help="the Ulysses degrees the deployments run, comma separated (default 1,2)",
+    )
     arguments = parser.parse_args()
+    degrees = [int(value) for value in arguments.ulysses.split(",") if value.strip()]
 
     root = pathlib.Path(arguments.root)
     kernels = pathlib.Path(arguments.kernels)
@@ -140,7 +151,19 @@ def main() -> int:
         config = json.loads(path.read_text())
         print(f"{path.parent.name}: {config['num_attention_heads']} heads, "
               f"{config['hidden_size']} wide, head width {config['attention_head_dim']}")
-        for package, field, value, reason in expectations(config):
+        legal = [
+            degree
+            for degree in (1, 2, 4, 8, 16)
+            if degree & (degree - 1) == 0
+            and config["num_attention_heads"] % degree == 0
+        ]
+        beyond = [degree for degree in legal if degree not in degrees]
+        if beyond:
+            print(
+                f"  note: degrees {beyond} are legal partitions and are not checked; "
+                f"a deployment at one would refuse at its first attention launch"
+            )
+        for package, field, value, reason in expectations(config, degrees):
             manifest = kernels / package / "package.toml"
             if not manifest.is_file():
                 print(f"  NO MANIFEST {package}")
