@@ -228,7 +228,11 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // The video encoder reads one tile per call, so its plan is stated per tile; the driver's loop
     // must hoist it or the arena is reserved once per tile.
     for (width, height) in [(256_u32, 64_u32), (512, 128)] {
-        let raster = minimax_h3::encoding::Extent { frames: 25, height, width };
+        let raster = minimax_h3::encoding::Extent {
+            frames: 25,
+            height,
+            width,
+        };
         let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
         let bytes: u64 = plan.iter().map(|buffer| buffer.elements * 4).sum();
         println!(
