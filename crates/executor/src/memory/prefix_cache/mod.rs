@@ -92,6 +92,10 @@ pub struct LayerPlanes {
     pub pages: u32,
     /// The element type the group's value planes hold, as a kernel operand.
     pub dtype: ops::DType,
+    /// The layer's key values, `[pages, block_size, kv_heads, head_dim]`.
+    pub key: StorageView,
+    /// The layer's value values, as `key`.
+    pub value: StorageView,
     /// The layer's key scales, `[pages,1,1,1]`; `None` on a dense pool.
     pub key_scale: Option<StorageView>,
     /// The layer's value scales, as `key_scale`.
@@ -358,6 +362,8 @@ impl PrefixCache {
             block_size: self.planes.page_size(group)?,
             pages: self.planes.pages(group)?,
             dtype: self.planes.dtype(group)?,
+            key: self.planes.key_values(group, layer)?,
+            value: self.planes.value_values(group, layer)?,
             key_scale: self.planes.key_scale(group, layer)?,
             value_scale: self.planes.value_scale(group, layer)?,
             key_initialized: self.planes.key_initialized(group, layer)?,

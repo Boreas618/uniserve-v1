@@ -1259,6 +1259,65 @@ impl CachePlanes {
             .ok_or_else(|| Error::Invariant("a cache pool always holds its flags".into()))
     }
 
+    /// One layer's key values as `[pages, block_size, kv_heads, head_dim]`,
+    /// borrowed from the value plane: a layer's cell of a page is one unit
+    /// holding `block_size` tokens, so the view strides by `units_per_page`
+    /// units between pages and by one row inside a page.
+    pub fn key_values(&self, group: usize, layer: usize) -> Result<StorageView> {
+        self.layer_values(group, layer, 0)
+    }
+
+    /// One layer's value values, as [`key_values`](Self::key_values).
+    pub fn value_values(&self, group: usize, layer: usize) -> Result<StorageView> {
+        self.layer_values(group, layer, 1)
+    }
+
+    /// The value-plane view of one layer, shaped
+    /// `[pages, block_size, kv_heads, head_dim]`.
+    ///
+    /// The plane holds one unit of `block_size` tokens per layer of a column,
+    /// so a page's stride is `units_per_page` units and a token's is one row;
+    /// the element type is the group's own, and nothing is copied.
+    fn layer_values(&self, group: usize, layer: usize, field: usize) -> Result<StorageView> {
+        let plan = self.group(group)?;
+        let (column, unit) = self.layer_cell(group, layer)?;
+        let units_per_page = self.units_per_page(group)?;
+        let pages = i64::from(self.pages(group)?);
+        if pages == 0 {
+            return Err(Error::Invariant(format!(
+                "cache group {group} holds no page"
+            )));
+        }
+        let dtype = plan.dtype;
+        let element = dtype.bytes() as u64;
+        if element == 0 || plan.row_bytes() == 0 || self.plan.plane_bytes % element != 0 {
+            return Err(Error::Invariant(format!(
+                "cache group {group} holds {} bytes of a page unit in {element}-byte elements",
+                self.plan.plane_bytes
+            )));
+        }
+        // The elements one column's unit holds: `block_size` tokens of one layer.
+        let unit_elements = (self.plan.plane_bytes / element) as i64;
+        let cells = i64::from(column) * i64::from(self.num_units) + i64::from(unit);
+        let offset = usize::try_from(cells as u64 * self.plan.plane_bytes).map_err(|_| {
+            Error::Invariant("a per-layer plane view lies outside its storage".into())
+        })?;
+        let heads = i64::from(plan.num_kv_heads);
+        let dim = i64::from(plan.head_dim);
+        StorageView::strided(
+            Arc::clone(&self.values[field]) as Arc<dyn Backing>,
+            offset,
+            dtype,
+            &[pages, i64::from(plan.block_size), heads, dim],
+            &[
+                i64::from(units_per_page) * unit_elements,
+                heads * dim,
+                dim,
+                1,
+            ],
+        )
+    }
+
     /// The per-layer view of one plane: `[pages, 1, 1, 1]` over the layer's
     /// cell, with one element per page and a page's stride of `units_per_page`
     /// units. It borrows the plane's storage; nothing is copied.
@@ -1567,6 +1626,12 @@ mod layer_view_tests {
 
         let second = pool.key_scale(0, 3)?.expect("an FP8 pool holds scales");
         assert_eq!(second.shape(), &[4, 1, 1, 1]);
+
+        // The layer's values are one unit of a page: `block_size` tokens of
+        // one row per head, and a page's stride is two units.
+        let values = pool.key_values(0, 3)?;
+        assert_eq!(values.shape(), &[4, 16, 1, 8]);
+        assert_eq!(values.strides(), &[2 * 128, 8, 8, 1]);
         Ok(())
     }
 
