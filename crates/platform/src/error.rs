@@ -31,6 +31,34 @@ pub enum Error {
         source: Arc<libloading::Error>,
     },
 
+    /// A native kernel library could not be opened (`NativeLibrary::open`).
+    #[error("cannot load native library {path}: {source}")]
+    NativeLoad {
+        path: std::path::PathBuf,
+        #[source]
+        source: Arc<libloading::Error>,
+    },
+
+    /// A native kernel library does not export the entry point its package
+    /// declares (`NativeLibrary::entry`).
+    #[error("native library {path} does not export {symbol}: {source}")]
+    NativeSymbol {
+        path: std::path::PathBuf,
+        symbol: String,
+        #[source]
+        source: Arc<libloading::Error>,
+    },
+
+    /// A cuBLASLt call returned a `cublasStatus_t` other than
+    /// `CUBLAS_STATUS_SUCCESS`.
+    #[error("{call} failed with {name} ({code}): {message}")]
+    Blas {
+        call: &'static str,
+        code: i32,
+        name: &'static str,
+        message: &'static str,
+    },
+
     /// A CUDA driver call returned a `CUresult` other than `CUDA_SUCCESS`.
     #[error("{call} failed with {name} ({code}): {message}")]
     Driver {

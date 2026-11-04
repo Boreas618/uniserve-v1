@@ -519,8 +519,8 @@ fn inherit_listener(command: &mut Command, listener: TcpListener) {
 /// A rank that ends in order destroys its CUDA contexts, which removes the
 /// shared memory the driver keeps for each context's interprocess events. A
 /// rank that is killed or crashes leaves that storage in `/dev/shm`, named
-/// for the rank's process id (`cuda::shm::remove_event_storage`), and the names of
-/// its NCCL communicators' proxy storage (`cuda::shm::NcclSegments`), which the
+/// for the rank's process id (`platform::shm::remove_event_storage`), and the names of
+/// its NCCL communicators' proxy storage (`platform::shm::NcclSegments`), which the
 /// daemon notes while the rank lives. Every wait here therefore observes
 /// the exit first without reaping it, removes the storage named for the rank
 /// while its zombie still holds the process id, so that no live process can
@@ -538,7 +538,7 @@ pub(crate) struct Child {
     exited: Option<Exited>,
     /// The NCCL shared memory the rank was last seen to map under names
     /// still linked ([`Self::note_nccl_segments`]).
-    segments: cuda::shm::NcclSegments,
+    segments: platform::shm::NcclSegments,
 }
 
 enum Process {
@@ -574,7 +574,7 @@ impl Child {
         Ok(Self {
             process: Process::Spawned(command.spawn()?),
             exited: None,
-            segments: cuda::shm::NcclSegments::default(),
+            segments: platform::shm::NcclSegments::default(),
         })
     }
 
@@ -584,7 +584,7 @@ impl Child {
         Self {
             process: Process::Adopted { pid, pidfd },
             exited: None,
-            segments: cuda::shm::NcclSegments::default(),
+            segments: platform::shm::NcclSegments::default(),
         }
     }
 
@@ -613,7 +613,7 @@ impl Child {
     pub(crate) fn note_nccl_segments(&mut self) -> std::io::Result<()> {
         if self.exited.is_none() {
             self.segments
-                .extend(cuda::shm::NcclSegments::mapped_by(Some(self.id()))?);
+                .extend(platform::shm::NcclSegments::mapped_by(Some(self.id()))?);
         }
         Ok(())
     }
@@ -704,7 +704,7 @@ impl Child {
         // effort: the rank is reaped whatever it finds.
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let _ = cuda::shm::remove_event_storage(uid, self.id());
+        let _ = platform::shm::remove_event_storage(uid, self.id());
         let _ = self.segments.remove();
         let exited = match &mut self.process {
             Process::Spawned(child) => Exited::Status(child.wait()?),

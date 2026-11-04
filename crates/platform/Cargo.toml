@@ -1,6 +1,6 @@
 [package]
-name = "cuda"
-description = "CUDA driver, virtual memory, NVML and NCCL bindings loaded at runtime"
+name = "platform"
+description = "The CUDA boundary: driver, virtual memory and allocator, graphs, kernel launch, NVML, NCCL, cuBLASLt and cuDNN, loaded at runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

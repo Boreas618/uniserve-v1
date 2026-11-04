@@ -690,7 +690,7 @@ mod tests {
     #[ignore = "requires a CUDA device"]
     fn launch_ranges_take_each_launch_and_each_graph_launch_whole() -> Result<()> {
         use crate::cupti::tests::{SERIAL, Spin, with_captured_graph};
-        use crate::{DeviceId, GraphExec, PrimaryContext, Stream, lock};
+        use crate::{DeviceId, PrimaryContext, Stream, lock};
 
         let _serial = lock(&SERIAL);
         let device = DeviceId(0);
@@ -705,9 +705,7 @@ mod tests {
             &stream,
             |stream| (0..2).try_for_each(|_| spin.launch(stream, 4, 100_000)),
             |source| {
-                // SAFETY: with_captured_graph keeps the source live, and this
-                // test is its sole owner and submitter.
-                let graph = unsafe { GraphExec::instantiate(device, source)? };
+                let graph = source.instantiate()?;
                 let mut launches =
                     RangeProfiler::enable(context.handle(), 0, &metrics, Ranges::Launches, 16)?;
                 launches.start()?;

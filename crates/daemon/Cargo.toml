@@ -16,7 +16,7 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
-cuda.workspace = true
+platform.workspace = true
 # The launches a successor world's ranks start with, which a change of the
 # parallel configuration plans before it starts them.
 engine.workspace = true
