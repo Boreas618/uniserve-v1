@@ -5,10 +5,10 @@ use std::sync::Arc;
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 
 use super::{BlockTableUpdate, GroupShape};
-use crate::memory::allocation::{Storage, StorageView};
-use crate::stream::{Fill, Issue};
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{Storage, StorageView};
+use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
 /// Byte alignment of each carved table inside the shared allocation.
@@ -176,6 +176,18 @@ impl BlockTableStorage {
         .into_iter()
         .map(|(name, view)| (name.to_owned(), view.clone()))
         .collect()
+    }
+
+    /// The device's unit tables as `[table, slot, width]` i32, with the
+    /// dimensions a caller must index them by.
+    ///
+    /// A batch reads row `slot` of table `table` at
+    /// `(table * slots + slot) * width` words; a row the scheduler never
+    /// filled is zero words, which is page 0 of a group whose pages start at
+    /// one. The view borrows the tables' storage: a caller that reads rows
+    /// after a batch must keep the slot until it does.
+    pub fn unit_tables(&self) -> (StorageView, u32, u32) {
+        (self.unit_tables.clone(), self.rows, self.width)
     }
 
     fn entry(&self, view: &StorageView, index: u64) -> u64 {

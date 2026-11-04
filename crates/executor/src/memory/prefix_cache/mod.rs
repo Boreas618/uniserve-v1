@@ -357,6 +357,13 @@ impl PrefixCache {
     /// `layer / columns` - so its scale and flag views are `[pages,1,1,1]`,
     /// borrowed from the per-cell planes and never copied. A dense pool answers
     /// `None` for its scales because it holds none.
+    /// The device's unit tables, as
+    /// [`BlockTableStorage::unit_tables`](block_tables::BlockTableStorage::unit_tables)
+    /// states them: `[table, slot, width]` i32 and the two dimensions.
+    pub fn unit_tables(&self) -> (StorageView, u32, u32) {
+        self.storage.unit_tables()
+    }
+
     pub fn layer_planes(&self, group: usize, layer: usize) -> Result<LayerPlanes> {
         Ok(LayerPlanes {
             block_size: self.planes.page_size(group)?,
