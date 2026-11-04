@@ -83,7 +83,7 @@ pub mod registration;
 /// Counter-based random draws of the rank's token sampler.
 pub mod philox;
 
-pub use channel::{Channel, Listener, Wake};
+pub use channel::{Channel, Listener, Wake, Waker};
 pub use error::{EncodingError, IpcError, IpcResult, TransportError};
 pub use frame::Frame;
 pub use launch::{ExpertParallelDescriptor, LaunchDescriptor, ReceivedWeights, StorageLaunch};
@@ -104,6 +104,8 @@ mod parallel;
 mod request;
 mod tensor;
 mod transfer;
+/// The first frame between main processes of one epoch (§2.3).
+pub mod peer;
 /// The scheduler's name for one phase (§4.5).
 pub mod phase;
 /// The vocabulary of a program-layer update (§7.3).
@@ -133,5 +135,6 @@ pub use proto::request::{
 pub use request::*;
 pub use tensor::*;
 pub use transfer::*;
+pub use peer::{PeerAccepted, PeerRegistration};
 pub use phase::PhaseId;
 pub use update::{ProgramStatus, UpdateFailure};
