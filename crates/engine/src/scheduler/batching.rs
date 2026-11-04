@@ -649,23 +649,22 @@ impl Scheduler {
         let Some(group) = cache.coordinator.groups().first() else {
             return;
         };
+        let (Ok(block_size), Ok(units_per_page)) = (
+            u32::try_from(group.block_size),
+            u32::try_from(group.units_per_page),
+        ) else {
+            return;
+        };
         let page = slots::PageGeometry {
-            block_size: group.block_size,
-            units_per_page: group.units_per_page,
+            block_size,
+            units_per_page,
         };
-        let Some(worker) = batch.requests.first().map(|(_, placed)| placed.worker.clone()) else {
+        // The attention descriptor's static bound: the executor states it
+        // from the launch, since a KV view's shape must not move per batch.
+        let max_kv_len = self.executor.info().max_model_len;
+        if max_kv_len == 0 {
             return;
-        };
-        let Some(max_kv_len) = self
-            .executor
-            .info()
-            .workers
-            .iter()
-            .find(|(id, _)| **id == worker)
-            .map(|(_, info)| info.max_model_len)
-        else {
-            return;
-        };
+        }
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut sampling = Vec::with_capacity(batch.requests.len());
         for (call, placed) in &batch.requests {
