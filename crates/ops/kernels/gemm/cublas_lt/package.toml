@@ -1,0 +1,43 @@
+# The gemm operator's cuBLASLt backend: design 5.2's program package.
+#
+# One native module per descriptor: the module's host code runs one dense
+# product through cuBLASLt, and the element types, the weight order and the
+# epilogue are compile-time choices `src/build.py` derives from
+# `UNISERVE_DESCRIPTOR` (design 9: the dense layers' GEMM).
+#
+# The algorithm choice and its workspace are the package's tuning data (design
+# 5.4): each shape asks cuBLASLt's heuristic once when it is first used, and the
+# plan is then reused for every call of that shape. Serving never times
+# anything. An offline tuner records its choices by publishing a new revision of
+# this package, which is why no plan is written outside the package.
+
+op = "gemm"
+backend = "cublas_lt"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+entries = { launch = "uniserve_gemm" }
+
+[source]
+kind = "cuda"
+files = ["src/gemm.cpp", "src/uniserve_gemm.h", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none_k_2048`.
+[kernel.descriptors]
+dimensions = { input = ["bf16", "f16", "f32"], weight = ["bf16", "f16", "f32"], accumulate = ["f32", "bf16", "f16"], output = ["bf16", "f16", "f32"], order = ["kxn", "nxk"], epilogue = ["none", "bias"], k = ["768", "1536", "2048", "4096", "7168"] }
+
+[parameters]
+# The language standard the host code is written in; the module has no device
+# code of its own (cuBLASLt brings its own kernels).
+standard = "c++20"
+optimization = "-O3"
