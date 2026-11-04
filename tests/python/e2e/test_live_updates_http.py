@@ -985,10 +985,13 @@ def _restart_while_streaming(
     # boundaries fall at different events of different requests.
     reads: list[list[str]] = [[] for _ in HANDED_STREAMS]
     dones = [threading.Event() for _ in HANDED_STREAMS]
+    # The finish reason each stream ends with: a response the successor closes
+    # instead of finishing carries none, and the count alone would not say so.
+    reasons: list[list[str]] = [[] for _ in HANDED_STREAMS]
     streaming = [
         threading.Thread(
             target=_stream_count,
-            args=(base_url, name, read, done),
+            args=(base_url, name, read, done, reason),
             kwargs={
                 "prompt": (
                     f"Count from 1 to {last}, separated by commas and spaces. "
@@ -996,7 +999,9 @@ def _restart_while_streaming(
                 )
             },
         )
-        for read, done, last in zip(reads, dones, HANDED_STREAMS, strict=True)
+        for read, done, reason, last in zip(
+            reads, dones, reasons, HANDED_STREAMS, strict=True
+        )
     ]
     for thread in streaming:
         thread.start()
@@ -1049,6 +1054,10 @@ def _restart_while_streaming(
         assert numbers and numbers[-1] >= last // 2, (
             f"stream {index} stopped at {numbers[-1] if numbers else 0}"
         )
+        # It finished rather than being closed: the successor's last chunk
+        # names why it stopped.
+        assert reasons[index], f"stream {index} ended without a finish reason"
+        assert reasons[index][-1] in ("stop", "length"), reasons[index]
 
     # The records prove the streams moved rather than ended: each was frozen,
     # taken over by the successor at the pause the successor measured, and
