@@ -25,6 +25,12 @@
 //! weights `i / 5`, and emits those five blended frames before the successor's body; the first blended
 //! frame is entirely the predecessor's and the fifth one fifth the successor's.
 
+use nn::Shape;
+use nn::layers::{CrossFade, RgbBytes};
+use nn::{DType, Forward, TensorView, Weight};
+
+use crate::config::CLIP_FRAMES;
+use crate::decoding::{CLIP_OUTPUT_FRAMES, OVERLAP_FRAMES};
 use crate::{Error, Result};
 
 /// The per-channel standard deviations the video decoder's RGB is normalized by, in red, green, blue
@@ -157,32 +163,247 @@ pub struct Splice {
     pub body: (u32, u32),
     /// The frames of the clip's own decode that overlap the next clip.
     pub overlap: (u32, u32),
+    /// Whether this clip ends the timeline and therefore writes its own tail.
+    pub last: bool,
 }
 
 impl Splice {
-    /// The splice the checkpoint's 25-frame clip decodes to: a 17-frame body and a 5-frame tail after
-    /// three VAE padding frames.
+    /// The splice the checkpoint's 25-frame clip decodes to: a 17-frame body to keep and a 5-frame
+    /// tail after three VAE padding frames.
     pub const CLIP: Self = Self {
-        body: (0, 17),
-        overlap: (20, 25),
+        body: (0, CLIP_FRAMES),
+        overlap: (CLIP_OUTPUT_FRAMES - OVERLAP_FRAMES, CLIP_OUTPUT_FRAMES),
+        last: false,
     };
 
-    /// The splice of a clip that ends the timeline: it keeps its own tail, so the last frames of the
-    /// video are not lost.
+    /// The splice of a clip that ends the timeline: it keeps its own body **and** its own tail, and it
+    /// still drops the three padding frames between them - the tail is the last five frames of the
+    /// video, not the padding that precedes it.
     pub const LAST: Self = Self {
-        body: (0, 25),
-        overlap: (25, 25),
+        body: (0, CLIP_FRAMES),
+        overlap: (CLIP_OUTPUT_FRAMES - OVERLAP_FRAMES, CLIP_OUTPUT_FRAMES),
+        last: true,
     };
-
-    /// The frames of a clip the timeline writes, in order, when it is not last.
-    pub fn kept(&self) -> (u32, u32) {
-        (self.body.0, self.body.1)
-    }
 
     /// How many frames of this clip the timeline writes.
     pub fn frames(&self) -> u32 {
-        let (start, stop) = self.kept();
-        stop - start
+        let body = self.body.1 - self.body.0;
+        let tail = if self.last {
+            self.overlap.1 - self.overlap.0
+        } else {
+            0
+        };
+        body + tail
+    }
+}
+
+/// The video postprocessor: one clip's decoded frames into the request's bytes.
+///
+/// `output.py:43-70` and `models/decoder.py:356-620` are the reference, and this is the step the design
+/// puts at the component's second entry point (`video_postprocessor.forward`): **the decoder decodes a
+/// clip, this splices it**. Per clip it drops the three VAE padding frames, cross-fades the clip's first
+/// five body frames against the predecessor's tail at weights `i/5` (the reference's
+/// `arange(5)/5`, so the first blended frame is entirely the predecessor's), yields the tail to the next
+/// clip as state, and writes the kept frames as `[frames, rows, columns, 3]` bytes.
+///
+/// The blend is `CrossFade` on the **frames** axis: the two sources are each one contiguous block (a
+/// `[3, 25, H, W]` clip and a `[3, 5, H, W]` tail), which is the operator's condition, and the frames'
+/// weights are the ones it applies along the leading positions of its axis. The arithmetic is the
+/// reference's decoded-precision blend followed by the FP32 de-normalization, in that order: the
+/// de-normalization is [`RgbBytes`]' and reads the same constants the checkpoint publishes.
+pub struct VideoPostprocessor {
+    fade: CrossFade,
+    bytes: RgbBytes,
+    dtype: DType,
+}
+
+impl VideoPostprocessor {
+    /// The blend over the five overlap frames and the byte packing of a raster of `dtype`.
+    ///
+    /// `mean` and `std` are the checkpoint's `[3]` de-normalization constants, published by the loader.
+    pub fn new(dtype: DType, mean: Weight, std: Weight) -> Result<Self> {
+        let fade = CrossFade::new(dtype, OVERLAP_FRAMES, 1).map_err(|error| {
+            Error::config(format!(
+                "the clip splice fades five frames of the frames axis, and CrossFade refuses axis 1: \
+                 {error}"
+            ))
+        })?;
+        Ok(Self {
+            fade,
+            bytes: RgbBytes::new(dtype, Rgb::CHANNELS, mean, std)?,
+            dtype,
+        })
+    }
+
+    /// The element type of the clip raster this reads.
+    pub const fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// The frames one clip of `splice` writes, which is what [`Self::forward`]'s `out` must hold.
+    pub fn frames(splice: &Splice) -> u32 {
+        splice.frames()
+    }
+
+    /// Write one clip's kept frames into `out`, blending with `previous` when it has a predecessor.
+    ///
+    /// `clip` is the clip's decoded raster `[3, frames, rows, columns]` in [`Self::dtype`]; `previous`
+    /// is the predecessor's tail `[3, overlap, rows, columns]` and is `None` for the timeline's first
+    /// clip, which has nothing to fade against; `blended` is a scratch raster the same shape as `clip`,
+    /// used only when there is a predecessor; `out` is `[splice.frames(), rows, columns, 3]` bytes.
+    ///
+    /// The clip's tail is not written here unless `splice.last`: it is the state the caller hands the
+    /// next clip, and passing it on is the runner's.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        previous: Option<TensorView>,
+        clip: TensorView,
+        splice: &Splice,
+        blended: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let raster = Raster::of(clip)?;
+        raster.check_out(out, splice)?;
+        let source = match previous {
+            Some(previous) => {
+                raster.check_previous(previous, self.dtype)?;
+                raster.check_scratch(blended, self.dtype)?;
+                self.fade.forward(f, Some(previous), clip, blended)?;
+                blended
+            }
+            None => clip,
+        };
+        self.bytes.forward(f, raster.body(source, splice), out)?;
+        if splice.last {
+            self.bytes
+                .forward(f, raster.written(source, splice.overlap), out)?;
+        }
+        Ok(())
+    }
+}
+
+/// The extents of one clip's decoded raster, read off the view.
+#[derive(Clone, Copy)]
+struct Raster {
+    frames: u32,
+    height: u32,
+    width: u32,
+}
+
+impl Raster {
+    /// The raster `[channels, frames, rows, columns]` a `clip` view describes.
+    fn of(clip: TensorView) -> Result<Self> {
+        if clip.shape.rank() != 4 || clip.shape.dim(0) != u64::from(Rgb::CHANNELS) {
+            return Err(Error::config(format!(
+                "a decoded clip is [{}, frames, rows, columns], not {:?}",
+                Rgb::CHANNELS,
+                clip.shape.dims()
+            )));
+        }
+        let frames = u32::try_from(clip.shape.dim(1))
+            .map_err(|_| Error::config("a clip taller than a frame count".to_owned()))?;
+        if frames != CLIP_OUTPUT_FRAMES {
+            return Err(Error::config(format!(
+                "a clip's decode is {CLIP_OUTPUT_FRAMES} frames and the view carries {frames}"
+            )));
+        }
+        Ok(Self {
+            frames,
+            height: u32::try_from(clip.shape.dim(2))
+                .map_err(|_| Error::config("a raster taller than a pixel count".to_owned()))?,
+            width: u32::try_from(clip.shape.dim(3))
+                .map_err(|_| Error::config("a raster wider than a pixel count".to_owned()))?,
+        })
+    }
+
+    /// The view of `range` frames of `raster`, as `[channels, frames, rows, columns]`.
+    ///
+    /// The clip is contiguous and channels-first, so a frame range is a column-block of every channel:
+    /// the view keeps the channel stride and narrows the frames axis, which every operator here reads
+    /// through the view's strides rather than by flattening.
+    fn written(&self, raster: TensorView, range: (u32, u32)) -> TensorView {
+        let (start, stop) = range;
+        let element = raster.element(&[0, u64::from(start), 0, 0]);
+        let shape = Shape::new(&[
+            u64::from(Rgb::CHANNELS),
+            u64::from(stop - start),
+            u64::from(self.height),
+            u64::from(self.width),
+        ]);
+        let strides = nn::Strides::new(&[
+            u64::from(self.frames) * u64::from(self.height) * u64::from(self.width),
+            u64::from(self.height) * u64::from(self.width),
+            u64::from(self.width),
+            1,
+        ]);
+        TensorView::with_strides(element, raster.dtype, shape, strides)
+    }
+
+    /// The body view of one clip: what the timeline keeps before the tail.
+    fn body(&self, raster: TensorView, splice: &Splice) -> TensorView {
+        self.written(raster, splice.body)
+    }
+
+    /// The output view of one clip: `[frames, rows, columns, channels]` bytes.
+    fn check_out(&self, out: TensorView, splice: &Splice) -> Result<()> {
+        let frames = u64::from(splice.frames());
+        if out.dtype != DType::U8 {
+            return Err(Error::config(format!(
+                "the output raster is u8 bytes, not {out:?}"
+            )));
+        }
+        if out.shape.dims() != [frames, u64::from(self.height), u64::from(self.width), 3] {
+            return Err(Error::config(format!(
+                "the output raster is [{} kept, {}, {}, 3] and the view is {:?}",
+                splice.frames(),
+                self.height,
+                self.width,
+                out.shape.dims()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The predecessor's tail, which must be one contiguous block of the clip's own type.
+    fn check_previous(&self, previous: TensorView, dtype: DType) -> Result<()> {
+        let shape = [
+            u64::from(Rgb::CHANNELS),
+            u64::from(OVERLAP_FRAMES),
+            u64::from(self.height),
+            u64::from(self.width),
+        ];
+        if previous.shape.dims() != shape {
+            return Err(Error::config(format!(
+                "a predecessor's tail is {shape:?} and the view is {:?}",
+                previous.shape.dims()
+            )));
+        }
+        if previous.dtype != dtype {
+            return Err(Error::config(format!(
+                "the predecessor's tail is {} and the clip is {dtype}",
+                previous.dtype
+            )));
+        }
+        Ok(())
+    }
+
+    /// The blend's scratch, which must be a raster the clip's own shape and type.
+    fn check_scratch(&self, blended: TensorView, dtype: DType) -> Result<()> {
+        let shape = [
+            u64::from(Rgb::CHANNELS),
+            u64::from(CLIP_OUTPUT_FRAMES),
+            u64::from(self.height),
+            u64::from(self.width),
+        ];
+        if blended.shape.dims() != shape || blended.dtype != dtype {
+            return Err(Error::config(format!(
+                "the blend's scratch is {shape:?} of {dtype} and the view is {:?} of {}",
+                blended.shape.dims(),
+                blended.dtype
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -253,16 +474,21 @@ mod tests {
         let rgb = Rgb::of(107, 768, 1344);
         assert_eq!(rgb.bytes(), 107 * 768 * 1344 * 3);
         assert_eq!(rgb.overlap_elements(), 3 * 5 * 768 * 1344);
-        assert_eq!(Rgb::workspace_frames(), 25);
-        // A clip writes 17 frames and shares 5; the last writes all 25.
-        assert_eq!(Splice::CLIP.frames(), 17);
-        assert_eq!(Splice::LAST.frames(), 25);
-        assert_eq!(timeline_frames(&[Splice::CLIP; 6]).expect("timeline"), 102);
-        let mut clips = vec![Splice::CLIP; 6];
+        assert_eq!(Rgb::workspace_frames(), CLIP_OUTPUT_FRAMES);
+        // A clip writes its body and shares a tail; the last writes its body **and** its tail, and the
+        // three padding frames between them are dropped, which is what makes the timeline `17n + 5`.
+        assert_eq!(Splice::CLIP.frames(), CLIP_FRAMES);
+        assert_eq!(Splice::LAST.frames(), CLIP_FRAMES + OVERLAP_FRAMES);
+        let clips_n = 6;
+        let mut clips = vec![Splice::CLIP; clips_n as usize];
         *clips.last_mut().expect("a clip") = Splice::LAST;
-        // 5 x 17 + 25 = 110: one timeline of `17n + 5` frames with n = 6 covers 107, and the last
-        // clip's tail is trimmed by the pixel extents the request states.
-        assert_eq!(timeline_frames(&clips).expect("timeline"), 110);
+        assert_eq!(
+            timeline_frames(&clips).expect("timeline"),
+            CLIP_FRAMES * clips_n + OVERLAP_FRAMES
+        );
+        // The padding frames are neither kept nor shared: `LAST`'s two ranges leave them out.
+        let (start, stop) = Splice::LAST.overlap;
+        assert!(Splice::LAST.body.1 < start && stop - start == OVERLAP_FRAMES);
         assert!(timeline_frames(&[]).is_err());
     }
 }
