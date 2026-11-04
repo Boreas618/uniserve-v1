@@ -19,6 +19,11 @@ publish = false
 clap.workspace = true
 libc.workspace = true
 ops.workspace = true
+# `cubin-launch` is the crate's one device-side member: it loads an installed module with
+# `platform::Library` and launches it with `Function::launch_ex`, which is the executor's own
+# route. Nothing of the Program Server itself reaches `platform`; the dependency exists for that
+# binary, and for the reason in `src/cubin_launch.rs`.
+platform = { path = "../platform" }
 prost.workspace = true
 rustix = { workspace = true, features = ["net"] }
 serde.workspace = true
@@ -34,3 +39,8 @@ protox.workspace = true
 
 [lints]
 workspace = true
+
+# The cubin launcher: one installed module, one recipe, one launch on a device.
+[[bin]]
+name = "cubin-launch"
+path = "src/bin/cubin_launch.rs"
