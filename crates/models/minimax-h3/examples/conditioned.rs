@@ -310,19 +310,16 @@ fn weights(args: &Args) -> Result<(), String> {
 /// raster would reserve the ladder fifteen times over at a served canvas. The grid's tiles are
 /// uniform, so the largest is the one the arena needs - and the frames are the condition's own, a
 /// still being one.
-fn largest_tile(config: &minimax_h3::VideoVaeConfig, pixels: Extent) -> Result<Extent, String> {
+fn largest_tile(pixels: Extent) -> Result<Extent, String> {
     let encoder =
         minimax_h3::tiled_encode::ClipEncoder::new(pixels.height, pixels.width).map_err(show)?;
-    let plan = encoder.plan();
-    let ratio = config.spatial_compression();
-    plan.tiles
-        .iter()
-        .map(|tile| Extent {
-            frames: pixels.frames,
-            height: tile.rows.1 * ratio,
-            width: tile.columns.1 * ratio,
-        })
-        .max_by_key(|extent| extent.height as u64 * extent.width as u64)
+    // `Plan::tile_extents` is the driver's own statement of what `VideoEncoder::reserve` is handed,
+    // ratio and seam rule included, so the arena cannot disagree with the reservation.
+    encoder
+        .plan()
+        .tile_extents(pixels.frames)
+        .into_iter()
+        .max_by_key(|extent| u64::from(extent.height) * u64::from(extent.width))
         .ok_or_else(|| "the tile plan of this raster holds no tile".to_owned())
 }
 
@@ -380,7 +377,7 @@ fn plan(args: &Args) -> Result<(), String> {
     };
     let conditioning =
         minimax_h3::encoding::conditioning_arena(&config.video_vae, 1, latent).map_err(show)?;
-    let tile = largest_tile(&config.video_vae, pixels)?;
+    let tile = largest_tile(pixels)?;
     let tiles =
         minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, tile).map_err(show)?;
     println!(
@@ -629,7 +626,7 @@ fn encode(args: &Args) -> Result<(), String> {
             .iter()
             .map(|buffer| buffer.bytes())
             .sum();
-    let tile = largest_tile(&config.video_vae, pixels)?;
+    let tile = largest_tile(pixels)?;
     let encoder_bytes: u64 =
         minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, tile)
             .map_err(show)?

@@ -573,17 +573,14 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for (height, width) in [(768_u32, 1344_u32), (672, 1536)] {
         let encoder = minimax_h3::tiled_encode::ClipEncoder::new(height, width)?;
         let plan = encoder.plan();
-        let ratio = config.video_vae.spatial_compression();
+        // The extents are the driver's own - `VideoEncoder::reserve`'s input - so the plan below is
+        // the plan the run reserves, ratio and seam rule included.
+        let extents = plan.tile_extents(minimax_h3::decoding::CLIP_OUTPUT_FRAMES);
         let mut total = 0_u64;
         let mut largest = 0_u64;
-        for tile in &plan.tiles {
-            let extent = minimax_h3::encoding::Extent {
-                frames: minimax_h3::decoding::CLIP_OUTPUT_FRAMES,
-                height: tile.rows.1 * ratio,
-                width: tile.columns.1 * ratio,
-            };
+        for extent in &extents {
             let bytes: u64 =
-                minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, extent)?
+                minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, *extent)?
                     .iter()
                     .map(|buffer| buffer.bytes())
                     .sum();
@@ -591,8 +588,8 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             if largest < bytes {
                 largest = bytes;
                 println!(
-                    "    largest tile: latent {}x{}, pixels {}x{}",
-                    tile.rows.1, tile.columns.1, extent.height, extent.width
+                    "    largest tile: pixels {}x{}, {} frames",
+                    extent.height, extent.width, extent.frames
                 );
             }
         }
@@ -643,21 +640,27 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     // The video encoder reads one tile per call, so its plan is stated per tile; the driver's loop
     // must hoist it or the arena is reserved once per tile.
-    for (width, height) in [(256_u32, 256_u32), (512, 128)] {
-        let raster = minimax_h3::encoding::Extent {
-            frames: 25,
-            height,
-            width,
-        };
-        let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
-        distinct_names("the video encoder tile plan", &plan);
-        let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
-        println!(
-            "encoder tile {width}x{height} px: {} buffers, {} bytes = {} MiB",
-            plan.len(),
-            bytes,
-            bytes / (1 << 20)
-        );
+    // The encoder's ladder is per tile and scales with the condition's **frames**, not with the
+    // raster: a still (`fl2va`'s keyframe, `ref2va`'s image) is one frame, a reference clip is
+    // `CLIP_OUTPUT_FRAMES`. Both are printed because a deployment must bound what a request brings,
+    // and the still is what most conditioned requests actually cost.
+    for frames in [1_u32, minimax_h3::decoding::CLIP_OUTPUT_FRAMES] {
+        for (width, height) in [(256_u32, 256_u32), (512, 128)] {
+            let raster = minimax_h3::encoding::Extent {
+                frames,
+                height,
+                width,
+            };
+            let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
+            distinct_names("the video encoder tile plan", &plan);
+            let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+            println!(
+                "encoder tile {width}x{height} px, {frames} frames: {} buffers, {} bytes = {} MiB",
+                plan.len(),
+                bytes,
+                bytes / (1 << 20)
+            );
+        }
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
     let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
