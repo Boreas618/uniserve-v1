@@ -119,6 +119,7 @@ const OPERATORS: &[&str] = &[
     <crate::audio_activation::AudioActivation as Op>::NAME,
     <crate::patch::Patch as Op>::NAME,
     <crate::rope::RopeApply as Op>::NAME,
+    <crate::pcm::PcmInterleave as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.
