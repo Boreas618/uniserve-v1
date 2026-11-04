@@ -846,8 +846,11 @@ impl Denoiser {
         let video_indices = state(tables, "video_indices")?;
         let video_rows = u64::from(video_indices.shape.dim(0) as u32);
         let patch = nn::layers::Patch::new(channels, height, width)?;
+        // The one inverse of the pack above: the DiT's `1x2x2` tiles back into the latent raster.
+        // It reads the token grid from `out`, so a clip of another length replays the same launch.
+        let unpatch = nn::layers::UnpatchifyVideo::new(dtype, channels, 1, 2)?;
         let patched = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
-        patch.forward(f, video, patched, frames, nn::layers::PatchMode::Patchify)?;
+        patch.forward(f, video, patched, frames)?;
         let projected = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
         self.transformer.project(f, patched, projected)?;
         nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, projected, video_indices)?;
@@ -917,13 +920,7 @@ impl Denoiser {
             velocity_rows,
         )?;
         let velocity = arena.tensor(dtype, video.shape)?;
-        patch.forward(
-            f,
-            velocity,
-            velocity_rows,
-            frames,
-            nn::layers::PatchMode::Unpatchify,
-        )?;
+        unpatch.forward(f, velocity_rows, velocity)?;
         self.solver
             .step(f, Modality::Video, video, velocity, step.index)?;
 
