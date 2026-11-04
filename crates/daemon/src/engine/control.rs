@@ -808,6 +808,11 @@ pub fn prepare_epoch(
     filled: &crate::epoch::FilledPrograms,
     descriptors: &[program_server::Descriptors],
 ) -> anyhow::Result<crate::epoch::FilledPrograms> {
+    // A program is selected by its backend's name, so a deployment that left
+    // one at `auto` has not said which program it means: refused here, by the
+    // option that would state it, rather than as a package the server is not
+    // missing (§5.1).
+    filled.stated().map_err(anyhow::Error::msg)?;
     let leader_server = servers
         .iter()
         .find(|server| server.host == leader)
@@ -1347,22 +1352,29 @@ mod tests {
             .write_build_config(3, &crate::epoch::BuildConfig::of(&ServeConfig::default()))
             .unwrap();
         let own = std::env::current_exe().unwrap().display().to_string();
-        let mut spec = wire::EngineSpec {
-            deployment: "model".to_owned(),
-            model: "/models/qwen3".to_owned(),
-            host: "rank-0".to_owned(),
-            world: 3,
-            placement: Some(wire::Placement {
-                devices: vec![0],
-                queue_depth: 4,
-                ..wire::Placement::default()
-            }),
-            workers: Some(wire::Workers {
-                executable: own,
-                ..wire::Workers::default()
-            }),
-            ..wire::EngineSpec::default()
-        };
+        // The deployment's own spec, as `ServeOptions` builds it: an epoch's
+        // start reads the ranks it places, and a spec with no scheduling or
+        // cache tables is no deployment's.
+        let mut spec = ServeConfig::default().engine_spec().unwrap();
+        // The leader completes the options' spec with what the loaded model
+        // determines, and a start reads it back (`crate::leader`), so a spec an
+        // epoch could start always states facts. This test starts a process,
+        // not a model, so it states the empty ones the crate's other specs do.
+        spec.model_facts = Some(Default::default());
+        spec.deployment = "model".to_owned();
+        spec.model = "/models/qwen3".to_owned();
+        spec.host = "rank-0".to_owned();
+        spec.world = 3;
+        let placement = spec
+            .placement
+            .as_mut()
+            .expect("the default spec places ranks");
+        placement.devices = vec![0];
+        placement.queue_depth = 4;
+        spec.workers
+            .as_mut()
+            .expect("the default spec names the workers")
+            .executable = own;
 
         let start = control.epoch_start(&spec, 9).unwrap();
         assert_eq!(start.build, Some(proto::BUILD.to_owned()));
@@ -1572,7 +1584,10 @@ fn local_devices(host: &str, spec: &wire::EngineSpec) -> anyhow::Result<Vec<u32>
                 })?
                 .parse::<u32>()
                 .with_context(|| {
-                    format!("the device ordinal of rank {:?} does not parse", rank.device)
+                    format!(
+                        "the device ordinal of rank {:?} does not parse",
+                        rank.device
+                    )
                 })?;
             if !devices.contains(&ordinal) {
                 devices.push(ordinal);

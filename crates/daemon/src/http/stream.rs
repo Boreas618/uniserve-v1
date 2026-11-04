@@ -76,6 +76,15 @@ pub(crate) enum Step {
     Migrate,
     /// The response ended; no later frame follows.
     Ended,
+    /// The response failed before anything was written: the connection answers
+    /// it with `error`'s status and `frames`, which are the sink's own shape of
+    /// the failure. Only a response whose head is held reports this — a
+    /// response whose head is written reports its failure as frames inside the
+    /// stream, where the status is already stated.
+    Failed {
+        error: crate::openai::error::ApiError,
+        frames: Vec<Bytes>,
+    },
 }
 
 /// A response body produced from one request's engine events, freezable at an
@@ -164,9 +173,37 @@ pub(crate) enum Pause {
     Complete,
 }
 
+/// What a response's driver hands its connection.
+enum Produced {
+    /// A body frame.
+    Frame(Bytes),
+    /// The response failed before its head was written: the connection states
+    /// the failure in the head it has not sent yet.
+    Failed {
+        error: crate::openai::error::ApiError,
+        frames: Vec<Bytes>,
+    },
+}
+
+/// What a response body produces first, for a connection that has not written
+/// the response head yet.
+pub(crate) enum Opened {
+    /// The body's first frame.
+    Frame(Bytes),
+    /// The body failed before producing anything: the head states the outcome.
+    Failed(crate::openai::error::ApiError, Vec<Bytes>),
+    /// The body ended without producing anything.
+    Ended,
+}
+
 /// The handle a connection writes one handoffable response body from.
 pub(crate) struct ResponseStream {
-    frames: mpsc::Receiver<Bytes>,
+    frames: mpsc::Receiver<Produced>,
+    /// Frames taken from a failure the connection reads as body frames.
+    produced: std::collections::VecDeque<Bytes>,
+    /// Whether the response's head waits for the body's first output: one
+    /// document, whose status is the outcome.
+    head_held: bool,
     control: mpsc::Sender<Control>,
     /// Whether to write an SSE comment while the body waits for its engine.
     keep_alive: bool,
@@ -180,30 +217,81 @@ impl ResponseStream {
     /// longer than the keep-alive interval; it is for server-sent events only,
     /// where a comment is part of the protocol.
     pub(crate) fn start(session: Box<dyn Session>, keep_alive: bool) -> Self {
+        Self::opening(session, keep_alive, false)
+    }
+
+    /// Starts a body whose head the connection holds until the first output
+    /// arrives: a response answered as one document, whose status is its
+    /// outcome (§7.5.1 step 4 — such a response has not started writing when a
+    /// handoff pauses it).
+    pub(crate) fn start_held(session: Box<dyn Session>, keep_alive: bool) -> Self {
+        Self::opening(session, keep_alive, true)
+    }
+
+    fn opening(session: Box<dyn Session>, keep_alive: bool, head_held: bool) -> Self {
         let (frames, produced) = mpsc::channel(AHEAD);
         let (control, controls) = mpsc::channel(4);
         tokio::spawn(drive(session, frames, controls));
         Self {
             frames: produced,
+            produced: std::collections::VecDeque::new(),
+            head_held,
             control,
             keep_alive,
         }
     }
 
+    /// Whether the response head waits for this body's first output.
+    pub(crate) fn head_held(&self) -> bool {
+        self.head_held
+    }
+
+    /// What the body produces first, for a connection whose head is not
+    /// written yet.
+    pub(crate) async fn opened(&mut self) -> Opened {
+        if let Some(frame) = self.produced.pop_front() {
+            return Opened::Frame(frame);
+        }
+        match self.frames.recv().await {
+            Some(Produced::Frame(frame)) => Opened::Frame(frame),
+            Some(Produced::Failed { error, frames }) => Opened::Failed(error, frames),
+            None => Opened::Ended,
+        }
+    }
+
     /// The next body frame; `None` once the body ended.
     pub(crate) async fn next_frame(&mut self) -> Option<Bytes> {
-        if !self.keep_alive {
-            return self.frames.recv().await;
+        if let Some(frame) = self.produced.pop_front() {
+            return Some(frame);
         }
-        match tokio::time::timeout(KEEP_ALIVE, self.frames.recv()).await {
-            Ok(frame) => frame,
-            Err(_) => Some(Bytes::from_static(KEEP_ALIVE_COMMENT)),
+        let frame = if !self.keep_alive {
+            self.frames.recv().await
+        } else {
+            match tokio::time::timeout(KEEP_ALIVE, self.frames.recv()).await {
+                Ok(frame) => frame,
+                Err(_) => return Some(Bytes::from_static(KEEP_ALIVE_COMMENT)),
+            }
+        };
+        match frame? {
+            Produced::Frame(frame) => Some(frame),
+            // A failure the connection is reading as body frames: its head is
+            // already written, so the sink's document is all that is left.
+            Produced::Failed { frames, .. } => {
+                self.produced.extend(frames);
+                self.produced.pop_front()
+            }
         }
     }
 
     /// Takes a frame that is ready without waiting.
     pub(crate) fn try_frame(&mut self) -> Option<Bytes> {
-        self.frames.try_recv().ok()
+        if let Some(frame) = self.produced.pop_front() {
+            return Some(frame);
+        }
+        match self.frames.try_recv() {
+            Ok(Produced::Frame(frame)) => Some(frame),
+            _ => None,
+        }
     }
 
     /// Freezes the response at the boundary just reached.
@@ -236,15 +324,29 @@ impl ResponseStream {
                     Err(_) => return Pause::Complete,
                 },
                 frame = self.frames.recv() => match frame {
-                    Some(frame) => keep(frame),
+                    Some(Produced::Frame(frame)) => keep(frame),
+                    // A failure the connection reads as body frames: its head
+                    // is written, so those frames are the response's own.
+                    Some(Produced::Failed { frames, .. }) => {
+                        for frame in frames {
+                            keep(frame);
+                        }
+                    }
                     None => return Pause::Complete,
                 },
             }
         };
         // The driver produces nothing until it is told to go on, so what is
         // left in the channel is everything it produced before the boundary.
-        while let Ok(frame) = self.frames.try_recv() {
-            keep(frame);
+        while let Ok(produced) = self.frames.try_recv() {
+            match produced {
+                Produced::Frame(frame) => keep(frame),
+                Produced::Failed { frames, .. } => {
+                    for frame in frames {
+                        keep(frame);
+                    }
+                }
+            }
         }
         Pause::Frozen(state)
     }
@@ -321,7 +423,7 @@ pub(crate) fn attach(response: &mut Response, body: HandedBody) {
 /// messages before each step.
 async fn drive(
     mut session: Box<dyn Session>,
-    frames: mpsc::Sender<Bytes>,
+    frames: mpsc::Sender<Produced>,
     mut control: mpsc::Receiver<Control>,
 ) {
     loop {
@@ -337,7 +439,7 @@ async fn drive(
         match step {
             Driven::Step(Step::Frames(produced)) => {
                 for frame in produced {
-                    if frames.send(frame).await.is_err() {
+                    if frames.send(Produced::Frame(frame)).await.is_err() {
                         // The connection is gone; cancel the request.
                         session.abort();
                         return;
@@ -347,6 +449,20 @@ async fn drive(
             Driven::Step(Step::Migrate) => session.migrate().await,
             Driven::Step(Step::Ended) => {
                 session.abort();
+                return;
+            }
+            Driven::Step(Step::Failed {
+                error,
+                frames: produced,
+            }) => {
+                // The connection has not written the head, so it states the
+                // failure there: this step is the body's last.
+                let _ = frames
+                    .send(Produced::Failed {
+                        error,
+                        frames: produced,
+                    })
+                    .await;
                 return;
             }
             Driven::Message(Control::Pause(answer)) => {

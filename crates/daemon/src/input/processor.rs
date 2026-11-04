@@ -162,7 +162,6 @@ pub(crate) trait LoadModel {
 }
 
 impl LoadModel for ModelConfig {
-
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     ///
     /// A diffusers pipeline has no chat template and carries its conditioner's

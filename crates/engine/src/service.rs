@@ -610,9 +610,9 @@ struct Attachment {
     info: wire::EngineInfo,
 }
 
-/// Serves the daemon's requests on `stream` with `schedulers` until the
-/// daemon commands a shutdown or closes the connection, then shuts every
-/// scheduler down.
+/// Serves the daemon's requests on `stream` with `schedulers`, under `policy`
+/// read from `policies`, until the daemon commands a shutdown or closes the
+/// connection, then shuts every scheduler down.
 ///
 /// The connection has said hello and been welcomed, and the engine has
 /// reported itself ready; from here on it carries submissions, commands,
@@ -620,10 +620,23 @@ struct Attachment {
 /// engine reports itself failed and goes on answering each submission with
 /// an error.
 ///
+/// `policy` is the epoch's first policy, installed before the first
+/// submission (§7.3 steps 2 and 3). A daemon that owns the engine's process
+/// interface commands its epochs' policies there instead, and starts the
+/// engine with none (§[`run_engine`]); a caller that runs the schedulers
+/// itself has no process interface to command one, and an engine with no
+/// route instance places no request.
+///
 /// # Errors
 ///
-/// Fails when the connection fails or the event threads cannot start.
-pub fn serve_requests(stream: UnixStream, schedulers: Vec<SchedulerHandle>) -> anyhow::Result<()> {
+/// Fails when the connection fails, the event threads cannot start, or
+/// `policy` cannot be prepared or switched in.
+pub fn serve_requests(
+    stream: UnixStream,
+    schedulers: Vec<SchedulerHandle>,
+    policy: PolicyProgram,
+    policies: Arc<dyn PolicySource + Send + Sync>,
+) -> anyhow::Result<()> {
     let writer = stream
         .try_clone()
         .context("sharing the daemon's connection")?;
@@ -632,7 +645,8 @@ pub fn serve_requests(stream: UnixStream, schedulers: Vec<SchedulerHandle>) -> a
         Connection::from_unix(writer)?,
         schedulers,
         None,
-        None,
+        Some(policies),
+        Some(policy),
     )
 }
 
@@ -648,6 +662,7 @@ fn serve(
     schedulers: Vec<SchedulerHandle>,
     attachment: Option<Attachment>,
     policies: Option<Arc<dyn PolicySource + Send + Sync>>,
+    serving: Option<PolicyProgram>,
 ) -> anyhow::Result<()> {
     let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
     let count = schedulers.len();
@@ -681,6 +696,20 @@ fn serve(
         Ordering::Release,
     );
     anyhow::ensure!(!routing.slots.is_empty(), "the engine runs no scheduler");
+
+    // §7.3 steps 2 and 3 for an engine whose caller states the policy it
+    // serves: the route instance answers before the first submission, because
+    // nothing else installs one here. A daemon that commands its epochs'
+    // policies over the process interface states none, and its precopy does.
+    if let Some(program) = serving {
+        let source = policies
+            .as_ref()
+            .context("an engine serving a stated policy needs the source of its module")?;
+        routing
+            .precopy_route(source.as_ref(), program)
+            .map_err(anyhow::Error::msg)?;
+        routing.switchover_route().map_err(anyhow::Error::msg)?;
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     // The daemon's commands for the epoch's policy run beside the requests: a
@@ -2508,6 +2537,7 @@ pub fn run_engine(
         schedulers,
         Some(Attachment { engine, info }),
         policies,
+        None,
     )
 }
 
