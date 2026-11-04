@@ -1240,16 +1240,22 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     );
                 }
             }
+            // The paired forward runs in the **smallest** bucket that launches the operator: what it
+            // establishes is a fact about the operator's program under this descriptor key, not about
+            // the bucket, so the cheapest forward the model has establishes it as well as every other
+            // one would, and the mechanism's own shadow batches compare the buckets its resident
+            // requests occupy (7.3 step 2). Comparing every bucket here would spend `buckets x
+            // operators` full forwards of the precopy's budget re-establishing one fact.
+            let compared = named
+                .then(|| launching.iter().copied().min())
+                .flatten()
+                // A kernel cannot be compared with one of another descriptor (`Forward::operate`
+                // pairs on operator and key), so a key one generation does not hold - a new launch,
+                // or one whose descriptor changed - is left to the walk, which recaptures.
+                .filter(|_| next.kernel(operator, &key).is_ok())
+                .filter(|_| self.generation.kernel(operator, &key).is_ok());
             for bucket in launching {
-                // The paired forward runs first, and only where **both** generations have a program
-                // under this same key: a kernel cannot be compared with one of another descriptor
-                // (`Forward::operate` pairs on operator and key), so a key one of them does not hold
-                // - a new launch, or one whose descriptor changed - is left to the walk, which
-                // recaptures the bucket.
-                if named
-                    && next.kernel(operator, &key).is_ok()
-                    && self.generation.kernel(operator, &key).is_ok()
-                {
+                if compared == Some(bucket) {
                     jobs.push(Job::Shadow {
                         runner: self.id,
                         operator,
