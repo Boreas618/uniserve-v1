@@ -401,6 +401,13 @@ fn directories(path: &Path) -> Result<Vec<PathBuf>> {
 /// never reused. A pid in the name is what says whether that process is still
 /// running: this one's staged directories are live and are left alone.
 fn sweep_other_staging(parent: &Path) -> Result<()> {
+    // Whether a process is alive is a fact this only knows how to ask for on a
+    // host with `/proc`. Without one, every other staging directory looks dead,
+    // and sweeping a live peer's would corrupt its publish — so a host that
+    // cannot answer the question keeps the leftovers instead.
+    if !Path::new("/proc").is_dir() {
+        return Ok(());
+    }
     let mine = format!(".staged-{}-", std::process::id());
     for entry in std::fs::read_dir(parent)? {
         let entry = entry?;
