@@ -1179,6 +1179,14 @@ impl Denoiser {
         latents: nn::Latents,
         cond: nn::Conditioning<'_>,
     ) -> Result<()> {
+        // The sparse path's rows are tile-ordered and its attention reads the segment tables rather
+        // than the dense visibility pair; until `attention_sparse` is in the tree this deployment
+        // has no forward, and saying so beats failing on a table lookup three lines down.
+        if !self.config.attention.is_dense() {
+            return Err(Error::config(
+                "this deployment attends sparsely, and the sparse forward is not wired".to_owned(),
+            ));
+        }
         let tables = cond.state;
         let video = latents.video;
         let channels = video.shape.dim(0);
