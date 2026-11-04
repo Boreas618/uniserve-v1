@@ -1189,53 +1189,6 @@ fn replica_facts(
     )
 }
 
-/// Every candidate replica of `request`'s call of `kind` that serves the named
-/// component: a media call, whose candidates are the workers binding that
-/// component rather than the text path's.
-pub(crate) fn component_replicas(
-    scheduler: &Scheduler,
-    request: RequestKey,
-    kind: CallKind,
-    component: &str,
-) -> Vec<ReplicaView> {
-    component_facts(scheduler, request, kind, component)
-        .into_iter()
-        .map(|(view, _, _)| view)
-        .collect()
-}
-
-/// The workers [`component_replicas`] offers, in the same order and of the same
-/// length: the mechanism's half of a named component's placement decision.
-pub(crate) fn component_targets(
-    scheduler: &Scheduler,
-    request: RequestKey,
-    kind: CallKind,
-    component: &str,
-) -> Vec<(crate::WorkerGroupId, String)> {
-    component_facts(scheduler, request, kind, component)
-        .into_iter()
-        .map(|(_, worker, bound)| (worker, bound))
-        .collect()
-}
-
-/// Every candidate replica of a named component's call, as views.
-fn component_facts(
-    scheduler: &Scheduler,
-    request: RequestKey,
-    kind: CallKind,
-    component: &str,
-) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
-    let executor = scheduler.executor.as_ref();
-    candidate_facts(
-        scheduler,
-        request,
-        kind,
-        scheduler
-            .placement
-            .component_candidates(executor, kind, component),
-    )
-}
-
 /// One replica view per candidate of `request`'s call, with the worker and
 /// component it names.
 ///
@@ -1357,21 +1310,6 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         phases: phases_in(&scheduler.info, &world_blocks(scheduler.executor.as_ref())),
         ranks: Vec::new(),
     }
-}
-
-/// The snapshot, with the requests the mechanism no longer holds but still
-/// reports: a policy put in mid-flight sees a finished request whose output
-/// events are retained, as the guest's `Snapshot` asks.
-///
-/// The recorder holds the last view it told the policy of each such request;
-/// this appends the ones the snapshot does not already name.
-pub(crate) fn with_finished(mut snapshot: Snapshot, finished: &[RequestView]) -> Snapshot {
-    for view in finished {
-        if !snapshot.requests.iter().any(|held| held.id == view.id) {
-            snapshot.requests.push(view.clone());
-        }
-    }
-    snapshot
 }
 
 /// The first request the mechanism is still to admit.
@@ -1521,16 +1459,6 @@ pub(crate) fn arrived(request: RequestView) -> Event {
     Event::Arrived { request }
 }
 
-/// The mechanism admitted a queued request.
-pub(crate) const fn admitted(request: ViewRequestId) -> Event {
-    Event::Admitted { request }
-}
-
-/// A resident request's view changed in a way the policy must see.
-pub(crate) fn updated(request: RequestView) -> Event {
-    Event::Updated { request }
-}
-
 /// A call of the request advanced by `tokens` tokens of `phase`.
 pub(crate) const fn advanced(request: ViewRequestId, phase: PhaseId, tokens: u32) -> Event {
     Event::Advanced {
@@ -1569,19 +1497,9 @@ pub(crate) fn cached(page: PageView) -> Event {
     Event::Cached { page }
 }
 
-/// A resident (device) page was used again.
-pub(crate) const fn hit(page: PageId) -> Event {
-    Event::Hit { page }
-}
-
 /// A page was freed.
 pub(crate) const fn freed(page: PageId) -> Event {
     Event::Freed { page }
-}
-
-/// An encoder product entered the encoder cache.
-pub(crate) fn encoded(entry: EncodingView) -> Event {
-    Event::Encoded { entry }
 }
 
 #[cfg(test)]
