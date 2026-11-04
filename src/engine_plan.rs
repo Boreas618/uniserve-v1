@@ -292,7 +292,7 @@ impl EpochPlan {
                     .largest(Variant::DecodeGreedy)
                     .map_or(1, |bucket| bucket.rows);
                 let provider: Box<dyn KvProvider> =
-                    Box::new(ResidentCache::new(memory.shared_cache(), rows)?);
+                    Box::new(ResidentCache::new(memory.shared_cache(), device, rows)?);
                 let runner = CausalLmRunner::new(
                     RunnerId(0),
                     vec![PhaseId(0)],

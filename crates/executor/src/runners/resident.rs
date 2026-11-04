@@ -19,6 +19,7 @@ use ops::{DType, DevicePtr, Shape, Strides, TensorView};
 use platform::{Buffer, PoolKind, Stream};
 
 use crate::arena::Pools;
+use crate::memory::prefix_cache::scratch::ScratchCache;
 
 use super::causal_lm::KvProvider;
 use crate::memory::prefix_cache::{LayerPlanes, PrefixCache};
@@ -30,6 +31,14 @@ pub struct ResidentCache {
     /// slots, applied transfers) while a batch may be gathering its table, so the share is behind
     /// the owners' one lock rather than an unsynchronized `Arc`.
     cache: Arc<Mutex<PrefixCache>>,
+    /// The device the cache and the scratch set live on.
+    device: platform::DeviceId,
+    /// The device's pools, attached by the executor before the first gather: the scratch page set
+    /// is mapped through them, so the mapping is inside the device's one book (4.1).
+    pools: Mutex<Option<Arc<Mutex<Pools>>>>,
+    /// The paired forward's page set, mapped on the first shadow walk. One set serves every group:
+    /// its rows are the batch's rows and its pages are the largest page set a row needs.
+    scratch: Mutex<Option<Scratch>>,
     /// One gather column per attention group, `[rows, width]` i32, carved when the device's pools
     /// are attached (the executor creates them, so they cannot be had at construction).
     tables: Vec<Table>,
@@ -70,6 +79,50 @@ impl Table {
         })
     }
 
+    /// A `[rows, pages]` i32 table over a scratch set, filled once with the set's own page ids:
+    /// page `k` of row `r` is `r * pages + k`.
+    ///
+    /// The ids do not depend on a batch, so the table is written once rather than gathered per
+    /// step: a paired forward's pages are private to it (7.3), and every row of every batch reads
+    /// the same numbering.
+    fn new_scratch(
+        pools: &Arc<Mutex<Pools>>,
+        rows: u32,
+        pages: u32,
+        device: platform::DeviceId,
+        stream: &Stream,
+    ) -> Result<Self> {
+        let mut locked = pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let table = Self::new(&mut locked, rows, pages)?;
+        let mut ids = Vec::with_capacity(rows as usize * pages as usize);
+        for row in 0..rows {
+            for page in 0..pages {
+                ids.push(i32::try_from(row * pages + page).map_err(|_| {
+                    Error::Invalid("a scratch page id does not fit i32".into())
+                })?);
+            }
+        }
+        let bytes = ids.len() * 4;
+        let mut host = platform::PinnedBuffer::new(device, bytes)?;
+        // SAFETY: the pinned buffer holds exactly `ids.len()` i32 and is written whole before it is
+        // read; the copy is stream-ordered before the first forward that reads the table.
+        unsafe {
+            let target = host.as_mut_slice();
+            let source =
+                std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4);
+            target.copy_from_slice(source);
+            platform::memcpy_async(
+                table.buffer.address(),
+                host.address(),
+                bytes,
+                stream,
+            )?;
+        }
+        Ok(table)
+    }
+
     /// The `[rows, width]` i32 view over this table's storage.
     fn view(&self) -> TensorView {
         TensorView::new(
@@ -90,7 +143,7 @@ impl ResidentCache {
     ///
     /// `rows` is the bucket's row count, padding included: every captured graph addresses a table
     /// of exactly that height, so the gather column is allocated once, here, and never grows.
-    pub fn new(cache: Arc<Mutex<PrefixCache>>, rows: u32) -> Result<Self> {
+    pub fn new(cache: Arc<Mutex<PrefixCache>>, device: platform::DeviceId, rows: u32) -> Result<Self> {
         let groups = {
             let cache = cache
                 .lock()
@@ -110,6 +163,9 @@ impl ResidentCache {
         };
         Ok(Self {
             cache,
+            device,
+            pools: Mutex::new(None),
+            scratch: Mutex::new(None),
             tables: Vec::new(),
             rows,
             width,
@@ -122,6 +178,53 @@ impl ResidentCache {
     /// The pool behind the provider, for a caller that also drives its imports and exports.
     pub fn cache(&self) -> &Arc<Mutex<PrefixCache>> {
         &self.cache
+    }
+
+    /// The paired forward's view: its group's table and the layer planes over the scratch pages.
+    fn scratch_view(
+        &self,
+        group: usize,
+        slots: &[i32],
+        scratch: &Option<Scratch>,
+    ) -> (TensorView, Vec<KvPlanes>) {
+        let scratch = scratch
+            .as_ref()
+            .expect("the scratch set was just mapped or mapped already");
+        let layers = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .layers(group);
+        let mut planes = Vec::with_capacity(layers);
+        for layer in 0..layers {
+            // A layer's planes are borrowed views over the region; a failure here is a region that
+            // does not hold the layer, which the provider reports by leaving the plane out.
+            match scratch
+                .cache
+                .layer_planes(group, layer)
+                .and_then(|planes| planes_of(&planes))
+            {
+                Ok(plane) => planes.push(plane),
+                Err(error) => {
+                    tracing::warn!(%error, group, layer, "a scratch plane does not resolve");
+                }
+            }
+        }
+        let rows = slots.len().max(1) as u32;
+        match scratch.tables.get(group) {
+            Some(table) => (
+                TensorView::new(
+                    DevicePtr::new(table.buffer.address()),
+                    DType::I32,
+                    Shape::new(&[u64::from(rows), u64::from(table.width)]),
+                ),
+                planes,
+            ),
+            None => (
+                TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[0, 0])),
+                planes,
+            ),
+        }
     }
 
     /// Gathers rows `slots` of `group`'s pooled table into the group's column and answers it.
@@ -236,11 +339,26 @@ fn view_of(view: &crate::memory::allocation::StorageView) -> Result<TensorView> 
     ))
 }
 
+/// The paired forward's scratch page set: the region and one `[rows, pages]` i32 block table per
+/// group over it.
+///
+/// The set is the shadow's own - its pages are never a serving request's (7.3) - so the table's
+/// page ids are this set's own numbering: page `k` of row `r` is `r * pages + k`, which is what the
+/// pool's per-row tables say and what the attention kernel reads.
+struct Scratch {
+    cache: ScratchCache,
+    tables: Vec<Table>,
+}
+
 impl KvProvider for ResidentCache {
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) -> Result<()> {
         if !self.tables.is_empty() {
             return Ok(());
         }
+        *self
+            .pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&pools));
         let mut tables = Vec::with_capacity(self.groups);
         {
             let mut locked = pools
