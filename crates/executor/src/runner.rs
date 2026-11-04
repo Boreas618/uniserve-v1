@@ -43,6 +43,20 @@ pub trait Runner: Send {
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
+    /// Turns one shadow batch of the scheduler's `shadow` pass into the paired forwards it needs
+    /// (7.3 step 2).
+    ///
+    /// `batch.generation` is the generation being prepared: the batch's columns say what to run and
+    /// the runner compares that generation's kernels against the serving one's, operator by
+    /// operator, without writing resident memory. A runner that shadows no operator returns no
+    /// job.
+    fn shadow(&mut self, batch: Batch) -> Result<Jobs> {
+        let _ = batch;
+        Err(crate::Error::Invariant(
+            "this runner has no shadow pass".into(),
+        ))
+    }
+
     /// Captures every bucket of the serving generation that has no graph yet, largest first
     /// (`specs/replaceable-processes.md` 9.4 step 3: the executor captures before it serves).
     ///
@@ -55,6 +69,9 @@ pub trait Runner: Send {
     /// launch structure intact, recapture those whose structure changes, and return the jobs the
     /// device must run between serving batches to finish it.
     ///
+    /// Which of the two a bucket needs is a fact about the walk's launch structure against the
+    /// captured graph, so a runner returns the walk job and decides inside it (4.5).
+    ///
     /// Precopy leaves the current generation serving. The runner holds both generations until
     /// `purge` releases the old one.
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs>;
@@ -63,12 +80,15 @@ pub trait Runner: Send {
     /// its kernels and graphs. The runner keeps the previous generation for a revert (7.3).
     fn switchover(&mut self, generation: u64);
 
-    /// Reverts a prepared generation: it never takes over, the serving generation stays, and its
-    /// graphs are released (7.3 step 4).
+    /// Reverts a generation (7.3 step 4).
     ///
-    /// This is `switchover`'s reverse for an update that did not commit. Design 4.5's method list
-    /// does not name it and a failed precopy cannot do without it, so it is a filled silence beside
-    /// `serve` and `warmup`.
+    /// After a switchover this is the switchover reversed: the generation kept for a revert serves
+    /// again and the failed one takes its place as the kept generation, so its graphs and kernels
+    /// live until `purge` releases them after the last batch that used them. A generation that
+    /// never took over has its graphs released here and the serving generation is untouched.
+    ///
+    /// Design 4.5's method list does not name it and a failed precopy cannot do without it, so it
+    /// is a filled silence beside `serve` and `warmup`.
     fn revert(&mut self, generation: u64);
 
     /// Releases everything that references a generation older than `generation` (7.3): the graphs
