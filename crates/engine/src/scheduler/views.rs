@@ -647,7 +647,34 @@ fn warming(scheduler: &Scheduler) -> Vec<WarmingView> {
 /// The mechanism knows the shortfall when executing a plan hits it; a step that
 /// hit none has nothing to reclaim.
 pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
-    (!scheduler.starved.is_empty()).then_some(shortage(Storage::KvUnits, 1))
+    if scheduler.starved.is_empty() {
+        return None;
+    }
+    let Some(cache) = scheduler.storage.cache() else {
+        return Some(shortage(Storage::KvUnits, 1));
+    };
+    // What the starved requests' next calls need beyond what the pool holds: a
+    // policy sizing its victims by `need` frees enough for them to go on. Each
+    // contributes at least one unit, because a request the mechanism could not
+    // give units to needs some however small its next call is (a prefill chunk
+    // is sized by the policy, so its token count is not known here).
+    let wanted = scheduler
+        .starved
+        .iter()
+        .filter_map(|id| {
+            let state = scheduler.running.get(id)?;
+            Some((*id, state))
+        })
+        .map(|(id, state)| {
+            let tokens = usize::try_from(next_tokens(scheduler, state, id)).unwrap_or(usize::MAX);
+            u64::try_from(cache.coordinator.units_for_tokens(tokens).max(1)).unwrap_or(u64::MAX)
+        })
+        .fold(0u64, u64::saturating_add);
+    let free = u64::try_from(cache.block_pool.free_units()).unwrap_or(0);
+    Some(shortage(
+        Storage::KvUnits,
+        wanted.saturating_sub(free).max(1),
+    ))
 }
 
 // ---------------------------------------------------------------------------
