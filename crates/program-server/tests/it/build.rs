@@ -36,10 +36,51 @@ fn repository() -> PathBuf {
         .expect("the repository root above the crate")
 }
 
-/// The interpreter of the Program Server's own Python environment.
-fn interpreter() -> PathBuf {
-    repository().join("crates/program-server/python/.venv/bin/python")
+/// The interpreter of the Program Server's own Python environment, when this
+/// host has one.
+///
+/// The environment is provisioned, not part of the repository, and a host may
+/// keep it anywhere; a witness that needs it must find it or skip, never fail
+/// for it. `UNISERVE_PROGRAM_SERVER_PYTHON` names it; otherwise the environment
+/// under the crate is tried, then a `python3.12` on `PATH` that already has
+/// Triton.
+fn python() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(named) = std::env::var_os("UNISERVE_PROGRAM_SERVER_PYTHON") {
+        candidates.push(PathBuf::from(named));
+    }
+    let environment = repository().join("crates/program-server/python/.venv/bin");
+    candidates.push(environment.join("python"));
+    candidates.push(environment.join("python3"));
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        for name in ["python3.12", "python3"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() && compiles(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
+
+/// Whether an interpreter imports Triton, which is what a Triton package's build
+/// needs of it.
+fn compiles(interpreter: &Path) -> bool {
+    std::process::Command::new(interpreter)
+        .args(["-c", "import triton"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// The sentence a witness prints when this host has no Python environment.
+const NO_PYTHON: &str = "SKIPPED (provisioning): no Python environment with Triton; set \
+     UNISERVE_PROGRAM_SERVER_PYTHON or `uv sync --project crates/program-server/python`";
 
 /// A package of the tree and the pieces a request names it by: its directory,
 /// its operator, its backend, and one descriptor its `[kernel.descriptors]`
@@ -50,6 +91,10 @@ struct TreePackage {
     op: String,
     backend: String,
     descriptor: String,
+    /// The compile script the package names, when it names one. A `cuda`
+    /// package whose script is Python needs the Program Server's environment to
+    /// run it, which is a different thing to provision than nvcc.
+    script: Option<String>,
 }
 
 /// The operators the Qwen3-MoE slice names, in the order its fixture lists
@@ -82,16 +127,27 @@ fn slice_operators() -> Vec<String> {
 fn tree_package(kind: &str) -> Option<TreePackage> {
     let slice = slice_operators();
     let packages = tree_packages(kind);
-    for operator in &slice {
-        if let Some(package) = packages
-            .iter()
-            .find(|package| &package.op == operator)
-            .map(repackage)
-        {
-            return Some(package);
-        }
-    }
-    packages.into_iter().next()
+    // A script that is not Python builds the module without the Program
+    // Server's environment, so a witness of the source kind alone prefers it:
+    // otherwise the witness silently becomes a test of that environment.
+    let plain = |package: &TreePackage| {
+        package
+            .script
+            .as_deref()
+            .is_none_or(|script| !script.ends_with(".py"))
+    };
+    let from_slice = |wanted: bool| {
+        slice.iter().find_map(|operator| {
+            packages
+                .iter()
+                .find(|package| &package.op == operator && (!wanted || plain(package)))
+                .map(repackage)
+        })
+    };
+    from_slice(true)
+        .or_else(|| packages.iter().find(|package| plain(package)).map(repackage))
+        .or_else(|| from_slice(false))
+        .or_else(|| packages.first().map(repackage))
 }
 
 /// A package of `tree_packages`, by value, so the caller can own it.
@@ -101,6 +157,7 @@ fn repackage(package: &TreePackage) -> TreePackage {
         op: package.op.clone(),
         backend: package.backend.clone(),
         descriptor: package.descriptor.clone(),
+        script: package.script.clone(),
     }
 }
 
@@ -134,8 +191,8 @@ fn tree_packages(kind: &str) -> Vec<TreePackage> {
             let Ok(parsed) = text.parse::<toml::Table>() else {
                 continue;
             };
-            let source_kind = parsed
-                .get("source")
+            let source = parsed.get("source");
+            let source_kind = source
                 .and_then(|source| source.get("kind"))
                 .and_then(toml::Value::as_str);
             if source_kind != Some(kind) {
@@ -150,11 +207,16 @@ fn tree_packages(kind: &str) -> Vec<TreePackage> {
             let Some(descriptor) = descriptor_key(&text) else {
                 continue;
             };
+            let script = source
+                .and_then(|source| source.get("script"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned);
             found.push(TreePackage {
                 directory: backend,
                 op: op.to_owned(),
                 backend: backend_name.to_owned(),
                 descriptor,
+                script,
             });
         }
     }
@@ -418,22 +480,17 @@ fn file_of(module: &Module, name: &str) -> Vec<u8> {
 
 #[test]
 fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
-    if !interpreter().is_file() {
-        eprintln!(
-            "SKIPPED (provisioning): no Python environment at {}.\n\
-             Create it with `uv sync --project crates/program-server/python \
-             --python /usr/bin/python3.12`, then run this test again.",
-            interpreter().display()
-        );
+    let Some(python) = python() else {
+        eprintln!("{NO_PYTHON}");
         return;
-    }
+    };
     let Some(package) = tree_package("triton") else {
         eprintln!("SKIPPED: the tree holds no Triton package");
         return;
     };
     let toolchains = ToolchainConfig {
         nvcc: None,
-        python: interpreter(),
+        python: python.clone(),
         wasm: None,
         max_jobs: 2,
     };
@@ -525,6 +582,10 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
 
 #[test]
 fn a_cuda_package_builds_the_module_its_manifest_declares() {
+    let Some(python) = python() else {
+        eprintln!("{NO_PYTHON}");
+        return;
+    };
     if !have("nvcc", &["--version"]) {
         eprintln!("SKIPPED (provisioning): no nvcc on this host");
         return;
@@ -535,7 +596,7 @@ fn a_cuda_package_builds_the_module_its_manifest_declares() {
     };
     let toolchains = ToolchainConfig {
         nvcc: None,
-        python: interpreter(),
+        python: python.clone(),
         wasm: None,
         max_jobs: 2,
     };
@@ -614,20 +675,17 @@ fn a_cuda_package_builds_the_module_its_manifest_declares() {
 
 #[test]
 fn a_cute_dsl_package_builds_a_native_module_with_its_entries() {
-    if !interpreter().is_file() {
-        eprintln!(
-            "SKIPPED (provisioning): no Python environment at {}",
-            interpreter().display()
-        );
+    let Some(python) = python() else {
+        eprintln!("{NO_PYTHON}");
         return;
-    }
+    };
     let Some(package) = tree_package("cute_dsl") else {
         eprintln!("SKIPPED: the tree holds no CuTe DSL package");
         return;
     };
     let toolchains = ToolchainConfig {
         nvcc: None,
-        python: interpreter(),
+        python: python.clone(),
         wasm: None,
         max_jobs: 2,
     };
@@ -834,4 +892,259 @@ fn an_executable_program_is_installed_stored_and_resolved_as_it_is() {
 
     witness.stop.store(true, Ordering::SeqCst);
     witness.thread.join().unwrap();
+}
+
+/// A package that declares no toolchain version is built by whatever this host
+/// has; one that names a version this host does not have is refused before its
+/// build starts.
+///
+/// The version is the one part of a package's declaration that is about the
+/// host rather than about the program, and a fixture whose build does not
+/// depend on the patch release declares it empty so that it builds on whichever
+/// host the caller's test uses (design section 5.2). The same package with a
+/// version no host has proves the comparison is still made.
+#[test]
+fn a_package_that_declares_no_toolchain_version_builds_on_any_host() {
+    let Some(toolchains) = cuda_toolchains() else {
+        eprintln!("SKIPPED (provisioning): this host has no nvcc to build with");
+        return;
+    };
+    let source = repository().join("crates/ops/kernels/moe_sort/trtllm");
+    let manifest = std::fs::read_to_string(source.join("package.toml")).unwrap();
+    let Some(key) = descriptor_key(&manifest) else {
+        panic!("the moe_sort package declares no descriptor");
+    };
+    let temporary = tempfile::tempdir().unwrap();
+
+    // The same sources twice: once declaring no version, once declaring one no
+    // host has.
+    let mut packages = Vec::new();
+    for (name, version) in [("any-version", ""), ("another-version", "0.0.1")] {
+        let directory = temporary.path().join(name);
+        copy_tree(&source, &directory);
+        std::fs::write(
+            directory.join("package.toml"),
+            declare_toolchain_version(&manifest, version),
+        )
+        .unwrap();
+        packages.push(directory);
+    }
+
+    let built = prepare_outcome(&packages[0], "moe_sort", "trtllm", &key, toolchains.clone());
+    assert!(
+        built.is_ok(),
+        "a package declaring no version was not built: {built:?}"
+    );
+
+    let refused = prepare_outcome(&packages[1], "moe_sort", "trtllm", &key, toolchains);
+    let message = refused.expect_err("a package declaring another version was built");
+    assert!(
+        message.contains("is written for nvcc"),
+        "the refusal does not name the version: {message}"
+    );
+}
+
+/// The toolchains a CUDA package needs, when this host has nvcc.
+fn cuda_toolchains() -> Option<ToolchainConfig> {
+    let Some(python) = python() else {
+        eprintln!("{NO_PYTHON}");
+        return None;
+    };
+    if !have("nvcc", &["--version"]) {
+        return None;
+    }
+    let toolchains = ToolchainConfig {
+        nvcc: None,
+        python: python.clone(),
+        wasm: None,
+        max_jobs: 1,
+    };
+    let version = program_server::toolchain::Toolchains::discover(&toolchains)
+        .ok()?
+        .version(program_server::manifest::ToolchainKind::Nvcc)
+        .ok()?
+        .to_owned();
+    eprintln!("this host's nvcc is {version}");
+    Some(toolchains)
+}
+
+/// Installs and prepares one package, answering the failure's message when it
+/// fails.
+fn prepare_outcome(
+    package: &Path,
+    op: &str,
+    backend: &str,
+    key: &str,
+    toolchains: ToolchainConfig,
+) -> std::result::Result<(), String> {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = configuration(temporary.path(), toolchains);
+    let (_server, stop, thread) = start(&configuration);
+    let mut client = Client::connect(&configuration.socket).unwrap();
+    let outcome = client
+        .install(package)
+        .map_err(|error| error.to_string())
+        .and_then(|_| {
+            let request = PrepareRequest {
+                targets: vec![Target::new("sm_100a")],
+                programs: vec![ProgramRequest {
+                    slot: ProgramSlot::all(op),
+                    selector: Selector::Latest {
+                        backend: backend.to_owned(),
+                        arguments: toml::Table::new(),
+                    },
+                }],
+                descriptors: vec![Descriptors {
+                    op: op.to_owned(),
+                    keys: vec![key.to_owned()],
+                }],
+            };
+            client
+                .prepare(&request, &mut |_| {})
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+    outcome
+}
+
+/// A scheduling policy is built when it is installed, and what the store keeps is
+/// its module: a second server over the same package root — the restart a
+/// deployment does — prepares and resolves it with no wasm toolchain at all.
+///
+/// A policy is the one kind whose build needs its repository's ancestry: its
+/// crate inherits a workspace from the directories above it, so it can only be
+/// built while the publisher's directory exists. Building it at install is what
+/// removes that dependency from everything after (design section 6.2).
+#[test]
+fn a_policy_is_built_when_it_is_installed_and_needs_no_compiler_after() {
+    let Some(python) = python() else {
+        eprintln!("{NO_PYTHON}");
+        return;
+    };
+    let precompiler = match std::env::var_os("SCHEDULING_PRECOMPILE") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let candidate = repository().join("target/programs-builder01/debug/scheduling-precompile");
+            if !candidate.is_file() {
+                eprintln!(
+                    "SKIPPED (provisioning): no scheduling-precompile; \
+                     `cargo build -p scheduling-precompile` builds it"
+                );
+                return;
+            }
+            candidate
+        }
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let package = temporary.path().join("policy");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    // The smallest module wasmtime accepts as a policy's input: the wasm header
+    // and nothing else. What the policy computes is a scheduling question, not
+    // this path's.
+    std::fs::write(
+        package.join("src/build.py"),
+        "import os, pathlib\n\
+         out = pathlib.Path(os.environ['UNISERVE_OUT'])\n\
+         out.mkdir(parents=True, exist_ok=True)\n\
+         (out / 'policy.wasm').write_bytes(b'\\x00asm\\x01\\x00\\x00\\x00')\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("package.toml"),
+        r#"# A synthetic policy: the program layer's wasm path, nothing else.
+op = "scheduling"
+backend = "fixture"
+
+[toolchain]
+kind = "wasm"
+version = ""
+
+[module]
+form = "wasm"
+
+[source]
+kind = "wasm"
+files = ["src/build.py"]
+script = "src/build.py"
+"#,
+    )
+    .unwrap();
+
+    let root = temporary.path().join("packages");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = temporary.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let with_precompiler = ServerConfig {
+        socket: temporary.path().join("first.sock"),
+        package_root: root.clone(),
+        store_roots: vec![Root {
+            path: store.clone(),
+            writable: true,
+        }],
+        upstream: None,
+        limits: Limits::default(),
+        toolchains: ToolchainConfig {
+            nvcc: None,
+            python: python.clone(),
+            wasm: Some(precompiler),
+            max_jobs: 1,
+        },
+        devices: vec![Device {
+            arch: Target::new("sm_100a"),
+            model: Target::new("b200"),
+        }],
+    };
+    let (_server, stop, thread) = start(&with_precompiler);
+    let mut client = Client::connect(&with_precompiler.socket).unwrap();
+    client.install(&package).unwrap();
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+
+    // The artifact is beside the installed manifest, so a host that has no
+    // precompiler — the deployment's serving host — can still prepare it.
+    let revision = root.join("scheduling").join("fixture").join("1");
+    assert!(
+        revision.join("module.wasm").is_file(),
+        "install kept no module beside the manifest at {}",
+        revision.display()
+    );
+
+    let mut without_precompiler = with_precompiler.clone();
+    without_precompiler.socket = temporary.path().join("second.sock");
+    without_precompiler.toolchains.wasm = None;
+    let (_server, stop, thread) = start(&without_precompiler);
+    let mut client = Client::connect(&without_precompiler.socket).unwrap();
+    let request = PrepareRequest {
+        targets: Vec::new(),
+        programs: vec![ProgramRequest {
+            slot: ProgramSlot::all("scheduling"),
+            selector: Selector::Latest {
+                backend: "fixture".to_owned(),
+                arguments: toml::Table::new(),
+            },
+        }],
+        descriptors: Vec::new(),
+    };
+    let prepared = client
+        .prepare(&request, &mut |_| {})
+        .expect("a policy whose module the store holds needs no compiler");
+    let target = Target::new(program_server::manifest::WASM_TARGET);
+    let module = client
+        .resolve(
+            "scheduling",
+            &prepared.programs[0].program,
+            &target,
+            program_server::manifest::POLICY_DESCRIPTOR,
+            &mut |_| {},
+        )
+        .expect("the policy's module resolves");
+    assert_eq!(module.form, ModuleForm::Wasm);
+    assert!(
+        !file_of(&module, program_server::source::MODULE_WASM).is_empty(),
+        "the resolved module holds no wasm"
+    );
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
 }
