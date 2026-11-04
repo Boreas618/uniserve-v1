@@ -2611,14 +2611,16 @@ fn a_latent_image_block_is_written_by_its_own_call() {
     );
 }
 
-/// A context prefill writes a vision block whole, so a block longer than the
-/// step budget can never be scheduled: its request is refused at submission.
-/// A block of exactly the step budget is served, because the budget is
-/// inclusive and the block gets a step of its own: the text before it is
-/// prefilled first, so the step that writes the block starts at its first
-/// position and carries exactly its tokens. A chunk that would have to split a
-/// block is never named.
-#[test]
+/// A context prefill writes the prompt and an input image's vision block in
+/// one call, the block whole, so the step budget bounds the **context** the
+/// prefill reaches and not the block alone: a request whose context does not
+/// fit is refused at submission, and one that fits exactly is served.
+///
+/// The prompt here is four tokens, so a block of twelve makes the sixteen-token
+/// budget exactly and is served, while a block of thirteen does not fit and is
+/// refused. A block that fits the budget on its own and not beside its prompt
+/// (sixteen, against this prompt) is refused too, and the reason names the
+/// context.
 fn a_vision_block_beyond_the_step_budget_is_refused() {
     const STEP_BUDGET: u32 = 16;
 
@@ -2662,8 +2664,11 @@ fn a_vision_block_beyond_the_step_budget_is_refused() {
         }
         None
     };
+    // Four prompt tokens and a block of twelve fill the step budget exactly.
+    const PROMPT_TOKENS: u32 = 4;
     let oversized = terminal(96, STEP_BUDGET + 1);
-    let fitting = terminal(97, STEP_BUDGET);
+    let alone = terminal(98, STEP_BUDGET);
+    let fitting = terminal(97, STEP_BUDGET - PROMPT_TOKENS);
     handle.shutdown();
     let _ = jh.join();
 
@@ -2676,6 +2681,16 @@ fn a_vision_block_beyond_the_step_budget_is_refused() {
             })
         ),
         "{oversized:?}"
+    );
+    assert!(
+        matches!(
+            &alone,
+            Some(Event::Rejected {
+                kind: RejectionKind::Invalid,
+                ..
+            })
+        ),
+        "a block that fills the budget alone does not fit beside its prompt: {alone:?}"
     );
     assert!(
         matches!(

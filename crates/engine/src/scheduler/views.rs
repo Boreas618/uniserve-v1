@@ -698,7 +698,18 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
         // phase it needs next, and its draft gap appears in `refill_tokens`.
         // `PhaseKind::Refill` stays in the phase table as the kind of the call
         // the mechanism builds, not as a phase a request sits in.
-        CallKind::Forward(ForwardMode::Prefill) if refill_gap(scheduler, state).is_some() => {
+        // Only a request whose context is fully ingested can be refilled:
+        // before that, a prefill call is the chunk that writes the rest of
+        // the prompt, and naming it a decode hides that chunk from the
+        // policy (the built call then differs from the plan and is dropped).
+        CallKind::Forward(ForwardMode::Prefill)
+            if refill_gap(scheduler, state).is_some()
+                && scheduler
+                    .num_scheduled_prompt_tokens(id)
+                    .is_some_and(|scheduled| {
+                        scheduled >= state.req.prompt_token_ids.len() as u32
+                    }) =>
+        {
             PhaseKind::Decode
         }
         other => call_phase(other),
@@ -713,15 +724,7 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
 /// the tokens its context already holds plus the block a commit writes. A
 /// canvas-generating request's commit extends the context past its prompt, and
 /// the prefill that writes it is sized from this end.
-///
-/// A vision block is written whole, so the end never falls inside one: it is
-/// the boundary at or after the cursor — the start of the block the prefill has
-/// not reached yet, the end of the one it is inside, or the end of the text
-/// after every block. A step budget that exactly fits one block therefore
-/// serves it, in a step of its own, while a chunk that would have to split the
-/// block is never named. `max_num_batched_tokens` bounds a step inclusively:
-/// a step of exactly that many tokens is legal.
-fn prefill_end(state: &RequestState, prefilled: u32) -> u32 {
+fn prefill_end(state: &RequestState) -> u32 {
     // The end of the context the next prefill must reach. A migrated request's
     // prompt continues with the tokens it generated before it moved here
     // (`Scheduler::request_state`), so the prompt ids say how far the context
@@ -731,37 +734,24 @@ fn prefill_end(state: &RequestState, prefilled: u32) -> u32 {
     // Every vision block of an input image writes its cache tokens into the
     // context at its prompt position, so the prefill that reaches it is sized
     // past the text around it.
-    let mut total = prompt;
-    let mut boundary: Option<u32> = None;
+    let mut blocks = 0u32;
     let mut cursor = generation::BlockCursor::default();
-    while let Some((image, input)) = state.input_block(cursor) {
+    while let Some((_, input)) = state.input_block(cursor) {
         if input.encoder != crate::ImageEncoder::Vision {
             break;
         }
         let Some(tokens) = input.num_cache_tokens else {
             break;
         };
-        let start = image.position;
-        let stop = start.saturating_add(tokens);
-        total = total.saturating_add(tokens);
-        if boundary.is_none() {
-            if prefilled < start {
-                // The text before the block still has to be written: the step
-                // ends where the block begins, so the next one can write it
-                // whole.
-                boundary = Some(start);
-            } else if prefilled < stop {
-                boundary = Some(stop);
-            }
-        }
+        blocks = blocks.saturating_add(tokens);
         let Some(next) = state.next_block(cursor) else {
             break;
         };
         cursor = next;
     }
     let commit = u32::try_from(state.canvas_commit.len()).unwrap_or(u32::MAX);
-    boundary
-        .unwrap_or(total)
+    prompt
+        .saturating_add(blocks)
         .max(state.cache_visible_len.saturating_add(commit))
 }
 
@@ -913,7 +903,7 @@ pub(crate) fn request(
         arrived_at: nanos_at(state.queued_at),
         admitted_at: recorded.admitted_at,
         prompt_tokens: u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX),
-        prefill_tokens: prefill_end(state, prefilled),
+        prefill_tokens: prefill_end(state),
         generated_tokens: u32::try_from(state.num_generated_tokens).unwrap_or(u32::MAX),
         cached_prefix_tokens: recorded.cached_prefix_tokens,
         prefilled_tokens: prefilled,

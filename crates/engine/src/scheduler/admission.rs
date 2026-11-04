@@ -209,21 +209,27 @@ impl Scheduler {
                 );
             }
         }
-        // A context prefill writes an input image's vision block whole, as
-        // one attention block of one call, so the block's exact cache length
-        // must fit one scheduling step's token budget.
-        if let Some(tokens) = req
+        // A context prefill writes the prompt and every input image's vision
+        // block in one call, each block whole as one attention block of that
+        // call, so the whole context the prefill reaches must fit one
+        // scheduling step's token budget. The bound is the context, not the
+        // block: a block that fits the budget alone still does not fit beside
+        // the prompt it is embedded in.
+        let blocks: usize = req
             .multimodal_inputs
             .images
             .iter()
             .flat_map(|image| &image.encoders)
             .filter(|input| input.encoder == crate::ImageEncoder::Vision)
             .filter_map(|input| input.num_cache_tokens)
-            .find(|&tokens| tokens as usize > self.config.max_num_batched_tokens)
-        {
+            .map(|tokens| tokens as usize)
+            .sum();
+        let context = req.prompt_token_ids.len().saturating_add(blocks);
+        if blocks > 0 && context > self.config.max_num_batched_tokens {
             return Err(format!(
-                "a {}-token input image vision block exceeds the {}-token step budget",
-                tokens, self.config.max_num_batched_tokens
+                "a {context}-token context, whose {blocks} tokens of input image vision block \
+                 are written whole by one context prefill, exceeds the {}-token step budget",
+                self.config.max_num_batched_tokens
             ));
         }
         if let Some(feature) = self.missing_required_feature(req) {
