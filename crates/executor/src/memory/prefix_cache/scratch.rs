@@ -272,6 +272,6 @@ impl PrefixCache {
         device: DeviceId,
         pools: &mut Pools,
     ) -> Result<ScratchCache> {
-        ScratchCache::allocate(&self.plan(), rows, pages, device, pools)
+        ScratchCache::allocate(self.plan(), rows, pages, device, pools)
     }
 }
