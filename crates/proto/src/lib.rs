@@ -56,7 +56,10 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// `Revert`, `Purge`), the programs those commands carry, and the main
 /// process's reports (`Precopied`, `PolicyReverted`), and the acknowledgements
 /// and fault reports the main process answers a command with (`Switched`,
-/// `Committed`, `Reverted`, `Purged`, `Stalled`, `Fault`).
+/// `Committed`, `Reverted`, `Purged`, `Stalled`, `Fault`, `PrecopyFailed`,
+/// `NonFiniteLogits`); the frontend's peer registration and the daemon's
+/// commands to it (`Serve`, `Drain`, `Pause`, `Drained`); and the main
+/// process's `/metrics` counters (`FromEngine::Metrics`).
 pub const PROTOCOL_MINOR: u32 = 4;
 
 /// The build this crate is compiled in: the package version, then `+` and a
