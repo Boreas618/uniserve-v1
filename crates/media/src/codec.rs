@@ -54,7 +54,8 @@ impl Rgb24Frames<'_> {
 ///
 /// # Errors
 ///
-/// [`crate::Error::Codec`] naming the encoder this runtime cannot open.
+/// [`crate::Error::MissingCodec`] naming a serving encoder the runtime does
+/// not provide, [`crate::Error::Codec`] when a provided encoder cannot open.
 pub fn require_codecs() -> crate::Result<()> {
     crate::ffi::require_codecs()
 }

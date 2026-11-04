@@ -99,10 +99,13 @@ fn last_error() -> String {
 /// boundary this crate replaces.
 fn check(code: c_int) -> Result<()> {
     const PLAN: c_int = -2;
+    const MISSING_CODEC: c_int = -3;
     if code == 0 {
         Ok(())
     } else if code == PLAN {
         Err(Error::Plan(last_error()))
+    } else if code == MISSING_CODEC {
+        Err(Error::MissingCodec(last_error()))
     } else {
         Err(Error::Codec(last_error()))
     }

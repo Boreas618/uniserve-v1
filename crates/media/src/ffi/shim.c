@@ -55,6 +55,8 @@
  * video stream, a track without audio. Rust reports these as plan errors, the
  * same way the Python boundary raised ValueError for them. */
 #define USV_PLAN (-2)
+/* A serving encoder the runtime does not provide; the message is its name. */
+#define USV_MISSING_CODEC (-3)
 
 #define IO_BLOCK 32768
 #define VIDEO_THREADS 8
@@ -77,6 +79,13 @@ static int fail_averror(const char *context, int code) {
     char reason[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(code, reason, sizeof(reason));
     return fail("%s: %s", context, reason);
+}
+
+/* A serving encoder the runtime does not provide; Rust reports its name in
+ * Error::MissingCodec. */
+static int fail_missing_codec(const char *name) {
+    snprintf(usv_error_message, sizeof(usv_error_message), "%s", name);
+    return USV_MISSING_CODEC;
 }
 
 /* A failure of the media itself, which Rust reports as a plan error. */
@@ -339,11 +348,11 @@ int usv_require_codecs(void) {
      * here, by name, instead of on the first request. */
     const AVCodec *video = avcodec_find_encoder_by_name("libx264");
     if (!video) {
-        return fail("the FFmpeg runtime does not provide the libx264 encoder");
+        return fail_missing_codec("libx264");
     }
     const AVCodec *audio = avcodec_find_encoder_by_name("aac");
     if (!audio) {
-        return fail("the FFmpeg runtime does not provide the aac encoder");
+        return fail_missing_codec("aac");
     }
 
     AVCodecContext *context = avcodec_alloc_context3(video);
@@ -453,7 +462,7 @@ static int video_encoder_open(VideoEncoder *encoder, int width, int height,
     encoder->frame_rate = frame_rate;
     encoder->codec = avcodec_find_encoder_by_name("libx264");
     if (!encoder->codec) {
-        return fail("the FFmpeg runtime does not provide the libx264 encoder");
+        return fail_missing_codec("libx264");
     }
     AVCodecContext *context = avcodec_alloc_context3(encoder->codec);
     if (!context) {
@@ -659,7 +668,7 @@ static int audio_encoder_open(AudioEncoder *encoder, int rate) {
     encoder->rate = rate;
     const AVCodec *codec = avcodec_find_encoder_by_name("aac");
     if (!codec) {
-        return fail("the FFmpeg runtime does not provide the AAC encoder");
+        return fail_missing_codec("aac");
     }
     AVCodecContext *context = avcodec_alloc_context3(codec);
     if (!context) {
