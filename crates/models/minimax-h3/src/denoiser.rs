@@ -1409,30 +1409,36 @@ impl nn::capability::Denoiser for Denoiser {
             _ => {}
         }
         let noise = nn::Noise::new();
-        // The video's stream is drawn at the latent's **native** shape and patchified into the rows
-        // the transformer reads: the reference's draw is `noise_shape("video")`, which is
-        // `[channels, frames, height, width]` before any packing, and `prepare_latents` then
-        // patchifies it (`denoiser.py:1056-1110`). Drawing straight into the packed rows would put
-        // the stream's first four elements in the first patch's four channels instead of in the
-        // first channel's four voxels - the same multiset of values in another arrangement, and a
-        // request whose seed no longer names the latents the reference's seed names.
+        // The video's stream is drawn at the latent's **native** shape, `[channels, frames, height,
+        // width]`, which is the buffer `denoise` reads and the solver folds a velocity into - its
+        // own patch is `Patch::forward(f, video, patched, frames)`, so the sample a step updates is
+        // the raster, not the rows. The reference draws the same shape (`noise_shape("video")`)
+        // and patchifies it on the way into its state (`prepare_latents`, `denoiser.py:1056-1110`).
+        // Drawing the packed rows here instead would be the same element count in another
+        // arrangement: every value the seed named, in the patch's order rather than the latent's,
+        // which no shape refuses and no trajectory shows.
         let video = layout.video;
-        let native = f.arena().tensor(
-            out.video.dtype,
-            Shape::new(&[
-                u64::from(video.channels),
-                u64::from(video.frames),
-                u64::from(video.height),
-                u64::from(video.width),
-            ]),
-        )?;
-        noise.draw(f, native, nn::NoiseKey::Scalar(seed.0), 0, 0, video_offset)?;
-        nn::layers::Patch::new(
+        let native = [
             u64::from(video.channels),
+            u64::from(video.frames),
             u64::from(video.height),
             u64::from(video.width),
-        )
-        .and_then(|patch| patch.forward(f, native, out.video, u64::from(video.frames)))?;
+        ];
+        if out.video.shape.dims() != &native[..] {
+            return Err(flattened(Error::config(format!(
+                "the video latents are {:?} and this layout's draw is {native:?}: a sample is the \
+                 native raster a step patchifies, not the rows it packs into",
+                out.video.shape.dims()
+            ))));
+        }
+        noise.draw(
+            f,
+            out.video,
+            nn::NoiseKey::Scalar(seed.0),
+            0,
+            0,
+            video_offset,
+        )?;
         if let Some(audio) = out.audio {
             noise.draw(f, audio, nn::NoiseKey::Scalar(seed.0), 0, 1, audio_offset)?;
         }
