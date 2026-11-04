@@ -904,18 +904,90 @@ impl Scheduler {
 
     /// Completes the batches in flight, scheduling nothing new while the
     /// caller set `closing`.
+    ///
+    /// The drain is unbounded in what it may wait for and bounded only in
+    /// silence: a batch the executor never answers, and never finishes,
+    /// would otherwise hold the hook the drain serves for ever. Whenever a
+    /// batch or a submission leaves the pending set the drain has made
+    /// progress and its silence clock restarts, so a scheduler that keeps
+    /// receiving results is never cut off, however long the drain takes
+    /// under load. A drain that goes `DRAIN_SILENCE` without one abandons the
+    /// batches and submissions it still holds, naming them.
     pub(super) fn drain_batches(&mut self) -> Result<(), String> {
-        while !(self.inflight.pending_batches.is_empty()
-            && self.inflight.pending_submissions.is_empty())
-        {
+        let mut silent_since = Instant::now();
+        let mut held = self.drain_pending();
+        while held.0 != 0 || held.1 != 0 {
             if self.fatal {
                 return Err("the engine failed before the hook ran".to_owned());
             }
             if !self.step_nonblocking() {
                 self.park_for_progress();
             }
+            let pending = self.drain_pending();
+            if pending != held {
+                held = pending;
+                silent_since = Instant::now();
+                continue;
+            }
+            if silent_since.elapsed() >= DRAIN_SILENCE {
+                return Err(self.abandoned_drain(held));
+            }
         }
         Ok(())
+    }
+
+    /// What a drain still waits on: the batches the executor holds, and the
+    /// batches it has not accepted.
+    fn drain_pending(&self) -> (usize, usize) {
+        (
+            self.inflight.pending_batches.len(),
+            self.inflight.pending_submissions.len(),
+        )
+    }
+
+    /// Names what a drain that stopped progressing still holds: each batch
+    /// with its age and the requests it carries, and the submissions never
+    /// accepted.
+    fn abandoned_drain(&self, held: (usize, usize)) -> String {
+        let mut batches: Vec<_> = self.inflight.pending_batches.iter().collect();
+        batches.sort_by_key(|(id, _)| **id);
+        let batches: Vec<String> = batches
+            .into_iter()
+            .map(|(id, batch)| {
+                let mut requests: Vec<_> =
+                    batch.calls.iter().map(|(key, _)| key.request_id.0).collect();
+                requests.sort_unstable();
+                requests.dedup();
+                format!(
+                    "batch {id} ({:?} in flight, {} call(s), request(s) {requests:?})",
+                    batch.started.elapsed(),
+                    batch.calls.len()
+                )
+            })
+            .collect();
+        let queued: Vec<String> = self
+            .inflight
+            .pending_submissions
+            .iter()
+            .map(|batch| {
+                let mut requests: Vec<_> =
+                    batch.requests.iter().map(|(call, _)| call.request_key.request_id.0).collect();
+                requests.sort_unstable();
+                requests.dedup();
+                format!("batch {} (never accepted, request(s) {requests:?})", batch.id)
+            })
+            .collect();
+        format!(
+            "the drain stopped progressing with {} batch(es) and {} submission(s): {}{}",
+            held.0,
+            held.1,
+            batches.join(", "),
+            if queued.is_empty() {
+                String::new()
+            } else {
+                format!("; queued: {}", queued.join(", "))
+            }
+        )
     }
 
     /// Runs the worker hook on every worker, its batches complete.
