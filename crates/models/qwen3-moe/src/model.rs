@@ -165,12 +165,13 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The plan of one forward over `tokens` tokens.
+    /// The plan of one forward over `tokens` tokens of `dtype`'s activations.
     pub fn new(
         config: &Config,
         partition: &Partition,
         tokens: u64,
         options: &LoadOptions,
+        dtype: DType,
     ) -> Result<Self> {
         Ok(Self {
             tokens,
@@ -418,7 +419,13 @@ impl Qwen3Moe {
     }
 
     pub fn plan(&self, tokens: u64) -> Result<Plan> {
-        Plan::new(&self.config, &self.partition, tokens, &self.options)
+        Plan::new(
+            &self.config,
+            &self.partition,
+            tokens,
+            &self.options,
+            self.dtype,
+        )
     }
 
     /// Run the decoder layers `0..=last` over `hidden`, and answer the layer's output rows.
@@ -840,7 +847,14 @@ mod tests {
 
     #[test]
     fn the_plan_of_the_slice() {
-        let plan = Plan::new(&config(), &Partition::single(), 4, &LoadOptions::default()).unwrap();
+        let plan = Plan::new(
+            &config(),
+            &Partition::single(),
+            4,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
         assert_eq!(plan.hidden, 2048);
         assert_eq!(plan.query, 32 * 128);
         assert_eq!(plan.key_value, 4 * 128);
@@ -857,7 +871,14 @@ mod tests {
         let mut config = config();
         config.mlp_only_layers = vec![1];
         assert!(config.has_dense_layers());
-        let plan = Plan::new(&config, &Partition::single(), 2, &LoadOptions::default()).unwrap();
+        let plan = Plan::new(
+            &config,
+            &Partition::single(),
+            2,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
         assert_eq!(plan.feed_forward, 6144);
     }
 
@@ -865,7 +886,7 @@ mod tests {
     fn tensor_parallel_heads_divide_the_projection() {
         let config = config();
         let partition = Partition::new(&config, 4, 1, 1, 0).unwrap();
-        let plan = Plan::new(&config, &partition, 3, &LoadOptions::default()).unwrap();
+        let plan = Plan::new(&config, &partition, 3, &LoadOptions::default(), DType::BF16).unwrap();
         assert_eq!(plan.query, 8 * 128);
         assert_eq!(plan.key_value, 128);
     }
@@ -876,12 +897,20 @@ mod tests {
     #[test]
     fn a_sharded_head_plans_its_shard_and_the_gather() {
         let config = config();
-        let single = Plan::new(&config, &Partition::single(), 1, &LoadOptions::default()).unwrap();
+        let single = Plan::new(
+            &config,
+            &Partition::single(),
+            1,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
         let sharded = Plan::new(
             &config,
             &Partition::new(&config, 2, 0, 1, 0).unwrap(),
             1,
             &LoadOptions::default(),
+            DType::BF16,
         )
         .unwrap();
         assert_eq!(sharded.vocabulary, 75968);
@@ -900,7 +929,14 @@ mod tests {
     fn an_encoded_expert_step_is_planned_and_a_dense_one_is_not() {
         let config = config();
         let partition = Partition::single();
-        let dense = Plan::new(&config, &partition, 15, &LoadOptions::default()).unwrap();
+        let dense = Plan::new(
+            &config,
+            &partition,
+            15,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
         assert_eq!(dense.moe, 0);
         let encoded = Plan::new(
             &config,
@@ -910,6 +946,7 @@ mod tests {
                 experts_encoded: true,
                 ..LoadOptions::default()
             },
+            DType::BF16,
         )
         .unwrap();
         // The permutation's worst case: 120 expanded routes over 128 experts at 128-row tiles is one
@@ -929,10 +966,16 @@ mod tests {
         let config = config();
         let partition = Partition::single();
         let bytes = |tokens: u64| {
-            Plan::new(&config, &partition, tokens, &LoadOptions::default())
-                .unwrap()
-                .bytes(DType::BF16)
-                .unwrap()
+            Plan::new(
+                &config,
+                &partition,
+                tokens,
+                &LoadOptions::default(),
+                DType::BF16,
+            )
+            .unwrap()
+            .bytes(DType::BF16)
+            .unwrap()
         };
         // Per token: two F32 factor columns, three hidden buffers, three query-width buffers
         // (query, rotated query, attended output), three key/value-width buffers and the logits'
