@@ -10,6 +10,8 @@
 
 pub mod allocation;
 pub mod buffer;
+pub mod encoders;
+pub mod output;
 pub mod pinned_pool;
 pub mod request_slots;
 pub mod retained;
