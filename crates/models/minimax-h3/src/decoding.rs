@@ -358,10 +358,10 @@ pub struct ClipDecoder {
 
 impl ClipDecoder {
     /// The output path of `canvas`, whose tiles the caller decodes in [`Tile`] order.
-    pub fn new(config: &VideoVaeConfig) -> Result<Self> {
+    pub fn new(config: &VideoVaeConfig, dtype: DType) -> Result<Self> {
         let spatial = config.spatial_compression();
         let unpatchify = UnpatchifyVideo::new(
-            DType::F16,
+            dtype,
             u64::from(config.out_channels),
             config.temporal_compression(),
             spatial,
@@ -382,7 +382,7 @@ impl ClipDecoder {
         let mut extent = crate::video_vae::MINIMUM_OVERLAP;
         while extent < crate::video_vae::TILE_PIXELS {
             for axis in [2, 3] {
-                blends.push((extent, axis, CrossFade::new(DType::F16, extent, axis)?));
+                blends.push((extent, axis, CrossFade::new(dtype, extent, axis)?));
             }
             extent += alignment;
         }
@@ -903,7 +903,7 @@ mod tests {
         // minimum overlap give a grid of four columns and seven rows, each tile 16x16 latent.
         let config = crate::video_vae::tests::video_config();
         let canvas = Canvas::clip(&config, 48, 84);
-        let clip = ClipDecoder::new(&config).expect("the output path");
+        let clip = ClipDecoder::new(&config, DType::F16).expect("the output path");
         let tiles = Tiles::of(&config, &canvas)
             .expect("the grid")
             .tiles(&config, &canvas);
