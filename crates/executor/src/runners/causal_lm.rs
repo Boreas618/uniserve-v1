@@ -1183,35 +1183,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 changed.push((operator, key.to_owned()));
             }
         }
-        // A rebind sets the new kernel's parameters on a graph node, so a changed operator needs at
-        // least one serving graph that launches it. The serving generation holds a kernel for every
-        // operator in `changed`, and every bucket's forward launches it, so an operator no serving
-        // graph names was captured without the launch annotation: rebinding would leave every batch
-        // on the old kernel while the generation claimed the new one. Asking the graphs themselves
-        // keeps this free of records of its own - and catches a partial annotation, which a record
-        // of "this bucket had no table" cannot.
-        let serving = self.generation.number();
-        let serving_buckets = self.graphs.buckets(serving);
-        if !changed.is_empty() && !serving_buckets.is_empty() {
-            let missing: Vec<&'static str> = changed
-                .iter()
-                .map(|(operator, _)| *operator)
-                .filter(|operator| {
-                    serving_buckets.iter().all(|bucket| {
-                        self.graphs
-                            .captured(*bucket, serving)
-                            .is_none_or(|captured| !captured.uses(operator))
-                    })
-                })
-                .collect();
-            if !missing.is_empty() {
-                return Err(Error::Invariant(format!(
-                    "no captured graph of generation {serving} launches {missing:?}, so the \
-                     changed kernel cannot be rebound onto one: the operator launches are not \
-                     annotated"
-                )));
-            }
-        }
         // A launch `next` adds is a change too: its bucket has nothing to compare it against, and
         // only a recapture can serve it (4.5).
         for (operator, key, _) in next.iter() {
@@ -1228,7 +1199,29 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             // The buckets that launch this operator, whichever key they use: a program under a new
             // key of the same operator changes the launch structure of the buckets that launch the
             // operator at all, and only a walk over them can tell rebind from recapture (4.5).
-            for bucket in self.graphs.using(operator, self.generation.number()) {
+            let mut launching = self.graphs.using(operator, self.generation.number());
+            if launching.is_empty() {
+                // No captured graph names the operator, which means the launch annotation was not
+                // reported when the bucket was captured. The graph cannot say which buckets launch
+                // it, so every serving bucket is prepared - and each walk recaptures, because
+                // there is no node to rebind - rather than the update quietly doing nothing.
+                launching = self.graphs.buckets(self.generation.number());
+                // An operator the serving generation already holds a kernel for is one its graphs
+                // launch, so a graph that names none of them was captured without the annotation.
+                // A genuinely new operator names no graph for the honest reason, and says nothing.
+                let existed = self
+                    .generation
+                    .iter()
+                    .any(|(name, _, _)| name == operator);
+                if existed && !launching.is_empty() {
+                    tracing::error!(
+                        %operator,
+                        "no captured graph names {operator}: the operator launches are not \
+                         annotated, so every serving bucket is recaptured rather than rebound"
+                    );
+                }
+            }
+            for bucket in launching {
                 // The paired forward runs first, and only where the two generations have a program
                 // under this same key: a kernel cannot be compared with one of another descriptor
                 // (`Forward::operate` pairs on operator and key), so a new key's bucket is left to
@@ -1562,17 +1555,31 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
-        if !served.same_structure(&walked.nodes)? {
+        // A walk with no node table means the operator launches were not annotated, so there is no
+        // node to set the new kernel's parameters on and a rebind would be the silent no-op the
+        // record exists to prevent. Recapturing is the design's other path (7.3 step 2) and is
+        // correct here: the template already carries the new kernels and their arguments.
+        let unannotated = walked.nodes.is_empty();
+        if unannotated || !served.same_structure(&walked.nodes)? {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments.
             let held = hold_kernels(&kernels, &walked.nodes)?;
             let recaptured = Captured::new(walked.template, walked.nodes, held)?;
             self.graphs.insert(bucket, generation, recaptured);
-            tracing::info!(
-                bucket = %bucket,
-                generation,
-                "the launch structure changed; recaptured the bucket instead of rebinding it"
-            );
+            if unannotated {
+                tracing::error!(
+                    bucket = %bucket,
+                    generation,
+                    "the walk reported no node table; recaptured the bucket rather than silently \
+                     rebinding nothing"
+                );
+            } else {
+                tracing::info!(
+                    bucket = %bucket,
+                    generation,
+                    "the launch structure changed; recaptured the bucket instead of rebinding it"
+                );
+            }
             return Ok(());
         }
         // The walk's launches are the same ones, in the same order, as the live graph's: pair
