@@ -281,7 +281,7 @@ impl Scheduler {
         // encoding waits, as its call would.
         let Some(worker) =
             self.placement
-                .place(self.executor.as_ref(), &self.info, request_key, kind)
+                .place(self.executor.inner(), &self.info, request_key, kind)
         else {
             return false;
         };

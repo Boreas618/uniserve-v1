@@ -412,21 +412,19 @@ fn main() {
         (30, 40), // 480x640
         (30, 52), // 480x832
     ] {
-        for mode in [ops::patch::Mode::Patchify, ops::patch::Mode::Unpatchify] {
-            push(
-                "patch",
-                ops::patch::Descriptor {
-                    dtype: DType::BF16,
-                    channels: 24,
-                    height,
-                    width,
-                    mode,
-                    block: ops::patch::BLOCK,
-                    pdl: PDL,
-                }
-                .to_string(),
-            );
-        }
+        // One key per raster: the inverse is `unpatchify_video` at 1×2×2, not a mode of this op.
+        push(
+            "patch",
+            ops::patch::Descriptor {
+                dtype: DType::BF16,
+                channels: 24,
+                height,
+                width,
+                block: ops::patch::BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
     }
     // The two `unpatchify_video` geometries the decoder needs: the latents and the decoder's own
     // output. The token grid is the request's -- its clip length and its canvas -- so it is a launch
@@ -530,6 +528,220 @@ fn main() {
         }
         .to_string(),
     );
+
+    // ---- The audio encoder's head pool, and the video path's last step.
+    //
+    // The pool is the projection's two fused reductions: `heads = num_attention_heads 8`, the head
+    // width `latent_dim / heads = 256`, pooled to `latent_channels = 32` (`audio_vae.py:431-440`,
+    // `audio_vae/config.json`).
+    push(
+        "adaptive_pool",
+        ops::adaptive_pool::Descriptor {
+            dtype: DType::F32,
+            heads: AUDIO_ATTENTION_HEADS,
+            width: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
+            output: AUDIO_LATENT_CHANNELS,
+            block: ELEMENTWISE_BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The video path's last step: the VAE's raster is `float16`
+    // (`uniserve/models/minimax_h3/output.py`'s own state buffer), three channels, packed bytes.
+    push(
+        "rgb_bytes",
+        ops::rgb::Descriptor {
+            dtype: DType::F16,
+            channels: 3,
+            block: ops::rgb::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // ---- The text encoder (Qwen3-VL, `text_encoder/config.json`): its norms and its two audited
+    // activations. `hidden_size 5120` for the language model, `intermediate_size` 25600 gated, and
+    // the vision tower's `gelu_pytorch_tanh` over its own `intermediate_size 4304`.
+    //
+    // `rms_norm`/`add_rms_norm` are compiled per column count and tile, the tile being the layer's
+    // `next_power_of_two(columns)`; the element type is the checkpoint's `bfloat16`.
+    let text_columns = 5120_u32;
+    push(
+        "rms_norm",
+        ops::norm::RmsNormDescriptor {
+            dtype: DType::BF16,
+            columns: text_columns,
+            tile: text_columns.next_power_of_two(),
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    push(
+        "add_rms_norm",
+        ops::norm::AddRmsNormDescriptor {
+            dtype: DType::BF16,
+            columns: text_columns,
+            tile: text_columns.next_power_of_two(),
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The audio encoder's GeGLU applies tanh-GELU over its hidden width, `2 · latent_channels`
+    // (`audio_vae.py:417`, `GeGLU(channels, 2 * channels)`), in FP32.
+    push(
+        "gelu",
+        ops::gelu::Descriptor {
+            dtype: DType::F32,
+            columns: AUDIO_LATENT_CHANNELS * 2,
+            block: ELEMENTWISE_BLOCK,
+            approximate: ops::gelu::Approximation::Tanh,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The vision tower's MLP activation, over its own `intermediate_size 4304`.
+    push(
+        "gelu",
+        ops::gelu::Descriptor {
+            dtype: DType::BF16,
+            columns: 4304,
+            block: ELEMENTWISE_BLOCK,
+            approximate: ops::gelu::Approximation::Tanh,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
+    //
+    // The decoder's seven upsamplers are `ConvTranspose1d` with `kernel = decoder_kernel_sizes`,
+    // `stride = decoder_rates`, `padding = (kernel - rate) / 2` — two distinct geometries for the
+    // seven stages (`autoencoder_kl_minimax_h3_audio.py:447-459`): `(9, 5, 2)` twice and `(4, 2, 1)`
+    // five times. The key names the geometry, not the channels, so two rows cover all seven.
+    // The key builder: the operator's name and the descriptor, pushed by the caller so that one
+    // closure does not hold `push` for the rest of the section.
+    let convolution = |kernel: [u32; 3],
+                       stride: [u32; 3],
+                       padding: [u32; 3],
+                       dilation: [u32; 3],
+                       transposed: bool|
+     -> (&'static str, String) {
+        (
+            if transposed {
+                "conv_transpose1d"
+            } else {
+                "conv1d"
+            },
+            ops::conv::Descriptor {
+                input: DType::F32,
+                weight: DType::F32,
+                output: DType::F32,
+                geometry: ops::conv::Geometry {
+                    kernel,
+                    stride,
+                    padding,
+                    dilation,
+                    groups: 1,
+                },
+                bias: true,
+                // The preset's declaration for a model convolution in FP32 (the video VAE keeps it
+                // on, and the audio VAEs are the same FP32 numerical path).
+                tf32: true,
+                rank: 1,
+                transposed,
+            }
+            .to_string(),
+        )
+    };
+    let (operator, key) = convolution([9, 1, 1], [5, 1, 1], [2, 1, 1], [1, 1, 1], true);
+    push(operator, key);
+    let (operator, key) = convolution([4, 1, 1], [2, 1, 1], [1, 1, 1], [1, 1, 1], true);
+    push(operator, key);
+    // The decoder's entry and exit convolutions, and the pointwise narrowing inside a residual unit.
+    let (operator, key) = convolution([7, 1, 1], [1, 1, 1], [3, 1, 1], [1, 1, 1], false);
+    push(operator, key);
+    let (operator, key) = convolution([1, 1, 1], [1, 1, 1], [0, 1, 1], [1, 1, 1], false);
+    push(operator, key);
+    // The decoder's residual units: the three resblock kernels, each at the three dilations
+    // (`resblock_kernel_sizes [3, 7, 11]`, `resblock_dilation_sizes [1, 3, 5]`).
+    for kernel in [3_u32, 7, 11] {
+        for dilation in [1_u32, 3, 5] {
+            push(
+                "conv1d",
+                ops::conv::Descriptor {
+                    input: DType::F32,
+                    weight: DType::F32,
+                    output: DType::F32,
+                    geometry: ops::conv::Geometry {
+                        kernel: [kernel, 1, 1],
+                        stride: [1, 1, 1],
+                        padding: [(dilation * (kernel - 1)) / 2, 1, 1],
+                        dilation: [dilation, 1, 1],
+                        groups: 1,
+                    },
+                    bias: true,
+                    tf32: true,
+                    rank: 1,
+                    transposed: false,
+                }
+                .to_string(),
+            );
+        }
+    }
+    // The encoder's residual units are a seven-tap convolution at dilations 1, 3 and 9
+    // (`audio_vae.py:352-354`, padding `3 · dilation`), and its exit convolution is three taps at
+    // padding 1. Two of these rows coincide with the decoder's seven-tap rows above.
+    for dilation in [1_u32, 3, 9] {
+        let (operator, key) = convolution(
+            [7, 1, 1],
+            [1, 1, 1],
+            [3 * dilation, 1, 1],
+            [dilation, 1, 1],
+            false,
+        );
+        push(operator, key);
+    }
+    let (operator, key) = convolution([3, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1], false);
+    push(operator, key);
+    // The encoder's strided convolutions: `kernel = 2 · stride`, `padding = ceil(stride / 2)`
+    // (`audio_vae.py:355-363`), for the three distinct rates of `encoder_rates [2, 4, 4, 5, 5]`.
+    for stride in [2_u32, 4, 5] {
+        let (operator, key) = convolution(
+            [2 * stride, 1, 1],
+            [stride, 1, 1],
+            [stride.div_ceil(2), 1, 1],
+            [1, 1, 1],
+            false,
+        );
+        push(operator, key);
+    }
+
+    // ---- The VSA selection's pooled-score product: the stage-1 video attention's per-head tile
+    // similarity, over the transformer's own head geometry (56 heads of 128) in the checkpoint's
+    // element type. The lanes one program uses for the contraction are the head width; the pooling
+    // itself (the tile reduction and its stride) is `vsa_prepare_tiles`' launch values.
+    push(
+        "vsa_scores",
+        ops::segments::ScoresDescriptor::new(
+            DType::BF16,
+            HEADS,
+            HEAD_DIM,
+            HEAD_DIM.next_power_of_two(),
+            PDL,
+        )
+        .to_string(),
+    );
+
+    // Gaps this file does not fill, named rather than invented:
+    // - `bias_add`: the channel list per call site follows the stage widths above, but the call sites
+    //   are the decoder's and the video VAE's own composition, which is h3's to state.
+    // - `conv3d`: the video VAE's per-stage geometry (kernels 3, spatial strides from
+    //   `spatial_downsample_factors [2,2,2,2,1,1]`, temporal 1 or 2) is a construction inside
+    //   `diffusers`' `AutoencoderKLMiniMaxH3`, not a number in a config.
+    // - `embedding`, `act_and_mul`: the text encoder's shard rows and its gate/value strides are the
+    //   layer's layout choices, not the config's.
+    // - the five VSA operators, `gated_residual`, `frame_pad`/`frame_moments`/`frame_norm_pad`,
+    //   `position_interpolate`, `rope_apply`, `rows`, `paged_attention`: h3's packing and processor.
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();

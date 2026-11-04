@@ -63,10 +63,9 @@ def parse_key(key, dimensions):
             )
         fields[name] = value
         remaining = rest[len(value) :].removeprefix("_")
-    # A descriptor may leave a declared dimension out of its key: an operator
-    # prints a field only for the variant that has it (a one-dimensional
-    # rotation names no axes, a full-width one no width), so the package's spec
-    # answers for what is missing.
+    missing = sorted(set(dimensions) - set(fields))
+    if missing:
+        raise SystemExit(f"{key}: the descriptor names no {missing}")
     return fields
 
 

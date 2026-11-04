@@ -16,9 +16,22 @@
 //!
 //! The rows come from the step's `[8, capacity]` int64 column table — slot, mode, task, the host cache
 //! length, host logical and sampling positions, the verification base visible length and whether the
-//! row counts penalties — and a row with no sampled task (`task < 0`) keeps its token state. Slots are
-//! unique within a step, so each row's reads and writes of its slot need no ordering; the penalty
-//! accumulation is an atomic add, as an indexed accumulation is.
+//! row counts penalties. Slots are unique within a step, so each row's reads and writes of its slot
+//! need no ordering; the penalty accumulation is an atomic add, as an indexed accumulation is.
+//!
+//! **Two sentinels make a row inert, and they are what lets a warm batch be recorded.** A row whose
+//! *task* is `-1` samples nothing: its token-state stores and its penalty add are skipped, and the
+//! per-task views are not read (the loads are masked off). A row whose *slot* is `-1` has no
+//! destination at all: **every store into the slot state is skipped**, including the three lengths
+//! this operator maintains. So `count` may be the bucket's whole row count with padding rows staged
+//! as `slot = task = -1`, and the launch changes nothing — which is how a warmup capture can record
+//! the serving graph without advancing a slot's counts or its positions.
+//!
+//! The masked-by-slot rule is deliberate where it differs from the reference
+//! (`uniserve/sampling/state.py::_commit_kernel` stores the cache length under the row mask, not
+//! under `slot >= 0`, so a padded row there writes `state[-1]`: a host-side bug that a CUDA launch
+//! would turn into a write outside the tensor). The sentinel is honoured here on every store, and the
+//! catalogue states it.
 
 use std::fmt;
 
@@ -212,6 +225,23 @@ impl Op for SlotCommit {
             &args.points,
         ] {
             view.require_rank(Self::NAME, 1)?;
+        }
+        // `valid` and `active` are flags whose product is the penalty weight; the kernel casts that
+        // product to `i32`, so the views must be integer — a float flag would silently truncate. The
+        // runner's own convention is `i32`, and `u8` costs nothing to accept.
+        for (name, view) in [
+            ("the valid flags", &args.valid),
+            ("the active flags", &args.active),
+        ] {
+            if !matches!(view.dtype, DType::I32 | DType::I64 | DType::U8) {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "{name} are {}, an integer flag is i32, i64 or u8",
+                        view.dtype
+                    ),
+                ));
+            }
         }
         for (name, view) in [
             ("the tokens", &args.tokens),

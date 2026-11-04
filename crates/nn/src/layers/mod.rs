@@ -20,6 +20,7 @@
 
 mod activation;
 mod attention;
+mod audio;
 mod bias;
 mod conv;
 mod cross_fade;
@@ -33,9 +34,11 @@ mod moe;
 mod noise;
 mod norm;
 mod patch;
+mod pcm;
 mod pool;
 mod position;
 mod residual;
+mod rgb;
 mod rope;
 mod rotate;
 mod rows;
@@ -46,6 +49,7 @@ mod unpatchify;
 
 pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Silu, Snake, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
+pub use audio::AudioActivation;
 pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use cross_fade::CrossFade;
@@ -61,12 +65,14 @@ pub use norm::{LayerNorm, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use ops::rope::Rotation;
-pub use patch::{Patch, PatchMode};
+pub use patch::Patch;
+pub use pcm::PcmInterleave;
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
 pub use residual::{
     ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };
+pub use rgb::RgbBytes;
 pub use rope::{Rotary, Sections};
 pub use rotate::Rotate;
 pub use rows::Rows;
