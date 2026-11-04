@@ -29,7 +29,7 @@ use executor::capacity::{graph_storage_budget_bytes, graph_storage_bytes, quota}
 use executor::device::GraphStorage;
 use executor::memory::Memory;
 use executor::plan::{Buckets, Variant};
-use executor::runner::{NamedRunner, RunnerId};
+use executor::runner::{Binding, NamedRunner, RunnerId};
 use executor::runners::causal_lm::{CausalLmRunner, Geometry, KvProvider, Shared};
 use executor::runners::resident::ResidentCache;
 use executor::stream::EventPool;
@@ -207,7 +207,18 @@ impl EpochPlan {
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
-    pub(crate) fn graph(&self, device: DeviceId, resident: u64) -> Result<GraphStorage> {
+    /// `snapshot` is the state group's snapshot (`CachePlan::state_snapshot_bytes`, design 4.5),
+    /// which the scratch pool has to hold beside the shadow region. The **reservation** is one
+    /// figure - the pool is reserved once at construction, and a second reservation of the same
+    /// pool kind is a no-op the allocator refuses - and the storage states both tenants' shares, so
+    /// the paired forward's twins take `shadow` and `Snapshot::allocate` keeps the rest:
+    /// `shadow + snapshot == scratch`, and the order the two take their bytes in does not matter.
+    pub(crate) fn graph(
+        &self,
+        device: DeviceId,
+        resident: u64,
+        snapshot: u64,
+    ) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
         let storage = handle.memory_info()?;
@@ -226,7 +237,16 @@ impl EpochPlan {
         if bytes == 0 {
             bail!("device {} reports no memory to capture graphs in", device.0);
         }
-        let scratch = graph_storage_budget_bytes(i64::try_from(total)?) / 8;
+        // The shadow region §7.3 step 2 runs a replaced operator in, plus the state group's
+        // snapshot §4.5 copies units through: one scratch pool, sized once, never allocated per
+        // step or per batch.
+        let shadow = graph_storage_budget_bytes(i64::try_from(total)?) / 8;
+        let scratch = shadow.checked_add(snapshot).with_context(|| {
+            format!(
+                "device {} reserves a {shadow}-byte shadow region and a {snapshot}-byte state snapshot, more than one scratch pool holds",
+                device.0
+            )
+        })?;
         // Every pool on this device is booked against `budget`, so `budget` is what the device has
         // left to give: the epoch's weights are device-resident retained storage, mapped before
         // this call (4.1), and an allowance drawn from the total would let the graph, scratch and
@@ -235,16 +255,22 @@ impl EpochPlan {
         // rules is the allowance: a deployment that asks for a smaller share gets it, and a device
         // already holding the weights gets only what remains.
         let budget = quota(total, self.build.mem_fraction_static).min(storage.free);
-        // What a rank must be able to map to serve at all: one generation's graph pool and its
-        // scratch. The second pool is a reservation until a preparation captures into it, so it is
-        // not part of this test - a deployment with room for one pool starts and serves, and an
-        // update that needs the second one is refused by name when it maps.
-        let needs = bytes / 2 + scratch + resident;
+        // What a rank must be able to map to serve at all, which is every pool the allocator
+        // books at its first capture: the graph range in full and the scratch. The graph range is
+        // mapped whole and not a pool at a time - `arena::Pools::new` divides the range among the
+        // streams and `Pools::pool` allocates a stream's share in one buffer, with one stream
+        // here - so a rank that holds room for one of the two pools and not both is refused here
+        // rather than at its first capture, after the model load. The resident pool is a
+        // reservation of addresses and not of storage: its bytes are the KV cache the capacity
+        // plan fitted into the same free bytes below, and they map through the Storage Server's
+        // ledger, so charging them here as well would refuse a deployment whose cache fills the
+        // device's free bytes - which is what the fit is meant to do.
+        let needs = bytes + scratch;
         if budget < needs {
             bail!(
                 "device {} has {budget} bytes left of {total} once the model is mapped, at \
-                 mem_fraction_static {}, less than the graph pool and scratch of {needs} a rank \
-                 maps to serve",
+                 mem_fraction_static {}, less than the {needs} bytes of graph range and scratch a \
+                 rank maps to serve",
                 device.0,
                 self.build.mem_fraction_static,
             );
@@ -256,6 +282,9 @@ impl EpochPlan {
             // of it, so the graph reservation is not divided among streams.
             streams: 1,
             scratch,
+            // The shadow region alone, which the paired forward's twins allocate; `scratch` keeps
+            // the reservation that also holds the state group's snapshot (7.3, 4.5).
+            shadow,
             // The KV pool: the units the capacity plan fitted, each the size of a cache unit. This
             // rank keeps its keys and values in the process - that is what a prefix cache is - so
             // the figure is the plan's and not zero. A pool whose figure is zero is not reserved,
@@ -427,13 +456,15 @@ impl EpochPlan {
                 let provider: Box<dyn KvProvider> =
                     Box::new(ResidentCache::new(memory.shared_cache(), device, rows)?);
                 let runner = CausalLmRunner::new(
-                    RunnerId(0),
-                    vec![PhaseId(0)],
+                    Binding {
+                        id: RunnerId(0),
+                        phases: vec![PhaseId(0)],
+                        device,
+                        stream,
+                    },
                     Shared::new(model),
                     Arc::clone(generation),
                     self.buckets.clone(),
-                    device,
-                    stream,
                     geometry,
                     provider,
                     // A seed that changes with the process, so two runs of one deployment are not
@@ -459,7 +490,12 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory, ipc::WorkerInfo)> {
+    ) -> Result<(
+        Arc<qwen3_moe::Qwen3Moe>,
+        Memory,
+        ipc::WorkerInfo,
+        GraphStorage,
+    )> {
         let placement = &self.placement;
         let class = architectural_class(&self.checkpoint)?;
         match class.as_str() {
@@ -482,8 +518,8 @@ impl EpochPlan {
                     &mut loader,
                     placement.load_options,
                 )?;
-                let (memory, info) = self.open_memory(&model, storage)?;
-                Ok((Arc::new(model), memory, info))
+                let (memory, info, graph) = self.open_memory(&model, storage)?;
+                Ok((Arc::new(model), memory, info, graph))
             }
             other => bail!(
                 "{} declares model class {other}, which this build cannot serve",
@@ -504,7 +540,7 @@ impl EpochPlan {
         &self,
         model: &qwen3_moe::Qwen3Moe,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Memory, ipc::WorkerInfo)> {
+    ) -> Result<(Memory, ipc::WorkerInfo, GraphStorage)> {
         let device = *self
             .devices
             .first()
@@ -561,7 +597,8 @@ impl EpochPlan {
             (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
             _ => 0,
         };
-        let graph = self.graph(device, resident)?;
+        let snapshot = planned.state_snapshot_bytes();
+        let graph = self.graph(device, resident, snapshot)?;
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
@@ -589,7 +626,7 @@ impl EpochPlan {
         // capacities it fitted, the cache it holds and where it is. It is the same `WorkerInfo` the
         // deployment's other ranks report, so the scheduler plans against one description of a
         // rank rather than a second one derived here.
-        Ok((memory, planned.plan.info.clone()))
+        Ok((memory, planned.plan.info.clone(), graph))
     }
 
     /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).

@@ -905,6 +905,9 @@ fn connect_front(
         minor: proto::PROTOCOL_MINOR,
         build: proto::BUILD.to_owned(),
         engine: attachment.engine,
+        // The supervisor's own link, not a main process's request link: it states no interface, and
+        // the daemon keeps its pre-`interface` behaviour for it.
+        interface: 0,
     })?;
     let welcome: wire::Welcome = reader
         .recv(WELCOME_TIMEOUT)?
@@ -2438,6 +2441,8 @@ pub fn run_engine(
         minor: proto::PROTOCOL_MINOR,
         build: proto::BUILD.to_owned(),
         engine,
+        // The supervisor's own link, not a main process's request link: it states no interface.
+        interface: 0,
     })?;
     let welcome: wire::Welcome = reader
         .recv(WELCOME_TIMEOUT)?
@@ -2627,7 +2632,12 @@ fn policy_usage(
 fn precopied(generation: u64) -> proto::process::Report {
     proto::process::Report {
         kind: Some(proto::process::report::Kind::Precopied(
-            proto::process::Precopied { generation },
+            proto::process::Precopied {
+                generation,
+                // This path shadows nothing: a worker-process executor refuses a shadow batch,
+                // and its update's evidence is the workers' own.
+                uncompared: Vec::new(),
+            },
         )),
     }
 }

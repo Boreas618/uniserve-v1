@@ -547,6 +547,18 @@ impl Drop for GraphExec {
     }
 }
 
+/// The number of captures open in this process, as of the last begin or end.
+///
+/// A hang inside a capture and a hang inside a launch look identical from outside and are different
+/// defects, and the thread that hangs cannot say which: the counter is written where a capture opens
+/// and closes and read by whoever reports the stall (2.4).
+static OPEN_CAPTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The captures open in this process on any stream.
+pub fn open_captures() -> usize {
+    OPEN_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A capture in progress on one stream.
 ///
 /// It begins the driver's stream capture and keeps the device's context
@@ -620,6 +632,7 @@ impl Capture {
                 "the stream's capture is in status {status} right after it began"
             )));
         }
+        OPEN_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             stream: stream.clone(),
             core: Arc::new(Core {
@@ -689,6 +702,7 @@ impl Capture {
             "cuStreamEndCapture",
         )?;
         self.ended = true;
+        OPEN_CAPTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // The driver promises the same graph at the end of the capture; a
         // different handle would leave the node handles of `record` dangling.
         debug_assert_eq!(raw, self.core.raw);
@@ -703,6 +717,7 @@ impl Drop for Capture {
         if self.ended {
             return;
         }
+        OPEN_CAPTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // Ends the capture so the stream can be used again. The captured graph
         // is discarded: its owner drops it along with the capture.
         if let Ok(driver) = driver::driver() {

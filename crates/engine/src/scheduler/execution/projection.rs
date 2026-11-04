@@ -711,6 +711,18 @@ impl Scheduler {
             .is_some_and(|owner| self.placement.prefill_groups.contains(owner))
     }
 
+    /// Whether a media request may take its next call.
+    ///
+    /// A media request has no token output window to fill and no decoder
+    /// boundaries: its own state (`MediaFlowState`) names the calls it has
+    /// ready, and the media flow checks that, its admission in flight and the
+    /// component and host task pools it occupies when it plans one. Its output
+    /// journal is unbounded — one event per call — so there is no window to
+    /// wait for either; only a finish in flight holds it.
+    pub(in crate::scheduler) fn media_can_schedule_next(&self, id: RequestId) -> bool {
+        !self.inflight.pending_finishes.contains_key(&id)
+    }
+
     /// Returns whether the next call can be scheduled.
     pub(in crate::scheduler) fn can_schedule_next(&self, id: RequestId) -> bool {
         !self.inflight.pending_finishes.contains_key(&id)

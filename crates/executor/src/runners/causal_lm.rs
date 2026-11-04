@@ -66,7 +66,7 @@ fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize)
 
 #[cfg(test)]
 use crate::plan::Variant;
-use crate::runner::{Runner, RunnerId};
+use crate::runner::{Binding, Runner, RunnerId};
 use crate::{Error, Result};
 
 /// The host columns of one batch, padded to a bucket and held for the upload.
@@ -214,10 +214,10 @@ impl Staging {
                 "the batch states no query offsets for its {rows} rows"
             )));
         }
-        if tokens < bucket_tokens {
-            if let Some(last) = self.rows.query_offsets.last_mut() {
-                *last = bucket_tokens as i32;
-            }
+        if tokens < bucket_tokens
+            && let Some(last) = self.rows.query_offsets.last_mut()
+        {
+            *last = bucket_tokens as i32;
         }
         while self.rows.query_offsets.len() <= bucket_rows {
             let end = self
@@ -899,6 +899,15 @@ pub trait KvProvider: Send + Sync {
         Ok(())
     }
 
+    /// The cache this provider reads, when it reads one: the handle a sleep gives back and a wake
+    /// maps again (2.5).
+    ///
+    /// One call per cache, not per runner: two runners of a device that share one cache must be
+    /// woken once, and the caller dedups by the handle's address.
+    fn cache(&self) -> Option<&Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        None
+    }
+
     /// Applies what the mechanism allocated for this batch's cache pages, on `stream`, before the
     /// batch's forward reads them.
     ///
@@ -1010,6 +1019,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     pools: Option<Arc<std::sync::Mutex<Pools>>>,
     /// The device's counters, when the executor handed them over (7.3's metrics).
     counters: Option<Arc<crate::device::SharedCounters>>,
+    /// The device's record of the operators an update could not compare, each with its reason
+    /// (7.3 step 2). The control thread reports it when the precopy finishes, so an update that
+    /// has no evidence for an operator says so rather than leaving it to the log.
+    uncompared: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// The host columns of the batch being staged.
     staging: Staging,
     /// The device the runner computes on.
@@ -1106,17 +1119,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// It captures nothing here: the device executor's warmup captures every bucket after the
     /// runner is bound, largest first, so the pools' plans exist before serving starts.
     pub fn new(
-        id: RunnerId,
-        phases: Vec<PhaseId>,
+        binding: Binding,
         model: M,
         generation: Arc<Generation>,
         buckets: Buckets,
-        device: DeviceId,
-        stream: platform::Stream,
         geometry: Geometry,
         kv: Box<dyn KvProvider>,
         seed: u64,
     ) -> Result<Self> {
+        let Binding {
+            id,
+            phases,
+            device,
+            stream,
+        } = binding;
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
@@ -1137,6 +1153,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             graphs: Graphs::new(),
             pools: None,
             counters: None,
+            uncompared: None,
             staging,
             device,
             stream,
@@ -1196,13 +1213,48 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.shadow = Some(shadow);
     }
 
+    /// Records that a program-layer update could not compare `entry` (7.3 step 2), once.
+    ///
+    /// The same operator is shadowed once per bucket the update's requests occupy, so the record
+    /// keeps the first statement of each fact and drops its repeats.
+    fn note_uncompared(&self, entry: String) {
+        let Some(sink) = &self.uncompared else {
+            return;
+        };
+        let mut sink = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sink.contains(&entry) {
+            sink.push(entry);
+        }
+    }
+
+    /// Starts a new update's record of what it could not compare.
+    fn clear_uncompared(&self) {
+        let Some(sink) = &self.uncompared else {
+            return;
+        };
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// The shape of the bucket a batch is served from.
     fn bucket_for(&self, shape: &Shape) -> Result<Bucket> {
-        self.buckets.require(shape)
+        let bucket = self.buckets.require(shape)?;
+        // A media bucket is refused by name rather than replayed: its graph is shaped for a latent
+        // canvas or a raster, and a catalogue that mixed the two families must read as the mistake
+        // it is, not as wrong tokens (`plan::Bucket::causal_lm`).
+        bucket.causal_lm()?;
+        Ok(bucket)
     }
 }
 
 impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
+    fn cache(&self) -> Option<Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        self.kv.cache().cloned()
+    }
+
     fn phases(&self) -> &[PhaseId] {
         &self.phases
     }
@@ -1249,16 +1301,26 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let next = self.generation_named(batch.generation)?;
         let mut jobs = Vec::new();
         for (operator, key, kernel) in self.generation.iter() {
-            let Ok(candidate) = next.kernel(operator, key) else {
-                // The new generation has no program under this key: its program for the operator
-                // is a different descriptor, whose kernel output cannot be paired with this one.
-                // The precopy's walk recaptures such a bucket; there is nothing to compare here.
-                tracing::debug!(
-                    operator,
-                    key,
-                    "the prepared generation has no program under this key; no paired forward"
-                );
-                continue;
+            let candidate = match next.kernel(operator, key) {
+                Ok(candidate) => candidate,
+                // A recapture replaces the operator's program by another compilation, whose
+                // descriptor text may differ. The comparison pairs by operator (7.3 step 2), and
+                // the previous program is resolved by the key it served with, so the update is
+                // still compared rather than silently committed. The walk has already recaptured
+                // this bucket for the new descriptor; the comparison is what measures the program.
+                Err(_) => {
+                    let Some(other) = next.keys(operator).next() else {
+                        // The operator left the deployment: no program of the prepared generation
+                        // launches it, so there is nothing for a comparison to pair.
+                        tracing::debug!(
+                            operator,
+                            key,
+                            "the prepared generation holds no program for this operator; no paired forward"
+                        );
+                        continue;
+                    };
+                    next.kernel(operator, other)?
+                }
             };
             if Arc::ptr_eq(candidate, kernel) {
                 continue;
@@ -1270,6 +1332,20 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 bucket,
                 generation: batch.generation,
             });
+        }
+        // An operator the prepared generation *adds* has no program in the serving generation to
+        // be compared against: the update's evidence does not cover it, and saying so is the
+        // difference between an update that was measured and one that merely ran.
+        for (operator, key, _) in next.iter() {
+            if self.generation.keys(operator).next().is_some() {
+                continue;
+            }
+            self.note_uncompared(format!(
+                "operator {operator} is new in generation {}: the serving generation holds no \
+                 program of it, so there is nothing to compare it against (its {key} program is \
+                 unmeasured)",
+                batch.generation
+            ));
         }
         Ok(Jobs::new(jobs))
     }
@@ -1292,19 +1368,22 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
+        // One update's evidence: a new precopy starts its record empty, so an operator this
+        // update compares is never reported from the one before it.
+        self.clear_uncompared();
         // One update at a time: a second generation prepared while the first is still waiting for
         // its switchover would leave the first one's graphs unreachable and unaccounted for. The
         // daemon discards an update before starting the next, so this is a disagreement, not a
         // sequence to support.
-        if let Some(prepared) = &self.next {
-            if prepared.number() != next.number() {
-                return Err(Error::Invariant(format!(
-                    "precopy of generation {} while generation {} is prepared and has not been \
-                     switched over or discarded",
-                    next.number(),
-                    prepared.number()
-                )));
-            }
+        if let Some(prepared) = &self.next
+            && prepared.number() != next.number()
+        {
+            return Err(Error::Invariant(format!(
+                "precopy of generation {} while generation {} is prepared and has not been \
+                 switched over or discarded",
+                next.number(),
+                prepared.number()
+            )));
         }
         // Which (operator, key) pairs changed between the serving generation and `next` (7.3
         // step 1). A kernel is unchanged when it is the same `Arc`, so an untouched program keeps
@@ -1474,6 +1553,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.counters = Some(counters);
     }
 
+    fn attach_uncompared(&mut self, sink: Arc<std::sync::Mutex<Vec<String>>>) {
+        self.uncompared = Some(sink);
+    }
+
     fn discard(&mut self, generation: u64) -> Result<()> {
         // A generation in service is not a prepared one: discarding it would take the graphs that
         // serve batches away and leave the device able to answer nothing. The engine discards the
@@ -1627,7 +1710,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 generation,
                 ..
             } => self
-                .shadow(*operator, key, *bucket, *generation)
+                .shadow(operator, key, *bucket, *generation)
                 .map(|()| BatchOutput::default()),
             Job::Rebind {
                 bucket, generation, ..
@@ -1674,11 +1757,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
         kernels: &Arc<ops::Generation>,
     ) -> Result<Walked> {
         let stream = self.stream.clone();
-        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(
+        // One thread records and takes the capture back: an `Arc`/`Mutex` here would say the
+        // handle is shared across threads, which it is not, and the allocator is right to warn
+        // about a non-`Send` handle in an `Arc`.
+        let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
             &stream,
             platform::CaptureMode::Relaxed,
         )?));
-        let mut recording = Recording::new(Arc::clone(&capture));
+        let mut recording = Recording::new(std::rc::Rc::clone(&capture));
         // The forward runs with the generation being walked and the bucket's arena, so every
         // operator launch becomes a node of the template and is reported to `recording`.
         ops::capture::set_sink(Some(&mut recording));
@@ -1689,10 +1775,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return Err(failure.into());
         }
         walked?;
-        let capture = Arc::try_unwrap(capture)
-            .map_err(|_| Error::Invariant("the capture is still shared by its recorder".into()))?
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = std::rc::Rc::try_unwrap(capture).map_err(|_| {
+            Error::Invariant("the capture is still shared by its recorder".into())
+        })?;
+        let capture = capture.into_inner();
         let template = capture.end()?;
         // The node table comes from the capture sink, and the template is the record of what was
         // actually launched: the two can only be compared here. A graph that launched kernels and
@@ -1843,11 +1929,36 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // which the calling device command reports.
         harness.reset();
         self.shadow = Some(harness);
+        // A pair the two programs could not be compared over, and a forward that carved no twin at
+        // all, are both statements of what this update has no evidence for: the operator is named
+        // in the update's answer rather than left to the log (7.3 step 2).
+        if let Ok(summary) = &compared {
+            for entry in &summary.incomparable {
+                self.note_uncompared(format!(
+                    "operator {operator} {key} of generation {generation} in the bucket of {} \
+                     tokens and {} rows: {entry}",
+                    bucket.tokens, bucket.rows
+                ));
+            }
+            if summary.pairs == 0 {
+                self.note_uncompared(format!(
+                    "operator {operator} of generation {generation} was shadowed in the bucket of \
+                     {} tokens and {} rows and its launch carved no twin, so nothing was compared",
+                    bucket.tokens, bucket.rows
+                ));
+            }
+        }
         compared.map(|_| ())
     }
 
     /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
     /// and `next`'s on the twins (7.3).
+    ///
+    /// The pair is the operator's, not the descriptor's: `key` is the key the serving generation
+    /// stored the previous program under, and every launch of the operator in this bucket is
+    /// compared against it (or against the serving program under the launch's own key, when that
+    /// generation still holds one - an operator served under several descriptors is compared
+    /// program for program).
     ///
     /// The paired forward runs over a scratch KV: every page it writes is a scratch page, so the
     /// new kernel cannot touch a page a serving request reads. The model's `Forward::operate` does
@@ -2340,6 +2451,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ));
         };
         let rows = u64::from(bucket.rows);
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(bucket.rows as usize))?;
         let gathered = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
@@ -2526,14 +2638,14 @@ fn hold_kernels(
 /// Public because a device test of the rebind mechanism must record with the sink the runner
 /// captures with: a copy of it in a test would measure the copy.
 pub struct Recording {
-    capture: Arc<std::sync::Mutex<platform::Capture>>,
+    capture: std::rc::Rc<std::cell::RefCell<platform::Capture>>,
     nodes: crate::captured::Nodes,
     failure: Option<platform::Error>,
 }
 
 impl Recording {
     /// Records into `capture`, which the caller installs as the sink and takes back afterwards.
-    pub fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
+    pub fn new(capture: std::rc::Rc<std::cell::RefCell<platform::Capture>>) -> Self {
         Self {
             capture,
             nodes: Vec::new(),
@@ -2559,13 +2671,7 @@ impl Recording {
 
 impl ops::capture::Sink for Recording {
     fn launched(&mut self, operator: &'static str, key: &str) {
-        let recorded = {
-            let mut capture = self
-                .capture
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            capture.record()
-        };
+        let recorded = self.capture.borrow_mut().record();
         match recorded {
             Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
             Err(error) => {
@@ -2698,9 +2804,99 @@ pub fn calls_output(
     Ok(output)
 }
 
+/// Refuses a decode batch whose rows disagree with the bucket's sampling path.
+///
+/// A bucket's variant fixes the sampler launch sequence for every row: [`Variant::DecodeGreedy`]
+/// argmaxes each row's penalized logits and [`Variant::DecodeSampled`] draws one token per row from
+/// its distribution. Neither sequence can serve a row of the other class - a draw cannot produce a
+/// greedy token (the candidates are ordered by token id before the inverse CDF, so a draw selects an
+/// id, not the largest logit), and an argmax is not what a row that states a temperature asked for.
+///
+/// Which requests share a batch is the batcher's decision, so the composition is not the executor's
+/// to change: it states that the batch it was handed cannot be served, naming the row and the
+/// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
+/// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
+/// host argmax of the row's kept logits (`greedy_first_tokens`).
+fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> Result<()> {
+    if !variant.is_decode() {
+        return Ok(());
+    }
+    let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+    let temperature = ops::sampler::TEMPERATURE as usize;
+    let rows = parameters.len() / columns;
+    for (row, stated) in parameters.chunks_exact(columns).enumerate() {
+        let greedy_row = stated[temperature] == 0.0;
+        if greedy_row == variant.greedy() {
+            continue;
+        }
+        return Err(Error::Invariant(format!(
+            "a batch is homogeneous in its sampling path: the {} bucket holds {rows} row(s) and row \
+             {row} states temperature {}, so its token is {} and this bucket has no launch sequence \
+             for it",
+            variant.name(),
+            stated[temperature],
+            if greedy_row {
+                "the argmax of its penalized logits"
+            } else {
+                "drawn from its distribution"
+            },
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decode batch is homogeneous in its sampling path: a row of the other class is refused by
+    /// name rather than served by a launch sequence that cannot produce its token. A prefill bucket
+    /// is exempt, because a prompt-ending greedy row is ordinary there.
+    #[test]
+    fn a_decode_bucket_refuses_a_row_of_the_other_sampling_class() {
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        let temperature = ops::sampler::TEMPERATURE as usize;
+        // One row a stated temperature, the rest of its columns the reference values: 8 floats a row,
+        // as the executor writes them.
+        let rows = |stated: &[f32]| {
+            stated
+                .iter()
+                .flat_map(|stated| {
+                    let mut row = vec![1.0_f32; columns];
+                    row[temperature] = *stated;
+                    row
+                })
+                .collect::<Vec<f32>>()
+        };
+
+        assert!(
+            refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.0, 0.0])).is_ok(),
+            "two greedy rows were refused by a greedy bucket"
+        );
+        assert!(
+            refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &rows(&[0.7, 1.0])).is_ok(),
+            "two sampled rows were refused by a sampling bucket"
+        );
+        assert!(
+            refuse_mixed_sampling(crate::plan::Variant::PrefillOutput, &rows(&[0.0, 0.7])).is_ok(),
+            "a prompt-ending greedy row was refused inside a drawing prefill bucket"
+        );
+
+        let error = refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &rows(&[0.7, 0.0]))
+            .expect_err("a greedy row was drawn from in a sampling bucket");
+        let text = error.to_string();
+        assert!(
+            text.contains("decode_sampled") && text.contains("row 1"),
+            "the refusal names neither the bucket nor the row: {text}"
+        );
+
+        let error = refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.5]))
+            .expect_err("a sampled row was argmaxed in a greedy bucket");
+        assert!(
+            error.to_string().contains("decode_greedy"),
+            "the refusal does not name the bucket: {error}"
+        );
+    }
 
     /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
     /// prefix passes through every provider, and one that reuses a leased one is refused by name by

@@ -254,7 +254,18 @@ struct ProcessInterface {
 impl ProcessInterface {
     /// Connects to `address` and states this process's identity, which the daemon answers with the
     /// deployment's nodes or a refusal (§2.3).
-    fn connect(address: &str, deployment: &str) -> Result<Self> {
+    fn connect(address: &str, deployment: &str, engine: u64) -> Result<Self> {
+        // A process link that cannot name its engine is refused here rather than sent: zero states
+        // "no main process", and a daemon that accepted it would file this connection in the place
+        // of a process it can never command. The launch file states the number, so a launch without
+        // one is the deployment's fault and this is where it is named.
+        if engine == 0 {
+            bail!(
+                "the launch file states engine 0, which names no main process: the daemon addresses \
+                 the epoch's program-layer commands by this number, so a process it started under \
+                 none cannot be commanded"
+            );
+        }
         let mut connection = proto::Connection::connect(address).with_context(|| {
             format!("connecting to the daemon's process interface at {address}")
         })?;
@@ -265,6 +276,14 @@ impl ProcessInterface {
             peer: Some(proto::process::hello::Peer::Engine(
                 proto::process::Engine {
                     deployment: deployment.to_owned(),
+                    // The daemon keys this connection by the number the epoch layer started this
+                    // process under, so a command it sends for engine N reaches this process and
+                    // not whichever connection the daemon happened to accept Nth.
+                    engine,
+                    // This is the process link: the one the daemon's program-layer commands
+                    // travel down. The request link, on its own socket, states `REQUESTS`, so the
+                    // two links of one engine are never confused for one another.
+                    interface: proto::process::Interface::Process as i32,
                 },
             )),
         })?;
@@ -292,6 +311,11 @@ impl ProcessInterface {
         tracing::info!(
             nodes = welcome.nodes.len(),
             build = %welcome.build,
+            // The engine number this link claims, so this process's line and the daemon's
+            // "a process connected engine=N" are matched by a number rather than by their order in
+            // the log - which is the confusion that cost a run.
+            engine,
+            interface = "process",
             "connected to the deployment's process interface"
         );
         Ok(Self {
@@ -525,6 +549,16 @@ pub(crate) struct MainProcess {
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
     executors: Vec<Arc<Executor>>,
     memory: Option<Memory>,
+    /// The rank's Storage Server client, kept for the two calls of §2.5 that reach its ledger and no
+    /// other: a park gives the cache's segments back, and a wake maps them again. Every caller takes
+    /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
+    /// hold one beside the control thread without a lock.
+    storage: Option<Arc<Retained>>,
+    /// Whether this process's segments are given back to the Storage Server: a park sets it, a wake
+    /// clears it. It exists so a process that never parked sends no wake at all - a wake for a pool
+    /// that never slept is a no-op, but its round trip would still wait behind a queued capture on
+    /// the first `Serve`, and the first token must not pay for a mechanism it did not use.
+    slept: bool,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
     modules: Lane<Install>,
@@ -681,7 +715,11 @@ impl MainProcess {
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
-        let mut process = ProcessInterface::connect(&launch.processes, &launch.deployment)?;
+        let mut process = ProcessInterface::connect(
+            &launch.processes,
+            &launch.deployment,
+            launch.engine,
+        )?;
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -691,6 +729,9 @@ impl MainProcess {
         let storage = claim(&mut process, launch, &epoch.host, host_kv_cache)?;
         let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
             .context("connecting to the Storage Server")?;
+        // The client outlives every world of the epoch, and §2.5's park and wake reach its ledger
+        // through the memory owners: kept here so the park does not have to hold the connect.
+        let retained = Arc::clone(&client);
         // A weight's region is one device's address, so the store maps on the device this rank's
         // model is loaded for; the client is shared, the mapping is not.
         let weight_device = *plan
@@ -702,7 +743,7 @@ impl MainProcess {
         // one `Arc` and not a second load. The load and the capacity plan are one call because the
         // order between them is the plan's: the weights are mapped first, so what the plan measures
         // is what is left of the device rather than what was there before the model.
-        let (model, mut memory, inventory) = plan
+        let (model, mut memory, inventory, graph) = plan
             .load_and_open(&mut weights, &mut &*client)
             .context("loading the epoch's model")?;
 
@@ -731,19 +772,30 @@ impl MainProcess {
         // memory and handed to the executor thread, so every owner and every runner books against
         // the same allowance.
         let pools = memory.pools();
-        let device = *plan
-            .devices()
-            .first()
-            .context("this rank serves no device")?;
-        // Only the scratch figure is read here: the device thread starts before any batch and the
-        // shadow region is the one pool it is sized with. The resident pool is the capacity plan's
-        // and `open_memory` opens it, so this call states none.
-        let scratch = plan.graph(device, 0)?.scratch;
+        // A rank with no device serves nothing, and saying it here names the deployment's fault
+        // rather than leaving the pool's figure to a plan that never sized one.
+        if plan.devices().is_empty() {
+            bail!("this rank serves no device");
+        }
+        // The scratch pool's figure comes from the one call that sized it, with the memory: the
+        // shadow region and the state group's snapshot are one reservation (4.5), and a second
+        // computation here could disagree with the pool the allocator reserved.
+        let scratch = graph.scratch;
+        // The shadow region alone: the twins allocate it, and the reservation beside it holds the
+        // state group's snapshot too (7.3, 4.5).
+        let shadow = graph.shadow;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
             let executor =
-                Executor::spawn(*device, runners, plan.events(), Arc::clone(&pools), scratch)?;
+                Executor::spawn(
+                    *device,
+                    runners,
+                    plan.events(),
+                    Arc::clone(&pools),
+                    scratch,
+                    shadow,
+                )?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
@@ -756,6 +808,10 @@ impl MainProcess {
             let shadow = executor.set_shadow()?;
             device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
+            // §2.5's two commands reach the Storage Server's ledger from the device thread, which
+            // owns the stream a wake resets its units on, so the client is bound beside the cache
+            // handle rather than kept only here.
+            executor.bind_storage(Arc::clone(&client));
             executors.push(Arc::new(executor));
             generations.push(generation);
         }
@@ -771,6 +827,8 @@ impl MainProcess {
             schedulers,
             executors,
             memory: Some(memory),
+            storage: Some(retained),
+            slept: false,
             blocking,
             modules,
             update,
@@ -838,6 +896,17 @@ impl MainProcess {
     /// sends the epoch's programs.
     fn park_standby(&mut self) -> Result<()> {
         self.serving = false;
+        // The same release the `Park` command makes: this process serves nothing from here until a
+        // promotion, and a standby holding the cache's segments while a successor loads is the
+        // memory the handover needs. A pool that is not segmented has nothing to give back, and the
+        // line says so.
+        if let Err(error) = self.give_back_segments() {
+            tracing::warn!(
+                %error,
+                "this standby could not give the cache's segments back; it parks with them still \
+                 mapped"
+            );
+        }
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Parked(
                 proto::process::Parked {
@@ -845,6 +914,73 @@ impl MainProcess {
                 },
             )),
         });
+        Ok(())
+    }
+
+    /// §2.5: gives the parked process's cache segments back to the Storage Server, and states what
+    /// went back and what stayed.
+    ///
+    /// The segments are the only pool a sleep releases: the graph pools and the scratch region are
+    /// reservations whose captures keep their addresses (the segments' offsets are fixed inside one
+    /// reserved range, so a wake is a remap and never a recapture), and the resident owners map
+    /// through the same ledger for the process's life. A pool that is not segmented has nothing to
+    /// give back, and the line says that rather than reading as a release that happened.
+    fn give_back_segments(&mut self) -> Result<()> {
+        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        // One command per device, and the control thread waits for each: the release is what the
+        // successor's memory depends on, so a park that has not given its segments back is not
+        // reported `Parked` yet. The device queue serialises commands, so this runs between
+        // batches.
+        for executor in &self.executors {
+            let device = executor.device();
+            let submission = executor
+                .sleep()
+                .with_context(|| format!("queueing device {device}'s sleep"))?;
+            device_command(&self.watchdog, device, "the park's sleep", submission)?;
+        }
+        self.slept = true;
+        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        if let (Some(before), Some(after)) = (kept_before, kept) {
+            tracing::info!(
+                given_back = before.saturating_sub(after),
+                kept = after,
+                pool = "the cache's segments",
+                devices = self.executors.len(),
+                "the park gave back the segments it no longer serves, and kept the pools it serves \
+                 with"
+            );
+        }
+        Ok(())
+    }
+
+    /// §2.5: takes the cache's segments back on every device, `limit` at a time, before admission
+    /// opens. A wake is a remap, not a repair: the generation's captures keep their addresses, so no
+    /// warmup follows it, and a wake that fails leaves admission closed and fails its caller by name.
+    fn take_back_segments(&mut self) -> Result<()> {
+        if !self.slept {
+            return Ok(());
+        }
+        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        for executor in &self.executors {
+            let device = executor.device();
+            // No limit: this process takes back everything the Storage Server still holds for its
+            // rank. A limit is a bound on a smaller wake, not a demand that everything return.
+            let submission = executor
+                .wake(None)
+                .with_context(|| format!("queueing device {device}'s wake"))?;
+            device_command(&self.watchdog, device, "the wake", submission)?;
+        }
+        self.slept = false;
+        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        if let (Some(before), Some(after)) = (kept_before, kept) {
+            tracing::info!(
+                taken_back = after.saturating_sub(before),
+                kept_after = after,
+                limit = "every segment the storage holds",
+                devices = self.executors.len(),
+                "the wake took its segments back before admission opened"
+            );
+        }
         Ok(())
     }
 
@@ -1210,6 +1346,18 @@ impl MainProcess {
                 // after `Promoted`.
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
+                    // §2.5: the schedulers are parked and nothing is in flight, so the cache's
+                    // segments can go back to the Storage Server - a parked process that keeps them
+                    // holds a successor's memory. A park that cannot give them back is still a park:
+                    // the process serves nothing, and failing the epoch over a release would end a
+                    // process that a promotion can still use. It says so instead.
+                    if let Err(error) = self.give_back_segments() {
+                        tracing::warn!(
+                            %error,
+                            "the park could not give the cache's segments back; it is parked with \
+                             them still mapped"
+                        );
+                    }
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Parked(
                             proto::process::Parked {
@@ -1223,6 +1371,10 @@ impl MainProcess {
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
+                    // §2.5: the promotion runs on the addresses the predecessor's segments held, so
+                    // they are mapped again before anything is admitted, and a wake that fails fails
+                    // the promotion by name.
+                    self.take_back_segments()?;
                     self.promoted = true;
                     // A promoted standby admits on the same rule as any other process: once the
                     // generation it will serve has been warmed (§4.5).
@@ -1326,7 +1478,7 @@ impl MainProcess {
                     operators = programs.len(),
                     policy = %policy.backend,
                     policy_revision = policy.revision,
-                    "received the daemon's precopy"
+                    "the daemon's Precopy arrived"
                 );
                 self.start_precopy(generation, &programs, &policy, reply)?;
                 return Ok(None);
@@ -1416,19 +1568,43 @@ impl MainProcess {
             .all(|generation| generation.is_empty());
         let resolved;
         let mut candidates = Candidates::new();
-        let programs = if programs.is_empty() && never_installed {
-            let (programs, listed) = match self.listed_programs() {
-                Ok(resolved) => resolved,
-                Err(failure) => return self.abandon_precopy(generation, failure, reply),
-            };
-            tracing::info!(
-                operators = programs.len(),
-                alternative = listed.values().filter(|ordered| ordered.len() > 1).count(),
-                "the precopy named no kernel program: installing this host's built programs"
-            );
-            candidates = listed;
-            resolved = programs;
-            &resolved
+        let programs = if never_installed {
+            // A named program chooses its operator's implementation - its backend and revision -
+            // and never states the operator set: a deployment that pins one operator's kernel
+            // still runs every other operator its buckets launch. So the epoch's first generation
+            // takes this host's store as its set and the deployment's named programs overlaid on
+            // it by operator, which is the only reading under which `kernels=1` on a host that
+            // built twenty-seven launches a model rather than a fragment.
+            match self.listed_programs() {
+                Ok((mut listed, ordered)) => {
+                    let named = programs.len();
+                    overlay_named(&mut listed, programs);
+                    tracing::info!(
+                        operators = listed.len(),
+                        named,
+                        alternative = ordered.values().filter(|held| held.len() > 1).count(),
+                        "this host's built programs, with the deployment's named ones overlaid"
+                    );
+                    candidates = ordered;
+                    resolved = listed;
+                    &resolved
+                }
+                // The store describes nothing for this host's targets. With no named program there
+                // is nothing to install at all and the listing's own refusal is the answer; with a
+                // named one, the named set is installed and the walk reports what it cannot bind.
+                Err(failure) if programs.is_empty() => {
+                    return self.abandon_precopy(generation, failure, reply);
+                }
+                Err(failure) => {
+                    tracing::warn!(
+                        ?failure,
+                        named = programs.len(),
+                        "this host's store describes no program to overlay: installing what the \
+                         deployment named"
+                    );
+                    programs
+                }
+            }
         } else {
             programs
         };
@@ -1537,6 +1713,41 @@ impl MainProcess {
             candidates.insert(op, ordered);
         }
         Ok((programs, candidates))
+    }
+
+    /// One operator's program from this host's store, for a walk that named an operator the
+    /// deployment left unnamed.
+    ///
+    /// The store's listing is the authority for what this host can launch: its packages are the
+    /// modules built for this host's targets. The first candidate of the operator is taken - the
+    /// deployment expressed no preference, so the store's order decides - and `None` says the store
+    /// describes nothing for the operator, which the caller states as a missing package rather than
+    /// a missing key.
+    fn borrow_program(
+        &self,
+        operator: &str,
+    ) -> std::result::Result<Option<(program_server::program::ProgramSlot, Program)>, String> {
+        let listing = self.listing()?;
+        for (op, ordered) in select_programs(&listing.packages, &self.targets) {
+            if ops::operator_name(&op) != Some(operator) {
+                continue;
+            }
+            let Some((backend, revision)) = ordered.first() else {
+                continue;
+            };
+            return Ok(Some((
+                program_server::program::ProgramSlot {
+                    op,
+                    phase: None,
+                },
+                Program {
+                    backend: backend.clone(),
+                    revision: *revision,
+                    arguments: Default::default(),
+                },
+            )));
+        }
+        Ok(None)
     }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
@@ -1814,6 +2025,24 @@ impl MainProcess {
             .report("this node's warmup", generation, bound, now);
     }
 
+    /// The operators this node's devices could not compare, each with its reason, in device order
+    /// and without repeats (7.3 step 2).
+    ///
+    /// It is carried by the precopy's answer so an update that has no evidence for an operator says
+    /// so in the record the daemon reads, not only in this process's log: empty is the statement
+    /// that every operator the update replaced was compared.
+    fn uncompared(&self) -> Vec<String> {
+        let mut entries: Vec<String> = Vec::new();
+        for executor in &self.executors {
+            for entry in executor.uncompared() {
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries
+    }
+
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
     /// as it is, and the next serve pass looks again.
@@ -1841,6 +2070,7 @@ impl MainProcess {
             tracing::warn!(
                 generation,
                 stage = entered,
+                waiting_on = %pending_work(&precopy.stage, &self.executors),
                 waited_s = precopy.since.elapsed().as_secs(),
                 "the precopy has stood in this stage past the watchdog's stall bound and nothing \
                  has answered: the Program Server, a device or a scheduler is the one to look at"
@@ -1909,6 +2139,27 @@ impl MainProcess {
                 self.after_modules(precopy, loaded)
             }
             PrecopyStage::Executors(submissions) => {
+                // A device that never answers is a process that serves nothing until the epoch
+                // ends: the stage is polled, so without this bound the only line it prints is the
+                // stall warning, and the run waits out the daemon's whole prepare bound to learn
+                // what the log already showed. Preparing an installed generation is a rebind or a
+                // recapture - seconds of capture and a pinned upload, never a compile - so a stage
+                // that has stood past twice the watchdog's stall bound is failed here by name,
+                // saying what never answered. Serving keeps what it had; the update does not.
+                if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
+                    let pending = pending_work(&precopy.stage, &self.executors);
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy {
+                            reason: format!(
+                                "this node's device never answered its preparation after {}s \
+                                 ({pending}): the device thread is the one to look at",
+                                precopy.since.elapsed().as_secs()
+                            ),
+                        },
+                        precopy.reply,
+                    );
+                }
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
@@ -1944,6 +2195,45 @@ impl MainProcess {
                                     precopy.reply,
                                 );
                             };
+                            // The walk can name an operator this generation holds no program for:
+                            // a deployment names the implementations it pins and says nothing about
+                            // the rest, so the rest come from this host's store - one borrow per
+                            // operator, and a store that describes none stops the update with a
+                            // sentence naming the package rather than a key.
+                            if !precopy.names(&operator) {
+                                match self.borrow_program(&operator) {
+                                    Ok(Some((slot, program))) => {
+                                        tracing::info!(
+                                            %operator,
+                                            backend = %program.backend,
+                                            revision = program.revision,
+                                            generation,
+                                            "the walk named an operator the deployment left \
+                                             unnamed: this host's store supplies it"
+                                        );
+                                        precopy.programs.insert(slot, program);
+                                    }
+                                    Ok(None) => {
+                                        return self.abandon_precopy(
+                                            generation,
+                                            UpdateFailure::Precopy {
+                                                reason: format!(
+                                                    "{operator} has no kernel in this host's \
+                                                     store and the deployment does not name one"
+                                                ),
+                                            },
+                                            precopy.reply,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        return self.abandon_precopy(
+                                            generation,
+                                            UpdateFailure::Precopy { reason: error },
+                                            precopy.reply,
+                                        );
+                                    }
+                                }
+                            }
                             if precopy
                                 .learned
                                 .get(&operator)
@@ -2035,7 +2325,13 @@ impl MainProcess {
                 // serving generation and a revert has nothing to undo.
                 self.prepared = std::mem::take(&mut precopy.next);
                 self.update.precopied(generation)?;
-                self.answer(precopy.reply, ProgramStatus::Precopied { generation });
+                self.answer(
+                    precopy.reply,
+                    ProgramStatus::Precopied {
+                        generation,
+                        uncompared: self.uncompared(),
+                    },
+                );
                 Ok(())
             }
             PrecopyStage::Done => Ok(()),
@@ -2358,6 +2654,11 @@ impl MainProcess {
             self.pending_serve = true;
             return Ok(());
         }
+        // §2.5: a process that parked gave its segments back, so nothing may be admitted until they
+        // are mapped again - and a wake that fails fails the resume by name rather than serving
+        // unmapped pages.
+        self.take_back_segments()
+            .with_context(|| format!("waking epoch {} before it admits", serve.epoch))?;
         // A `Serve` that arrives while the warmup still has to capture this generation's buckets is
         // owed rather than refused: admission opens when the last submission finishes, the same way
         // it does at a switchover (§4.5).
@@ -3321,8 +3622,12 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
     let kind = match status {
-        ProgramStatus::Precopied { generation } => Kind::Precopied(proto::process::Precopied {
+        ProgramStatus::Precopied {
+            generation,
+            uncompared,
+        } => Kind::Precopied(proto::process::Precopied {
             generation: *generation,
+            uncompared: uncompared.clone(),
         }),
         ProgramStatus::PrecopyFailed { failure, .. } => {
             Kind::PrecopyFailed(proto::process::PrecopyFailed {
@@ -3890,6 +4195,33 @@ struct Precopy {
     stage: PrecopyStage,
 }
 
+/// Overlays the deployment's named programs on this host's store listing, by operator.
+///
+/// A named program chooses its operator's implementation - its backend, its revision and the
+/// arguments it was built with - and states nothing about the operators it does not name, so the
+/// two sets are united rather than substituted: the store stays the authority for every operator
+/// the deployment left unnamed. The named slot replaces every slot of its operator the listing
+/// holds, whatever phase either states.
+fn overlay_named(listed: &mut Programs, named: &Programs) {
+    for (slot, program) in named {
+        listed.retain(|held, _| held.op != slot.op);
+        listed.insert(slot.clone(), program.clone());
+    }
+}
+
+impl Precopy {
+    /// Whether this generation holds a program for `operator`.
+    ///
+    /// A program is named by a slot, and a slot names an operator and an optional phase, so the
+    /// question a walk asks - "does this generation have an implementation of this operator?" - is
+    /// answered by any slot of that operator, whatever phase it states.
+    fn names(&self, operator: &str) -> bool {
+        self.programs
+            .keys()
+            .any(|slot| ops::operator_name(&slot.op) == Some(operator))
+    }
+}
+
 /// The stage a precopy is in.
 enum PrecopyStage {
     /// The module-load lane builds, resolves and installs each device's
@@ -3980,6 +4312,56 @@ enum StageFailure {
 
 /// Whether every submission finished, and if not, why the first unfinished or
 /// failed one did not.
+/// What one stage is still waiting for, in one phrase.
+///
+/// A stage's name says where a hang is, not which of the stage's several waits it is: the module
+/// lane holds one task per device, the executor stage one submission per device, and the shadow
+/// stage one step per scheduler. The stall line prints the counts so a run names the wait that
+/// never answered without a second run built for the purpose.
+fn pending_work(stage: &PrecopyStage, executors: &[Arc<Executor>]) -> String {
+    match stage {
+        PrecopyStage::Modules(tasks) => {
+            let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
+            format!("{answered} of {} kernel load(s) answered", tasks.len())
+        }
+        PrecopyStage::Executors(submissions) => {
+            // The label alone says which stage stood; the device thread's own account says whether
+            // it is working (a capture in progress, a bucket being recaptured) or waiting on
+            // something outside it. A capture is open or it is not, and the two look identical
+            // from the control thread without this.
+            let mut pending = Vec::new();
+            for (rank, submission) in submissions.iter().enumerate() {
+                if submission.outcome().is_some() {
+                    continue;
+                }
+                let Some(executor) = executors.get(rank) else {
+                    pending.push(format!("rank {rank}: no executor"));
+                    continue;
+                };
+                let performing = executor
+                    .performing()
+                    .unwrap_or_else(|| "nothing".to_owned());
+                pending.push(format!(
+                    "rank {rank}: {performing}, {} open capture(s)",
+                    executor.capturing()
+                ));
+            }
+            format!(
+                "{} of {} device preparation(s) answered ({})",
+                submissions.len() - pending.len(),
+                submissions.len(),
+                pending.join("; ")
+            )
+        }
+        PrecopyStage::Shadow(answers) => {
+            let answered = answers.iter().filter(|answer| !answer.is_empty()).count();
+            format!("{answered} of {} shadow step(s) answered", answers.len())
+        }
+        // The driver replaces the stage with this before it looks at it, so it is never the wait.
+        PrecopyStage::Done => "no stage".to_owned(),
+    }
+}
+
 fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
     for submission in submissions {
         match submission.outcome() {
@@ -4214,6 +4596,9 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
         build: proto::BUILD.to_owned(),
         major: proto::PROTOCOL_MAJOR,
         minor: proto::PROTOCOL_MINOR,
+        // The request link: requests, their events and the epoch's metrics. The process link
+        // states `PROCESS` on its own socket, and both name the same engine number.
+        interface: proto::process::Interface::Requests as i32,
     })?;
     let welcome: proto::request::wire::Welcome = control
         .daemon_mut()
@@ -4245,6 +4630,48 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A named program chooses its operator's implementation and never states the operator set:
+    /// the generation's programs are the store's listing with the named ones overlaid by operator.
+    #[test]
+    fn a_named_program_replaces_its_operator_and_leaves_the_rest_of_the_listing() {
+        let slot = |op: &str| program_server::program::ProgramSlot {
+            op: op.to_owned(),
+            phase: None,
+        };
+        let program = |backend: &str, revision: u32| Program {
+            backend: backend.to_owned(),
+            revision,
+            arguments: Default::default(),
+        };
+
+        let mut listed = Programs::new();
+        listed.insert(slot("paged_attention"), program("fa4", 3));
+        listed.insert(slot("rms_norm"), program("reference", 1));
+        listed.insert(slot("softmax"), program("reference", 2));
+
+        let mut named = Programs::new();
+        named.insert(slot("paged_attention"), program("trtllm", 7));
+
+        overlay_named(&mut listed, &named);
+
+        assert_eq!(listed.len(), 3, "the overlay changed the operator set");
+        assert_eq!(
+            listed.get(&slot("paged_attention")).map(|held| held.backend.as_str()),
+            Some("trtllm"),
+            "the deployment's own choice did not replace the store's default"
+        );
+        assert_eq!(
+            listed.get(&slot("rms_norm")).map(|held| held.revision),
+            Some(1),
+            "an operator the deployment did not name was dropped"
+        );
+        assert_eq!(
+            listed.get(&slot("softmax")).map(|held| held.revision),
+            Some(2),
+            "an operator the deployment did not name was dropped"
+        );
+    }
+
     use program_server::protocol::{ListedModule, ListedPackage};
     use program_server::ModuleForm;
 

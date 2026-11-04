@@ -28,6 +28,9 @@ message Hello {
   string build = 3;
   // The identity the daemon started the engine process under.
   uint64 engine = 4;
+  // Which of the process's links this connection is, as `process.proto`'s
+  // `Interface` states it: this one is always `INTERFACE_REQUESTS`.
+  int32 interface = 5;
 }
 
 // The answer to a `Hello`.

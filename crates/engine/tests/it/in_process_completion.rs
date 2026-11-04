@@ -67,7 +67,10 @@ fn rank(host: &str) -> WorkerInfo {
         request_slots: 8,
         max_batch_calls: 16,
         max_batch_tokens: 512,
-        prefix_cache: None,
+        // A text pool serves token generation, so it advertises the paged KV
+        // pool every such worker has (`WorkerInfo::default`): a worker with no
+        // prefix cache is refused a token request at submission, which is the
+        // rule for a media-only rank and not for this one.
         buffer_pool_bytes: 1 << 20,
         ..WorkerInfo::default()
     }
@@ -353,8 +356,11 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
             while let Ok(event) = events.try_recv() {
                 match event {
                     Event::TextToken { .. } | Event::TextTokens { .. } => served[index] = true,
-                    Event::Rejected { .. } | Event::Error { .. } => {
-                        panic!("request {} was refused, not queued", index + 1)
+                    refused @ (Event::Rejected { .. } | Event::Error { .. }) => {
+                        panic!(
+                            "request {} was refused, not queued: {refused:?}",
+                            index + 1
+                        )
                     }
                     _ => {}
                 }
