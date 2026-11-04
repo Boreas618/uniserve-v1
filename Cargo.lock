@@ -4684,6 +4684,7 @@ dependencies = [
  "libc",
  "libloading",
  "mimalloc",
+ "program-server",
  "rustix",
  "storage",
  "storage-server",
