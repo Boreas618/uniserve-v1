@@ -143,6 +143,13 @@ fn run_rank(
         .map_err(|error| format!("synchronize after the replay: {error}"))?;
     let replayed = read_back(&host, &buffer, &stream)?;
 
+    // The graphs must be destroyed before the communicator they hold: NCCL's own teardown of a
+    // communicator whose captured graphs still exist hangs (the caller measured that order in a C
+    // probe on four devices, and this probe hung at exactly this point in its first version). The
+    // executor's pools and generations follow the same rule: a generation's graph execs are
+    // destroyed before the communicator their collective node names.
+    drop(exec);
+    drop(graph);
     communicator
         .destroy()
         .map_err(|error| format!("Communicator::destroy: {error}"))?;
