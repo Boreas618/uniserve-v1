@@ -446,7 +446,10 @@ mod tests {
             combine.to_string(),
             "mode_combine_hidden_2048_top_8_experts_128_max_tokens_8192_ranks_4_dtype_bf16"
         );
-        let wider = Descriptor { ranks: 8, ..combine };
+        let wider = Descriptor {
+            ranks: 8,
+            ..combine
+        };
         assert_ne!(wider.to_string(), combine.to_string());
     }
 }

@@ -168,10 +168,12 @@ impl Op for MoeUnpermute {
 
         args.routes
             .require_shape(Self::NAME, Shape::new(&[routes, hidden]))?;
-        args.routes.require_row(Self::NAME, descriptor.input, hidden)?;
+        args.routes
+            .require_row(Self::NAME, descriptor.input, hidden)?;
         args.out
             .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
-        args.out.require_row(Self::NAME, descriptor.output, hidden)?;
+        args.out
+            .require_row(Self::NAME, descriptor.output, hidden)?;
         args.expanded_to_permuted
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.scales
@@ -229,11 +231,7 @@ impl Op for MoeUnpermute {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        Tolerance::dot(
-            u64::from(descriptor.top),
-            DType::F32,
-            descriptor.output,
-        )
+        Tolerance::dot(u64::from(descriptor.top), DType::F32, descriptor.output)
     }
 }
 
@@ -257,8 +255,14 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Call, hidden), layout.hidden);
         assert_eq!(std::mem::offset_of!(Call, routes_rows), layout.routes_rows);
         assert_eq!(std::mem::offset_of!(Call, input_dtype), layout.input_dtype);
-        assert_eq!(std::mem::offset_of!(Call, scales_dtype), layout.scales_dtype);
-        assert_eq!(std::mem::offset_of!(Call, output_dtype), layout.output_dtype);
+        assert_eq!(
+            std::mem::offset_of!(Call, scales_dtype),
+            layout.scales_dtype
+        );
+        assert_eq!(
+            std::mem::offset_of!(Call, output_dtype),
+            layout.output_dtype
+        );
         assert_eq!(std::mem::offset_of!(Call, error), layout.error);
     }
 
