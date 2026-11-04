@@ -131,6 +131,11 @@ impl Shadow {
 /// twin, `numel` elements of `dtype` each. The comparison is what 7.3 requires of a shadow run:
 /// element by element, in the dtype's own value domain, within the operator's [`Tolerance`], with
 /// two NaNs agreeing and a NaN against a number not.
+///
+/// A difference names the operator's bound as well as the measurement - how many elements
+/// differ, the widest one's reference and candidate, its absolute difference, and the `atol` and
+/// `rtol` it left - because "the kernels differ" does not say whether a program is wrong or was
+/// compiled twice.
 pub fn compare_buffers(
     dtype: DType,
     numel: u64,
@@ -159,6 +164,11 @@ pub fn compare_buffers(
             "a twin buffer's copy has an unexpected size".into(),
         ));
     }
+    // Every element is compared, not only up to the first difference: the reason an update is
+    // refused states how far apart the two programs are and how many elements that is, which is
+    // what tells a wrong kernel from a rounding, and the scan is host memory over a bucket.
+    let mut differing: u64 = 0;
+    let mut widest: Option<(usize, f32, f32, f32)> = None;
     for index in 0..numel as usize {
         let offset = index * width;
         // Each arm reads the element through `element`, which names the offset a buffer too short
@@ -203,12 +213,24 @@ pub fn compare_buffers(
             tolerance.allows(reference, candidate)
         };
         if !agree {
-            return Err(Error::Invariant(format!(
-                "element {index} differs beyond tolerance: reference {reference}, candidate \
-                 {candidate}, tolerance atol {} rtol {}",
-                tolerance.atol, tolerance.rtol
-            )));
+            differing += 1;
+            // `total_cmp` orders the non-finite differences too, so a NaN or an infinity is
+            // selected as the widest and named rather than dropped by a comparison that would
+            // answer false for it.
+            let difference = (reference - candidate).abs();
+            let wider = widest.is_none_or(|(_, _, _, widest)| difference.total_cmp(&widest).is_gt());
+            if wider {
+                widest = Some((index, reference, candidate, difference));
+            }
         }
+    }
+    if let Some((index, reference, candidate, difference)) = widest {
+        return Err(Error::Invariant(format!(
+            "{differing} of {numel} elements differ beyond tolerance: the widest is element \
+             {index}: reference {reference}, candidate {candidate}, |difference| {difference}, \
+             tolerance atol {} rtol {}",
+            tolerance.atol, tolerance.rtol
+        )));
     }
     Ok(numel)
 }

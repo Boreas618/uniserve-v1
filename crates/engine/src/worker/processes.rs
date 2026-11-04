@@ -194,13 +194,18 @@ pub(crate) struct ProcessClient {
 }
 
 impl ProcessClient {
-    /// Connects to the leader daemon's process socket at `address` as an
-    /// engine of `deployment`.
+    /// Connects to the leader daemon's process socket at `address` as
+    /// `deployment`'s engine `engine`, or as no process at all when `engine` is
+    /// zero (the leader's own planning client).
     ///
     /// # Errors
     ///
     /// Fails when nothing listens there or the daemon refuses the engine.
-    pub(crate) fn connect(address: &str, deployment: &str) -> anyhow::Result<Processes> {
+    pub(crate) fn connect(
+        address: &str,
+        deployment: &str,
+        engine: u64,
+    ) -> anyhow::Result<Processes> {
         let mut connection = Connection::connect(address)
             .with_context(|| format!("connecting to the daemon at {address}"))?;
         connection.send(&Hello {
@@ -209,6 +214,14 @@ impl ProcessClient {
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(proto::process::Engine {
                 deployment: deployment.to_owned(),
+                // `engine` is the number the epoch layer started a main process under, and a
+                // client that is not one states zero: the daemon keys a connection by this number,
+                // so a command reaches the process it names rather than whichever connection the
+                // daemon accepted in that place. The leader's planning client is not a process.
+                engine,
+                // A client that is not a main process states no interface, and the daemon keeps
+                // its pre-`interface` behaviour for it.
+                interface: 0,
             })),
         })?;
         let welcome: Welcome = connection
