@@ -1255,11 +1255,13 @@ impl MainProcess {
                 )));
             };
             let serving = descriptor_keys(&self.generations[0], operator);
-            let keys = if !serving.is_empty() {
-                serving
-            } else if let Some(keys) = learned.get(operator) {
-                keys.clone()
-            } else {
+            // A generation that launched this operator states the keys it runs; a key the walk has
+            // taught since is added to them, never substituted for them. The first generation has
+            // nothing serving, so its keys come from the package - once, not one capture at a time -
+            // and a taught key joins them for the packages the store does not describe.
+            let mut keys = serving;
+            let mut known: Vec<String> = learned.get(operator).cloned().unwrap_or_default();
+            if keys.is_empty() {
                 if listing.is_none() {
                     listing = Some(self.listing().map_err(invalid)?);
                 }
@@ -1269,15 +1271,18 @@ impl MainProcess {
                     program,
                     &self.targets,
                 );
-                if declared.is_empty() {
+                if declared.is_empty() && known.is_empty() {
                     return Err(invalid(format!(
                         "the package the daemon names for {} ({} revision {}) declares no \
                          descriptor for this node's target {:?}",
                         slot.op, program.backend, program.revision, self.targets
                     )));
                 }
-                declared
-            };
+                keys = declared;
+            }
+            keys.append(&mut known);
+            keys.sort_unstable();
+            keys.dedup();
             descriptors.push(Descriptors {
                 op: slot.op.clone(),
                 keys,
@@ -1823,6 +1828,11 @@ impl MainProcess {
     /// generation and its nodes stayed through probation, so the revert is the
     /// reverse switchover and nothing has to be prepared again.
     fn revert(&mut self, generation: u64, failure: UpdateFailure) -> Result<ProgramStatus> {
+        // The phase before the call decides what a device does with the update's generation: a
+        // generation that was prepared but never cut over never served, so nothing goes back and it
+        // is discarded; a generation on probation served, and its reverse switchover runs. The
+        // machine answers `Serving` either way once the call returns, so the phase is read first.
+        let phase = self.update.phase();
         if let Err(error) = self.update.revert(generation, failure.clone()) {
             tracing::error!(%error, "reverting a program-layer update failed");
             return Ok(ProgramStatus::Failed {
@@ -1848,7 +1858,14 @@ impl MainProcess {
             // generation at all: the update's kernels are the ones its graphs were rebound to, and a
             // revert that half happened leaves the epoch serving from neither. So a failed revert
             // ends the epoch by name instead of leaving it to fail on a batch that finds no graph.
-            let submission = executor.revert(current).with_context(|| {
+            let queued = match phase {
+                // §7.3 step 2's discard: the generation's graphs and kernels go, and the generation
+                // that serves is untouched. A reverse switchover here would be refused by name -
+                // nothing was switched over - and would end the epoch over an update that never cut.
+                executor::hot_update::Phase::Precopied { .. } => executor.discard(generation),
+                _ => executor.revert(current),
+            };
+            let submission = queued.with_context(|| {
                 format!("queueing device {}'s revert to generation {current}", device.0)
             })?;
             device_command(&self.watchdog, device, "revert", submission)?;
