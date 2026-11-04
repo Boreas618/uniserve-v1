@@ -712,8 +712,17 @@ impl Transformer {
     ///
     /// One type for the whole stack: the precision rule keeps the checkpoint's own representation,
     /// and every layer's operands are of it.
+    ///
+    /// The witness is a **block's** norm gain and not an end projection. Those four are pinned FP32
+    /// at every preset (`precision.py:106-117`), so `proj_in` reports the pin rather than the
+    /// stack: at `auto` a BF16 deployment would claim FP32, a harness would allocate FP32
+    /// activations against BF16 blocks, and the sampler's first layer gemm would be the mixed pair
+    /// this branch has already spent rounds removing (`input_f32_weight_bf16`). A block's gain is
+    /// never pinned, so it is the deployment's type by construction.
     pub fn dtype(&self) -> nn::DType {
-        self.proj_in.weight().dtype
+        self.layers
+            .first()
+            .map_or_else(|| self.proj_in.weight().dtype, |layer| layer.norm1.dtype())
     }
 
     /// Read one DiT partition of the checkpoint.
