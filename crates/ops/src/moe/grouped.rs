@@ -716,6 +716,7 @@ fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> 
 /// choices that are *compiled* into the program — the tile, the cluster, the activation, the block
 /// scale layout — travel as well, since the entry checks the call against the module it was built as
 /// and refuses a mismatch by name rather than launching a kernel with another tactic's assumptions.
+#[repr(C)]
 pub struct GatherNvfp4Call {
     /// `[tokens, hidden/2]` U8: the activations, two E2M1 codes a byte, token-major.
     pub hidden: *const c_void,
@@ -807,6 +808,7 @@ impl NativeCall for GatherNvfp4Call {
 }
 
 /// One encoded FC2 launch, as the trtllm-gen batched-GEMM entry reads it.
+#[repr(C)]
 pub struct RouteNvfp4Call {
     /// `[routes, intermediate/2]` U8: the gated rows FC1 produced, encoded.
     pub hidden: *const c_void,
