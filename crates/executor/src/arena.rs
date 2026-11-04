@@ -19,6 +19,7 @@
 //! plan reuses the mapped blocks of a larger one instead of growing the pool.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use platform::{Allocator, Buffer, DeviceId, DevicePtr, PoolKind};
 
@@ -73,6 +74,8 @@ pub struct Pools {
     allocator: Allocator,
     /// The pool's reservation per stream and every plan's booking.
     ledger: Ledger,
+    /// The device's three books, shared with its allocator.
+    totals: Arc<PoolTotals>,
     pools: HashMap<StreamId, Pool>,
     /// How many streams share the reservation.
     streams: usize,
@@ -215,23 +218,89 @@ impl Ledger {
     }
 }
 
-/// The device's allowance, as the allocator books against it (4.1).
+/// The device's allowance and the last booked total of each of the three pool kinds (4.1).
 ///
-/// `platform::Allocator` calls `book` with the NEW CUMULATIVE TOTAL of one
-/// `(device, pool)` before it maps anything, so a total past the allowance is
-/// refused and nothing is mapped; the books are the allocator's, and this
-/// answers from the budget the graph pools were sized against. A refusal books
-/// nothing because there is nothing here to change: the total is the allocator's
-/// own figure, not a running count of ours that a failed call could leave
-/// inflated.
-impl platform::Budget for Ledger {
+/// `platform::Allocator` books one `(device, pool)` total at a time, so a budget that compares
+/// each pool's total against the whole allowance lets the three kinds sum past it: a graph pool and
+/// a scratch pool can each be under the allowance while together they are over it, and the refusal
+/// then arrives from the driver in the middle of a step instead of from the book. This holds the
+/// three totals together and compares their sum, so the device's mappings are one decision.
+///
+/// One instance per device, shared by `Arc` with the allocator the device maps through; a second
+/// instance would be a second book over the same bytes.
+pub struct PoolTotals {
+    /// The bytes every pool kind together may hold on the device.
+    allowance: u64,
+    /// The last booked total of each kind, by [`PoolKind`]'s order.
+    totals: std::sync::Mutex<[u64; 3]>,
+}
+
+impl PoolTotals {
+    /// The books of a device that may hold `allowance` bytes across its three pools.
+    pub fn new(allowance: u64) -> Self {
+        Self {
+            allowance,
+            totals: std::sync::Mutex::new([0; 3]),
+        }
+    }
+
+    /// The device's whole allowance.
+    pub fn allowance(&self) -> u64 {
+        self.allowance
+    }
+
+    /// The last total booked for `pool`.
+    pub fn total(&self, pool: PoolKind) -> u64 {
+        let totals = self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        totals[Self::slot(pool)]
+    }
+
+    /// The three totals as the metrics report them, graph, scratch, resident.
+    pub fn totals(&self) -> (u64, u64, u64) {
+        let totals = self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (totals[0], totals[1], totals[2])
+    }
+
+    /// Which of the three books `pool` keeps.
+    fn slot(pool: PoolKind) -> usize {
+        match pool {
+            PoolKind::Graph => 0,
+            PoolKind::Scratch => 1,
+            PoolKind::Resident => 2,
+        }
+    }
+}
+
+impl platform::Budget for PoolTotals {
     fn book(&self, device: DeviceId, pool: PoolKind, bytes: u64) -> platform::Result<()> {
-        if bytes > self.budget {
+        let slot = Self::slot(pool);
+        let mut totals = self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let others: u64 = totals
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != slot)
+            .map(|(_, total)| *total)
+            .sum();
+        let held = others.saturating_add(bytes);
+        if held > self.allowance {
             return Err(platform::Error::InvalidArgument(format!(
-                "{pool:?} on device {device:?} would hold {bytes} bytes of a {}-byte allowance",
-                self.budget
+                "{pool:?} on device {device:?} would hold {bytes} bytes, and the three pools \
+                 together {held} of a {}-byte allowance",
+                self.allowance
             )));
         }
+        // The call carries the pool's cumulative total, never a delta: replacing it is what makes
+        // a refused call book nothing.
+        totals[slot] = bytes;
         Ok(())
     }
 }
@@ -244,39 +313,46 @@ impl Pools {
     /// stream's range must not move while its graphs live, and two streams' work runs at once.
     /// `budget` is the device budget the pool is booked against, kept apart from the reservation so
     /// a report of one cannot pass the other's invariant by construction.
-    pub fn new(allocator: Allocator, bytes: u64, budget: u64, streams: usize) -> Result<Self> {
+    pub fn new(
+        allocator: Allocator,
+        totals: Arc<PoolTotals>,
+        graph: u64,
+        scratch: u64,
+        resident: u64,
+        streams: usize,
+    ) -> Result<Self> {
         let streams = streams.max(1);
         let mut allocator = allocator;
-        let size = usize::try_from(bytes)
+        let size = usize::try_from(graph)
             .map_err(|_| Error::Resource("the graph storage is larger than memory".into()))?;
         allocator.reserve(PoolKind::Graph, size)?;
-        Ok(Self {
-            allocator,
-            ledger: Ledger::new(bytes / streams as u64, budget),
-            pools: HashMap::new(),
-            streams,
-            scratch_reserved: false,
-        })
-    }
-
-    /// The same, reserving every pool the device maps in one place (4.1): the graph range the
-    /// captured graphs address, the scratch the shadow pair's region and the paired forward's
-    /// pages come from, and the resident range the storage owners carve.
-    ///
-    /// One `Pools` per device is the only allocator on it, so the three pool kinds are one booking
-    /// and item 5's `graph + scratch + resident <= budget` is decided by one book.
-    pub fn with_pools(allocator: Allocator, graph: u64, scratch: u64, resident: u64, budget: u64, streams: usize) -> Result<Self> {
-        let mut pools = Self::new(allocator, graph, budget, streams)?;
+        // The other two kinds in the same book (4.1): a pool whose figure is zero is not reserved,
+        // and the three reservations are one allowance.
         for (pool, bytes) in [(PoolKind::Scratch, scratch), (PoolKind::Resident, resident)] {
             if bytes == 0 {
                 continue;
             }
-            let size = usize::try_from(bytes)
-                .map_err(|_| Error::Resource(POOL_TOO_LARGE))?;
-            pools.allocator.reserve(pool, size)?;
+            let size = usize::try_from(bytes).map_err(|_| Error::Resource(POOL_TOO_LARGE))?;
+            allocator.reserve(pool, size)?;
         }
-        pools.scratch_reserved = scratch != 0;
-        Ok(pools)
+        Ok(Self {
+            allocator,
+            ledger: Ledger::new(graph / streams as u64, totals.allowance()),
+            totals,
+            pools: HashMap::new(),
+            streams,
+            scratch_reserved: scratch != 0,
+        })
+    }
+
+    /// The device's three books, for a caller that builds the allocator before the pools.
+    pub fn totals_of(allowance: u64) -> PoolTotals {
+        PoolTotals::new(allowance)
+    }
+
+    /// The device's three books.
+    pub fn totals(&self) -> &Arc<PoolTotals> {
+        &self.totals
     }
 
     /// Maps `bytes` of `pool` through the device's one allocator, for an owner that carves its own
@@ -297,9 +373,9 @@ impl Pools {
         self.allocator.mapped_bytes(pool) as u64
     }
 
-    /// The device's allowance.
+    /// The device's allowance: what its three pools together may hold.
     pub fn budget(&self) -> u64 {
-        self.ledger.budget
+        self.totals.allowance()
     }
 
     /// The bytes each stream's range reserves.
@@ -461,6 +537,39 @@ impl std::fmt::Debug for Pools {
 mod tests {
     use super::*;
     use crate::plan::Variant;
+
+    /// The device's three pool kinds share one allowance: two bookings under it pass, a third that
+    /// would take their sum past it is refused, and the refusal books nothing, so a retry of a
+    /// size that fits succeeds.
+    ///
+    /// This is the defect the per-pool check had: each kind compared its own total against the
+    /// whole allowance, so two kinds could each be under it while together they were over, and the
+    /// refusal arrived from the driver mid-step instead of from the book.
+    #[test]
+    fn the_three_pool_kinds_share_one_allowance() {
+        use platform::Budget as _;
+
+        let device = DeviceId(0);
+        let totals = PoolTotals::new(12 << 30);
+        assert_eq!(totals.allowance(), 12 << 30);
+        // Two kinds, each well under the allowance, together holding most of it.
+        totals.book(device, PoolKind::Graph, 8 << 30).expect("8 GiB of 12");
+        totals.book(device, PoolKind::Scratch, 3 << 30).expect("11 GiB of 12");
+        // The third would take the sum past the allowance: refused, and nothing is recorded.
+        let error = totals
+            .book(device, PoolKind::Resident, 2 << 30)
+            .expect_err("14 GiB of a 12-GiB allowance is over");
+        assert!(format!("{error}").contains("allowance"), "{error}");
+        assert_eq!(totals.total(PoolKind::Resident), 0);
+        // The first two books did not move, and a smaller third size fits.
+        assert_eq!(totals.totals(), (8 << 30, 3 << 30, 0));
+        totals.book(device, PoolKind::Resident, 1 << 30).expect("12 GiB of 12");
+        assert_eq!(totals.totals(), (8 << 30, 3 << 30, 1 << 30));
+        // A total replaces the kind's own, so shrinking one makes room for another.
+        totals.book(device, PoolKind::Scratch, 0).expect("the total is what is booked");
+        totals.book(device, PoolKind::Resident, 4 << 30).expect("8 + 4 of 12");
+        assert_eq!(totals.totals(), (8 << 30, 0, 4 << 30));
+    }
 
     /// A capture shape of `rows` decode rows.
     fn bucket(rows: u32) -> Bucket {

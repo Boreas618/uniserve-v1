@@ -14,12 +14,15 @@
 op = "dense_attention"
 backend = "fa4"
 
+# The CuTe DSL this package is written for, as the toolchain reports it (`cutlass.__version__`);
+# the Program Server refuses a package whose version no host here has, so this must name the
+# environment the tree installs.
 [toolchain]
 kind = "cute_dsl"
-version = "4.5.0"
+version = "4.6.2"
 packages = [
     { name = "flash-attn", version = "4.0.0" },
-    { name = "torch", version = "2.9.1" },
+    { name = "torch", version = "2.13.0" },
 ]
 
 [module]

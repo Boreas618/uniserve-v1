@@ -402,6 +402,8 @@ pub enum JobKind {
     Revert,
     /// Releasing an old generation's graphs (7.3 step 6).
     Purge,
+    /// Releasing a prepared generation that never served (an abandoned precopy, 7.3 step 2).
+    Discard,
     /// A storage job: the copies, fills and fences a storage owner recorded.
     Issue,
     /// A job that only waits for the events it was given.
@@ -422,6 +424,7 @@ impl JobKind {
             Self::Switchover => "switchover",
             Self::Revert => "revert",
             Self::Purge => "purge",
+            Self::Discard => "discard",
             Self::Issue => "issue",
             Self::After => "after",
         }

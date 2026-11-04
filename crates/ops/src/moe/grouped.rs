@@ -353,6 +353,17 @@ impl Op for GatherGemm {
         }
     }
 
+    /// The standard bound for the gated product, written against `hidden` and FP32 accumulation.
+    ///
+    /// One output element is `Σ_{j<hidden} x_j · w_j` over the contraction (a dense row of the
+    /// expert's up/gate matrix gathered into place — the gather moves rows, not terms), so the
+    /// reduction length is `hidden`, a descriptor field, and `γₙ` is the reduction's factor.
+    ///
+    /// The `atol` is the term the reduction does not cover: **the activation's envelope**. This
+    /// operator is the first half of the gated product, so its output is what `silu` and the
+    /// multiply then amplify, and the reference compares the *gated* result. `ACTIVATION_ENVELOPE`
+    /// is the bound on that factor and `2 · γₙ · envelope² · 2` is what survives it — the same
+    /// sentence for `route_gemm`, whose input is already one.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         let reduction = u64::from(descriptor.hidden);
         let accumulate = DType::F32;
@@ -459,6 +470,13 @@ impl Op for RouteGemm {
         }
     }
 
+    /// `route_gemm`'s bound: the contraction is the expert's own width, `intermediate`.
+    ///
+    /// One output element is `Σ_{j<intermediate} g(x)_j · w_j`: `intermediate` products in FP32, so
+    /// `rtol = γₙ + u` with `n = intermediate`, a descriptor field. The `atol` is again the gated
+    /// activation's envelope — this operator has no activation of its own, but its *input* is one,
+    /// and its rounding relative to the activation's bound is what the reference comparison sees.
+    /// A dense launch of the same expert differs only in how the row was found, never in these terms.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         let reduction = u64::from(descriptor.intermediate);
         let accumulate = DType::F32;
@@ -587,7 +605,9 @@ pub struct GatherGemmNvfp4Descriptor {
     /// Element type of the activations and of the output. The weights are packed, so this is the
     /// unpacked element type rather than the stored one.
     pub dtype: DType,
-    /// Element type of the block scales, as the checkpoint stores them.
+    /// Element type of the block scales, as the checkpoint stores them: `F8_E4M3` for a ModelOpt
+    /// export, `U8` for a shard that already holds the codes. One byte either way, and never
+    /// assumed — the loader passes the shard's own type.
     pub scale: DType,
     /// The block-scale layout the checkpoint uses.
     pub layout: ScaleLayout,
@@ -626,7 +646,10 @@ pub struct GatherGemmNvfp4Args {
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
     pub scales: TensorView,
-    /// `[experts]` f32: the reciprocal of each expert's tensor scale, as the loader carries it.
+    /// `[experts, 2]` f32: the reciprocals of each expert's tensor scales, one **per projection** in
+    /// the fused reading order — column 0 is the value half (up), column 1 the gate half. A
+    /// checkpoint carries one tensor scale per projection, so the two columns are generally
+    /// different numbers and a program may not use one for both.
     pub global_scale: TensorView,
     /// `[tokens, top]` i32: the experts each token's routes selected.
     pub ids: TensorView,
@@ -727,7 +750,7 @@ impl GatherGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+            .require_shape(Self::NAME, Shape::new(&[experts, 2]))?;
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -843,11 +866,19 @@ impl Op for GatherGemmNvfp4 {
         }
     }
 
+    /// `gather_gemm`'s bound exactly, because the dequantization is exact where it happens.
+    ///
+    /// The packed operand is E2M1 codes plus one E4M3 scale per sixteen elements *along the
+    /// contraction*; the program decodes a code (exact: E2M1 is a subset of FP32) and multiplies it
+    /// by its block's scale (exact: E4M3 into FP32), then contracts in FP32 — each product is the
+    /// reference's own `w · s` product, so the sum has the same reduction length (`hidden`), the same
+    /// accumulation dtype, and the same bound. The one per-expert tensor scale is a *factor*, applied
+    /// once, and contributes one rounding that `rtol`'s `u` already covers.
+    ///
+    /// The bound is therefore **not looser than the dense form's**: an implementation that instead
+    /// scaled the accumulated row by the reciprocal would add one rounding per output element, which
+    /// this bound would catch — the order is part of what the tolerance asserts, not an aside.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // The packed weights and their block scales are the reference's own operands: the dequantized
-        // product is what a dense launch of the same expert computes, so the bound is `GatherGemm`'s
-        // — the contraction in FP32 with the activation's envelope on top. Any extra error would come
-        // from dequantizing in a different order, which this bound also covers.
         let reduction = u64::from(descriptor.hidden);
         let accumulate = DType::F32;
         let gamma = crate::tolerance::gamma(reduction, accumulate);
@@ -1029,7 +1060,9 @@ pub struct RouteGemmNvfp4Args {
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
     pub scales: TensorView,
-    /// `[experts]` f32: the reciprocal of each expert's tensor scale.
+    /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale, one **per projection** —
+    /// this product fuses a single projection, so the table has one column and the shape still says
+    /// which half of a two-projection stack it is.
     pub global_scale: TensorView,
     /// `[routes]` i32: the expert each row belongs to.
     pub ids: TensorView,
@@ -1123,7 +1156,7 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+            .require_shape(Self::NAME, Shape::new(&[experts, 1]))?;
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1194,9 +1227,11 @@ impl Op for RouteGemmNvfp4 {
         }
     }
 
+    /// `route_gemm`'s bound, and for the same reason as FC1's pair: decode, scale per block, contract
+    /// in FP32 — never scale the accumulated row, which would add a rounding the dense bound does not
+    /// allow. The contraction is `intermediate`, the accumulation FP32, and the `atol` is the gated
+    /// activation's envelope, since this operator's input is one.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // The contraction is the expert width, accumulated in FP32, and the packed weights are the
-        // reference's own operands: the bound is the dense `route_gemm`'s.
         let reduction = u64::from(descriptor.intermediate);
         let accumulate = DType::F32;
         let gamma = crate::tolerance::gamma(reduction, accumulate);
@@ -1236,7 +1271,7 @@ mod nvfp4_launch_tests {
             hidden: table(DType::BF16, &[3, 2048]),
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
-            global_scale: table(DType::F32, &[128]),
+            global_scale: table(DType::F32, &[128, 2]),
             ids: table(DType::I32, &[3, 8]),
             tile_to_expert: table(DType::I32, &[2]),
             tile_to_limit: table(DType::I32, &[2]),
