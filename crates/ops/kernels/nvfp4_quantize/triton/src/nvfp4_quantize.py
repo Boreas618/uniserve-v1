@@ -131,15 +131,24 @@ def _nvfp4_quantize_kernel(
     ``input`` is ``[rows, COLUMNS]`` with contiguous rows, ``values``
     ``[rows, COLUMNS / 2]`` bytes and ``scales`` bytes in the descriptor's
     layout — ``[rows, SCALE_COLUMNS]`` linear, or ``[padded_rows,
-    PADDED_COLUMNS]`` swizzled. ``global_scale`` is the reciprocal of the
-    matrix's FP32 tensor scale.
+    PADDED_COLUMNS]`` swizzled. ``global_scale`` is the address of a one-element
+    FP32 tensor holding the reciprocal of the matrix's FP32 tensor scale.
     """
+    # The tensor scale is a device operand: the loader publishes a calibrated
+    # checkpoint's value as one FP32 word, and every program reads it from there,
+    # so the number the kernel scales by is the checkpoint's and not a host copy.
+    global_scale = tl.load(global_scale).to(tl.float32)
+
     # Each program owns one row's run of BLOCK elements, a whole number of K16
     # blocks, so a block never crosses a row.
     chunks = COLUMNS // BLOCK
     program = tl.program_id(0)
     row = (program // chunks).to(tl.int64)
     chunk = program % chunks
+
+    # One scalar read of the matrix's global scale, shared by every block of this program; the
+    # broadcast is what a scalar parameter did before it became an address.
+    global_scale = tl.load(global_scale)
 
     columns = chunk * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(input_ptr + row * COLUMNS + columns).to(tl.float32)

@@ -1,0 +1,41 @@
+# The vsa_compress_pooled operator's Triton backend: design 5.2's program package.
+#
+# The compression VSA's gate adds to every query row: one softmax over the key tiles, weighted into
+# the pooled per-head means `vsa_prepare_tiles` writes, narrowed once into the attention's row type.
+# The pooled scores and values are FP32 and only the result narrows, so `dtype` names the compressed
+# rows and no operand is a dimension.
+#
+# `max_tiles` is the bound the operator refuses a tile count past, and this package compiles it as
+# the block the softmax reduces in, rounded up to a power of two; `width` is the feature block and
+# `block` the lanes it uses; `heads` sizes the pooled values' layout and a program is one head, so
+# the grid carries the count.
+
+op = "vsa_compress_pooled"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/vsa_compress_pooled.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_heads_56_width_128_max_tiles_640_block_128_pdl_false`.
+#
+# 640 is the tile count of the deployment's longest sparse reduction: 40960 keys at the sparse
+# path's 64-key tiles. The wider bound is the same arithmetic for a longer clip, and both are
+# compiled because the tile count is the tolerance's reduction length.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["56"], width = ["128"], max_tiles = ["640", "2048"], block = ["128"], pdl = ["false", "true"] }
+
+[parameters]

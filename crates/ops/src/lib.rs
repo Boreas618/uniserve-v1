@@ -108,6 +108,7 @@ pub mod pcm;
 pub mod phase;
 pub mod platform;
 pub mod position;
+pub mod posterior;
 pub mod prefix_cache;
 pub mod residual;
 pub mod resize;

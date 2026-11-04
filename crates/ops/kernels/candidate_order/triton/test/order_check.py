@@ -98,8 +98,7 @@ def run_interpreter(package, key, seed):
                 got_ids,
                 ROWS,
                 width,
-                TILE=128,
-                PDL=False,
+                BLOCK=128,
             )
             if not np.array_equal(got_ids.numpy(), want_ids):
                 print(f"ids differ at width {width}, duplicate {duplicate}")
@@ -118,7 +117,11 @@ def run_interpreter(package, key, seed):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("module", nargs="?", help="the resolved module directory")
-    parser.add_argument("--package", default=".", help="the package root")
+    parser.add_argument(
+        "--package",
+        default=str(pathlib.Path(__file__).resolve().parents[1]),
+        help="the package root holding package.toml",
+    )
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--seed", type=int, default=11)
     arguments = parser.parse_args()

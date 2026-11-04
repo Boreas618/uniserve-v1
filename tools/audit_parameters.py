@@ -131,6 +131,26 @@ def packed(operator):
     return None, None, None
 
 
+
+def split_key_or_none(dimensions, key):
+    """The key's pairs when every dimension it names is declared, else None."""
+    if not dimensions:
+        return None
+    names = sorted(dimensions, key=len, reverse=True)
+    rest, pairs = key, []
+    while rest:
+        name = next((n for n in names if rest.startswith(n) and rest[len(n):].startswith("_")), None)
+        if name is None:
+            return None
+        after = rest[len(name) + 1:]
+        ends = [end for end in (after.find("_" + n + "_") for n in names) if end >= 0]
+        end = min(ends) if ends else len(after)
+        if not after[:end]:
+            return None
+        pairs.append((name, after[:end]))
+        rest = after[end:].lstrip("_")
+    return pairs
+
 def module_parameters(operator, key):
     """The parameter count a module's PTX declares, and its declared signature's length."""
     for manifest_path in KERNELS.glob(f"{operator}/*/package.toml"):
@@ -138,7 +158,21 @@ def module_parameters(operator, key):
         if not (source / "build.py").exists():
             continue
         manifest = tomllib.loads(manifest_path.read_text())
-        dimensions = manifest.get("kernel", {}).get("descriptors", {}).get("dimensions", {})
+        descriptors = manifest.get("kernel", {}).get("descriptors", {})
+        # A package may declare one table of shapes or one per shape (`[[kernel.descriptors]]`);
+        # a key is parsed against the table of the shape it covers.
+        if isinstance(descriptors, list):
+            tables = descriptors
+        else:
+            tables = [descriptors] if descriptors else []
+        dimensions = {}
+        for table in tables:
+            names = table.get("dimensions") or {}
+            if split_key_or_none(names, key) is not None:
+                dimensions = names
+                break
+        if not dimensions and tables:
+            dimensions = tables[0].get("dimensions") or {}
         sys.path.insert(0, str(source))
         try:
             sys.modules.pop("_compile", None)
