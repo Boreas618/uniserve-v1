@@ -767,19 +767,14 @@ fn main() {
     }
 
     // ---- The VSA selection's pooled-score product: the stage-1 video attention's per-head tile
-    // similarity, over the transformer's own head geometry (56 heads of 128) in the checkpoint's
-    // element type. The lanes one program uses for the contraction are the head width; the pooling
-    // itself (the tile reduction and its stride) is `vsa_prepare_tiles`' launch values.
+    // similarity, over the transformer's own head geometry (56 heads of 128). The operands are the
+    // pooled means in FP32 and so are the scores, so no element type is in the key; the lanes one
+    // program uses for the contraction are the head width, and the pooling itself (the tile
+    // reduction and its stride) is `vsa_prepare_tiles`' launch values.
     push(
         "vsa_scores",
-        ops::segments::ScoresDescriptor::new(
-            DType::BF16,
-            HEADS,
-            HEAD_DIM,
-            HEAD_DIM.next_power_of_two(),
-            PDL,
-        )
-        .to_string(),
+        ops::segments::ScoresDescriptor::new(HEADS, HEAD_DIM, HEAD_DIM.next_power_of_two(), PDL)
+            .to_string(),
     );
 
     // ---- The audio encoder's frame/channel swap, in the audio VAEs' own FP32.
