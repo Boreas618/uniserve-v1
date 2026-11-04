@@ -1215,8 +1215,23 @@ impl Denoiser {
         self.transformer.project(f, patched, projected)?;
         nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, projected, video_indices)?;
 
+        // One audio stream or none. A layout with audio rows and no audio latents would otherwise
+        // denoise the video and return it without sound, and a missing table where the layout has
+        // one is a disagreement about the layout rather than an absent stream.
+        let audio = match (latents.audio, tables.get("audio_indices")) {
+            (Some(audio), Ok(indices)) => Some((audio, indices)),
+            (None, Ok(indices)) if indices.shape.dim(0) > 0 => {
+                return Err(Error::config(format!(
+                    "this layout has {} audio rows and no audio latents",
+                    indices.shape.dim(0)
+                )));
+            }
+            (Some(_), Err(error)) => return Err(error),
+            _ => None,
+        };
+
         // The audio rows: one element per channel-step pair, projected like any other row.
-        if let (Some(audio), Ok(audio_indices)) = (latents.audio, tables.get("audio_indices")) {
+        if let Some((audio, audio_indices)) = audio {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
             let features = u64::from(self.config.transformer.audio_channels);
             let flat = TensorView::with_strides(
@@ -1309,7 +1324,7 @@ impl Denoiser {
         self.solver
             .step(f, Modality::Video, video, velocity, step.index)?;
 
-        if let (Some(audio), Ok(audio_indices)) = (latents.audio, tables.get("audio_indices")) {
+        if let Some((audio, audio_indices)) = audio {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
             let audio_hidden = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
             nn::layers::gather_rows(f, hidden, audio_indices, audio_hidden)?;
