@@ -644,7 +644,10 @@ pub struct GatherGemmNvfp4Args {
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
     pub scales: TensorView,
-    /// `[experts]` f32: the reciprocal of each expert's tensor scale, as the loader carries it.
+    /// `[experts, 2]` f32: the reciprocals of each expert's tensor scales, one **per projection** in
+    /// the fused reading order — column 0 is the value half (up), column 1 the gate half. A
+    /// checkpoint carries one tensor scale per projection, so the two columns are generally
+    /// different numbers and a program may not use one for both.
     pub global_scale: TensorView,
     /// `[tokens, top]` i32: the experts each token's routes selected.
     pub ids: TensorView,
@@ -745,7 +748,7 @@ impl GatherGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+            .require_shape(Self::NAME, Shape::new(&[experts, 2]))?;
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1055,7 +1058,9 @@ pub struct RouteGemmNvfp4Args {
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
     pub scales: TensorView,
-    /// `[experts]` f32: the reciprocal of each expert's tensor scale.
+    /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale, one **per projection** —
+    /// this product fuses a single projection, so the table has one column and the shape still says
+    /// which half of a two-projection stack it is.
     pub global_scale: TensorView,
     /// `[routes]` i32: the expert each row belongs to.
     pub ids: TensorView,
@@ -1149,7 +1154,7 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+            .require_shape(Self::NAME, Shape::new(&[experts, 1]))?;
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1264,7 +1269,7 @@ mod nvfp4_launch_tests {
             hidden: table(DType::BF16, &[3, 2048]),
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
-            global_scale: table(DType::F32, &[128]),
+            global_scale: table(DType::F32, &[128, 2]),
             ids: table(DType::I32, &[3, 8]),
             tile_to_expert: table(DType::I32, &[2]),
             tile_to_limit: table(DType::I32, &[2]),
