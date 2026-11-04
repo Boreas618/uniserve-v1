@@ -155,17 +155,18 @@ pub struct Buffer {
 impl Buffer {
     /// The width of one element, by the name the plans use.
     ///
-    /// The four names below are the whole set a plan may declare; `f16` and `bf16` are two bytes each and
-    /// `f32` is four, which is the difference between a 200 MiB buffer and a 400 MiB one. An unknown name
-    /// is refused rather than assumed, because the assumption - four bytes - would be half the budget for
-    /// a reduced-precision buffer.
+    /// The names below are the whole set a plan may declare: the four the arena holds floats and bytes in,
+    /// and `i32` for the index buffers a gather reads. `f16` and `bf16` are two bytes each, `i32` and `f32`
+    /// are four, which is the difference between a 200 MiB buffer and a 400 MiB one. An unknown name is
+    /// refused rather than assumed, because the assumption - four bytes - would be half the budget for a
+    /// reduced-precision buffer.
     pub fn width(&self) -> Result<u64> {
         match self.element {
             "u8" => Ok(1),
             "f16" | "bf16" => Ok(2),
-            "f32" => Ok(4),
+            "i32" | "f32" => Ok(4),
             other => Err(Error::config(format!(
-                "{other} is not an element type a plan declares: u8, f16, bf16 or f32"
+                "{other} is not an element type a plan declares: u8, f16, bf16, i32 or f32"
             ))),
         }
     }
@@ -633,15 +634,16 @@ mod tests {
 
     /// The ImageNet constants as the model publishes them: host memory, one f32 per channel.
     #[test]
-    fn a_plans_element_names_are_the_four_the_arena_holds() {
+    fn a_plans_element_names_are_a_closed_set_with_stated_widths() {
         // A reduced-precision buffer counted as four bytes doubles its budget, and an unknown name used to
-        // fall through to that same four, so the set is closed here and every width is stated.
+        // fall through to that same four, so the set is closed here and every width is stated. `i32` is the
+        // index buffers a gather reads, four bytes like `f32` but not a float.
         let buffer = |element: &'static str| Buffer {
             name: format!("probe.{element}"),
             element,
             elements: 1024,
         };
-        for (element, width) in [("u8", 1), ("f16", 2), ("bf16", 2), ("f32", 4)] {
+        for (element, width) in [("u8", 1), ("f16", 2), ("bf16", 2), ("i32", 4), ("f32", 4)] {
             let buffer = buffer(element);
             assert_eq!(buffer.width().expect(element), width, "{element}");
             assert_eq!(buffer.bytes(), 1024 * width, "{element}");
