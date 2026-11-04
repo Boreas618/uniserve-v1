@@ -102,6 +102,10 @@ struct Args {
     /// The prompt as text, and the ids a front end tokenized it into.
     prompt: String,
     prompt_ids: Vec<u32>,
+    /// The element type to compute in: `auto` is the checkpoint's own, anything else is the
+    /// deployment's statement - one conversion at load, printed, and carried in the case so the
+    /// reference half loads at the same width.
+    dtype: Option<String>,
 }
 
 impl Args {
@@ -113,6 +117,7 @@ impl Args {
         let mut out = PathBuf::from("artifacts/h3-stage4");
         let mut prompt = None;
         let mut prompt_ids = None;
+        let mut dtype = None;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -157,6 +162,11 @@ impl Args {
                             .next()
                             .ok_or_else(|| Failure("--out needs a path".into()))?,
                     );
+                }
+                "--dtype" => {
+                    dtype = Some(arguments.next().ok_or_else(|| {
+                        Failure("--dtype needs `auto` or an element type".into())
+                    })?);
                 }
                 "--prompt" => {
                     prompt = Some(
@@ -216,6 +226,7 @@ impl Args {
             out,
             prompt,
             prompt_ids,
+            dtype,
         })
     }
 }
@@ -237,6 +248,24 @@ const DEFAULT_IDS: [u32; 6] = [64, 8251, 11435, 389, 279, 16359];
 /// page this stage writes follows the export rather than a harness constant. Two types in one
 /// component is a deployment question, not a diagnosis one: it is refused, by name and with both
 /// types, rather than answered by picking one.
+fn compute_dtype(source: &Checkpoint, stated: Option<DType>) -> Result<DType> {
+    let own = checkpoint_dtype(source)?;
+    match stated {
+        None => {
+            println!("dtype: {own}, the checkpoint's own (`auto`)");
+            Ok(own)
+        }
+        Some(dtype) => {
+            println!(
+                "dtype: {dtype}, the deployment's statement; the component holds {own}, so this \
+                 is one conversion at load"
+            );
+            Ok(dtype)
+        }
+    }
+}
+
+/// The one element type the export's `text_encoder` holds, from its own tensor headers.
 fn checkpoint_dtype(source: &Checkpoint) -> Result<DType> {
     match source.dtypes().as_slice() {
         [only] => Ok(*only),
@@ -307,10 +336,9 @@ fn stage_weights(args: &Args) -> Result<()> {
 
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
-    println!("dtype: {}, the checkpoint's own", checkpoint_dtype(source)?);
+    let dtype = compute_dtype(source, None)?;
     let mut store = HostStore::new();
     let mut loader = WeightLoader::new(source, &mut store, None, None);
-    let dtype = checkpoint_dtype(source)?;
     let encoder = TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?;
     println!(
         "load: published {} weight regions on the host, {} retained layers",
@@ -751,6 +779,22 @@ fn stage_encode(args: &Args) -> Result<()> {
     let store = args.store.clone().ok_or_else(|| {
         Failure::message("--store is required for `encode`: the walk's programs are read from it")
     })?;
+    // The flag, the checkpoint and the element type are host checks: they run before a device is
+    // opened, so a typo costs a second rather than a device.
+    let stated = match args.dtype.as_deref() {
+        None | Some("auto") => None,
+        Some("bf16") => Some(DType::BF16),
+        Some("f16") => Some(DType::F16),
+        Some("f32") => Some(DType::F32),
+        Some(other) => {
+            return Err(Failure::message(format!(
+                "--dtype takes `auto`, `bf16`, `f16` or `f32`, not `{other}`"
+            )));
+        }
+    };
+    let checkpoint = Checkpoint::open(&args.root)?;
+    let source = checkpoint.component("text_encoder")?;
+    let dtype = compute_dtype(source, stated)?;
 
     // 1. The device and the generation the compiled programs were loaded for.
     let device = platform::Device::new(DeviceId(args.device))?;
@@ -762,14 +806,6 @@ fn stage_encode(args: &Args) -> Result<()> {
     //    type and shape as it is handed over, so a checkpoint this encoder cannot read is refused
     //    here rather than at the first launch.
     //
-    //    The element type is the checkpoint's own, read from its tensor headers: `dtype = auto`
-    //    converts nothing, and a harness that chose a width would be reporting a page for a model
-    //    nobody serves. An export holding two element types in one component gets a refusal, not a
-    //    choice: which one is a deployment question and this stage has no business answering it.
-    let checkpoint = Checkpoint::open(&args.root)?;
-    let source = checkpoint.component("text_encoder")?;
-    let dtype = checkpoint_dtype(source)?;
-    println!("dtype: {dtype}, the checkpoint's own");
     let mut weights = DeviceWeights::new(&device, 0)?;
     let encoder = {
         let mut loader = WeightLoader::new(source, &mut weights, None, None);
@@ -913,10 +949,12 @@ fn stage_encode(args: &Args) -> Result<()> {
     let case = format!(
         "{{\n  \"task\": \"t2va\",\n  \"text_tokens\": {tokens},\n  \"hidden\": {hidden},\n  \
          \"prompt\": {prompt},\n  \"prompt_ids\": [{ids_json}],\n  \"vision\": \"none\",\n  \
-         \"vocab_size\": {vocab},\n  \"dtype\": \"{element}\"\n}}\n",
+         \"vocab_size\": {vocab},\n  \"dtype\": \"{element}\",\n  \
+         \"checkpoint_dtype\": \"{own}\"\n}}\n",
         prompt = json_string(&args.prompt),
         vocab = text.vocab_size,
         element = dtype,
+        own = checkpoint_dtype(checkpoint.component("text_encoder")?)?,
     );
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
