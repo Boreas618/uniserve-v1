@@ -510,6 +510,30 @@ impl Phase {
     }
 }
 
+/// A program-layer update in flight, as the daemon keeps it between the
+/// request that started it and the one that ends its probation (§7.3 steps
+/// 2-6): the update, the epoch it moves, and every main process with the
+/// generation it prepared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgramUpdate {
+    /// The update, in its probation.
+    pub update: Update,
+    /// The epoch whose programs it moves.
+    pub epoch: u64,
+    /// The main processes that prepared a generation: the node they run on,
+    /// the engine number their reports carry, and the generation each of
+    /// them numbered.
+    pub prepared: Vec<PreparedProcess>,
+}
+
+/// One main process that prepared a generation of a program update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedProcess {
+    pub host: String,
+    pub engine: u64,
+    pub generation: u64,
+}
+
 /// The epochs a deployment's daemon keeps and the processes it manages on
 /// its node: the state `GET /admin/config` reports and a change is routed
 /// by (§7.2).
@@ -520,6 +544,11 @@ pub struct Epochs {
     update: Mutex<Option<Update>>,
     /// The last launch generation allocated per worker group and rank.
     generations: Mutex<BTreeMap<(String, u64), u64>>,
+    /// The daemon's command channel to its main processes (`supervision::
+    /// ProcessCommands`), which the program layer commands through.
+    commands: Mutex<Option<crate::supervision::ProcessCommands>>,
+    /// The program-layer update in flight: its probation's record (§7.3).
+    program: Mutex<Option<ProgramUpdate>>,
 }
 
 impl Epochs {
@@ -616,6 +645,189 @@ impl Epochs {
         if let Some(record) = records.get_mut(&epoch) {
             record.status = Status::Purged;
         }
+    }
+
+    /// Ends a probation by putting the previous generation back: what the
+    /// epoch executed before the update is what it executes again (§7.3
+    /// step 5), and the generation the update prepared is dropped with it.
+    pub fn reverted(&self, epoch: u64) {
+        let mut records = locked(&self.records);
+        let Some(record) = records.get_mut(&epoch) else {
+            return;
+        };
+        if !record.previous_kernels.is_empty() || record.previous_policy.is_some() {
+            record.kernels = std::mem::take(&mut record.previous_kernels);
+            record.policy = record
+                .previous_policy
+                .take()
+                .unwrap_or_else(|| record.policy.clone());
+        }
+        record.status = Status::Serving;
+    }
+
+    /// Gives the epochs the daemon's command channel to its main processes,
+    /// once, when the daemon starts (§2.3): the program layer commands
+    /// through it and reads its reports.
+    pub fn supervise(&self, commands: crate::supervision::ProcessCommands) {
+        *locked(&self.commands) = Some(commands);
+    }
+
+    /// The program-layer update in flight, if there is one.
+    pub fn program_update(&self) -> Option<ProgramUpdate> {
+        locked(&self.program).clone()
+    }
+
+    /// Applies `update`, a program-layer change a routing decision prepared,
+    /// to the main processes `processes`: their programs are prepared
+    /// (`Precopy`), they switch to the generation each numbered, and the
+    /// epoch's record takes the new programs as the probation's (§7.3 steps
+    /// 2-4). The probation lasts until [`Self::commit_programs`] or
+    /// [`Self::revert_programs`].
+    ///
+    /// # Errors
+    ///
+    /// Fails with the first failure and leaves what serves untouched: a
+    /// refused precopy changes nothing, and a fault, a stalled job,
+    /// non-finite logits or a policy revert fails the update with its own
+    /// account.
+    pub fn apply_programs(
+        &self,
+        update: Update,
+        processes: Vec<crate::engine::control::EpochProcess>,
+    ) -> Result<(), Failure> {
+        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
+            kind: "no_command_channel".to_owned(),
+            reason: "the daemon has no channel to its main processes".to_owned(),
+            device: None,
+        })?;
+        let (epoch, _) = self.serving().ok_or_else(|| Failure {
+            kind: "no_epoch".to_owned(),
+            reason: "the daemon executes no epoch".to_owned(),
+            device: None,
+        })?;
+        let programs = update.target.programs.clone();
+        let mut switch = crate::engine::control::ProgramSwitch::new(&commands, processes, update.clone());
+        switch.precopy(&programs.kernels, &programs.policy)?;
+        switch.switchover()?;
+        // The generation the main processes execute is the epoch's now; the
+        // probation keeps what it executed before as its last resort.
+        self.precopied(epoch, programs);
+        let prepared = switch
+            .processes()
+            .iter()
+            .zip(switch.generations().iter().copied())
+            .map(|(process, generation)| PreparedProcess {
+                host: process.host.clone(),
+                engine: process.engine,
+                generation,
+            })
+            .collect();
+        let mut update = switch.update().clone();
+        update.state = UpdateState::Probation;
+        *locked(&self.program) = Some(ProgramUpdate {
+            update: update.clone(),
+            epoch,
+            prepared,
+        });
+        *locked(&self.update) = Some(update);
+        Ok(())
+    }
+
+    /// Ends the program-layer probation in favour of the generation that
+    /// executes: every main process commits it and purges what it no longer
+    /// runs (§7.3 steps 5-6), and the epoch's record keeps no previous
+    /// generation.
+    ///
+    /// Answers `Ok(false)` when the update in flight is not a program-layer
+    /// one, so a caller that also has epoch-layer updates asks and falls
+    /// through.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the first failure of the commit, leaving the probation
+    /// standing for [`Self::revert_programs`].
+    pub fn commit_programs(&self) -> anyhow::Result<bool> {
+        let Some(program) = self.program_update() else {
+            return Ok(false);
+        };
+        let commands = locked(&self.commands).clone().ok_or_else(|| {
+            anyhow::anyhow!("the daemon has no channel to its main processes")
+        })?;
+        let processes: Vec<_> = program
+            .prepared
+            .iter()
+            .map(|prepared| crate::engine::control::EpochProcess {
+                host: prepared.host.clone(),
+                engine: prepared.engine,
+            })
+            .collect();
+        let generations: Vec<u64> = program
+            .prepared
+            .iter()
+            .map(|prepared| prepared.generation)
+            .collect();
+        let mut switch = crate::engine::control::ProgramSwitch::resuming(
+            &commands,
+            processes,
+            program.update.clone(),
+            generations,
+        );
+        if let Err(failure) = switch.commit().and_then(|()| switch.purge()) {
+            anyhow::bail!("committing the program update: {}", failure.reason);
+        }
+        self.committed(program.epoch);
+        self.purged(program.epoch);
+        *locked(&self.update) = Some(switch.update().clone());
+        *locked(&self.program) = None;
+        Ok(true)
+    }
+
+    /// Returns every main process to the generation it served before the
+    /// program-layer update, with `reason` (§7.3 step 5), so the update is
+    /// unavailable with its first failure until it is applied with `force`
+    /// (§7.2).
+    ///
+    /// Answers `Ok(false)` when the update in flight is not a program-layer
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a main process does not answer the revert. The epochs'
+    /// records are the previous generation's either way.
+    pub fn revert_programs(&self, reason: &str) -> anyhow::Result<bool> {
+        let Some(program) = self.program_update() else {
+            return Ok(false);
+        };
+        let commands = locked(&self.commands).clone().ok_or_else(|| {
+            anyhow::anyhow!("the daemon has no channel to its main processes")
+        })?;
+        let processes: Vec<_> = program
+            .prepared
+            .iter()
+            .map(|prepared| crate::engine::control::EpochProcess {
+                host: prepared.host.clone(),
+                engine: prepared.engine,
+            })
+            .collect();
+        let generations: Vec<u64> = program
+            .prepared
+            .iter()
+            .map(|prepared| prepared.generation)
+            .collect();
+        let mut switch = crate::engine::control::ProgramSwitch::resuming(
+            &commands,
+            processes,
+            program.update.clone(),
+            generations,
+        );
+        let outcome = switch.revert(reason);
+        self.reverted(program.epoch);
+        *locked(&self.update) = Some(switch.update().clone());
+        *locked(&self.program) = None;
+        if let Err(failure) = outcome {
+            anyhow::bail!("reverting the program update: {}", failure.reason);
+        }
+        Ok(true)
     }
 
     /// Epoch `epoch`'s record, if the daemon keeps one.
