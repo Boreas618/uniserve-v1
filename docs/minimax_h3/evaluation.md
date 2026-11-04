@@ -142,7 +142,11 @@ No server states a precision selector except `base-reference`, which states `dty
 `quantization_config.mode=quality`: the launch defaults already are those values, but on that server
 omitting them produced a constant frame and silence in the `ref2va` cell while stating them passes
 (1 of 1 requests, a real MP4). The set therefore states them where they were measured to matter and
-nowhere else, and a check cell states only what its own path needs.
+nowhere else, and a check cell states only what its own path needs. They are the baseline
+implementation's selectors: `quantization_config` and its precision presets retire in favour of the
+checkpoint's own representation and the quantisation field, and the exception disappears with them —
+a server that no longer reads the preset drops the two arguments, because nothing measured here
+depends on a name the implementation has stopped knowing.
 
 The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (canvas, frame count, frame rate and stereo 32-kHz soundtrack, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
 
