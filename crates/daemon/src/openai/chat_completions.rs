@@ -33,6 +33,7 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use futures::{Stream, StreamExt as _, pin_mut};
 use itertools::Itertools as _;
+use proto::handoff;
 use proto::request::GenerationConstraint;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
@@ -514,13 +515,14 @@ async fn collect_chat_events(
     ))
 }
 
-/// Converts one serving event stream into OpenAI chat-completion chunks.
+/// The OpenAI chunks of one streamed chat completion: converts one serving
+/// event stream into OpenAI chat-completion chunks.
 ///
-/// `context` holds the response options the request chose. Prompt logprobs are never
-/// streamed (`ChatResponseContext::include_prompt_logprobs`). The chunk sequence is an
-/// assistant-role start chunk, content, reasoning, tool-call, logprob, and
-/// image deltas, one chunk carrying `finish_reason`, and, with
-/// `include_usage`, a final usage chunk.
+/// `context` holds the response options the request chose. Prompt logprobs
+/// are never streamed (`ChatResponseContext::include_prompt_logprobs`). The
+/// chunk sequence is an assistant-role start chunk, content, reasoning,
+/// tool-call, logprob, and image deltas, one chunk carrying `finish_reason`,
+/// and, with `include_usage`, a final usage chunk.
 ///
 /// When logprobs or token IDs are requested, the semantic deltas of one
 /// decoded update are buffered in a `PendingChatChunk` and emitted together
@@ -528,11 +530,349 @@ async fn collect_chat_events(
 /// update that touches hidden reasoning is dropped along with the reasoning
 /// text.
 ///
+/// A hot restart hands this stage over too (`handoff.ChatChunks`): the
+/// successor writes the same chunk sequence, including the chunk an update
+/// had buffered when the response stopped.
+pub(crate) struct ChatStreamEmitter {
+    context: ChatResponseContext,
+    /// The response's `created` timestamp, which every chunk repeats.
+    created: u64,
+    /// Whether a tool call was published, which the finish reason follows.
+    saw_tool_calls: bool,
+    /// Denoising steps per image, by image identity.
+    image_step_counts: HashMap<u32, u32>,
+    /// Completed images, in completion order.
+    completed_image_ids: Vec<u32>,
+    /// Whether a reasoning block is open that the client does not see.
+    inside_hidden_reasoning: bool,
+    /// Whether the current update's metadata belongs to hidden reasoning.
+    suppress_current_update_metadata: bool,
+    /// The chunk being buffered until the update's metadata arrives.
+    pending_chunk: Option<PendingChatChunk>,
+    /// Body frames produced in all.
+    frames: u64,
+    /// Whether the terminal chunk was produced; nothing follows it.
+    done: bool,
+}
+
+impl ChatStreamEmitter {
+    /// The emitter of the streamed response `context` describes, whose chunks
+    /// carry the `created` timestamp.
+    pub(crate) fn new(context: &ChatResponseContext, created: u64) -> Self {
+        // With logprobs or token IDs requested, semantic deltas are buffered
+        // until the update's `TokenDelta` arrives, so one chunk carries both.
+        let pending_chunk = (context.requested_logprobs || context.return_token_ids)
+            .then(PendingChatChunk::default);
+        Self {
+            context: context.clone(),
+            created,
+            saw_tool_calls: false,
+            image_step_counts: HashMap::new(),
+            completed_image_ids: Vec::new(),
+            inside_hidden_reasoning: false,
+            suppress_current_update_metadata: false,
+            pending_chunk,
+            frames: 0,
+            done: false,
+        }
+    }
+
+    /// The chunks `output` produces, in order.
+    ///
+    /// Token metadata arrives after all semantic deltas of one decoded update
+    /// (see the module docs). If that update contains hidden reasoning,
+    /// including a delimiter-only start or end of a hidden reasoning block,
+    /// its metadata is omitted along with the reasoning text; with reasoning
+    /// visible, every update keeps its metadata.
+    ///
+    /// # Errors
+    ///
+    /// Fails as the response does: a rejected or failed request, or logprobs
+    /// that cannot be converted.
+    pub(crate) fn push(
+        &mut self,
+        output: &RequestOutput,
+    ) -> Result<Vec<ChatCompletionStreamResponse>, ApiError> {
+        let mut chunks = Vec::new();
+        match output {
+            RequestOutput::Accepted(prompt) => {
+                let mut chunk =
+                    start_chunk(&self.context.request_id, &self.context.response_model, self.created);
+                if self.context.return_token_ids {
+                    chunk.prompt_token_ids = Some(prompt.token_ids.to_vec());
+                }
+                chunks.push(chunk);
+            }
+            RequestOutput::TextDelta { text } => {
+                if !text.is_empty() {
+                    let kind = AssistantBlockKind::Text;
+                    if let Some(pending_chunk) = self.pending_chunk.as_mut() {
+                        pending_chunk.push_block_delta(kind, text.clone());
+                    } else {
+                        chunks.push(block_delta_chunk(
+                            &self.context.request_id,
+                            &self.context.response_model,
+                            self.created,
+                            kind,
+                            text.clone(),
+                        ));
+                    }
+                }
+            }
+            RequestOutput::TokenDelta {
+                token_ids,
+                logprobs,
+            } => {
+                let include_metadata =
+                    !self.suppress_current_update_metadata && !self.inside_hidden_reasoning;
+                self.suppress_current_update_metadata = false;
+                let openai_logprobs = if include_metadata {
+                    logprobs
+                        .as_ref()
+                        .map(|lp| {
+                            decoded_logprobs_to_openai_chat(
+                                lp,
+                                self.context.return_tokens_as_token_ids,
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                let openai_token_ids = include_metadata
+                    .then_some(token_ids)
+                    .and_then(|token_ids| self.context.return_token_ids.then_some(token_ids))
+                    .filter(|tokens| !tokens.is_empty());
+                if let Some(pending_chunk) = self.pending_chunk.as_mut() {
+                    pending_chunk.logprobs = openai_logprobs;
+                    pending_chunk.token_ids = openai_token_ids.cloned();
+                    if let Some(chunk) =
+                        pending_chunk.take_chunk(&self.context.request_id, &self.context.response_model, self.created)
+                    {
+                        chunks.push(chunk);
+                    }
+                } else if let Some(logprobs) = openai_logprobs {
+                    chunks.push(logprobs_only_chunk(
+                        &self.context.request_id,
+                        &self.context.response_model,
+                        self.created,
+                        logprobs,
+                    ));
+                }
+            }
+            RequestOutput::ReasoningDelta { text: delta } => {
+                let kind = AssistantBlockKind::Reasoning;
+                let include_delta =
+                    self.context.include_reasoning || !matches!(kind, AssistantBlockKind::Reasoning);
+                if include_delta {
+                    if let Some(pending_chunk) = self.pending_chunk.as_mut() {
+                        pending_chunk.push_block_delta(kind, delta.clone());
+                    } else {
+                        chunks.push(block_delta_chunk(
+                            &self.context.request_id,
+                            &self.context.response_model,
+                            self.created,
+                            kind,
+                            delta.clone(),
+                        ));
+                    }
+                } else {
+                    self.suppress_current_update_metadata = true;
+                }
+            }
+            RequestOutput::OutputBlockStart { kind, .. } => {
+                debug!(?kind, "starting new block");
+                if !self.context.include_reasoning && matches!(kind, AssistantBlockKind::Reasoning)
+                {
+                    self.inside_hidden_reasoning = true;
+                    self.suppress_current_update_metadata = true;
+                }
+            }
+            RequestOutput::OutputBlockEnd { .. } => {
+                debug!("ending current block");
+                // Every block end follows its own start, so this is the end of
+                // the hidden reasoning block that the start arm opened.
+                if self.inside_hidden_reasoning {
+                    self.inside_hidden_reasoning = false;
+                    self.suppress_current_update_metadata = true;
+                }
+            }
+            RequestOutput::ToolCallStart {
+                index, id, name, ..
+            } => {
+                let tool_index = *index as u32;
+                self.saw_tool_calls = true;
+                debug!(tool_call_id = %id, tool_call_name = %name, "starting new tool call");
+                if let Some(pending_chunk) = self.pending_chunk.as_mut() {
+                    pending_chunk.push_tool_call_start(tool_index, id.clone(), name.clone());
+                } else {
+                    chunks.push(tool_call_start_chunk(
+                        &self.context.request_id,
+                        &self.context.response_model,
+                        self.created,
+                        tool_index,
+                        id.clone(),
+                        name.clone(),
+                    ));
+                }
+            }
+            RequestOutput::ToolCallArgumentsDelta { index, delta, .. } => {
+                let tool_index = *index as u32;
+                if let Some(pending_chunk) = self.pending_chunk.as_mut() {
+                    pending_chunk.push_tool_call_arguments(tool_index, delta.clone());
+                } else {
+                    chunks.push(tool_call_arguments_chunk(
+                        &self.context.request_id,
+                        &self.context.response_model,
+                        self.created,
+                        tool_index,
+                        delta.clone(),
+                    ));
+                }
+            }
+            RequestOutput::ToolCallEnd { .. } => {
+                debug!("ending current tool call");
+            }
+            RequestOutput::ImageStep { image_id } => {
+                *self.image_step_counts.entry(*image_id).or_default() += 1;
+            }
+            RequestOutput::ImageDone(image) => {
+                // Flush buffered deltas first so the image chunk keeps its
+                // position after the text generated before it.
+                if let Some(pending_chunk) = self.pending_chunk.as_mut()
+                    && let Some(chunk) = pending_chunk.take_chunk(
+                        &self.context.request_id,
+                        &self.context.response_model,
+                        self.created,
+                    )
+                {
+                    chunks.push(chunk);
+                }
+                chunks.push(image_delta_chunk(
+                    &self.context.request_id,
+                    &self.context.response_model,
+                    self.created,
+                    image.png_base64.clone(),
+                ));
+                self.image_step_counts.entry(image.image_id).or_default();
+                self.completed_image_ids.push(image.image_id);
+            }
+            RequestOutput::Finished { reason, usage } => {
+                if let Some(pending_chunk) = self.pending_chunk.as_mut()
+                    && let Some(chunk) = pending_chunk.take_chunk(
+                        &self.context.request_id,
+                        &self.context.response_model,
+                        self.created,
+                    )
+                {
+                    chunks.push(chunk);
+                }
+                chunks.push(final_chunk(
+                    &self.context.request_id,
+                    &self.context.response_model,
+                    self.created,
+                    reason,
+                    self.saw_tool_calls,
+                ));
+                if self.context.include_usage {
+                    chunks.push(usage_chunk(
+                        &self.context.request_id,
+                        &self.context.response_model,
+                        self.created,
+                        Usage::new(
+                            usage.prompt_tokens,
+                            usage.output_tokens,
+                            usage.image_count,
+                            usage.image_steps,
+                            self.completed_image_ids
+                                .iter()
+                                .map(|image_id| {
+                                    self.image_step_counts
+                                        .get(image_id)
+                                        .copied()
+                                        .unwrap_or_default()
+                                })
+                                .collect(),
+                        ),
+                    ));
+                }
+                self.done = true;
+            }
+            RequestOutput::Rejected { kind, message } => {
+                return Err(ApiError::rejected(*kind, message.clone()));
+            }
+            RequestOutput::Failed { message } => {
+                // As in `collect_chat_completion`, the failure detail is
+                // logged but not returned to the client.
+                error!(%message, "chat completion failed");
+                bail_server_error!("Internal server error");
+            }
+            _ => {}
+        }
+        self.frames = self.frames.saturating_add(chunks.len() as u64);
+        Ok(chunks)
+    }
+
+    /// Whether the terminal chunk was produced.
+    pub(crate) fn done(&self) -> bool {
+        self.done
+    }
+
+    /// The stage's state, for the process that goes on writing the response
+    /// after a hot restart.
+    ///
+    /// A response freezes at an engine event boundary, and the buffered chunk
+    /// only ever holds the deltas of one decoded update, whose metadata
+    /// arrives in the same engine event: a step boundary is always a point
+    /// with nothing buffered. A buffered chunk here is a defect, and the
+    /// stage reports that it cannot be handed over rather than losing it.
+    pub(crate) fn state(&self) -> Option<handoff::ChatChunks> {
+        if self.has_pending_chunk() {
+            return None;
+        }
+        Some(handoff::ChatChunks {
+            saw_tool_calls: self.saw_tool_calls,
+            image_steps: self.image_step_counts.clone().into_iter().collect(),
+            completed_images: self.completed_image_ids.clone(),
+            inside_hidden_reasoning: self.inside_hidden_reasoning,
+            suppress_current_update_metadata: self.suppress_current_update_metadata,
+            frames: self.frames,
+            done: self.done,
+            created: self.created,
+        })
+    }
+
+    /// Takes over a state this stage produced.
+    pub(crate) fn resume(&mut self, state: &handoff::ChatChunks) {
+        self.saw_tool_calls = state.saw_tool_calls;
+        self.image_step_counts = state.image_steps.clone().into_iter().collect();
+        self.completed_image_ids.clone_from(&state.completed_images);
+        self.inside_hidden_reasoning = state.inside_hidden_reasoning;
+        self.suppress_current_update_metadata = state.suppress_current_update_metadata;
+        self.frames = state.frames;
+        self.done = state.done;
+        self.created = state.created;
+    }
+
+    /// Whether a chunk is buffered from an update whose metadata has not
+    /// arrived yet.
+    fn has_pending_chunk(&self) -> bool {
+        self.pending_chunk.as_ref().is_some_and(|pending| {
+            pending.delta.content.is_some()
+                || pending.delta.reasoning.is_some()
+                || pending.delta.tool_calls.is_some()
+                || pending.logprobs.is_some()
+                || pending.token_ids.is_some()
+        })
+    }
+}
+
+/// Builds the chunk stream of one streamed chat completion.
+///
 /// # Errors
 ///
-/// Yields `ApiError::rejected` for a `Rejected` event, and a server error for
-/// a stream error, a `Failed` event, or a logprob conversion failure. The
-/// stream ends after the first error.
+/// Fails as the response does: a rejected or failed request, or logprobs that
+/// cannot be converted.
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
     stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
@@ -540,236 +880,15 @@ pub async fn chat_completion_chunk_stream(
     created: u64,
     mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
-    let ChatResponseContext {
-        request_id,
-        response_model,
-        include_usage,
-        requested_logprobs,
-        include_prompt_logprobs: _,
-        include_reasoning,
-        return_token_ids,
-        return_tokens_as_token_ids,
-    } = context;
+    let mut emitter = ChatStreamEmitter::new(&context, created);
     pin_mut!(stream);
-    let mut saw_tool_calls = false;
-    let mut image_step_counts = HashMap::<u32, u32>::new();
-    let mut completed_image_ids = Vec::<u32>::new();
-    // Token metadata arrives after all semantic deltas of one decoded update
-    // (see the module docs). If that update contains hidden reasoning,
-    // including a delimiter-only start or end of a hidden reasoning block,
-    // its metadata is omitted along with the reasoning text; with reasoning
-    // visible, every update keeps its metadata. `inside_hidden_reasoning`
-    // stays set across updates while a hidden reasoning block is open.
-    // `suppress_current_update_metadata` marks the current update as touching
-    // hidden reasoning and is cleared when its metadata arrives.
-    let mut inside_hidden_reasoning = false;
-    let mut suppress_current_update_metadata = false;
-
-    // With logprobs or token IDs requested, semantic deltas are buffered until
-    // the update's `TokenDelta` arrives, so one chunk carries both.
-    let mut pending_chunk =
-        (requested_logprobs || return_token_ids).then(PendingChatChunk::default);
-
     while let Some(next) = stream.next().await {
         match next {
-            Ok(RequestOutput::Accepted(prompt)) => {
-                let mut chunk = start_chunk(&request_id, &response_model, created);
-                if return_token_ids {
-                    chunk.prompt_token_ids = Some(prompt.token_ids.to_vec());
-                }
-                y.yield_ok(chunk).await;
-            }
-            Ok(RequestOutput::TextDelta { text }) => {
-                if !text.is_empty() {
-                    let kind = AssistantBlockKind::Text;
-                    if let Some(pending_chunk) = pending_chunk.as_mut() {
-                        pending_chunk.push_block_delta(kind, text);
-                    } else {
-                        let chunk =
-                            block_delta_chunk(&request_id, &response_model, created, kind, text);
-                        y.yield_ok(chunk).await;
-                    }
-                }
-            }
-            Ok(RequestOutput::TokenDelta {
-                token_ids,
-                logprobs,
-            }) => {
-                let include_metadata =
-                    !suppress_current_update_metadata && !inside_hidden_reasoning;
-                suppress_current_update_metadata = false;
-                let openai_logprobs = if include_metadata {
-                    logprobs
-                        .as_ref()
-                        .map(|lp| decoded_logprobs_to_openai_chat(lp, return_tokens_as_token_ids))
-                        .transpose()?
-                } else {
-                    None
-                };
-                let openai_token_ids = include_metadata
-                    .then_some(token_ids)
-                    .and_then(|token_ids| return_token_ids.then_some(token_ids))
-                    .filter(|t| !t.is_empty());
-                if let Some(pending_chunk) = pending_chunk.as_mut() {
-                    pending_chunk.logprobs = openai_logprobs;
-                    pending_chunk.token_ids = openai_token_ids;
-                    if let Some(chunk) =
-                        pending_chunk.take_chunk(&request_id, &response_model, created)
-                    {
-                        y.yield_ok(chunk).await;
-                    }
-                } else if let Some(logprobs) = openai_logprobs {
-                    y.yield_ok(logprobs_only_chunk(
-                        &request_id,
-                        &response_model,
-                        created,
-                        logprobs,
-                    ))
-                    .await;
-                }
-            }
-            Ok(RequestOutput::ReasoningDelta { text: delta }) => {
-                let kind = AssistantBlockKind::Reasoning;
-                let include_delta =
-                    include_reasoning || !matches!(kind, AssistantBlockKind::Reasoning);
-                if include_delta {
-                    if let Some(pending_chunk) = pending_chunk.as_mut() {
-                        pending_chunk.push_block_delta(kind, delta);
-                    } else {
-                        let chunk =
-                            block_delta_chunk(&request_id, &response_model, created, kind, delta);
-                        y.yield_ok(chunk).await;
-                    }
-                } else {
-                    suppress_current_update_metadata = true;
-                }
-            }
-            Ok(RequestOutput::OutputBlockStart { kind, .. }) => {
-                debug!(?kind, "starting new block");
-                if !include_reasoning && matches!(kind, AssistantBlockKind::Reasoning) {
-                    inside_hidden_reasoning = true;
-                    suppress_current_update_metadata = true;
-                }
-            }
-            Ok(RequestOutput::OutputBlockEnd { .. }) => {
-                debug!("ending current block");
-                // Every block end follows its own start, so this is the end
-                // of the hidden reasoning block that the start arm opened.
-                if inside_hidden_reasoning {
-                    inside_hidden_reasoning = false;
-                    suppress_current_update_metadata = true;
-                }
-            }
-            Ok(RequestOutput::ToolCallStart {
-                index, id, name, ..
-            }) => {
-                let tool_index = index as u32;
-                saw_tool_calls = true;
-                debug!(
-                    tool_call_id = %id,
-                    tool_call_name = %name,
-                    "starting new tool call"
-                );
-                if let Some(pending_chunk) = pending_chunk.as_mut() {
-                    pending_chunk.push_tool_call_start(tool_index, id, name);
-                } else {
-                    y.yield_ok(tool_call_start_chunk(
-                        &request_id,
-                        &response_model,
-                        created,
-                        tool_index,
-                        id,
-                        name,
-                    ))
-                    .await;
-                }
-            }
-            Ok(RequestOutput::ToolCallArgumentsDelta { index, delta, .. }) => {
-                let tool_index = index as u32;
-                if let Some(pending_chunk) = pending_chunk.as_mut() {
-                    pending_chunk.push_tool_call_arguments(tool_index, delta);
-                } else {
-                    y.yield_ok(tool_call_arguments_chunk(
-                        &request_id,
-                        &response_model,
-                        created,
-                        tool_index,
-                        delta,
-                    ))
-                    .await;
-                }
-            }
-            Ok(RequestOutput::ToolCallEnd { .. }) => {
-                debug!("ending current tool call");
-            }
-            Ok(RequestOutput::ImageStep { image_id }) => {
-                *image_step_counts.entry(image_id).or_default() += 1;
-            }
-            Ok(RequestOutput::ImageDone(image)) => {
-                // Flush buffered deltas first so the image chunk keeps its
-                // position after the text generated before it.
-                if let Some(pending_chunk) = pending_chunk.as_mut()
-                    && let Some(chunk) =
-                        pending_chunk.take_chunk(&request_id, &response_model, created)
-                {
+            Ok(output) => {
+                for chunk in emitter.push(&output)? {
                     y.yield_ok(chunk).await;
                 }
-                let chunk =
-                    image_delta_chunk(&request_id, &response_model, created, image.png_base64);
-                y.yield_ok(chunk).await;
-                image_step_counts.entry(image.image_id).or_default();
-                completed_image_ids.push(image.image_id);
             }
-            Ok(RequestOutput::Finished { reason, usage }) => {
-                if let Some(pending_chunk) = pending_chunk.as_mut()
-                    && let Some(chunk) =
-                        pending_chunk.take_chunk(&request_id, &response_model, created)
-                {
-                    y.yield_ok(chunk).await;
-                }
-
-                y.yield_ok(final_chunk(
-                    &request_id,
-                    &response_model,
-                    created,
-                    &reason,
-                    saw_tool_calls,
-                ))
-                .await;
-
-                if include_usage {
-                    y.yield_ok(usage_chunk(
-                        &request_id,
-                        &response_model,
-                        created,
-                        Usage::new(
-                            usage.prompt_tokens,
-                            usage.output_tokens,
-                            usage.image_count,
-                            usage.image_steps,
-                            completed_image_ids
-                                .iter()
-                                .map(|image_id| {
-                                    image_step_counts.get(image_id).copied().unwrap_or_default()
-                                })
-                                .collect(),
-                        ),
-                    ))
-                    .await;
-                }
-
-                return Ok(());
-            }
-            Ok(RequestOutput::Rejected { kind, message }) => {
-                return Err(ApiError::rejected(kind, message));
-            }
-            Ok(RequestOutput::Failed { message }) => {
-                // As in `collect_chat_completion`, the failure detail is
-                // logged but not returned to the client.
-                error!(%message, "chat completion failed");
-                bail_server_error!("Internal server error");
-            }
-            Ok(_) => {}
             Err(error) => {
                 error!(
                     error = %error.as_report(),

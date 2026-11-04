@@ -57,11 +57,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use proto::request::{
     DiffusionRequest, Event, FeedbackImage, FeedbackSource, GeneratedImage, GenerationRequest,
-    MigrationCause, Request, Trajectory,
+    MigrationCause, Request, RequestId, Trajectory,
 };
 use tokio::sync::mpsc;
 
@@ -140,6 +141,17 @@ impl Migrator {
         };
         Ok((events, scheduler))
     }
+}
+
+/// What one step of a request's events resolved to.
+pub(crate) enum Step {
+    /// The next event; its tokens are already kept as the request's facts.
+    Event(Event),
+    /// The request's engine is handing the request over: the consumer
+    /// migrates ([`RequestEvents::migrate_pending`]) before the next step.
+    Migrate,
+    /// The request ended.
+    Ended,
 }
 
 /// A request a migration submits again, as last submitted.
@@ -363,21 +375,19 @@ impl RequestEvents {
         self.recv().await
     }
 
-    /// Receives the next event without waiting.
+    /// Advances the request's events one step, registering `cx`'s waker.
     ///
-    /// A migration it meets waits for the next [`Self::recv`], which carries
-    /// it out; until then it reports no event.
-    ///
-    /// # Errors
-    ///
-    /// Returns the channel's error when no event waits or the request ended.
-    pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
+    /// The same stream [`Self::recv`] offers, without awaiting it: a response
+    /// driven from a poll loop (a handoffable stream, design §7.5.1) needs one
+    /// step at a time and must not hold a future across the pause.
+    pub(crate) fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
         loop {
             if self.pending.is_some() {
-                return Err(mpsc::error::TryRecvError::Empty);
+                return Poll::Ready(Step::Migrate);
             }
-            match self.stream.try_recv() {
-                Ok(Event::Migratable {
+            let event = ready!(self.stream.poll_recv(cx));
+            match event {
+                Some(Event::Migratable {
                     cause,
                     denoised_steps,
                     stored_layout,
@@ -386,21 +396,84 @@ impl RequestEvents {
                         cause,
                         denoised_steps,
                         stored_layout,
-                    })
+                    });
+                    return Poll::Ready(Step::Migrate);
                 }
-                Ok(Event::ControlToken { id }) => self.keep(&[id]),
-                Ok(event) if self.skips(&event) => {}
-                Ok(event) => {
+                Some(Event::ControlToken { id }) => self.keep(&[id]),
+                Some(event) if self.skips(&event) => {}
+                Some(event) => {
                     self.observe(&event);
-                    return Ok(event);
+                    return Poll::Ready(Step::Event(event));
                 }
-                Err(error) => {
-                    if error == mpsc::error::TryRecvError::Disconnected {
-                        self.finish();
-                    }
-                    return Err(error);
+                None => {
+                    self.finish();
+                    return Poll::Ready(Step::Ended);
                 }
             }
+        }
+    }
+
+    /// Carries out the migration the last [`Self::poll_step`] reported, after
+    /// which the events go on from the engine that serves the request now.
+    ///
+    /// # Errors
+    ///
+    /// Returns the terminal event the consumer receives instead.
+    pub(crate) async fn migrate_pending(&mut self) -> Result<(), Event> {
+        let Some(migration) = self.pending.take() else {
+            return Ok(());
+        };
+        self.migrate(migration).await
+    }
+
+    /// The request's identity in the engine that serves it, which a
+    /// successor takes its event stream over by; `None` once the request
+    /// ended or was handed over.
+    pub(crate) fn engine_request_id(&self) -> Option<RequestId> {
+        self.open.then(|| self.stream.id())
+    }
+
+    /// The request's engine events its consumer took in all, and the public
+    /// tokens they carried: the position a successor takes the stream over
+    /// from (`Command::Takeover`).
+    pub(crate) fn progress(&self) -> (u64, u64) {
+        (
+            self.stream.consumed(),
+            self.request
+                .as_ref()
+                .and_then(|request| match request {
+                    Resumable::Generation(generation) => {
+                        Some(generation.generated_token_ids.len() as u64)
+                    }
+                    Resumable::Diffusion(_) => None,
+                })
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The request as submitted, encoded as JSON for the handoff state's
+    /// record of what this process's pipeline processed.
+    pub(crate) fn submitted(&self) -> Option<Vec<u8>> {
+        let resumable = self.request.as_ref()?;
+        let request = match resumable {
+            Resumable::Generation(generation) => {
+                Request::Generation(Box::new(generation.as_ref().clone()))
+            }
+            Resumable::Diffusion(diffusion) => Request::Diffusion(diffusion.clone()),
+        };
+        serde_json::to_vec(&request).ok()
+    }
+
+    /// Ends this process's consumption of the request's events without
+    /// cancelling it: the engine's next consumer takes the stream over
+    /// (design §7.5.1). The stream's owner reports the progress it reached
+    /// before this call.
+    pub(crate) fn hand_over(&mut self) {
+        self.open = false;
+        self.request = None;
+        self.stream.hand_over();
+        if let Some(on_finish) = self.on_finish.take() {
+            on_finish();
         }
     }
 
