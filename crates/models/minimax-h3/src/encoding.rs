@@ -775,3 +775,423 @@ mod tests {
         assert!(Stack::of(&config).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The video encoder's device path.
+// ---------------------------------------------------------------------------------------------
+
+use nn::Forward;
+use nn::layers::{Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad, ScaledAdd};
+use nn::weights::{Weight, WeightLoader, WeightRequest};
+use ops::tensor::{DType, Shape, TensorView};
+
+/// One causal convolution of the encoder and the normalization that feeds it.
+///
+/// The reference's `CausalConv3d.forward(norm=…)` normalizes each input frame, activates it, pads the
+/// result with a reflection of the edge rows and columns and two zero frames in front, and convolves;
+/// no output frame therefore reads a later input frame. The bias belongs to the convolution here,
+/// where the reference adds it in a second pass to keep its rounding equal to `conv(x) + bias` — the
+/// same value, one rounding apart.
+struct Normalized {
+    norm: FrameNormPad,
+    conv: Conv3d,
+    /// The source width the normalization reduces.
+    channels: u32,
+    /// The frame groups its statistics are taken over.
+    groups: u32,
+    /// The variance floor of those statistics.
+    epsilon: f32,
+}
+
+/// One residual block: two normalized causal convolutions added to the input's projection.
+struct Block {
+    first: Normalized,
+    second: Normalized,
+    /// The one-by-one projection of the input when the width changes.
+    shortcut: Option<Conv3d>,
+}
+
+/// One encoder level: its blocks, then the convolution that halves space and strides time.
+struct Level {
+    blocks: Vec<Block>,
+    downsample: Option<Conv3d>,
+}
+
+/// The video encoder: the causal convolutional network that turns a clip's pixels into the posterior
+/// moments of its latent.
+///
+/// One call encodes one raster: the caller tiles a clip as `Grid` states, and a band of latent rows
+/// may be encoded on its own through `Grid::band`. Every convolution runs FP32 with TF32 allowed, the
+/// precision the checkpoint's preset declares for the video VAE's encoder (specs/worker.md 9).
+pub struct VideoEncoder {
+    stack: Stack,
+    /// The input convolution, over raw pixels.
+    input: Conv3d,
+    levels: Vec<Level>,
+    /// The final normalization and the moment convolution, `2 · latent_channels` wide.
+    output: Normalized,
+    /// The one-by-one projection after the moments.
+    moments: Conv3d,
+    /// Whether the spatial padding mirrors the edge rows and columns (the checkpoint's mode) or
+    /// replicates them.
+    reflect: bool,
+}
+
+/// The geometry every causal convolution of the encoder is built for: three taps, no padding of its
+/// own (the frame pad supplies it) and unit dilation.
+fn geometry(kernel: u32, stride: [u32; 3]) -> Result<ConvGeometry> {
+    Ok(ConvGeometry::new(
+        3,
+        [kernel; 3],
+        stride,
+        [0; 3],
+        [1; 3],
+        1,
+    )?)
+}
+
+/// Read one weight of `shape`.
+fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(
+        name.to_owned(),
+        0,
+        Shape::new(shape),
+    ))?)
+}
+
+/// Read one convolution of the checkpoint: `from` input channels, `to` output, `kernel` taps.
+fn convolution(
+    loader: &mut WeightLoader,
+    name: &str,
+    from: u32,
+    to: u32,
+    kernel: u32,
+    stride: [u32; 3],
+) -> Result<Conv3d> {
+    let weight = read(
+        loader,
+        &format!("{name}.weight"),
+        &[
+            u64::from(to),
+            u64::from(from),
+            u64::from(kernel),
+            u64::from(kernel),
+            u64::from(kernel),
+        ],
+    )?;
+    let bias = read(loader, &format!("{name}.bias"), &[u64::from(to)])?;
+    Ok(Conv3d::new(
+        weight,
+        Some(bias),
+        geometry(kernel, stride)?,
+        true,
+    )?)
+}
+
+impl VideoEncoder {
+    /// Read the encoder's weights. Every convolution is stored plain, so nothing is folded.
+    pub fn load(config: &VideoVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
+        let stack = Stack::of(config)?;
+        let groups = config.norm_num_groups;
+        let epsilon = config.norm_eps;
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(Error::config(format!(
+                "the video encoder's normalization epsilon is {epsilon}"
+            )));
+        }
+        let reflect = matches!(
+            config.spatial_padding_mode,
+            crate::config::SpatialPadding::Reflect
+        );
+        // A normalized convolution reads its affine parameters from `norm` and its filter from `conv`.
+        let normalized = |loader: &mut WeightLoader,
+                          norm_name: &str,
+                          conv_name: &str,
+                          channels: u32,
+                          to: u32,
+                          kernel: u32|
+         -> Result<Normalized> {
+            let weight = read(
+                loader,
+                &format!("{norm_name}.weight"),
+                &[u64::from(channels)],
+            )?;
+            let bias = read(loader, &format!("{norm_name}.bias"), &[u64::from(channels)])?;
+            Ok(Normalized {
+                norm: FrameNormPad::new(u64::from(groups), Some(weight), Some(bias), reflect)?,
+                conv: convolution(loader, conv_name, channels, to, kernel, [1; 3])?,
+                channels,
+                groups,
+                epsilon,
+            })
+        };
+
+        let input = convolution(
+            loader,
+            "encoder.conv_in",
+            stack.input_channels,
+            stack.widths[0],
+            3,
+            [1; 3],
+        )?;
+        let mut width = stack.widths[0];
+        let mut levels = Vec::with_capacity(stack.widths.len());
+        for (index, out) in stack.widths.iter().enumerate() {
+            let stage = format!("encoder.down_blocks.{index}");
+            let mut blocks = Vec::with_capacity(stack.blocks as usize);
+            for block in 0..stack.blocks {
+                let base = format!("{stage}.resnets.{block}");
+                let from = if block == 0 { width } else { *out };
+                let first = normalized(
+                    loader,
+                    &format!("{base}.norm1"),
+                    &format!("{base}.conv1"),
+                    from,
+                    *out,
+                    3,
+                )?;
+                let second = normalized(
+                    loader,
+                    &format!("{base}.norm2"),
+                    &format!("{base}.conv2"),
+                    *out,
+                    *out,
+                    3,
+                )?;
+                let shortcut = if from == *out {
+                    None
+                } else {
+                    Some(convolution(
+                        loader,
+                        &format!("{base}.conv_shortcut"),
+                        from,
+                        *out,
+                        1,
+                        [1; 3],
+                    )?)
+                };
+                blocks.push(Block {
+                    first,
+                    second,
+                    shortcut,
+                });
+            }
+            let temporal = stack.temporal_strides[index];
+            let spatial = stack.spatial_strides[index];
+            let downsample = if temporal * spatial > 1 {
+                Some(convolution(
+                    loader,
+                    &format!("{stage}.downsamplers.0.conv"),
+                    *out,
+                    *out,
+                    3,
+                    [temporal, spatial, spatial],
+                )?)
+            } else {
+                None
+            };
+            levels.push(Level { blocks, downsample });
+            width = *out;
+        }
+        let output = normalized(
+            loader,
+            "encoder.norm_out",
+            "encoder.conv_out",
+            width,
+            2 * stack.latent_channels,
+            3,
+        )?;
+        let moments = convolution(
+            loader,
+            "quant_conv",
+            2 * stack.latent_channels,
+            2 * stack.latent_channels,
+            1,
+            [1; 3],
+        )?;
+        Ok(Self {
+            stack,
+            input,
+            levels,
+            output,
+            moments,
+            reflect,
+        })
+    }
+}
+impl Normalized {
+    /// Normalize each frame, activate it, pad the result and convolve it.
+    ///
+    /// The padding is one pixel on each spatial side, mirrored or replicated, and two zero frames in
+    /// front, so the convolution's own geometry carries none and no output frame reads a later input
+    /// frame.
+    fn run(&self, f: &Forward, values: TensorView, out: TensorView) -> Result<()> {
+        let (batch, _, frames, height, width) = extent(values)?;
+        let mean = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, u64::from(self.groups)]))?;
+        let rstd = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, u64::from(self.groups)]))?;
+        FrameMoments::new(u64::from(self.groups), self.epsilon).forward(f, values, mean, rstd)?;
+        let padded = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[
+                batch,
+                u64::from(self.channels),
+                frames + 2,
+                height + 2,
+                width + 2,
+            ]),
+        )?;
+        self.norm.forward(f, values, mean, rstd, padded, 1, 1, 2)?;
+        Ok(self.conv.forward(f, padded, out)?)
+    }
+}
+
+/// The extent of a five-axis tensor: `(batch, channels, frames, height, width)`.
+fn extent(view: TensorView) -> Result<(u64, u64, u64, u64, u64)> {
+    if view.shape.rank() != 5 {
+        return Err(Error::config(format!(
+            "a video tensor is {:?}, five axes expected",
+            view.shape.dims()
+        )));
+    }
+    Ok((
+        view.shape.dim(0),
+        view.shape.dim(1),
+        view.shape.dim(2),
+        view.shape.dim(3),
+        view.shape.dim(4),
+    ))
+}
+
+/// A five-axis tensor as the two-axis view an elementwise operator reads.
+fn rows(view: TensorView) -> Result<TensorView> {
+    let columns = view.shape.dim(4);
+    if columns == 0 {
+        return Err(Error::config("a tensor of no column".to_owned()));
+    }
+    let rows = view.shape.numel() / columns;
+    Ok(view.reshape(Shape::new(&[rows, columns])))
+}
+
+impl VideoEncoder {
+    /// Encode one raster into the posterior moments of its latent.
+    ///
+    /// `pixels` is `[1, in_channels, frames, height, width]` FP32 — one tile of a clip, normalized by
+    /// [`normalize`] — and `out` is `[1, 2 · latent_channels, frames', height / 16, width / 16]`. The
+    /// caller tiles a clip as [`Grid`] states and stitches the tiles' latents; a band of latent rows
+    /// may be encoded on its own through [`Grid::band`].
+    pub fn encode(&self, f: &Forward, pixels: TensorView, out: TensorView) -> Result<()> {
+        let (batch, channels, frames, height, width) = extent(pixels)?;
+        if batch != 1 {
+            return Err(Error::config(format!(
+                "the video encoder reads one tile at a time, not {batch}"
+            )));
+        }
+        if channels != u64::from(self.stack.input_channels) {
+            return Err(Error::config(format!(
+                "{channels} input channels for a stack of {}",
+                self.stack.input_channels
+            )));
+        }
+        if frames < u64::from(crate::config::CLIP_FRAMES) {
+            return Err(Error::config(format!(
+                "a {frames}-frame raster is shorter than the {}-frame clip",
+                crate::config::CLIP_FRAMES
+            )));
+        }
+        let extents = self.stack.extents(Extent {
+            frames: u32::try_from(frames)
+                .map_err(|_| Error::config("too many frames".to_owned()))?,
+            height: u32::try_from(height).map_err(|_| Error::config("too tall".to_owned()))?,
+            width: u32::try_from(width).map_err(|_| Error::config("too wide".to_owned()))?,
+        });
+
+        // The input convolution reads padded pixels; it has no normalization of its own.
+        let padded = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[batch, channels, frames + 2, height + 2, width + 2]),
+        )?;
+        FramePad::new(self.reflect).forward(f, pixels, padded, 1, 1, 2)?;
+        let first = u64::from(self.stack.widths[0]);
+        let mut hidden = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[batch, first, frames, height, width]),
+        )?;
+        self.input.forward(f, padded, hidden)?;
+
+        // The blocks alternate between two buffers: one holds the residual stream, the other the
+        // block's output, which the scaled addition folds back into the stream. A level's blocks all
+        // write the level's width, which is the next level's input width.
+        for (index, level) in self.levels.iter().enumerate() {
+            let extent = extents[index];
+            let width = u64::from(self.stack.widths[index]);
+            let mut target = f.arena().tensor(
+                DType::F32,
+                Shape::new(&[
+                    batch,
+                    width,
+                    u64::from(extent.frames),
+                    u64::from(extent.height),
+                    u64::from(extent.width),
+                ]),
+            )?;
+            for block in &level.blocks {
+                self.block(f, block, hidden, target)?;
+                std::mem::swap(&mut hidden, &mut target);
+            }
+            if let Some(downsample) = &level.downsample {
+                // The padding comes off the source's extents: two zero frames in front and one pixel
+                // after the bottom and the right edge, which is what halves an even extent exactly.
+                let next = extents[index + 1];
+                let padded = f.arena().tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        batch,
+                        width,
+                        u64::from(extent.frames) + 2,
+                        u64::from(extent.height) + 1,
+                        u64::from(extent.width) + 1,
+                    ]),
+                )?;
+                FramePad::new(self.reflect).forward(f, hidden, padded, 0, 0, 2)?;
+                let mut strided = f.arena().tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        batch,
+                        width,
+                        u64::from(next.frames),
+                        u64::from(next.height),
+                        u64::from(next.width),
+                    ]),
+                )?;
+                downsample.forward(f, padded, strided)?;
+                std::mem::swap(&mut hidden, &mut strided);
+            }
+        }
+
+        // The moment convolution writes `2 · latent_channels`; the one-by-one projection narrows it to
+        // the latent's own channels, which is the posterior the caller reads.
+        let moments = f.arena().tensor(DType::F32, out.shape)?;
+        self.output.run(f, hidden, moments)?;
+        Ok(self.moments.forward(f, moments, out)?)
+    }
+
+    /// One residual block: two normalized convolutions, added to the input or its projection.
+    fn block(&self, f: &Forward, block: &Block, values: TensorView, out: TensorView) -> Result<()> {
+        let hidden = f.arena().tensor(DType::F32, values.shape)?;
+        block.first.run(f, values, hidden)?;
+        block.second.run(f, hidden, out)?;
+        let residual = match &block.shortcut {
+            Some(shortcut) => {
+                let projected = f.arena().tensor(DType::F32, values.shape)?;
+                shortcut.forward(f, values, projected)?;
+                projected
+            }
+            None => values,
+        };
+        Ok(ScaledAdd.forward(f, rows(out)?, rows(residual)?, 1.0, 1.0)?)
+    }
+}
