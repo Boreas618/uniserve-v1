@@ -428,3 +428,475 @@ impl Op for ValueFirstSwiglu {
         Tolerance::new(0.0, 4.0 * descriptor.dtype.unit_roundoff() as f32)
     }
 }
+
+/// The widest row an E4M3 gating kernel reduces, in elements.
+///
+/// One program handles a complete row, so a wider row would not fit its registers.
+pub const MAX_E4M3_WIDTH: u32 = 32768;
+
+/// One compilation of `act_and_mul_fp8`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ActAndMulE4M3Descriptor {
+    /// Element type of the gates and the values.
+    pub dtype: DType,
+    /// Elements per output row, at most [`MAX_E4M3_WIDTH`].
+    pub width: u32,
+    /// The lanes one program loads: `width` rounded up to a power of two.
+    pub block: u32,
+    /// The activation applied to the gate half.
+    pub activation: Activation,
+    /// Elements between the gate rows.
+    pub gate_stride: u64,
+    /// Elements between the value rows.
+    pub value_stride: u64,
+    /// Round the activated gate and the product to the input type before encoding.
+    pub stepwise: bool,
+}
+
+impl fmt::Display for ActAndMulE4M3Descriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("output", DType::F8E4M3)
+            .field("width", self.width)
+            .field("block", self.block)
+            .field("activation", self.activation)
+            .field("gate_stride", self.gate_stride)
+            .field("value_stride", self.value_stride)
+            .field("stepwise", self.stepwise)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `act_and_mul_fp8`.
+pub struct ActAndMulE4M3Args {
+    /// The gate half, its rows `gate_stride` elements apart.
+    pub gate: TensorView,
+    /// The value half, its rows `value_stride` elements apart.
+    pub value: TensorView,
+    /// `[rows, width]`, contiguous E4M3: receives the row-scaled gating values.
+    pub out: TensorView,
+    /// `[rows]`, FP32: the dequantization scale of each row.
+    pub scale: TensorView,
+}
+
+/// The activation of the gate half times the value half, encoded as E4M3 with a row scale.
+pub struct ActAndMulE4M3;
+
+impl Op for ActAndMulE4M3 {
+    const NAME: &'static str = "act_and_mul_fp8";
+
+    type Descriptor = ActAndMulE4M3Descriptor;
+    type Args<'a> = ActAndMulE4M3Args;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let width = u64::from(descriptor.width);
+        if width == 0 || width > u64::from(MAX_E4M3_WIDTH) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("a row of {width} elements is outside the kernel's 1..={MAX_E4M3_WIDTH}"),
+            ));
+        }
+        if !descriptor.block.is_power_of_two() || u64::from(descriptor.block) < width {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the {} lane block does not cover a row of {width} elements",
+                    descriptor.block
+                ),
+            ));
+        }
+        args.out.require_rank(Self::NAME, 2)?;
+        args.out.require_row(Self::NAME, DType::F8E4M3, width)?;
+        let rows = args.out.shape.dim(0);
+        args.scale.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.scale.require_row(Self::NAME, DType::F32, rows)?;
+        for (name, view, stride) in [
+            ("gate", &args.gate, descriptor.gate_stride),
+            ("value", &args.value, descriptor.value_stride),
+        ] {
+            view.require_row(Self::NAME, descriptor.dtype, width)?;
+            if view.rows() != rows {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the {name} half holds {} rows, the output {rows}",
+                        view.rows()
+                    ),
+                ));
+            }
+            if view.shape.rank() > 1 && view.strides.get(0) != stride {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the {name} rows are {} elements apart, the descriptor says {stride}",
+                        view.strides.get(0)
+                    ),
+                ));
+            }
+        }
+        for (name, stride) in [
+            ("gate", descriptor.gate_stride),
+            ("value", descriptor.value_stride),
+        ] {
+            if stride > i32::MAX as u64 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("the {name} row stride {stride} does not fit the kernel's int32"),
+                ));
+            }
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.gate)
+            .view(args.value)
+            .view(args.out)
+            .view(args.scale)
+            .i32(descriptor.gate_stride as i32)
+            .i32(descriptor.value_stride as i32);
+        kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        ActAndMulE4M3Args {
+            out: twins.shadow_of(args.out),
+            scale: twins.shadow_of(args.scale),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The activation chain rounds in the input type and the row's scale quantizes the result to
+        // E4M3: the encoded value is within one rounding of the format of the exact product.
+        Tolerance::new(
+            0.0,
+            4.0 * descriptor.dtype.unit_roundoff() as f32
+                + 2.0 * DType::F8E4M3.unit_roundoff() as f32,
+        )
+    }
+}
+
+/// One compilation of `value_first_swiglu_fp8`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ValueFirstSwigluE4M3Descriptor {
+    /// Element type of the packed input.
+    pub dtype: DType,
+    /// Elements per output row, at most [`MAX_E4M3_WIDTH`].
+    pub width: u32,
+    /// The lanes one program loads: `width` rounded up to a power of two.
+    pub block: u32,
+    /// Elements between the packed input rows, which hold `2 · width` elements.
+    pub input_stride: u64,
+}
+
+impl fmt::Display for ValueFirstSwigluE4M3Descriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("output", DType::F8E4M3)
+            .field("width", self.width)
+            .field("block", self.block)
+            .field("input_stride", self.input_stride)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `value_first_swiglu_fp8`.
+pub struct ValueFirstSwigluE4M3Args {
+    /// `[rows, 2 · width]`, contiguous, value half first.
+    pub value_gate: TensorView,
+    /// `[rows, width]`, contiguous E4M3: receives the row-scaled SwiGLU.
+    pub out: TensorView,
+    /// `[rows]`, FP32: the dequantization scale of each row.
+    pub scale: TensorView,
+}
+
+/// `value · silu(gate)` over a packed projection, encoded as E4M3 with a row scale.
+pub struct ValueFirstSwigluE4M3;
+
+impl Op for ValueFirstSwigluE4M3 {
+    const NAME: &'static str = "value_first_swiglu_fp8";
+
+    type Descriptor = ValueFirstSwigluE4M3Descriptor;
+    type Args<'a> = ValueFirstSwigluE4M3Args;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let width = u64::from(descriptor.width);
+        if width == 0 || width > u64::from(MAX_E4M3_WIDTH) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("a row of {width} elements is outside the kernel's 1..={MAX_E4M3_WIDTH}"),
+            ));
+        }
+        if !descriptor.block.is_power_of_two() || u64::from(descriptor.block) < width {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the {} lane block does not cover a row of {width} elements",
+                    descriptor.block
+                ),
+            ));
+        }
+        args.out.require_rank(Self::NAME, 2)?;
+        args.out.require_row(Self::NAME, DType::F8E4M3, width)?;
+        let rows = args.out.shape.dim(0);
+        args.scale.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.scale.require_row(Self::NAME, DType::F32, rows)?;
+        args.value_gate
+            .require_row(Self::NAME, descriptor.dtype, 2 * width)?;
+        if args.value_gate.rows() != rows {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the packed projection holds {} rows, the output {rows}",
+                    args.value_gate.rows()
+                ),
+            ));
+        }
+        if args.value_gate.shape.rank() > 1
+            && args.value_gate.strides.get(0) != descriptor.input_stride
+        {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the packed rows are {} elements apart, the descriptor says {}",
+                    args.value_gate.strides.get(0),
+                    descriptor.input_stride
+                ),
+            ));
+        }
+        if descriptor.input_stride > i32::MAX as u64 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the packed row stride {} does not fit the kernel's int32",
+                    descriptor.input_stride
+                ),
+            ));
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.value_gate)
+            .view(args.out)
+            .view(args.scale)
+            .i32(descriptor.input_stride as i32);
+        kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        ValueFirstSwigluE4M3Args {
+            out: twins.shadow_of(args.out),
+            scale: twins.shadow_of(args.scale),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The sigmoid and its products round in the input type; the row's scale quantizes the
+        // result to E4M3.
+        Tolerance::new(
+            0.0,
+            4.0 * descriptor.dtype.unit_roundoff() as f32
+                + 2.0 * DType::F8E4M3.unit_roundoff() as f32,
+        )
+    }
+}
+
+/// One compilation of `swiglu`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SwigluDescriptor {
+    /// Element type of the value, the gate, the biases and the output.
+    pub dtype: DType,
+    /// Elements per row of the output.
+    pub width: u32,
+    /// The elements one program walks: the tile, or the magnitude tile with partials.
+    pub block: u32,
+    /// Elements between the value rows.
+    pub value_stride: u64,
+    /// Elements between the gate rows.
+    pub gate_stride: u64,
+    /// Whether the value half has a bias.
+    pub value_bias: bool,
+    /// Whether the gate half has a bias.
+    pub gate_bias: bool,
+    /// Whether each program records its largest magnitude into `partials`.
+    pub absmax: bool,
+}
+
+impl fmt::Display for SwigluDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("width", self.width)
+            .field("block", self.block)
+            .field("value_stride", self.value_stride)
+            .field("gate_stride", self.gate_stride)
+            .field("value_bias", self.value_bias)
+            .field("gate_bias", self.gate_bias)
+            .field("absmax", self.absmax)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `swiglu`.
+pub struct SwigluArgs {
+    /// The value half, its rows `value_stride` elements apart.
+    pub value: TensorView,
+    /// The gate half, its rows `gate_stride` elements apart.
+    pub gate: TensorView,
+    /// `[width]`: the value half's bias, present exactly when the descriptor adds one.
+    pub value_bias: Option<TensorView>,
+    /// `[width]`: the gate half's bias, present exactly when the descriptor adds one.
+    pub gate_bias: Option<TensorView>,
+    /// `[rows, width]`, contiguous: receives `(value + bias) · silu(gate + bias)`.
+    pub out: TensorView,
+    /// `[programs]`, FP32: each program's largest output magnitude.
+    pub partials: Option<TensorView>,
+}
+
+/// SwiGLU over separate value and gate views, each with its own bias.
+pub struct Swiglu;
+
+impl Op for Swiglu {
+    const NAME: &'static str = "swiglu";
+
+    type Descriptor = SwigluDescriptor;
+    type Args<'a> = SwigluArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let width = u64::from(descriptor.width);
+        if width == 0 || descriptor.block == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a row or a block of zero elements computes nothing".to_owned(),
+            ));
+        }
+        args.out.require_row(Self::NAME, descriptor.dtype, width)?;
+        let rows = args.out.rows();
+        for (name, view, stride) in [
+            ("value", &args.value, descriptor.value_stride),
+            ("gate", &args.gate, descriptor.gate_stride),
+        ] {
+            view.require_row(Self::NAME, descriptor.dtype, width)?;
+            if view.rows() != rows {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the {name} half holds {} rows, the output {rows}",
+                        view.rows()
+                    ),
+                ));
+            }
+            if view.shape.rank() > 1 && view.strides.get(0) != stride {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the {name} rows are {} elements apart, the descriptor says {stride}",
+                        view.strides.get(0)
+                    ),
+                ));
+            }
+        }
+        for (name, bias, present) in [
+            ("value", &args.value_bias, descriptor.value_bias),
+            ("gate", &args.gate_bias, descriptor.gate_bias),
+        ] {
+            match (bias, present) {
+                (Some(bias), true) => {
+                    bias.require_shape(Self::NAME, Shape::new(&[width]))?;
+                    bias.require_row(Self::NAME, descriptor.dtype, width)?;
+                }
+                (None, false) => {}
+                (None, true) => {
+                    return Err(Error::argument(
+                        Self::NAME,
+                        format!("the descriptor adds a {name} bias but none was given"),
+                    ));
+                }
+                (Some(_), false) => {
+                    return Err(Error::argument(
+                        Self::NAME,
+                        format!("a {name} bias was given but the descriptor adds none"),
+                    ));
+                }
+            }
+        }
+
+        let elements = rows * width;
+        if elements > i32::MAX as u64 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("{elements} elements do not fit the kernel's int32 count"),
+            ));
+        }
+        let programs = elements.div_ceil(u64::from(descriptor.block));
+        match (&args.partials, descriptor.absmax) {
+            (Some(partials), true) => {
+                partials.require_shape(Self::NAME, Shape::new(&[programs]))?;
+                partials.require_row(Self::NAME, DType::F32, programs)?;
+            }
+            (None, false) => {}
+            (None, true) => {
+                return Err(Error::argument(
+                    Self::NAME,
+                    "the descriptor records magnitudes but no buffer was given".to_owned(),
+                ));
+            }
+            (Some(_), false) => {
+                return Err(Error::argument(
+                    Self::NAME,
+                    "a magnitude buffer was given but the descriptor records none".to_owned(),
+                ));
+            }
+        }
+
+        // A flag is off, so its slot is never dereferenced; the kernel still takes the argument.
+        let value_bias = args.value_bias.unwrap_or(args.out);
+        let gate_bias = args.gate_bias.unwrap_or(args.out);
+        let partials = args.partials.unwrap_or(args.out);
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.value)
+            .view(args.gate)
+            .view(value_bias)
+            .view(gate_bias)
+            .view(args.out)
+            .view(partials)
+            .i32(elements as i32);
+        kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        SwigluArgs {
+            out: twins.shadow_of(args.out),
+            partials: args.partials.map(|partials| twins.shadow_of(partials)),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // Two bias adds, the sigmoid, its product with the biased gate and the product with the
+        // biased value: five roundings in the output type, and no reduction.
+        Tolerance::new(0.0, 5.0 * descriptor.dtype.unit_roundoff() as f32)
+    }
+}
