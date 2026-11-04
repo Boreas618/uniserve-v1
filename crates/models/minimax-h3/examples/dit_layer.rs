@@ -10,6 +10,8 @@
 //!                  checkpoint's own tensors
 //! --stage block    one stack layer on a device: its rotary, its attention, its feed-forward and its
 //!                  modulation, over a request's packed rows
+//! --stage denoise  the whole sampler on a device: the draw, `--evaluations` schedule evaluations
+//!                  through the solver, and the trajectory, one file per evaluation
 //! ```
 //!
 //! **The stack is loaded with `--layers` layers, and the count must be even.** `Transformer::forward`
@@ -28,6 +30,14 @@
 //! `notes/h3/numeric-diagnosis.md` defines and `compare_blocks` reads. A reference producer reads
 //! `stack_in`, runs the same layer stack of today's implementation on it, and writes `stack_out` under
 //! the same name in its own tree; the two trees then pair cold.
+//!
+//! Stage `denoise` writes a trajectory instead: `<out>/denoiser/text_features.h3t` is the prefix
+//! source both sides read (synthetic and fixed, so the stage is about the sampler and not about an
+//! encoder), `latents_<modality>_e<i>.h3t` is one evaluation state - `e0` the draw and `eN` the sample
+//! after the last of the `N` evaluations - and `case.json` names the request, the seed, the count and
+//! the checkpoint's own schedule, so the reference producer runs the same first `N` evaluations of it.
+//! Every stage writes `walk.txt`: one `operator<TAB>key` per launch, which `tools/walk_gaps.py` reads
+//! against the store's list.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -35,12 +45,15 @@ use std::process::ExitCode;
 use minimax_h3::attention::{Factors, Visible};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::{Canvas, Config};
-use minimax_h3::denoiser::Layouts;
+use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::modulation::{self, AdaLnCache, Groups, Projections};
 use minimax_h3::packing;
 use minimax_h3::partition::Partition;
 use minimax_h3::schedule::{Modality, Schedule};
 use minimax_h3::transformer::{ROTATED_AXES, Transformer};
+// The block's capability methods: `draw_noise`, `layout`, `state_tables` and the rest are the
+// trait's, and the stage that drives the whole block calls them the way the executor does.
+use nn::capability::Denoiser as _;
 use nn::capability::{VideoRequest, VideoTask};
 use nn::{
     Arena, Backing, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape, TensorView,
@@ -52,27 +65,6 @@ const DEFAULT_ROOT: &str = "/workspace/models/MiniMax-H3";
 
 /// The modulation table's width in `hidden_size` units: three tags of six vectors.
 const ADALN_COLUMNS: u64 = 18;
-
-/// The operators one stack layer launches, in the order it meets them.
-///
-/// Not a key list: the store is searched for every committed module of these operators, and `ops`
-/// binds the descriptor a launch asks for. An operator with no directory in the store is skipped
-/// here and named at the launch that needs it.
-const OPERATORS: [&str; 11] = [
-    "gemm",
-    "silu",
-    // The row gathers are `logits_gather` launches: `nn::layers::gather_rows` binds that operator
-    // with the gathered width in its key, so the store directory to look for is this one.
-    "logits_gather",
-    "modulated_rms_norm",
-    "qk_norm_rope",
-    "rotary_factors",
-    "rope_apply",
-    "dense_attention",
-    "act_and_mul",
-    "gated_residual",
-    "rows",
-];
 
 fn main() -> ExitCode {
     match run() {
@@ -120,6 +112,7 @@ type Result<T> = std::result::Result<T, Failure>;
 enum Stage {
     Weights,
     Block,
+    Denoise,
 }
 
 struct Args {
@@ -134,6 +127,10 @@ struct Args {
     height: u32,
     text_tokens: u32,
     arena_gib: u64,
+    /// The sampling key of stage `denoise`: one seed for the whole request's stream.
+    seed: u64,
+    /// How many of the checkpoint schedule's evaluations stage `denoise` runs; `None` is all of them.
+    evaluations: Option<u32>,
     out: PathBuf,
 }
 
@@ -151,6 +148,8 @@ impl Args {
             height: 768,
             text_tokens: 64,
             arena_gib: 12,
+            seed: 0,
+            evaluations: None,
             out: PathBuf::from("artifacts/h3-dit-layer0"),
         };
         let mut words = std::env::args().skip(1);
@@ -165,9 +164,10 @@ impl Args {
                     args.stage = match value("--stage")?.as_str() {
                         "weights" => Stage::Weights,
                         "block" => Stage::Block,
+                        "denoise" => Stage::Denoise,
                         other => {
                             return Err(Failure::message(format!(
-                                "unknown stage `{other}`; expected weights or block"
+                                "unknown stage `{other}`; expected weights, block or denoise"
                             )));
                         }
                     };
@@ -227,12 +227,28 @@ impl Args {
                         Failure::message(format!("--arena-gib takes whole GiB, not `{number}`"))
                     })?;
                 }
+                "--seed" => {
+                    let number = value("--seed")?;
+                    args.seed = number.parse().map_err(|_| {
+                        Failure::message(format!("--seed takes a whole number, not `{number}`"))
+                    })?;
+                }
+                "--evaluations" => {
+                    let number = value("--evaluations")?;
+                    let count: u32 = number.parse().map_err(|_| {
+                        Failure::message(format!(
+                            "--evaluations takes a whole number, not `{number}`"
+                        ))
+                    })?;
+                    args.evaluations = Some(count);
+                }
                 "--out" => args.out = PathBuf::from(value("--out")?),
                 "--help" | "-h" => {
                     return Err(Failure::message(
-                        "dit_layer --stage weights|block [--root PATH] [--store PATH] \
+                        "dit_layer --stage weights|block|denoise [--root PATH] [--store PATH] \
                          [--dit base|ref] [--device N] [--layers N] [--frames N] [--width N] \
-                         [--height N] [--text-tokens N] [--arena-gib N] [--out DIR]",
+                         [--height N] [--text-tokens N] [--arena-gib N] [--seed N] \
+                         [--evaluations N] [--out DIR]",
                     ));
                 }
                 other => {
@@ -259,6 +275,7 @@ fn run() -> Result<()> {
     match args.stage {
         Stage::Weights => stage_weights(&args),
         Stage::Block => stage_block(&args),
+        Stage::Denoise => stage_denoise(&args),
     }
 }
 
@@ -402,6 +419,483 @@ fn index_names(root: &Path, dit: Dit) -> Result<Vec<String>> {
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| Failure::message(format!("{}: no `weight_map` object", path.display())))?;
     Ok(map.keys().cloned().collect())
+}
+
+/// Stage 3: the sampler, over one request's whole trajectory.
+///
+/// The subject is the noise, the schedule, the solver and the step table, so nothing else is in the
+/// path: the prefix source is a file this harness writes for both sides (`text_features.h3t`,
+/// synthetic and stated), no encoder or conditioner runs, and the case's count is a *prefix* of the
+/// checkpoint's own schedule rather than a schedule of its own.
+///
+/// **`e0` is the draw and `eN` the sample after the last of the `N` evaluations.** The state before
+/// each evaluation is on disk, counted from the draw, so a wrong draw is a tensor on the page rather
+/// than a plausible trajectory that happens to start somewhere else.
+fn stage_denoise(args: &Args) -> Result<()> {
+    let store_root = args.store.clone().ok_or_else(|| {
+        Failure::message(
+            "stage `denoise` needs a program store: pass --store <path> or set UNISERVE_STORE",
+        )
+    })?;
+    let (denoiser_config, partition) = configuration(args)?;
+    let hidden = u64::from(denoiser_config.transformer.hidden_size);
+
+    // 1. The device and the kernels first: a driver that cannot give a device, or a store missing an
+    //    operator, fails before a byte of the checkpoint is read.
+    let device = platform::Device::new(platform::DeviceId(args.device))?;
+    let _guard = device.enter()?;
+    let stream = device.stream()?;
+    let generation = load_generation(&device, &store_root)?;
+
+    // 2. The case's request, its layout and its packing: the deployment's own rule, so the row count,
+    //    the padding and the coordinates are the ones a served request would have.
+    let arrangement = partition.arrangement(&denoiser_config)?;
+    let layouts = Layouts::new(denoiser_config.clone(), arrangement)?;
+    let request = VideoRequest {
+        task: VideoTask::TextToVideoAudio,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: 24,
+        first_frames: 0,
+        last_frames: 0,
+        references: 0,
+        text_tokens: args.text_tokens,
+        conditions: &[],
+        vision_spans: &[],
+    };
+    let (layout, packing) = layouts.layout(&request)?;
+    let frames = packing::align_num_frames(request.frames);
+    let canvas = canvas_of_layout(&layout)?;
+    let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
+    let tokens = u64::from(packing.padded_tokens);
+    println!(
+        "request: {}x{}, {} frames, {} rows packed of {} padded, {} attended",
+        args.width,
+        args.height,
+        frames,
+        packing.video_rows + packing.audio_rows,
+        tokens,
+        tables.used
+    );
+
+    // 3. The whole block in one loader: the stack, the projections, the AdaLN cache and the solver,
+    //    which is what the served path builds.
+    let checkpoint = Checkpoint::open(&args.root)?;
+    let dit = checkpoint.component(args.dit.directory())?;
+    let mut weights = DeviceWeights::new(&device, 0)?;
+    let rows = layouts.rows_bound()?;
+    let block = {
+        let mut loader = WeightLoader::new(dit, &mut weights, None, None);
+        Denoiser::load(
+            denoiser_config.clone(),
+            arrangement,
+            rows,
+            &partition,
+            &mut loader,
+            None,
+        )?
+    };
+    let dtype = block.dtype();
+    println!(
+        "loaded: {} stack layers, hidden {hidden}, {rows} packed rows, {dtype}",
+        denoiser_config.transformer.num_hidden_layers
+    );
+    // The stage's files are the prefix source and the trajectory, and it writes them in the
+    // checkpoint's own element type: a conversion there would be a second representation of the same
+    // numbers on one side of the comparison only.
+    if dtype != DType::BF16 {
+        return Err(Failure::message(format!(
+            "this stage writes its synthetic prefix source in BF16 and the checkpoint's blocks \
+             compute in {dtype}; no conversion is declared, so the stage refuses"
+        )));
+    }
+
+    // 4. The block's own view of the request, and the arena. The plan is the model's statement of one
+    //    evaluation's temporaries; the harness adds what only it holds - the two kinds of table, the
+    //    prefix source and the latents - and reserves the sum. `Denoiser::layout` is the same
+    //    `Layouts::cover` the packing above used, so there is one layout for this request.
+    let shape = <Denoiser as nn::capability::Denoiser>::layout(&block, &request);
+    let planned: u64 = block
+        .denoise_arena(&shape)?
+        .iter()
+        .map(|buffer| buffer.bytes())
+        .sum();
+    let constant_specs = block.constant_tables();
+    let state_specs = block.state_tables(&shape);
+    let video = shape.video;
+    let video_elements = u64::from(video.channels)
+        * u64::from(video.frames)
+        * u64::from(video.height)
+        * u64::from(video.width);
+    let text_rows = u64::from(shape.text_rows);
+    let audio_rows = state_specs
+        .iter()
+        .find(|spec| spec.name == "audio_indices")
+        .map(|spec| spec.shape.dim(0));
+    let audio_width = u64::from(denoiser_config.transformer.audio_channels);
+    let needed = planned
+        + table_bytes(&constant_specs)
+        + table_bytes(&state_specs)
+        + text_rows * hidden * 2
+        + video_elements * 4
+        + audio_rows.unwrap_or(0) * audio_width * 4;
+    let arena_bytes = needed.max(args.arena_gib << 30);
+    let allocator = weights.allocator();
+    let reserve = usize::try_from(arena_bytes).unwrap_or(usize::MAX);
+    allocator.reserve(platform::PoolKind::Graph, reserve)?;
+    let region = allocator.allocate(platform::PoolKind::Graph, reserve)?;
+    let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
+    let forward = Forward::new(&stream, &generation, &arena);
+    println!(
+        "tables: {} constants, {} state; arena {:.2} GiB needed of {:.2} GiB reserved",
+        constant_specs.len(),
+        state_specs.len(),
+        needed as f64 / f64::from(1 << 30),
+        arena_bytes as f64 / f64::from(1 << 30)
+    );
+
+    // 5. The walk starts at the constants: the AdaLN cache's own projections are launches, and a walk
+    //    that began at the forward would report a complete list while the run refused at the cache.
+    let mut walk = Walk(Vec::new());
+    ops::capture::set_sink(Some(&mut walk));
+    let sink = SinkGuard;
+
+    // 6. The constants the block fills once after a load, then the request's own tables, whose host
+    //    bytes only the model writes. The evaluation's word is one of them, and this harness is the
+    //    executor that writes it before each evaluation.
+    let constants = allocate_tables(&arena, &constant_specs)?;
+    block.prepare_constants(&forward, &constants)?;
+    let mut hosts = host_tables(&state_specs)?;
+    block.prepare_state(&request, &shape, &mut hosts)?;
+    let state: Vec<TensorView> = state_specs
+        .iter()
+        .zip(&hosts)
+        .map(|(spec, bytes)| {
+            let view = arena.tensor(spec.dtype, spec.shape)?;
+            upload_bytes(&stream, view, bytes)?;
+            Ok(view)
+        })
+        .collect::<Result<Vec<TensorView>>>()?;
+    let step_table = state_specs
+        .iter()
+        .position(|spec| spec.name == "step")
+        .ok_or_else(|| {
+            Failure::message(format!(
+                "the state tables are {:?} and the solver gathers its coefficient from one named \
+                 `step`",
+                state_specs.iter().map(|spec| spec.name).collect::<Vec<_>>()
+            ))
+        })?;
+
+    // 7. The prefix source as a file: fixed bytes at the layout's text capacity, so both sides read
+    //    the same rows and neither re-derives an encoder's output. `denoise` reads its dtype as the
+    //    forward's own.
+    let (text, text_bytes) = pseudo_rows(&stream, &arena, text_rows, hidden)?;
+
+    // 8. The latents at their native extents - the raster a step patchifies, and the audio's rows -
+    //    then the draw. A `t2va` request has no condition rows, so the prefix source carries none.
+    let video_latents = arena.tensor(
+        DType::F32,
+        Shape::new(&[
+            u64::from(video.channels),
+            u64::from(video.frames),
+            u64::from(video.height),
+            u64::from(video.width),
+        ]),
+    )?;
+    let audio_latents = match (shape.audio, audio_rows) {
+        (Some(audio), Some(rows)) => {
+            let declared = u64::from(audio.channels)
+                * u64::from(audio.frames)
+                * u64::from(audio.height)
+                * u64::from(audio.width);
+            if declared != rows * audio_width {
+                return Err(Failure::message(format!(
+                    "the layout's audio latent holds {declared} elements and the audio row table \
+                     {rows} rows of {audio_width}"
+                )));
+            }
+            Some(arena.tensor(DType::F32, Shape::new(&[rows, audio_width]))?)
+        }
+        (None, None) | (None, Some(0)) => None,
+        (Some(_), None) => {
+            return Err(Failure::message(
+                "the layout draws an audio stream and names no audio row table",
+            ));
+        }
+        (None, Some(rows)) => {
+            return Err(Failure::message(format!(
+                "the layout has {rows} audio rows and no audio latent to draw"
+            )));
+        }
+    };
+    let latents = nn::capability::Latents {
+        video: video_latents,
+        audio: audio_latents,
+    };
+    block.draw_noise(&forward, nn::capability::Seed(args.seed), shape, latents)?;
+    stream.synchronize()?;
+
+    // 9. The schedule the checkpoint states, and how much of it this case runs. The case may shorten
+    //    it and may not change it: the steps are the schedule's own, each naming its index and the
+    //    count of the grid it belongs to.
+    let schedule = block.schedule();
+    let steps = schedule.steps(Modality::Video)?;
+    let num_steps = u32::try_from(steps.len()).unwrap_or(u32::MAX);
+    if num_steps != block.evaluations() {
+        return Err(Failure::message(format!(
+            "the schedule states {num_steps} evaluations and the block was loaded for {}",
+            block.evaluations()
+        )));
+    }
+    let evaluations = args.evaluations.unwrap_or(num_steps);
+    if evaluations > num_steps {
+        return Err(Failure::message(format!(
+            "the case asks {evaluations} evaluations and the checkpoint's {} grid has {num_steps}",
+            schedule.spec().grid.kind()
+        )));
+    }
+    if evaluations == 0 {
+        return Err(Failure::message(
+            "the case asks no evaluations: `e0` would be its only state, and a stage that draws \
+             and stops says nothing about the schedule",
+        ));
+    }
+    println!(
+        "schedule: {} grid, {num_steps} evaluations, running {evaluations}, seed {}",
+        schedule.spec().grid.kind(),
+        args.seed
+    );
+
+    // 10. The case and the draw, then the evaluations. The case goes out before the trajectory: it
+    //     names the run, and a stop inside the loop is read against it.
+    let directory = args.out.join("denoiser");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    let case = format!(
+        "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
+         \"text_rows\": {text_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
+         \"seed\": {}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}, \
+         \"schedule\": \"{}\", \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \
+         \"video_shape\": {}}}\n",
+        args.width,
+        args.height,
+        frames,
+        request.text_tokens,
+        shape.condition_rows,
+        denoiser_config.transformer.num_hidden_layers,
+        args.seed,
+        schedule.spec().grid.kind(),
+        format_sample(&video_latents),
+    );
+    std::fs::write(directory.join("case.json"), case)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    write_h3t(
+        &directory.join("text_features.h3t"),
+        &[text_rows, hidden],
+        4,
+        &text_bytes,
+    )?;
+    let drew = write_sample(&stream, &directory, "e0", video_latents, audio_latents)?;
+
+    // 11. The trajectory. The loop is one closure so that the walk is written whatever the
+    //     evaluations did: a stop's most valuable artefact is the list of launches before it.
+    let trajectory = (|| -> Result<Vec<u8>> {
+        let mut last = drew.clone();
+        for (index, step) in steps.iter().enumerate().take(evaluations as usize) {
+            if step.index != index as u32 {
+                return Err(Failure::message(format!(
+                    "the schedule's step {index} names itself {}",
+                    step.index
+                )));
+            }
+            // The solver's coefficient is device data the executor writes before each replay; this
+            // harness is that executor, so it writes the one word the step table holds.
+            let word = i32::try_from(index)
+                .map_err(|_| Failure::message(format!("evaluation {index} of a step table")))?;
+            upload_bytes(&stream, state[step_table], &word.to_le_bytes())?;
+            let cond = nn::capability::Conditioning {
+                text,
+                source: None,
+                media: &[],
+                images: None,
+                audio: None,
+                state: &state,
+                step: None,
+            };
+            block.denoise(&forward, step, latents, cond)?;
+            last = write_sample(
+                &stream,
+                &directory,
+                &format!("e{}", index + 1),
+                video_latents,
+                audio_latents,
+            )?;
+            println!(
+                "evaluations: {} of {evaluations}, sigma {} -> {}",
+                index + 1,
+                step.sigma,
+                step.sigma_next
+            );
+        }
+        Ok(last)
+    })();
+    ops::capture::set_sink(None);
+    drop(sink);
+
+    // 12. What ran, and the one verdict a run cannot fake: a trajectory whose last sample is its own
+    //     draw wrote nothing, which the exit code would otherwise pass.
+    let walk_path = directory.join("walk.txt");
+    if !walk.0.is_empty() {
+        std::fs::write(&walk_path, walk.text())
+            .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
+        println!(
+            "walk    {} launches of {} distinct programs -> {}",
+            walk.0.len(),
+            walk.distinct(),
+            walk_path.display()
+        );
+    }
+    let last = trajectory?;
+    if walk.0.is_empty() {
+        return Err(Failure::message(
+            "the walk recorded no launches: the forward replayed a captured graph, or no sink was \
+             installed",
+        ));
+    }
+    if last == drew {
+        return Err(Failure::message(
+            "the last sample is byte-identical to the draw: the evaluations wrote nothing",
+        ));
+    }
+    println!(
+        "wrote {} states of {video_elements} latent elements to {}",
+        evaluations + 1,
+        directory.display()
+    );
+    Ok(())
+}
+
+/// The bytes a list of tables occupies, in each table's own element type.
+fn table_bytes(specs: &[nn::capability::StateTable]) -> u64 {
+    specs
+        .iter()
+        .map(|spec| spec.shape.numel() * spec.dtype.bytes().unwrap_or(1))
+        .sum()
+}
+
+/// Allocate one device tensor per table, in the table's own element type and extents.
+fn allocate_tables(arena: &Arena, specs: &[nn::capability::StateTable]) -> Result<Vec<TensorView>> {
+    specs
+        .iter()
+        .map(|spec| Ok(arena.tensor(spec.dtype, spec.shape)?))
+        .collect()
+}
+
+/// Zeroed host bytes for one table list, sized as the model declared each table.
+fn host_tables(specs: &[nn::capability::StateTable]) -> Result<Vec<Vec<u8>>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let width = spec.dtype.bytes().ok_or_else(|| {
+                Failure::message(format!(
+                    "the table `{}` is {} and has no byte width",
+                    spec.name, spec.dtype
+                ))
+            })?;
+            let bytes = usize::try_from(spec.shape.numel() * width).map_err(|_| {
+                Failure::message(format!(
+                    "the table `{}` is {:?} and does not fit a host allocation",
+                    spec.name,
+                    spec.shape.dims()
+                ))
+            })?;
+            Ok(vec![0_u8; bytes])
+        })
+        .collect()
+}
+
+/// Upload host bytes into a tensor already allocated for them.
+fn upload_bytes(stream: &platform::Stream, view: TensorView, bytes: &[u8]) -> Result<()> {
+    let width = view
+        .dtype
+        .bytes()
+        .ok_or_else(|| Failure::message(format!("a {} view has no byte width", view.dtype)))?;
+    let expected = usize::try_from(view.shape.numel() * width).unwrap_or(usize::MAX);
+    if bytes.len() != expected {
+        return Err(Failure::message(format!(
+            "{} bytes for a {} view of {:?}, which holds {expected}",
+            bytes.len(),
+            view.dtype,
+            view.shape.dims()
+        )));
+    }
+    // SAFETY: `bytes` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            view.ptr.address(),
+            bytes.as_ptr() as u64,
+            bytes.len(),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(())
+}
+
+/// The whole of a tensor's device memory, as bytes.
+fn download(stream: &platform::Stream, view: TensorView) -> Result<Vec<u8>> {
+    let width = view
+        .dtype
+        .bytes()
+        .ok_or_else(|| Failure::message(format!("a {} view has no byte width", view.dtype)))?;
+    let count = usize::try_from(view.shape.numel() * width).map_err(|_| {
+        Failure::message(format!("{:?} is not a host allocation", view.shape.dims()))
+    })?;
+    let mut bytes = vec![0_u8; count];
+    // SAFETY: `bytes` is written by the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(bytes.as_mut_ptr() as u64, view.ptr.address(), count, stream)?;
+    }
+    stream.synchronize()?;
+    Ok(bytes)
+}
+
+/// Write one evaluation state's latents, and answer the video's bytes.
+///
+/// The video is the native raster and the audio its rows, both FP32: one file per tensor, named with
+/// the state, so a residual in one evaluation is one glance rather than a bisect.
+fn write_sample(
+    stream: &platform::Stream,
+    directory: &Path,
+    state: &str,
+    video: TensorView,
+    audio: Option<TensorView>,
+) -> Result<Vec<u8>> {
+    let video_bytes = download(stream, video)?;
+    write_h3t(
+        &directory.join(format!("latents_video_{state}.h3t")),
+        video.shape.dims(),
+        1,
+        &video_bytes,
+    )?;
+    if let Some(audio) = audio {
+        let audio_bytes = download(stream, audio)?;
+        write_h3t(
+            &directory.join(format!("latents_audio_{state}.h3t")),
+            audio.shape.dims(),
+            1,
+            &audio_bytes,
+        )?;
+    }
+    Ok(video_bytes)
+}
+
+/// The video raster's extents, as the case writes them.
+fn format_sample(video: &TensorView) -> String {
+    let dims: Vec<String> = video.shape.dims().iter().map(u64::to_string).collect();
+    format!("[{}]", dims.join(", "))
 }
 
 /// Stage 2: one stack layer's arithmetic on a device.
@@ -1073,26 +1567,23 @@ fn load_generation(device: &platform::Device, root: &Path) -> Result<ops::Genera
     }
     let mut entries = Vec::new();
     let mut installed = 0_usize;
-    let mut missing: Vec<&str> = Vec::new();
-    for operator in OPERATORS {
-        let op_root = root.join(operator);
-        if !op_root.is_dir() {
-            missing.push(operator);
-            continue;
-        }
-        for (descriptor, directory) in committed(&op_root) {
+    let mut operators: Vec<String> = std::fs::read_dir(root)
+        .map_err(|error| Failure::message(format!("{}: {error}", root.display())))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    operators.sort();
+    for operator in &operators {
+        for (descriptor, directory) in committed(&root.join(operator)) {
             entries.push(install(device, operator, &descriptor, &directory)?);
             installed += 1;
         }
     }
     println!(
-        "store: {installed} committed modules of {} operators{}",
-        OPERATORS.len(),
-        if missing.is_empty() {
-            String::new()
-        } else {
-            format!("; no directory for {missing:?}")
-        }
+        "store: {installed} committed modules of {} operators",
+        operators.len()
     );
     Ok(ops::Generation::new(1, entries))
 }
