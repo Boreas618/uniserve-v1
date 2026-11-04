@@ -99,6 +99,7 @@ const OPERATORS: &[&str] = &[
     <crate::moe::combine::MoeUnpermute as Op>::NAME,
     <crate::moe::exchange::ExpertExchange as Op>::NAME,
     <crate::moe::grouped::GatherGemm as Op>::NAME,
+    <crate::moe::grouped::GatherGemmNvfp4 as Op>::NAME,
     <crate::moe::grouped::RouteGemm as Op>::NAME,
     <crate::moe::routing::TopkSoftmax as Op>::NAME,
     <crate::moe::routing::ExpertGather as Op>::NAME,
