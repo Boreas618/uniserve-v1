@@ -25,7 +25,7 @@ use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Backing, Storage, StorageView};
 
 /// One source span to convert, and the destination units to write it into.
-pub(crate) struct ConversionRequest<'a> {
+pub struct ConversionRequest<'a> {
     /// The workspace's scratch, `[20 E + 8 S)` bytes: the raw keys at
     /// `[0, 8 E)`, the raw values at `[8 E, 16 E)`, the FP32 conversion
     /// values at `[16 E, 20 E)` and the FP32 source scales at `[20 E, 20 E + 8 S)`,
@@ -67,7 +67,7 @@ pub(crate) struct ConversionRequest<'a> {
 /// workspace's scratch, its stream and the pool's fields, and launched per
 /// span afterwards. A launch enqueues its kernels on the stream it is given;
 /// the caller has already ordered the span's reads before it.
-pub(crate) trait PageConversion: Send + Sync {
+pub trait PageConversion: Send + Sync {
     /// Decode `request`'s span and encode it into the destination units.
     fn convert(&self, stream: Option<&Stream>, request: &ConversionRequest<'_>) -> Result<()>;
 }
@@ -79,7 +79,7 @@ pub(crate) trait PageConversion: Send + Sync {
 /// memory the same way, so it needs a program; this one states that the path is
 /// unreachable, and a request that does reach it says why instead of silently
 /// writing nothing.
-pub(crate) struct Unimported;
+pub struct Unimported;
 
 impl PageConversion for Unimported {
     fn convert(&self, _stream: Option<&Stream>, request: &ConversionRequest<'_>) -> Result<()> {
