@@ -13,6 +13,7 @@ from typing import Any
 from ..types import BenchmarkPoint, Example
 from .base import Dataset
 from .beans import BeansDataset
+from .gsm8k import GSM8KDataset
 from .jsonl import JsonlDataset
 from .minimax_h3 import MiniMaxH3Dataset
 from .mjhq import MJHQDataset
@@ -31,6 +32,7 @@ DATASETS: dict[str, type[Dataset]] = {
     "jsonl": JsonlDataset,
     "minimax-h3": MiniMaxH3Dataset,
     "systemone": SystemOneDataset,
+    "gsm8k": GSM8KDataset,
 }
 
 
@@ -94,6 +96,7 @@ __all__ = [
     "DATASETS",
     "BeansDataset",
     "Dataset",
+    "GSM8KDataset",
     "JsonlDataset",
     "MJHQDataset",
     "MiniMaxH3Dataset",
