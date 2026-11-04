@@ -28,6 +28,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_heads_56_width_128_block_128_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["56"], width = ["128"], block = ["128", "256"], pdl = ["false", "true"] }
+dimensions = { heads = ["56"], width = ["128"], block = ["128", "256"], pdl = ["false", "true"] }
 
 [parameters]
