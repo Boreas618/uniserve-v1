@@ -217,9 +217,9 @@ impl Activation {
     /// The output length for `length` input samples, which is `length` itself.
     ///
     /// Stated as the two passes so that [`Resample`]'s arithmetic is the only place the formulas live.
-    pub fn length(&self, length: u32) -> u32 {
-        let up = Resample::new(self.ratio, self.kernel).expect("an admitted activation");
-        up.downsample_length(up.upsample_length(length))
+    pub fn length(&self, length: u32) -> Result<u32> {
+        let up = Resample::new(self.ratio, self.kernel)?;
+        Ok(up.downsample_length(up.upsample_length(length)))
     }
 }
 
@@ -727,7 +727,11 @@ pub(crate) mod tests {
         assert_eq!(activation.ratio, 2);
         assert_eq!(activation.kernel, 12);
         for length in [1u32, 2, 7, 40, 1000, 4000] {
-            assert_eq!(activation.length(length), length, "length {length}");
+            assert_eq!(
+                activation.length(length).expect("a length"),
+                length,
+                "length {length}"
+            );
         }
         let resample = Resample::new(2, 12).expect("the checkpoint's resampler");
         assert_eq!(resample.pad, 5);

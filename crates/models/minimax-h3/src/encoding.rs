@@ -783,7 +783,7 @@ mod tests {
 use nn::Forward;
 use nn::layers::{Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad, ScaledAdd};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use ops::tensor::{DType, Shape, TensorView};
+use nn::{DType, Shape, TensorView};
 
 /// One causal convolution of the encoder and the normalization that feeds it.
 ///
