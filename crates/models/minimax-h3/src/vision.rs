@@ -1106,9 +1106,10 @@ mod tests {
         // 2 by 2 blocks of each step.
         assert_eq!(geometry.patches, 4 * 16 * 16);
         assert_eq!(geometry.merged, 4 * (16 / merge) * (16 / merge));
-        // The sequence positions are the merged rows of one step, which is what a temporal patch
-        // shares: a video block's rotary is per step, not per clip.
-        assert_eq!(geometry.sequence, (16 / merge) * (16 / merge));
+        // The attention sequence is one step's **patches**, not its merged rows: the tower attends
+        // over patch rows and merges afterwards, so a video block runs four sequences of 16 * 16.
+        assert_eq!(geometry.sequence, 16 * 16);
+        assert_eq!(geometry.sequence, geometry.patches / geometry.time);
     }
 
     #[test]
@@ -1145,6 +1146,7 @@ mod tests {
         assert_eq!(keyframe.patches, 48 * 84);
         assert_eq!(keyframe.merged, (48 / merge) * (84 / merge));
         assert_eq!(keyframe.sequence, 48 * 84);
+        assert_eq!(keyframe.sequence, keyframe.patches / keyframe.time);
         assert!(Geometry::of(&config, [1, 256, 256]).is_ok());
     }
 
