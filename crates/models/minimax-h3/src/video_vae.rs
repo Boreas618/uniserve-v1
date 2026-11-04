@@ -455,12 +455,12 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 // The video decoder's transformer.
 // ---------------------------------------------------------------------------------------------
 
+use nn::Forward;
 use nn::layers::Rotation;
 use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::Forward;
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
 use ops::gemm::WeightOrder;
 
