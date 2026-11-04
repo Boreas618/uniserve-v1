@@ -1461,20 +1461,34 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
     } else {
         DeviceAllocation::linear(DEVICE, 4).unwrap()
     };
+    let range = |allocation: &DeviceAllocation| {
+        DeviceRange::new(
+            DevicePtr::from_address(allocation.address()),
+            allocation.len(),
+        )
+    };
     let args = MatmulArgs {
-        a: a_device.address(),
-        b: b_device.address(),
-        c: c_device.address(),
-        d: d_device.address(),
+        a: range(&a_device),
+        b: range(&b_device),
+        c: range(&c_device),
+        d: range(&d_device),
         alpha: 1.0,
         beta: 0.0,
-        bias: 0,
-        workspace: workspace.address(),
-        workspace_bytes: workspace.len(),
+        // A multiplication without the bias epilogue names no bias vector.
+        bias: DeviceRange::new(DevicePtr::from_address(0), 0),
+        workspace: range(&workspace),
     };
-    // SAFETY: every operand is a device allocation of the descriptor's bytes and
-    // outlives the launch, and the workspace is the algorithm's own need.
-    unsafe { matmul.run(&descriptor, &algorithm, &args, &stream) }.unwrap();
+    matmul.run(&descriptor, &algorithm, &args, &stream).unwrap();
+    // A range too small for the descriptor's shape is refused by name, before
+    // any cuBLASLt call.
+    let short = MatmulArgs {
+        a: DeviceRange::new(DevicePtr::from_address(a_device.address()), 8),
+        ..args
+    };
+    let refused = matmul
+        .run(&descriptor, &algorithm, &short, &stream)
+        .unwrap_err();
+    assert!(matches!(refused, Error::InvalidArgument(_)), "{refused:?}");
     stream.synchronize().unwrap();
 
     let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
