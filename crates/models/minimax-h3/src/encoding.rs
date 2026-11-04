@@ -1627,6 +1627,17 @@ struct GeGlu {
 }
 
 impl AudioEncoder {
+    /// Every checkpoint tensor the audio encoder reads, by name.
+    ///
+    /// Built from [`audio_sources`], the table the load drives, so the list cannot drift from what is
+    /// bound: a weight-normalized convolution names its direction and its magnitude, and the fused
+    /// attention projections name every part. The export this tree was checked against ships
+    /// `audio_vae/config.json` and no tensor file, so against that checkpoint the honest verdict is
+    /// "all absent" - a refusal naming the block, not a read error from inside a layer.
+    pub fn keys(config: &crate::AudioVaeConfig) -> Result<Vec<String>> {
+        Ok(crate::audio_vae::tensor_keys(&audio_sources(config)?))
+    }
+
     /// The latent frames `samples` samples encode to: `ceil(samples / hop)`.
     ///
     /// This is the reference's rule (`encoding.py:244`) and the reason it is a ceiling is the pad its
@@ -2352,6 +2363,33 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_audio_encoders_keys_are_the_encoders_half_and_name_every_part() {
+        let config = crate::audio_vae::tests::audio_config();
+        let keys = AudioEncoder::keys(&config).expect("the encoder's keys");
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        // The encoder's 171 names are 37 weight-normalized pairs and the rest single tensors; the
+        // export this tree was checked against ships `audio_vae/config.json` and no tensor file, so
+        // against it the honest verdict is "all absent" rather than a load that reads nothing.
+        assert_eq!(keys.len(), 171);
+        assert_eq!(
+            keys.iter().filter(|key| key.ends_with(".weight_g")).count(),
+            37
+        );
+        assert_eq!(
+            keys.iter().filter(|key| key.ends_with(".weight_v")).count(),
+            37
+        );
+        let decoder = crate::audio_vae::AudioDecoder::keys(&config).expect("the decoder's keys");
+        assert!(
+            keys.iter().all(|key| !decoder.contains(key)),
+            "the two audio halves read disjoint tensors"
+        );
+    }
+
     use super::*;
     use crate::video_vae::tests::video_config;
 
