@@ -183,7 +183,9 @@ impl CacheDescription {
         let row_bytes = u64::from(kv_heads) * u64::from(head_dim) * element;
         let plane_bytes = row_bytes * u64::from(block_size);
         Self {
-            columns: 1,
+            // One column per layer: every layer writes its own column's unit,
+            // so a page holds one unit whatever the layer count.
+            columns: layers.max(1),
             plane_bytes,
             quantized: false,
             unit_bytes: 2 * plane_bytes + 2,
