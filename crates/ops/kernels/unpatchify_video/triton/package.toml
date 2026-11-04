@@ -30,6 +30,6 @@ architectures = ["sm_100a", "sm_90a"]
 [kernel.descriptors]
 # `patch` is the `frames×height×width` voxels one token carries; the grid follows the model's
 # latents and the decoder's output raster.
-dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["3", "24"], frames = ["2", "4", "8", "16", "32"], height = ["8", "16", "30", "32", "40", "48", "64"], width = ["8", "16", "30", "32", "40", "48", "64"], patch = ["1x2x2", "1x4x4", "4x16x16"], affine = ["true", "false"], block = ["1024"], pdl = ["false", "true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["3", "24"], patch = ["1x2x2", "1x4x4", "4x16x16"], affine = ["true", "false"], block = ["1024"], pdl = ["false", "true"] }
 
 [parameters]
