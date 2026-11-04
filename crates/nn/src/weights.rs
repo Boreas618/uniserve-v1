@@ -1013,6 +1013,9 @@ impl<'a> WeightLoader<'a> {
     /// reciprocal of the checkpoint's FP32 tensor
     /// scale, the scalar `nvfp4_quantize` takes. The product op's `alpha` is the two tensor
     /// scales' product, which the runner copies into one device scalar once at load.
+    // The two arrangements are separate arguments on purpose: one is the file's statement, the other
+    // the deployment's, and naming both is what keeps a caller from passing one for the other.
+    #[allow(clippy::too_many_arguments)]
     pub fn nvfp4(
         &mut self,
         values: &WeightRequest,
@@ -1092,7 +1095,7 @@ impl<'a> WeightLoader<'a> {
             let blocks = file.columns(columns);
             let arranged = swizzled_scales(&bytes.bytes, rows, blocks);
             let shape = product.shape(rows, columns);
-            let files = self.identities(&[scales.tensor.clone()])?;
+            let files = self.identities(std::slice::from_ref(&scales.tensor))?;
             self.publish_computed(
                 WeightKey {
                     files,
@@ -1121,10 +1124,9 @@ impl<'a> WeightLoader<'a> {
                 let reciprocal = self.activation_reciprocal(request)?;
                 let shape = Shape::new(&[1]);
                 let bytes = reciprocal.to_le_bytes();
-                let files = self.identities(&[
-                    request.tensor.clone(),
-                    format!("{}__nvfp4_input_scale", request.tensor),
-                ])?;
+                // The activation's reciprocal is computed from one file: the suffix names the
+                // published piece, not a tensor the checkpoint holds, so it is not an identity.
+                let files = self.identities(std::slice::from_ref(&request.tensor))?;
                 Some(
                     self.publish_computed(
                         WeightKey {
@@ -2102,7 +2104,7 @@ mod tests {
         let linear: Vec<u8> = (1..=rows * blocks).map(|value| value as u8).collect();
         let swizzled = swizzled_scales(&linear, rows, blocks);
         let index = 594_usize;
-        assert_eq!(swizzled[index], (5 * blocks + 6) as u8);
+        assert_eq!(swizzled[index], (5 * blocks + 6 + 1) as u8);
     }
 
     #[test]
