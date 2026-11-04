@@ -1772,24 +1772,26 @@ pub fn denoise_arena(
     // The packed rows, the two projections that fill them, and the rotary tables of the one
     // sequence.
     push(&mut plan, "packed", element, tokens * hidden);
-    push(&mut plan, "patched", element, video_rows * patches);
-    push(&mut plan, "video.projected", element, video_rows * hidden);
-    // The input projections are FP32 too (`transformer.py:366-372`), so both read a widened copy of
-    // their own rows: the video's 96 columns, the audio's 32. Both widenings are `scaled_add` keys
-    // (`columns = 96` and `columns = 32`), and `Transformer::{project, project_audio}` reserve them
-    // after the buffer each writes.
-    push(&mut plan, "patched.wide", "f32", video_rows * patches);
-    if let Some((audio_rows, audio_features)) = audio {
-        push(&mut plan, "audio.projected", element, audio_rows * hidden);
-        // The audio patch, widened for its own input projection - `audio.patched.wide` so that it is
-        // the video's `patched.wide` at another modality and not a second `audio.wide`, which is
-        // the name the head's widening already takes (`head`, `{name}.wide`). Two entries with one
-        // name alias one region, since the executor keys the arena's storage by name.
+    // The sample's own type is FP32 - the draw writes it, the solver updates it, and the reference
+    // refuses anything else - so the patch's input and output are FP32 and so is nothing else here
+    // that the stack reads. The input projections keep the checkpoint's weight and take an FP32
+    // activation and an FP32 output (`transformer.py:366-372`), and the one rounding into the packed
+    // rows is the narrowing that follows them.
+    push(&mut plan, "patched", "f32", video_rows * patches);
+    push(&mut plan, "video.projected", "f32", video_rows * hidden);
+    push(
+        &mut plan,
+        "video.projected.stack",
+        element,
+        video_rows * hidden,
+    );
+    if let Some((audio_rows, _)) = audio {
+        push(&mut plan, "audio.projected", "f32", audio_rows * hidden);
         push(
             &mut plan,
-            "audio.patched.wide",
-            "f32",
-            audio_rows * audio_features,
+            "audio.projected.stack",
+            element,
+            audio_rows * hidden,
         );
     }
     push(&mut plan, "cosine", "f32", tokens * rotated);
@@ -1895,16 +1897,18 @@ pub fn denoise_arena(
     // at the patch width, and the velocity the solver writes into the latents from.
     push(&mut plan, "video.hidden", element, video_rows * hidden);
     push(&mut plan, "video.groups", "i32", video_rows);
+    // The prediction is FP32 from the head (`transformer.py:404-421`) and the solver reads one type
+    // for the sample and the velocity, so neither of these is the stack's element type.
     push(
         &mut plan,
         "video.velocity_rows",
-        element,
+        "f32",
         video_rows * patches,
     );
     push(
         &mut plan,
         "video.velocity",
-        element,
+        "f32",
         channels * frames * height * columns,
     );
     if let Some((audio_rows, audio_features)) = audio {
@@ -1922,7 +1926,7 @@ pub fn denoise_arena(
         push(
             &mut plan,
             "audio.velocity",
-            element,
+            "f32",
             audio_rows * audio_features,
         );
     }
@@ -2569,6 +2573,17 @@ impl Denoiser {
         }
         let hidden_size = u64::from(self.config.transformer.hidden_size);
         let dtype = cond.text.dtype;
+        // The trajectory is FP32 and the reference says so with its own refusal
+        // (`denoiser.py:1206-1216`: a latent input of any other type is a `ValueError`). A sample in
+        // the stack's type would round the trajectory once per evaluation - a drift no shape refuses
+        // and no page localises - so this refuses instead of running the cheaper arithmetic.
+        if video.dtype != DType::F32 {
+            return Err(Error::config(format!(
+                "the video latents are {} and a trajectory is FP32: the sample is what the solver \
+                 accumulates into, and the stack's own element type is {}",
+                video.dtype, dtype
+            )));
+        }
         let arena = f.arena();
 
         // The packed rows: every row gathers its prefix source, so a generated row reads the zero
@@ -2579,15 +2594,29 @@ impl Denoiser {
         // The video rows: patchify, project, scatter.
         let video_indices = tables.get("video_indices")?;
         let video_rows = u64::from(video_indices.shape.dim(0) as u32);
+        // **The sample is the latent's own type, and the stack is the checkpoint's.** The reference
+        // keeps its trajectory in FP32 (`denoiser.py:1206-1216` refuses anything else) and rounds
+        // only inside a launch, so the boundary is crossed twice per evaluation and each crossing is
+        // one launch: the patch and the input projection read the sample's type, the projection's
+        // output is narrowed into the packed rows, and the prediction is widened back before the
+        // solver - whose step reads one type for the sample and the velocity (`solver.rs`).
+        // Allocating these in `cond.text.dtype` instead would round the trajectory itself at every
+        // evaluation, which no shape refuses and no page shows.
+        let sample_dtype = video.dtype;
         let patch = nn::layers::Patch::new(channels, height, width)?;
         // The one inverse of the pack above: the DiT's `1x2x2` tiles back into the latent raster.
         // It reads the token grid from `out`, so a clip of another length replays the same launch.
-        let unpatch = nn::layers::UnpatchifyVideo::new(dtype, channels, 1, 2)?;
-        let patched = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
+        let unpatch = nn::layers::UnpatchifyVideo::new(sample_dtype, channels, 1, 2)?;
+        let patched = arena.tensor(sample_dtype, Shape::new(&[video_rows, channels * 4]))?;
         patch.forward(f, video, patched, frames)?;
-        let projected = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
+        // The reference projects with `output_dtype=torch.float32` and narrows afterwards
+        // (`denoiser.py:1216-1221`): the projection's weights are the checkpoint's, its activation
+        // and its output are FP32, and the one rounding into the packed rows is the narrowing.
+        let projected = arena.tensor(DType::F32, Shape::new(&[video_rows, hidden_size]))?;
         self.transformer.project(f, patched, projected)?;
-        nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, projected, video_indices)?;
+        let narrowed = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
+        nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
+        nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, narrowed, video_indices)?;
 
         // One audio stream or none. A layout with audio rows and no audio latents would otherwise
         // denoise the video and return it without sound, and a missing table where the layout has
@@ -2614,12 +2643,16 @@ impl Denoiser {
                 Shape::new(&[audio_rows, features]),
                 nn::Strides::new(&[features, 1]),
             );
-            let projected = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
+            // The audio's own two crossings, for the reason the video's: the latent is the sample's
+            // type and the projection's FP32 output is narrowed into the packed rows.
+            let projected = arena.tensor(DType::F32, Shape::new(&[audio_rows, hidden_size]))?;
             self.transformer.project_audio(f, flat, projected)?;
+            let narrowed = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
+            nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
             nn::layers::Rows::new(dtype, hidden_size)?.replace(
                 f,
                 hidden,
-                projected,
+                narrowed,
                 audio_indices,
             )?;
         }
@@ -2692,7 +2725,10 @@ impl Denoiser {
             video_indices,
             one_column(video_groups),
         )?;
-        let velocity_rows = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
+        // The head is FP32 in the reference (`transformer.py:404-421`), so the prediction is
+        // written wide and never narrowed: the solver's sample is the latent's type and the velocity
+        // must be the same one.
+        let velocity_rows = arena.tensor(sample_dtype, Shape::new(&[video_rows, channels * 4]))?;
         self.transformer.velocity(
             f,
             video_hidden,
@@ -2703,7 +2739,7 @@ impl Denoiser {
             step_index,
             velocity_rows,
         )?;
-        let velocity = arena.tensor(dtype, video.shape)?;
+        let velocity = arena.tensor(sample_dtype, video.shape)?;
         unpatch.forward(f, velocity_rows, velocity)?;
         // The solver's coefficient is gathered on the device from the executor's `step` table, so
         // this launch addresses one staging word whose contents change per evaluation rather than
@@ -2730,7 +2766,7 @@ impl Denoiser {
                 one_column(audio_groups),
             )?;
             let features = u64::from(self.config.transformer.audio_channels);
-            let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, features]))?;
+            let velocity = arena.tensor(sample_dtype, Shape::new(&[audio_rows, features]))?;
             self.transformer.velocity(
                 f,
                 audio_hidden,
