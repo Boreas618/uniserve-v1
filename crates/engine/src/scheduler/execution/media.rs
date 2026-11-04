@@ -761,6 +761,7 @@ impl Scheduler {
                         request,
                         CallKind::Media(media_call),
                         component,
+                        &placement::Choice::Existing,
                     )
                     .is_some()
             })
@@ -1211,7 +1212,12 @@ impl Scheduler {
         // reserved span in the buffer pool of each rank that backs it.
         let (worker, selected_component) = self
             .placement
-            .select_worker(self.executor.as_ref(), &self.info, &call)
+            .select_worker(
+                self.executor.as_ref(),
+                &self.info,
+                &call,
+                &placement::Choice::Existing,
+            )
             .ok_or("a planned call retains an executable component")?;
         call.component = selected_component;
         let state = self
