@@ -223,6 +223,7 @@ impl From<ModuleForm> for wire::ModuleForm {
         match form {
             ModuleForm::Cubin => wire::ModuleForm::Cubin,
             ModuleForm::Native => wire::ModuleForm::Native,
+            ModuleForm::Wasm => wire::ModuleForm::Wasm,
         }
     }
 }
@@ -234,6 +235,7 @@ impl TryFrom<wire::ModuleForm> for ModuleForm {
         match form {
             wire::ModuleForm::Cubin => Ok(ModuleForm::Cubin),
             wire::ModuleForm::Native => Ok(ModuleForm::Native),
+            wire::ModuleForm::Wasm => Ok(ModuleForm::Wasm),
             wire::ModuleForm::Unspecified => Err(Error::Protocol("a module has no form".into())),
         }
     }
@@ -652,29 +654,34 @@ impl Client {
             &[],
         )?;
         match self.answer()? {
-            wire::server_message::Message::Listing(listing) => Ok(Listing {
-                packages: listing
-                    .packages
-                    .into_iter()
-                    .map(|package| ListedPackage {
+            wire::server_message::Message::Listing(listing) => {
+                let mut packages = Vec::with_capacity(listing.packages.len());
+                for package in listing.packages {
+                    let mut modules = Vec::with_capacity(package.modules.len());
+                    for module in package.modules {
+                        let form = wire::ModuleForm::try_from(module.form)
+                            .map_err(|_| {
+                                Error::Protocol(format!(
+                                    "a listed module has an unknown form {}",
+                                    module.form
+                                ))
+                            })?
+                            .try_into()?;
+                        modules.push(ListedModule {
+                            target: Target::new(module.target),
+                            descriptor: module.descriptor,
+                            form,
+                        });
+                    }
+                    packages.push(ListedPackage {
                         op: package.op,
                         backend: package.backend,
                         revision: package.revision,
-                        modules: package
-                            .modules
-                            .into_iter()
-                            .map(|module| ListedModule {
-                                target: Target::new(module.target),
-                                descriptor: module.descriptor,
-                                form: wire::ModuleForm::try_from(module.form)
-                                    .map_or(ModuleForm::Cubin, |form| {
-                                        ModuleForm::try_from(form).unwrap_or(ModuleForm::Cubin)
-                                    }),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }),
+                        modules,
+                    });
+                }
+                Ok(Listing { packages })
+            }
             wire::server_message::Message::Refused(refused) => Err(refused_error(refused)),
             other => Err(unexpected(Some(other))),
         }

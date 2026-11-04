@@ -123,6 +123,10 @@ enum ModuleForm {
   // A native library with a C ABI: loaded with `dlopen` and called through
   // the entry its package declares.
   MODULE_FORM_NATIVE = 2;
+  // A wasm32 program precompiled for this host's CPU, which wasmtime loads:
+  // a scheduling policy (design section 5.3). A flat blob, with neither
+  // launch metadata nor a C entry.
+  MODULE_FORM_WASM = 3;
 }
 
 // The state of one module's build.

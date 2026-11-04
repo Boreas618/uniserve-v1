@@ -178,6 +178,60 @@ fn a_package_root_with_an_invalid_package_is_refused_when_the_server_opens() {
     ));
 }
 
+/// The manifest of a wasm scheduling policy.
+const POLICY: &str = r#"
+op = "scheduling"
+backend = "fcfs"
+
+[toolchain]
+kind = "wasm"
+version = "wasmtime-31"
+
+[module]
+form = "wasm"
+
+[source]
+kind = "wasm"
+files = ["src/lib.rs"]
+
+[kernel]
+architectures = ["wasm32"]
+descriptors = { keys = ["default"] }
+"#;
+
+#[test]
+fn a_policy_module_is_listed_as_the_wasm_module_it_is() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path(), None);
+    let package_root = configuration
+        .package_root
+        .join("scheduling")
+        .join("fcfs")
+        .join("1");
+    std::fs::create_dir_all(package_root.join("src")).unwrap();
+    std::fs::write(package_root.join("package.toml"), POLICY).unwrap();
+    std::fs::write(package_root.join("src/lib.rs"), b"// the policy\n").unwrap();
+    let module = configuration.store_roots[0]
+        .path
+        .join("scheduling/fcfs/1/wasm32/default");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("module.cwasm"), b"a precompiled module").unwrap();
+    std::fs::write(module.join(".committed"), b"").unwrap();
+
+    let server = ProgramServer::open(&configuration).unwrap();
+    let listing = server.list().unwrap();
+    assert_eq!(listing.packages.len(), 1);
+    let package = &listing.packages[0];
+    assert_eq!(package.op, "scheduling");
+    assert_eq!(package.modules.len(), 1);
+    assert_eq!(package.modules[0].target.as_str(), "wasm32");
+    assert_eq!(package.modules[0].descriptor, "default");
+    assert_eq!(
+        package.modules[0].form,
+        program_server::manifest::ModuleForm::Wasm
+    );
+}
+
 #[test]
 fn prepare_refuses_an_operator_with_no_installed_backend() {
     let temporary = tempfile::tempdir().unwrap();
