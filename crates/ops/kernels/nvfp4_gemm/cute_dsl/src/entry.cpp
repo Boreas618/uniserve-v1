@@ -43,9 +43,14 @@ extern "C" int32_t uniserve_nvfp4_gemm(const uniserve_nvfp4_gemm_call* call, voi
     return refuse(const_cast<uniserve_nvfp4_gemm_call*>(call),
                   "nvfp4_gemm needs input, weight, both scale matrices, alpha and out");
   }
-  // The problem's three extents are the descriptor's: they are compile-time
-  // values in the module, so the Program Server's resolution of the call's
-  // descriptor is what guarantees the extents match the compiled tile.
+  // The problem's three extents are compile-time values of the module, so the
+  // call must name the problem that was compiled: a call of other extents would
+  // read and write outside the operands the tiles were built for.
+  if (call->m != UNISERVE_NVFP4_M || call->n != UNISERVE_NVFP4_N ||
+      call->k != UNISERVE_NVFP4_K) {
+    return refuse(const_cast<uniserve_nvfp4_gemm_call*>(call),
+                  "the module is compiled for another problem size");
+  }
   return cute_dsl_nvfp4_gemm_wrapper(
       &module(),
       const_cast<void*>(call->input),

@@ -70,6 +70,13 @@ def spec(fields, parameters, target):
             k,
         ],
         "options": {},
+        # The module states the problem it was compiled for, so a call of other
+        # extents is refused instead of run against the compiled tiles.
+        "defines": [
+            f"UNISERVE_NVFP4_M={m}",
+            f"UNISERVE_NVFP4_N={n}",
+            f"UNISERVE_NVFP4_K={k}",
+        ],
     }
 
 
