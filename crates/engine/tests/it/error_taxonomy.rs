@@ -61,6 +61,21 @@ enum Observe {
 #[derive(Clone, Copy)]
 enum Dispatch {
     Plan,
+    /// Answers the same plan once and an empty one afterwards.
+    ///
+    /// A real policy names only queued requests, so a program that admits a
+    /// request and keeps naming it on later dispatches states an admission of a
+    /// resident request, which §4.4 refuses — and the refusal, not the
+    /// starvation, is then what the case reports.
+    ///
+    /// This double does not read the dispatch view: it decides from its own
+    /// state, "I admitted once", which is legitimate state for a policy
+    /// instance but is not the view-derived decision a deployment makes.
+    /// Reading the view from here would mean parsing the request views inside
+    /// hand-written WebAssembly; the follow-up is a test policy compiled the
+    /// way `fcfs` is, so a fixture can decide admission the way a deployment
+    /// does (noted in `notes/pending/error-taxonomy-view-reading.md`).
+    PlanOnce,
     /// Runs until the fuel is gone, which §4.4 counts as a failed call.
     Burns,
 }
@@ -116,13 +131,23 @@ impl Toy {
                 Call::Dispatch.export(),
                 packed(PLAN, plan.len())
             ),
+            Dispatch::PlanOnce => format!(
+                "(func (export \"{}\") (param i32 i32) (result i64) \
+                 (if (global.get $admits) \
+                   (then (global.set $admits (i32.const 0)) \
+                         (return (i64.const {})))) \
+                 (i64.const {}))",
+                Call::Dispatch.export(),
+                packed(PLAN, plan.len()),
+                packed(VICTIMS, 2)
+            ),
             Dispatch::Burns => format!(
                 "(func (export \"{}\") (param i32 i32) (result i64) (loop (br 0)) i64.const 0)",
                 Call::Dispatch.export()
             ),
         };
         let source = format!(
-            "(module (memory (export \"memory\") 1) \
+            "(module (memory (export \"memory\") 1) (global $admits (mut i32) (i32.const 1)) \
              (data (i32.const {PLAN}) \"{plan}\") \
              (data (i32.const {LIMITS}) \"{limits}\") \
              (data (i32.const {EXPERTS}) \"{experts}\") \
@@ -445,6 +470,10 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
         admit: vec![scheduling::guest::RequestId(1)],
         ..Plan::default()
     };
+    // It admits once: naming the resident request again on the next dispatch
+    // would be a refused admission, which is a different failure from the one
+    // this case states.
+    admitting.dispatch = Dispatch::PlanOnce;
     // A program may admit only a queued request (§4.4), and the trial of the
     // first program runs before this request exists. So the world serves an
     // idle program first, the request arrives, and the admitting program is
@@ -512,6 +541,7 @@ fn starving(admit: Vec<RequestId>, timeout: Nanos) -> Toy {
             admit,
             ..Plan::default()
         },
+        dispatch: Dispatch::PlanOnce,
         // Distinct from the previous program's, so the revert is visible.
         experts: ExpertOrder {
             placement: vec![0, 1],
