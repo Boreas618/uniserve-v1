@@ -111,6 +111,7 @@ const OPERATORS: &[&str] = &[
     <crate::snake::Snake as Op>::NAME,
     <crate::bias::BiasAdd as Op>::NAME,
     <crate::gelu::Gelu as Op>::NAME,
+    <crate::adaptive_pool::AdaptivePool as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.

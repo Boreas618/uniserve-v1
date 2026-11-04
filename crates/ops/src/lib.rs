@@ -72,6 +72,7 @@
 //! operator, and never from a measurement of the pair being compared.
 
 pub mod activation;
+pub mod adaptive_pool;
 pub mod attention;
 pub mod audio_resample;
 pub mod bias;
