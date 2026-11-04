@@ -105,7 +105,7 @@ use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
 use crate::engine_plan::EpochPlan;
 use daemon::epoch::BuildConfig;
-use engine::{SchedulerHandle, Stage};
+use engine::{PolicyProgram, PolicySource, ProgramSource, SchedulerHandle};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
@@ -328,6 +328,8 @@ pub(crate) struct MainProcess {
     generations: Vec<Arc<Generation>>,
     /// What this node resolves a module for (§5.3).
     targets: Vec<Target>,
+    /// The Program Server's socket, which a policy's source resolves its module through.
+    program_server: PathBuf,
 }
 
 impl MainProcess {
@@ -434,6 +436,7 @@ impl MainProcess {
             retired: Vec::new(),
             generations,
             targets: plan.targets().to_vec(),
+            program_server: plan.program_server().to_path_buf(),
         })
     }
 
@@ -817,6 +820,7 @@ impl MainProcess {
             reply,
             policy: policy.clone(),
             next: Vec::new(),
+            policies: Vec::new(),
             stage: PrecopyStage::Modules(tasks),
         });
         Ok(())
@@ -868,6 +872,24 @@ impl MainProcess {
                 self.after_modules(precopy, loaded)
             }
             PrecopyStage::Executors(submissions) => {
+                // The policy's module is built on each scheduler's blocking thread, so its answer
+                // arrives here as well: a policy that did not prepare fails the update before any
+                // device cuts over, which is what §4.4's dry run is for.
+                match poll_policies(&precopy.policies) {
+                    PolicyStage::Pending => {
+                        precopy.stage = PrecopyStage::Executors(submissions);
+                        self.precopy = Some(precopy);
+                        return Ok(());
+                    }
+                    PolicyStage::Failed(reason) => {
+                        return self.abandon_precopy(
+                            generation,
+                            UpdateFailure::Policy { error: reason },
+                            precopy.reply,
+                        );
+                    }
+                    PolicyStage::Prepared => {}
+                }
                 if let Some(failure) = unfinished(&submissions, "preparing this node's devices") {
                     match failure {
                         StageFailure::Pending => {
@@ -955,15 +977,18 @@ impl MainProcess {
         // The candidate policy is instantiated on the current snapshot, and
         // every decision it would make is dry-run against the hard constraints
         // before anything switches (§4.4, §7.3 step 2).
-        if let Err(error) = precopy_policy(&self.schedulers, &precopy.policy) {
-            return self.abandon_precopy(
-                generation,
-                UpdateFailure::Policy {
-                    error: format!("{error:#}"),
-                },
-                precopy.reply,
-            );
-        }
+        let policies = match self.request_policy(&precopy.policy) {
+            Ok(policies) => policies,
+            Err(error) => {
+                return self.abandon_precopy(
+                    generation,
+                    UpdateFailure::Policy {
+                        error: format!("{error:#}"),
+                    },
+                    precopy.reply,
+                );
+            }
+        };
 
         // Rebind or recapture, as jobs between serving batches (§4.5).
         let mut submissions = Vec::with_capacity(next.len());
@@ -972,6 +997,7 @@ impl MainProcess {
         }
         let mut precopy = precopy;
         precopy.next = next;
+        precopy.policies = policies;
         precopy.stage = PrecopyStage::Executors(submissions);
         self.precopy = Some(precopy);
         Ok(())
@@ -985,7 +1011,7 @@ impl MainProcess {
         failure: UpdateFailure,
         reply: Option<u32>,
     ) -> Result<()> {
-        discard_policy(&self.schedulers);
+        self.discard_policy();
         // The executors already rebound or recaptured this generation's graphs, and a generation
         // that never serves must give its captures back (§7.3 step 2): `purge` releases what is
         // older than the serving generation, which a discarded one is not, so the executor drops it
@@ -1021,7 +1047,7 @@ impl MainProcess {
     /// §7.3 step 3: cut over at the batch boundary whose step the scheduler put
     /// the command at; an expert group's ranks switch at the same step.
     fn switchover(&mut self, generation: u64, step: Option<u64>) -> Result<ProgramStatus> {
-        switchover_policy(&self.schedulers, generation, step)?;
+        self.switchover_policy(generation, step);
         for executor in &self.executors {
             let device = executor.device();
             let submission = executor.switchover(generation)?;
@@ -1056,7 +1082,7 @@ impl MainProcess {
         // Probation ended in a commit, so the generation before the update can never serve again.
         // Its graphs and kernels live until the purge, which is the executor's book to keep.
         self.retired.clear();
-        commit_policy(&self.schedulers, generation)?;
+        self.commit_policy(generation);
         Ok(ProgramStatus::Committed { generation })
     }
 
@@ -1071,9 +1097,7 @@ impl MainProcess {
                 failure,
             };
         }
-        if let Err(error) = revert_policy(&self.schedulers, generation) {
-            tracing::error!(%error, "reverting the scheduling policy failed");
-        }
+        self.revert_policy(generation);
         // The generation that served before the update serves again, and the one built for the
         // update keeps nothing: its kernels are released and its captures are never taken over.
         if !self.retired.is_empty() {
@@ -1108,9 +1132,8 @@ impl MainProcess {
         if let Err(error) = self.update.request_purge(generation) {
             bail!("purging generation {generation}: {error}");
         }
-        for scheduler in &self.schedulers {
-            scheduler.policy_mut().request(Stage::Purge, generation)?;
-        }
+        // A purge has no policy half: the scheduling policy is one program per epoch and its
+        // modules are released with the scheduler, not with a generation's graphs.
         for executor in &self.executors {
             let device = executor.device();
             let submission = executor.purge(generation)?;
@@ -1269,60 +1292,117 @@ impl MainProcess {
     }
 }
 
-/// §7.3 step 2's policy half: the update's policy program is prepared on the
-/// scheduler's own snapshot and adopted as a candidate, which the switchover puts
-/// in the serving instance's place.
-///
-/// The state a candidate is admitted on is the scheduler's - the live objects, the
-/// step's room and the shortage the mechanism faces - so the scheduler takes the
-/// program and prepares it, and this side never holds a slot.
-fn precopy_policy(schedulers: &[engine::SchedulerHandle], policy: &Program) -> Result<()> {
-    for scheduler in schedulers {
-        scheduler.precopy_policy(policy)?;
+impl MainProcess {
+    /// §7.3 step 2's policy half: every scheduler prepares the update's policy program on its own
+    /// state, from the module the Program Server resolves for this host's baseline target, and
+    /// answers on a channel the serve pass polls.
+    ///
+    /// The build runs on the scheduler's own blocking thread, never here: a policy's module is
+    /// compiled the first time it is asked for, and §2.4 forbids the control thread to wait on it.
+    fn request_policy(
+        &self,
+        policy: &Program,
+    ) -> Result<Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>> {
+        let program = PolicyProgram::from_arguments(
+            policy.backend.clone(),
+            policy.revision,
+            &policy.arguments.iter().map(|(name, value)| (name.clone(), value.to_string())).collect(),
+        )
+        .map_err(|error| anyhow::anyhow!("the update's policy program: {error}"))?;
+        let source = Arc::new(
+            ProgramSource::connect(&self.program_server)
+                .map_err(|error| anyhow::anyhow!("reaching the Program Server: {error}"))?,
+        );
+        let source: Arc<dyn PolicySource + Send + Sync> = source;
+        Ok(self
+            .schedulers
+            .iter()
+            .map(|scheduler| scheduler.precopy_policy(program.clone(), Arc::clone(&source)))
+            .collect())
     }
-    Ok(())
+
+    /// §7.3 step 3's policy half: every scheduler's next batch boundary answers from the prepared
+    /// policy. `step` is the boundary the epoch's schedulers agreed on, which only the scheduler
+    /// node can name; the control thread does not choose one.
+    fn switchover_policy(&self, _generation: u64, _step: Option<u64>) {
+        for scheduler in &self.schedulers {
+            if let Err(error) = answer(scheduler.switchover_policy(), self.watchdog.stall_bound(), "the policy switchover") {
+                tracing::error!(%error, "switching the scheduling policy failed");
+            }
+        }
+    }
+
+    /// §7.3 step 5's policy half: probation ended in a commit, so the prepared policy is the serving
+    /// one and the previous module is gone.
+    fn commit_policy(&self, _generation: u64) {
+        for scheduler in &self.schedulers {
+            scheduler.commit_policy();
+        }
+    }
+
+    /// §7.3 step 4's policy half: the previous policy module answers again from the next boundary,
+    /// and the candidate is dropped at it.
+    fn revert_policy(&self, _generation: u64) {
+        for scheduler in &self.schedulers {
+            if let Err(error) = answer(scheduler.revert_policy(), self.watchdog.stall_bound(), "the policy revert") {
+                tracing::error!(%error, "reverting the scheduling policy failed");
+            }
+        }
+    }
+
+    /// A precopy that failed discards its policy candidate, so the next update's program is the only
+    /// one that can serve.
+    fn discard_policy(&self) {
+        // The candidate is dropped by the revert every scheduler applies; a scheduler that never
+        // switched has nothing to drop, and the stage it is asked for is the one that says so.
+        for scheduler in &self.schedulers {
+            let _ = scheduler.revert_policy();
+        }
+    }
 }
 
-/// §7.3 step 3's policy half: the switchover is asked for on the slot, and the
-/// mechanism applies it at this rank's next batch boundary.
-///
-/// `step` is the boundary the epoch's schedulers agreed on, which only the
-/// scheduler node can name; `None` means the command came from the daemon, which
-/// does not choose a boundary, so each scheduler switches at its own next one.
-fn switchover_policy(
-    schedulers: &[engine::SchedulerHandle],
-    _generation: u64,
-    _step: Option<u64>,
+/// What polling a precopy's policy answers found.
+enum PolicyStage {
+    /// At least one scheduler has not answered yet.
+    Pending,
+    /// A scheduler's policy did not prepare.
+    Failed(String),
+    /// Every scheduler prepared its candidate.
+    Prepared,
+}
+
+/// Whether every scheduler answered, and if not, why the first failure did (§7.3 step 2).
+fn poll_policies(
+    policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+) -> PolicyStage {
+    for receiver in policies {
+        match receiver.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return PolicyStage::Failed(error),
+            Err(crossbeam_channel::TryRecvError::Empty) => return PolicyStage::Pending,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                return PolicyStage::Failed("a scheduler that was preparing the policy is gone".to_owned());
+            }
+        }
+    }
+    PolicyStage::Prepared
+}
+
+/// Waits on one scheduler's answer, no longer than the stall bound (§2.4).
+fn answer(
+    receiver: crossbeam_channel::Receiver<std::result::Result<(), String>>,
+    bound: Duration,
+    what: &str,
 ) -> Result<()> {
-    for scheduler in schedulers {
-        scheduler.policy_mut().request(Stage::Switchover);
-    }
-    Ok(())
-}
-
-/// §7.3 step 5's policy half: probation ended in a commit, so the candidate is
-/// the serving instance and the previous one is gone.
-fn commit_policy(schedulers: &[engine::SchedulerHandle], _generation: u64) -> Result<()> {
-    for scheduler in schedulers {
-        scheduler.policy_mut().request(Stage::Commit);
-    }
-    Ok(())
-}
-
-/// §7.3 step 4's policy half: the previous policy module serves again from the
-/// next batch boundary, and the candidate is dropped at it.
-fn revert_policy(schedulers: &[engine::SchedulerHandle], _generation: u64) -> Result<()> {
-    for scheduler in schedulers {
-        scheduler.policy_mut().request(Stage::Revert);
-    }
-    Ok(())
-}
-
-/// A discarded generation's policy slot: the candidate never serves (§7.3 step 2,
-/// a precopy that failed).
-fn discard_policy(schedulers: &[engine::SchedulerHandle]) {
-    for scheduler in schedulers {
-        scheduler.policy_mut().discard();
+    match receiver.recv_timeout(bound) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => bail!("{what} failed: {error}"),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            bail!("{what} did not answer within the stall bound")
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            bail!("{what} lost its scheduler")
+        }
     }
 }
 
@@ -1535,6 +1615,9 @@ struct Precopy {
     policy: Program,
     /// The generation built for each device, in `executors` order.
     next: Vec<Arc<Generation>>,
+    /// The answers of every scheduler that is preparing the update's policy program. The build runs
+    /// on the schedulers' own blocking threads, so the serve pass polls them instead of waiting.
+    policies: Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>,
     stage: PrecopyStage,
 }
 
