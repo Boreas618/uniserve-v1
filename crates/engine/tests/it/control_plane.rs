@@ -2613,7 +2613,11 @@ fn a_latent_image_block_is_written_by_its_own_call() {
 
 /// A context prefill writes a vision block whole, so a block longer than the
 /// step budget can never be scheduled: its request is refused at submission.
-/// A block of exactly the step budget is served.
+/// A block of exactly the step budget is served, because the budget is
+/// inclusive and the block gets a step of its own: the text before it is
+/// prefilled first, so the step that writes the block starts at its first
+/// position and carries exactly its tokens. A chunk that would have to split a
+/// block is never named.
 #[test]
 fn a_vision_block_beyond_the_step_budget_is_refused() {
     const STEP_BUDGET: u32 = 16;
