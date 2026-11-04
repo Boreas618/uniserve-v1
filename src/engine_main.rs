@@ -545,6 +545,11 @@ pub(crate) struct MainProcess {
     /// The frontend's admission gate, the `/admin/pause_generation` of §2.3: submissions are
     /// refused while it is held, and no request in flight is ended by it.
     paused: bool,
+    /// The probation an update must survive before it is committed, when the launch file states
+    /// one (§7.3 step 4). The daemon decides the commit; this is the process's own guard against
+    /// an update that is left on probation with nobody watching: it reverts at the threshold
+    /// rather than serving a generation that was never accepted.
+    rollback: Option<Duration>,
 }
 
 impl MainProcess {
@@ -695,6 +700,7 @@ impl MainProcess {
             serving: !launch.standby,
             parked: None,
             paused: false,
+            rollback: launch.rollback_s.map(Duration::from_secs),
         };
         if launch.standby {
             process.park_standby()?;
@@ -785,6 +791,9 @@ impl MainProcess {
                 return Ok(Some(failure));
             }
             if let Some(failure) = self.watch_schedulers()? {
+                return Ok(Some(failure));
+            }
+            if let Some(failure) = self.watch_probation()? {
                 return Ok(Some(failure));
             }
         }
@@ -1689,6 +1698,31 @@ impl MainProcess {
         }
         self.serving = true;
         Ok(())
+    }
+
+    /// §7.3 step 4: an update left on probation past the window the launch file states is
+    /// reverted, so a deployment never serves a generation nobody accepted.
+    ///
+    /// The daemon commits; this is the guard for when it does not - an operator who closed the
+    /// dashboard, a commit that never arrived. Without a stated window there is no guard, which is
+    /// the daemon's decision and not this process's.
+    fn watch_probation(&mut self) -> Result<Option<UpdateFailure>> {
+        let Some(window) = self.rollback else {
+            return Ok(None);
+        };
+        if !self.update.probation_expired(Instant::now(), window) {
+            return Ok(None);
+        }
+        let failure = UpdateFailure::Threshold {
+            reason: format!(
+                "the update was on probation for longer than the {} seconds the launch file allows",
+                window.as_secs()
+            ),
+        };
+        tracing::info!(seconds = window.as_secs(), "an update outlived its probation and is reverted");
+        let generation = self.update.current();
+        self.revert(generation, failure)?;
+        Ok(None)
     }
 
     /// A scheduler thread that stopped ends the epoch's service, and the epoch says so.
