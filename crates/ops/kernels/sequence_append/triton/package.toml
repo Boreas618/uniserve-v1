@@ -1,0 +1,33 @@
+# The sequence_append operator's Triton backend: design 5.2's program package.
+#
+# One cubin per descriptor: a packed sequence's register prefix and the zero tail a bucket
+# reserves, written into a buffer the caller has already filled up to `rows`. The grid covers
+# only the rows this launch owns, so the caller's rows are not addressable by any thread.
+#
+# The register count and the tail are the model's and the bucket's, so they are the
+# compilation; the caller's row count is a launch word.
+
+op = "sequence_append"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/sequence_append.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], width = ["5376"], registers = ["4"], tail = ["12", "28", "60", "124", "252"], block = ["1024"], pdl = ["false", "true"] }
+
+[parameters]
