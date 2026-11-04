@@ -168,17 +168,30 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // The DiT's plans, from the crate's own function, one line per deployment shape: the base DiT on
     // one rank and on two, and the reference DiT a `ref2va` runs. Each is one evaluation's reservations.
     let ratio = config.video_vae.spatial_compression();
-    for (name, dit, task, shard) in [
+    // (name, DiT, task, Ulysses degree, text-tensor degree). The two degrees are stated apart
+    // because they shard different things: the denoiser's heads follow the Ulysses degree, while the
+    // text encoder's shards follow the tensor degree and leave the DiT's plan untouched. A row that
+    // named one degree while measuring the other would size a deployment it never planned.
+    for (name, dit, task, ulysses, tensor) in [
         (
             "t2va / fl2va, 1 rank",
             Dit::Base,
             nn::capability::VideoTask::TextToVideoAudio,
-            1_u32,
+            1_usize,
+            1_usize,
         ),
         (
-            "t2va, TP2",
+            "t2va, Ulysses 2 (the text encoder unsharded)",
             Dit::Base,
             nn::capability::VideoTask::TextToVideoAudio,
+            2,
+            1,
+        ),
+        (
+            "t2va, Ulysses 2 x tensor 2",
+            Dit::Base,
+            nn::capability::VideoTask::TextToVideoAudio,
+            2,
             2,
         ),
         (
@@ -186,20 +199,15 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             Dit::Reference,
             nn::capability::VideoTask::ReferenceToVideoAudio,
             1,
+            1,
         ),
     ] {
         let Some(rules) = config.denoisers.get(&dit) else {
             println!("DiT plan {name}: this checkpoint has no such DiT");
             continue;
         };
-        let partition = minimax_h3::partition::Partition::serving(
-            &config,
-            task,
-            shard as usize,
-            shard as usize,
-            0,
-            0,
-        )?;
+        let partition =
+            minimax_h3::partition::Partition::serving(&config, task, ulysses, tensor, 0, 0)?;
         let arrangement = partition.arrangement(rules)?;
         for frames in [124_u32, 362] {
             let conditioned = !matches!(task, nn::capability::VideoTask::TextToVideoAudio);
