@@ -151,25 +151,6 @@ impl EpochPlan {
         })
     }
 
-    /// The epoch's build config, for an accessor that needs another of its fields.
-    pub(crate) fn build(&self) -> &daemon::epoch::BuildConfig {
-        &self.build
-    }
-
-    /// The checkpoint this rank serves.
-    pub(crate) fn checkpoint(&self) -> &Path {
-        &self.checkpoint
-    }
-
-    /// The bucket catalog every device captures, built once from `cuda_graph`.
-    ///
-    /// A catalog is a property of the epoch, not of a device, so `graph` and `runners` share it
-    /// rather than each building one: two catalogs of one epoch would be two answers to what a
-    /// batch may be, and a batch that fits one but not the other would have no graph to replay.
-    pub(crate) fn buckets(&self) -> &Buckets {
-        &self.buckets
-    }
-
     /// The blocking pools' admission bounds, one lane per kind (§2.4).
     ///
     /// The build config sizes no pool - a blocking lane's width follows the work it carries, not
