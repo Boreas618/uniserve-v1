@@ -413,11 +413,11 @@ impl ClipDecoder {
         if tile.above != 0 {
             let previous = self.placement(decoded, tile, first_row, first_column, tile.above, 0)?;
             self.blend(tile.above, 2)?
-                .forward(f, previous, view, view)?;
+                .forward(f, Some(previous), view, view)?;
         }
         if tile.left != 0 {
             let previous = self.placement(decoded, tile, first_row, first_column, 0, tile.left)?;
-            self.blend(tile.left, 3)?.forward(f, previous, view, view)?;
+            self.blend(tile.left, 3)?.forward(f, Some(previous), view, view)?;
         }
         Ok(())
     }
