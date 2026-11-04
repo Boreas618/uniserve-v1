@@ -36,16 +36,25 @@ use ops::moe::sort::{self, MoeSort, SortArgs};
 use ops::{DType, DevicePtr, Op, Shape, TensorView};
 
 use crate::error::{Error, Result};
-use crate::forward::Forward;
+use crate::forward::{ALIGNMENT, Forward};
 use crate::layers::Linear;
 use crate::weights::{QuantizedStack, Weight};
 
 /// The scratch one grouped product of `routes` permuted rows and `width` columns needs, in bytes.
 ///
-/// The artifact states it, so it is read rather than guessed: `getWorkspaceSizesInBytes`
-/// (`trtllmGen_bmm_export/BatchedGemmInterface.h`) sums the gated activation's row-max planes, its
-/// tile bars and the persistent scheduler's counter, each of the first two padded to a kibibyte.
-/// `routes` is padded to whole MMA tiles because the program walks whole tiles.
+/// Read from the artifact rather than guessed, and read to its guard:
+/// `getWorkspaceSizesInBytes` (`trtllmGen_bmm_export/BatchedGemmInterface.h`) asks for the gated
+/// activation's row-max planes and tile bars — each padded to a kibibyte — **only when**
+/// `mUseDeepSeekFp8 && mFusedAct`, and `run` additionally requires both operands to be E4M3
+/// (`BatchedGemmInterface.h:617`). The encoded pair this block launches is E2M1 against E2M1, so
+/// `run` never reads those planes for it, and the only entry that can apply is the persistent
+/// scheduler's counter.
+///
+/// The planes are still reserved, and this is the reason rather than a hedge: the artifact's sizing
+/// function tests the two options and not the dtypes, so a package that sets both is *told* to pass
+/// a buffer of that size, and a caller that sized from the dtypes alone would be second-guessing a
+/// program it cannot see. The formula is therefore the artifact's, over the plan's padded route
+/// count; `routes` is padded to whole MMA tiles because the program walks whole tiles.
 ///
 /// The size is a property of the plan, not of the step: it is computed from the route count the plan
 /// states, so every replay of a captured bucket reserves the same number of bytes and nothing in a
@@ -73,6 +82,72 @@ const fn pad_1k(bytes: u64) -> u64 {
 const MMA_TILE: (u32, u32) = (128, 128);
 /// The cluster shape the grouped products' packages are compiled for.
 const MMA_CLUSTER: (u32, u32) = (1, 1);
+
+/// Rows per permutation tile: the row extent of [`MMA_TILE`], which is what a sort's permutation
+/// buffer is padded to.
+pub const TILE_ROWS: u32 = MMA_TILE.0;
+
+/// The geometry one encoded expert step's buffers are sized from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EncodedGeometry {
+    /// The hidden width.
+    pub hidden: u64,
+    /// One half of the gated product's width.
+    pub intermediate: u64,
+    /// Routes per token.
+    pub top: u64,
+    /// Experts the block routes over.
+    pub experts: u64,
+    /// Rows per permutation tile.
+    pub tile: u64,
+}
+
+/// The bytes one forward's encoded step reserves from the arena, for `tokens` rows.
+///
+/// The step's buffers are the same for every layer and for every replay of a plan, so they are
+/// stated rather than discovered: a deployment sizes its arena from this, and a reservation the step
+/// made beyond it would be a write past the plan.
+///
+/// Every row count here is the permutation's **worst case**, not the routes a particular batch
+/// happens to produce: `max_permuted_rows(tokens, top, experts, tile)` is what a skip-routed sort can
+/// reach when every expert owns a single route — for the slice's own 15-token batch that is 15360
+/// rows against 120 expanded routes. The host cannot know the tile count (it is device data the sort
+/// produces), so the buffers are sized for the worst case and a replay over the same plan finds the
+/// same addresses, which is the price of a captured graph. The dense pair does not pay it because
+/// its down product writes only the live rows, and that asymmetry is the honest cost of the encoded
+/// path rather than a defect to hide.
+///
+/// `layout` is the activation encoding's block-scale layout: a field of the products' descriptors,
+/// not of the weights, whose scales have their own layout.
+pub fn encoded_bytes(tokens: u64, geometry: EncodedGeometry, layout: ScaleLayout) -> u64 {
+    let EncodedGeometry {
+        hidden,
+        intermediate,
+        top,
+        experts,
+        tile,
+    } = geometry;
+    let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
+    // One byte per block scale in either element type the field may have.
+    let scales = |rows: u64, columns: u64| layout.shape(rows, columns).numel();
+    let scratch = grouped_workspace_bytes(routes, intermediate.saturating_mul(2))
+        .max(grouped_workspace_bytes(routes, hidden));
+    let mut total: u64 = 0;
+    for bytes in [
+        tokens * (hidden / 2),        // the activation's packed codes
+        scales(tokens, hidden),       // its block scales
+        tokens * 4,                   // its per-token factor, F32
+        routes * intermediate * 2,    // FC1's gated rows, the hidden type
+        routes * (intermediate / 2),  // their packed codes
+        scales(routes, intermediate), // their block scales
+        routes * 4,                   // their per-token factor, F32
+        routes * hidden * 2,          // FC2's rows, one per route
+        scratch,                      // the products' scratch
+    ] {
+        total = total.next_multiple_of(ALIGNMENT).saturating_add(bytes);
+    }
+    total
+}
 
 /// The expert stacks a block multiplies.
 ///
@@ -703,6 +778,24 @@ impl Moe {
         let first = grouped_workspace_bytes(routes, width);
         let second = grouped_workspace_bytes(routes, u64::from(self.hidden));
         first.max(second)
+    }
+
+    /// The bytes one forward's encoded step reserves from the arena, for `tokens` rows.
+    ///
+    /// [`encoded_bytes`] states the extents; this answers them for this block's geometry, which is
+    /// what a deployment asks when it sizes the arena from its plan.
+    pub fn encoded_bytes(&self, tokens: u64, layout: ScaleLayout) -> u64 {
+        encoded_bytes(
+            tokens,
+            EncodedGeometry {
+                hidden: u64::from(self.hidden),
+                intermediate: u64::from(self.intermediate),
+                top: u64::from(self.top),
+                experts: u64::from(self.experts),
+                tile: u64::from(self.tile),
+            },
+            layout,
+        )
     }
 
     /// The first product's descriptor over an encoded stack: the block scale's element type and the
