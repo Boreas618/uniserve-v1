@@ -548,102 +548,97 @@ impl Qwen3Moe {
         )
     }
 
-    /// The router's choice at one layer, from that layer's own input rows.
+    /// The router's choice at one layer, from that layer's **post-attention state**.
     ///
-    /// `hidden` is the layer's input — the reference's `hidden_{layer}`, not its output — `[tokens,
-    /// hidden]`; `ids` and `weights` are the caller's `[tokens, top]` i32 and F32. The layer's input
-    /// norm runs, then its router: no attention, no expert, no other layer, and no fold into the
-    /// stream, so nothing here can be confused with a state.
+    /// `state` is `residual + attention` for that layer — the tensor the forward's
+    /// `post_attention_norm` is given, `[tokens, hidden]` — and `ids`/`weights` are the caller's
+    /// `[tokens, top]` i32 and F32. This method runs that norm, then the router: no attention, no
+    /// expert, no fold, no other layer.
     ///
-    /// The ids are the checkpoint's expert indices, before the expert map. This is the only way a
-    /// caller gets the model's own routing for a layer: [`nn::layers::Moe::route`] takes rows the
-    /// input norm has already produced, and the layers are private, so a comparison against a
-    /// reference's `layer.mlp.gate` needs this call or none.
+    /// **The state is the layer's post-attention one, not its input.** The model's MoE reads
+    /// `post_attention_norm(residual + attention)`, so a caller that passes the layer's input rows
+    /// asks about a router the forward never runs, and nothing here can refuse it: both are
+    /// `[tokens, hidden]` states. A reference builds the same vector from its hooks as
+    /// `hidden_{layer} + hidden_{layer+1}_attended`; with `--from`, that sum is what the harness
+    /// hands in. Above layer 0 the state exists only after the prefix.
     ///
-    /// A layer whose MLP is dense has no router, and is refused by name.
-    ///
-    /// **`hidden` is a state, not a block's update.** The residual stream below the layer and the
-    /// update a layer's block produces have the same shape, so handing this method an update answers
-    /// a well-formed question about the wrong tensor: nothing here can refuse it, and the difference
-    /// shows only when the ids are compared. Above layer 0 the state exists only after the prefix,
-    /// which is why a caller holding the reference's files passes `hidden_{layer}` and a caller
-    /// without them has nothing correct to pass.
+    /// The ids are the checkpoint's expert indices, before the expert map, and a layer whose MLP is
+    /// dense has no router to answer from.
     pub fn route(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        state: TensorView,
         layer: usize,
         ids: TensorView,
         weights: TensorView,
     ) -> Result<()> {
+        let (tokens, plan) = self.state_shape(state, layer)?;
+        let normalized = f
+            .arena()
+            .tensor(state.dtype, Shape::new(&[tokens, plan.hidden]))?;
+        self.layers[layer].route(f, state, normalized, ids, weights)
+    }
+
+    /// The rows and plan a routing cut's `state` implies, refusing a layer the model does not have
+    /// and rows that are not `[tokens, hidden]` of the model's dtype.
+    fn state_shape(&self, state: TensorView, layer: usize) -> Result<(u64, Plan)> {
         if layer >= self.layers.len() {
             return Err(Error::Config(format!(
                 "layer {layer} was asked for but the model has {}",
                 self.layers.len()
             )));
         }
-        let tokens = hidden.rows();
+        let tokens = state.rows();
         let plan = self.plan(tokens)?;
-        if hidden.shape.rank() != 2
-            || hidden.shape.dim(0) != tokens
-            || hidden.shape.dim(1) != plan.hidden
+        if state.shape.rank() != 2
+            || state.shape.dim(0) != tokens
+            || state.shape.dim(1) != plan.hidden
         {
             return Err(Error::Config(format!(
-                "hidden is {:?}, [{tokens}, {}] expected",
-                hidden.shape.dims(),
+                "state is {:?}, [{tokens}, {}] expected",
+                state.shape.dims(),
                 plan.hidden
             )));
         }
-        let normalized = f
-            .arena()
-            .tensor(hidden.dtype, Shape::new(&[tokens, plan.hidden]))?;
-        self.layers[layer].route(f, hidden, normalized, ids, weights)
+        if state.dtype != self.dtype {
+            return Err(Error::Config(format!(
+                "state is {}, the model is {}",
+                state.dtype, self.dtype
+            )));
+        }
+        Ok((tokens, plan))
     }
 
-    /// The router's raw scores at one layer, from that layer's own input rows.
+    /// The router's raw scores at one layer, from that layer's **post-attention state**.
     ///
-    /// `hidden` is the layer's input — the reference's `hidden_{layer}` — `[tokens, hidden]`, and
-    /// `scores` is the caller's `[tokens, experts]` buffer of the same dtype, which receives the
-    /// gate's product before the top-k softens it. The layer's input norm runs, then its gate, and
-    /// nothing else.
+    /// `state` is `residual + attention` for that layer — the tensor the forward's
+    /// `post_attention_norm` is given, `[tokens, hidden]`. This method runs that norm, then the
+    /// gate, and nothing else, so its scores are the forward's own router operand's. A reference
+    /// computes the same state from its own hooks as `hidden_{layer} + hidden_{layer+1}_attended`,
+    /// and with `--from` that is what the harness must hand in.
     ///
-    /// This is the measurement a routing difference needs first. `topk_softmax` applies the softmax
-    /// itself, so the scores are the last point at which a *factor* is visible as a factor: scores
-    /// that are a fraction of a reference's give nearly equal weights, an order that follows those
-    /// scores, and ids that mostly agree — the exact signature of a routing defect that a comparison
-    /// of weights alone would call "flat weights" and a comparison of ids alone would call "close".
+    /// **It is not the layer's input rows.** The router the model runs is fed the post-attention
+    /// normalization; a cut that normalized the layer's input would answer about a router no forward
+    /// executes, and its ids would agree with a reference's only as far as two correlated vectors do.
     ///
-    /// Like [`Self::route`], the answer is about a **state**, not a block's update, and a layer whose
-    /// MLP is dense has no gate to answer from.
+    /// `scores` receives `[tokens, experts]` of the state's dtype. One difference from the forward's
+    /// own path, and it is a rounding: the forward fuses the residual add into the norm, so its
+    /// normalized row is computed from the unrounded sum, while a caller that materializes
+    /// `residual + attention` first hands the norm the sum rounded to the model's dtype. That is one
+    /// rounding of a value both sides compute the same way, and it is the same one a reference
+    /// computing `hidden_{layer} + hidden_{layer+1}_attended` in its own dtype makes.
     pub fn gate(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        state: TensorView,
         layer: usize,
         scores: TensorView,
     ) -> Result<()> {
-        if layer >= self.layers.len() {
-            return Err(Error::Config(format!(
-                "layer {layer} was asked for but the model has {}",
-                self.layers.len()
-            )));
-        }
-        let tokens = hidden.rows();
-        let plan = self.plan(tokens)?;
-        if hidden.shape.rank() != 2
-            || hidden.shape.dim(0) != tokens
-            || hidden.shape.dim(1) != plan.hidden
-        {
-            return Err(Error::Config(format!(
-                "hidden is {:?}, [{tokens}, {}] expected",
-                hidden.shape.dims(),
-                plan.hidden
-            )));
-        }
+        let (tokens, plan) = self.state_shape(state, layer)?;
         let normalized = f
             .arena()
-            .tensor(hidden.dtype, Shape::new(&[tokens, plan.hidden]))?;
-        self.layers[layer].gate(f, hidden, normalized, scores)
+            .tensor(state.dtype, Shape::new(&[tokens, plan.hidden]))?;
+        self.layers[layer].gate(f, state, normalized, scores)
     }
 
     /// Run layers `start..=last` on the caller's rows, and answer the state after `last` (with
@@ -864,33 +859,39 @@ impl DecoderLayer {
     /// `stop` cuts the layer short for an in-layer walk and answers the tensor that cut produces;
     /// the sublayers it skips are not launched at all. With `stop = None` the answer is `update`,
     /// the layer's output.
-    /// The router's raw scores at this layer: its own input norm, then its gate, and nothing else.
+    /// The router's raw scores at this layer: its post-attention norm, then its gate, and nothing
+    /// else.
+    ///
+    /// `state` is the layer's **post-attention state** — its residual plus its attention's output,
+    /// the tensor `post_attention_norm` is given in [`Self::forward`] — and not the layer's input.
+    /// The forward's MoE reads `post_attention_norm(state)`, so a cut that normalized the layer's
+    /// input instead would answer a question about a router the model never runs.
     fn gate(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        state: TensorView,
         normalized: TensorView,
         scores: TensorView,
     ) -> Result<()> {
-        self.input_norm.forward(f, hidden, normalized)?;
+        self.post_attention_norm.forward(f, state, normalized)?;
         self.mlp.gate(f, normalized, scores)
     }
 
-    /// The router's choice at this layer: its own input norm, then its router, and nothing else.
+    /// The router's choice at this layer: its post-attention norm, then its router, and nothing
+    /// else.
     ///
-    /// `hidden` is the layer's *input* — the residual stream below it — and `normalized` is the
-    /// caller's row buffer, because the norm's answer is what the router reads. This is the cut a
-    /// routing comparison needs: the ids it produces come from the same rows through the same norm
-    /// as the forward's, so a reference's `layer.mlp.gate` output compares with them directly.
+    /// `state` is the layer's **post-attention state**, as in [`Self::gate`]: the same tensor the
+    /// forward's `post_attention_norm` is given, so the ids come from the same rows through the same
+    /// norm as the forward's and a reference's `layer.mlp.gate` output compares with them directly.
     fn route(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        state: TensorView,
         normalized: TensorView,
         ids: TensorView,
         weights: TensorView,
     ) -> Result<()> {
-        self.input_norm.forward(f, hidden, normalized)?;
+        self.post_attention_norm.forward(f, state, normalized)?;
         self.mlp.route(f, normalized, ids, weights)
     }
 
