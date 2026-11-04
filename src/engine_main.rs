@@ -2060,7 +2060,7 @@ impl MainProcess {
             tracing::warn!(
                 generation,
                 stage = entered,
-                waiting_on = %pending_work(&precopy.stage),
+                waiting_on = %pending_work(&precopy.stage, &self.executors),
                 waited_s = precopy.since.elapsed().as_secs(),
                 "the precopy has stood in this stage past the watchdog's stall bound and nothing \
                  has answered: the Program Server, a device or a scheduler is the one to look at"
@@ -2137,7 +2137,7 @@ impl MainProcess {
                 // that has stood past twice the watchdog's stall bound is failed here by name,
                 // saying what never answered. Serving keeps what it had; the update does not.
                 if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
-                    let pending = pending_work(&precopy.stage);
+                    let pending = pending_work(&precopy.stage, &self.executors);
                     return self.abandon_precopy(
                         generation,
                         UpdateFailure::Precopy {
@@ -4308,20 +4308,39 @@ enum StageFailure {
 /// lane holds one task per device, the executor stage one submission per device, and the shadow
 /// stage one step per scheduler. The stall line prints the counts so a run names the wait that
 /// never answered without a second run built for the purpose.
-fn pending_work(stage: &PrecopyStage) -> String {
+fn pending_work(stage: &PrecopyStage, executors: &[Arc<Executor>]) -> String {
     match stage {
         PrecopyStage::Modules(tasks) => {
             let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
             format!("{answered} of {} kernel load(s) answered", tasks.len())
         }
         PrecopyStage::Executors(submissions) => {
-            let answered = submissions
-                .iter()
-                .filter(|submission| submission.outcome().is_some())
-                .count();
+            // The label alone says which stage stood; the device thread's own account says whether
+            // it is working (a capture in progress, a bucket being recaptured) or waiting on
+            // something outside it. A capture is open or it is not, and the two look identical
+            // from the control thread without this.
+            let mut pending = Vec::new();
+            for (rank, submission) in submissions.iter().enumerate() {
+                if submission.outcome().is_some() {
+                    continue;
+                }
+                let Some(executor) = executors.get(rank) else {
+                    pending.push(format!("rank {rank}: no executor"));
+                    continue;
+                };
+                let performing = executor
+                    .performing()
+                    .unwrap_or_else(|| "nothing".to_owned());
+                pending.push(format!(
+                    "rank {rank}: {performing}, {} open capture(s)",
+                    executor.capturing()
+                ));
+            }
             format!(
-                "{answered} of {} device preparation(s) answered",
-                submissions.len()
+                "{} of {} device preparation(s) answered ({})",
+                submissions.len() - pending.len(),
+                submissions.len(),
+                pending.join("; ")
             )
         }
         PrecopyStage::Shadow(answers) => {
