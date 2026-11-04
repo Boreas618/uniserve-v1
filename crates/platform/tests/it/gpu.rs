@@ -1702,7 +1702,7 @@ fn tensor_maps_encode_tiled_descriptors() {
 }
 
 #[test]
-#[ignore = "requires a CUDA device"]
+#[ignore = "requires a CUDA device and NCCL"]
 fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
     let _driver = exclusive_driver();
     let id = UniqueId::new().unwrap();
