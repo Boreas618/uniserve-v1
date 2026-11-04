@@ -238,8 +238,9 @@ impl Registration {
     /// Waits until a hot restart asks this response to pause.
     ///
     /// Returns `false` when the restart ended without pausing this response.
-    pub(crate) async fn pausing(&mut self) -> bool {
-        self.requested.wait_for(|requested| *requested).await.is_ok()
+    pub(crate) async fn pausing(&self) -> bool {
+        let mut requested = self.requested.clone();
+        requested.wait_for(|requested| *requested).await.is_ok()
     }
 
     /// Reports the response frozen and waits for the restart's decision.
@@ -293,5 +294,98 @@ impl Drop for Registration {
                 let _ = reported.send(None);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{Decision, FrozenStream, Handoff};
+
+    /// A frozen response's minimal state: a socket descriptor is all the
+    /// pause needs of it beyond the state the connection filled in.
+    fn frozen(id: u64, request_id: &str) -> FrozenStream {
+        let (decision, _decided) = tokio::sync::oneshot::channel();
+        let socket: std::os::fd::OwnedFd = std::fs::File::open("/dev/null")
+            .expect("a socket stand-in")
+            .into();
+        FrozenStream {
+            id,
+            request_id: request_id.to_owned(),
+            frozen_at_ns: super::now_ns(),
+            state: proto::handoff::Stream::default(),
+            descriptor: socket,
+            decision,
+        }
+    }
+
+    /// A pause ends when every response in flight has answered: one that ends
+    /// before it freezes neither holds the pause nor is handed over.
+    #[tokio::test]
+    async fn a_response_that_ends_before_it_freezes_does_not_hold_the_pause() {
+        let handoff = Handoff::new();
+        let kept = handoff.register();
+        let ended = handoff.register();
+        let freezing = tokio::spawn({
+            let kept = Arc::clone(&kept);
+            async move {
+                assert!(kept.pausing().await, "the kept response is asked to pause");
+                kept.report(Some(frozen(kept.id(), "kept"))).await
+            }
+        });
+
+        // The other response's connection ends before it can freeze.
+        drop(ended);
+
+        let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
+            .await
+            .expect("the pause ends once the responses in flight answered");
+        assert_eq!(paused.len(), 1, "only the response that froze is handed over");
+        assert_eq!(paused[0].request_id, "kept");
+
+        // The restart's decision reaches the response that froze.
+        paused
+            .into_iter()
+            .next()
+            .expect("the frozen response")
+            .decision
+            .send(Decision::Resume)
+            .expect("the response awaits its decision");
+        assert_eq!(freezing.await.expect("the freeze task"), Decision::Resume);
+    }
+
+    /// A pause hands over a response that registers while it is pausing, so
+    /// the handed set is what is in flight when the pause ends.
+    #[tokio::test]
+    async fn a_response_that_registers_during_the_pause_is_handed_over_too() {
+        let handoff = Handoff::new();
+        let freezing = tokio::spawn({
+            let handoff = handoff.clone();
+            async move {
+                tokio::task::yield_now().await;
+                let late = handoff.register();
+                assert!(late.pausing().await, "the late response is asked to pause");
+                let decision = late.report(Some(frozen(late.id(), "late"))).await;
+                (late, decision)
+            }
+        });
+
+        let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
+            .await
+            .expect("the pause ends");
+        assert!(
+            paused.iter().any(|stream| stream.request_id == "late"),
+            "the response registered during the pause is handed over"
+        );
+        for stream in paused {
+            stream
+                .decision
+                .send(Decision::Resume)
+                .expect("the response awaits its decision");
+        }
+        let (_, decision) = freezing.await.expect("the late registration");
+        assert_eq!(decision, Decision::Resume);
     }
 }
