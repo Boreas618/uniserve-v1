@@ -390,7 +390,7 @@ impl Connection {
             .header(header::CONTENT_LENGTH, body.len())
             .header(header::CONNECTION, "close")
             .body(Body::from(body))
-            .expect("a fixed error response");
+            .map_err(|error| anyhow::anyhow!("building a protocol error response: {error}"))?;
         self.written = 0;
         self.frames = 0;
         let mut absent = RequestBody::empty();
@@ -1065,6 +1065,14 @@ impl RequestBody {
             shared: Arc::clone(&self.shared),
             wanted: Arc::clone(&self.wanted),
         };
+        // Every part is already a valid `http` value — `method`, `target` and
+        // `version` come from the parser as parsed values — so building the
+        // request cannot fail and there is no error to report to a caller that
+        // is the connection itself.
+        #[expect(
+            clippy::expect_used,
+            reason = "a request from parsed parts cannot fail to build"
+        )]
         let mut request = Request::builder()
             .method(method)
             .uri(target)
