@@ -33,7 +33,7 @@ use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
 };
 use nn::weights::WeightRequest;
-use nn::{DType, DecodedMedia, Decoder, Forward, Shape, TensorView, Weight, WeightLoader};
+use nn::{DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader};
 
 /// One upsampling stage of the decoder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1065,6 +1065,30 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
 }
 
 impl Decoder for AudioDecoder {
+    fn layout_tables(&self, _layout: &nn::capability::Layout) -> Vec<StateTable> {
+        // Every table this decoder reads is a weight, bound at load: nothing follows from the
+        // layout, so the runner uploads nothing for it.
+        Vec::new()
+    }
+
+    fn prepare_layout(
+        &self,
+        _layout: &nn::capability::Layout,
+        out: &mut [Vec<u8>],
+    ) -> nn::Result<()> {
+        if out.is_empty() {
+            Ok(())
+        } else {
+            Err(nn::Error::Shape {
+                owner: "AudioDecoder",
+                problem: format!(
+                    "the audio decoder has no layout tables; {} buffers were offered",
+                    out.len()
+                ),
+            })
+        }
+    }
+
     /// Decode one run of latent frames into interleaved PCM.
     ///
     /// The audio decoder has no layout constants: every table it reads is a weight, bound at load, so

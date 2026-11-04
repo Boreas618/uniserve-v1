@@ -376,8 +376,10 @@ impl Op for FilterCandidates {
             .view(args.ids)
             .view(args.parameters)
             .view(args.valid)
-            .u64(rows)
-            .u32(descriptor.width);
+            .u64(rows);
+        // The candidate width is compiled into the program, so it is not a parameter here: a word the
+        // module does not declare would push the two scratch addresses the compiler's launcher appends
+        // out of place.
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -486,8 +488,10 @@ impl Op for InverseCdf {
             .view(args.ids)
             .view(args.draws)
             .view(args.tokens)
-            .u64(rows)
-            .u32(descriptor.width);
+            .u64(rows);
+        // The candidate width is compiled into the program, so it is not a parameter here: a word the
+        // module does not declare would push the two scratch addresses the compiler's launcher appends
+        // out of place.
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -567,11 +571,10 @@ impl Op for ArgMax {
         }
 
         let mut arguments = Arguments::new();
-        arguments
-            .view(args.values)
-            .view(args.out)
-            .u64(rows)
-            .u32(descriptor.width);
+        arguments.view(args.values).view(args.out).u64(rows);
+        // The candidate width is compiled into the program, so it is not a parameter here: a word the
+        // module does not declare would push the two scratch addresses the compiler's launcher appends
+        // out of place.
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 

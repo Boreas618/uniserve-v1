@@ -345,6 +345,63 @@ impl Qwen3Moe {
         Plan::new(&self.config, &self.partition, tokens, &self.options)
     }
 
+    /// Run the decoder layers `0..=last` over `hidden`, and answer the layer's output rows.
+    ///
+    /// This is the bisection tool a wrong number needs: `forward` walks all 48 layers and then
+    /// normalizes, so a defect shows up only as a bad logit row with nothing saying which layer
+    /// produced it. Naming a layer runs the same code up to and including it, with the same rotary
+    /// tables and the same residual stream, and returns the rows that layer wrote.
+    ///
+    /// `last` past the last layer is refused rather than clamped: a stage asking for layer 60 of a
+    /// 48-layer model is a caller error, and clamping it would answer a different question.
+    pub fn forward_through(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        hidden: TensorView,
+        last: usize,
+    ) -> Result<TensorView> {
+        if last >= self.layers.len() {
+            return Err(Error::Config(format!(
+                "layer {last} was asked for but the model has {}",
+                self.layers.len()
+            )));
+        }
+        let tokens = batch.tokens();
+        let plan = self.plan(tokens)?;
+        if hidden.shape.rank() != 2
+            || hidden.shape.dim(0) != tokens
+            || hidden.shape.dim(1) != plan.hidden
+        {
+            return Err(Error::Config(format!(
+                "hidden is {:?}, [{tokens}, {}] expected",
+                hidden.shape.dims(),
+                plan.hidden
+            )));
+        }
+        let cosine = f
+            .arena
+            .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))?;
+        let sine = f
+            .arena
+            .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))?;
+        self.factors(f, batch.positions, cosine, sine)?;
+        let buffers = Buffers::reserve(f.arena, &plan, self.dtype)?;
+        let mut residual = hidden;
+        let mut input = hidden;
+        for (index, layer) in self.layers[..=last].iter().enumerate() {
+            layer.forward(
+                f, batch, cache, index, &buffers, residual, cosine, sine, input,
+            )?;
+            if index == 0 {
+                residual = buffers.residual;
+            }
+            input = buffers.update;
+        }
+        Ok(input)
+    }
+
     /// The model as the executor sees it: one causal-LM block named `backbone`.
     pub fn into_model(self) -> Model {
         Model::new(vec![(

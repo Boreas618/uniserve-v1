@@ -11,10 +11,9 @@
 # and its filter, stride, padding and dilation are trivial along the other two.
 # The filter is `[k, c/groups, t, 1, 1]` and the output `[n, k, ol]`.
 #
-# The key is the operator crate's, all three axes printed as the geometry carries
-# them: `input_bf16_weight_bf16_output_bf16_geometry_kernel_3x1x1_stride_1x1x1_`
-# `padding_1x1x1_dilation_1x1x1_groups_1_bias_true_tf32_false_rank_1_`
-# `transposed_false`.
+# The key is the operator crate's and names the element types alone — the geometry, the bias, the
+# TF32 permission and the direction travel in the call structure: `input_bf16_weight_bf16_`
+# `output_bf16`.
 #
 # `tf32` is a permission, not a setting: it says whether the engine *may* use TF32
 # tensor cores for an FP32 convolution, which is what design 9 asks the video VAE
@@ -54,6 +53,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 [kernel.descriptors]
-dimensions = { input = ["bf16", "f32"], weight = ["bf16", "f32"], output = ["bf16", "f32"], geometry_kernel = ["10x1x1", "11x1x1", "1x1x1", "1x3x1", "3x1x1", "4x1x1", "7x1x1", "8x1x1"], stride = ["1x1x1", "2x1x1", "4x1x1", "5x1x1"], padding = ["0x0x0", "0x1x1", "15x1x1", "1x1x1", "25x1x1", "27x1x1", "2x1x1", "3x1x1", "5x1x1", "9x1x1"], dilation = ["1x1x1", "3x1x1", "5x1x1", "9x1x1"], groups = ["1"], bias = ["true", "false"], tf32 = ["true", "false"], rank = ["1"], transposed = ["false"] }
+dimensions = { input = ["bf16", "f32"], weight = ["bf16", "f32"], output = ["bf16", "f32"] }
 
 [parameters]
