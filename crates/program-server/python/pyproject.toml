@@ -37,14 +37,9 @@ dependencies = [
     "flash-attn-4[cu13]==4.0.0b30",
 ]
 
-[build-system]
-requires = ["uv_build>=0.12,<0.13"]
-build-backend = "uv_build"
-
-[tool.uv.build-backend]
-module-name = "uniserve_program_server"
-module-root = "src"
-
 [tool.uv]
-# The compile drivers are the package's only use; nothing here runs a server.
-package = true
+# An environment, not a distribution: it holds the compilers and the packages
+# a kernel program imports, and nothing imports it. The compile drivers are the
+# kernel packages' own `src/build.py` (design 5.2: a revision fixes the rule
+# that picks its kernel), which this environment's interpreter runs.
+package = false
