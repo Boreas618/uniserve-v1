@@ -251,8 +251,9 @@ impl VideoPostprocessor {
     ///
     /// `clip` is the clip's decoded raster `[3, frames, rows, columns]` in [`Self::dtype`]; `previous`
     /// is the predecessor's tail `[3, overlap, rows, columns]` and is `None` for the timeline's first
-    /// clip, which has nothing to fade against; `blended` is a scratch raster the same shape as `clip`,
-    /// used only when there is a predecessor; `out` is `[splice.frames(), rows, columns, 3]` bytes.
+    /// clip, which has nothing to fade against; `out` is `[splice.frames(), rows, columns, 3]` bytes.
+    /// The blend's scratch is reserved here, in the arena the executor sized from the plan: the model is
+    /// the one reserver, and a buffer the runner placed would be a second mechanism.
     ///
     /// The clip's tail is not written here unless `splice.last`: it is the state the caller hands the
     /// next clip, and passing it on is the runner's.
@@ -262,7 +263,6 @@ impl VideoPostprocessor {
         previous: Option<TensorView>,
         clip: TensorView,
         splice: &Splice,
-        blended: TensorView,
         out: TensorView,
     ) -> Result<()> {
         let raster = Raster::of(clip)?;
@@ -270,7 +270,7 @@ impl VideoPostprocessor {
         let source = match previous {
             Some(previous) => {
                 raster.check_previous(previous, self.dtype)?;
-                raster.check_scratch(blended, self.dtype)?;
+                let blended = f.arena().tensor(clip.dtype, clip.shape)?;
                 self.fade.forward(f, Some(previous), clip, blended)?;
                 blended
             }
@@ -393,24 +393,6 @@ impl Raster {
             return Err(Error::config(format!(
                 "the predecessor's tail is {} and the clip is {dtype}",
                 previous.dtype
-            )));
-        }
-        Ok(())
-    }
-
-    /// The blend's scratch, which must be a raster the clip's own shape and type.
-    fn check_scratch(&self, blended: TensorView, dtype: DType) -> Result<()> {
-        let shape = [
-            u64::from(Rgb::CHANNELS),
-            u64::from(CLIP_OUTPUT_FRAMES),
-            u64::from(self.height),
-            u64::from(self.width),
-        ];
-        if blended.shape.dims() != shape || blended.dtype != dtype {
-            return Err(Error::config(format!(
-                "the blend's scratch is {shape:?} of {dtype} and the view is {:?} of {}",
-                blended.shape.dims(),
-                blended.dtype
             )));
         }
         Ok(())
