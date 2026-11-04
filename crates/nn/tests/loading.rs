@@ -563,6 +563,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 &["up", "gate"],
                 2,
                 Nvfp4Names::vllm(),
+                nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
@@ -606,6 +607,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 &["up", "gate"],
                 2,
                 Nvfp4Names::vllm(),
+                nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
@@ -668,6 +670,7 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
             &["up"],
             2,
             Nvfp4Names::vllm(),
+            nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
             false,
         )
@@ -1026,6 +1029,7 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
             &["up", "gate"],
             2,
             Nvfp4Names::vllm(),
+            nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
             false,
         )
@@ -1141,6 +1145,7 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
             &["up"],
             2,
             Nvfp4Names::diffusers(),
+            nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
             false,
         )
@@ -1160,6 +1165,7 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
                 &["up"],
                 2,
                 Nvfp4Names::vllm(),
+                nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
@@ -1266,4 +1272,140 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
     assert_eq!(reading.read, ["transformer/weight"]);
     assert_eq!(reading.unread, ["vae/weight"]);
     assert!(!reading.is_complete());
+}
+
+/// A shuffled stack's values are the shard's rows permuted inside 32-row blocks — the reference's
+/// `srcToDstBlk32RowMap` in closed form — applied once at load, with the published layout naming the
+/// arrangement so a product cannot read one for the other.
+#[test]
+fn a_shuffled_stack_permutes_its_values_rows_at_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    // One expert, 32 rows by 32 columns: 16 packed bytes a row, two block scales a row.
+    let expert = |prefix: &str| {
+        let mut values = Vec::new();
+        for row in 0..32u8 {
+            values.extend(std::iter::repeat_n(row, 16));
+        }
+        vec![
+            (
+                format!("{prefix}.weight_packed"),
+                DType::U8,
+                vec![32, 16],
+                values,
+            ),
+            (
+                format!("{prefix}.weight_scale"),
+                DType::F8E4M3,
+                vec![32, 2],
+                vec![0x38; 64],
+            ),
+            (
+                format!("{prefix}.weight_tensor_scale"),
+                DType::F32,
+                vec![1],
+                0.5f32.to_le_bytes().to_vec(),
+            ),
+        ]
+    };
+    let mut tensors = expert("experts.0.up_proj");
+    tensors.extend(expert("experts.0.gate_proj"));
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(directory, "model.safetensors", &views);
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up_gate",
+                "experts",
+                &["up", "gate"],
+                1,
+                Nvfp4Names::diffusers(),
+                nn::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
+                ops::fp4::ScaleLayout::Linear,
+                false,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.published[0].0.layout,
+        WeightLayout::NVFP4_VALUES_SHUFFLED,
+        "the published values name the arrangement they are in"
+    );
+
+    // Destination row `d` holds source row `(d % 8) * 4 + d / 8`: the interleave of four eight-row
+    // groups that makes a thread block's tile contiguous.
+    let published = &store.published[0].1;
+    for destination in 0..32usize {
+        let source = (destination % 8) * 4 + destination / 8;
+        assert_eq!(
+            published[destination * 16],
+            source as u8,
+            "row {destination} should hold source row {source}"
+        );
+    }
+
+    // A row count that is not a whole number of 32-row blocks has no such arrangement, and the
+    // refusal names both numbers.
+    let short = tempfile::tempdir().unwrap();
+    let short_directory = short.path();
+    let rows = 30u8;
+    let mut tensors = Vec::new();
+    for projection in ["up_proj", "gate_proj"] {
+        let mut values = Vec::new();
+        for row in 0..rows {
+            values.extend(std::iter::repeat_n(row, 16));
+        }
+        tensors.push((
+            format!("experts.0.{projection}.weight_packed"),
+            DType::U8,
+            vec![u64::from(rows), 16],
+            values,
+        ));
+        tensors.push((
+            format!("experts.0.{projection}.weight_scale"),
+            DType::F8E4M3,
+            vec![u64::from(rows), 2],
+            vec![0x38; usize::from(rows) * 2],
+        ));
+        tensors.push((
+            format!("experts.0.{projection}.weight_tensor_scale"),
+            DType::F32,
+            vec![1],
+            0.5f32.to_le_bytes().to_vec(),
+        ));
+    }
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(short_directory, "model.safetensors", &views);
+    let short_checkpoint = Checkpoint::open(short_directory).unwrap();
+    let error = {
+        let mut store = Recording::default();
+        let mut loader = WeightLoader::new(&short_checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up_gate",
+                "experts",
+                &["up", "gate"],
+                1,
+                Nvfp4Names::diffusers(),
+                nn::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
+                ops::fp4::ScaleLayout::Linear,
+                false,
+            )
+            .expect_err("a 30-row matrix has no 32-row arrangement")
+    };
+    assert!(format!("{error}").contains("32-row blocks"), "{error}");
 }

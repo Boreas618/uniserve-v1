@@ -476,6 +476,9 @@ fn expert_block(
                 &["up", "gate"],
                 vocabulary,
                 Nvfp4Names::vllm(),
+                nn::weights::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
                 layout,
                 false,
             )
@@ -487,6 +490,9 @@ fn expert_block(
                 &["down"],
                 vocabulary,
                 Nvfp4Names::vllm(),
+                nn::weights::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
                 layout,
                 false,
             )
