@@ -1415,6 +1415,72 @@ impl AudioEncoder {
     }
 }
 
+/// Every buffer **one tile's** video encode takes from `Forward::arena()`, in reservation order.
+///
+/// `VideoEncoder::encode` reads one tile, so this is one call's list: the padded pixels, the input
+/// convolution's output, then per level the alternating pair its blocks swap (one buffer for the level's
+/// width, plus the block's own working buffer and the shortcut's projection), the pad and the strided
+/// output where the level downsamples, and the moments convolution's output.
+///
+/// **A caller that encodes several tiles must hoist these buffers out of its loop.** The arena never
+/// rewinds - its only rewind is the executor's per-forward `reset` - so a driver that calls `encode` once
+/// per tile multiplies this whole list by the tile count. The level-0 buffers are the pixels at the
+/// encoder's first width, so at a 256-by-64-pixel tile they are ~143 MB each: four of them is most of a
+/// gigabyte for one tile, and a tiled reference clip is tens of tiles. This function states one tile so
+/// the multiplication is visible rather than hidden inside a driver.
+pub fn video_encoder_tile_arena(
+    config: &VideoVaeConfig,
+    raster: Extent,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let stack = Stack::of(config)?;
+    let extents = stack.extents(raster);
+    let mut plan = Vec::new();
+    let mut push = |name: String, elements: u64| {
+        plan.push(crate::decoding::Buffer {
+            name,
+            element: "f32",
+            elements,
+        });
+    };
+    let pixels = |extent: &Extent| {
+        u64::from(extent.frames) * u64::from(extent.height) * u64::from(extent.width)
+    };
+    push(
+        "padded".to_owned(),
+        u64::from(stack.input_channels)
+            * u64::from(raster.frames + 2)
+            * u64::from(raster.height + 2)
+            * u64::from(raster.width + 2),
+    );
+    for (index, level) in extents.iter().take(extents.len() - 1).enumerate() {
+        let width = u64::from(stack.widths[index]);
+        push(format!("level{index}.stream"), width * pixels(level));
+        for block in 0..stack.blocks {
+            push(format!("level{index}.block{block}"), width * pixels(level));
+        }
+        // The first block of a level takes the previous level's width, so it is the one that projects
+        // its input; the rest add to their own width and need no projection.
+        push(format!("level{index}.projected"), width * pixels(level));
+        let next = &extents[index + 1];
+        if next.frames < level.frames || next.height < level.height || next.width < level.width {
+            push(
+                format!("level{index}.pad"),
+                width
+                    * u64::from(level.frames + 2)
+                    * u64::from(level.height + 1)
+                    * u64::from(level.width + 1),
+            );
+            push(format!("level{index}.strided"), width * pixels(next));
+        }
+    }
+    let latent = extents.last().copied().unwrap_or(raster);
+    push(
+        "moments".to_owned(),
+        2 * u64::from(stack.latent_channels) * pixels(&latent),
+    );
+    Ok(plan)
+}
+
 /// Every buffer one audio encode takes from `Forward::arena()`, in reservation order.
 ///
 /// The encoder's `encode` reserves the input convolution's output, then per stage the two buffers its
@@ -1715,6 +1781,43 @@ impl GeGlu {
 mod tests {
     use super::*;
     use crate::video_vae::tests::video_config;
+
+    #[test]
+    fn the_video_encoders_tile_plan_is_one_tile_and_says_so() {
+        let config = video_config();
+        let stack = Stack::of(&config).expect("the stack");
+        let raster = Extent {
+            frames: 25,
+            height: 64,
+            width: 256,
+        };
+        let plan = video_encoder_tile_arena(&config, raster).expect("the plan");
+        let levels = stack.widths.len();
+        let downsamplers = stack
+            .temporal_strides
+            .iter()
+            .zip(stack.spatial_strides.iter())
+            .filter(|(temporal, spatial)| *temporal * *spatial > 1)
+            .count();
+        // Two before the levels, two plus the level's blocks and its projection inside them, and the
+        // moments of the latent raster.
+        assert_eq!(
+            plan.len(),
+            2 + downsamplers * 2 + levels * (2 + stack.blocks as usize) + 1
+        );
+        // Level 0 runs at the tile's pixels and the encoder's first width, and it is the entry a tiled
+        // driver multiplies by its tile count.
+        let stream = plan
+            .iter()
+            .find(|buffer| buffer.name == "level0.stream")
+            .expect("level 0's stream");
+        assert_eq!(
+            stream.elements,
+            u64::from(stack.widths[0]) * 25 * 64 * 256,
+            "level 0 is the tile's pixels at the first width"
+        );
+        assert!(stream.elements > 100 * 1024 * 1024);
+    }
 
     #[test]
     fn the_audio_encoders_arena_names_every_buffer_it_reserves() {
