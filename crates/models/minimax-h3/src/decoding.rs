@@ -256,6 +256,11 @@ pub fn video_arena(
             elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
+            name: "blended",
+            element: "f16",
+            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
+        },
+        Buffer {
             name: "rgb",
             element: "u8",
             elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
