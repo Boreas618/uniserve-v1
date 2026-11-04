@@ -1,0 +1,19 @@
+[package]
+name = "qwen3-moe"
+description = "Qwen3MoeForCausalLM: configuration, partition and the causal-LM model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The numerical model composes `nn` layers; `nn` re-exports the `ops` kernel ABI. The loader reads
+# checkpoint metadata at this boundary, so the model's own types stay plain and typed.
+[dependencies]
+nn = { path = "../../nn" }
+ops = { path = "../../ops" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
