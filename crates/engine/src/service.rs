@@ -2632,7 +2632,12 @@ fn policy_usage(
 fn precopied(generation: u64) -> proto::process::Report {
     proto::process::Report {
         kind: Some(proto::process::report::Kind::Precopied(
-            proto::process::Precopied { generation },
+            proto::process::Precopied {
+                generation,
+                // This path shadows nothing: a worker-process executor refuses a shadow batch,
+                // and its update's evidence is the workers' own.
+                uncompared: Vec::new(),
+            },
         )),
     }
 }

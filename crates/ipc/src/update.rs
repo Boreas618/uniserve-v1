@@ -108,6 +108,12 @@ pub enum ProgramStatus {
     Precopied {
         /// The generation being installed.
         generation: u64,
+        /// The operators this update could not compare, each with its reason
+        /// (7.3 step 2). Empty states every replaced operator was compared; a
+        /// pass with nothing to compile against lists every operator that has
+        /// no shadow evidence.
+        #[serde(default)]
+        uncompared: Vec<String>,
     },
     /// Precopy failed: the new generation was discarded and serving goes on.
     PrecopyFailed {

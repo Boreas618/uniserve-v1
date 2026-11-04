@@ -549,6 +549,16 @@ pub(crate) struct MainProcess {
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
     executors: Vec<Arc<Executor>>,
     memory: Option<Memory>,
+    /// The rank's Storage Server client, kept for the two calls of §2.5 that reach its ledger and no
+    /// other: a park gives the cache's segments back, and a wake maps them again. Every caller takes
+    /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
+    /// hold one beside the control thread without a lock.
+    storage: Option<Arc<Retained>>,
+    /// Whether this process's segments are given back to the Storage Server: a park sets it, a wake
+    /// clears it. It exists so a process that never parked sends no wake at all - a wake for a pool
+    /// that never slept is a no-op, but its round trip would still wait behind a queued capture on
+    /// the first `Serve`, and the first token must not pay for a mechanism it did not use.
+    slept: bool,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
     modules: Lane<Install>,
@@ -719,6 +729,9 @@ impl MainProcess {
         let storage = claim(&mut process, launch, &epoch.host, host_kv_cache)?;
         let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
             .context("connecting to the Storage Server")?;
+        // The client outlives every world of the epoch, and §2.5's park and wake reach its ledger
+        // through the memory owners: kept here so the park does not have to hold the connect.
+        let retained = Arc::clone(&client);
         // A weight's region is one device's address, so the store maps on the device this rank's
         // model is loaded for; the client is shared, the mapping is not.
         let weight_device = *plan
@@ -785,6 +798,10 @@ impl MainProcess {
             let shadow = executor.set_shadow()?;
             device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
+            // §2.5's two commands reach the Storage Server's ledger from the device thread, which
+            // owns the stream a wake resets its units on, so the client is bound beside the cache
+            // handle rather than kept only here.
+            executor.bind_storage(Arc::clone(&client));
             executors.push(Arc::new(executor));
             generations.push(generation);
         }
@@ -800,6 +817,8 @@ impl MainProcess {
             schedulers,
             executors,
             memory: Some(memory),
+            storage: Some(retained),
+            slept: false,
             blocking,
             modules,
             update,
@@ -867,6 +886,17 @@ impl MainProcess {
     /// sends the epoch's programs.
     fn park_standby(&mut self) -> Result<()> {
         self.serving = false;
+        // The same release the `Park` command makes: this process serves nothing from here until a
+        // promotion, and a standby holding the cache's segments while a successor loads is the
+        // memory the handover needs. A pool that is not segmented has nothing to give back, and the
+        // line says so.
+        if let Err(error) = self.give_back_segments() {
+            tracing::warn!(
+                %error,
+                "this standby could not give the cache's segments back; it parks with them still \
+                 mapped"
+            );
+        }
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Parked(
                 proto::process::Parked {
@@ -874,6 +904,73 @@ impl MainProcess {
                 },
             )),
         });
+        Ok(())
+    }
+
+    /// §2.5: gives the parked process's cache segments back to the Storage Server, and states what
+    /// went back and what stayed.
+    ///
+    /// The segments are the only pool a sleep releases: the graph pools and the scratch region are
+    /// reservations whose captures keep their addresses (the segments' offsets are fixed inside one
+    /// reserved range, so a wake is a remap and never a recapture), and the resident owners map
+    /// through the same ledger for the process's life. A pool that is not segmented has nothing to
+    /// give back, and the line says that rather than reading as a release that happened.
+    fn give_back_segments(&mut self) -> Result<()> {
+        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        // One command per device, and the control thread waits for each: the release is what the
+        // successor's memory depends on, so a park that has not given its segments back is not
+        // reported `Parked` yet. The device queue serialises commands, so this runs between
+        // batches.
+        for executor in &self.executors {
+            let device = executor.device();
+            let submission = executor
+                .sleep()
+                .with_context(|| format!("queueing device {device}'s sleep"))?;
+            device_command(&self.watchdog, device, "the park's sleep", submission)?;
+        }
+        self.slept = true;
+        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        if let (Some(before), Some(after)) = (kept_before, kept) {
+            tracing::info!(
+                given_back = before.saturating_sub(after),
+                kept = after,
+                pool = "the cache's segments",
+                devices = self.executors.len(),
+                "the park gave back the segments it no longer serves, and kept the pools it serves \
+                 with"
+            );
+        }
+        Ok(())
+    }
+
+    /// §2.5: takes the cache's segments back on every device, `limit` at a time, before admission
+    /// opens. A wake is a remap, not a repair: the generation's captures keep their addresses, so no
+    /// warmup follows it, and a wake that fails leaves admission closed and fails its caller by name.
+    fn take_back_segments(&mut self) -> Result<()> {
+        if !self.slept {
+            return Ok(());
+        }
+        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        for executor in &self.executors {
+            let device = executor.device();
+            // No limit: this process takes back everything the Storage Server still holds for its
+            // rank. A limit is a bound on a smaller wake, not a demand that everything return.
+            let submission = executor
+                .wake(None)
+                .with_context(|| format!("queueing device {device}'s wake"))?;
+            device_command(&self.watchdog, device, "the wake", submission)?;
+        }
+        self.slept = false;
+        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        if let (Some(before), Some(after)) = (kept_before, kept) {
+            tracing::info!(
+                taken_back = after.saturating_sub(before),
+                kept_after = after,
+                limit = "every segment the storage holds",
+                devices = self.executors.len(),
+                "the wake took its segments back before admission opened"
+            );
+        }
         Ok(())
     }
 
@@ -1239,6 +1336,18 @@ impl MainProcess {
                 // after `Promoted`.
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
+                    // §2.5: the schedulers are parked and nothing is in flight, so the cache's
+                    // segments can go back to the Storage Server - a parked process that keeps them
+                    // holds a successor's memory. A park that cannot give them back is still a park:
+                    // the process serves nothing, and failing the epoch over a release would end a
+                    // process that a promotion can still use. It says so instead.
+                    if let Err(error) = self.give_back_segments() {
+                        tracing::warn!(
+                            %error,
+                            "the park could not give the cache's segments back; it is parked with \
+                             them still mapped"
+                        );
+                    }
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Parked(
                             proto::process::Parked {
@@ -1252,6 +1361,10 @@ impl MainProcess {
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
+                    // §2.5: the promotion runs on the addresses the predecessor's segments held, so
+                    // they are mapped again before anything is admitted, and a wake that fails fails
+                    // the promotion by name.
+                    self.take_back_segments()?;
                     self.promoted = true;
                     // A promoted standby admits on the same rule as any other process: once the
                     // generation it will serve has been warmed (§4.5).
@@ -1843,6 +1956,24 @@ impl MainProcess {
             .report("this node's warmup", generation, bound, now);
     }
 
+    /// The operators this node's devices could not compare, each with its reason, in device order
+    /// and without repeats (7.3 step 2).
+    ///
+    /// It is carried by the precopy's answer so an update that has no evidence for an operator says
+    /// so in the record the daemon reads, not only in this process's log: empty is the statement
+    /// that every operator the update replaced was compared.
+    fn uncompared(&self) -> Vec<String> {
+        let mut entries: Vec<String> = Vec::new();
+        for executor in &self.executors {
+            for entry in executor.uncompared() {
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries
+    }
+
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
     /// as it is, and the next serve pass looks again.
@@ -2064,7 +2195,13 @@ impl MainProcess {
                 // serving generation and a revert has nothing to undo.
                 self.prepared = std::mem::take(&mut precopy.next);
                 self.update.precopied(generation)?;
-                self.answer(precopy.reply, ProgramStatus::Precopied { generation });
+                self.answer(
+                    precopy.reply,
+                    ProgramStatus::Precopied {
+                        generation,
+                        uncompared: self.uncompared(),
+                    },
+                );
                 Ok(())
             }
             PrecopyStage::Done => Ok(()),
@@ -2387,6 +2524,11 @@ impl MainProcess {
             self.pending_serve = true;
             return Ok(());
         }
+        // §2.5: a process that parked gave its segments back, so nothing may be admitted until they
+        // are mapped again - and a wake that fails fails the resume by name rather than serving
+        // unmapped pages.
+        self.take_back_segments()
+            .with_context(|| format!("waking epoch {} before it admits", serve.epoch))?;
         // A `Serve` that arrives while the warmup still has to capture this generation's buckets is
         // owed rather than refused: admission opens when the last submission finishes, the same way
         // it does at a switchover (§4.5).
@@ -3350,8 +3492,12 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
     let kind = match status {
-        ProgramStatus::Precopied { generation } => Kind::Precopied(proto::process::Precopied {
+        ProgramStatus::Precopied {
+            generation,
+            uncompared,
+        } => Kind::Precopied(proto::process::Precopied {
             generation: *generation,
+            uncompared: uncompared.clone(),
         }),
         ProgramStatus::PrecopyFailed { failure, .. } => {
             Kind::PrecopyFailed(proto::process::PrecopyFailed {
