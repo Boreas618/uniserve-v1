@@ -99,9 +99,10 @@ impl Table {
         let mut ids = Vec::with_capacity(rows as usize * pages as usize);
         for row in 0..rows {
             for page in 0..pages {
-                ids.push(i32::try_from(row * pages + page).map_err(|_| {
-                    Error::Invalid("a scratch page id does not fit i32".into())
-                })?);
+                ids.push(
+                    i32::try_from(row * pages + page)
+                        .map_err(|_| Error::Invalid("a scratch page id does not fit i32".into()))?,
+                );
             }
         }
         let bytes = ids.len() * 4;
@@ -110,15 +111,9 @@ impl Table {
         // read; the copy is stream-ordered before the first forward that reads the table.
         unsafe {
             let target = host.as_mut_slice();
-            let source =
-                std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4);
+            let source = std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4);
             target.copy_from_slice(source);
-            platform::memcpy_async(
-                table.buffer.address(),
-                host.address(),
-                bytes,
-                stream,
-            )?;
+            platform::memcpy_async(table.buffer.address(), host.address(), bytes, stream)?;
         }
         Ok(table)
     }
@@ -143,7 +138,11 @@ impl ResidentCache {
     ///
     /// `rows` is the bucket's row count, padding included: every captured graph addresses a table
     /// of exactly that height, so the gather column is allocated once, here, and never grows.
-    pub fn new(cache: Arc<Mutex<PrefixCache>>, device: platform::DeviceId, rows: u32) -> Result<Self> {
+    pub fn new(
+        cache: Arc<Mutex<PrefixCache>>,
+        device: platform::DeviceId,
+        rows: u32,
+    ) -> Result<Self> {
         let groups = {
             let cache = cache
                 .lock()
@@ -185,11 +184,8 @@ impl ResidentCache {
         &self,
         group: usize,
         slots: &[i32],
-        scratch: &Option<Scratch>,
+        scratch: &Scratch,
     ) -> (TensorView, Vec<KvPlanes>) {
-        let scratch = scratch
-            .as_ref()
-            .expect("the scratch set was just mapped or mapped already");
         let layers = self
             .cache
             .lock()
@@ -275,9 +271,8 @@ impl ResidentCache {
                 }
                 continue;
             }
-            let slot = u32::try_from(*slot).map_err(|_| {
-                Error::Invalid(format!("group {group} has no row slot {slot}"))
-            })?;
+            let slot = u32::try_from(*slot)
+                .map_err(|_| Error::Invalid(format!("group {group} has no row slot {slot}")))?;
             if slot >= pool_rows {
                 return Err(Error::Invalid(format!(
                     "group {group} has {} request slots and a row asks for {slot}",
@@ -285,9 +280,7 @@ impl ResidentCache {
                 )));
             }
             let source = pooled.address()
-                + (group as u64 * u64::from(pool_rows) + u64::from(slot))
-                    * u64::from(width)
-                    * 4;
+                + (group as u64 * u64::from(pool_rows) + u64::from(slot)) * u64::from(width) * 4;
             // SAFETY: both ranges are `width` i32 of live device storage and the destination row
             // lies inside this provider's column.
             unsafe {
@@ -384,12 +377,7 @@ impl KvProvider for ResidentCache {
         self.dtype
     }
 
-    fn block_table(
-        &self,
-        group: usize,
-        slots: &[i32],
-        stream: &Stream,
-    ) -> Result<TensorView> {
+    fn block_table(&self, group: usize, slots: &[i32], stream: &Stream) -> Result<TensorView> {
         self.gather(group, slots, stream)
     }
 
