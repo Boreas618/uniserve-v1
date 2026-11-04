@@ -808,7 +808,9 @@ impl MainProcess {
             // A precopy in flight advances one stage per pass, never waiting on
             // its builds or its devices (§7.3 step 2).
             self.advance_precopy()?;
-            self.advance_warmup()?;
+            if let Some(failure) = self.advance_warmup()? {
+                return Ok(Some(failure));
+            }
 
             running = self.read_executors();
             if let Some(failure) = self.watch(&running)? {
@@ -1360,7 +1362,7 @@ impl MainProcess {
     /// it is where a capture that cannot be made on this device surfaces - after the daemon was told
     /// the cut-over happened, which is why the failure goes through the update's decision table
     /// rather than through the switchover's answer.
-    fn advance_warmup(&mut self) -> Result<()> {
+    fn advance_warmup(&mut self) -> Result<Option<UpdateFailure>> {
         let mut pending = Vec::with_capacity(self.warming.len());
         for (device, submission, generation) in std::mem::take(&mut self.warming) {
             match submission.outcome() {
@@ -1381,13 +1383,15 @@ impl MainProcess {
                         ),
                         batch: None,
                     };
-                    self.failure(failure)?;
-                    return Ok(());
+                    // The table decides, as it does for every other failure: on probation this
+                    // reverts the generation, and an update the daemon already committed leaves a
+                    // device that cannot run it, which ends the epoch rather than serving on.
+                    return self.failure(failure);
                 }
             }
         }
         self.warming = pending;
-        Ok(())
+        Ok(None)
     }
 
 
