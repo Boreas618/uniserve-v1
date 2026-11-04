@@ -1,0 +1,36 @@
+# The bias_add operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The two residual flags are part of the compilation, not of the call: a program
+# that adds a residual reads four operands and rounds two or three times, one that
+# does not reads two and rounds once. The key is the one `Descriptor`'s `Display`
+# prints, e.g. `dtype_bf16_channels_512_block_1024_residual_true_residual_bias_false_pdl_false`.
+
+op = "bias_add"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/bias_add.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["128", "256", "512", "1024", "2048"], block = ["256", "512", "1024", "2048", "4096"], residual = ["true", "false"], residual_bias = ["true", "false"], pdl = ["true", "false"] }
+
+[parameters]

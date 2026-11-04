@@ -16,6 +16,10 @@
 //!
 //! The activation runs in FP32 and the product rounds to the output type, which is what the eager
 //! expression does (specs/worker.md 9, "SwiGLU").
+//!
+//! A plain, ungated `silu` is here too, because a model applies it on its own as well: H3's timestep
+//! embedding is `Linear → SiLU → Linear` over one buffer, which is not a gated pair and must not be
+//! expressed as one.
 
 use std::fmt;
 
@@ -903,5 +907,155 @@ impl Op for Swiglu {
         // Two bias adds, the sigmoid, its product with the biased gate and the product with the
         // biased value: five roundings in the output type, and no reduction.
         Tolerance::new(0.0, 5.0 * descriptor.dtype.unit_roundoff() as f32)
+    }
+}
+
+/// The envelope of `|x|` a single-input activation's tolerance follows.
+const SILU_VALUE_ENVELOPE: f32 = 8.0;
+
+/// One compilation of `silu`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SiluDescriptor {
+    /// Element type of the input and the output.
+    pub dtype: DType,
+    /// Elements one row holds; the columns the module was compiled for.
+    pub columns: u32,
+    /// Elements one thread block evaluates.
+    pub block: u32,
+    /// Whether the module was compiled for programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl fmt::Display for SiluDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("columns", self.columns)
+            .field("block", self.block)
+            .field("pdl", self.pdl)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `silu`.
+#[derive(Clone, Copy)]
+pub struct SiluArgs {
+    /// `[rows, columns]`, contiguous: the values to activate.
+    pub x: TensorView,
+    /// `[rows, columns]`, contiguous, in the descriptor's element type.
+    pub out: TensorView,
+}
+
+/// The sigmoid linear unit on its own, `out = x / (1 + exp(−x))`.
+///
+/// One formula, so one program — unlike `gelu`, which is compiled per approximation. It is not
+/// [`ActAndMul`] with a flag: that operator reads two halves of a gated projection and multiplies
+/// one by the other, while a caller here has one buffer and one output.
+pub struct Silu;
+
+impl Op for Silu {
+    const NAME: &'static str = "silu";
+
+    type Descriptor = SiluDescriptor;
+    type Args<'a> = SiluArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let columns = u64::from(descriptor.columns);
+        args.x.require_rank(Self::NAME, 2)?;
+        args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
+        if args.x.strides != crate::tensor::Strides::row_major(args.x.shape) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the activation is read contiguous; found strides {}",
+                    args.x.strides
+                ),
+            ));
+        }
+        args.out
+            .require_row(Self::NAME, descriptor.dtype, columns)?;
+        args.out.require_shape(Self::NAME, args.x.shape)?;
+        if args.out.strides != crate::tensor::Strides::row_major(args.x.shape) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the result is written contiguous; found strides {}",
+                    args.out.strides
+                ),
+            ));
+        }
+
+        let elements = args.x.shape.numel();
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.x)
+            .view(args.out)
+            .u64(elements)
+            .u32(descriptor.columns)
+            .flag(descriptor.pdl);
+        kernel.launch(
+            LaunchGrid::covering(elements, u64::from(descriptor.block))?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        SiluArgs {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // One rounding from FP32 into the output type, plus the exponential's error as an absolute
+        // part: over `|x| ≤ 8` the sigmoid's few FP32 ulps, carried through one product by `|x|`,
+        // stay far below the narrowest output type's own half ulp.
+        Tolerance::rounding(1, DType::F32, descriptor.dtype)
+            .with_atol(4.0 * SILU_VALUE_ENVELOPE * f32::EPSILON)
+    }
+}
+
+#[cfg(test)]
+mod silu_tests {
+    use super::*;
+
+    fn descriptor(dtype: DType, pdl: bool) -> SiluDescriptor {
+        SiluDescriptor {
+            dtype,
+            columns: 5376,
+            block: 1024,
+            pdl,
+        }
+    }
+
+    #[test]
+    fn the_key_is_the_shape_and_the_launch_flag_and_nothing_else() {
+        assert_eq!(
+            crate::descriptor::key(&descriptor(DType::BF16, false)),
+            "dtype_bf16_columns_5376_block_1024_pdl_false"
+        );
+        assert_ne!(
+            crate::descriptor::key(&descriptor(DType::BF16, true)),
+            crate::descriptor::key(&descriptor(DType::BF16, false)),
+            "a PDL compilation is another module"
+        );
+    }
+
+    #[test]
+    fn the_absolute_part_covers_the_exponential_and_stays_below_an_output_ulp() {
+        let bound = <Silu as Op>::tolerance(&descriptor(DType::BF16, false));
+        assert!(bound.atol > 0.0, "the exponential needs an absolute part");
+        assert!(
+            bound.atol < DType::BF16.unit_roundoff() as f32,
+            "the envelope must not swallow the output type's own rounding"
+        );
+        assert!(bound.rtol >= DType::BF16.unit_roundoff() as f32);
     }
 }

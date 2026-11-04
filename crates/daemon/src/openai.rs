@@ -12,7 +12,7 @@
 pub mod chat_completions;
 pub(crate) mod error;
 pub mod images;
-mod protocol;
+pub(crate) mod protocol;
 mod systemone;
 pub(crate) mod video_jobs;
 pub mod videos;

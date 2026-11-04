@@ -142,6 +142,57 @@ impl ScaledResidual {
 
         f.operate::<residual::ScaledResidual>(&descriptor, args)
     }
+
+    /// Fold `update` into `hidden` with a scale the caller brings: `[1]` or `[columns]`.
+    ///
+    /// A diffusion solver's step scales the residual stream by one device scalar per
+    /// `(layout, step)` that the runner uploads, so the scale cannot be the layer's retained weight.
+    /// The operator reads one element as a factor for every channel and a whole row as the
+    /// per-channel weights, so both forms are one program and neither moves a key; the width stays
+    /// the layer's, from the weight it was built with (specs/worker.md 9, 求解器).
+    pub fn forward_with_scale(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        update: TensorView,
+        scale: TensorView,
+    ) -> Result<()> {
+        let columns = self.scale.shape().numel();
+        if hidden.shape.rank() != 2 || hidden.shape.last() != columns {
+            return Err(Error::shape(
+                "ScaledResidual::forward_with_scale",
+                format!("{:?} is not [rows, {columns}]", hidden.shape.dims()),
+            ));
+        }
+        if scale.shape.numel() != 1 && scale.shape.numel() != columns {
+            return Err(Error::shape(
+                "ScaledResidual::forward_with_scale",
+                format!(
+                    "{} scale elements for {columns} channels; one element is the broadcast form",
+                    scale.shape.numel()
+                ),
+            ));
+        }
+        let descriptor = residual::ScaledResidualDescriptor {
+            dtype: hidden.dtype,
+            columns: u32::try_from(columns).map_err(|_| {
+                Error::shape(
+                    "ScaledResidual::forward_with_scale",
+                    "a row wider than a descriptor holds".to_owned(),
+                )
+            })?,
+            block: BLOCK,
+            update_bias: self.bias.is_some(),
+        };
+        let args = residual::ScaledResidualArgs {
+            hidden,
+            update,
+            update_bias: self.bias.as_ref().map(Weight::view),
+            scale,
+        };
+
+        f.operate::<residual::ScaledResidual>(&descriptor, args)
+    }
 }
 
 /// `hidden += (update + bias) · scale; out = rms(hidden) · weight`.
@@ -328,5 +379,52 @@ impl ScaledResidualLayerNorm {
         };
 
         f.operate::<LayerNormOp>(&descriptor, args)
+    }
+}
+
+/// The diffusion solver's update: `target ← β · target + α · source`, in place.
+///
+/// The Euler step passes `α = σ_next − σ`, `β = 1`; the probability-flow start passes `β = σ₀`,
+/// `α = 0`. Both coefficients are host values, so a captured graph stays valid, and the two
+/// operands' element types differ on purpose — a BF16 trajectory stepped by an FP32 velocity
+/// (specs/worker.md 9, 求解器; `ops::residual::ScaledAdd`).
+pub struct ScaledAdd;
+
+impl ScaledAdd {
+    /// `target ← β · target + α · source` over `[rows, columns]`, writing `target` in place.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        target: TensorView,
+        source: TensorView,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<()> {
+        if target.shape.rank() != 2 || target.shape != source.shape {
+            return Err(Error::shape(
+                "ScaledAdd",
+                format!("{:?} with {:?}", target.shape.dims(), source.shape.dims()),
+            ));
+        }
+        let descriptor = residual::ScaledAddDescriptor {
+            target: target.dtype,
+            source: source.dtype,
+            columns: u32::try_from(target.shape.last()).map_err(|_| {
+                Error::shape(
+                    "ScaledAdd",
+                    "more columns than a descriptor holds".to_owned(),
+                )
+            })?,
+            block: BLOCK,
+        };
+        f.operate::<residual::ScaledAdd>(
+            &descriptor,
+            residual::ScaledAddArgs {
+                target,
+                source,
+                alpha,
+                beta,
+            },
+        )
     }
 }

@@ -1,0 +1,36 @@
+# The page_conversion operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program decodes one (token, layer) of the imported span, up to `head_dim`
+# heads of it: the grid carries the span's extent and the source's page size,
+# scale group and page count are runtime words, so one module serves every span
+# of that geometry (specs/worker.md 8, the prefix cache's conversion rows).
+
+op = "page_conversion"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/page_conversion.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `field_key_source_f8e4m3_compute_bf16_head_dim_128_heads_1_layers_32_scaled_true`.
+[kernel.descriptors]
+dimensions = { field = ["key", "value"], source = ["f8e4m3", "bf16"], compute = ["bf16", "f16", "f32"], head_dim = ["128", "64"], heads = ["1", "4"], layers = ["32"], scaled = ["true", "false"] }
+
+[parameters]

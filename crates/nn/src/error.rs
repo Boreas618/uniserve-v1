@@ -61,6 +61,17 @@ pub enum Error {
         problem: String,
     },
 
+    /// A loader's policy does not describe the checkpoint it is asked to read.
+    ///
+    /// A policy (an element type, a quantization) is chosen once for a model; a component whose
+    /// weights are not of that kind would be read as something it is not, which is a wrong answer
+    /// rather than a convenience.
+    #[error("loader policy: {problem}")]
+    Policy {
+        /// What the policy asks for and what the checkpoint holds.
+        problem: String,
+    },
+
     /// A capability of the design that this crate does not implement yet, named precisely.
     #[error("unsupported: {0}")]
     Unsupported(String),
@@ -71,6 +82,13 @@ impl Error {
     pub(crate) fn shape(owner: &'static str, problem: impl Into<String>) -> Self {
         Self::Shape {
             owner,
+            problem: problem.into(),
+        }
+    }
+
+    /// A policy that does not describe the checkpoint.
+    pub(crate) fn policy(problem: impl Into<String>) -> Self {
+        Self::Policy {
             problem: problem.into(),
         }
     }

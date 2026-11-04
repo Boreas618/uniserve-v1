@@ -1,10 +1,14 @@
-# The paged_kv_write operator's triton backend: design 5.2's program package.
+# The kv_write operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program writes one tile of one token's cache row and raises the page's
+# initialization flag, so one module serves every token count. The cache's dtype
+# equals the keys' here; an FP8 page needs a per-page scale the operator's
+# arguments do not carry, so no descriptor declares one yet.
 
-op = "paged_kv_write"
+op = "kv_write"
 backend = "triton"
 
 [toolchain]
@@ -18,15 +22,15 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/paged_kv_write.py", "src/build.py", "src/_compile.py"]
+files = ["src/kv_write.py", "src/build.py", "src/_compile.py"]
 script = "src/build.py"
 
 [kernel]
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `dtype_bf16_kv_bf16_page_64_heads_4_head_dim_128_tile_128_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "fp32"], heads = ["4", "8"], head_dim = ["128"], block_size = ["16", "64", "128"], pages = ["1024", "4096", "16384", "65536"], flags = ["blocks", "none"], layout = ["contiguous"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], kv = ["bf16", "f16", "f32"], page = ["64", "16", "32", "128"], heads = ["4", "8", "1", "2"], head_dim = ["128", "64", "256"], tile = ["128", "256", "512", "1024"], pdl = ["true", "false"] }
 
 [parameters]
-tile = 256

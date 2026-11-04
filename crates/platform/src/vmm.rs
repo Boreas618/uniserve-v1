@@ -977,11 +977,14 @@ impl SegmentedMapping {
         self.grant(offset, bytes, protection)
     }
 
-    /// Unmaps segment `index` and releases this process's reference to its
-    /// storage, at once: the caller has drained every device access to it.
-    /// The storage is freed once no other process maps it and no Storage
-    /// Server holds its descriptor. A segment that is not mapped is left
-    /// as it is.
+    /// Unmaps segment `index` and releases this process's mapped reference to
+    /// its storage; the caller has drained every device access to it. The
+    /// creating handle of a segment this mapping created ([`Self::create`])
+    /// goes to the reclaimer like any other released storage, so the physical
+    /// allocation is freed once the reclaimer has run
+    /// ([`crate::reclaim::flush`] waits for it) and no other process maps it
+    /// and no Storage Server holds its descriptor. A segment that is not
+    /// mapped is left as it is.
     ///
     /// # Errors
     ///

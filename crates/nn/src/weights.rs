@@ -92,6 +92,16 @@ pub enum Quantization {
     NvFp4,
 }
 
+impl Quantization {
+    /// The element type this policy's encoded weights are stored in.
+    pub const fn encoding(self) -> DType {
+        match self {
+            Self::Fp8 | Self::Mxfp8 => DType::F8E4M3,
+            Self::NvFp4 => DType::U8,
+        }
+    }
+}
+
 impl fmt::Display for Quantization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -307,6 +317,26 @@ pub struct QuantizedWeight {
     pub scales: Weight,
     /// The reciprocal of the checkpoint's FP32 tensor scale.
     pub global_scale: f32,
+    /// The layout the block scales are stored in.
+    pub layout: ScaleLayout,
+}
+
+/// A calibrated NVFP4 **stack of experts**, as `gather_gemm_nvfp4` and `route_gemm_nvfp4` read it.
+///
+/// A model's expert block multiplies whole stacks: its weights are `[experts, rows, columns/2]` U8,
+/// its block scales carry one entry per expert, and the tensor scale varies per expert — so the
+/// scalar [`QuantizedWeight::global_scale`] cannot serve it, and a model may not build the table
+/// itself (constructing a weight is the loader's, not a model's). The loader publishes all three
+/// from the checkpoint's per-expert tensors: the encoded values and scales concatenated in the
+/// operator's reading order, and the reciprocals as a `[experts]` f32 weight.
+#[derive(Clone, Copy, Debug)]
+pub struct QuantizedStack {
+    /// `[experts, rows, columns/2]` U8: two E2M1 codes a byte, packed along the contraction.
+    pub values: Weight,
+    /// `[experts, ...]` U8: the block scales in [`Self::layout`], one per sixteen elements.
+    pub scales: Weight,
+    /// `[experts]` f32: the reciprocal of each expert's checkpoint tensor scale.
+    pub global_scale: Weight,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
 }
@@ -542,20 +572,58 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
-    /// Borrow this loader for another checkpoint: the same store, the same conversion, a
-    /// different shard set.
+    /// Borrow this loader for another checkpoint: the same store, the same element-type and
+    /// quantization policy, a different shard set.
     ///
-    /// A pipeline's components each keep their own index in their own directory (`transformer/`,
-    /// `vae/`, `text_encoder/`), so a model crate opens one [`Checkpoint`] per component and reads
-    /// each through one loader. Retained storage stays the loader's, so a weight converted once for
+    /// A pipeline root holds one component per subdirectory (`transformer/`, `vae/`,
+    /// `text_encoder/`, …), each with its own index and its own file identities, so a model crate
+    /// opens the root once and reads every component through one store: a weight converted once for
     /// one component is reused for another and never converted twice (specs/worker.md 8).
-    pub fn for_checkpoint<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> WeightLoader<'b> {
-        WeightLoader {
+    ///
+    /// The policy is the loader's, not the component's, so a component that its policy does not
+    /// describe is refused here: an FP8-policy loader over a BF16 component, or a float policy over
+    /// a component whose weights are an FP8 or NVFP4 encoding, would read weights as something they
+    /// are not, which is a wrong answer rather than a convenience. A model that needs two policies
+    /// builds two loaders over the same store.
+    pub fn reborrow<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
+        self.check_policy(checkpoint)?;
+        Ok(WeightLoader {
             checkpoint,
             store: self.store,
             dtype: self.dtype,
             quantization: self.quantization,
+        })
+    }
+
+    /// Whether this loader's policy describes `checkpoint`'s weights.
+    fn check_policy(&self, checkpoint: &Checkpoint) -> Result<()> {
+        let held = checkpoint.dtypes();
+        let listed = held
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(quantization) = self.quantization {
+            let encoding = quantization.encoding();
+            if !held.contains(&encoding) {
+                return Err(Error::policy(format!(
+                    "a {quantization} policy encodes weights as {encoding}, and this checkpoint \
+                     holds {listed}"
+                )));
+            }
         }
+        if let Some(dtype) = self.dtype {
+            for encoded in [DType::F8E4M3, DType::F4E2M1] {
+                if held.contains(&encoded) {
+                    return Err(Error::policy(format!(
+                        "this checkpoint holds {encoded} encoded weights, which a {dtype} element \
+                         type does not describe; the quantization is the loader's policy, not its \
+                         element type"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load a calibrated NVFP4 matrix: its packed E2M1 values, its block scales and its tensor
@@ -631,6 +699,235 @@ impl<'a> WeightLoader<'a> {
             scales,
             global_scale,
             layout,
+        })
+    }
+
+    /// Load the encoded fields of a whole expert stack: `experts` experts, each contributing
+    /// `projections.len()` projections in the order the operator reads them.
+    ///
+    /// The checkpoint stores each expert's projection as its own tensor, so a stack is a
+    /// concatenation: expert-major, and within an expert the projections in `projections`' order
+    /// (the gated product reads up first, gate second). The three fields answer the three the
+    /// operators take — packed values, block scales, and one reciprocal per expert — and all three
+    /// are published through retained storage under one key per field, so a second load of the same
+    /// checkpoint costs nothing.
+    ///
+    /// `name` names the stack in keys and errors and must not collide with a tensor's: a computed
+    /// weight needs its own name. A block-scale layout whose per-expert entry is padded, or a
+    /// projection count that would break the swizzle's 128-row tiles, is refused here rather than
+    /// read as a table no program expects.
+    pub fn nvfp4_stack(
+        &mut self,
+        name: &str,
+        prefix: &str,
+        projections: &[&str],
+        experts: u32,
+        layout: ScaleLayout,
+    ) -> Result<QuantizedStack> {
+        if experts == 0 || projections.is_empty() {
+            return Err(Error::weight(
+                name,
+                "a stack has experts and at least one projection".to_owned(),
+            ));
+        }
+        let count = u64::from(experts);
+        let per = projections.len() as u64;
+
+        // Every field of every expert, by the suffix set `nvfp4` consumes.
+        let mut names = Vec::new();
+        let mut rows = None;
+        let mut columns = None;
+        let mut values_bytes = Vec::new();
+        let mut scales_bytes = Vec::new();
+        let mut reciprocals = Vec::with_capacity(experts as usize);
+        let mut scale_shape = None;
+        for expert in 0..count {
+            for projection in projections {
+                let stem = format!("{prefix}.{expert}.{projection}_proj");
+                let (values_name, scales_name) =
+                    (format!("{stem}.weight"), format!("{stem}.weight_scale"));
+                let tensor_name = format!("{stem}.weight_scale_2");
+                names.push(values_name.clone());
+                names.push(scales_name.clone());
+                names.push(tensor_name.clone());
+
+                let values = self.checkpoint.read(&values_name)?;
+                if values.dtype != DType::U8 {
+                    return Err(Error::weight(
+                        &values_name,
+                        format!("packed E2M1 values are U8 bytes, not {}", values.dtype),
+                    ));
+                }
+                let (rows_here, columns_here) = match values.shape.dims() {
+                    [rows, packed] => (*rows, packed * 2),
+                    other => {
+                        return Err(Error::weight(
+                            &values_name,
+                            format!("a packed matrix is two axes, not {other:?}"),
+                        ));
+                    }
+                };
+                // The stack's geometry is the first expert's; every other projection must agree,
+                // because one set of views serves them all.
+                let agreed = |seen: &mut Option<u64>, here: u64, what: &str| -> Result<()> {
+                    match *seen {
+                        None => *seen = Some(here),
+                        Some(agreed) if agreed != here => {
+                            return Err(Error::weight(
+                                &values_name,
+                                format!("{here} {what} against the stack's {agreed}"),
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                    Ok(())
+                };
+                agreed(&mut rows, rows_here, "rows")?;
+                agreed(&mut columns, columns_here, "columns")?;
+
+                let scales = self.checkpoint.read(&scales_name)?;
+                if scales.dtype != DType::U8 {
+                    return Err(Error::weight(
+                        &scales_name,
+                        format!("block scales are U8 bytes, not {}", scales.dtype),
+                    ));
+                }
+                let expected = layout.shape(rows_here, columns_here);
+                if scales.shape != expected {
+                    return Err(Error::weight(
+                        &scales_name,
+                        format!(
+                            "the {layout} block scales of a [{rows_here}, {columns_here}] matrix are \
+                             {:?}, not {:?}",
+                            expected.dims(),
+                            scales.shape.dims()
+                        ),
+                    ));
+                }
+
+                let tensor = self.checkpoint.read(&tensor_name)?;
+                if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
+                    return Err(Error::weight(
+                        &tensor_name,
+                        format!(
+                            "a tensor scale is one floating number, not {} {:?}",
+                            tensor.dtype,
+                            tensor.shape.dims()
+                        ),
+                    ));
+                }
+                let scale = to_f32(tensor.dtype, &tensor.bytes, &tensor_name)?[0];
+                if !(scale.is_finite() && scale > 0.0) {
+                    return Err(Error::weight(
+                        &tensor_name,
+                        format!("a tensor scale of {scale} is not a positive number"),
+                    ));
+                }
+                reciprocals.push(1.0 / scale);
+
+                values_bytes.extend_from_slice(&values.bytes);
+                scales_bytes.extend_from_slice(&scales.bytes);
+                scale_shape = Some(expected);
+            }
+        }
+
+        let rows = rows.unwrap_or(0) * per;
+        let columns = columns.unwrap_or(0);
+        let per_expert_scales = layout.shape(rows, columns);
+        let entry = scale_shape.map(|shape: Shape| shape.numel()).unwrap_or(0);
+        if per_expert_scales.numel() != entry * per {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "a {layout} entry for {rows} rows of {columns} elements pads to {} blocks, and \
+                     {per} concatenated entries hold {entry} each",
+                    per_expert_scales.numel() / per.max(1)
+                ),
+            ));
+        }
+
+        let values_shape = Shape::new(&[count, rows, columns / 2]);
+        let scales_shape = Shape::new(&[count, per_expert_scales.dim(0), per_expert_scales.dim(1)]);
+        let scale_bytes: Vec<u8> = reciprocals
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let files = self.identities(&names)?;
+
+        let values = self.publish_computed(
+            WeightKey {
+                files: files.clone(),
+                dtype: DType::U8,
+                layout: WeightLayout::NVFP4_VALUES,
+                region: WeightRegion {
+                    tensors: std::iter::once(format!("{name}__nvfp4_values"))
+                        .chain(names.iter().cloned())
+                        .collect(),
+                    start: 0,
+                    shape: values_shape,
+                    stride: None,
+                },
+            },
+            values_shape,
+            &values_bytes,
+        )?;
+        let scales = self.publish_computed(
+            WeightKey {
+                files: files.clone(),
+                dtype: DType::U8,
+                layout: match layout {
+                    ScaleLayout::Linear => WeightLayout::NVFP4_SCALES_LINEAR,
+                    ScaleLayout::Swizzled128X4 => WeightLayout::NVFP4_SCALES_SWIZZLED,
+                },
+                region: WeightRegion {
+                    tensors: std::iter::once(format!("{name}__nvfp4_scales"))
+                        .chain(names.iter().cloned())
+                        .collect(),
+                    start: 0,
+                    shape: scales_shape,
+                    stride: None,
+                },
+            },
+            scales_shape,
+            &scales_bytes,
+        )?;
+        let global_scale = self.publish_computed(
+            WeightKey {
+                files,
+                dtype: DType::F32,
+                layout: WeightLayout::ROW_MAJOR,
+                region: WeightRegion {
+                    tensors: std::iter::once(format!("{name}__nvfp4_tensor_scales"))
+                        .chain(names.iter().cloned())
+                        .collect(),
+                    start: 0,
+                    shape: Shape::new(&[count]),
+                    stride: None,
+                },
+            },
+            Shape::new(&[count]),
+            &scale_bytes,
+        )?;
+        Ok(QuantizedStack {
+            values,
+            scales,
+            global_scale,
+            layout,
+        })
+    }
+
+    /// Publish bytes this loader computed, under a key it built, and answer the weight.
+    fn publish_computed(&mut self, key: WeightKey, shape: Shape, bytes: &[u8]) -> Result<Weight> {
+        if let Some(backing) = self.store.retained(&key)? {
+            return Ok(Weight {
+                view: backing.view(key.dtype, shape)?,
+                backing,
+            });
+        }
+        let backing = self.store.publish(&key, key.dtype, shape, bytes)?;
+        Ok(Weight {
+            view: backing.view(key.dtype, shape)?,
+            backing,
         })
     }
 
@@ -912,7 +1209,9 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
         | (DType::F16, DType::F32)
         | (DType::F16, DType::BF16)
         | (DType::F32, DType::BF16)
-        | (DType::F32, DType::F16) => {}
+        | (DType::F32, DType::F16)
+        | (DType::F32, DType::I16)
+        | (DType::I16, DType::F32) => {}
         (same, target) if same == target => return Ok(bytes.to_vec()),
         (source, target) => {
             return Err(Error::weight(
@@ -939,6 +1238,8 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
             }
             DType::F16 => half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
             DType::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            // A PCM sample is an integer that F32 holds exactly, so the read is lossless.
+            DType::I16 => f32::from(i16::from_le_bytes([chunk[0], chunk[1]])),
             other => {
                 return Err(Error::weight(
                     tensor,
@@ -947,9 +1248,12 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
             }
         };
         match to {
-            DType::BF16 => converted.extend_from_slice(&(value.to_bits() >> 16).to_le_bytes()),
+            DType::BF16 => {
+                converted.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
+            }
             DType::F16 => converted.extend_from_slice(&f32_to_half(value).to_le_bytes()),
             DType::F32 => converted.extend_from_slice(&value.to_le_bytes()),
+            DType::I16 => converted.extend_from_slice(&f32_to_i16(value).to_le_bytes()),
             other => {
                 return Err(Error::weight(
                     tensor,
@@ -959,6 +1263,22 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
         }
     }
     Ok(converted)
+}
+
+/// The `i16` a sample becomes: nearest, ties to even, saturating at both ends.
+///
+/// A PCM track is a clip, not a wrap: a sample beyond the range stores at the end of it rather
+/// than folding to the opposite sign, and a NaN stores as zero (the saturating cast's answer, and a
+/// NaN in a checkpoint is already corrupt).
+fn f32_to_i16(value: f32) -> i16 {
+    let rounded = value.round_ties_even();
+    if rounded >= f32::from(i16::MAX) {
+        i16::MAX
+    } else if rounded <= f32::from(i16::MIN) {
+        i16::MIN
+    } else {
+        rounded as i16
+    }
 }
 
 /// The `f32` values of `bytes`, which hold `dtype` elements.
@@ -981,6 +1301,21 @@ fn from_f32(dtype: DType, values: &[f32], tensor: &str) -> Result<Vec<u8>> {
     convert(DType::F32, dtype, &bytes, tensor)
 }
 
+/// `value` divided by `2^shift`, rounded to nearest with ties to even.
+fn round_even(value: u32, shift: u32) -> u32 {
+    if shift == 0 {
+        return value;
+    }
+    let quotient = value >> shift;
+    let remainder = value & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    if remainder > half || (remainder == half && quotient & 1 == 1) {
+        quotient + 1
+    } else {
+        quotient
+    }
+}
+
 /// The `f32` value of an IEEE half-precision bit pattern.
 fn half_to_f32(half: u16) -> f32 {
     let sign = u32::from(half & 0x8000) << 16;
@@ -991,14 +1326,13 @@ fn half_to_f32(half: u16) -> f32 {
             if mantissa == 0 {
                 sign
             } else {
-                // A subnormal half is a normal float scaled by 2^-24.
-                let mut exponent = 127 - 15 - 10;
-                let mut mantissa = mantissa;
-                while mantissa & 0x0400 == 0 {
-                    mantissa <<= 1;
-                    exponent -= 1;
-                }
-                sign | ((exponent as u32) << 23) | ((mantissa & 0x03ff) << 13)
+                // A subnormal half is `mantissa · 2^-24`. Normalizing it left until the leading bit
+                // reaches the half's implicit position gives the float's exponent and fraction.
+                let leading = 31 - mantissa.leading_zeros();
+                let shift = 10 - leading;
+                let fraction = (mantissa << shift) & 0x03ff;
+                let exponent = 127 - 15 + 1 - shift as i32;
+                sign | ((exponent as u32) << 23) | (fraction << 13)
             }
         }
         0x1f => sign | 0x7f80_0000 | (mantissa << 13),
@@ -1021,19 +1355,35 @@ fn f32_to_half(value: f32) -> u16 {
     if exponent == 0xff {
         return sign | 0x7c00 | if mantissa == 0 { 0 } else { 0x0200 };
     }
-    // Round to nearest, ties to even, in the half's precision.
     let unbiased = exponent as i32 - 127;
     if unbiased > 15 {
         return sign | 0x7c00;
     }
-    if unbiased < -14 {
-        let subnormal = (mantissa | 0x0080_0000) >> ((-14 - unbiased + 1) as u32);
-        let rounded = (subnormal + 1) >> 1;
-        return sign | rounded as u16;
+    if unbiased >= -14 {
+        // A normal half: drop thirteen mantissa bits, round to nearest with ties to even, and let
+        // the rounding carry into the exponent — a carry out of the largest finite half is the
+        // infinity that nearest-rounding gives.
+        let half_exponent = ((unbiased + 15) as u32) << 10;
+        let total = half_exponent + round_even(mantissa, 13);
+        return if total >= 0x7c00 {
+            sign | 0x7c00
+        } else {
+            sign | total as u16
+        };
     }
-    let half_exponent = ((unbiased + 15) as u16) << 10;
-    let rounded = mantissa + 0x1000;
-    sign | half_exponent | ((rounded >> 13) as u16 & 0x03ff)
+    // A subnormal half is a whole number of `2^-24` units: the significand at the float's own scale
+    // (`1.m · 2^23`) divided by `2^(-unbiased - 1)`, rounded to nearest with ties to even.
+    let significand = mantissa | 0x0080_0000;
+    let shift = (-unbiased - 1) as u32;
+    if shift > 24 {
+        return sign;
+    }
+    let rounded = round_even(significand, shift);
+    if rounded >= 0x0400 {
+        // Rounded up out of the subnormals into the smallest normal.
+        return sign | 0x0400;
+    }
+    sign | rounded as u16
 }
 
 #[cfg(test)]
@@ -1042,14 +1392,53 @@ mod tests {
 
     #[test]
     fn half_round_trips_the_values_a_checkpoint_holds() {
-        for value in [0.0_f32, 1.0, -1.0, 0.5, 0.1, 65_504.0, 1e-5] {
-            let half = f32_to_half(value);
-            let back = half_to_f32(half);
+        // A subnormal half has an absolute precision of 2^-24, not a relative one, so the bound is
+        // half a unit there and relative only from the smallest normal upward.
+        const SMALLEST_NORMAL: f32 = 6.103_515_6e-5;
+        const HALF_UNIT: f32 = 2.980_232_2e-8;
+        for value in [0.0_f32, 1.0, -1.0, 0.5, 0.1, 65_504.0, 1e-5, 1.192_092_9e-7] {
+            let back = half_to_f32(f32_to_half(value));
+            let bound = if value.abs() < SMALLEST_NORMAL {
+                HALF_UNIT
+            } else {
+                value.abs() * 1e-3
+            };
+            assert!((back - value).abs() <= bound, "{value:e} became {back:e}");
+        }
+    }
+
+    #[test]
+    fn a_half_conversion_holds_the_subnormal_range_and_the_specials() {
+        // A quarter of the half's magnitude range is subnormal, and a checkpoint holds RMS weights
+        // and epsilon-like constants there; the encoding is a whole number of 2^-24 units.
+        for (value, units) in [
+            (1e-5_f32, 168_u16),
+            (5.960_464_5e-8, 1),
+            (1.192_092_9e-7, 2),
+            (6.097_555_6e-5, 1023),
+        ] {
+            assert_eq!(f32_to_half(value), units, "{value:e}");
             assert!(
-                (back - value).abs() <= value.abs() * 1e-3,
-                "{value} became {back}"
+                (half_to_f32(units) - value).abs() <= 5.960_464_5e-8,
+                "{value:e}"
             );
         }
+        // Below half a unit of the smallest subnormal the value is zero; past half a unit it is
+        // one, and exactly half a unit ties between 0 and 1, where even wins.
+        assert_eq!(f32_to_half(2.0e-8), 0);
+        assert_eq!(f32_to_half(-2.0e-8), 0x8000);
+        assert_eq!(f32_to_half(2.980_232_2e-8), 0);
+        assert_eq!(f32_to_half(4.5e-8), 1);
+        // A value that rounds up out of the subnormals becomes the smallest normal.
+        assert_eq!(f32_to_half(6.101e-5), 0x0400);
+        // Ties round to even, and the largest finite magnitude's neighbourhood rounds to infinity.
+        assert_eq!(half_to_f32(f32_to_half(65504.0)), 65504.0);
+        assert_eq!(f32_to_half(65_520.0), 0x7c00);
+        assert_eq!(f32_to_half(70_000.0), 0x7c00);
+        assert!(f32_to_half(f32::NAN) & 0x7c00 == 0x7c00);
+        assert!(f32_to_half(f32::NAN) & 0x03ff != 0);
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(half_to_f32(0x8000), -0.0);
     }
 
     #[test]
@@ -1073,5 +1462,63 @@ mod tests {
         assert!(text.contains("bf16"));
         assert!(text.contains("up_gate"));
         assert!(text.contains("up+gate"));
+    }
+
+    /// A PCM sample converts to its nearest integer, ties to even, and clamps at both ends: a clip
+    /// does not wrap, and the two ends are the values an audio codec actually reaches.
+    #[test]
+    fn a_sample_converts_to_the_nearest_sixteen_bit_integer() {
+        let bytes: Vec<u8> = [
+            0.0f32, 0.5, 1.5, 2.5, -0.5, -1.5, 32767.4, 32768.0, -32768.4, -40000.0, 3.0,
+        ]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+        let converted = convert(DType::F32, DType::I16, &bytes, "pcm").unwrap();
+        let samples: Vec<i16> = converted
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(
+            samples,
+            [0, 0, 2, 2, 0, -2, 32767, 32767, -32768, -32768, 3],
+            "nearest with ties to even, saturated at both ends"
+        );
+        // And back: every one of those integers is a float exactly.
+        let back = convert(DType::I16, DType::F32, &converted, "pcm").unwrap();
+        let floats: Vec<f32> = back
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        assert_eq!(
+            floats,
+            [
+                0.0, 0.0, 2.0, 2.0, 0.0, -2.0, 32767.0, 32767.0, -32768.0, -32768.0, 3.0
+            ]
+        );
+    }
+
+    /// Every other pair that names I16 is refused, and the refusal names both types.
+    #[test]
+    fn a_sample_converts_only_to_and_from_f32() {
+        for (from, to) in [
+            (DType::BF16, DType::I16),
+            (DType::I16, DType::BF16),
+            (DType::F16, DType::I16),
+            (DType::I16, DType::F16),
+            (DType::U8, DType::I16),
+            (DType::I16, DType::U8),
+        ] {
+            let bytes = vec![0u8; 2];
+            let error = convert(from, to, &bytes, "pcm").unwrap_err().to_string();
+            assert!(
+                error.contains(&from.to_string()) && error.contains(&to.to_string()),
+                "{from} to {to} was refused without naming both: {error}"
+            );
+        }
     }
 }

@@ -60,7 +60,7 @@ const LIBCUPTI: &str = "libcupti.so";
 /// The CUPTI library this process loads: the CUPTI the process named as its
 /// NVTX injection library (`NVTX_INJECTION64_PATH`), which NVTX already
 /// loaded; else `libcupti.so.N` in the directory of the `libcudart.so.N` the
-/// process loaded, when that file exists; else [`LIBCUPTI`]. Resolved once,
+/// process loaded, when that file exists; else `LIBCUPTI`. Resolved once,
 /// at the first load.
 pub fn library() -> &'static str {
     static LIBRARY: OnceLock<String> = OnceLock::new();

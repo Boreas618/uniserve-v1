@@ -156,7 +156,7 @@ impl Leader {
 
     /// Assigns a new request to the least loaded ready replica. A request
     /// stays with that replica's migrator through its world transitions.
-    async fn route(&self) -> Result<Arc<Replica>, SubmitError> {
+    async fn replica_for_request(&self) -> Result<Arc<Replica>, SubmitError> {
         let mut observed = self.replicas.serving.subscribe();
         'changed: loop {
             let replicas = observed.borrow_and_update().clone();
@@ -475,6 +475,7 @@ impl Leader {
             daemon,
             config.host_identity.clone(),
             config.served_model_name().to_owned(),
+            config.program_server.clone(),
         )?);
         let specs = engine::EngineConfig::replica_specs(&prepared.spec)?;
         let clients =
@@ -963,6 +964,117 @@ impl Leader {
         Ok(self.stats(request_id, started, core, output))
     }
 
+    /// Submits one generation request and returns what its handoffable body
+    /// is built from: the request's engine events, the pipeline that produces
+    /// its output, how long it took to reach the engine, and the recorder of
+    /// its statistics.
+    ///
+    /// The caller drives the body one engine event at a time
+    /// (`output::run::GenerationRun`), so the response can stop at an engine
+    /// event boundary and go on in a successor (design `specs/worker.md`
+    /// §7.5.1).
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::generate`] does.
+    pub(crate) async fn generate_handed(
+        &self,
+        request: GenerateRequest,
+    ) -> Result<
+        (
+            RequestEvents,
+            crate::output::OutputParams,
+            u64,
+            crate::metrics::stats::RequestOutcome,
+        ),
+        ServeError,
+    > {
+        let started = Instant::now();
+        let request_id = request.request_id.clone();
+        let image_urls = match &request.prompt {
+            Prompt::Chat(chat) if self.processor.supports_image_input() => chat.image_urls(),
+            _ => Vec::new(),
+        };
+        let images = self
+            .images
+            .fetch_images(image_urls)
+            .await
+            .map_err(|error| ServeError::ImageInput {
+                request_id: request_id.clone(),
+                index: error.index,
+                source: error.source,
+            })?;
+        let processor = Arc::clone(&self.processor);
+        let (request, output) =
+            preprocess(&request_id, move || processor.preprocess(request, images)).await?;
+
+        let compile_us = elapsed_us(started);
+        let (events, core) = self.submit(request.into()).await?;
+        let labels = EngineLabels {
+            model_name: self.model_name.clone(),
+            engine: core,
+        };
+        let log = self.log_requests.then_some(request_id);
+        let outcome = crate::metrics::stats::RequestOutcome::new(labels, started, log);
+        Ok((events, output, compile_us, outcome))
+    }
+
+    /// The model's tokenizer, which a successor builds a handed-over body's
+    /// decoder from.
+    pub(crate) fn tokenizer(&self) -> crate::tokenizer::DynTokenizer {
+        self.processor.tokenizer()
+    }
+
+    /// The statistics recorder of a request this process takes over, under
+    /// the replica that serves it and the instant it entered the deployment.
+    pub(crate) fn request_outcome(
+        &self,
+        request_id: &str,
+        replica: u32,
+        started: std::time::Instant,
+    ) -> crate::metrics::stats::RequestOutcome {
+        let labels = EngineLabels {
+            model_name: self.model_name.clone(),
+            engine: replica,
+        };
+        let log = self.log_requests.then(|| request_id.to_owned());
+        crate::metrics::stats::RequestOutcome::new(labels, started, log)
+    }
+
+    /// Takes one request's engine event stream over from the process that
+    /// consumed it, going on after the position it reached (design §7.5.1
+    /// step 4): the request keeps generating in the engine that serves it,
+    /// and is neither cancelled nor submitted again. Both handed kinds of
+    /// response call it, with the replica and identity their state carries.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state names no replica or no engine identity, that
+    /// replica serves no requests, or the engine refuses the takeover.
+    pub(crate) fn take_over_request(
+        &self,
+        engine_replica: u32,
+        engine_request_id: &str,
+        consumed: u64,
+    ) -> anyhow::Result<RequestEvents> {
+        let replica = self
+            .replicas()
+            .get(engine_replica as usize)
+            .cloned()
+            .with_context(|| format!("the handed response names replica {engine_replica}"))?;
+        let client = replica
+            .hold
+            .client()
+            .context("the handed response's replica has no engine connection")?;
+        let id = proto::request::RequestId(
+            engine_request_id
+                .parse()
+                .context("the handed response's engine identity")?,
+        );
+        let stream = client.take_over(id, consumed)?;
+        Ok(RequestEvents::taken_over(stream, consumed))
+    }
+
     /// Fetches, probes and plans a video request's media, presents its
     /// prompt, and streams its output.
     ///
@@ -1038,11 +1150,141 @@ impl Leader {
         &self,
         request: Request,
     ) -> Result<(RequestEvents, u32), SubmitError> {
-        let replica = self.route().await?;
+        let replica = self.replica_for_request().await?;
         let (events, scheduler) = replica.migrator.submit(request).await?;
         // A request the engine ended at submission names no scheduler; its
         // stream holds its terminal event.
         Ok((events, scheduler.unwrap_or(0) + replica.ordinal as u32))
+    }
+}
+
+/// The layer a configuration change moves on, and the update a program-layer
+/// change starts.
+///
+/// A change is routed by what it moves and never by what it says (§7.2): the
+/// daemon's and the frontend's own options are the host layer, which a hot
+/// restart applies (§7.5); a different build config is the epoch layer,
+/// whose programs are prepared when the epoch is built (§7.4); and a change
+/// whose build config is the same moves only the programs, which the serving
+/// main processes take in place (§7.3).
+///
+/// The target's programs are prepared at every host's Program Server before
+/// anything is compared, so a newly installed revision at an unchanged
+/// configuration is a program-layer change: the comparison sees the
+/// revisions the Program Servers select, not the ones the serving epoch
+/// pinned. `prepare` is blocking I/O, so it runs off the async runtime.
+///
+/// # Errors
+///
+/// Refuses a target whose programs a Program Server cannot select or build.
+impl Leader {
+    pub(crate) async fn route(
+        &self,
+        current: &ServeConfig,
+        target: &ServeConfig,
+        force: bool,
+    ) -> Result<Option<crate::epoch::Update>, UpdateError> {
+        if crate::epoch::host_layer_differ(current, target) {
+            return Ok(None);
+        }
+        let previous_build_config = crate::epoch::BuildConfig::of(current);
+        if previous_build_config != crate::epoch::BuildConfig::of(target) {
+            return Ok(None);
+        }
+        // From here only the programs can differ. The descriptors a
+        // `prepare` builds modules for come from the epoch's engine spec,
+        // which this decision does not resolve: the main process resolves
+        // the modules it needs when it loads them (`resolve`), so the
+        // selection and the revisions are what this call is for.
+        let filled = crate::epoch::FilledPrograms::of(target);
+        let servers = self.program_servers(target);
+        let leader_host = self.program_leader_host(target, &servers);
+        let prepared = {
+            let servers = servers.clone();
+            let leader_host = leader_host.clone();
+            let filled = filled.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
+            })
+            .await
+            .map_err(|error| {
+                UpdateError::Failed(anyhow::anyhow!("preparing the target's programs: {error}"))
+            })?
+            .map_err(|error| {
+                UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
+            })?
+        };
+        let next = crate::epoch::Deployment {
+            config: target.clone(),
+            build_config: previous_build_config,
+            programs: prepared,
+        };
+        // Nothing the configuration states and no revision the Program
+        // Servers select differs: the change applies to nothing, and the
+        // world-level path answers it as unchanged.
+        if next.programs == filled {
+            return Ok(None);
+        }
+        // The reverted-update refusal is the daemon's record's, checked when
+        // the update executes (`Epochs::unavailable`): this decision holds no
+        // record of its own.
+        let _ = force;
+        Ok(Some(crate::epoch::Update::new(0, next)))
+    }
+
+    /// Where each host of the deployment prepares an epoch's programs: the
+    /// Program Server socket the configuration names, or the Program
+    /// Server's default socket on that host (§5.1, §6.3). The targets are the
+    /// Program Server's own: the daemon does not query the devices of another
+    /// host to name them.
+    fn program_servers(
+        &self,
+        config: &ServeConfig,
+    ) -> Vec<crate::engine::control::ProgramServer> {
+        let socket = config
+            .program_server
+            .clone()
+            .unwrap_or_else(program_server::command::default_socket);
+        let mut servers = Vec::new();
+        for replica in self.replicas() {
+            let Some(control) = replica.control.get() else {
+                continue;
+            };
+            let host = control.host().to_owned();
+            if servers
+                .iter()
+                .any(|server: &crate::engine::control::ProgramServer| server.host == host)
+            {
+                continue;
+            }
+            servers.push(crate::engine::control::ProgramServer {
+                host,
+                socket: socket.clone(),
+                targets: Vec::new(),
+            });
+        }
+        servers
+    }
+
+    /// The host whose Program Server selects the epoch's revisions first,
+    /// which every other host is then asked for exactly: the epoch's engine
+    /// host when the configuration names one, and otherwise the first host
+    /// of the deployment.
+    fn program_leader_host(
+        &self,
+        config: &ServeConfig,
+        servers: &[crate::engine::control::ProgramServer],
+    ) -> String {
+        config
+            .engine_host
+            .clone()
+            .or_else(|| servers.first().map(|server| server.host.clone()))
+            .or_else(|| {
+                self.replicas()
+                    .first()
+                    .and_then(|replica| replica.control.get().map(|control| control.host().to_owned()))
+            })
+            .unwrap_or_default()
     }
 }
 

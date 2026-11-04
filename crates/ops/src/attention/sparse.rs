@@ -110,7 +110,6 @@ impl fmt::Display for SparseDescriptor {
             .field("output", self.output)
             .field("head_dim", self.head_dim)
             .field("lse", self.lse)
-            .field("keys", self.keys)
             .finish(formatter)
     }
 }
@@ -336,7 +335,7 @@ impl Op for SparseAttention {
                 ),
             ));
         }
-        // `keys` is what the module's bound is written for; a longer key extent is another module.
+        // The declared bound; the program itself reads the extent from the key view.
         if key_rows > u64::from(descriptor.keys) {
             return Err(Error::argument(
                 operator,
@@ -548,7 +547,7 @@ mod tests {
     fn key_names_every_compiled_value() {
         assert_eq!(
             block64().to_string(),
-            "block_64_dtype_bf16_output_bf16_head_dim_128_lse_true_keys_65536"
+            "block_64_dtype_bf16_output_bf16_head_dim_128_lse_true"
         );
     }
 
@@ -559,7 +558,7 @@ mod tests {
         block128.lse = false;
         assert_ne!(block64().to_string(), block128.to_string());
         assert!(block128.to_string().starts_with("block_128_dtype_bf16"));
-        assert!(block128.to_string().contains("_lse_false_"));
+        assert!(block128.to_string().ends_with("_lse_false"));
     }
 
     /// The header the packages mirror must carry these offsets; the constants beside the structure

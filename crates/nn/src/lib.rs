@@ -4,7 +4,7 @@
 //! ## Where this crate sits
 //!
 //! The call chain of one forward is `runner → model → layer → operator → kernel` (specs/worker.md
-//! 4). A model in `crates/models/` composes the layers here; a layer calls the operators of
+//! 4). A model in `crates/models/<model>/` composes the layers here; a layer calls the operators of
 //! [`ops`] and nothing below them; the operator's launch code reaches the loaded kernel. `nn` owns
 //! no runtime object: it never allocates device memory, creates a stream, captures a graph or
 //! selects a program. Everything a forward needs arrives borrowed in [`Forward`].
@@ -50,9 +50,10 @@ pub mod tensor;
 pub mod weights;
 
 pub use capability::{
-    BatchRow, BatchRows, CausalLm, Conditioning, DecodedMedia, Decoder, Denoiser, Encoder,
-    EncoderInputs, EncoderOutputs, ImageInput, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind,
-    Seed, Step, TokenBatch, VideoRequest, VideoTask,
+    BatchRow, BatchRows, CausalLm, ConditionRole, ConditionShape, Conditioning, DecodedMedia,
+    Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt,
+    ImageInput, ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind, Seed, StateTable,
+    Step, TokenBatch, VideoRequest, VideoTask,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use error::{Error, Result};
@@ -60,14 +61,19 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, Forward};
 pub use group::Group;
 pub use layers::{
-    Attention, AttentionBackend, Candidates, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d,
-    Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation, LayerNorm, Linear,
-    ModulatedRmsNorm, Moe, Noise, PackedSwiGlu, ParallelLMHead, RmsNorm, Rotary, Rotation, Sampler,
-    SamplerState, Samples, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, SwiGlu,
+    Activation, AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d,
+    ConvGeometry, ConvTranspose1d, CrossFade, Embedding, FrameMoments, FrameNormPad, FramePad,
+    GatedActivation, GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise,
+    NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, PatchMode, RmsNorm, Rotary, Rotate, Rotation,
+    Sampler, SamplerState, Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm,
+    ScaledResidualRmsNorm, Sections, SegmentAttention, SegmentTables, Silu, Snake, SwiGlu,
     TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tensor::Backing;
-pub use weights::{Quantization, RetainedWeights, Weight, WeightKey, WeightLayout, WeightLoader};
+pub use weights::{
+    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Weight, WeightKey,
+    WeightLayout, WeightLoader,
+};

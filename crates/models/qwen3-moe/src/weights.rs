@@ -84,6 +84,56 @@ impl ExpertSource {
     }
 }
 
+/// One expert's three projections in an encoded (NVFP4) checkpoint.
+///
+/// A quantized checkpoint stores each projection three times over: the packed E2M1 nibbles in
+/// `…{projection}_proj.weight` (`[rows, columns/2]` U8), the block scales in
+/// `…{projection}_proj.weight_scale` (one E4M3 scale per sixteen elements in the package's swizzled
+/// layout), and the projection's own FP32 scale in `…{projection}_proj.weight_scale_2`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EncodedProjection {
+    /// The packed weights, two E2M1 codes per byte along the contraction.
+    pub values: String,
+    /// The block scales.
+    pub scales: String,
+    /// The projection's FP32 tensor scale, whose reciprocal the loader carries.
+    pub global_scale: String,
+}
+
+/// One expert's three encoded projections.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EncodedTensors {
+    /// The causal (down) projection.
+    pub down: EncodedProjection,
+    /// The up projection.
+    pub up: EncodedProjection,
+    /// The gate projection.
+    pub gate: EncodedProjection,
+}
+
+impl ExpertSource {
+    /// The encoded checkpoint tensor names of expert `expert` under this source.
+    ///
+    /// The suffix set is the one ModelOpt writes and `WeightLoader::nvfp4` consumes; a checkpoint
+    /// that names them differently is a layout the loader does not know and must refuse rather than
+    /// reinterpret bytes.
+    pub fn encoded(&self, expert: usize) -> EncodedTensors {
+        let at = |projection: &str| {
+            let stem = format!("{}.{expert}.{projection}_proj", self.checkpoint_prefix);
+            EncodedProjection {
+                values: format!("{stem}.weight"),
+                scales: format!("{stem}.weight_scale"),
+                global_scale: format!("{stem}.weight_scale_2"),
+            }
+        };
+        EncodedTensors {
+            down: at("down"),
+            up: at("up"),
+            gate: at("gate"),
+        }
+    }
+}
+
 /// Every parameter of a Qwen3-MoE model, keyed by the model's path.
 ///
 /// Sparse layers contribute their router here and their experts through [`expert_sources`]. A tied
@@ -178,6 +228,37 @@ pub fn expert_sources(config: &Config) -> Vec<ExpertSource> {
 mod tests {
     use super::*;
     use crate::{Activation, Config};
+    use nn::Shape;
+
+    #[test]
+    fn an_encoded_expert_names_the_packed_scales_and_tensor_scale_the_loader_reads() {
+        let source = ExpertSource {
+            module: "layers.3.mlp.experts".to_owned(),
+            checkpoint_prefix: "model.layers.3.mlp.experts".to_owned(),
+        };
+        let expert = source.encoded(17);
+        // Three names per projection, in the suffix set `WeightLoader::nvfp4` consumes; a checkpoint
+        // that spells them otherwise is a layout the loader refuses rather than reinterprets.
+        assert_eq!(
+            expert.up.values,
+            "model.layers.3.mlp.experts.17.up_proj.weight"
+        );
+        assert_eq!(
+            expert.up.scales,
+            "model.layers.3.mlp.experts.17.up_proj.weight_scale"
+        );
+        assert_eq!(
+            expert.up.global_scale,
+            "model.layers.3.mlp.experts.17.up_proj.weight_scale_2"
+        );
+        assert!(expert.down.values.ends_with("17.down_proj.weight"));
+        assert!(expert.gate.scales.ends_with("17.gate_proj.weight_scale"));
+        // The dense path's names are untouched by the encoded one.
+        assert_eq!(
+            source.tensors(17).up,
+            "model.layers.3.mlp.experts.17.up_proj.weight"
+        );
+    }
 
     fn config(sparse_layers: &[usize], bias: bool, tied: bool) -> Config {
         Config {
@@ -219,7 +300,10 @@ mod tests {
         // embedding, norm and head; then per layer two norms, four projections (q, k, v, o), two
         // per-head norms and the router.
         assert_eq!(sources.len(), 3 + 48 * 9);
-        let names: Vec<&str> = sources.iter().map(|source| source.checkpoint.as_str()).collect();
+        let names: Vec<&str> = sources
+            .iter()
+            .map(|source| source.checkpoint.as_str())
+            .collect();
         assert!(names.contains(&"model.embed_tokens.weight"));
         assert!(names.contains(&"lm_head.weight"));
         assert!(names.contains(&"model.layers.47.self_attn.q_norm.weight"));
@@ -231,6 +315,109 @@ mod tests {
             experts[7].tensors(3).up,
             "model.layers.7.mlp.experts.3.up_proj.weight"
         );
+    }
+
+    #[test]
+    fn every_parameter_of_the_local_checkpoint_has_the_shape_the_loader_expects() {
+        // The name mapping alone cannot catch a transposed or mis-shaped request; the checkpoint's
+        // own headers can, before anything reaches a device. Shapes are derived from `config.json`
+        // here rather than from the loader, so the two agree only if both read the design right.
+        let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B/config.json");
+        if !path.is_file() {
+            return;
+        }
+        let root = path.parent().expect("a parent directory");
+        // The metadata is here on every machine; the shards are not. Without at least one shard
+        // there are no headers to read, so the shape check runs where the weights live (a GPU host)
+        // and is skipped where they do not.
+        let shards = std::fs::read_dir(root)
+            .expect("the checkpoint's directory")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".safetensors")
+            });
+        if !shards {
+            return;
+        }
+        let config = crate::Config::read(root).expect("the local Qwen3-30B-A3B metadata");
+        let checkpoint = nn::Checkpoint::open(root).expect("the local checkpoint's headers");
+
+        let hidden = config.hidden_size as u64;
+        let query = (config.num_attention_heads * config.head_dim) as u64;
+        let key_value = (config.num_key_value_heads * config.head_dim) as u64;
+        let head_dim = config.head_dim as u64;
+        let vocabulary = config.vocab_size as u64;
+        let intermediate = config.intermediate_size as u64;
+
+        let expected = |parameter: &str| -> Shape {
+            if parameter.ends_with("attention.q_proj.weight") {
+                Shape::new(&[query, hidden])
+            } else if parameter.ends_with("attention.k_proj.weight")
+                || parameter.ends_with("attention.v_proj.weight")
+            {
+                Shape::new(&[key_value, hidden])
+            } else if parameter.ends_with("attention.o_proj.weight") {
+                Shape::new(&[hidden, query])
+            } else if parameter.ends_with("attention.q_norm.weight")
+                || parameter.ends_with("attention.k_norm.weight")
+            {
+                Shape::new(&[head_dim])
+            } else if parameter.ends_with("mlp.router.weight") {
+                Shape::new(&[config.num_experts as u64, hidden])
+            } else if parameter.ends_with("mlp.gate_proj.weight")
+                || parameter.ends_with("mlp.up_proj.weight")
+            {
+                Shape::new(&[intermediate, hidden])
+            } else if parameter.ends_with("mlp.down_proj.weight") {
+                Shape::new(&[hidden, intermediate])
+            } else if parameter == "embedding.weight" || parameter == "lm_head.weight" {
+                Shape::new(&[vocabulary, hidden])
+            } else {
+                // The norms: one value per hidden element.
+                Shape::new(&[hidden])
+            }
+        };
+
+        for source in parameter_sources(&config) {
+            let tensor = checkpoint.tensor(&source.checkpoint).unwrap_or_else(|| {
+                panic!(
+                    "the checkpoint has no {} ({})",
+                    source.checkpoint, source.parameter
+                )
+            });
+            assert_eq!(
+                tensor.shape,
+                expected(&source.parameter),
+                "{} has the wrong shape",
+                source.checkpoint
+            );
+        }
+
+        // The expert stacks are per expert and per projection, both read as `[out, in]`.
+        let experts = config.moe_intermediate_size as u64;
+        for source in expert_sources(&config) {
+            for expert in 0..config.num_experts {
+                let tensors = source.tensors(expert);
+                for (name, shape) in [
+                    (tensors.up, Shape::new(&[experts, hidden])),
+                    (tensors.gate, Shape::new(&[experts, hidden])),
+                    (tensors.down, Shape::new(&[hidden, experts])),
+                ] {
+                    let tensor = checkpoint
+                        .tensor(&name)
+                        .unwrap_or_else(|| panic!("the checkpoint has no {name}"));
+                    assert_eq!(
+                        tensor.shape,
+                        shape,
+                        "{name} has the wrong shape",
+                        name = name
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -31,4 +31,4 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_width_32768`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "fp32"], width = ["8192", "16384", "32768", "65536"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], width = ["8192", "16384", "32768", "65536"] }

@@ -72,13 +72,16 @@
 //! operator, and never from a measurement of the pair being compared.
 
 pub mod activation;
+pub mod adaptive_pool;
 pub mod attention;
+pub mod audio_activation;
 pub mod audio_resample;
 pub mod bias;
 pub mod block_copy;
 pub mod capture;
 pub mod commit;
 pub mod conv;
+pub mod cross_fade;
 pub mod descriptor;
 pub mod embedding;
 pub mod error;
@@ -98,20 +101,26 @@ pub mod moe;
 pub mod noise;
 pub mod norm;
 pub mod op;
+pub mod patch;
+pub mod pcm;
 pub mod phase;
 pub mod platform;
+pub mod position;
 pub mod prefix_cache;
 pub mod replicate_pad;
 pub mod residual;
 pub mod resize;
 pub mod rope;
+pub mod rows;
 pub mod sampler;
 pub mod segments;
+pub mod sequence_append;
 pub mod snake;
 pub mod snake_beta;
 pub mod tensor;
 pub mod tolerance;
 pub mod twins;
+pub mod unpatchify;
 
 pub use descriptor::{Float, Key};
 pub use error::{Error, Result};

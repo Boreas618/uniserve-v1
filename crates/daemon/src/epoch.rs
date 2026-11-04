@@ -21,12 +21,13 @@
 //! daemon records the wire form ([`crate::proto`]'s `process::Program`)
 //! until that crate lands.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use proto::request::ModelDtype;
+pub use program_server::{PhaseKind, Program, ProgramSlot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -34,49 +35,89 @@ use crate::options::{
     CudaGraphOptions, KvCacheOptions, LoadOptions, ServeConfig, VideoOptions, WorkerOptions,
 };
 
-/// A program the epoch fills an operator or the scheduling interface with:
-/// the backend's name, the revision of its package the upstream Program
-/// Server numbered, and its parameters (§5.1).
+/// The operator names the epoch record keys its kernel programs by (§5.1,
+/// §5.2), of the operators whose backend a configuration selects. They are
+/// `crates/ops`'s `Op::NAME` of the same operator, so the daemon, the
+/// Program Server and the main process cannot disagree about a slot's name.
 ///
-/// The Rust type is `crates/program-server`'s `Program`; the programs swarm
-/// owns it, and the daemon uses its wire form until that crate lands. The
-/// wire form is the same three values, so nothing but the type name changes
-/// then.
-pub type Program = proto::process::Program;
+/// The complete slot set is `crates/ops`'s operator names. The rest are
+/// filled by the epoch's programs like any other slot and need no entry
+/// here: their backend is not a configuration field, so this module names
+/// only the operators the configuration selects a backend for. The
+/// scheduling interface is not an operator at all: its program is the epoch
+/// record's `policy` field.
+pub mod operators {
+    use ops::Op as _;
 
-/// The phase of an operator's calls a kernel program fills. An operator is
-/// filled once for all its phases unless the configuration fills it per
-/// phase, which attention allows (§5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PhaseKind {
-    /// Prompt processing.
-    Prefill,
-    /// One token of a request in progress.
-    Decode,
+    /// Paged attention, the operator `attention_backend` and the per-phase
+    /// attention fields select a backend for (§4.2, §9).
+    pub const PAGED_ATTENTION: &str = ops::attention::PagedAttention::NAME;
+    /// The grouped expert GEMM's gather and compute, the operator
+    /// `moe_runner_backend` selects a backend for (§5.1, §9). The grouped
+    /// experts are two operators, and one program backend fills both.
+    pub const GATHER_GEMM: &str = ops::moe::GatherGemm::NAME;
+    /// The grouped expert GEMM's route and combine, filled by the same
+    /// program backend as [`GATHER_GEMM`].
+    pub const ROUTE_GEMM: &str = ops::moe::RouteGemm::NAME;
+    /// The expert exchange around the grouped expert GEMM, the operator
+    /// `moe_config.exchange` selects a backend for (§9).
+    pub const EXPERT_EXCHANGE: &str = ops::moe::ExpertExchange::NAME;
 }
 
-impl PhaseKind {
-    /// The wire form of this phase.
-    pub fn to_wire(self) -> proto::process::PhaseKind {
-        match self {
-            Self::Prefill => proto::process::PhaseKind::Prefill,
-            Self::Decode => proto::process::PhaseKind::Decode,
-        }
-    }
 
-    /// The phase `wire` names; `None` for the unspecified value, which a
-    /// `KernelProgram` leaves absent for an operator filled for every face.
-    pub fn from_wire(wire: proto::process::PhaseKind) -> Option<Self> {
-        match wire {
-            proto::process::PhaseKind::Prefill => Some(Self::Prefill),
-            proto::process::PhaseKind::Decode => Some(Self::Decode),
-            proto::process::PhaseKind::Unspecified => None,
-        }
+/// The key an epoch's programs are stored under: the operator, and the
+/// phase when the configuration fills it per phase (§5.2). Programs and
+/// slots are `crates/program-server`'s types, which the daemon, the main
+/// process and the Program Server all name programs with (§5.1).
+pub type KernelKey = ProgramSlot;
+
+/// One program as the process interface's wire form: its parameters as the
+/// TOML text of each value, so a main process of another build reads each
+/// back as the value it was (§5.1).
+pub fn program_to_wire(program: &Program) -> proto::process::Program {
+    proto::process::Program {
+        backend: program.backend.clone(),
+        revision: program.revision,
+        arguments: program
+            .arguments
+            .iter()
+            .map(|(key, value)| (key.clone(), value.to_string()))
+            .collect(),
     }
 }
 
-/// What one operator is filled with, or which phases of it.
-pub type KernelKey = (String, Option<PhaseKind>);
+/// The program `wire` states, its parameters read back as TOML values.
+pub fn program_from_wire(wire: proto::process::Program) -> Program {
+    Program {
+        backend: wire.backend,
+        revision: wire.revision,
+        arguments: wire
+            .arguments
+            .into_iter()
+            .map(|(key, value)| {
+                let value = value.parse::<toml::Value>().unwrap_or(toml::Value::String(value));
+                (key, value)
+            })
+            .collect(),
+    }
+}
+
+/// One operator's program as the `Precopy` command states it (§7.3 step 2).
+pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::KernelProgram {
+    proto::process::KernelProgram {
+        op: slot.op.clone(),
+        phase: slot.phase.map(|phase| {
+            let phase = match phase {
+                PhaseKind::Prefill => proto::process::PhaseKind::Prefill,
+                PhaseKind::Decode => proto::process::PhaseKind::Decode,
+                PhaseKind::Encode => proto::process::PhaseKind::Encode,
+                PhaseKind::Denoise => proto::process::PhaseKind::Denoise,
+            };
+            phase as i32
+        }),
+        program: Some(program_to_wire(program)),
+    }
+}
 
 /// The values that build a main process: every one of them is a value a new
 /// epoch must be built for, and no other change is (§7.1, §7.7).
@@ -205,6 +246,15 @@ pub struct EpochRecord {
     pub previous_policy: Option<Program>,
     /// Where the epoch is in its life.
     pub status: Status,
+    /// The MODEL generation: the number the epoch's own main processes gave
+    /// the programs they execute, read from their `Parked`, `Promoted` or
+    /// launch report and never invented here (§2.5, §7.4). It is not a
+    /// process's identity: that is [`ManagedProcess::generation`], the
+    /// launch generation, allocated by [`Epochs::next_generation`].
+    pub generation: Option<u64>,
+    /// The deployment's world allocation this epoch executes (§7.4), which
+    /// the epoch's launch file and its Storage Server claim carry.
+    pub world: u64,
 }
 
 /// The role of a process a node's daemon manages (§2.1).
@@ -237,12 +287,23 @@ pub enum ProcessState {
 pub struct ManagedProcess {
     /// What it is.
     pub role: Role,
+    /// The worker group it runs in (`engine`, `worker`, ...): the group a
+    /// launch generation is allocated for (§2.5).
+    pub group: String,
+    /// Its rank inside that group.
+    pub rank: u64,
     /// Its process id on its node, once started.
     pub pid: Option<u32>,
     /// The epoch a main process belongs to; `None` for the frontend.
     pub epoch: Option<u64>,
     /// The build identity it was started from.
     pub build: String,
+    /// The LAUNCH generation: the identity of this launch of the process,
+    /// which the daemon allocates ([`Epochs::next_generation`]) and the
+    /// process names in its launch file and its reports. It is not the
+    /// model generation ([`EpochRecord::generation`]), which the main
+    /// process numbers for the programs it executes; 0 until launched.
+    pub generation: u64,
     /// Where it is.
     pub state: ProcessState,
 }
@@ -323,12 +384,31 @@ impl Failure {
                 reason: format!("non-finite logits for request {}", logits.request),
                 device: None,
             }),
-            Kind::PolicyReverted(_) => Some(Self {
+            Kind::PolicyReverted(reverted) => Some(Self {
                 kind: "policy_reverted".to_owned(),
-                reason: "the scheduling policy failed and the previous one serves".to_owned(),
+                reason: {
+                    // Presence is the contract (§4.4): absent is the route
+                    // instance the engine's control thread runs, a value one
+                    // scheduler thread's policy.
+                    let instance = match reverted.scheduler {
+                        Some(scheduler) => format!("scheduler {scheduler}"),
+                        None => "the engine's control thread".to_owned(),
+                    };
+                    let fatal = if reverted.fatal {
+                        ", and no previous policy module is left"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "the policy of {instance} (backend {} revision {}) failed: {}{fatal}",
+                        reverted.backend, reverted.revision, reverted.reason
+                    )
+                },
                 device: None,
             }),
-            Kind::Precopied(_)
+            Kind::Parked(_)
+            | Kind::Promoted(_)
+            | Kind::Precopied(_)
             | Kind::Switched(_)
             | Kind::Committed(_)
             | Kind::Reverted(_)
@@ -381,6 +461,55 @@ impl Update {
     }
 }
 
+/// One phase of an update, as the daemon's event log names it (§7.2, §7.3):
+/// the program layer's steps and the probation's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The new generation's programs are being prepared in the serving main
+    /// processes (§7.3 step 2).
+    Precopy,
+    /// Every main process prepared them.
+    Precopied,
+    /// The switchover to the new generation is under way (§7.3 step 3).
+    Switchover,
+    /// Every main process executes the new generation.
+    Switched,
+    /// The new generation serves while the previous one is kept (§7.3
+    /// step 4).
+    Probation,
+    /// The probation ended in favour of the new generation (§7.3 step 5).
+    Committed,
+    /// The probation ended by returning to the previous generation, with
+    /// the reason it did.
+    Reverted,
+    /// The generation the probation kept is gone (§7.3 step 6).
+    Purged,
+    /// A main process could not prepare the new generation's programs; the
+    /// serving one is untouched (§7.3 step 2).
+    PrecopyFailed,
+    /// A scheduling policy failed and the main process reinstantiated the
+    /// previous one (§4.4).
+    PolicyReverted,
+}
+
+impl Phase {
+    /// The name the event log and the update's readers use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Precopy => "precopy",
+            Self::Precopied => "precopied",
+            Self::Switchover => "switchover",
+            Self::Switched => "switched",
+            Self::Probation => "probation",
+            Self::Committed => "committed",
+            Self::Reverted => "reverted",
+            Self::Purged => "purged",
+            Self::PrecopyFailed => "precopy_failed",
+            Self::PolicyReverted => "policy_reverted",
+        }
+    }
+}
+
 /// The epochs a deployment's daemon keeps and the processes it manages on
 /// its node: the state `GET /admin/config` reports and a change is routed
 /// by (§7.2).
@@ -388,6 +517,9 @@ impl Update {
 pub struct Epochs {
     records: Mutex<BTreeMap<u64, EpochRecord>>,
     processes: Mutex<Vec<ManagedProcess>>,
+    update: Mutex<Option<Update>>,
+    /// The last launch generation allocated per worker group and rank.
+    generations: Mutex<BTreeMap<(String, u64), u64>>,
 }
 
 impl Epochs {
@@ -400,6 +532,90 @@ impl Epochs {
     /// that epoch before.
     pub fn record(&self, epoch: u64, record: EpochRecord) {
         locked(&self.records).insert(epoch, record);
+    }
+
+    /// The launch generation to start `group`'s rank `rank` in (§2.5,
+    /// §7.4): one more than the highest launch generation this daemon knows
+    /// for it, which is the one it allocated last or the one the process
+    /// table records for that group and rank, so a standby of a serving
+    /// process is `serving + 1`.
+    ///
+    /// This is the one place a generation is allocated: a caller that
+    /// computed one itself would launch two processes under one number.
+    pub fn next_generation(&self, group: &str, rank: u64) -> u64 {
+        let runnning = self
+            .processes()
+            .iter()
+            .filter(|process| process.group == group && process.rank == rank)
+            .map(|process| process.generation)
+            .max()
+            .unwrap_or(0);
+        let mut allocated = locked(&self.generations);
+        let key = (group.to_owned(), rank);
+        let last = allocated.get(&key).copied().unwrap_or(0).max(runnning);
+        let next = last + 1;
+        allocated.insert(key, next);
+        next
+    }
+
+    /// Records `update` as the deployment's update: the one in flight, or
+    /// the last one that ended.
+    pub fn set_update(&self, update: Update) {
+        *locked(&self.update) = Some(update);
+    }
+
+    /// The deployment's update: the one in flight, or the last one that
+    /// ended.
+    pub fn update(&self) -> Option<Update> {
+        locked(&self.update).clone()
+    }
+
+    /// Why `target` may not be applied without `force` (§7.2, §7.3 step 4):
+    /// the last update reverted from the same programs after a failure.
+    ///
+    /// The comparison is the programs', revisions included, because those
+    /// are what a reverted program-layer update was: applying the same
+    /// configuration again selects the same revisions, so the refusal is
+    /// about the change and not about how it was asked for.
+    pub fn unavailable(&self, target: &Deployment) -> Option<Failure> {
+        let update = locked(&self.update);
+        let update = update.as_ref()?;
+        let failure = update.unavailable()?;
+        (update.target.programs == target.programs).then(|| failure.clone())
+    }
+
+    /// Records that epoch `epoch` now executes `programs`, keeping what it
+    /// executed before as the probation's previous generation (§7.3 steps
+    /// 2-4). The record's status stays what it was: the programs are in the
+    /// main process, the probation is the update's.
+    pub fn precopied(&self, epoch: u64, programs: FilledPrograms) {
+        let mut records = locked(&self.records);
+        let Some(record) = records.get_mut(&epoch) else {
+            return;
+        };
+        record.previous_kernels = std::mem::replace(&mut record.kernels, programs.kernels);
+        record.previous_policy = Some(std::mem::replace(&mut record.policy, programs.policy));
+    }
+
+    /// Records that epoch `epoch`'s new programs are what serves and the
+    /// previous generation is no longer kept (§7.3 step 5).
+    pub fn committed(&self, epoch: u64) {
+        let mut records = locked(&self.records);
+        let Some(record) = records.get_mut(&epoch) else {
+            return;
+        };
+        record.previous_kernels.clear();
+        record.previous_policy = None;
+        record.status = Status::Serving;
+    }
+
+    /// Records that everything older than the generation epoch `epoch`
+    /// executes is gone (§7.3 step 6).
+    pub fn purged(&self, epoch: u64) {
+        let mut records = locked(&self.records);
+        if let Some(record) = records.get_mut(&epoch) {
+            record.status = Status::Purged;
+        }
     }
 
     /// Epoch `epoch`'s record, if the daemon keeps one.
@@ -433,13 +649,14 @@ impl Epochs {
     }
 
     /// The epochs and the process table as `GET /admin/config` reports
-    /// them: the records of §5.1, with the programs in the wire form the
-    /// daemon records, and one entry per process the daemon manages.
+    /// them: one array entry per epoch, ascending by number, with the
+    /// programs in the form the daemon records, and one entry per process
+    /// the daemon manages.
     pub fn report(&self) -> Value {
         let epochs = locked(&self.records)
             .iter()
-            .map(|(epoch, record)| (epoch.to_string(), record_report(record)))
-            .collect::<Map<String, Value>>();
+            .map(|(epoch, record)| record_report(*epoch, record))
+            .collect::<Vec<_>>();
         let processes = locked(&self.processes)
             .iter()
             .map(process_report)
@@ -448,19 +665,17 @@ impl Epochs {
     }
 }
 
-/// One epoch record as JSON: the programs by operator and phase, the
-/// previous generation, and the status, as the design names them.
-fn record_report(record: &EpochRecord) -> Value {
+/// One epoch record as JSON: its number, the build config, the programs by
+/// operator and phase, the previous generation, and the status, as the
+/// design names them.
+fn record_report(epoch: u64, record: &EpochRecord) -> Value {
     let kernels = record
         .kernels
         .iter()
-        .map(|((op, phase), program)| {
+        .map(|(slot, program)| {
             serde_json::json!({
-                "op": op,
-                "phase": phase.map(|phase| match phase {
-                    PhaseKind::Prefill => "prefill",
-                    PhaseKind::Decode => "decode",
-                }),
+                "op": slot.op,
+                "phase": slot.phase.map(PhaseKind::as_str),
                 "program": program_report(program),
             })
         })
@@ -468,23 +683,23 @@ fn record_report(record: &EpochRecord) -> Value {
     let previous = record
         .previous_kernels
         .iter()
-        .map(|((op, phase), program)| {
+        .map(|(slot, program)| {
             serde_json::json!({
-                "op": op,
-                "phase": phase.map(|phase| match phase {
-                    PhaseKind::Prefill => "prefill",
-                    PhaseKind::Decode => "decode",
-                }),
+                "op": slot.op,
+                "phase": slot.phase.map(PhaseKind::as_str),
                 "program": program_report(program),
             })
         })
         .collect::<Vec<_>>();
     serde_json::json!({
+        "epoch": epoch,
         "build_config": serde_json::to_value(&record.build_config).unwrap_or(Value::Null),
         "kernels": kernels,
         "policy": program_report(&record.policy),
         "previous_kernels": previous,
         "previous_policy": record.previous_policy.as_ref().map(program_report),
+        "generation": record.generation,
+        "world": record.world,
         "status": match record.status {
             Status::Precopy => "precopy",
             Status::Serving => "serving",
@@ -512,7 +727,10 @@ fn process_report(process: &ManagedProcess) -> Value {
         },
         "pid": process.pid,
         "epoch": process.epoch,
+        "group": process.group,
+        "rank": process.rank,
         "build": process.build,
+        "generation": process.generation,
         "state": match &process.state {
             ProcessState::Starting => "starting".to_owned(),
             ProcessState::Serving => "serving".to_owned(),
@@ -539,22 +757,6 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// only the operators the configuration selects a backend for. The
 /// scheduling interface is not an operator at all: its program is the epoch
 /// record's `policy` field.
-pub mod operators {
-    /// Paged attention, the operator `attention_backend` and the per-phase
-    /// attention fields select a backend for (§4.2, §9).
-    pub const PAGED_ATTENTION: &str = "paged_attention";
-    /// The grouped expert GEMM's gather and compute, the operator
-    /// `moe_runner_backend` selects a backend for (§5.1, §9). The grouped
-    /// experts are two operators, and one program backend fills both.
-    pub const GATHER_GEMM: &str = "gather_gemm";
-    /// The grouped expert GEMM's route and combine, filled by the same
-    /// program backend as [`GATHER_GEMM`].
-    pub const ROUTE_GEMM: &str = "route_gemm";
-    /// The expert exchange around the grouped expert GEMM, the operator
-    /// `moe_config.exchange` selects a backend for (§9).
-    pub const EXPERT_EXCHANGE: &str = "expert_exchange";
-}
-
 /// The programs a configuration fills, by operator and phase, and the
 /// scheduling interface's (§5.1, §5.2).
 ///
@@ -579,11 +781,11 @@ impl FilledPrograms {
         let attention = attention_programs(config);
         kernels.extend(attention);
         kernels.insert(
-            (operators::EXPERT_EXCHANGE.to_owned(), None),
+            KernelKey::all(operators::EXPERT_EXCHANGE),
             Program {
                 backend: word(&config.moe_config.exchange),
                 revision: 0,
-                arguments: HashMap::new(),
+                arguments: toml::Table::new(),
             },
         );
         if let Some(backend) = &config.moe_runner_backend {
@@ -591,11 +793,11 @@ impl FilledPrograms {
             // and one program backend fills both (§9).
             for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
                 kernels.insert(
-                    (operator.to_owned(), None),
+                    KernelKey::all(operator),
                     Program {
                         backend: backend.clone(),
                         revision: 0,
-                        arguments: HashMap::new(),
+                        arguments: toml::Table::new(),
                     },
                 );
             }
@@ -626,7 +828,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
     let arguments = || toml_arguments(&config.flashinfer_config);
     if prefill == decode {
         return vec![(
-            (operators::PAGED_ATTENTION.to_owned(), None),
+            KernelKey::all(operators::PAGED_ATTENTION),
             Program {
                 backend: prefill,
                 revision: 0,
@@ -636,7 +838,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
     }
     vec![
         (
-            (operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Prefill)),
+            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill),
             Program {
                 backend: prefill,
                 revision: 0,
@@ -644,7 +846,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
             },
         ),
         (
-            (operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Decode)),
+            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode),
             Program {
                 backend: decode,
                 revision: 0,
@@ -657,7 +859,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
 /// The scheduling program's parameters: the values §7.7 assigns to the
 /// scheduling policy, which decides with them inside the build config's
 /// bounds (§4.4).
-fn policy_arguments(config: &ServeConfig) -> HashMap<String, String> {
+fn policy_arguments(config: &ServeConfig) -> toml::Table {
     #[derive(Serialize)]
     struct Arguments {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -690,17 +892,13 @@ fn policy_arguments(config: &ServeConfig) -> HashMap<String, String> {
     toml_arguments(&arguments)
 }
 
-/// `value`'s fields as the TOML key/value strings a program's arguments
-/// carry (the wire form of `Program.arguments`, §5.1): a main process of
-/// another build reads each value back as the TOML value it was. Values the
-/// field's serialization leaves out, such as an unset option, are absent.
-fn toml_arguments<T: Serialize>(value: &T) -> HashMap<String, String> {
+/// `value`'s fields as the TOML table a program's arguments carry (§5.1).
+/// Values the field's serialization leaves out, such as an unset option, are
+/// absent.
+fn toml_arguments<T: Serialize>(value: &T) -> toml::Table {
     match toml::Value::try_from(value) {
-        Ok(toml::Value::Table(table)) => table
-            .into_iter()
-            .map(|(key, value)| (key, value.to_string()))
-            .collect(),
-        _ => HashMap::new(),
+        Ok(toml::Value::Table(table)) => table,
+        _ => toml::Table::new(),
     }
 }
 
@@ -802,7 +1000,7 @@ mod tests {
         Program {
             backend: backend.to_owned(),
             revision: 1,
-            arguments: std::collections::HashMap::new(),
+            arguments: toml::Table::new(),
         }
     }
 
@@ -811,11 +1009,13 @@ mod tests {
         let config = ServeConfig::default();
         EpochRecord {
             build_config: BuildConfig::of(&config),
-            kernels: BTreeMap::from([(("rms_norm".to_owned(), None), program("triton"))]),
+            kernels: BTreeMap::from([(KernelKey::all("rms_norm"), program("triton"))]),
             policy: program("fcfs"),
             previous_kernels: BTreeMap::new(),
             previous_policy: None,
             status: Status::Serving,
+            generation: None,
+            world: 3,
         }
     }
 
@@ -978,16 +1178,16 @@ mod tests {
         // One attention program for every phase, the expert exchange's
         // backend, and no grouped expert GEMM until the configuration names
         // one: prepare resolves it (§5.1).
-        let attention = &programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), None)];
+        let attention = &programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)];
         assert_eq!(attention.backend, "auto");
         assert_eq!(attention.revision, 0, "no revision before prepare");
         assert_eq!(
-            programs.kernels[&(operators::EXPERT_EXCHANGE.to_owned(), None)].backend,
+            programs.kernels[&KernelKey::all(operators::EXPERT_EXCHANGE)].backend,
             "alltoall"
         );
         for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
             assert!(
-                !programs.kernels.contains_key(&(operator.to_owned(), None)),
+                !programs.kernels.contains_key(&KernelKey::all(operator)),
                 "an operator the configuration does not fill is absent"
             );
         }
@@ -997,7 +1197,7 @@ mod tests {
         assert_eq!(programs.policy.backend, "fcfs");
         assert_eq!(
             programs.policy.arguments["max_batch"],
-            NonZeroUsize::new(128).unwrap().get().to_string()
+            toml::Value::Integer(128)
         );
         let scheduler = SchedulerOptions {
             max_queued_requests: NonZeroUsize::new(16),
@@ -1009,10 +1209,22 @@ mod tests {
         stated.max_num_batched_tokens = NonZeroUsize::new(4096);
         stated.speculative_config.expected_speedup = Some(2.5);
         let programs = FilledPrograms::of(&stated);
-        assert_eq!(programs.policy.arguments["chunked_prefill_size"], "2048");
-        assert_eq!(programs.policy.arguments["max_queued_requests"], "16");
-        assert_eq!(programs.policy.arguments["max_num_batched_tokens"], "4096");
-        assert_eq!(programs.policy.arguments["expected_speedup"], "2.5");
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(2048)
+        );
+        assert_eq!(
+            programs.policy.arguments["max_queued_requests"],
+            toml::Value::Integer(16)
+        );
+        assert_eq!(
+            programs.policy.arguments["max_num_batched_tokens"],
+            toml::Value::Integer(4096)
+        );
+        assert_eq!(
+            programs.policy.arguments["expected_speedup"],
+            toml::Value::Float(2.5)
+        );
 
         // Per-phase attention: two entries, each naming its phase, once the
         // fields state different backends.
@@ -1021,14 +1233,14 @@ mod tests {
         split.decode_attention_backend = Some("trtllm".to_owned());
         let programs = FilledPrograms::of(&split);
         let prefill =
-            &programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Prefill))];
+            &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill)];
         let decode =
-            &programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Decode))];
+            &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode)];
         assert_eq!((prefill.backend.as_str(), decode.backend.as_str()), ("fa4", "trtllm"));
         assert!(
             !programs
                 .kernels
-                .contains_key(&(operators::PAGED_ATTENTION.to_owned(), None)),
+                .contains_key(&KernelKey::all(operators::PAGED_ATTENTION)),
             "a per-phase fill covers no whole operator"
         );
 
@@ -1037,7 +1249,7 @@ mod tests {
         one.prefill_attention_backend = Some("fa4".to_owned());
         let programs = FilledPrograms::of(&one);
         assert_eq!(
-            programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), None)].backend,
+            programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
             "fa4"
         );
 
@@ -1047,7 +1259,7 @@ mod tests {
         let programs = FilledPrograms::of(&moe);
         for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
             assert_eq!(
-                programs.kernels[&(operator.to_owned(), None)].backend,
+                programs.kernels[&KernelKey::all(operator)].backend,
                 "cutlass"
             );
         }
@@ -1118,6 +1330,48 @@ mod tests {
             Some("stalled".to_owned())
         );
 
+        // The policy's failure names the instance, the backend and the
+        // revision, and whether no previous module is left (§4.4).
+        let reverted = proto::process::Report {
+            kind: Some(Kind::PolicyReverted(proto::process::PolicyReverted {
+                scheduler: Some(2),
+                backend: "trtllm".to_owned(),
+                revision: 7,
+                reason: "the fuel budget is exhausted".to_owned(),
+                fatal: false,
+            })),
+        };
+        let failure = Failure::of_report(&reverted).expect("a policy revert fails the update");
+        assert_eq!(failure.kind, "policy_reverted");
+        assert!(failure.reason.contains("scheduler 2"), "{}", failure.reason);
+        assert!(failure.reason.contains("trtllm"), "{}", failure.reason);
+        assert!(failure.reason.contains("revision 7"), "{}", failure.reason);
+        assert!(
+            failure.reason.contains("the fuel budget is exhausted"),
+            "{}",
+            failure.reason
+        );
+        let route = proto::process::Report {
+            kind: Some(Kind::PolicyReverted(proto::process::PolicyReverted {
+                scheduler: None,
+                backend: "fcfs".to_owned(),
+                revision: 1,
+                reason: "a decision was refused".to_owned(),
+                fatal: true,
+            })),
+        };
+        let failure = Failure::of_report(&route).expect("a fatal policy revert fails the update");
+        assert!(
+            failure.reason.contains("the engine's control thread"),
+            "{}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("no previous policy module is left"),
+            "{}",
+            failure.reason
+        );
+
         for acknowledged in [
             proto::process::Report {
                 kind: Some(Kind::Precopied(proto::process::Precopied { generation: 4 })),
@@ -1155,7 +1409,7 @@ mod tests {
         let mut second = record();
         second.status = Status::Precopy;
         second.kernels.insert(
-            ("paged_attention".to_owned(), Some(PhaseKind::Decode)),
+            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode),
             program("trtllm"),
         );
         epochs.record(2, second);
@@ -1164,16 +1418,65 @@ mod tests {
             Some((1, Status::Probation))
         );
 
+        // The epochs are one array, ascending, each naming its number.
         let report = epochs.report();
-        assert_eq!(report["epochs"]["1"]["status"], Value::from("probation"));
-        assert_eq!(report["epochs"]["2"]["status"], Value::from("precopy"));
+        let entries = report["epochs"].as_array().expect("epochs is an array");
         assert_eq!(
-            report["epochs"]["2"]["kernels"][0]["phase"],
-            Value::from("decode")
+            entries
+                .iter()
+                .map(|entry| entry["epoch"].as_u64())
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+        assert_eq!(entries[0]["status"], Value::from("probation"));
+        assert_eq!(entries[1]["status"], Value::from("precopy"));
+        assert_eq!(entries[1]["kernels"][0]["phase"], Value::from("decode"));
+        assert_eq!(
+            entries[1]["kernels"][0]["program"]["backend"],
+            Value::from("trtllm")
+        );
+    }
+
+    /// A launch generation is allocated in one place: one more than the
+    /// highest generation the daemon knows for that group and rank, which is
+    /// the serving epoch's (§2.5, §7.4), so a standby of a serving epoch is
+    /// `serving + 1`, and two callers never get one number.
+    #[test]
+    fn a_launch_generation_is_one_more_than_the_serving_epochs() {
+        let epochs = Epochs::new();
+        assert_eq!(epochs.next_generation("engine", 0), 1, "the first launch");
+
+        // A serving process's launch generation is the base: its standby is
+        // one more, and so is the next allocation after that.
+        epochs.set_processes(vec![ManagedProcess {
+            role: Role::MainProcess,
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(42),
+            epoch: Some(1),
+            build: "2.0.0+0123456789abcdef".to_owned(),
+            generation: 6,
+            state: ProcessState::Serving,
+        }]);
+        assert_eq!(
+            epochs.next_generation("engine", 0),
+            7,
+            "the standby of a serving process is serving + 1"
         );
         assert_eq!(
-            report["epochs"]["2"]["kernels"][0]["program"]["backend"],
-            Value::from("trtllm")
+            epochs.next_generation("engine", 0),
+            8,
+            "an allocation is one more than the last one"
+        );
+        assert_eq!(
+            epochs.next_generation("engine", 1),
+            7,
+            "a rank allocates for itself"
+        );
+        assert_eq!(
+            epochs.next_generation("worker", 0),
+            7,
+            "a group allocates for itself"
         );
     }
 
@@ -1184,16 +1487,22 @@ mod tests {
         epochs.set_processes(vec![
             ManagedProcess {
                 role: Role::Frontend,
+                group: "frontend".to_owned(),
+                rank: 0,
                 pid: Some(41),
                 epoch: None,
                 build: "2.0.0+0123456789abcdef".to_owned(),
+                generation: 0,
                 state: ProcessState::Serving,
             },
             ManagedProcess {
                 role: Role::MainProcess,
+                group: "engine".to_owned(),
+                rank: 0,
                 pid: Some(42),
                 epoch: Some(7),
                 build: "2.0.0+0123456789abcdef".to_owned(),
+                generation: 4,
                 state: ProcessState::Parked,
             },
         ]);

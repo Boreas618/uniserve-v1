@@ -1,0 +1,45 @@
+# The modulated_rms_norm operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the modulation's own: the activation and output types, the
+# row-index type, the row width and its lane block, the epsilon, the three
+# modulation row strides (one parameter table serves many activation rows, and
+# its layout is the model's), and the three flags that decide whether the block
+# folds a gated update in, writes an E4M3 output with a per-row scale, and
+# retains the normalized source. The key is the one
+# `ModulatedRmsNormDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_output_bf16_indices_i32_width_3072_block_4096_epsilon_0x358637bd_gate_stride_3072_shift_stride_3072_scale_stride_3072_update_true_retain_false`.
+#
+# The widths are the H3 transformer's hidden sizes and their neighbours; a
+# modulation row stride is a whole multiple of the row width, which is what a
+# chunked shift/scale/gate table gives. The values narrow to exactly the keys
+# `model` publishes for H3.
+
+op = "modulated_rms_norm"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/modulated_rms_norm.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32", "f8e4m3"], indices = ["i32", "i64"], width = ["1024", "2048", "3072", "4096", "5376", "6144", "7168", "8192"], block = ["1024", "2048", "4096", "8192"], epsilon = ["0x358637bd", "0x3727c5ac"], gate_stride = ["0", "1024", "2048", "3072", "4096", "5376", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152"], shift_stride = ["1024", "2048", "3072", "4096", "5376", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152"], scale_stride = ["1024", "2048", "3072", "4096", "5376", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152"], update = ["true", "false"], retain = ["true", "false"] }
+
+[parameters]

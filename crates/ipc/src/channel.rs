@@ -376,6 +376,15 @@ impl LocalWake {
         })
     }
 
+    /// The descriptor to poll for a pending wake.
+    fn poll_fd(&self) -> libc::pollfd {
+        libc::pollfd {
+            fd: self.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }
+    }
+
     /// Drains the descriptor and reports whether any wake had fired.
     fn take(&mut self) -> bool {
         let mut fired = false;
@@ -384,6 +393,64 @@ impl LocalWake {
             fired = true;
         }
         fired
+    }
+}
+
+/// A local wake that is not tied to a connection.
+///
+/// The owner of a loop (a control thread, a pool's worker) waits on
+/// [`Waker::wait`]; every thread that has the [`Wake`] it hands out ends that
+/// wait by firing it, and the loop then reads the state the firing thread
+/// changed. Unlike a [`Channel`], nothing is ever sent over it: its descriptor's
+/// unread bytes are the only state, so a firing is either consumed by the wait
+/// that is running or left readable for the next one.
+pub struct Waker {
+    local: LocalWake,
+}
+
+impl Waker {
+    /// A waker with no firing pending.
+    pub fn new() -> IpcResult<Self> {
+        Ok(Self {
+            local: LocalWake::new()?,
+        })
+    }
+
+    /// A handle that fires this waker, for any thread.
+    pub fn wake(&self) -> Wake {
+        self.local.wake.clone()
+    }
+
+    /// The descriptor a caller that polls several sources itself includes: it
+    /// is readable while a firing is pending.
+    pub fn poll_fd(&self) -> libc::pollfd {
+        self.local.poll_fd()
+    }
+
+    /// Drains a pending firing, whether or not it ended a wait.
+    pub fn drain(&mut self) {
+        self.local.take();
+    }
+
+    /// Blocks until a wake fires or `timeout` passes, and reports which.
+    pub fn wait(&mut self, timeout: Duration) -> IpcResult<bool> {
+        if self.local.take() {
+            return Ok(true);
+        }
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            let mut descriptors = [self.local.poll_fd()];
+            let remaining = deadline.map(|deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            wait_ready(&mut descriptors, remaining)?;
+            if self.local.take() {
+                return Ok(true);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(false);
+            }
+        }
     }
 }
 
