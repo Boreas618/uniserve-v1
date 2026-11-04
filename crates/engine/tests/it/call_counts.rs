@@ -356,22 +356,28 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
 
     // The trial asks the decision set once on the state that exists now - a
     // `dispatch` and no `observe`, since observing a step's events is the step's
-    // - and the instance a switchover adopts is the trial's candidate, so before
-    // the first step the serving instance has been asked exactly that.
+    // - and the instance a switchover adopts is the trial's candidate. So the
+    // serving instance's life is one instantiation, one evaluation, and one
+    // `observe` and `dispatch` per step it has taken since: stated as a relation
+    // between the counts, a step this world takes on its own does not change it.
     install(&handle, &serving);
     let installed = reached(&handle, 0);
-    assert_eq!(installed.step, 0, "no step ran before the first request");
     let usage = installed.usage.expect("the policy has served");
-    assert_eq!(usage.decisions.calls(Call::Init), 1, "the trial's init");
-    assert_eq!(
-        usage.decisions.calls(Call::Dispatch),
-        1,
-        "the trial's one evaluation of the decision set"
-    );
+    assert_eq!(usage.decisions.calls(Call::Init), 1, "one instantiation");
     assert_eq!(
         usage.decisions.calls(Call::Observe),
-        0,
-        "the trial observes no step, because it is not one"
+        installed.step,
+        "one observe per step and none anywhere else"
+    );
+    assert_eq!(
+        usage.decisions.calls(Call::Dispatch),
+        installed.step + 1,
+        "one dispatch per step, the trial's one evaluation beside them"
+    );
+    assert_eq!(
+        usage.decisions.calls(Call::Limits),
+        1,
+        "the limits are declared once in an instance's life"
     );
 
     // Requests make the world step. Under a policy that traps on a breach, a
@@ -410,12 +416,12 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     assert_eq!(
         usage.decisions.calls(Call::Observe),
         progress.step,
-        "one observe per step, and none anywhere else"
+        "still one observe per step, and none anywhere else"
     );
     assert_eq!(
         usage.decisions.calls(Call::Dispatch),
         progress.step + 1,
-        "one dispatch per step, the trial's one evaluation beside them"
+        "still one dispatch per step, the trial's evaluation beside them"
     );
     assert_eq!(
         usage.calls,
