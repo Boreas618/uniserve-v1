@@ -372,6 +372,56 @@ impl EngineClient {
         Ok((stream, scheduler))
     }
 
+    /// Takes one request's event stream over from the connection that
+    /// consumed it, going on after the `consumed` events that response took
+    /// (design `specs/worker.md` §7.5.1 step 4): a hot restart's successor
+    /// attaches to a request the engine kept running, which is neither
+    /// cancelled nor submitted again.
+    ///
+    /// The local receiver is registered before the command is sent, so the
+    /// engine's replay of the events after `consumed` reaches the returned
+    /// stream even if it arrives first. The engine sends no acceptance for a
+    /// takeover: the request is already admitted.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the engine serves no requests.
+    pub fn take_over(&self, request: RequestId, consumed: u64) -> Result<EventStream, SubmitError> {
+        if let EngineState::Failed(reason) = self.state() {
+            return Err(SubmitError::Unavailable(reason));
+        }
+        if self.state() == EngineState::Closed {
+            return Err(SubmitError::Unavailable("its process ended".to_owned()));
+        }
+        let (events, receiver) = mpsc::unbounded_channel();
+        lock(&self.shared.requests).insert(
+            request,
+            Pending {
+                events,
+                accepted: None,
+            },
+        );
+        let stream = EventStream {
+            id: request,
+            events: receiver,
+            shared: Some(Arc::clone(&self.shared)),
+            // The event stream the predecessor consumed already told the
+            // engine whether the request awaits its decoder.
+            awaits_decoder: false,
+            text_tokens: 0,
+            acknowledged: consumed as usize,
+            consumed,
+            reported: consumed,
+            open: true,
+            on_finish: None,
+        };
+        self.shared.command(
+            request,
+            wire::command::Kind::Takeover(wire::Takeover { events: consumed }),
+        );
+        Ok(stream)
+    }
+
     /// Promotes a prepared engine, which succeeds a parked one: its workers
     /// adopt the predecessor's cache flags, and it imports `index`, the
     /// predecessor's prefix cache index, and serves the requests the

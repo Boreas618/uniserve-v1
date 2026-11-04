@@ -1,8 +1,12 @@
-# The qk_norm_rope operator's triton backend: design 5.2's program package.
+# The qk_norm_rope operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program normalizes and rotates every query and key head of `rows` tokens;
+# the token count is a launch value and the head geometry is the descriptor's.
+# `block` is the head width the program loads in one tile, so a descriptor's
+# block must cover `head_dim`.
 
 op = "qk_norm_rope"
 backend = "triton"
@@ -25,8 +29,8 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16"], head_dim = ["128"], q_heads = ["32"], k_heads = ["4"], factors = ["fp32"], rounding = ["once", "stepwise"], layout = ["tokens_heads"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8"], k_heads = ["4", "8", "2", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"] }
 
 [parameters]
-eps = 1e-06

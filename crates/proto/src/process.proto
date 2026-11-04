@@ -31,7 +31,17 @@ message Hello {
     Join join = 4;
     // An engine process asking the leader to supervise its processes.
     Engine engine = 5;
+    // A frontend process of the deployment, which the daemon commands down
+    // this connection (minor 4).
+    Frontend frontend = 6;
   }
+}
+
+// A frontend process of a deployment: the application on the leader node,
+// which the leader's daemon starts and commands (`Serve`, `Drain`, `Pause`).
+message Frontend {
+  // The deployment: the served model name.
+  string deployment = 1;
 }
 
 // A daemon of another node joining the leader.
@@ -287,7 +297,253 @@ message LedgerReport {
 message Event {
   oneof kind {
     Exit exit = 1;
+    // A command for the main process of one epoch (minor 4).
+    Command command = 2;
   }
+}
+
+// A program: the backend that fills an operator or the scheduling interface,
+// the revision of its package the upstream Program Server numbered, and its
+// parameters (`specs/worker.md` §5.1). The Rust type is `crates/program-server`'s
+// `Program`; this is only its wire form, which the daemon records and sends.
+message Program {
+  // The backend's name, from the configuration field that selects it.
+  string backend = 1;
+  // The revision the upstream Program Server gave the package: the same
+  // content on every host, and never overwritten.
+  uint32 revision = 2;
+  // The program's parameters as TOML key/value pairs: each value is the TOML
+  // representation of that parameter's configured value, so `chunked_prefill_size
+  // = 4096` arrives as `chunked_prefill_size = "4096"`. A main process of
+  // another build reads them back as TOML values.
+  map<string, string> arguments = 3;
+}
+
+// The phase of an operator's calls that a kernel program fills. An operator
+// is filled once for all its phases unless the configuration fills it per
+// phase, which attention allows (`prefill_attention_backend`,
+// `decode_attention_backend`, §5.2).
+enum PhaseKind {
+  PHASE_KIND_UNSPECIFIED = 0;
+  PHASE_KIND_PREFILL = 1;
+  PHASE_KIND_DECODE = 2;
+  PHASE_KIND_ENCODE = 3;
+  PHASE_KIND_DENOISE = 4;
+}
+
+// One operator's kernel program, or one phase's of it: the epoch record's
+// key is the operator and the phase, `phase` absent for every phase.
+message KernelProgram {
+  // The operator's name, as the `ops` crate names it.
+  string op = 1;
+  optional PhaseKind phase = 2;
+  Program program = 3;
+}
+
+// A command for the main process of one epoch, from the daemon that manages
+// it. Commands go only downward: the main process reports on `Upstream`'s
+// `Report` and never commands the daemon (`specs/worker.md` §2.3).
+message Command {
+  oneof kind {
+    // Park every request at a step boundary and execute nothing more: a
+    // standby that mapped its weights read-only, captured its graphs on
+    // scratch and is ready to be promoted (§2.5, §7.4).
+    Park park = 1;
+    // Promote this parked standby in place, on the addresses its graphs
+    // already use: map the storage it mapped read-only writable and serve
+    // (§2.5).
+    Promote promote = 2;
+    // Prepare the next generation of kernels and the next scheduling policy
+    // while serving: resolve and load the modules, instantiate the policy on
+    // the current snapshot and trial every decision, rebind or recapture the
+    // graphs, and run the shadow execution of every replaced operator
+    // (§7.3 step 2). Answered with `Report::Precopied` when it succeeded.
+    Precopy precopy = 3;
+    // Use generation `generation` from the next batch boundary: rebind the
+    // graphs or point at the recaptured ones, and switch the scheduling
+    // policy (§7.3 step 3).
+    Switchover switchover = 4;
+    // End the probation: the previous generation is the last resort no
+    // longer (§7.3 step 5).
+    Commit commit = 5;
+    // Return to the previous generation: the reverse of the switchover
+    // (§7.3 step 5).
+    Revert revert = 6;
+    // Drop everything older than `generation` once no batch uses it: rebind
+    // or destroy the graphs that still reference the old kernels, whose last
+    // reference then unloads their libraries (§7.3 step 6).
+    Purge purge = 7;
+    // Stop admitting to the frontend, end the requests in flight as
+    // migratable at their step boundary with their facts kept, and report
+    // `Report::Drained` (§2.3, §7.4 step 2).
+    Drain drain = 8;
+    // Epoch `epoch` serves from now on: the frontend submits to the main
+    // process at `requests` and resubmits the facts the drain kept (§2.3,
+    // §7.4 step 2).
+    Serve serve = 9;
+    // Hold or release the frontend's admissions, the `/admin/pause_generation`
+    // gate, without ending any request (§2.3).
+    Pause pause = 10;
+  }
+}
+
+// The programs an epoch's main process is to switch to: one kernel program
+// per operator (and, for attention, per phase), and the scheduling policy.
+message Precopy {
+  repeated KernelProgram kernels = 1;
+  Program policy = 2;
+  // The generation this precopy prepares; `Report::Precopied` echoes it, so
+  // a daemon matches an answer to the epoch it was preparing. The main
+  // process's own counter is not a substitute: the number is the daemon's.
+  uint64 generation = 3;
+}
+
+message Park {}
+message Promote {}
+
+message Switchover {
+  uint64 generation = 1;
+}
+
+message Commit {}
+
+// Return to the previous generation: the reverse of the switchover (§7.3
+// step 5). The reason is the main process's own account of why, such as the
+// first error of a probation; empty when the daemon states none.
+message Revert {
+  string reason = 1;
+}
+
+message Purge {
+  uint64 generation = 1;
+}
+
+message Drain {
+  uint64 epoch = 1;
+}
+
+message Serve {
+  uint64 epoch = 1;
+  // The main process's request socket, `unix:<path>` or `host:port`.
+  string requests = 2;
+}
+
+message Pause {
+  bool paused = 1;
+}
+
+// What a daemon tells an engine, unasked: a report of one epoch's main
+// process (§7.3). The design names `Precopied`, `PolicyReverted` and the
+// switchover's, commit's, revert's and purge's answers; the acks and the
+// fault reports are what lets the daemon apply the probation's rules and
+// record the first error that marks an update unavailable (§7.3 step 4,
+// §7.2).
+message Report {
+  oneof kind {
+    // `Precopy` succeeded: generation `generation` is ready for the
+    // switchover.
+    Precopied precopied = 1;
+    // The scheduling policy failed after a commit: the main process
+    // reinstantiated the previous policy on the current snapshot, and the
+    // daemon's record takes it back.
+    PolicyReverted policy_reverted = 2;
+    // `Switchover` took effect at the batch boundary: generation
+    // `generation` executes from now on (§7.3 step 3).
+    Switched switched = 3;
+    // `Commit` took effect: the previous generation is no longer kept
+    // (§7.3 step 5).
+    Committed committed = 4;
+    // `Revert` took effect: the previous generation executes again, and the
+    // reason is the main process's own account of why.
+    Reverted reverted = 5;
+    // `Purge` took effect: no batch or graph uses a generation older than
+    // `generation` (§7.3 step 6).
+    Purged purged = 6;
+    // A job ran past half the watchdog timeout in an executor (§2.4).
+    Stalled stalled = 7;
+    // A failure the main process itself observed, such as an error that
+    // makes an executor unusable (§7.3 step 4).
+    Fault fault = 8;
+    // The precopy failed: the new generation was not loaded, trialled or
+    // prepared, and is dropped; service goes on with the current one (§7.3
+    // step 2, "preparation or precopy failed"). A revert condition of §7.3
+    // step 4 only when it happens during a probation.
+    PrecopyFailed precopy_failed = 9;
+    // The main process computed non-finite logits for `request` (§7.3 step
+    // 4), which rolls the epoch back.
+    NonFiniteLogits non_finite_logits = 10;
+    // The frontend drained epoch `epoch`: it admits nothing, and the facts
+    // of the requests in flight are kept for `Serve` (§2.3, §7.4 step 2).
+    Drained drained = 11;
+  }
+}
+
+message Precopied {
+  uint64 generation = 1;
+}
+
+// The scheduling policy failed (§4.4): the main process reinstantiated the
+// previous policy on the current snapshot. During a probation this marks the
+// update unusable with this, the first error; after a commit with `fatal`
+// set, no previous policy module is left and the daemon treats it as the
+// main process's failure (§7.3).
+message PolicyReverted {
+  // The scheduler thread whose policy call failed; absent for the route
+  // instance the engine's control thread runs.
+  optional uint32 scheduler = 1;
+  string backend = 2;
+  uint32 revision = 3;
+  string reason = 4;
+  bool fatal = 5;
+}
+
+message Switched {
+  uint64 generation = 1;
+}
+
+message Committed {}
+
+message Reverted {
+  string reason = 1;
+}
+
+message Purged {
+  uint64 generation = 1;
+}
+
+// A job ran past half the watchdog timeout in an executor (§2.4): the epoch
+// it belongs to, the executor's batch (not a scheduler step), the job kind
+// and how long it has run. `job` is one of `forward`, `replay`, `capture`,
+// `rebind`, `copy`, `fence`; a string rather than an enum keeps the
+// executor's kinds extensible without a protocol revision, and a daemon of
+// another build records what its main process says.
+message Stalled {
+  uint64 generation = 1;
+  string batch = 2;
+  string job = 3;
+  uint64 elapsed_ms = 4;
+}
+
+// A fatal condition the main process observed (§7.3 step 4). `kind` is one
+// of `sticky`, `illegal_address`, `launch_failed`, `out_of_memory`,
+// `process_exit`; `device` the CUDA ordinal it happened on, when it names
+// one; `reason` the driver's message.
+message Fault {
+  string kind = 1;
+  string reason = 2;
+  uint32 device = 3;
+}
+
+message PrecopyFailed {
+  string reason = 1;
+}
+
+message NonFiniteLogits {
+  string request = 1;
+}
+
+message Drained {
+  uint64 epoch = 1;
 }
 
 // A supervised process exited.
@@ -304,6 +560,8 @@ message Exit {
 message Upstream {
   oneof kind {
     Request request = 1;
+    // The main process's report of its own state, unasked (minor 4).
+    Report report = 2;
   }
 }
 

@@ -44,9 +44,16 @@ pub(crate) struct AdminEvent {
     pub seq: u64,
     /// Seconds since the Unix epoch.
     pub time: f64,
-    /// `operation`, `engine` or `deployment`.
+    /// The event's category: `operation`, `engine`, `deployment` or
+    /// `config`.
     pub kind: String,
     pub message: String,
+    /// What the event carries beyond its message, always present: `{}` when
+    /// it carries nothing. An update's phase is `phase` here, beside the
+    /// update's number and the epoch it moved, so a reader of the log reads
+    /// the phase from the data and the category from `kind`.
+    #[serde(default)]
+    pub data: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A write operation: running, or the last one that ended.
@@ -163,6 +170,39 @@ impl Admin {
             time: now(),
             kind: kind.to_owned(),
             message: message.into(),
+            data: serde_json::Map::new(),
+        });
+        drop(events);
+        self.appended.notify_waiters();
+    }
+
+    /// Appends an update's phase event (§7.2, §7.3): a `deployment` event
+    /// whose `data` names the phase, the update and the epoch it moved,
+    /// beside whatever else the phase knows.
+    pub(crate) fn update_event(
+        &self,
+        update: u64,
+        phase: crate::epoch::Phase,
+        epoch: u64,
+        extra: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
+    ) {
+        let mut data = serde_json::Map::new();
+        data.insert("phase".to_owned(), serde_json::Value::from(phase.as_str()));
+        data.insert("update".to_owned(), serde_json::Value::from(update));
+        data.insert("epoch".to_owned(), serde_json::Value::from(epoch));
+        for (key, value) in extra {
+            data.insert(key.to_owned(), value);
+        }
+        let mut events = locked(&self.events);
+        if events.len() == EVENT_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(AdminEvent {
+            seq: self.next_event.fetch_add(1, Ordering::Relaxed),
+            time: now(),
+            kind: "deployment".to_owned(),
+            message: format!("update {update}: {}", phase.as_str()),
+            data,
         });
         drop(events);
         self.appended.notify_waiters();

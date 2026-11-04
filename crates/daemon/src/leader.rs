@@ -963,6 +963,61 @@ impl Leader {
         Ok(self.stats(request_id, started, core, output))
     }
 
+    /// Submits one generation request and returns what its handoffable body
+    /// is built from: the request's engine events, the pipeline that produces
+    /// its output, how long it took to reach the engine, and the recorder of
+    /// its statistics.
+    ///
+    /// The caller drives the body one engine event at a time
+    /// (`output::run::GenerationRun`), so the response can stop at an engine
+    /// event boundary and go on in a successor (design `specs/worker.md`
+    /// §7.5.1).
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::generate`] does.
+    pub(crate) async fn generate_handed(
+        &self,
+        request: GenerateRequest,
+    ) -> Result<
+        (
+            RequestEvents,
+            crate::output::OutputParams,
+            u64,
+            crate::metrics::stats::RequestOutcome,
+        ),
+        ServeError,
+    > {
+        let started = Instant::now();
+        let request_id = request.request_id.clone();
+        let image_urls = match &request.prompt {
+            Prompt::Chat(chat) if self.processor.supports_image_input() => chat.image_urls(),
+            _ => Vec::new(),
+        };
+        let images = self
+            .images
+            .fetch_images(image_urls)
+            .await
+            .map_err(|error| ServeError::ImageInput {
+                request_id: request_id.clone(),
+                index: error.index,
+                source: error.source,
+            })?;
+        let processor = Arc::clone(&self.processor);
+        let (request, output) =
+            preprocess(&request_id, move || processor.preprocess(request, images)).await?;
+
+        let compile_us = elapsed_us(started);
+        let (events, core) = self.submit(request.into()).await?;
+        let labels = EngineLabels {
+            model_name: self.model_name.clone(),
+            engine: core,
+        };
+        let log = self.log_requests.then_some(request_id);
+        let outcome = crate::metrics::stats::RequestOutcome::new(labels, started, log);
+        Ok((events, output, compile_us, outcome))
+    }
+
     /// Fetches, probes and plans a video request's media, presents its
     /// prompt, and streams its output.
     ///

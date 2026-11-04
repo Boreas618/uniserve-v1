@@ -9,7 +9,7 @@ import _compile
 import embedding as kernels
 
 #: The vocabulary weight's dtype, and the output row's.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 #: Token id dtypes: a fused embedding table arrives as int32 or int64 ids.
 IDS = {"i32": "i32", "i64": "i64"}

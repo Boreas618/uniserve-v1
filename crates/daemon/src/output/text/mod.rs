@@ -4,6 +4,7 @@
 //! which `output::assembly` consumes; `logprobs` converts engine token-ID
 //! candidates into decoded strings.
 
+pub(crate) use decoded::DecodeStream;
 pub use decoded::{
     DecodedTextEvent, Finished, ImageEvent, TextDecodeOptions, decoded_text_event_stream,
 };
