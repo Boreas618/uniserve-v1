@@ -410,8 +410,14 @@ fn stage_decode(args: &Args) -> Result<()> {
     // weights fails inside a publish and names a buffer rather than the plan. At a stated FP32 the
     // decoder is 9.7 GB, which no floor guessed here could cover (`--arena-gib` never sized it either:
     // that flag is the graph arena's).
-    let needed = resident_bytes(component, VideoDecoder::keys(&config.video_vae)?)?;
-    let mut weights = DeviceWeights::new(&device, needed)?;
+    let granularity =
+        u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
+    let needed = resident_bytes(
+        component,
+        VideoDecoder::keys(&config.video_vae)?,
+        granularity,
+    )?;
+    let mut weights = DeviceWeights::new(&device, needed, granularity)?;
     let (decoder, positions, rows) = {
         let mut loader = WeightLoader::new(component, &mut weights, None, None);
         let weight = loader.constant(
@@ -743,14 +749,26 @@ impl RetainedWeights for HostWeights {
 /// tensor is counted here and not published, and the sum is larger than the pool needs by those
 /// vectors. Erring larger is the only direction that is safe: a sum short of the weights is the
 /// failure this function exists to prevent.
-fn resident_bytes(component: &nn::Checkpoint, keys: Vec<String>) -> Result<u64> {
+fn resident_bytes(component: &nn::Checkpoint, keys: Vec<String>, granularity: u64) -> Result<u64> {
     let mut total = 0_u64;
     for key in keys {
+        // A weight-norm pair publishes one folded weight, whose bytes are the second tensor's: the
+        // gain is read and multiplied in, never stored, so counting it would reserve a block the
+        // loader never asks for - and pairs are the commonest thing in this component.
+        if key.ends_with(".weight_g") {
+            continue;
+        }
         let Some(location) = component.tensor(&key) else {
             // Absent names are the loader's to refuse, with the block that asks for them.
             continue;
         };
-        total += location.shape.numel() * u64::from(location.dtype.bits()) / 8;
+        let bytes = location.shape.numel() * u64::from(location.dtype.bits()) / 8;
+        // The pool hands out whole blocks, and a block is the request rounded up to the driver's
+        // granularity (`platform::pool::allocate_block`): 585 tensors each padded to that unit is the
+        // difference between the index's sum and what the pool needs, and on this device it is the
+        // 128 MiB the caller's stop reported rather than a rounding error. Counting the roundings is
+        // what makes this the pool's own number instead of a floor plus headroom.
+        total += bytes.max(1).next_multiple_of(granularity.max(1));
     }
     Ok(total)
 }
@@ -763,7 +781,7 @@ struct DeviceWeights {
 }
 
 impl DeviceWeights {
-    fn new(device: &platform::Device, requested: u64) -> Result<Self> {
+    fn new(device: &platform::Device, requested: u64, granularity: u64) -> Result<Self> {
         let budget = std::sync::Arc::new(NoLimit);
         let mut pools = platform::Allocator::new(device, budget)?;
         // The requested size is the weights' own; a zero request - a caller that did not measure -
@@ -790,7 +808,8 @@ impl DeviceWeights {
             )
         })?;
         println!(
-            "resident pool: {} MiB needed (the index), {} MiB reserved{}",
+            "resident pool: {} MiB needed (the index, each tensor rounded to the {granularity} B block \
+             granularity), {} MiB reserved{}",
             requested >> 20,
             reserved >> 20,
             if reserved < requested {
@@ -839,7 +858,22 @@ impl RetainedWeights for DeviceWeights {
     ) -> nn::Result<Backing> {
         let buffer = self
             .pools
-            .allocate(platform::PoolKind::Resident, bytes.len())?;
+            .allocate(platform::PoolKind::Resident, bytes.len())
+            .map_err(|source| {
+                // The pool's own message names a byte count and nothing else. Which tensor, how big,
+                // and how far the sum had got is what makes the next short reservation a repair
+                // instead of a guess: the index's sum under-counts a tensor the loader synthesizes,
+                // and this line says which one when it happens.
+                nn::Error::Checkpoint {
+                    path: key.to_string().into(),
+                    problem: format!(
+                        "publishing this weight ({dtype} {shape}, {request} bytes) would reach \
+                         {total} bytes of the resident pool: {source}",
+                        request = bytes.len(),
+                        total = self.bytes + bytes.len() as u64,
+                    ),
+                }
+            })?;
         // The publish is synchronous with respect to the host: the copy is issued on the device's
         // default stream and waited on before the backing is handed out, because the loader keeps no
         // stream and a later launch may use another one.
