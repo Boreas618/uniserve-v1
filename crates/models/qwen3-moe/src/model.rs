@@ -526,6 +526,72 @@ impl Qwen3Moe {
                 plan.hidden
             )));
         }
+        self.walk(f, batch, cache, hidden, last, None)
+            .map(|(out, _)| out)
+    }
+
+    /// Run layers `0..=layer` and stop inside `layer` after `stage`, answering what it wrote there.
+    ///
+    /// The prefix is run in full, so the layer's residual stream and every operand are the ones the
+    /// whole run hands it: an in-layer walk whose prefix differed from the model's would answer a
+    /// question about a model nobody runs. `stage = Mlp` is [`Self::forward_through`] for the same
+    /// layer, which is what makes this a refinement of the layer walk and not a second path.
+    pub fn forward_substage(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        hidden: TensorView,
+        layer: usize,
+        stage: Substage,
+    ) -> Result<TensorView> {
+        self.walk(f, batch, cache, hidden, layer, Some(stage))
+            .map(|(out, _)| out)
+    }
+
+    /// Run layers `0..=last`, or `0..last` and then `last` up to `tail`, and answer the rows the
+    /// last run wrote together with the residual stream as it then stands.
+    ///
+    /// One loop serves the whole run, the layer walk and the in-layer walk. Three loops that
+    /// reserve the same buffers and add the residual in the same order are three chances to
+    /// disagree about the layer equations, and a bisection whose prefix differs from the model it
+    /// bisects answers nothing.
+    fn walk(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        hidden: TensorView,
+        last: usize,
+        tail: Option<Substage>,
+    ) -> Result<(TensorView, TensorView)> {
+        let tokens = batch.tokens();
+        let plan = self.plan(tokens)?;
+        if last >= self.layers.len() {
+            return Err(Error::Config(format!(
+                "layer {last} was asked for but the model has {}",
+                self.layers.len()
+            )));
+        }
+        if hidden.shape.rank() != 2
+            || hidden.shape.dim(0) != tokens
+            || hidden.shape.dim(1) != plan.hidden
+        {
+            return Err(Error::Config(format!(
+                "hidden is {:?}, [{tokens}, {}] expected",
+                hidden.shape.dims(),
+                plan.hidden
+            )));
+        }
+        if hidden.dtype != self.dtype {
+            return Err(Error::Config(format!(
+                "hidden is {}, the model is {}",
+                hidden.dtype, self.dtype
+            )));
+        }
+
+        // The two rotary factor tables are one forward's worth of trigonometry, shared by every
+        // layer: the positions and the head geometry do not change between them.
         let cosine = f
             .arena
             .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))?;
@@ -541,26 +607,27 @@ impl Qwen3Moe {
             // deep and the next layer is handed the same addresses, which is what a replayed graph
             // expects. The layer-independent buffers above were reserved before this mark.
             let mark = f.arena.mark();
-            layer.forward(
+            let out = layer.forward(
                 f,
-                    batch,
-                    cache,
-                    index,
-                    &buffers,
-                    residual,
-                    buffers.residual,
-                    cosine,
-                    sine,
-                    input,
+                batch,
+                cache,
+                index,
+                &buffers,
+                residual,
+                buffers.residual,
+                cosine,
+                sine,
+                input,
+                if index == last { tail } else { None },
             )?;
             f.arena.release(mark);
             // The first layer read the embedding in `hidden` and wrote the first sum into the
             // plan's residual region; from here on the stream lives there and every layer
             // accumulates it in place.
+            input = out;
             residual = buffers.residual;
-            input = buffers.update;
         }
-        Ok(input)
+        Ok((input, residual))
     }
 
     /// The model as the executor sees it: one causal-LM block named `backbone`.
@@ -599,6 +666,10 @@ impl DecoderLayer {
     /// `residual` and `residual_out` differ for the first layer only: its input residual is the
     /// caller's `hidden` — the embedding — while its output must land in the plan's residual
     /// region, where every later layer accumulates in place.
+    ///
+    /// `stop` cuts the layer short for an in-layer walk and answers the tensor that cut produces;
+    /// the sublayers it skips are not launched at all. With `stop = None` the answer is `update`,
+    /// the layer's output.
     #[allow(
         clippy::too_many_arguments,
         reason = "the layer runs the reference's tuple through the plan's buffers"
@@ -615,7 +686,8 @@ impl DecoderLayer {
         cosine: TensorView,
         sine: TensorView,
         hidden: TensorView,
-    ) -> Result<()> {
+        stop: Option<Substage>,
+    ) -> Result<TensorView> {
         let normalized = buffers.normalized;
         let update = buffers.update;
 
@@ -628,10 +700,16 @@ impl DecoderLayer {
                 .forward_with_residual(f, hidden, residual, residual, normalized)
                 .map_err(Error::from)?;
         }
+        if stop == Some(Substage::Normalized) {
+            return Ok(normalized);
+        }
 
         self.attention.forward(
             f, batch, cache, index, buffers, normalized, cosine, sine, update,
         )?;
+        if stop == Some(Substage::Attended) {
+            return Ok(update);
+        }
 
         self.post_attention_norm
             .forward_with_residual(f, update, residual, residual_out, normalized)
@@ -640,7 +718,8 @@ impl DecoderLayer {
         match &self.mlp {
             Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from),
             Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update),
-        }
+        }?;
+        Ok(update)
     }
 }
 
@@ -764,6 +843,53 @@ fn headed(projection: TensorView, norm: &Weight) -> Result<Shape> {
     Ok(Shape::new(&[rows, columns / head_dim, head_dim]))
 }
 
+/// How far through one layer an in-layer walk goes.
+///
+/// A whole-run bisection answers which *layer* diverges; a layer is four operators deep and its
+/// output alone cannot say which of them. These are the three cuts a layer can be stopped at, in
+/// the order the layer runs them, each naming the tensor the reference's module holds at that point:
+///
+/// - [`Substage::Normalized`] is `input_layernorm`'s output, residual add included for every layer
+///   after the first (the first's input residual is the embedding itself);
+/// - [`Substage::Attended`] is `self_attn`'s output, projected out and **before** the residual add;
+/// - [`Substage::Mlp`] is the routed (or dense) block's output, which is the layer's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Substage {
+    /// The residual add and the input normalization.
+    Normalized,
+    /// The attention block's projection out, before the residual add.
+    Attended,
+    /// The routed (or dense) block, whose output is the layer's output.
+    Mlp,
+}
+
+impl Substage {
+    /// Every arm with its spelling, in the order a layer runs them.
+    ///
+    /// The spellings are the contract with a command line that names a stage: the model refuses
+    /// anything else, so a mistyped stage cannot silently run a different cut.
+    pub const NAMES: [&'static str; 3] = ["normalized", "attended", "mlp"];
+
+    /// The stage `name` asks for, or `None` when it names no cut.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "normalized" => Some(Self::Normalized),
+            "attended" => Some(Self::Attended),
+            "mlp" => Some(Self::Mlp),
+            _ => None,
+        }
+    }
+
+    /// The spelling of this stage, one of [`Self::NAMES`].
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normalized => "normalized",
+            Self::Attended => "attended",
+            Self::Mlp => "mlp",
+        }
+    }
+}
+
 impl CausalLm for Qwen3Moe {
     fn embed_input_ids(&self, f: &Forward, ids: TensorView, out: TensorView) -> nn::Result<()> {
         self.embedding
@@ -798,55 +924,21 @@ impl CausalLm for Qwen3Moe {
             ))));
         }
 
-        // The two rotary factor tables are one forward's worth of trigonometry, shared by every
-        // layer: the positions and the head geometry do not change between them.
-        let cosine = f
-            .arena
-            .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))
-            .map_err(Error::from)
+        // The rotary tables, the buffers and the residual stream are `walk`'s to reserve: the whole
+        // run and a bisection must share one loop, or the bisection measures a different model.
+        let last =
+            self.layers.len().checked_sub(1).ok_or_else(|| {
+                capability(Error::Config("the model has no decoder layer".into()))
+            })?;
+        let (input, residual) = self
+            .walk(f, batch, cache, hidden, last, None)
             .map_err(capability)?;
-        let sine = f
-            .arena
-            .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))
-            .map_err(Error::from)
-            .map_err(capability)?;
-        self.factors(f, batch.positions, cosine, sine)
-            .map_err(capability)?;
-        let buffers = Buffers::reserve(f.arena, &plan, self.dtype).map_err(capability)?;
 
-        // The residual stream is the embedding's output for the first layer; every later layer's
-        // pre-norm adds the previous layer's output into it.
-        let mut residual = hidden;
-        let mut input = hidden;
-        for (index, layer) in self.layers.iter().enumerate() {
-            // As in `forward_through`: the step's scratch is one layer's and is reused as the loop
-            // advances.
-            let mark = f.arena.mark();
-            layer
-                .forward(
-                    f,
-                    batch,
-                    cache,
-                    index,
-                    &buffers,
-                    residual,
-                    buffers.residual,
-                    cosine,
-                    sine,
-                    input,
-                )
-                .map_err(capability)?;
-            f.arena.release(mark);
-            // The first layer read the embedding in `hidden` and wrote the first sum into the
-            // plan's residual region; from here on the stream lives there and every layer
-            // accumulates it in place.
-            residual = buffers.residual;
-            input = buffers.update;
-        }
-
-        // The output norm: normalize the last layer's output with the summed residual.
+        // The output norm: the last layer's output added into the residual stream and normalized.
+        // The sum lands back in the stream, which is the last thing this forward needs from it, and
+        // `add_rms_norm` loads a whole row before storing any of it, so the alias is safe.
         self.norm
-            .forward_with_residual(f, input, residual, buffers.normalized, hidden)
+            .forward_with_residual(f, input, residual, residual, hidden)
             .map_err(Error::from)
             .map_err(capability)
     }
@@ -914,6 +1006,25 @@ impl std::fmt::Debug for Qwen3Moe {
 
 #[cfg(test)]
 mod tests {
+    /// The stage spellings are the contract with a command line: every name parses back to the
+    /// stage it names, in the layer's own order, and a name that is not one of them answers nothing
+    /// rather than a default. A bisection that silently ran a different cut would report the wrong
+    /// operator with full confidence.
+    #[test]
+    fn a_substage_name_round_trips_and_anything_else_is_refused() {
+        for (index, name) in Substage::NAMES.iter().enumerate() {
+            let stage = Substage::parse(name).expect("a declared name parses");
+            assert_eq!(stage.name(), *name);
+            assert_eq!(Substage::NAMES[index], stage.name());
+        }
+        assert_eq!(Substage::parse("normalized"), Some(Substage::Normalized));
+        assert_eq!(Substage::parse("attended"), Some(Substage::Attended));
+        assert_eq!(Substage::parse("mlp"), Some(Substage::Mlp));
+        for refused in ["", "norm", "Normalized", "attention", "attn", "moe", "mlp "] {
+            assert_eq!(Substage::parse(refused), None, "{refused:?} named no cut");
+        }
+    }
+
     use super::*;
     use crate::Activation;
 

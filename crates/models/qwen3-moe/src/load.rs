@@ -788,7 +788,10 @@ pub fn rotary_recipe(config: &Config) -> Result<(Vec<f32>, f32)> {
         (None, ..) => yarn_mscale(factor, mscale),
     };
     let attention = attention as f32;
-    Ok((frequencies, (f64::from(attention * attention) / denominator) as f32))
+    Ok((
+        frequencies,
+        (f64::from(attention * attention) / denominator) as f32,
+    ))
 }
 
 /// transformers' `_yarn_get_mscale`.
