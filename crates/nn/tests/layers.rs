@@ -8,7 +8,7 @@
 
 use nn::{
     DType, DevicePtr, FrameNormPad, Linear, ModulatedRmsNorm, Rotary, Rotation, ScaledResidual,
-    ScaledResidualRmsNorm, Shape, SwiGlu, TensorView, Weight, WeightedRmsNorm,
+    ScaledResidualRmsNorm, Shape, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -135,4 +135,37 @@ fn the_frame_normalization_states_its_layout_and_its_affine_pair() {
     );
     assert!(FrameNormPad::new(32, Some(weight(&[64])), Some(weight(&[64])), false).is_ok());
     assert!(FrameNormPad::new(32, None, None, true).is_ok());
+}
+
+#[test]
+fn the_tile_selection_needs_a_whole_tile_and_a_pair_of_rotated_features() {
+    // The programmes handle BLOCK_ROWS rows at a time, so a tile must be a whole number of them.
+    assert!(VsaTiles::new(64, 8, 128, 1e-6).is_ok());
+    assert!(VsaTiles::new(40, 8, 128, 1e-6).is_err());
+    assert!(VsaTiles::new(64, 0, 128, 1e-6).is_err());
+
+    let layer = VsaTiles::new(64, 8, 128, 1e-6).unwrap();
+    assert_eq!(layer.tile_rows(), 64);
+    assert_eq!(layer.heads(), 8);
+    assert_eq!(layer.width(), 128);
+    assert!(
+        VsaTiles::new(64, 8, 128, 1e-6)
+            .unwrap()
+            .with_rotation(128)
+            .is_ok()
+    );
+    assert!(
+        VsaTiles::new(64, 8, 128, 1e-6)
+            .unwrap()
+            .with_rotation(127)
+            .is_err(),
+        "an odd rotation has no pair"
+    );
+    assert!(
+        VsaTiles::new(64, 8, 128, 1e-6)
+            .unwrap()
+            .with_rotation(256)
+            .is_err(),
+        "the rotation cannot be wider than the features"
+    );
 }
