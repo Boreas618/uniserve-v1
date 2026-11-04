@@ -55,8 +55,11 @@ pub struct Submissions {
 enum Path {
     /// Worker processes, over the ipc protocol.
     Workers(Box<dyn Executor>),
-    /// The device executor of this process (2.4).
-    InProcess(InProcess),
+    /// The device executor of this process (2.4). Boxed: the arm holds the
+    /// batch path, the waiting thread's two channels and the shadows, and a
+    /// scheduler built on the worker-process path should not carry that much
+    /// unused room.
+    InProcess(Box<InProcess>),
 }
 
 /// The mechanism over `executor::Batches`: this process's own devices.
@@ -80,6 +83,8 @@ struct InProcess {
     queue: crossbeam_channel::Sender<Pending>,
     /// Shadow submissions in flight: the executor reports their failure to the
     /// world's own update (7.3), so the mechanism only keeps them alive.
+    /// Read when a shadow completes; the update path is what submits them.
+    #[allow(dead_code)]
     shadows: Vec<Submission>,
 }
 
@@ -130,14 +135,14 @@ impl Submissions {
             })
             .map_err(|error| anyhow::anyhow!("starting the in-process waiting thread: {error}"))?;
         Ok(Submissions {
-            path: Path::InProcess(InProcess {
+            path: Path::InProcess(Box::new(InProcess {
                 batches,
                 info,
                 generation: 0,
                 ready,
                 queue,
                 shadows: Vec::new(),
-            }),
+            })),
         })
     }
 
@@ -208,7 +213,9 @@ impl Submissions {
     ///
     /// The failure of a shadow batch is the world update's, which the main
     /// process reports; the mechanism keeps the submission alive and reads
-    /// nothing from it.
+    /// nothing from it. Unused until the update path submits one: the door is
+    /// here so that the arm is complete, not so that a caller can be invented.
+    #[allow(dead_code)]
     pub(super) fn shadow(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         match &mut self.path {
             Path::Workers(_) => Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
@@ -382,6 +389,7 @@ impl InProcess {
             })
     }
 
+    #[allow(dead_code)]
     fn shadow(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         // A shadow batch has no call of its own to report: the passes are the
         // world update's paired forwards, served on the generation cells.
