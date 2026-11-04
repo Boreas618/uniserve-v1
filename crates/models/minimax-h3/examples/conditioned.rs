@@ -373,7 +373,7 @@ fn encode(args: &Args) -> Result<(), String> {
         conditions: std::slice::from_ref(&condition),
         vision_spans: &[],
     };
-    let (layout, _packing) = layouts.layout(&request).map_err(show)?;
+    let (layout, packing) = layouts.layout(&request).map_err(show)?;
 
     // The resident pool is sized by what this partition will publish - the checkpoint's own bytes
     // for the blocks it places - not by a default: a pool that cannot give out one more buffer is a
@@ -407,7 +407,10 @@ fn encode(args: &Args) -> Result<(), String> {
     let dtype = denoiser_dtype(&denoiser);
     let hidden = u64::from(dit.transformer.hidden_size);
     let source_width = u64::from(config.text_encoder.hidden_size);
-    let rows = u64::from(layout.text_rows + layout.condition_rows + 1);
+    // The prefix source's three regions, from the packing's own indices: the text capacity, then the
+    // condition rows, then one zero row. `zero_row` is the model's statement of where the last
+    // begins, so nothing here re-derives it.
+    let rows = u64::from(packing.zero_row()) + 1;
     println!(
         "loaded: {} is the deployment's element type, hidden {hidden}, text {} rows of capacity, \
          conditions {} rows of capacity, prefix {rows} rows",
@@ -678,14 +681,14 @@ fn encode(args: &Args) -> Result<(), String> {
             segment.audio_rows()
         ));
     }
-    let zero_base = ((rows - 1) * hidden) as usize;
+    let zero_base = (u64::from(packing.zero_row()) * hidden) as usize;
     let zero_nonzero = values[zero_base..zero_base + hidden as usize]
         .iter()
         .filter(|value| **value != 0.0)
         .count();
     readback.push_str(&format!(
         "zero row {}: {zero_nonzero} non-zero of {hidden}\n",
-        rows - 1
+        packing.zero_row()
     ));
     let text_nonzero = values[..(u64::from(layout.text_rows) * hidden) as usize]
         .iter()
@@ -775,7 +778,14 @@ fn encode(args: &Args) -> Result<(), String> {
         return Err(format!(
             "the prefix's zero row ({}) holds {zero_nonzero} non-zero values: a write reached past \
              the layout's condition capacity",
-            rows - 1
+            packing.zero_row()
+        ));
+    }
+    if text_nonzero == 0 {
+        return Err(format!(
+            "the prompt rows [0, {}) read as zeros after conditioning: the refiner wrote nothing \
+             into the prefix source the denoiser gathers from",
+            layout.text_rows
         ));
     }
     if non_zero == 0 {
