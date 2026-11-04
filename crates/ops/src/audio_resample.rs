@@ -307,6 +307,18 @@ fn expected_width(
             Ok(width * ratio)
         }
         Mode::Downsample => {
+            // The downsampler pads by the filter's own half-widths and by nothing else; a caller
+            // that sets `pad` here is describing the *upsampler*'s pad and would be silently
+            // ignored, so it is refused instead.
+            if pad != 0 {
+                return Err(Error::argument(
+                    operator,
+                    format!(
+                        "a downsample pads by {pad_left} and {pad_right} and takes no other pad, \
+                         found {pad}"
+                    ),
+                ));
+            }
             let padded = width + u64::from(pad_left) + u64::from(pad_right);
             if padded < kernel {
                 return Err(Error::argument(
@@ -387,6 +399,8 @@ mod tests {
             expected_width("audio_resample", Mode::Downsample, 200, 12, 2, 0, 5, 6).unwrap(),
             100
         );
+        // A downsample describes its own pads and takes no other.
+        assert!(expected_width("audio_resample", Mode::Downsample, 200, 12, 2, 5, 5, 6).is_err());
         // A span shorter than the filter has nothing to convolve.
         assert!(expected_width("audio_resample", Mode::Downsample, 4, 12, 2, 0, 5, 6).is_err());
     }
