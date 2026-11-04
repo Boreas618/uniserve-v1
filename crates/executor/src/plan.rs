@@ -323,6 +323,21 @@ impl Buckets {
         self.ascending.iter().copied().find(|bucket| bucket.holds(shape))
     }
 
+    /// The smallest captured bucket that holds `shape`, or a refusal naming the shape.
+    ///
+    /// 4.5's planning rule is this one lookup: a batch is planned into the smallest captured bucket
+    /// that holds it, because a larger bucket still produces correct tokens and only costs
+    /// throughput while a smaller one would corrupt them. A shape no bucket holds is refused where
+    /// it is planned - by name, with the shape and the variant - rather than clamped down to a
+    /// bucket that does not hold it, or grown into one that was never captured.
+    pub fn require(&self, shape: &Shape) -> Result<Bucket> {
+        self.select(shape).ok_or_else(|| {
+            Error::Invalid(format!(
+                "no captured bucket holds {shape}: the bucket plan and the batch disagree"
+            ))
+        })
+    }
+
     /// The buckets in capture order: largest first, so smaller captures reuse the graph pool's
     /// blocks of the larger ones.
     pub fn capture_order(&self) -> impl Iterator<Item = &Bucket> {
@@ -354,6 +369,79 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every shape a scheduler can hand in is planned into the **smallest** captured bucket that
+    /// holds it, derived independently by brute force over the captured set: a larger bucket still
+    /// produces correct tokens and costs throughput, a smaller one would corrupt them, so the rule
+    /// is checked for every row and token count of every variant, not at a few samples.
+    #[test]
+    fn every_shape_is_planned_into_the_smallest_bucket_that_holds_it() {
+        let buckets = Buckets::causal_lm(&[1, 8, 32], &[128, 512], true);
+        let captured: Vec<Bucket> = buckets.iter().copied().collect();
+        assert!(!captured.is_empty());
+        for &variant in &[
+            Variant::DecodeGreedy,
+            Variant::DecodeSampled,
+            Variant::PrefillWrite,
+            Variant::PrefillOutput,
+        ] {
+            for rows in 1..=32u32 {
+                for tokens in 1..=512u32 {
+                    let shape = Shape {
+                        rows,
+                        tokens,
+                        variant,
+                    };
+                    // Brute force: the smallest holder, sorted by (rows, tokens) like `select`'s
+                    // ascending order, computed here rather than taken from the code under test.
+                    let expected = captured
+                        .iter()
+                        .copied()
+                        .filter(|bucket| bucket.holds(&shape))
+                        .min_by_key(|bucket| (bucket.rows, bucket.tokens));
+                    assert_eq!(
+                        buckets.select(&shape),
+                        expected,
+                        "{shape} must be planned into its smallest holder"
+                    );
+                    // Whatever it picks does hold the shape, and nothing smaller does.
+                    let chosen = buckets.select(&shape).expect("the catalog covers this shape");
+                    assert!(chosen.holds(&shape), "{chosen} does not hold {shape}");
+                    for bucket in &captured {
+                        if bucket.holds(&shape) {
+                            assert!(
+                                bucket.rows > chosen.rows
+                                    || (bucket.rows == chosen.rows
+                                        && bucket.tokens >= chosen.tokens),
+                                "{bucket} is smaller than {chosen} for {shape}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A shape the plan does not cover is refused by name - with the shape and its variant - and
+    /// never clamped into a bucket that does not hold it or grown into one that was not captured.
+    #[test]
+    fn an_uncovered_shape_is_refused_by_name() {
+        let buckets = Buckets::causal_lm(&[1, 8], &[128], false);
+        // Beyond the largest captured token count of a prefill variant.
+        let long = Shape::prefill(1, 129, Variant::PrefillOutput);
+        let error = buckets.require(&long).expect_err("no bucket holds 129 tokens");
+        let message = error.to_string();
+        assert!(message.contains(&long.to_string()), "{message}");
+        assert!(message.contains("no captured bucket"), "{message}");
+        // Beyond the largest captured row count of a decode variant.
+        let wide = Shape::decode(9, Variant::DecodeGreedy);
+        assert!(buckets.select(&wide).is_none(), "no bucket holds 9 rows");
+        assert!(buckets.require(&wide).is_err());
+        // A variant the deployment never captured: a greedy-only build has no sampled bucket.
+        let sampled = Shape::decode(1, Variant::DecodeSampled);
+        assert!(buckets.select(&sampled).is_none());
+        assert!(buckets.require(&sampled).is_err());
+    }
 
     /// A forward is served by the smallest bucket that holds it, and never by a bucket of another
     /// variant.

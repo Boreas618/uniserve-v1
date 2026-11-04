@@ -11,9 +11,260 @@
 //! the model is told how many ranks the exchange runs over, and the layer that shards a tensor
 //! reads only the degree and the rank's position in it.
 
+use nn::{DType, VideoTask};
+
+use crate::checkpoint::TASK_DITS;
+use crate::denoiser::Arrangement;
 use crate::{Error, Result, config::Config};
 
-/// How one deployment splits the model.
+/// The text rows the released checkpoint's dense deployment holds: two 64-row units.
+pub const RELEASED_TEXT_ROWS: u32 = 128;
+
+/// The condition rows it holds: three 64-row units, nine images, three videos and two keyframes.
+pub const RELEASED_CONDITION_ROWS: u32 = 192;
+
+/// One block a deployment places, by the name its deployment file gives it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Component {
+    /// The Qwen3-VL text encoder and its vision tower.
+    TextEncoder,
+    /// The base DiT partition: `t2va` and `fl2va`.
+    Transformer,
+    /// The reference-conditioned DiT partition: `ref2va`.
+    TransformerRef,
+    /// The video VAE decoder and its RGB reconstruction.
+    VideoDecoder,
+    /// The audio VAE decoder, BigVGAN.
+    AudioDecoder,
+    /// Both condition encoders, which `ref2va` uses.
+    LatentEncoder,
+}
+
+impl Component {
+    /// This component's bit in [`Components`].
+    const fn bit(self) -> u8 {
+        match self {
+            Self::TextEncoder => 0,
+            Self::Transformer => 1,
+            Self::TransformerRef => 2,
+            Self::VideoDecoder => 3,
+            Self::AudioDecoder => 4,
+            Self::LatentEncoder => 5,
+        }
+    }
+
+    /// Every component a deployment may place.
+    pub const ALL: [Component; 6] = [
+        Component::TextEncoder,
+        Component::Transformer,
+        Component::TransformerRef,
+        Component::VideoDecoder,
+        Component::AudioDecoder,
+        Component::LatentEncoder,
+    ];
+
+    /// The component's name in the checkpoint and in a deployment file.
+    ///
+    /// This is the checkpoint's own naming - a directory under the pipeline root - not the name the
+    /// runner addresses the built block by; that is [`Component::block`].
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "text_encoder",
+            Self::Transformer => "transformer",
+            Self::TransformerRef => "transformer_ref",
+            Self::VideoDecoder => "video_decoder",
+            Self::AudioDecoder => "audio_decoder",
+            Self::LatentEncoder => "latent_encoder",
+        }
+    }
+
+    /// The checkpoint directories this component's weights come from.
+    ///
+    /// A VAE directory holds both halves of its VAE, so a decoder and the encoder beside it read
+    /// the same directory and each loads its own half.
+    pub const fn directories(self) -> &'static [&'static str] {
+        match self {
+            Self::TextEncoder => &["text_encoder"],
+            Self::Transformer => &["transformer"],
+            Self::TransformerRef => &["transformer_ref"],
+            Self::VideoDecoder => &["vae"],
+            Self::AudioDecoder => &["audio_vae"],
+            Self::LatentEncoder => &["vae", "audio_vae"],
+        }
+    }
+
+    /// The element type this block is declared to compute in when a deployment states none.
+    ///
+    /// The design's default `dtype = "auto"` converts nothing at load, so each block keeps the
+    /// checkpoint's own representation: BF16 for the text encoder and the DiT partitions, FP16 for
+    /// the video VAE decoder (`specs/worker.md` 1; the `quality` preset of
+    /// `uniserve/models/minimax_h3/precision.py`, which is that representation). This is the type a
+    /// block whose constructor takes one is *converted to*; a constructor that takes none keeps the
+    /// stored representation, so this value is informational for those blocks. The design names no
+    /// representation for the audio VAE or the condition encoders, so they are declared BF16 like
+    /// the blocks beside them and no conversion is made for them.
+    pub const fn activation(self) -> DType {
+        match self {
+            Self::VideoDecoder => DType::F16,
+            Self::TextEncoder
+            | Self::Transformer
+            | Self::TransformerRef
+            | Self::AudioDecoder
+            | Self::LatentEncoder => DType::BF16,
+        }
+    }
+
+    /// The name the runner addresses this block by.
+    ///
+    /// Blocks are addressed by the capability their runner serves, not by the checkpoint's
+    /// directories: both DiT partitions are the `Denoiser` block, so a rank that places either
+    /// serves the same media call. The engine's media calls name `denoiser`, `text_encoder`,
+    /// `video_decoder`, `audio_decoder` and `latent_encoder`, which is this list.
+    pub const fn block(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "text_encoder",
+            Self::Transformer | Self::TransformerRef => "denoiser",
+            Self::VideoDecoder => "video_decoder",
+            Self::AudioDecoder => "audio_decoder",
+            Self::LatentEncoder => "latent_encoder",
+        }
+    }
+
+    /// The component a deployment file names, when it names one of these.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|component| component.name() == name)
+    }
+}
+
+/// The largest request a deployment admits, as the counts that size its DiT.
+///
+/// The attention's scratch and the per-layer buffers of a DiT are allocated once at load, for the
+/// largest layout the deployment will serve, so these are capacities and not the request's own
+/// numbers: a request larger than them is refused rather than overrunning a table
+/// (specs/worker.md 9, `uniserve/models/minimax_h3/denoiser.py`). They belong to the loading
+/// boundary because serving capacity is the caller's decision, not the architecture's
+/// (`AGENTS.md`, Model Library Boundary).
+///
+/// `text_rows` and `condition_rows` are **rows**, and each is a whole number of the attention
+/// kind's capacity unit - 64 rows under dense attention, one VSA tile under sparse attention -
+/// which is also what `Denoiser::load`'s `Arrangement` takes. The released checkpoint's dense
+/// deployment is 128 text rows and 192 condition rows (two and three units: nine images, three
+/// videos and two keyframes at one unit each); under a 128-row tile the same deployment needs
+/// capacities in whole 128-row tiles instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Capacity {
+    /// Text rows every layout of this deployment holds, a whole number of capacity units.
+    pub text_rows: u32,
+    /// Condition rows it holds, a whole number of capacity units.
+    pub condition_rows: u32,
+    /// The largest frame count it serves.
+    ///
+    /// A layout's row count grows with the frames, so this is the frame count that sizes the
+    /// buffers; it is not aligned here, because `align_num_frames` lowers it to the legal
+    /// timeline the checkpoint serves.
+    pub frames: u32,
+}
+
+impl Capacity {
+    /// The padded row count of the largest layout this capacity can reach.
+    ///
+    /// Every canvas the DiT offers is packed at [`Capacity::frames`] and the largest padded row
+    /// count wins; that is the row bound the attention and the modulation tables are allocated
+    /// for. The packing's own rules refuse a canvas or a frame count they cannot serve, so a
+    /// capacity the checkpoint cannot reach is reported here rather than on the device.
+    pub fn rows(&self, config: &crate::config::DenoiserConfig) -> Result<u32> {
+        let unit = config.attention.capacity_rows();
+        let text = self.text_rows;
+        let condition = self.condition_rows;
+        let frames = crate::packing::align_num_frames(self.frames);
+        let mut largest = 0;
+        for canvas in config.offered_canvases() {
+            let packing = crate::packing::dense_packing(frames, canvas, text, condition, unit)?;
+            largest = largest.max(packing.padded_tokens);
+            // A sparse deployment packs by video tiles as well, and its segments pad the audio
+            // and the video up to whole tiles; the bound is the larger of the two plans at the
+            // same admission, so neither can overrun the scratch.
+            if let crate::config::AttentionKind::Sparse { tile, .. } = config.attention {
+                let segments =
+                    crate::packing::segment_packing(frames, canvas, text, condition, tile, tile)?;
+                largest = largest.max(segments.extent.padded_tokens);
+            }
+        }
+        if largest == 0 {
+            return Err(Error::config(
+                "the DiT offers no canvas, so no layout can be sized".to_owned(),
+            ));
+        }
+        Ok(largest)
+    }
+}
+
+/// The set of blocks one rank places.
+///
+/// A deployment places a handful of blocks out of six, so the set is a bit per block: it is `Copy`,
+/// which keeps [`Partition`] `Copy` and lets a layer hold the partition it was built for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Components(u8);
+
+impl Components {
+    /// Every block a deployment may place.
+    pub const ALL: Components = Components((1 << Component::ALL.len()) - 1);
+
+    /// No block.
+    pub const NONE: Components = Components(0);
+
+    /// The element type of the checkpoint's stored representation for the block, per the design's
+    /// `auto` default: the video VAE decoder is FP16 as stored, the rest BF16.
+    pub fn of(components: impl IntoIterator<Item = Component>) -> Self {
+        let mut set = Self::NONE;
+        for component in components {
+            set = set.with(component);
+        }
+        set
+    }
+
+    /// The set with `component` added.
+    pub const fn with(self, component: Component) -> Self {
+        Self(self.0 | 1 << component.bit())
+    }
+
+    /// The set without `component`.
+    pub const fn without(self, component: Component) -> Self {
+        Self(self.0 & !(1 << component.bit()))
+    }
+
+    /// Whether `component` is placed.
+    pub const fn contains(self, component: Component) -> bool {
+        self.0 & (1 << component.bit()) != 0
+    }
+
+    /// Whether no block is placed.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The blocks placed, in deployment order.
+    pub fn iter(self) -> impl Iterator<Item = Component> {
+        Component::ALL
+            .into_iter()
+            .filter(move |component| self.contains(*component))
+    }
+}
+
+impl FromIterator<Component> for Components {
+    fn from_iter<I: IntoIterator<Item = Component>>(components: I) -> Self {
+        Self::of(components)
+    }
+}
+
+/// How one deployment splits the model, and which of its blocks this rank places.
+///
+/// The partition is a deployment fact the epoch hands the model: the degrees and the rank's place
+/// in them, the blocks the rank holds, and the row arrangement the blocks are sized for. It is
+/// still only a mathematical description - the shard sets, the communicator, the buffers and the
+/// streams are the runner's (`AGENTS.md`, Model Library Boundary).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Partition {
     /// Ulysses sequence-parallel degree of the denoiser: the heads each rank attends and the
@@ -24,16 +275,121 @@ pub struct Partition {
     pub tensor_parallel: usize,
     /// This rank's position in the text encoder's tensor-parallel group.
     pub tensor_rank: usize,
+    /// The blocks this rank places.
+    ///
+    /// A base release holds both DiT partitions and a deployment places one; a rank that places
+    /// none holds nothing. The set is the deployment file's, not the checkpoint's.
+    pub blocks: Components,
+    /// Text rows every layout this deployment serves holds.
+    ///
+    /// A whole number of the attention kind's capacity units - 64 rows under dense attention, one
+    /// VSA tile under sparse attention - which is the rule the denoiser's `Arrangement` states.
+    /// The released checkpoint's dense deployment is 128 text rows (two units).
+    pub text_rows: u32,
+    /// Condition rows it holds, a whole number of the same units.
+    ///
+    /// The released checkpoint's dense deployment is 192 rows (three units: nine images, three
+    /// videos and two keyframes at one unit each). Under a 128-row tile the capacities must be
+    /// whole 128-row tiles instead, and a `ref2va` deployment's are set by the reference videos'
+    /// rows, not by the prompt.
+    pub condition_rows: u32,
 }
 
 impl Partition {
-    /// An unsharded deployment: one rank holds the whole model.
-    pub const fn single() -> Self {
+    /// An unsharded deployment: one rank holds every block, sized for the released checkpoint.
+    pub fn single() -> Self {
         Self {
             ulysses_degree: 1,
             tensor_parallel: 1,
             tensor_rank: 0,
+            blocks: Components::ALL.without(Component::TransformerRef),
+            text_rows: RELEASED_TEXT_ROWS,
+            condition_rows: RELEASED_CONDITION_ROWS,
         }
+    }
+
+    /// The blocks a deployment serving `task` places over a checkpoint holding `config`.
+    ///
+    /// A server places **one** DiT partition, so the task decides which: `t2va` and `fl2va` run the
+    /// base `transformer`, `ref2va` the `transformer_ref`. A checkpoint that holds both therefore
+    /// serves the tasks of one partition per deployment, not all three.
+    ///
+    /// The decoders are placed for every task, because every task returns video and audio. The
+    /// condition encoders are placed for the tasks that carry conditions - `fl2va`'s keyframes and
+    /// `ref2va`'s references and keyframes - and not for `t2va`, whose request has none.
+    pub fn serving(
+        config: &Config,
+        task: VideoTask,
+        ulysses_degree: usize,
+        tensor_parallel: usize,
+        tensor_rank: usize,
+    ) -> Result<Self> {
+        let dit = TASK_DITS
+            .iter()
+            .find_map(|(served, dit)| (*served == task).then_some(*dit))
+            .ok_or_else(|| Error::config(format!("no MiniMax-H3 deployment serves {task:?}")))?;
+        if !config.denoisers.contains_key(&dit) {
+            return Err(Error::config(format!(
+                "the checkpoint holds no {} DiT, so it cannot serve {task:?} (it holds {})",
+                dit.directory(),
+                config
+                    .denoisers
+                    .keys()
+                    .map(|dit| dit.directory())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let mut blocks = Components::of([
+            Component::TextEncoder,
+            Component::VideoDecoder,
+            Component::AudioDecoder,
+        ])
+        .with(match dit {
+            crate::checkpoint::Dit::Base => Component::Transformer,
+            crate::checkpoint::Dit::Reference => Component::TransformerRef,
+        });
+        if matches!(
+            task,
+            VideoTask::FirstLastToVideoAudio | VideoTask::ReferenceToVideoAudio
+        ) {
+            blocks = blocks.with(Component::LatentEncoder);
+        }
+        let partition =
+            Self::new(config, ulysses_degree, tensor_parallel, tensor_rank)?.placing(blocks);
+        partition.validate(config)?;
+        Ok(partition)
+    }
+
+    /// The same partition, placing `blocks`.
+    ///
+    /// A deployment that serves `ref2va` places [`Component::TransformerRef`] and drops
+    /// [`Component::Transformer`]: the two are one block, and the task decides which checkpoint's
+    /// weights fill it.
+    pub const fn placing(mut self, blocks: Components) -> Self {
+        self.blocks = blocks;
+        self
+    }
+
+    /// The same partition, sized for `text_rows` text rows and `condition_rows` condition rows.
+    pub fn sized(mut self, text_rows: u32, condition_rows: u32) -> Self {
+        self.text_rows = text_rows;
+        self.condition_rows = condition_rows;
+        self
+    }
+
+    /// The row arrangement this partition gives a denoiser of `config`.
+    ///
+    /// The `shard` an arrangement carries is the Ulysses degree: one exchange rank's slice of a
+    /// layout's rows, and the alignment the packing pads to.
+    pub fn arrangement(&self, config: &crate::config::DenoiserConfig) -> Result<Arrangement> {
+        let shard = u32::try_from(self.ulysses_degree).map_err(|_| {
+            Error::config(format!(
+                "a Ulysses degree of {} rows does not fit a row count",
+                self.ulysses_degree
+            ))
+        })?;
+        Arrangement::new(config, self.text_rows, self.condition_rows, shard)
     }
 
     /// A deployment's partition, checked against the checkpoint's head counts.
@@ -47,6 +403,9 @@ impl Partition {
             ulysses_degree,
             tensor_parallel,
             tensor_rank,
+            blocks: Components::ALL.without(Component::TransformerRef),
+            text_rows: RELEASED_TEXT_ROWS,
+            condition_rows: RELEASED_CONDITION_ROWS,
         };
         partition.validate(config)?;
         Ok(partition)
@@ -69,6 +428,21 @@ impl Partition {
                 "the Ulysses degree {} is not a power of two",
                 self.ulysses_degree
             )));
+        }
+        // Both DiT partitions are the `denoiser` block - they are the same capability over two
+        // checkpoints, and the task picks one - so a rank that held both would register it twice.
+        if self.blocks.contains(Component::Transformer)
+            && self.blocks.contains(Component::TransformerRef)
+        {
+            return Err(Error::config(
+                "a rank cannot hold both the base and the reference denoiser: they are one block"
+                    .to_owned(),
+            ));
+        }
+        if self.text_rows == 0 || self.condition_rows == 0 {
+            return Err(Error::config(
+                "a deployment's text and condition row capacities are positive".to_owned(),
+            ));
         }
         if self.tensor_rank >= self.tensor_parallel {
             return Err(Error::config(format!(
@@ -151,6 +525,11 @@ mod tests {
         assert_eq!(partition.text_query_heads(&config), 64);
         assert_eq!(partition.text_key_value_heads(&config), 8);
         assert_eq!(partition.vocabulary_shard(151_936), (0, 151_936));
+        // One rank holds every component of a base deployment, and one denoiser: the task's. A
+        // `ref2va` deployment places `TransformerRef` instead.
+        assert!(partition.blocks.contains(Component::Transformer));
+        assert!(!partition.blocks.contains(Component::TransformerRef));
+        assert_eq!(partition.blocks.iter().count(), Component::ALL.len() - 1);
     }
 
     #[test]
@@ -201,12 +580,14 @@ mod tests {
             ulysses_degree: 1,
             tensor_parallel: 3,
             tensor_rank: 2,
+            ..Partition::single()
         };
         assert_eq!(partition.vocabulary_shard(151_936), (101_292, 151_936));
         let partition = Partition {
             ulysses_degree: 1,
             tensor_parallel: 2,
             tensor_rank: 0,
+            ..Partition::single()
         };
         assert_eq!(partition.vocabulary_shard(151_936), (0, 75_968));
         // A vocabulary the degree does not divide leaves the last shard short.
@@ -214,7 +595,88 @@ mod tests {
             ulysses_degree: 1,
             tensor_parallel: 4,
             tensor_rank: 3,
+            ..Partition::single()
         };
         assert_eq!(partition.vocabulary_shard(10), (9, 10));
+    }
+
+    #[test]
+    fn a_block_is_named_for_the_capability_its_runner_serves() {
+        // Both DiT partitions are the denoiser: a rank places one of them, and the runner's media
+        // call looks the capability up, not the checkpoint's directory.
+        assert_eq!(Component::Transformer.block(), "denoiser");
+        assert_eq!(Component::TransformerRef.block(), "denoiser");
+        assert_ne!(
+            Component::Transformer.name(),
+            Component::TransformerRef.name(),
+            "the two partitions stay distinct components of one checkpoint"
+        );
+        for component in Component::ALL {
+            assert!(!component.block().is_empty());
+            assert!(!component.name().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_rank_holds_one_denoiser() {
+        let config = crate::config::tests_support::released_config();
+        let both = Partition {
+            blocks: Components::of([Component::Transformer, Component::TransformerRef])
+                .with(Component::TextEncoder),
+            ..Partition::single()
+        };
+        let refused = both.validate(&config).expect_err("two denoisers");
+        assert!(refused.to_string().contains("one block"), "{refused}");
+        let one = Partition {
+            blocks: Components::of([Component::Transformer]).with(Component::TextEncoder),
+            ..Partition::single()
+        };
+        one.validate(&config).expect("one denoiser");
+    }
+
+    #[test]
+    fn a_deployment_places_one_denoiser_and_the_encoders_its_task_needs() {
+        let config = config();
+
+        // `t2va` carries no conditions, so it needs no condition encoder.
+        let t2va = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0).expect("t2va");
+        assert_eq!(
+            t2va.blocks,
+            Components::of([
+                Component::TextEncoder,
+                Component::Transformer,
+                Component::VideoDecoder,
+                Component::AudioDecoder,
+            ])
+        );
+
+        // A keyframe is a condition unit, so `fl2va` runs the encoders; it shares `t2va`'s DiT.
+        let fl2va =
+            Partition::serving(&config, VideoTask::FirstLastToVideoAudio, 1, 1, 0).expect("fl2va");
+        assert!(fl2va.blocks.contains(Component::LatentEncoder));
+        assert!(fl2va.blocks.contains(Component::Transformer));
+        assert!(!fl2va.blocks.contains(Component::TransformerRef));
+
+        // `ref2va` is the reference partition, and its references and keyframes need the encoders.
+        let ref2va =
+            Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0).expect("ref2va");
+        assert!(ref2va.blocks.contains(Component::TransformerRef));
+        assert!(!ref2va.blocks.contains(Component::Transformer));
+        assert!(ref2va.blocks.contains(Component::LatentEncoder));
+    }
+
+    #[test]
+    fn a_deployment_a_checkpoint_cannot_fill_is_refused() {
+        // An OmniRef export holds only the reference partition: it serves `ref2va` and nothing else.
+        let mut config = config();
+        config
+            .denoisers
+            .remove(&crate::checkpoint::Dit::Base)
+            .expect("the base partition");
+        let error = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0)
+            .expect_err("no transformer");
+        assert!(error.to_string().contains("transformer"), "{error}");
+        Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0)
+            .expect("the reference partition is held");
     }
 }

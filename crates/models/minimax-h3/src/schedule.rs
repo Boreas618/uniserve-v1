@@ -250,7 +250,13 @@ fn deduplicate(values: Vec<f32>) -> Vec<f32> {
 fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
     let step = (end - start) / (count - 1) as f64;
     (0..count)
-        .map(|index| start + index as f64 * step)
+        // Both endpoints are exact: the clean end of a schedule must be zero and not the residue
+        // that `start + n * step` leaves, which would scale the final sample by it.
+        .map(|index| match index {
+            0 => start,
+            last if last == count - 1 => end,
+            _ => start + index as f64 * step,
+        })
         .collect()
 }
 

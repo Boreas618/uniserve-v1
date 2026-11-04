@@ -117,23 +117,44 @@ impl CallCompletion {
     /// their index, so the pair comes from the batch that was submitted. A
     /// process publishes no immutable storage of its own to claim, so `media`
     /// is empty — an in-process media call is refused before it is submitted.
+    ///
+    /// Two things the device reports differently from a worker, both stated
+    /// rather than filled in: a call has no timing of its own (the batch
+    /// measures the step, and `BatchReport::timing` carries it), and a token's
+    /// log-probability arrives as one number per accepted token, not as ranked
+    /// candidates. The mechanism's type wants candidates whose first entry is
+    /// the accepted token — which is what `generation` checks — so the accepted
+    /// token is stated as the one candidate the device named, never a
+    /// neighbour invented to fill the list.
     pub(crate) fn from_output(
-        output: executor::batch::CallCompletion,
+        output: executor::batch::CallOutput,
         request_key: RequestKey,
         call_id: CallId,
     ) -> Self {
+        let token_logprobs = output
+            .tokens
+            .iter()
+            .zip(&output.token_logprobs)
+            .map(|(token, logprob)| {
+                vec![TokenLogprob {
+                    token_id: *token,
+                    logprob: *logprob,
+                    rank: 1,
+                }]
+            })
+            .collect();
         Self {
             request_key,
             call_id,
             status: output.status,
             error_code: output.error_code,
             error_message: output.error_message,
-            timing_counters: output.timing_counters,
+            timing_counters: TimingCounters::default(),
             cache_visible_len: output.cache_visible_len,
             cache_computed_len: output.cache_computed_len,
             step_index: output.step_index,
-            committed_tokens: output.committed_tokens,
-            token_logprobs: output.token_logprobs,
+            committed_tokens: output.tokens,
+            token_logprobs,
             prompt_logprobs: output.prompt_logprobs,
             candidate_logprobs: output.candidate_logprobs,
             media_output: output.media_output,
@@ -221,16 +242,15 @@ impl BatchReport {
                 ));
             }
         };
-        let mut reported: Vec<Option<executor::batch::CallCompletion>> = vec![None; calls.len()];
+        let mut reported: Vec<Option<executor::batch::CallOutput>> = vec![None; calls.len()];
         for completion in output.calls {
             let index = completion.call.0 as usize;
-            let (request_key, call_id) = calls.get(index).copied().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "batch {batch} reported call {} of {} the batch submitted",
-                    completion.call.0,
-                    calls.len()
-                )
-            })?;
+            anyhow::ensure!(
+                index < calls.len(),
+                "batch {batch} reported call {} of {} the batch submitted",
+                completion.call.0,
+                calls.len()
+            );
             anyhow::ensure!(
                 reported[index].is_none(),
                 "batch {batch} reported call {} twice",
@@ -238,25 +258,12 @@ impl BatchReport {
             );
             reported[index] = Some(completion);
         }
-        let mut timing = TimingCounters::default();
         let mut finished = Vec::with_capacity(calls.len());
         for (index, completion) in reported.into_iter().enumerate() {
             let Some(completion) = completion else {
                 continue;
             };
             let (request_key, call_id) = calls[index];
-            timing.queued_us = timing
-                .queued_us
-                .saturating_add(completion.timing_counters.queued_us);
-            timing.device_us = timing
-                .device_us
-                .saturating_add(completion.timing_counters.device_us);
-            timing.copy_us = timing
-                .copy_us
-                .saturating_add(completion.timing_counters.copy_us);
-            timing.host_us = timing
-                .host_us
-                .saturating_add(completion.timing_counters.host_us);
             finished.push(CallCompletion::from_output(
                 completion,
                 request_key,
@@ -275,8 +282,10 @@ impl BatchReport {
             // its commands' own delivery, and a command that failed failed the
             // batch.
             command_results: Vec::new(),
-            done: output.done,
-            timing,
+            // A submission completes the batch: the device executor reports a
+            // batch's calls together, never a part of one.
+            done: true,
+            timing: output.timing,
             // Device-side forward statistics are a worker's readout, not a
             // rank's own (`crate::worker`); a process reports none here.
             forward_stats: Vec::new(),
@@ -287,34 +296,24 @@ impl BatchReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use executor::batch::{BatchOutput, CallCompletion as DeviceCompletion, CallId as DeviceCallId};
+    use executor::batch::{BatchOutput, CallId as DeviceCallId, CallOutput as DeviceCall};
     use executor::completion::Outcome;
     use ipc::CallStatus;
 
-    /// What one device call reports, with `device_us` of its own so a report's
-    /// timing can be told from silence.
-    fn device_call(index: u64, committed: &[u32], device_us: u64) -> DeviceCompletion {
-        DeviceCompletion {
-            call: DeviceCallId(index),
-            status: CallStatus::Ok,
-            error_code: None,
-            error_message: None,
-            committed_tokens: committed.to_vec(),
-            token_logprobs: Vec::new(),
-            prompt_logprobs: Vec::new(),
-            candidate_logprobs: Vec::new(),
-            cache_computed_len: 0,
-            cache_visible_len: 0,
-            step_index: 0,
-            media_output: None,
-            cache_output: None,
-            draft_token_ids: Vec::new(),
-            latent_layouts: Vec::new(),
-            timing_counters: TimingCounters {
-                device_us,
-                ..TimingCounters::default()
+    /// What one device call reports: `committed` tokens, the batches it stands
+    /// at, and the log-probability of each when the deployment planned them.
+    fn device_call(index: u64, committed: &[u32], logprobs: &[f32]) -> DeviceCall {
+        let mut call = DeviceCall::completed(
+            DeviceCallId(index),
+            committed.to_vec(),
+            executor::batch::RowState {
+                step_index: 1,
+                cache_computed_len: 3,
+                cache_visible_len: 3,
             },
-        }
+        );
+        call.token_logprobs = logprobs.to_vec();
+        call
     }
 
     /// The names the mechanism gave a batch's calls: one per call, in the
@@ -330,11 +329,13 @@ mod tests {
             .collect()
     }
 
-    fn output(calls: Vec<DeviceCompletion>, done: bool) -> Outcome<BatchOutput> {
+    fn output(calls: Vec<DeviceCall>) -> Outcome<BatchOutput> {
         Outcome::Success(BatchOutput {
-            tokens: Vec::new(),
             calls,
-            done,
+            timing: TimingCounters {
+                device_us: 11,
+                ..TimingCounters::default()
+            },
         })
     }
 
@@ -346,7 +347,10 @@ mod tests {
         let calls = submitted(2);
         let report = BatchReport::from_output(
             4,
-            output(vec![device_call(1, &[7], 3), device_call(0, &[5], 4)], true),
+            output(vec![
+                device_call(1, &[7], &[-0.5]),
+                device_call(0, &[5], &[-0.25]),
+            ]),
             &calls,
         )
         .expect("a device's report is read");
@@ -359,7 +363,7 @@ mod tests {
         assert_eq!(report.calls[1].request_key, calls[1].0);
         assert_eq!(report.calls[1].call_id, calls[1].1);
         assert_eq!(report.calls[1].committed_tokens, vec![7]);
-        assert_eq!(report.timing.device_us, 7);
+        assert_eq!(report.timing.device_us, 11);
         assert!(report.command_results.is_empty());
     }
 
@@ -367,12 +371,9 @@ mod tests {
     /// neighbour: the executor numbers calls by their index into `Batch.calls`.
     #[test]
     fn a_call_the_batch_does_not_have_is_refused() {
-        let error = BatchReport::from_output(
-            4,
-            output(vec![device_call(2, &[7], 0)], false),
-            &submitted(2),
-        )
-        .expect_err("a call index outside the batch is a broken report");
+        let error =
+            BatchReport::from_output(4, output(vec![device_call(2, &[7], &[])]), &submitted(2))
+                .expect_err("a call index outside the batch is a broken report");
         assert!(
             format!("{error}").contains("of 2 the batch submitted"),
             "{error}"
@@ -383,7 +384,7 @@ mod tests {
     fn a_call_reported_twice_is_refused() {
         let error = BatchReport::from_output(
             4,
-            output(vec![device_call(0, &[1], 0), device_call(0, &[2], 0)], false),
+            output(vec![device_call(0, &[1], &[]), device_call(0, &[2], &[])]),
             &submitted(1),
         )
         .expect_err("one call reports once");
@@ -395,19 +396,16 @@ mod tests {
     /// call's state on tokens nobody accounted for.
     #[test]
     fn a_serving_batch_that_reports_no_call_is_refused() {
-        let error = BatchReport::from_output(4, output(Vec::new(), true), &submitted(2))
+        let error = BatchReport::from_output(4, output(Vec::new()), &submitted(2))
             .expect_err("silence is not a completion");
-        assert!(
-            format!("{error}").contains("no call reported"),
-            "{error}"
-        );
+        assert!(format!("{error}").contains("no call reported"), "{error}");
     }
 
     /// A lifecycle batch carries no call and completes by reporting nothing:
     /// that is the one report silence is right for.
     #[test]
     fn a_batch_of_commands_completes_with_no_call() {
-        let report = BatchReport::from_output(4, output(Vec::new(), true), &[])
+        let report = BatchReport::from_output(4, output(Vec::new()), &[])
             .expect("a lifecycle batch reports no call");
         assert!(report.calls.is_empty());
         assert!(report.command_results.is_empty());
