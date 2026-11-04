@@ -433,10 +433,15 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // rows once per request, the per-layer modulation table at `18 * hidden`, the final norm's at
     // `2 * hidden`, and the three narrow i32 gathers: each row's group tag, the coefficient, and the
     // step-to-entry table.
+    // The two modulation tables are the **deployment's** type, not FP32: at `dtype = "auto"` the AdaLN
+    // cache narrows the FP32 timestep pair into the modulation projections' type once per evaluation
+    // (`scaled_add` at `time_dim`), so the tables those projections build are the stack's own BF16 -
+    // that is the whole point of the narrowing. Only the two i32 gathers and the solver's coefficient
+    // are pinned.
     for (dtype, columns) in [
         (deployment, HIDDEN),
-        (DType::F32, 18 * HIDDEN),
-        (DType::F32, 2 * HIDDEN),
+        (deployment, 18 * HIDDEN),
+        (deployment, 2 * HIDDEN),
         // The solver's step coefficient: `[steps, 1]` FP32, gathered at the evaluation the
         // executor's `step` table names, so one staging word serves every step (`solver.rs`).
         (DType::F32, 1),
