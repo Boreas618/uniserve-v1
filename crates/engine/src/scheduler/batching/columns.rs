@@ -27,14 +27,15 @@
 //!   from the call;
 //! - **page_size** and **max_kv_len**: the cache's geometry.
 //!
-//! The commit table (`BatchColumns::commit`) is left empty. An empty table is
-//! legal only for a batch that commits nothing at all — a shadow batch, a
-//! cache-only prefill — and the executor states accepted progress in the eight
-//! columns `ops::commit::column` names. The mechanism does not yet state them:
-//! whose value each column carries (`ops::commit`, exec's answer) is open, and
-//! this module never invents one. A batch that does commit and is assembled
-//! here is therefore not yet servable, which is the gap this file records until
-//! the columns are filled.
+//! - **commit**: the eight columns `ops::commit::column` names, one row per
+//!   call: how the step advances the slot's device state. A decode advances by
+//!   its sampled token; a prefill that samples installs its token at the host
+//!   coordinates; a prefill that samples nothing only states its cache extent;
+//!   a verification installs the base its accepted span advances from. The
+//!   rules are the reference's (`uniserve/executor/text/commit.py`), which is
+//!   where every cell of the table is decided, and nothing here is a default:
+//!   a call the table cannot state — a decode or a verification that samples
+//!   nothing, a row writing past its block table — answers `None`.
 //!
 //! A batch whose calls disagree with what the layout promises — a call whose
 //! rows belong to several requests, a token outside its table, a call a token
@@ -44,7 +45,7 @@
 
 use std::ops::Range;
 
-use executor::batch::BatchColumns;
+use executor::batch::{commit, BatchColumns};
 use ipc::{Call, CallKind, ForwardMode};
 use nn::{BatchRow, BatchRows, RowKind};
 use proto::request::SamplingParams;
@@ -88,6 +89,15 @@ pub(crate) fn sampler_parameters(sampling: &SamplingParams) -> [f32; SAMPLER_PAR
     columns
 }
 
+/// Whether the request's token-count penalties shape its selection: the
+/// reference's `SamplingParams::uses_penalties`, which the commit table states
+/// per sampling row.
+fn uses_penalties(sampling: &SamplingParams) -> bool {
+    sampling.repetition_penalty != 1.0
+        || sampling.frequency_penalty != 0.0
+        || sampling.presence_penalty != 0.0
+}
+
 /// The sampler's columns per row, `ops::sampler::PARAMETER_COLUMNS`.
 pub(crate) const SAMPLER_PARAMETERS: usize = 8;
 
@@ -99,6 +109,10 @@ pub(crate) const SAMPLER_PARAMETERS: usize = 8;
 /// a verify's host tokens (`ipc::Call::input_token_ids`) or a decode's one token
 /// per row. A call that states fewer tokens than its rows evaluate is a fault:
 /// the mechanism never invents a token a kernel would then embed.
+///
+/// `draws[i]` is the request's sampling position before call `i`: the number of
+/// draws it has made, which an explicit or a verification row installs as the
+/// device state's sampling position.
 ///
 /// `page` is the cache's page geometry and `max_kv_len` the attention
 /// descriptor's static bound on a sequence, both of which the mechanism states
@@ -114,13 +128,19 @@ pub(crate) fn columns(
     requests: &[(Call, RequestPlacement)],
     inputs: &[Vec<i32>],
     sampling: &[&SamplingParams],
+    draws: &[u32],
     page: PageGeometry,
     max_kv_len: u32,
 ) -> Option<BatchColumns> {
-    if requests.len() != inputs.len() || requests.len() != sampling.len() {
+    if requests.len() != inputs.len()
+        || requests.len() != sampling.len()
+        || requests.len() != draws.len()
+    {
         return None;
     }
     let mut rows = BatchRows::default();
+    let mut commit_rows: Vec<[i64; commit::COMMIT_FIELDS]> = Vec::with_capacity(requests.len());
+    let mut tasks = 0usize;
     let mut slots = Vec::with_capacity(requests.len());
     let mut queries = Vec::new();
     let mut spans: Vec<Range<u32>> = Vec::with_capacity(requests.len());
@@ -210,6 +230,84 @@ pub(crate) fn columns(
             cache_group: 0,
             rows: span,
         });
+
+        // The commit row this call installs: how the sampling step advances the
+        // slot's device state. A row names its slot, its mode, the task whose
+        // sampled token it installs, the host length and positions an explicit
+        // or a verification row writes, and whether its token counts penalties.
+        let query = *forward.query_lens.last()?;
+        // A call samples when it has a consumer for its logits; a decode and a
+        // verification always do, and a prompt chunk's last row does not until
+        // it is the chunk that finishes the prompt.
+        let sampled = !call.consumer_slots.is_empty();
+        if matches!(kind, RowKind::Decode | RowKind::Verify) && !sampled {
+            return None;
+        }
+        let mode = match kind {
+            RowKind::Decode => commit::mode::DECODE,
+            RowKind::Verify => commit::mode::VERIFY,
+            RowKind::Prefill if sampled => commit::mode::EXPLICIT,
+            RowKind::Prefill => commit::mode::CACHE,
+        };
+        let explicit = mode == commit::mode::EXPLICIT;
+        let verify = mode == commit::mode::VERIFY;
+        // The tokens this call commits to the cache: a decode commits its one
+        // token, every other call its last row's query. A call that would write
+        // past its block table is a planning fault, not a clamp.
+        let committed = if matches!(kind, RowKind::Decode) { 1 } else { query };
+        let visible = call.coordinates.cache_visible_len;
+        let length = visible.checked_add(committed)?;
+        if committed > query || (!verify && length > table.allocated_tokens) {
+            return None;
+        }
+        let draw = *draws.get(index)?;
+        let mut cells = [0i64; commit::COMMIT_FIELDS];
+        cells[commit::column::SLOT] = i64::from(request);
+        cells[commit::column::MODE] = mode;
+        cells[commit::column::TASK] = if sampled {
+            let task = i64::try_from(tasks).ok()?;
+            tasks = tasks.checked_add(1)?;
+            task
+        } else {
+            -1
+        };
+        // Every prefill states its cache extent, sampled or not; a decode and a
+        // verification advance it on the device.
+        cells[commit::column::CACHE_LENGTH] = if matches!(kind, RowKind::Prefill) {
+            i64::from(length)
+        } else {
+            0
+        };
+        cells[commit::column::LOGICAL] = if explicit {
+            i64::from(first).saturating_add(i64::from(query))
+        } else if verify {
+            i64::from(first)
+        } else {
+            0
+        };
+        cells[commit::column::SAMPLING] = if explicit {
+            i64::from(draw).saturating_add(1)
+        } else if verify {
+            i64::from(draw)
+        } else {
+            0
+        };
+        cells[commit::column::VISIBLE] = if verify { i64::from(visible) } else { 0 };
+        cells[commit::column::PENALTIES] = if sampled && uses_penalties(sampling) {
+            1
+        } else {
+            0
+        };
+        commit_rows.push(cells);
+    }
+
+    // The table is column-major: one run of every column over the batch's rows.
+    let row_count = commit_rows.len();
+    let mut commit = vec![0i64; commit::COMMIT_FIELDS * row_count];
+    for (row, cells) in commit_rows.iter().enumerate() {
+        for (column, value) in cells.iter().enumerate() {
+            commit[column * row_count + row] = *value;
+        }
     }
 
     rows.query_offsets = slots::query_offsets(&queries)?;
@@ -321,9 +419,249 @@ mod tests {
         CallKind::Forward(ForwardMode::Verify)
     }
 
+    /// One cell of the commit table, which is column-major over the batch's
+    /// rows.
+    fn commit_cell(columns: &BatchColumns, column: usize, row: usize) -> i64 {
+        columns.commit[column * columns.rows() + row]
+    }
+
+    fn decode() -> CallKind {
+        CallKind::Forward(ForwardMode::Decode)
+    }
+
+    #[test]
+    fn a_decode_advances_its_own_slot_and_states_only_its_task() {
+        let mut decode_call = call(decode(), 12, &[1], true);
+        decode_call.coordinates.cache_visible_len = 12;
+        let requests = vec![(decode_call, placement(3, &[1], &[true]))];
+        let columns = columns(&requests, &[vec![42]], &[&sampling()], &[5], page(), 2048)
+            .expect("a decode batch");
+
+        assert_eq!(columns.commit.len(), commit::COMMIT_FIELDS * columns.rows());
+        assert_eq!(commit_cell(&columns, commit::column::SLOT, 0), 3);
+        assert_eq!(
+            commit_cell(&columns, commit::column::MODE, 0),
+            commit::mode::DECODE
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::TASK, 0),
+            0,
+            "a decode installs its one sampled token"
+        );
+        for column in [
+            commit::column::CACHE_LENGTH,
+            commit::column::LOGICAL,
+            commit::column::SAMPLING,
+            commit::column::VISIBLE,
+        ] {
+            assert_eq!(
+                commit_cell(&columns, column, 0),
+                0,
+                "the device advances a decode's lengths and positions from its own state"
+            );
+        }
+        assert_eq!(
+            commit_cell(&columns, commit::column::PENALTIES, 0),
+            1,
+            "every penalty of this request is set"
+        );
+    }
+
+    #[test]
+    fn a_prefill_that_samples_installs_its_token_at_the_host_coordinates() {
+        let mut prefill_call = call(prefill(), 8, &[4], true);
+        prefill_call.coordinates.cache_visible_len = 8;
+        let requests = vec![(prefill_call, placement(1, &[4], &[true]))];
+        let columns = columns(
+            &requests,
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[2],
+            page(),
+            2048,
+        )
+        .expect("a prefill batch");
+
+        assert_eq!(
+            commit_cell(&columns, commit::column::MODE, 0),
+            commit::mode::EXPLICIT
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::CACHE_LENGTH, 0),
+            12,
+            "the prefix plus the query this prefill commits"
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::LOGICAL, 0),
+            12,
+            "a sampling prefill advances its logical position by its query"
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::SAMPLING, 0),
+            3,
+            "the request's draw counter after the one draw this prefill makes"
+        );
+        assert_eq!(commit_cell(&columns, commit::column::VISIBLE, 0), 0);
+        assert_eq!(commit_cell(&columns, commit::column::TASK, 0), 0);
+        assert_eq!(commit_cell(&columns, commit::column::PENALTIES, 0), 1);
+    }
+
+    #[test]
+    fn a_prefill_that_samples_nothing_still_states_its_cache_extent() {
+        let mut chunk = call(prefill(), 8, &[2], true);
+        chunk.consumer_slots.clear();
+        chunk.coordinates.cache_visible_len = 8;
+        let mut neutral = sampling();
+        neutral.repetition_penalty = 1.0;
+        neutral.frequency_penalty = 0.0;
+        neutral.presence_penalty = 0.0;
+        let requests = vec![(chunk, placement(1, &[2], &[true]))];
+        let columns = columns(&requests, &[vec![5, 6]], &[&neutral], &[7], page(), 2048)
+            .expect("a chunked prefill batch");
+
+        assert_eq!(
+            commit_cell(&columns, commit::column::MODE, 0),
+            commit::mode::CACHE
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::CACHE_LENGTH, 0),
+            10,
+            "a prefill writes its extent whether or not it samples"
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::TASK, 0),
+            -1,
+            "a prompt chunk samples nothing"
+        );
+        for column in [
+            commit::column::LOGICAL,
+            commit::column::SAMPLING,
+            commit::column::VISIBLE,
+            commit::column::PENALTIES,
+        ] {
+            assert_eq!(commit_cell(&columns, column, 0), 0);
+        }
+    }
+
+    #[test]
+    fn a_verification_states_the_base_its_accepted_span_advances_from() {
+        let mut verify_call = call(verify(), 9, &[1, 1, 1], true);
+        verify_call.coordinates.cache_visible_len = 9;
+        let requests = vec![(verify_call, placement(1, &[1, 1, 1], &[true, true, true]))];
+        let columns = columns(
+            &requests,
+            &[vec![7, 8, 9]],
+            &[&sampling()],
+            &[4],
+            page(),
+            2048,
+        )
+        .expect("a verify batch");
+
+        assert_eq!(
+            commit_cell(&columns, commit::column::MODE, 0),
+            commit::mode::VERIFY
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::VISIBLE, 0),
+            9,
+            "the visible base the accepted count is added to"
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::LOGICAL, 0),
+            9,
+            "a verification keeps its logical position and advances by the accepted count"
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::SAMPLING, 0),
+            4,
+            "a verification installs its base draw and draws nothing itself"
+        );
+        assert_eq!(
+            commit_cell(&columns, commit::column::CACHE_LENGTH, 0),
+            0,
+            "the device states a verification's cache length from the accepted count"
+        );
+        assert_eq!(commit_cell(&columns, commit::column::TASK, 0), 0);
+    }
+
+    #[test]
+    fn tasks_are_numbered_over_the_sampling_calls_only() {
+        // A prompt chunk, then a decode, then a sampling prefill: the chunk
+        // installs no token and so consumes no task.
+        let mut chunk = call(prefill(), 8, &[2], true);
+        chunk.consumer_slots.clear();
+        chunk.coordinates.cache_visible_len = 8;
+        let mut decode_call = call(decode(), 10, &[1], true);
+        decode_call.consumer_slots = vec![2];
+        decode_call.coordinates.cache_visible_len = 10;
+        let mut prefill_call = call(prefill(), 11, &[2], true);
+        prefill_call.consumer_slots = vec![3];
+        prefill_call.coordinates.cache_visible_len = 11;
+        let requests = vec![
+            (chunk, placement(1, &[2], &[true])),
+            (decode_call, placement(2, &[1], &[true])),
+            (prefill_call, placement(3, &[2], &[true])),
+        ];
+        let columns = columns(
+            &requests,
+            &[vec![1, 2], vec![3], vec![4, 5]],
+            &[&sampling(), &sampling(), &sampling()],
+            &[0, 0, 0],
+            page(),
+            2048,
+        )
+        .expect("a mixed batch");
+
+        assert_eq!(
+            (0..3)
+                .map(|row| commit_cell(&columns, commit::column::TASK, row))
+                .collect::<Vec<_>>(),
+            vec![-1, 0, 1]
+        );
+        assert_eq!(
+            (0..3)
+                .map(|row| commit_cell(&columns, commit::column::SLOT, row))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(columns.commit.len(), commit::COMMIT_FIELDS * 3);
+    }
+
+    #[test]
+    fn a_call_the_commit_cannot_state_is_no_batch_rather_than_a_guess() {
+        // A decode always samples: one with no consumer has no task to name.
+        let mut unsampled_decode = call(decode(), 12, &[1], true);
+        unsampled_decode.consumer_slots.clear();
+        unsampled_decode.coordinates.cache_visible_len = 12;
+        assert!(columns(
+            &[(unsampled_decode, placement(1, &[1], &[true]))],
+            &[vec![1]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .is_none());
+
+        // A prefill writing past the extent its block table covers is a
+        // planning fault, not a clamped extent.
+        let mut overlong = call(prefill(), 18, &[4], true);
+        overlong.coordinates.cache_visible_len = 18;
+        assert!(columns(
+            &[(overlong, placement(1, &[4], &[true]))],
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .is_none());
+    }
+
     #[test]
     fn an_empty_batch_states_its_geometry_and_nothing_else() {
-        let columns = columns(&[], &[], &[], page(), 2048).expect("an empty batch is a batch");
+        let columns = columns(&[], &[], &[], &[], page(), 2048).expect("an empty batch is a batch");
         assert_eq!(columns.rows(), 0);
         assert_eq!(columns.tokens(), 0);
         assert!(columns.rows.query_offsets.is_empty() || columns.rows.query_offsets == vec![0]);
@@ -346,7 +684,7 @@ mod tests {
             ),
         ];
         let inputs = vec![vec![11, 12, 13, 14], vec![21, 22]];
-        let columns = columns(&requests, &inputs, &[&sampling(), &sampling()], page(), 2048).expect("a prefill batch");
+        let columns = columns(&requests, &inputs, &[&sampling(), &sampling()], &[0, 0], page(), 2048).expect("a prefill batch");
 
         assert_eq!(columns.rows(), 2, "one row per call");
         assert_eq!(columns.tokens(), 6);
@@ -389,7 +727,7 @@ mod tests {
             call(prefill(), 8, &[4], true),
             placement(1, &[4], &[true]),
         )];
-        let columns = columns(&requests, &[vec![1, 2, 3, 4]], &[&sampling()], page(), 2048)
+        let columns = columns(&requests, &[vec![1, 2, 3, 4]], &[&sampling()], &[0], page(), 2048)
             .expect("a prefill batch");
         assert_eq!(columns.parameters.len(), SAMPLER_PARAMETERS);
         assert_eq!(
@@ -413,7 +751,7 @@ mod tests {
             call(prefill(), 8, &[2], true),
             placement(1, &[2], &[false]),
         )];
-        let columns = columns(&requests, &[vec![1, 2]], &[&sampling()], page(), 64).expect("a prefill batch");
+        let columns = columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64).expect("a prefill batch");
         assert_eq!(columns.rows.slot_mapping, vec![-1, -1]);
     }
 
@@ -424,7 +762,7 @@ mod tests {
             call(verify(), 9, &[1, 1, 1], true),
             placement(1, &[1, 1, 1], &[true, true, true]),
         )];
-        let columns = columns(&requests, &[vec![7, 8, 9]], &[&sampling()], page(), 64).expect("a verify batch");
+        let columns = columns(&requests, &[vec![7, 8, 9]], &[&sampling()], &[0], page(), 64).expect("a verify batch");
         assert_eq!(columns.rows(), 3);
         assert_eq!(columns.tokens(), 3);
         assert_eq!(columns.rows.positions, vec![9, 10, 11]);
@@ -445,7 +783,7 @@ mod tests {
     fn a_media_call_is_not_a_token_batch() {
         let media = call(ipc::CallKind::Media(ipc::MediaCall::Denoising), 0, &[1], true);
         assert!(
-            columns(&[(media, placement(1, &[1], &[true]))], &[vec![0]], &[&sampling()], page(), 64)
+            columns(&[(media, placement(1, &[1], &[true]))], &[vec![0]], &[&sampling()], &[0], page(), 64)
                 .is_none(),
             "a media call has no token row"
         );
@@ -459,7 +797,7 @@ mod tests {
         let mut decode = decode;
         decode.input_token_ids.clear();
         assert!(
-            columns(&[(decode, placement(1, &[1], &[true]))], &[Vec::new()], &[&sampling()], page(), 64)
+            columns(&[(decode, placement(1, &[1], &[true]))], &[Vec::new()], &[&sampling()], &[0], page(), 64)
                 .is_none()
         );
     }
@@ -471,7 +809,7 @@ mod tests {
             call(prefill(), 20, &[1], true),
             placement(1, &[1], &[true]),
         )];
-        assert!(columns(&requests, &[vec![1]], &[&sampling()], page(), 64).is_none());
+        assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
     }
 
     #[test]
@@ -479,7 +817,7 @@ mod tests {
         let mut placement = placement(1, &[2], &[true]);
         placement.forward.push(0, 2, 4, 1, true);
         let requests = vec![(call(prefill(), 8, &[2], true), placement)];
-        assert!(columns(&requests, &[vec![1, 2]], &[&sampling()], page(), 64).is_none());
+        assert!(columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64).is_none());
     }
 
     #[test]
@@ -488,10 +826,10 @@ mod tests {
             call(prefill(), 8, &[2], true),
             placement(1, &[2], &[true]),
         )];
-        assert!(columns(&requests, &[vec![1]], &[&sampling()], page(), 64).is_none());
-        assert!(columns(&requests, &[vec![1, 2, 3]], &[&sampling()], page(), 64).is_none());
+        assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
+        assert!(columns(&requests, &[vec![1, 2, 3]], &[&sampling()], &[0], page(), 64).is_none());
         assert!(
-            columns(&requests, &[vec![1, 2], vec![3]], &[&sampling(), &sampling()], page(), 64)
+            columns(&requests, &[vec![1, 2], vec![3]], &[&sampling(), &sampling()], &[0, 0], page(), 64)
                 .is_none(),
             "an input list per call, not one more than there are calls"
         );

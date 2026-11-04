@@ -511,6 +511,19 @@ impl RequestState {
             }
             _ => {}
         }
+
+        // A sampling call draws once from the request's stream, which is what
+        // the next commit's sampling position must state: a decode draws for
+        // its token, and a prefill draws when it samples its last row. A
+        // verification installs the tokens a drafter proposed without drawing,
+        // and a prompt chunk that samples nothing draws nothing either.
+        if matches!(
+            call.kind,
+            CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Prefill)
+        ) && !call.consumer_slots.is_empty()
+        {
+            self.sampling_position = self.sampling_position.saturating_add(1);
+        }
         Ok(())
     }
 }
@@ -1661,6 +1674,14 @@ pub(crate) struct RequestState {
     /// rejected drafts, so this exceeds the visible extent until the next
     /// forward makes exactly what it initializes visible.
     pub(super) cache_computed_len: u32,
+    /// Draws the request's sampler has made. The slot's device state advances
+    /// its own sampling position as it installs a call's tokens; this is the
+    /// host copy the mechanism states in the commit table, and it advances
+    /// exactly as the reference counts draws: once for a decode and once for a
+    /// prefill that samples, and not at all for a verification, whose accepted
+    /// span installs tokens without drawing, nor for a prompt chunk that
+    /// samples nothing.
+    pub(super) sampling_position: u32,
     /// Committed token the next decode or `CloseCache` write continues from.
     pub(super) next_token: u32,
     pub(super) num_generated_tokens: usize,
