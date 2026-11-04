@@ -291,58 +291,69 @@ fn main() {
         );
     }
 
-    // ---- The DiT's rotation: three position axes of 16 frequencies each, cut into three sections
+    // The DiT's rotation: three position axes of 32 rotated elements each, cut into three sections
     // of the head's rotated columns, and the per-head normalization fused with it.
     //
     // `attention.py` normalizes every query and key head with a *learned* RMSNorm (`affine`) and
-    // rotates the leading 96 channels with neox RoPE over (time, height, width).
-    push(
-        "rotary_factors",
-        ops::rope::FactorsDescriptor {
-            dtype: DType::F32,
-            positions: DType::I32,
-            columns: ROTATED / 2,
-            block: ROTARY_BLOCK,
-            // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
-            // 1e4 base lives in the frequencies table the host fills.
-            scale: ops::Float::from(1.0_f32),
-            pdl: PDL,
-            axes: ROPE_AXES,
-            // A section is *rotated elements* per axis, not frequencies: three axes of 32 elements
-            // sum to the 96 the head rotates, and passing the frequency count (16) instead would
-            // describe a different head - the descriptor `attention.rs` builds says 32 each.
-            sections: {
-                let per_axis = ROTATED / ROPE_AXES;
-                let mut sections = [0; ops::rope::MAX_AXES];
-                sections[0] = per_axis;
-                sections[1] = per_axis;
-                sections[2] = per_axis;
-                sections
-            },
-            // H3's text encoder is Qwen3-VL: its M-RoPE cycles the axes over the frequencies.
-            interleaved: true,
-        }
-        .to_string(),
-    );
-    push(
-        "qk_norm_rope",
-        ops::rope::QkNormRopeDescriptor {
-            dtype: DType::BF16,
-            output: DType::BF16,
-            head_dim: HEAD_DIM,
-            q_heads: HEADS,
-            k_heads: HEADS,
-            // "neox RoPE": adjacent pairs rotate together.
-            rotation: ops::rope::Rotation::Interleaved,
-            epsilon: ops::Float::from(NORM_EPSILON),
-            rotated: ROTATED,
-            rows: QK_NORM_TOKENS,
-            block: row_tile(HEAD_DIM).min(1024),
-            affine: true,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // rotates the leading 96 channels with neox RoPE over (time, height, width). The table lists one
+    // row per partition: the whole head count, and the Ulysses-2 shard the same block binds at half
+    // the query and key heads.
+    for heads in [HEADS, HEADS / 2] {
+        push(
+            "qk_norm_rope",
+            ops::rope::QkNormRopeDescriptor {
+                dtype: DType::BF16,
+                output: DType::BF16,
+                head_dim: HEAD_DIM,
+                q_heads: heads,
+                k_heads: heads,
+                // "neox RoPE": adjacent pairs rotate together.
+                rotation: ops::rope::Rotation::Interleaved,
+                epsilon: ops::Float::from(NORM_EPSILON),
+                rotated: ROTATED,
+                rows: QK_NORM_TOKENS,
+                block: row_tile(HEAD_DIM).min(1024),
+                affine: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
+    // The factors those two operators read: the DiT's three equal axes of 32 rotated elements (96
+    // in all, so a 48-column table), and the text encoder's Qwen3-VL M-RoPE, whose three unequal
+    // sections (48, 40, 40 of the head's 128 rotated elements) grow at three rates over (time,
+    // height, width) and make a 64-column table.
+    for (rotated, per_axis) in [(ROTATED, [ROTATED / ROPE_AXES; 3]), (128, [48, 40, 40])] {
+        push(
+            "rotary_factors",
+            ops::rope::FactorsDescriptor {
+                dtype: DType::F32,
+                positions: DType::I32,
+                columns: rotated / 2,
+                block: ROTARY_BLOCK,
+                // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
+                // 1e4 base lives in the frequencies table the host fills.
+                scale: ops::Float::from(1.0_f32),
+                pdl: PDL,
+                axes: ROPE_AXES,
+                // A section is *rotated elements* per axis, not frequencies: three axes of 32
+                // elements sum to the 96 the DiT's head rotates, and passing the frequency count
+                // (16) would describe a different head - the descriptor `attention.rs` builds says
+                // 32 each. The encoder's sections are unequal for the same reason it uses M-RoPE.
+                sections: {
+                    let mut sections = [0; ops::rope::MAX_AXES];
+                    sections[0] = per_axis[0];
+                    sections[1] = per_axis[1];
+                    sections[2] = per_axis[2];
+                    sections
+                },
+                // H3's text encoder is Qwen3-VL: its M-RoPE cycles the axes over the frequencies.
+                interleaved: true,
+            }
+            .to_string(),
+        );
+    }
+
 
     // ---- The row gathers: `nn::layers::gather_rows` binds `logits_gather` with the gathered width
     // in its key, so every place the DiT gathers whole rows is a cell of this operator.
@@ -372,24 +383,35 @@ fn main() {
     }
 
     // ---- The transformer's per-row programs, at `hidden_size`.
-    push(
-        "modulated_rms_norm",
-        ModulatedRmsNormDescriptor {
-            dtype: DType::BF16,
-            output: DType::BF16,
-            indices: DType::I32,
-            width: HIDDEN,
-            block: row_tile(HIDDEN),
-            epsilon: ops::Float::from(NORM_EPSILON),
-            // The modulation vectors are `[rows, hidden]`: their row stride is the width.
-            gate_stride: u64::from(HIDDEN),
-            shift_stride: u64::from(HIDDEN),
-            scale_stride: u64::from(HIDDEN),
-            update: true,
-            retain: false,
-        }
-        .to_string(),
-    );
+    //
+    // The DiT's three modulated norms, each from its own call site in `transformer.rs`. The six
+    // modulation vectors are cut from a `[rows, 18 · hidden]` table, so a vector's row stride is
+    // `6 · hidden` (32256); the attention norm folds no gate and passes no update (`:158`), the MLP
+    // norm folds the sixth vector's gate and the block's update (`:169`), and the output norm reads
+    // a `[rows, 2 · hidden]` table instead, stride `2 · hidden` (10752) with neither (`:610`).
+    for (gate_stride, shift_stride, scale_stride, update) in [
+        (0_u32, 6 * HIDDEN, 6 * HIDDEN, false),
+        (6 * HIDDEN, 6 * HIDDEN, 6 * HIDDEN, true),
+        (0, 2 * HIDDEN, 2 * HIDDEN, false),
+    ] {
+        push(
+            "modulated_rms_norm",
+            ModulatedRmsNormDescriptor {
+                dtype: DType::BF16,
+                output: DType::BF16,
+                indices: DType::I32,
+                width: HIDDEN,
+                block: row_tile(HIDDEN),
+                epsilon: ops::Float::from(NORM_EPSILON),
+                gate_stride: u64::from(gate_stride),
+                shift_stride: u64::from(shift_stride),
+                scale_stride: u64::from(scale_stride),
+                update,
+                retain: false,
+            }
+            .to_string(),
+        );
+    }
     // The gated residual that closes each block: `hidden + gate[i] · update`. The block's
     // modulation table is `[rows, 6 · hidden]` and the gate is the sixth chunk of a row
     // (`transformer.rs`'s `chunks(modulation, width, 3)`, which takes the last of the three MLP
@@ -896,6 +918,24 @@ fn main() {
             wide: false,
             pdl: PDL,
             stepwise: false,
+        }
+        .to_string(),
+    );
+    // The DiT's block MLP, whose halves are packed beside each other in one `[rows, 2 · 14336]`
+    // projection: both row strides are twice the width, and the reference rounds each row's output
+    // to the activation's dtype as it goes, so the site declares the stepwise form.
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: DType::BF16,
+            width: 14336,
+            block: 1024,
+            activation: ops::activation::Activation::Silu,
+            gate_stride: 2 * 14336,
+            value_stride: 2 * 14336,
+            wide: false,
+            pdl: PDL,
+            stepwise: true,
         }
         .to_string(),
     );

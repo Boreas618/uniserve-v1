@@ -346,6 +346,30 @@ pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
     values
 }
 
+impl VideoEncoder {
+    /// Every checkpoint tensor the video encoder reads, by name.
+    ///
+    /// The encoder is a component whose names were already data (`sources` maps each parameter to
+    /// the checkpoint key that fills it), so this list is that mapping's other column rather than a
+    /// second spelling of it: a weight-normalized pair names both of its tensors, and a fused
+    /// request names every part. A checkpoint that lacks one is refused by block and name before a
+    /// byte is read.
+    pub fn keys(config: &VideoVaeConfig) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for source in sources(config)? {
+            match source.tensor {
+                crate::audio_vae::Tensor::Region(tensor) => keys.push(tensor),
+                crate::audio_vae::Tensor::Parts(parts) => keys.extend(parts),
+                crate::audio_vae::Tensor::Normalized { value, gain } => {
+                    keys.push(value);
+                    keys.push(gain);
+                }
+            }
+        }
+        Ok(keys)
+    }
+}
+
 /// Every parameter of the video encoder, with the checkpoint key that fills it.
 ///
 /// The encoder is the input convolution, six stages of two blocks each, the final normalization and
