@@ -30,10 +30,15 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false`.
-[kernel.descriptors]
-# A key names `rotated` only for a narrower rotation and `affine` only for an
-# unweighted normalization, so the package answers for their absence: a full
-# rotation keeps the key it always had and the H3 geometry is another key.
+# The operator prints `rotated` only when the rotation is narrower than the
+# head, so the package declares the two key shapes: the full-width weighted form
+# a text decoder compiles, and the narrowed form a multimodal transformer does
+# (H3 turns 96 of 128 channels). One backend, because a deployment names a
+# backend and not a key shape.
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8", "56"], k_heads = ["4", "8", "2", "1", "56"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"] }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["56", "32", "24", "16", "8"], k_heads = ["56", "4", "8", "2", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"], rotated = ["96", "64"] }
 
 [parameters]

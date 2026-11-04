@@ -1,0 +1,46 @@
+# The adaptive_pool operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one architecture
+# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
+# Program Server runs for one descriptor and target).
+#
+# This is the audio encoder's last reduction: the head mean of the attention
+# projection and its adaptive width pooling, fused into one pass because both land
+# on the same output element. `out[r, i]` averages `heads` values of the input
+# positions `floor(i·width/output) .. ceil((i+1)·width/output)`, a window that is
+# never empty — with more outputs than inputs every window is one position.
+#
+# The key names the element type and the three extents the pool is compiled from —
+# heads, the input width and the pooled width — plus the block and whether the
+# module was compiled for programmatic dependent launch. The row count is a launch
+# value, so no frame count makes a new module, e.g.
+# `dtype_f32_heads_8_width_256_output_32_block_1024_pdl_false`.
+
+op = "adaptive_pool"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/adaptive_pool.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
+
+[kernel.descriptors]
+# The checkpoint's own numbers narrow: 8 heads of 256 elements pooled to the audio
+# latent's 32 channels. The other values are the same pool at other widths, which is
+# what a second decoder scale would ask for.
+dimensions = { dtype = ["f16", "bf16", "f32"], heads = ["8", "16"], width = ["256"], output = ["32", "64"], block = ["1024"], pdl = ["true", "false"] }
+
+[parameters]

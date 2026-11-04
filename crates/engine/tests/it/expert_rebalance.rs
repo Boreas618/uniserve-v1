@@ -154,10 +154,12 @@ impl World {
     }
 }
 
-/// Blocks until a command answers, and answers its result.
-fn wait(receiver: crossbeam_channel::Receiver<Result<(), String>>) -> Result<(), String> {
+/// Blocks until a stage command answers, and answers its result without the
+/// stage's own report.
+fn wait<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<(), String> {
     match receiver.recv_timeout(ANSWER) {
-        Ok(result) => result,
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error),
         Err(error) => Err(format!("the scheduler did not answer: {error}")),
     }
 }

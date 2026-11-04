@@ -2598,8 +2598,16 @@ impl EpochPolicy for Routing {
     }
 
     fn commit(&self) {
-        for slot in &self.slots {
-            slot.handle.commit_policy();
+        let answers: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| slot.handle.commit_policy())
+            .collect();
+        for answer in answers {
+            // The scheduler applies the commit before the caller moves on; a
+            // scheduler that refuses it keeps serving the previous policy, which
+            // its next policy report names.
+            let _ = answer_stage(answer);
         }
     }
 

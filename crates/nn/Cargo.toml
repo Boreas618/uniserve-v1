@@ -14,8 +14,6 @@ ops = { path = "../ops" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# Checkpoints are safetensors: the Rust crate reads their headers and views their payloads.
-safetensors = "0.3"
 # A checkpoint shard is mapped, not loaded: the loader reads the bytes of one tensor at a time.
 memmap2 = "0.9"
 

@@ -1335,6 +1335,13 @@ impl KvOffloadManager {
 
     /// End the pins and hits of requests `live` no longer names: they were
     /// cancelled, failed or finished.
+    /// Whether any request holds a pin or a hit record here, which is what a
+    /// sweep would have to look at. A step asks this before it gathers the live
+    /// requests a sweep needs, so a step with nothing pinned costs nothing.
+    pub(crate) fn holds(&self) -> bool {
+        !self.pins.is_empty() || !self.hits.is_empty()
+    }
+
     pub(crate) fn sweep(&mut self, live: impl Fn(RequestId) -> bool) {
         let gone: Vec<RequestId> = self.pins.keys().copied().filter(|id| !live(*id)).collect();
         for request in gone {

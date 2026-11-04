@@ -401,6 +401,8 @@ struct Columns {
     /// The rows the largest bucket holds.
     rows: usize,
     positions: Column,
+    /// `[tokens]` i32 the input ids, which the model embeds into the forward's hidden states.
+    input_ids: Column,
     slot_mapping: Column,
     seq_lens: Column,
     query_offsets: Column,
@@ -430,6 +432,7 @@ impl Columns {
             tokens: tokens as usize,
             rows: rows as usize,
             positions: Column::new(device, DType::I32, tokens)?,
+            input_ids: Column::new(device, DType::I32, tokens)?,
             slot_mapping: Column::new(device, DType::I32, tokens)?,
             seq_lens: Column::new(device, DType::I32, rows)?,
             query_offsets: Column::new(device, DType::I32, rows + 1)?,
@@ -440,6 +443,230 @@ impl Columns {
             draws: Column::new(device, DType::F32, rows)?,
             readback: platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
         })
+    }
+}
+
+/// The commit table of a warm pose: `COMMIT_FIELDS` columns of `rows` i64 values, every row's slot
+/// and task `-1` and every other field zero.
+///
+/// The kernel treats a row with a negative slot as having no destination (no store of any kind) and
+/// a row with a negative task as having sampled nothing, so this table commits nothing while the
+/// launch that reads it is still recorded in the bucket's graph - which is what makes the graph a
+/// warmup captures the graph a serving batch replays.
+fn inert_commit(rows: usize) -> Vec<i64> {
+    let mut table = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+    for row in 0..rows {
+        table[ops::commit::column::SLOT * rows + row] = -1;
+        table[ops::commit::column::TASK * rows + row] = -1;
+    }
+    table
+}
+
+/// The descriptor a plain decode step's commit uses, from the table's capacity and the geometry.
+///
+/// `ops::commit` checks the table's leading stride against `stride`, every operand's type against
+/// `index`, and the block against `count`; the arithmetic is here, once, so a host test can state it
+/// without a device and the runner cannot drift from it.
+fn commit_descriptor(
+    capacity: u64,
+    block: u32,
+    vocabulary: u32,
+) -> ops::commit::CommitDescriptor {
+    ops::commit::CommitDescriptor {
+        // The table and the sampled ids are i32 end to end: `nn::Sampler` emits i32 tokens, and the
+        // operator checks `tokens` against `index`.
+        index: DType::I32,
+        verified: DType::I32,
+        penalties: DType::I32,
+        // The table is `[COMMIT_FIELDS, capacity]` and a column is contiguous.
+        stride: capacity,
+        // One next-input token per slot, in a `[slots, 1]` matrix.
+        future_stride: 1,
+        vocab: vocabulary,
+        block,
+    }
+}
+
+/// Every `slot_commit` descriptor a runner of `buckets` can launch, one per distinct block.
+///
+/// The commit is a runner-owned operator: no model calls it, so the epoch's program set does not
+/// contain it unless the runner asks. Its descriptor carries the vocabulary and the launch block
+/// (the smallest power of two covering the bucket's rows) while the table's capacity is the largest
+/// bucket's rows for every bucket, so the keys a deployment needs are one per power of two its
+/// buckets reach - eight for the default catalog.
+pub fn commit_descriptors(
+    buckets: &Buckets,
+    vocabulary: u32,
+) -> Vec<ops::commit::CommitDescriptor> {
+    let capacity = buckets
+        .iter()
+        .map(|bucket| u64::from(bucket.rows))
+        .max()
+        .unwrap_or(1);
+    let mut blocks: Vec<u32> = buckets
+        .iter()
+        .map(|bucket| commit_block(bucket.rows))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+        .into_iter()
+        .map(|block| commit_descriptor(capacity, block, vocabulary))
+        .collect()
+}
+
+/// The commit table the device reads, from the mechanism's `[COMMIT_FIELDS, rows]` i64 table.
+///
+/// The device table is `[COMMIT_FIELDS, capacity]` i32: the staged rows fill its first `rows`
+/// columns, and the rest keep whatever the previous batch left there behind `dim(1) >= count`.
+fn commit_table(commit: &[i64], rows: usize, capacity: usize) -> Result<Vec<i32>> {
+    let fields = ops::commit::COMMIT_FIELDS;
+    if commit.len() != fields * rows {
+        return Err(Error::Invariant(format!(
+            "the commit table holds {} values, {fields} fields of {rows} rows",
+            commit.len()
+        )));
+    }
+    let mut table = vec![0_i32; fields * capacity];
+    for field in 0..fields {
+        for row in 0..rows.min(capacity) {
+            let value = commit[field * rows + row];
+            table[field * capacity + row] = i32::try_from(value).map_err(|_| {
+                Error::Invalid(format!("a commit column value {value} does not fit i32"))
+            })?;
+        }
+    }
+    Ok(table)
+}
+
+/// The block a commit launch needs for `rows` rows: the smallest power of two that covers them.
+fn commit_block(rows: u32) -> u32 {
+    rows.max(1).next_power_of_two()
+}
+
+/// The rows the largest bucket of `buckets` holds, which sizes the columns bound once.
+fn largest_rows(buckets: &Buckets) -> Result<u32> {
+    buckets
+        .iter()
+        .map(|bucket| bucket.rows)
+        .max()
+        .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))
+}
+
+/// The token-state commit's operands (`ops::commit`), bound once and rewritten per batch.
+///
+/// A batch's sampled tokens must advance its slots' state - the histories the repetition,
+/// frequency and presence penalties subtract, and the positions a verify row carries. Without the
+/// launch a slot's state never moves, so the second decode step is computed against an empty
+/// history. It runs once per batch, after the sampler and before the read-back, inside the bucket's
+/// capture, so a replay advances the state exactly once.
+///
+/// Every operand is allocated when the runner binds and only the table's contents change per
+/// batch: the warm pose writes it with every row's slot and task `-1`, which the kernel treats as
+/// inert on every store, so the graph recorded at warmup is the graph a serving batch replays.
+struct CommitColumns {
+    /// `[COMMIT_FIELDS, capacity]` i32, column-major: the table the mechanism's rows fill.
+    table: Column,
+    /// `[rows]` i32 whether a row's token is valid, and whether its slot is active.
+    valid: Column,
+    active: Column,
+    /// `[1]` u8 continuation flag and `[1]` i32 accepted points: a plain decode's rows use neither.
+    continuation: Column,
+    points: Column,
+    /// `[slots]` the per-slot next-input predicate, logical position, sampling position and
+    /// verification length. A decode row advances the two positions by one.
+    predicates: Column,
+    logical: Column,
+    sampling: Column,
+    verified: Column,
+    /// `[slots]` i32 one next-input token per slot: a decode without speculation drafts none.
+    future: Column,
+    /// The table's leading stride, which the descriptor states.
+    capacity: u64,
+    /// The launch's block, which must cover every row of the largest bucket.
+    block: u32,
+}
+
+impl CommitColumns {
+    /// The commit operands of a runner whose largest bucket has `rows` rows over `slots` slots.
+    fn new(device: DeviceId, rows: u32, slots: u32) -> Result<Self> {
+        let capacity = u64::from(rows.max(1));
+        let mut columns = Self {
+            table: Column::new(device, DType::I32, u64::from(ops::commit::COMMIT_FIELDS as u32) * capacity)?,
+            valid: Column::new(device, DType::I32, capacity)?,
+            active: Column::new(device, DType::I32, capacity)?,
+            continuation: Column::new(device, DType::U8, 1)?,
+            points: Column::new(device, DType::I32, 1)?,
+            predicates: Column::new(device, DType::U8, u64::from(slots.max(1)))?,
+            logical: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            sampling: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            verified: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            future: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            capacity,
+            block: commit_block(rows),
+        };
+        // The roles a decode step leaves inert hold their starting values; only `table` is written
+        // again per batch.
+        let mut encoded = Vec::new();
+        let ones = vec![1_i32; capacity as usize];
+        encode_i32(&mut encoded, &ones);
+        columns.valid.write(&encoded)?;
+        columns.active.write(&encoded)?;
+        let zeros = vec![0_i32; slots.max(1) as usize];
+        encode_i32(&mut encoded, &zeros);
+        for column in [&mut columns.logical, &mut columns.sampling, &mut columns.verified, &mut columns.future] {
+            column.write(&encoded)?;
+        }
+        let zeros_i32 = vec![0_i32; 1];
+        encode_i32(&mut encoded, &zeros_i32);
+        columns.points.write(&encoded)?;
+        let zeros_u8 = vec![0_u8; 1];
+        columns.continuation.write(&zeros_u8)?;
+        let zeros_u8 = vec![0_u8; slots.max(1) as usize];
+        columns.predicates.write(&zeros_u8)?;
+        Ok(columns)
+    }
+
+    /// Writes the staged commit table - `[COMMIT_FIELDS, rows]` i64, column-major - as the i32 table
+    /// the descriptor asks for, then hands every operand to the device.
+    fn stage(&mut self, commit: &[i64], staged_rows: usize, capacity: usize) -> Result<()> {
+        if commit.is_empty() {
+            return Ok(());
+        }
+        let table = commit_table(commit, staged_rows, capacity)?;
+        let mut encoded = Vec::new();
+        encode_i32(&mut encoded, &table);
+        self.table.write(&encoded)?;
+        Ok(())
+    }
+
+    /// The `[COMMIT_FIELDS, capacity]` i32 view the kernel reads.
+    fn table_view(&self) -> TensorView {
+        TensorView::with_strides(
+            self.table.device.ptr,
+            DType::I32,
+            ops::Shape::new(&[ops::commit::COMMIT_FIELDS as u64, self.capacity]),
+            ops::Strides::new(&[self.capacity, 1]),
+        )
+    }
+
+    /// Copies every operand the batch rewrote into its device buffer.
+    fn upload(&self, stream: &platform::Stream) -> Result<()> {
+        for column in [
+            &self.table,
+            &self.valid,
+            &self.active,
+            &self.continuation,
+            &self.points,
+            &self.predicates,
+            &self.logical,
+            &self.sampling,
+            &self.verified,
+            &self.future,
+        ] {
+            column.upload(stream)?;
+        }
+        Ok(())
     }
 }
 
@@ -519,6 +746,16 @@ impl Sampling {
 /// reads it. `scratch` answers a page set of the paired forward's own, whose pages are never a
 /// serving request's (7.3).
 pub trait KvProvider: Send + Sync {
+    /// Gives the provider the device's one pool set, before its first gather.
+    ///
+    /// The runner's provider gathers block tables into columns of its own, and those columns are
+    /// carved from the device's allocator (4.1); the device actor creates that allocator, so it is
+    /// handed over here rather than at construction. A provider that maps nothing may ignore it.
+    fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<crate::arena::Pools>>) -> Result<()> {
+        let _ = pools;
+        Ok(())
+    }
+
     /// How many attention groups the model's layers index.
     fn groups(&self) -> usize;
 
@@ -598,6 +835,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     geometry: Geometry,
     /// Every bucket's per-step columns, whom the captured graphs address directly.
     columns: Columns,
+    /// The token-state commit's operands, written per batch and launched inside the capture.
+    commit: CommitColumns,
     /// The sampling step's own state, when any bucket samples.
     sampling: Option<Sampling>,
     /// The sampling row's output views, per bucket's plan, written by `sample` and read by the
@@ -611,9 +850,65 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// The sampling draws a step writes, in the runner's own buffer.
     draws: Vec<f32>,
     /// Where the batch's KV views come from: the resident cache, and a paired forward's scratch.
-    kv: Arc<dyn KvProvider>,
+    kv: Box<dyn KvProvider>,
     /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
     seed: std::cell::Cell<u64>,
+}
+
+/// One model object shared by the runners of every device a rank serves.
+///
+/// A rank's runners must all read the same weights, and a model is not copyable (it holds the
+/// checkpoint's mapped tensors), so the engine gives each device's runner a share of the one model
+/// it loaded. Delegation keeps the model type out of the executor: a runner is generic over
+/// `nn::CausalLm`, and this is that trait over a shared object.
+pub struct Shared<M>(Arc<M>);
+
+impl<M> Shared<M> {
+    /// The shared model.
+    pub fn new(model: Arc<M>) -> Self {
+        Self(model)
+    }
+
+    /// The model behind the share.
+    pub fn model(&self) -> &M {
+        &self.0
+    }
+}
+
+impl<M> Clone for Shared<M> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<M: CausalLm> CausalLm for Shared<M> {
+    fn embed_input_ids(
+        &self,
+        f: &nn::Forward,
+        ids: ops::TensorView,
+        out: ops::TensorView,
+    ) -> nn::Result<()> {
+        self.0.embed_input_ids(f, ids, out)
+    }
+
+    fn forward(
+        &self,
+        f: &nn::Forward,
+        batch: &nn::TokenBatch,
+        cache: &nn::KvView<'_>,
+        hidden: ops::TensorView,
+    ) -> nn::Result<()> {
+        self.0.forward(f, batch, cache, hidden)
+    }
+
+    fn logits(
+        &self,
+        f: &nn::Forward,
+        hidden: ops::TensorView,
+        out: ops::TensorView,
+    ) -> nn::Result<()> {
+        self.0.logits(f, hidden, out)
+    }
 }
 
 impl<M: CausalLm> CausalLmRunner<M> {
@@ -630,11 +925,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
         device: DeviceId,
         stream: platform::Stream,
         geometry: Geometry,
-        kv: Arc<dyn KvProvider>,
+        kv: Box<dyn KvProvider>,
         seed: u64,
     ) -> Result<Self> {
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
+        let commit_rows = largest_rows(&buckets)?;
         let columns = Columns::new(device, &buckets)?;
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
             Some(Sampling::new(device, &stream, geometry)?)
@@ -658,6 +954,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             shadow: None,
             geometry,
             columns,
+            commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             encoded: Vec::new(),
@@ -759,17 +1056,21 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
         // The operators whose kernel differs between the serving generation and the one the batch
         // names are the ones the paired forwards compare (7.3 step 2).
+        let next = self.generation_named(batch.generation)?;
         let mut jobs = Vec::new();
         for (operator, key, kernel) in self.generation.iter() {
-            let same = self
-                .generation_named(batch.generation)
-                .map(|next| {
-                    next.kernel(operator, key)
-                        .map(|candidate| Arc::ptr_eq(candidate, kernel))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if same {
+            let Ok(candidate) = next.kernel(operator, key) else {
+                // The new generation has no program under this key: its program for the operator
+                // is a different descriptor, whose kernel output cannot be paired with this one.
+                // The precopy's walk recaptures such a bucket; there is nothing to compare here.
+                tracing::debug!(
+                    operator,
+                    key,
+                    "the prepared generation has no program under this key; no paired forward"
+                );
+                continue;
+            };
+            if Arc::ptr_eq(candidate, kernel) {
                 continue;
             }
             jobs.push(Job::Shadow {
@@ -827,16 +1128,23 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let mut jobs = Vec::new();
         let mut buckets: std::collections::BTreeSet<Bucket> = std::collections::BTreeSet::new();
         for (operator, key) in changed {
+            // The buckets that launch this operator, whichever key they use: a program under a new
+            // key of the same operator changes the launch structure of the buckets that launch the
+            // operator at all, and only a walk over them can tell rebind from recapture (4.5).
             for bucket in self.graphs.using(operator, self.generation.number()) {
-                // The paired forward runs first: a difference beyond the operator's tolerance
-                // fails the precopy before anything is rebound or recaptured (7.3).
-                jobs.push(Job::Shadow {
-                    runner: self.id,
-                    operator,
-                    key: key.clone(),
-                    bucket,
-                    generation: next.number(),
-                });
+                // The paired forward runs first, and only where the two generations have a program
+                // under this same key: a kernel cannot be compared with one of another descriptor
+                // (`Forward::operate` pairs on operator and key), so a new key's bucket is left to
+                // the walk, which recaptures it.
+                if next.kernel(operator, &key).is_ok() {
+                    jobs.push(Job::Shadow {
+                        runner: self.id,
+                        operator,
+                        key: key.clone(),
+                        bucket,
+                        generation: next.number(),
+                    });
+                }
                 buckets.insert(bucket);
             }
         }
@@ -910,7 +1218,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
-        self.pools = Some(pools);
+        self.pools = Some(Arc::clone(&pools));
+        if let Err(error) = self.kv.attach_pools(pools) {
+            tracing::warn!(%error, "the cache provider took no pools; a gathered table will fail");
+        }
     }
 
     fn attach_shadow(&mut self, shadow: crate::shadow::Shadow) {
@@ -919,6 +1230,39 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
         self.counters = Some(counters);
+    }
+
+    fn discard(&mut self, generation: u64) {
+        // A prepared generation that never served: its graphs go, then their arena regions where
+        // no other generation holds the bucket, in `Captured`'s order. The serving generation and
+        // probation's old one are keyed separately and are not touched.
+        let dropped = self.graphs.discard(generation);
+        let dropped_count = dropped.len();
+        for bucket in dropped
+            .iter()
+            .filter(|bucket| !self.graphs.holds(**bucket))
+        {
+            if let Err(error) = self
+                .pool()
+                .and_then(|mut pools| pools.release_bucket(self.stream_id(), *bucket))
+            {
+                tracing::warn!(%error, %bucket, "releasing a discarded bucket's arena region");
+            }
+        }
+        // The generation object itself: a prepared one is held as `next` until switchover takes
+        // it, so an abandoned precopy drops the last reference that keeps its kernels loaded.
+        if self
+            .next
+            .as_ref()
+            .is_some_and(|next| next.number() == generation)
+        {
+            self.next = None;
+        }
+        tracing::debug!(
+            dropped = dropped_count,
+            generation,
+            "discarded a prepared generation that never served"
+        );
     }
 
     fn pool_metrics(&self) -> PoolMetrics {
@@ -978,6 +1322,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             } => {
                 let _ = batch;
                 let stream = self.stream.clone();
+                // The batch's columns are uploaded here, on the device thread, before the graph
+                // reads them: `submit` stages on the scheduler's thread and issues nothing, and a
+                // replay that skipped this would serve the pose the bucket was captured with.
+                self.upload(*bucket)?;
                 let captured = self.graphs.captured(*bucket, *generation).ok_or_else(|| {
                     Error::Invariant(format!(
                         "no graph of bucket {bucket} in generation {generation}"
@@ -1097,7 +1445,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
-        if !served.same_structure(&walked.nodes) {
+        if !served.same_structure(&walked.nodes)? {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments.
             let held = hold_kernels(&kernels, &walked.nodes)?;
@@ -1229,7 +1577,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .div_ceil(self.geometry.page_size.max(1))
             .max(1);
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+        let ids = self.input_ids(bucket);
         self.with_kv(&slots, Some(pages), |cache| {
+            self.model
+                .embed_input_ids(&forward, ids, hidden)
+                .map_err(|error| Error::Interface(error.to_string()))?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
                 .map_err(|error| Error::Interface(error.to_string()))
@@ -1310,6 +1662,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
         encode_i32(&mut self.encoded, &batch.positions[..tokens]);
         self.columns.positions.write(&self.encoded)?;
+        // The ids travel with the batch: `nn::CausalLm::forward` runs the stack over hidden states
+        // the model already holds, so embedding them is the runner's step, not the model's.
+        encode_i32(&mut self.encoded, self.staging.input_ids(tokens));
+        self.columns.input_ids.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
         self.columns.slot_mapping.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.seq_lens[..rows]);
@@ -1339,8 +1695,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
         encode_f32(&mut self.encoded, &self.draws);
         self.columns.draws.write(&self.encoded)?;
 
+        self.commit
+            .stage(self.staging.commit(), rows, self.commit.capacity as usize)?;
+
         for column in [
             &self.columns.positions,
+            &self.columns.input_ids,
             &self.columns.slot_mapping,
             &self.columns.seq_lens,
             &self.columns.query_offsets,
@@ -1352,7 +1712,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
         ] {
             column.upload(&self.stream)?;
         }
+        self.commit.upload(&self.stream)?;
         Ok(())
+    }
+
+    /// The bucket's extent of the input ids, which the forward embeds before the stack.
+    fn input_ids(&self, bucket: Bucket) -> TensorView {
+        self.columns.input_ids.extent(0..u64::from(bucket.tokens))
     }
 
     /// The device-side `TokenBatch` of `bucket`: the bucket's extent of each column.
@@ -1441,7 +1807,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
         )?;
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+        let ids = self.input_ids(bucket);
         self.with_kv(&slots, None, |cache| {
+            self.model
+                .embed_input_ids(&forward, ids, hidden)
+                .map_err(|error| Error::Interface(error.to_string()))?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
                 .map_err(|error| Error::Interface(error.to_string()))?;
@@ -1501,7 +1871,60 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.bucket_samples
             .borrow_mut()
             .insert(bucket, Sampled { tokens: samples.tokens });
+        self.commit_step(forward, bucket, &samples)?;
         Ok(())
+    }
+
+    /// Launches the token-state commit of `bucket`'s rows: their sampled tokens advance their
+    /// slots' history, so the next step's penalties are computed against it (4.4, `ops::commit`).
+    ///
+    /// It runs inside the bucket's capture, after the sampler and before the read-back, so a replay
+    /// advances the state exactly once. A batch with no commit table (a shadow batch, a chunk that
+    /// commits nothing) launches nothing, and the graph recorded for a bucket always carries the
+    /// launch, because the warm pose stages an inert table rather than an empty one.
+    fn commit_step(
+        &self,
+        forward: &Forward<'_>,
+        bucket: Bucket,
+        samples: &Samples,
+    ) -> Result<()> {
+        if self.staging.commit().is_empty() {
+            return Ok(());
+        }
+        let rows = u64::from(bucket.rows);
+        let descriptor = commit_descriptor(
+            self.commit.capacity,
+            self.commit.block,
+            self.geometry.vocabulary,
+        );
+        let slots = u64::from(self.geometry.slots.max(1));
+        let args = ops::commit::CommitArgs {
+            columns: self.commit.table_view(),
+            tokens: samples.tokens,
+            valid: self.commit.valid.extent(0..rows),
+            active: self.commit.active.extent(0..rows),
+            continuation: self.commit.continuation.extent(0..1),
+            points: self.commit.points.extent(0..1),
+            future: TensorView::with_strides(
+                self.commit.future.device.ptr,
+                DType::I32,
+                ops::Shape::new(&[slots, 1]),
+                ops::Strides::new(&[1, 1]),
+            ),
+            predicates: self.commit.predicates.extent(0..slots),
+            logical: self.commit.logical.extent(0..slots),
+            sampling: self.commit.sampling.extent(0..slots),
+            verified: self.commit.verified.extent(0..slots),
+            penalties: self
+                .sampling
+                .as_ref()
+                .map(|sampling| sampling.counts)
+                .ok_or_else(|| Error::State("a sampling batch has no count table".into()))?,
+            count: rows,
+        };
+        forward
+            .operate::<ops::commit::SlotCommit>(&descriptor, args)
+            .map_err(|error| Error::Interface(error.to_string()))
     }
 
     /// Stages a batch of the bucket's full size with nothing to write: what a warmup capture
@@ -1513,8 +1936,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
             rows: nn::BatchRows {
                 positions: vec![0; tokens],
                 slot_mapping: vec![-1; tokens],
-                seq_lens: vec![1; rows],
-                query_offsets: (0..=rows as i32).collect(),
+                // One row carries the bucket's whole token run and the rest carry none: a prefill
+                // graph's attention reads `query_offsets` as a partition of `num_tokens`, so a warm
+                // pose that gave every row one token would describe a batch of `rows` tokens wearing
+                // a `tokens`-token extent. A decode bucket has rows == tokens and gets the identity.
+                seq_lens: {
+                    let mut lengths = vec![1_i32; rows];
+                    lengths[0] = bucket.tokens as i32;
+                    lengths
+                },
+                query_offsets: {
+                    let mut offsets = vec![bucket.tokens as i32; rows + 1];
+                    offsets[0] = 0;
+                    offsets
+                },
                 logits_rows: vec![-1; rows],
                 calls: vec![nn::BatchRow {
                     request: 0,
@@ -1530,7 +1965,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
             parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
-            commit: Vec::new(),
+            // An inert table, not an empty one: a row whose slot and task are `-1` commits
+            // nothing, and the launch is still recorded, so a serving replay of this bucket
+            // advances the slots it names.
+            commit: inert_commit(rows),
             page_size: 1,
             max_kv_len: 1,
         };
@@ -1739,6 +2177,120 @@ mod tests {
         )?;
         assert_eq!(staged.tokens, 64);
         assert_eq!(&staging.batch_rows().slot_mapping[3..], &[-1i32; 61]);
+        Ok(())
+    }
+
+    /// The commit launch is well formed for the rows a bucket holds, and its table is the
+    /// mechanism's in the layout the operator states: `[COMMIT_FIELDS, capacity]` i32,
+    /// column-major, the staged rows first.
+    ///
+    /// These are the operator's own conditions (`SlotCommit::launch` checks them and refuses with
+    /// `Error::argument`), stated here because a wrong block or stride is otherwise discovered as a
+    /// failed launch inside a captured bucket on a device.
+    #[test]
+    fn the_commit_launch_is_well_formed_for_a_bucket() -> Result<()> {
+        let rows = 3;
+        let capacity = 4;
+        let vocabulary = 1_024;
+        let descriptor = commit_descriptor(capacity as u64, commit_block(rows as u32), vocabulary);
+        assert_eq!(descriptor.index, DType::I32);
+        assert_eq!(descriptor.verified, DType::I32);
+        assert_eq!(descriptor.penalties, DType::I32);
+        // The table's leading stride is its capacity, the stride `table_view` states.
+        assert_eq!(descriptor.stride, capacity as u64);
+        // A single next-input token per slot is a `[slots, 1]` matrix whose rows are one apart.
+        assert_eq!(descriptor.future_stride, 1);
+        assert_eq!(descriptor.vocab, vocabulary);
+        // The block covers the step's rows and is a power of two.
+        assert!(descriptor.block.is_power_of_two());
+        assert!(u64::from(descriptor.block) >= rows as u64);
+        assert_eq!(commit_block(1), 1);
+        assert_eq!(commit_block(5), 8);
+
+        // The mechanism's `[fields, rows]` table, column-major, becomes `[fields, capacity]`.
+        let mut staged = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+        for row in 0..rows {
+            staged[ops::commit::column::SLOT * rows + row] = row as i64 + 7;
+            staged[ops::commit::column::MODE * rows + row] = ops::commit::mode::DECODE;
+        }
+        let table = commit_table(&staged, rows, capacity)?;
+        assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * capacity);
+        let slots = &table[ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
+        assert_eq!(&slots[..rows], &[7, 8, 9]);
+        // The rows past the batch are not written from the staged table.
+        assert_eq!(slots[rows], 0);
+        // A table of the wrong length is refused rather than read past its end.
+        assert!(commit_table(&staged[..rows], rows, capacity).is_err());
+        Ok(())
+    }
+
+    /// The runner's own operator needs one key per block its buckets reach, not one per bucket:
+    /// the table's capacity is the largest bucket's rows for every bucket, so eight blocks cover
+    /// the default catalog's rows.
+    #[test]
+    fn the_commit_keys_are_one_per_block() {
+        let buckets = Buckets::causal_lm(&[1, 2, 4, 8, 16, 32, 64, 128], &[64, 128], false);
+        let descriptors = commit_descriptors(&buckets, 1_024);
+        let blocks: Vec<u32> = descriptors.iter().map(|descriptor| descriptor.block).collect();
+        assert_eq!(blocks, vec![1, 2, 4, 8, 16, 32, 64, 128]);
+        // One capacity for all of them: the largest bucket's rows, which is the table's stride.
+        for descriptor in &descriptors {
+            assert_eq!(descriptor.stride, 128);
+            assert_eq!(descriptor.vocab, 1_024);
+            assert_eq!(descriptor.index, DType::I32);
+        }
+        // A catalog whose rows are all small needs one key.
+        let small = Buckets::causal_lm(&[1, 3], &[4], false);
+        assert_eq!(commit_descriptors(&small, 1_024).len(), 1);
+    }
+
+    /// A warm pose's commit table is inert and complete: every column is present, no row names a
+    /// slot or a task, and nothing counts a penalty. The launch is recorded and the state stays as
+    /// it was, so the first request does not start from a history warmup invented.
+    #[test]
+    fn a_warm_pose_commits_nothing_but_is_recorded() {
+        let rows = 5;
+        let table = inert_commit(rows);
+        assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * rows);
+        for field in 0..ops::commit::COMMIT_FIELDS {
+            let column = &table[field * rows..(field + 1) * rows];
+            if field == ops::commit::column::SLOT || field == ops::commit::column::TASK {
+                assert_eq!(column, &[-1_i64; 5], "field {field} names no destination");
+            } else {
+                assert!(column.iter().all(|value| *value == 0), "field {field} is zero");
+            }
+        }
+    }
+
+    /// The staged ids are the batch's, in order, padded after them: the forward embeds these, so a
+    /// row's embedding comes from its own token and a padding token embeds nothing a request sees.
+    #[test]
+    fn the_staged_ids_are_the_batchs_in_order() -> Result<()> {
+        let buckets = Buckets::new([
+            Bucket::decode(4, Variant::DecodeGreedy),
+            Bucket::prefill(4, 64, Variant::PrefillOutput),
+        ]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        let commit_rows = largest_rows(&buckets)?;
+
+        staging.stage(
+            &prefill_columns(),
+            &[CallId(3)],
+            &Shape::prefill(1, 3, Variant::PrefillOutput),
+            Bucket::prefill(4, 64, Variant::PrefillOutput),
+        )?;
+        assert_eq!(&staging.input_ids(3), &[1, 2, 3]);
+
+        // A decode's two rows keep their tokens and its padding rows carry none of them.
+        staging.stage(
+            &decode_columns(),
+            &[CallId(4), CallId(5)],
+            &Shape::decode(2, Variant::DecodeGreedy),
+            Bucket::decode(4, Variant::DecodeGreedy),
+        )?;
+        assert_eq!(&staging.input_ids(2), &[7, 8]);
+        assert_eq!(staging.input_ids(4).len(), 4);
         Ok(())
     }
 

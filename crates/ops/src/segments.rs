@@ -953,3 +953,213 @@ fn stride(view: &TensorView, axis: usize) -> Result<i32> {
     i32::try_from(stride)
         .map_err(|_| Error::Shape(format!("the stride {stride} does not fit int32")))
 }
+
+/// One compilation of `vsa_scores`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ScoresDescriptor {
+    /// Heads per row.
+    pub heads: u32,
+    /// Features per head: the contraction.
+    pub width: u32,
+    /// Lanes one program uses for the contraction, rounded up to a power of two.
+    pub block: u32,
+    /// Whether the module was compiled for programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl ScoresDescriptor {
+    /// The descriptor of a pooled-score product.
+    ///
+    /// There is no element-type field because there is only one type the operands can have:
+    /// `vsa_prepare_tiles` writes each tile's per-head means as FP32 — the accumulation its pooling
+    /// runs in — and the reference computes the similarities in FP32 as well, so a BF16 or F16
+    /// product would have to narrow operands that are already FP32.
+    pub fn new(heads: u32, width: u32, block: u32, pdl: bool) -> Self {
+        Self {
+            heads,
+            width,
+            block,
+            pdl,
+        }
+    }
+}
+
+impl fmt::Display for ScoresDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("heads", self.heads)
+            .field("width", self.width)
+            .field("block", self.block)
+            .field("pdl", self.pdl)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `vsa_scores`.
+#[derive(Clone, Copy)]
+pub struct ScoresArgs {
+    /// `[query tiles, heads, width]` FP32: the pooled query rows, in the layout
+    /// `vsa_prepare_tiles` writes them.
+    pub pooled_query: TensorView,
+    /// `[tiles, heads, width]` FP32: the pooled key rows, in that same layout.
+    pub pooled_key: TensorView,
+    /// `[heads, query tiles, tiles]` FP32: one dot product per (query tile, key tile).
+    pub out: TensorView,
+}
+
+/// The pooled (query tile, key tile) similarities VSA's selection ranks.
+///
+/// This is the step between pooling and selection: `vsa_prepare_tiles` pools each tile's per-head
+/// means, `vsa_scores` contracts them per head, and `vsa_select_tiles` ranks the result. Without it
+/// the sparse path has no scores, and nothing else fills the gap: `gemm` has no batch axis, and the
+/// contraction is per head.
+///
+/// It is exactly a per-head dot product — no scale and no softmax, because the caller applies both
+/// afterwards (the selection only compares, and the attention scales its own products), so the
+/// program writes the raw sum of products and nothing else.
+///
+/// **The operands are the pooled tiles in the layout the pooling writes them**: a tile is the
+/// leading axis, then the head, then the feature. The scores are the other way round — head first —
+/// because `vsa_select_tiles` reads one row of `tiles` per (head, query tile) contiguously, and the
+/// selection is what consumes them.
+pub struct VsaScores;
+
+impl Op for VsaScores {
+    const NAME: &'static str = "vsa_scores";
+
+    type Descriptor = ScoresDescriptor;
+    type Args<'a> = ScoresArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let width = u64::from(descriptor.width);
+        let heads = u64::from(descriptor.heads);
+        if width == 0 || heads == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a score product needs at least one head of at least one feature".to_owned(),
+            ));
+        }
+        if args.pooled_query.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled query rows are FP32, the view says {}",
+                    args.pooled_query.dtype
+                ),
+            ));
+        }
+        if args.pooled_key.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled key rows are FP32, the view says {}",
+                    args.pooled_key.dtype
+                ),
+            ));
+        }
+        args.pooled_query.require_rank(Self::NAME, 3)?;
+        args.pooled_key.require_rank(Self::NAME, 3)?;
+        // A tile's pooled row is `[heads, width]` and the tile is its leading axis, so both operands
+        // carry the same two inner extents; a view whose planes are another head count or another
+        // width would contract against the wrong operands and produce plausible scores.
+        for (name, view) in [("query", args.pooled_query), ("key", args.pooled_key)] {
+            if view.shape.dim(1) != heads || view.shape.dim(2) != width {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the pooled {name} tiles are [_, {}, {}], the descriptor's [_, {heads}, \
+                         {width}]",
+                        view.shape.dim(1),
+                        view.shape.dim(2)
+                    ),
+                ));
+            }
+        }
+        let query_tiles = args.pooled_query.shape.dim(0);
+        let key_tiles = args.pooled_key.shape.dim(0);
+        if args.out.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                "the scores are FP32: the selection compares them".to_owned(),
+            ));
+        }
+        args.out
+            .require_shape(Self::NAME, Shape::new(&[heads, query_tiles, key_tiles]))?;
+        // The selection reads the scores as a contiguous `[heads, query tiles, tiles]` matrix, so
+        // this operator writes exactly that layout and no other.
+        if args.out.strides != crate::tensor::Strides::row_major(args.out.shape) {
+            return Err(Error::argument(
+                Self::NAME,
+                "the score matrix is written row-major".to_owned(),
+            ));
+        }
+        if u64::from(descriptor.block) < width.next_power_of_two() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the descriptor's {} lanes cannot hold the {width}-feature contraction",
+                    descriptor.block
+                ),
+            ));
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.pooled_query)
+            .view(args.pooled_key)
+            .view(args.out)
+            .i32(query_tiles as i32)
+            .i32(key_tiles as i32)
+            .flag(descriptor.pdl);
+        // One program per (head, query tile): it walks the key tiles and writes one row of scores.
+        kernel.launch(
+            LaunchGrid::new([query_tiles, heads, 1])?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        ScoresArgs {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The standard bound for the contraction and nothing else: `width` products per score,
+        // accumulated in FP32 and written as FP32, with no activation between them — so the reduction
+        // length is the feature width and the output's rounding is the accumulator's (whose `u` is
+        // already in the bound at FP32).
+        Tolerance::dot(u64::from(descriptor.width), DType::F32, DType::F32)
+    }
+}
+
+#[cfg(test)]
+mod scores_tests {
+    use super::*;
+
+    #[test]
+    fn the_key_names_the_contraction_and_the_lanes() {
+        let descriptor = ScoresDescriptor::new(56, 128, 128, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "heads_56_width_128_block_128_pdl_false"
+        );
+    }
+
+    #[test]
+    fn the_bound_is_the_contraction_and_the_accumulator() {
+        // Two widths differ only in the reduction length, and the bound follows it: a wider
+        // contraction cannot share a bound with a narrower one, which is why `width` is a key field.
+        let narrow = VsaScores::tolerance(&ScoresDescriptor::new(56, 64, 64, false));
+        let wide = VsaScores::tolerance(&ScoresDescriptor::new(56, 256, 256, false));
+        assert!(wide.rtol > narrow.rtol);
+    }
+}

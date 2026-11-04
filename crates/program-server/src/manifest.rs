@@ -250,6 +250,64 @@ pub const POLICY_DESCRIPTOR: &str = "default";
 /// host's CPU, not a GPU architecture.
 pub const WASM_TARGET: &str = "wasm32";
 
+/// The shapes a package covers: one descriptor table, or several.
+///
+/// An operator's key shape varies by variant — `qk_norm_rope` prints `rotated`
+/// only when its rotation is narrowed, `rotary_factors` prints `axes`,
+/// `sections` and `interleaved` only when it is sectioned — and a package serves
+/// an *operator*, not one key shape. A manifest writes either the one table it
+/// always wrote
+///
+/// ```toml
+/// [kernel.descriptors]
+/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = ["32"] }
+/// ```
+///
+/// or one table per shape
+///
+/// ```toml
+/// [[kernel.descriptors]]
+/// dimensions = { dtype = ["bf16"], head_dim = ["128"] }
+///
+/// [[kernel.descriptors]]
+/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = ["32"] }
+/// ```
+///
+/// A key is covered when it covers one of them, so a backend name keeps meaning
+/// what `prepare` selects by and a deployment's configuration names, rather
+/// than growing a shape vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DescriptorShapes {
+    /// The one table a package writes when its keys all have one shape.
+    One(Descriptors),
+    /// One table per shape.
+    Several(Vec<Descriptors>),
+}
+
+/// A package that declares nothing covers nothing.
+impl Default for DescriptorShapes {
+    fn default() -> Self {
+        Self::One(Descriptors::default())
+    }
+}
+
+impl DescriptorShapes {
+    /// Every shape the package covers, in the order the manifest writes them.
+    pub fn shapes(&self) -> &[Descriptors] {
+        match self {
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Several(several) => several.as_slice(),
+        }
+    }
+
+    /// Whether the package covers the descriptor whose key this is: it covers
+    /// one of the package's shapes.
+    pub fn covers(&self, key: &str) -> bool {
+        self.shapes().iter().any(|shape| shape.covers(key))
+    }
+}
+
 /// The descriptors a package covers (design section 4.2 and 5.2).
 ///
 /// A descriptor is the set of parameter values one compilation covers; its
@@ -339,8 +397,8 @@ pub struct KernelSpec {
     pub target: TargetKind,
     /// The architectures the package supports, such as `["sm_100a"]`.
     pub architectures: Vec<String>,
-    /// The descriptors the package covers.
-    pub descriptors: Descriptors,
+    /// The shapes the package covers, each a descriptor table.
+    pub descriptors: DescriptorShapes,
     /// The tile constants and the rule that picks a kernel for a descriptor.
     /// The package's own compile script and launch code read these; the
     /// Program Server only keeps them with the revision.
@@ -463,6 +521,16 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+
+    /// The descriptor shapes this package covers, in the manifest's order: one
+    /// table for a package whose keys all have one shape, one per shape for a
+    /// package whose operator's key varies by variant, and none for a policy.
+    pub fn descriptors(&self) -> &[Descriptors] {
+        match &self.kernel {
+            Some(kernel) => kernel.descriptors.shapes(),
+            None => &[],
+        }
     }
 
     /// Whether this package covers a descriptor key: a kernel program by its
