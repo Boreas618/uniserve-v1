@@ -686,14 +686,22 @@ fn stage_denoise(args: &Args) -> Result<()> {
 
     // 10. The case and the draw, then the evaluations. The case goes out before the trajectory: it
     //     names the run, and a stop inside the loop is read against it.
+    let grid = schedule.spec().grid.kind();
     let directory = args.out.join("denoiser");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // The case's `schedule` is the checkpoint's own word for its grid - `ScheduleGrid::kind()`,
+    // which is what the checkpoint's config states - and not the reference's class name
+    // (`UniformGrid`, `BlockGrid`, `PddGrid`). One vocabulary, and it is the one the model reads:
+    // the field's job is to make a FastH3 contract read as another grid a refusal rather than a
+    // page, and a spelling difference between two tools would be the same failure with none of the
+    // meaning.
     let case = format!(
         "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
          \"text_rows\": {text_rows}, \"prefix_rows\": {prefix_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
          \"seed\": {}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}, \
-         \"schedule\": \"{}\", \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \
+         \"schedule\": {grid:?}, \
+         \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \
          \"video_shape\": {}}}\n",
         args.width,
         args.height,
@@ -702,7 +710,6 @@ fn stage_denoise(args: &Args) -> Result<()> {
         shape.condition_rows,
         denoiser_config.transformer.num_hidden_layers,
         args.seed,
-        schedule.spec().grid.kind(),
         format_sample(&video_latents),
     );
     std::fs::write(directory.join("case.json"), case)
