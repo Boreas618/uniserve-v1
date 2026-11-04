@@ -207,6 +207,33 @@ mod tests {
     }
 
     #[test]
+    fn the_slice_checkpoint_maps_every_parameter() {
+        // The local 30B-A3B metadata, when the machine has it: 48 sparse layers, untied head.
+        let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B/config.json");
+        if !path.is_file() {
+            return;
+        }
+        let config = crate::Config::read(path.parent().expect("a parent directory"))
+            .expect("the local Qwen3-30B-A3B metadata");
+        let sources = parameter_sources(&config);
+        // embedding, norm and head; then per layer two norms, four projections (q, k, v, o), two
+        // per-head norms and the router.
+        assert_eq!(sources.len(), 3 + 48 * 9);
+        let names: Vec<&str> = sources.iter().map(|source| source.checkpoint.as_str()).collect();
+        assert!(names.contains(&"model.embed_tokens.weight"));
+        assert!(names.contains(&"lm_head.weight"));
+        assert!(names.contains(&"model.layers.47.self_attn.q_norm.weight"));
+        assert!(names.contains(&"model.layers.47.mlp.gate.weight"));
+        assert!(!names.iter().any(|name| name.contains("mlp.experts")));
+        assert_eq!(expert_sources(&config).len(), 48);
+        let experts = expert_sources(&config);
+        assert_eq!(
+            experts[7].tensors(3).up,
+            "model.layers.7.mlp.experts.3.up_proj.weight"
+        );
+    }
+
+    #[test]
     fn every_layer_of_the_local_checkpoint_maps() {
         let config = config(&[0, 1, 2, 3], false, false);
         let sources = parameter_sources(&config);
@@ -217,7 +244,7 @@ mod tests {
         assert!(names.contains(&"layers.0.attention.q_proj.weight"));
         assert!(names.contains(&"layers.3.mlp.router.weight"));
         assert!(!names.contains(&"layers.3.mlp.gate_proj.weight"));
-        assert_eq!(sources.len(), 3 + 4 * (2 + 5 + 2 + 1));
+        assert_eq!(sources.len(), 3 + 4 * (2 + 4 + 2 + 1));
         assert_eq!(expert_sources(&config).len(), 4);
     }
 
@@ -235,7 +262,8 @@ mod tests {
                 .iter()
                 .any(|source| source.parameter == "layers.1.mlp.router.weight")
         );
-        assert_eq!(expert_sources(&config).len(), 3);
+        // Layers 1..3 are dense; only layer 0 routes, so one expert source.
+        assert_eq!(expert_sources(&config).len(), 1);
     }
 
     #[test]

@@ -1102,6 +1102,21 @@ void usv_mux_close(UsvMuxer *muxer) {
 
 /* ---- audio decoding ------------------------------------------------------ */
 
+/* Appends one converted chunk of every output channel to that channel's
+ * plane. The decoder hands out frames, so a stream's samples arrive in frame
+ * order; appending each channel on its own turns that into the plane-major
+ * layout the caller reads, whatever the frames' sizes are. */
+static int append_channel_planes(Buffer *planes, int channels,
+                                 uint8_t **converted, int samples) {
+    for (int channel = 0; channel < channels; channel++) {
+        if (buffer_append(&planes[channel], converted[channel],
+                          (size_t)samples * sizeof(float)) != USV_OK) {
+            return USV_ERROR;
+        }
+    }
+    return USV_OK;
+}
+
 /* Decodes the first audio stream of `data` to planar float at the stream's
  * declared rate and channel layout, the format conversion PyAV's resampler
  * performs before the reference resamples the track: its output is the
@@ -1130,8 +1145,12 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
     AVFrame *frame = av_frame_alloc();
     AVPacket *packet = av_packet_alloc();
     SwrContext *resampler = NULL;
-    Buffer output;
-    memset(&output, 0, sizeof(output));
+    /* One plane per output channel while the stream is converted, and the
+     * plane-major buffer the caller receives. */
+    Buffer channel_planes[2];
+    Buffer concatenated;
+    memset(channel_planes, 0, sizeof(channel_planes));
+    memset(&concatenated, 0, sizeof(concatenated));
     AVChannelLayout out_layout;
     memset(&out_layout, 0, sizeof(out_layout));
     AVChannelLayout in_layout;
@@ -1245,15 +1264,13 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                 code = fail_averror("converting decoded audio", converted);
                 goto done;
             }
-            for (int channel = 0; channel < out_channels && converted > 0;
-                 channel++) {
-                if (buffer_append(&output, planes[channel],
-                                  (size_t)converted * sizeof(float)) != USV_OK) {
-                    av_freep(&planes[0]);
-                    av_freep(&planes);
-                    code = USV_ERROR;
-                    goto done;
-                }
+            if (converted > 0 &&
+                append_channel_planes(channel_planes, out_channels, planes,
+                                      converted) != USV_OK) {
+                av_freep(&planes[0]);
+                av_freep(&planes);
+                code = USV_ERROR;
+                goto done;
             }
             av_freep(&planes[0]);
             av_freep(&planes);
@@ -1292,15 +1309,13 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                 code = fail_averror("converting a flushed audio frame", converted);
                 goto done;
             }
-            for (int channel = 0; channel < out_channels && converted > 0;
-                 channel++) {
-                if (buffer_append(&output, planes[channel],
-                                  (size_t)converted * sizeof(float)) != USV_OK) {
-                    av_freep(&planes[0]);
-                    av_freep(&planes);
-                    code = USV_ERROR;
-                    goto done;
-                }
+            if (converted > 0 &&
+                append_channel_planes(channel_planes, out_channels, planes,
+                                      converted) != USV_OK) {
+                av_freep(&planes[0]);
+                av_freep(&planes);
+                code = USV_ERROR;
+                goto done;
             }
             av_freep(&planes[0]);
             av_freep(&planes);
@@ -1326,15 +1341,13 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                 code = fail_averror("flushing the audio converter", converted);
                 goto done;
             }
-            for (int channel = 0; channel < out_channels && converted > 0;
-                 channel++) {
-                if (buffer_append(&output, planes[channel],
-                                  (size_t)converted * sizeof(float)) != USV_OK) {
-                    av_freep(&planes[0]);
-                    av_freep(&planes);
-                    code = USV_ERROR;
-                    goto done;
-                }
+            if (converted > 0 &&
+                append_channel_planes(channel_planes, out_channels, planes,
+                                      converted) != USV_OK) {
+                av_freep(&planes[0]);
+                av_freep(&planes);
+                code = USV_ERROR;
+                goto done;
             }
             av_freep(&planes[0]);
             av_freep(&planes);
@@ -1348,17 +1361,38 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
         code = fail_plan("an audio stream decoded to no samples");
         goto done;
     }
+    size_t plane_samples = channel_planes[0].size / sizeof(float);
+    if (plane_samples == 0) {
+        code = fail_plan("an audio stream decoded to no samples");
+        goto done;
+    }
+    for (int channel = 1; channel < out_channels; channel++) {
+        if (channel_planes[channel].size / sizeof(float) != plane_samples) {
+            code = fail("the audio channels decoded to different lengths");
+            goto done;
+        }
+    }
+    for (int channel = 0; channel < out_channels; channel++) {
+        if (buffer_append(&concatenated, channel_planes[channel].data,
+                          channel_planes[channel].size) != USV_OK) {
+            code = USV_ERROR;
+            goto done;
+        }
+    }
     *rate = out_rate;
     *channels = out_channels;
-    *samples = (int64_t)(output.size / (sizeof(float) * (size_t)out_channels));
-    *planar = (float *)output.data;
-    output.data = NULL;
-    output.size = 0;
-    output.capacity = 0;
+    *samples = (int64_t)plane_samples;
+    *planar = (float *)concatenated.data;
+    concatenated.data = NULL;
+    concatenated.size = 0;
+    concatenated.capacity = 0;
     code = USV_OK;
 
 done:
-    buffer_free(&output);
+    for (int channel = 0; channel < 2; channel++) {
+        buffer_free(&channel_planes[channel]);
+    }
+    buffer_free(&concatenated);
     av_channel_layout_uninit(&in_layout);
     av_channel_layout_uninit(&out_layout);
     if (resampler) {

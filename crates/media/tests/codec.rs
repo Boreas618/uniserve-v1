@@ -148,8 +148,14 @@ fn frame_times(file: &Path) -> Vec<f64> {
     let text = String::from_utf8(output).expect("ffprobe writes UTF-8");
     text.lines()
         .filter(|line| !line.trim().is_empty())
+        // `csv=p=0` prints one line per frame and adds a field for each
+        // side-data entry the frame carries, which can leave a trailing empty
+        // column; the presentation time is the first field.
         .map(|line| {
-            line.trim()
+            line.split(',')
+                .next()
+                .expect("a line has a first field")
+                .trim()
                 .parse::<f64>()
                 .expect("ffprobe prints a frame's presentation time")
         })
