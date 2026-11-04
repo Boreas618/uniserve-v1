@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use libloading::Library;
 
 use crate::driver::Handle;
-use crate::{DataType, Device, DeviceId, Error, Result, Stream};
+use crate::{DataType, Device, DeviceId, DeviceRange, Error, Result, Stream};
 
 const LIBCUBLASLT: &str = "libcublasLt.so.13";
 
@@ -175,6 +175,7 @@ impl MatmulDescriptor {
             b: self.b.elements() * self.b.dtype.bytes() as u64,
             c: self.c.elements() * self.c.dtype.bytes() as u64,
             d: self.d.elements() * element,
+            bias: self.d.rows * self.d.dtype.bytes() as u64,
         }
     }
 
@@ -204,6 +205,9 @@ pub struct MatmulBytes {
     pub b: u64,
     pub c: u64,
     pub d: u64,
+    /// The bias vector of [`Epilogue::Bias`]: `D`'s rows of `D`'s type. It is
+    /// one vector for every batch, as cuBLASLt applies it.
+    pub bias: u64,
 }
 
 /// An algorithm cuBLASLt proposes for one [`MatmulDescriptor`], with the
@@ -246,26 +250,26 @@ impl Algorithm {
     }
 }
 
-/// The pointers and scalars of one multiplication:
+/// The buffers and scalars of one multiplication:
 /// `D = alpha · op(A) · op(B) + beta · C`, with the bias of
 /// [`Epilogue::Bias`] and the algorithm's workspace.
 ///
-/// Every pointer addresses device storage the caller keeps alive until the
-/// stream work completes, and that stays at its address for a captured
-/// graph's life.
+/// Each range states where its buffer starts and how many bytes are valid from
+/// there; [`Matmul::run`] checks them against the descriptor before any
+/// cuBLASLt call. The storage stays at its address for the work's life,
+/// including every replay of a graph that captured it.
 #[derive(Clone, Copy, Debug)]
 pub struct MatmulArgs {
-    pub a: u64,
-    pub b: u64,
-    pub c: u64,
-    pub d: u64,
+    pub a: DeviceRange,
+    pub b: DeviceRange,
+    pub c: DeviceRange,
+    pub d: DeviceRange,
     pub alpha: f32,
     pub beta: f32,
-    /// The bias vector, `D`'s rows long, for [`Epilogue::Bias`]; 0 otherwise.
-    pub bias: u64,
-    /// The workspace's address and bytes; at least the algorithm's need.
-    pub workspace: u64,
-    pub workspace_bytes: usize,
+    /// The bias vector for [`Epilogue::Bias`]; an empty range otherwise.
+    pub bias: DeviceRange,
+    /// The workspace the algorithm runs in, at least its need.
+    pub workspace: DeviceRange,
 }
 
 /// `cublasLtMatmulHeuristicResult_t`.
@@ -339,6 +343,17 @@ struct Api {
     get_version: unsafe extern "C" fn() -> usize,
     // Declared last: the library outlives every copied function pointer.
     _library: Library,
+}
+
+/// Fails unless `range` states at least `needed` bytes from its address.
+fn require_room(range: DeviceRange, needed: u64, what: &'static str) -> Result<()> {
+    if (range.bytes() as u64) < needed {
+        return Err(Error::invalid(format!(
+            "the {what} range states {} bytes, but the multiplication needs {needed}",
+            range.bytes()
+        )));
+    }
+    Ok(())
 }
 
 fn api() -> Result<&'static Api> {
@@ -526,13 +541,12 @@ impl Matmul {
     /// The call issues device work and returns without waiting for it; on a
     /// capturing stream it is captured into the graph.
     ///
-    /// # Safety
-    ///
-    /// `args` must address device storage that outlives every execution of
-    /// the launch: each operand at least [`MatmulDescriptor::bytes`] long,
-    /// the bias vector `D`'s rows long, and the workspace at least
-    /// `algorithm`'s.
-    pub unsafe fn run(
+    /// Before any cuBLASLt call, every range is checked against what the
+    /// descriptor's shapes need ([`MatmulDescriptor::bytes`]), the bias range
+    /// against [`Epilogue::Bias`]'s vector, and the workspace against
+    /// `algorithm`'s need; a range too small is refused by name. The caller
+    /// keeps the storage alive until the stream work completes.
+    pub fn run(
         &self,
         descriptor: &MatmulDescriptor,
         algorithm: &Algorithm,
@@ -540,17 +554,33 @@ impl Matmul {
         stream: &Stream,
     ) -> Result<()> {
         descriptor.check()?;
-        if args.workspace_bytes < algorithm.workspace_bytes {
+        let bytes = descriptor.bytes();
+        require_room(args.a, bytes.a, "A")?;
+        require_room(args.b, bytes.b, "B")?;
+        require_room(args.c, bytes.c, "C")?;
+        require_room(args.d, bytes.d, "D")?;
+        if descriptor.epilogue == Epilogue::Bias {
+            require_room(args.bias, bytes.bias, "bias")?;
+        }
+        if args.workspace.bytes() < algorithm.workspace_bytes {
             return Err(Error::invalid(format!(
                 "the multiplication needs {} bytes of workspace, {} given",
-                algorithm.workspace_bytes, args.workspace_bytes
+                algorithm.workspace_bytes,
+                args.workspace.bytes()
+            )));
+        }
+        if stream.device() != self.device {
+            return Err(Error::invalid(format!(
+                "the multiplication runs on {}, not on {}'s stream",
+                self.device,
+                stream.device()
             )));
         }
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let descriptions = Descriptions::new(self.api, descriptor)?;
         if descriptor.epilogue == Epilogue::Bias {
-            descriptions.set_bias(self.api, args.bias, descriptor.bias_type())?;
+            descriptions.set_bias(self.api, args.bias.ptr().address(), descriptor.bias_type())?;
         }
         let (alpha, beta) = (args.alpha, args.beta);
         // SAFETY: forwarded from the caller; every pointer is device storage
@@ -561,18 +591,18 @@ impl Matmul {
                     self.handle,
                     descriptions.matmul,
                     std::ptr::from_ref(&alpha).cast(),
-                    args.a as *const c_void,
+                    args.a.ptr().address() as *const c_void,
                     descriptions.a,
-                    args.b as *const c_void,
+                    args.b.ptr().address() as *const c_void,
                     descriptions.b,
                     std::ptr::from_ref(&beta).cast(),
-                    args.c as *const c_void,
+                    args.c.ptr().address() as *const c_void,
                     descriptions.c,
-                    args.d as *mut c_void,
+                    args.d.ptr().address() as *mut c_void,
                     descriptions.d,
                     &algorithm.bytes,
-                    args.workspace as *mut c_void,
-                    args.workspace_bytes,
+                    args.workspace.ptr().address() as *mut c_void,
+                    args.workspace.bytes(),
                     stream.handle(),
                 )
             },
@@ -834,7 +864,9 @@ mod tests {
                 a: 4 * 3 * 2,
                 b: 3 * 6 * 2,
                 c: 4 * 6 * 2,
-                d: 4 * 6 * 2
+                d: 4 * 6 * 2,
+                // One bias vector for every batch: D's rows of D's type.
+                bias: 4 * 2,
             }
         );
     }
