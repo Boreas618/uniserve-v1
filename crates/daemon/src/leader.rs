@@ -1931,6 +1931,28 @@ impl Replica {
         });
     }
 
+    /// Whether the world this replica's engine executes is still the world the
+    /// deployment serves. A switch moves service to its target through the
+    /// frontend, and the replica's own engine is then the drained previous
+    /// epoch's: it keeps no standby and is not promoted, because nothing routes
+    /// to it and a promoted process would be a second engine of a purged world.
+    fn serves_serving_epoch(&self) -> bool {
+        let Some(driver) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+        else {
+            return true;
+        };
+        let Some((_, record)) = driver.epochs().serving() else {
+            return true;
+        };
+        let Some(served) = locked(&self.served).as_ref().map(|spec| spec.world) else {
+            return true;
+        };
+        record.world == served
+    }
+
     /// Replaces the parked standby with one prepared from what the deployment
     /// runs now: a program update moves the serving engine in place, and a
     /// standby started before it holds the programs the update replaced. A
@@ -1973,6 +1995,9 @@ impl Replica {
             return Ok(());
         };
         if serving.state() != EngineState::Ready {
+            return Ok(());
+        }
+        if !self.serves_serving_epoch() {
             return Ok(());
         }
         {
@@ -2466,7 +2491,12 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
             );
             return;
         }
-        if let Some(promoted) = replica.promote_standby().await {
+        // A world the deployment no longer serves is relaunched, not promoted:
+        // the frontend serves another epoch, and a revert to this one has to
+        // find its engine alive.
+        if replica.serves_serving_epoch()
+            && let Some(promoted) = replica.promote_standby().await
+        {
             tracing::info!(%reason, "the standby promoted in place; it serves");
             client = Arc::downgrade(&promoted);
             continue;
