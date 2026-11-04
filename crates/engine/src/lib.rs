@@ -42,7 +42,6 @@ pub use crate::core::{
     EngineConfig, RankFacts, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
 };
 pub use crate::deployment::Deployment;
-pub use crate::process_link::ProcessLink;
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageOffloads,
@@ -55,23 +54,26 @@ pub use crate::handle::{
     EventSendError, EventTx, HookBarrier, PolicyPrograms, PolicySlotHandle, RankBudgets,
     StageApplied, StreamCancelCause, Submission, SubmitError, Successor, Wake, WeightsInFlight,
 };
+pub use crate::process_link::ProcessLink;
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
 pub use crate::kv_cache::{HostCacheSize, IndexedPage};
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::submission::Submissions;
+#[cfg(feature = "testing")]
+pub use crate::scheduler::testing::packaged_module;
+#[cfg(feature = "testing")]
+pub use crate::scheduler::testing::packaged_policy;
 pub use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
-    ExecutionDomainStats, GeneralStats, GroupCache, Limits, PREFETCH_FLOOR_TOKENS, ParkedCache,
-    Parameters, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
+    ExecutionDomainStats, GeneralStats, GroupCache, Limits, PREFETCH_FLOOR_TOKENS, Parameters,
+    ParkedCache, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
     PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy, RouteTrial, Scheduler,
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
     Validators, WorkerStats, arrival_view, ceilings_of,
 };
-pub use crate::service::{continuation_slot, run_engine, serve_requests};
-#[cfg(feature = "testing")]
-pub use crate::scheduler::testing::{packaged_module, packaged_policy};
+pub use crate::service::{EpochPolicy, continuation_slot, run_engine, serve_requests};
 #[cfg(feature = "testing")]
 pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,

@@ -38,10 +38,7 @@ use crate::supervision::ProcessCommands;
 
 /// How a node's service is asked to start and stop a process: the request
 /// channel every launch goes through, and where its answer goes.
-type Request = (
-    process::Request,
-    Sender<process::Reply>,
-);
+type Request = (process::Request, Sender<process::Reply>);
 
 /// The application process of the node: what the daemon needs to start it,
 /// gate it and end it.
@@ -142,16 +139,14 @@ impl Application {
 
     /// Holds new requests at the frontend's gate (`paused`) or releases them.
     pub(crate) fn pause(&mut self, paused: bool) -> anyhow::Result<()> {
-        let peer = self.peer.ok_or_else(|| {
-            anyhow::anyhow!("the frontend has not greeted: no peer to gate")
-        })?;
+        let peer = self
+            .peer
+            .ok_or_else(|| anyhow::anyhow!("the frontend has not greeted: no peer to gate"))?;
         self.commands
             .send(
                 peer,
                 process::Command {
-                    kind: Some(process::command::Kind::Pause(process::Pause {
-                        paused,
-                    })),
+                    kind: Some(process::command::Kind::Pause(process::Pause { paused })),
                 },
             )
             .map_err(|error| anyhow::anyhow!("gating the frontend failed: {error}"))?;
@@ -261,7 +256,11 @@ mod tests {
                 requests,
                 commands,
                 "uniserve",
-                vec!["frontend".to_owned(), "--port".to_owned(), "8000".to_owned()],
+                vec![
+                    "frontend".to_owned(),
+                    "--port".to_owned(),
+                    "8000".to_owned(),
+                ],
                 HashMap::new(),
                 7,
             ),

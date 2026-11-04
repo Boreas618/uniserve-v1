@@ -339,13 +339,15 @@ impl Supervisor {
     pub(crate) fn live(&self) -> Vec<HandedProcess> {
         self.children
             .iter()
-            .map(|((engine, group, rank, generation), supervised)| HandedProcess {
-                engine: *engine,
-                group: group.clone(),
-                rank: *rank,
-                generation: *generation,
-                pid: supervised.child.id(),
-            })
+            .map(
+                |((engine, group, rank, generation), supervised)| HandedProcess {
+                    engine: *engine,
+                    group: group.clone(),
+                    rank: *rank,
+                    generation: *generation,
+                    pid: supervised.child.id(),
+                },
+            )
             .collect()
     }
 

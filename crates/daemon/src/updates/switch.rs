@@ -1305,7 +1305,13 @@ mod tests {
             assert_eq!(spawn.rank, nodes()[index].rank);
             assert_eq!(spawn.generation, 6, "the serving generation's next one");
             assert_eq!(spawn.executable, "/opt/uniserve");
-            assert_eq!(spawn.arguments, vec!["engine".to_owned()]);
+            // The adapter writes the launch file and states the argv that
+            // reads it ([`crate::engine::launch`]): the switch starts a child,
+            // not a command line, so it states none.
+            assert!(
+                spawn.arguments.is_empty(),
+                "a spawn states no arguments: {spawn:?}"
+            );
         }
         assert_eq!(roster.claims.len(), 2);
         for (index, (_, world, scopes, retire)) in roster.claims.iter().enumerate() {

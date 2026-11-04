@@ -8,8 +8,8 @@
 //! connection serves the whole deployment, so one link reads it: a second
 //! [`ProcessLink::connect`] in the same process is refused.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;

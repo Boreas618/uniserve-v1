@@ -1596,6 +1596,16 @@ const SEGMENT_TABLES: [&str; 14] = [
     "video_indices",
 ];
 
+/// A rank-one row table as the rows of width one a row gather moves.
+///
+/// The per-row tables (`groups`, `prefix_index`, `modulation_indices`, `step`) are declared
+/// one-dimensional, because a layer reads one integer per row. `nn::layers::gather_rows` states its
+/// source and its output as `[rows, columns]`, so a table enters it as rows of width one: the same
+/// buffer with row-major strides for the new shape, no copy and no change of value.
+fn one_column(view: TensorView) -> TensorView {
+    view.reshape(Shape::new(&[view.numel(), 1]))
+}
+
 /// One request's state views, resolved by name against its kind's table set.
 struct Tables<'a> {
     names: &'static [&'static str],
@@ -2660,7 +2670,12 @@ impl Denoiser {
         let video_hidden = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
         nn::layers::gather_rows(f, hidden, video_indices, video_hidden)?;
         let video_groups = arena.tensor(DType::I32, Shape::new(&[video_rows]))?;
-        nn::layers::gather_rows(f, tables.get("groups")?, video_indices, video_groups)?;
+        nn::layers::gather_rows(
+            f,
+            one_column(tables.get("groups")?),
+            video_indices,
+            one_column(video_groups),
+        )?;
         let velocity_rows = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
         self.transformer.velocity(
             f,
@@ -2692,7 +2707,12 @@ impl Denoiser {
             let audio_hidden = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
             nn::layers::gather_rows(f, hidden, audio_indices, audio_hidden)?;
             let audio_groups = arena.tensor(DType::I32, Shape::new(&[audio_rows]))?;
-            nn::layers::gather_rows(f, tables.get("groups")?, audio_indices, audio_groups)?;
+            nn::layers::gather_rows(
+                f,
+                one_column(tables.get("groups")?),
+                audio_indices,
+                one_column(audio_groups),
+            )?;
             let features = u64::from(self.config.transformer.audio_channels);
             let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, features]))?;
             self.transformer.velocity(

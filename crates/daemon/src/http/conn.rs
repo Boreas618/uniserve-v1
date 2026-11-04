@@ -47,9 +47,9 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 use tracing::{debug, trace, warn};
 
-use crate::http::handoff::{self, Decision, FrozenStream};
+use crate::http::handoff::{self, Admissions, Decision, FrozenStream};
 use crate::http::listener::Listener;
-use crate::http::stream::{Handed, HandedBody, Pause};
+use crate::http::stream::{Handed, HandedBody, Opened, Pause};
 
 /// The accepted connection: a TCP stream on a serving address, a Unix stream
 /// on a socket address.
@@ -70,11 +70,14 @@ const BODY_CHUNK: usize = 64 << 10;
 ///
 /// A cancelled `accepting` ends each connection between two requests, as
 /// `axum::serve(...).with_graceful_shutdown(...)` did, and the caller bounds
-/// the wait (`server_config.shutdown_timeout`).
+/// the wait (`server_config.shutdown_timeout`). A closed `admitting` ends them
+/// there too, for the other reason a daemon takes no new request: it is
+/// handing the deployment over (design §7.5.1 step 1).
 pub(crate) async fn serve(
     mut listener: Listener,
     app: Router,
     accepting: CancellationToken,
+    admitting: Admissions,
 ) -> anyhow::Result<()> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -84,8 +87,9 @@ pub(crate) async fn serve(
             (io, _address) = axum::serve::Listener::accept(&mut listener) => {
                 let app = app.clone();
                 let stopping = accepting.clone();
+                let admitting = admitting.clone();
                 connections.spawn(async move {
-                    if let Err(error) = serve_connection(io, app, stopping).await {
+                    if let Err(error) = serve_connection(io, app, stopping, admitting).await {
                         debug!(%error, "a connection ended with an error");
                     }
                 });
@@ -105,6 +109,10 @@ pub(crate) async fn serve(
 
 /// Continues one response in flight on a socket the predecessor handed over.
 ///
+/// `started` is called once, before the response's first frame of this
+/// process's own — after the predecessor's bytes are out — and `finished` once,
+/// after the last frame and the body's terminator.
+///
 /// The predecessor wrote the response head and ended its ownership at a frame
 /// boundary, so this process writes the body bytes it produced and the socket
 /// did not take (`http.unwritten`, framed as the predecessor frames them: they
@@ -118,20 +126,78 @@ pub(crate) async fn adopt(
     http: proto::handoff::Http,
     mut body: crate::http::stream::ResponseStream,
     app: Router,
+    admitting: Admissions,
+    started: impl FnOnce(),
+    finished: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let io = socket_of(descriptor).context("taking over a handed connection")?;
-    let mut connection = Connection::new(io, app, CancellationToken::new());
+    let mut connection = Connection::new(io, app, CancellationToken::new(), admitting);
     connection.buffer = BytesMut::from(http.read_ahead.as_slice());
     // The counters continue the record the pause made.
     connection.written = http.written;
     connection.frames = http.frames;
-    connection.write(&http.unwritten, None).await?;
+    // A head the predecessor held and never wrote is not committed to a status:
+    // the bytes in `unwritten` are provisional, so the body's first output
+    // decides the head here, exactly as it does on the process that held it.
+    let mut started = Some(started);
+    if http.head_held && http.written == 0 {
+        match body.opened().await {
+            Opened::Frame(frame) => {
+                connection.write(&http.unwritten, None).await?;
+                if let Some(started) = started.take() {
+                    started();
+                }
+                connection.write_frame(&frame, http.chunked, None).await?;
+            }
+            Opened::Failed(error, frames) => {
+                connection
+                    .write_failure(error, frames, !http.keep_alive)
+                    .await?;
+                finished();
+                if !http.keep_alive {
+                    let _ = connection.io.shutdown().await;
+                }
+                return Ok(());
+            }
+            // One document, so a body that ends before producing one is a
+            // failure rather than an empty success.
+            Opened::Ended => {
+                let error = crate::openai::error::ApiError::server_error(
+                    "the response ended before it wrote its document".to_owned(),
+                );
+                let document = Connection::failure_document(&error);
+                connection
+                    .write_failure(error, vec![document], !http.keep_alive)
+                    .await?;
+                finished();
+                if !http.keep_alive {
+                    let _ = connection.io.shutdown().await;
+                }
+                return Ok(());
+            }
+        }
+    } else {
+        connection.write(&http.unwritten, None).await?;
+    }
+    // The predecessor's bytes are out and the next frame is this process's own:
+    // §7.5.1's pause ends here. A body with nothing left is at its end, so it
+    // reports the same moment before the terminator rather than not at all.
     while let Some(frame) = body.next_frame().await {
+        if let Some(started) = started.take() {
+            started();
+        }
         connection.write_frame(&frame, http.chunked, None).await?;
+    }
+    if let Some(started) = started.take() {
+        started();
     }
     if http.chunked {
         connection.write(b"0\r\n\r\n", None).await?;
     }
+    // The response ends here, not when the connection closes: a kept-alive
+    // connection serves the next request from `run`, and the handoff's record
+    // names this response, not the connection (design §7.5.1).
+    finished();
     if !http.keep_alive {
         let _ = connection.io.shutdown().await;
         return Ok(());
@@ -178,8 +244,13 @@ fn socket_of(descriptor: OwnedFd) -> io::Result<Io> {
 
 /// Serves one accepted connection until the client closes it, the server stops
 /// serving, or the connection ends it.
-async fn serve_connection(io: Io, app: Router, accepting: CancellationToken) -> anyhow::Result<()> {
-    let mut connection = Connection::new(io, app, accepting);
+async fn serve_connection(
+    io: Io,
+    app: Router,
+    accepting: CancellationToken,
+    admitting: Admissions,
+) -> anyhow::Result<()> {
+    let mut connection = Connection::new(io, app, accepting, admitting);
     connection.run().await
 }
 
@@ -189,6 +260,9 @@ struct Connection {
     io: Io,
     app: Router,
     accepting: CancellationToken,
+    /// Whether the daemon admits new requests; a hot restart closes it, and
+    /// the connection then ends at its next request boundary.
+    admitting: Admissions,
     /// Bytes read from the socket and not yet processed: the next request's
     /// head and body, or bytes of the request in flight its reader has not
     /// asked for yet.
@@ -206,11 +280,12 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(io: Io, app: Router, accepting: CancellationToken) -> Self {
+    fn new(io: Io, app: Router, accepting: CancellationToken, admitting: Admissions) -> Self {
         Self {
             io,
             app,
             accepting,
+            admitting,
             buffer: BytesMut::new(),
             peer_closed: false,
             pending: BytesMut::new(),
@@ -222,9 +297,12 @@ impl Connection {
     /// Serves requests on the connection until it ends.
     async fn run(&mut self) -> anyhow::Result<()> {
         loop {
-            // A server that is shutting down takes no request it did not
-            // already read: the request in flight ends and the connection
-            // closes.
+            // A server that is shutting down, or handing the deployment
+            // over, takes no request it did not already read: the request in
+            // flight ends and the connection closes.
+            if !self.admitting.open() && self.buffer.is_empty() {
+                return Ok(());
+            }
             if self.accepting.is_cancelled() && self.buffer.is_empty() {
                 return Ok(());
             }
@@ -254,7 +332,7 @@ impl Connection {
             );
             match outcome {
                 Outcome::KeepAlive => {
-                    if self.accepting.is_cancelled() {
+                    if self.accepting.is_cancelled() || !self.admitting.open() {
                         return Ok(());
                     }
                 }
@@ -390,7 +468,7 @@ impl Connection {
             .header(header::CONTENT_LENGTH, body.len())
             .header(header::CONNECTION, "close")
             .body(Body::from(body))
-            .expect("a fixed error response");
+            .map_err(|error| anyhow::anyhow!("building a protocol error response: {error}"))?;
         self.written = 0;
         self.frames = 0;
         let mut absent = RequestBody::empty();
@@ -408,7 +486,7 @@ impl Connection {
         body: &mut RequestBody,
     ) -> anyhow::Result<Outcome> {
         let head_only = body.head_request;
-        let handed = response
+        let mut handed = response
             .extensions()
             .get::<HandedBody>()
             .and_then(HandedBody::take);
@@ -435,12 +513,51 @@ impl Connection {
         };
         let framed = chunked || content_length.is_some();
         let closing = !keep_alive || !body.complete() || !framed;
-        self.write_head(&parts, chunked, content_length, closing)
-            .await?;
+        // A response answered as one document holds its head until the body's
+        // first output: the status is the outcome, so a head sent before the
+        // outcome could not state a failure (§7.5.1 step 4 — such a response
+        // has not started writing when a handoff pauses it, and the head bytes
+        // travel in `http.unwritten` if it does). The head is queued rather
+        // than written for the same reason: a pause in this window must be
+        // able to freeze it.
+        let holds = !head_only && !status_without_body(parts.status) && framed;
+        let mut opening = None;
+        if holds
+            && handed
+                .as_ref()
+                .is_some_and(|handed| handed.stream.head_held())
+        {
+            self.pending
+                .extend_from_slice(&head_bytes(&parts, chunked, content_length, closing));
+            match handed
+                .as_mut()
+                .expect("a held head has a body")
+                .stream
+                .opened()
+                .await
+            {
+                Opened::Frame(frame) => opening = Some(frame),
+                Opened::Failed(error, frames) => {
+                    return self.write_failure(error, frames, closing).await;
+                }
+                // One document, so a body that ends before producing one is a
+                // failure rather than an empty response.
+                Opened::Ended => {
+                    let error = crate::openai::error::ApiError::server_error(
+                        "the response ended before it wrote its document".to_owned(),
+                    );
+                    let document = Self::failure_document(&error);
+                    return self.write_failure(error, vec![document], closing).await;
+                }
+            }
+        } else {
+            self.write_head(&parts, chunked, content_length, closing)
+                .await?;
+        }
         if !head_only && !status_without_body(parts.status) {
             let complete = match handed {
                 Some(handed) => match self
-                    .write_handed(handed, keep_alive, body, chunked, content_length)
+                    .write_handed(handed, keep_alive, body, chunked, content_length, opening)
                     .await?
                 {
                     HandedOutcome::Complete => true,
@@ -472,37 +589,43 @@ impl Connection {
         content_length: Option<u64>,
         closing: bool,
     ) -> anyhow::Result<()> {
-        let reason = parts.status.canonical_reason().unwrap_or("");
-        let mut head = BytesMut::with_capacity(256);
-        head.extend_from_slice(
-            format!("HTTP/1.1 {} {}\r\n", parts.status.as_u16(), reason).as_bytes(),
-        );
-        for (name, value) in &parts.headers {
-            let name = name.as_str();
-            // The connection decides the body's framing and the connection's
-            // fate, not the handler.
-            if name.eq_ignore_ascii_case("connection")
-                || name.eq_ignore_ascii_case("transfer-encoding")
-                || name.eq_ignore_ascii_case("content-length")
-            {
-                continue;
-            }
-            head.extend_from_slice(name.as_bytes());
-            head.extend_from_slice(b": ");
-            head.extend_from_slice(value.as_bytes());
-            head.extend_from_slice(b"\r\n");
-        }
-        if let Some(length) = content_length {
-            head.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
-        } else if chunked {
-            head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-        }
-        head.extend_from_slice(if closing {
-            b"Connection: close\r\n\r\n" as &[u8]
-        } else {
-            b"Connection: keep-alive\r\n\r\n" as &[u8]
-        });
+        let head = head_bytes(parts, chunked, content_length, closing);
         self.write(&head, None).await.map(|_| ())
+    }
+
+    /// The document a failure answers with when the body produced none: the
+    /// error's own JSON, which is what a sink's `failed` writes for it.
+    fn failure_document(error: &crate::openai::error::ApiError) -> Bytes {
+        serde_json::to_vec(&error.to_error_response())
+            .map(Bytes::from)
+            .unwrap_or_default()
+    }
+
+    /// Answers a response that failed before its head was written: the status
+    /// is the failure's, and the body is the sink's document for it.
+    async fn write_failure(
+        &mut self,
+        error: crate::openai::error::ApiError,
+        frames: Vec<Bytes>,
+        closing: bool,
+    ) -> anyhow::Result<Outcome> {
+        // Nothing of the response is written yet: whatever was queued as its
+        // head is replaced by the one the failure states.
+        self.pending.clear();
+        let response = axum::response::IntoResponse::into_response(error);
+        let parts = response.into_parts().0;
+        let length: u64 = frames.iter().map(|frame| frame.len() as u64).sum();
+        let head = head_bytes(&parts, false, Some(length), closing);
+        self.pending.extend_from_slice(&head);
+        for frame in &frames {
+            self.pending.extend_from_slice(frame);
+        }
+        self.drain(None).await?;
+        Ok(if closing {
+            Outcome::Close
+        } else {
+            Outcome::KeepAlive
+        })
     }
 
     /// Writes the frames of a body the handler produced; `false` when the body
@@ -536,6 +659,7 @@ impl Connection {
         body: &RequestBody,
         chunked: bool,
         content_length: Option<u64>,
+        opening: Option<Bytes>,
     ) -> anyhow::Result<HandedOutcome> {
         let Handed {
             mut stream,
@@ -546,7 +670,16 @@ impl Connection {
         // After the first pause the restart owns the decision: the report is
         // spent, and the response goes on here whatever later requests say.
         let mut paused = false;
+        // The first frame a held-head body produced before its head was
+        // written; it goes out after the queued head, and the pause keeps
+        // stopping the response before it.
+        let mut opening = opening;
         loop {
+            if let Some(frame) = opening.take() {
+                self.write_frame(&frame, chunked, (!paused).then_some(&pause_requested))
+                    .await?;
+                continue;
+            }
             if paused {
                 // Everything is written here now; a stale request no longer
                 // stops the response.
@@ -650,6 +783,7 @@ impl Connection {
         };
         let http = handoff::Http {
             keep_alive,
+            head_held: stream.head_held(),
             unwritten: unwritten.to_vec(),
             read_ahead: body.read_ahead(&self.buffer),
             written: self.written,
@@ -775,6 +909,46 @@ impl Connection {
         }
         Ok(drain)
     }
+}
+
+/// The head bytes of one response, as this connection writes them: the status
+/// from the response, every header the connection does not own, and the framing
+/// and connection headers it does.
+fn head_bytes(
+    parts: &axum::http::response::Parts,
+    chunked: bool,
+    content_length: Option<u64>,
+    closing: bool,
+) -> BytesMut {
+    let reason = parts.status.canonical_reason().unwrap_or("");
+    let mut head = BytesMut::with_capacity(256);
+    head.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", parts.status.as_u16(), reason).as_bytes());
+    for (name, value) in &parts.headers {
+        let name = name.as_str();
+        // The connection decides the body's framing and the connection's
+        // fate, not the handler.
+        if name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    if let Some(length) = content_length {
+        head.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+    } else if chunked {
+        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    head.extend_from_slice(if closing {
+        b"Connection: close\r\n\r\n" as &[u8]
+    } else {
+        b"Connection: keep-alive\r\n\r\n" as &[u8]
+    });
+    head
 }
 
 /// What a drain found.
@@ -1065,6 +1239,14 @@ impl RequestBody {
             shared: Arc::clone(&self.shared),
             wanted: Arc::clone(&self.wanted),
         };
+        // Every part is already a valid `http` value — `method`, `target` and
+        // `version` come from the parser as parsed values — so building the
+        // request cannot fail and there is no error to report to a caller that
+        // is the connection itself.
+        #[expect(
+            clippy::expect_used,
+            reason = "a request from parsed parts cannot fail to build"
+        )]
         let mut request = Request::builder()
             .method(method)
             .uri(target)
@@ -1496,7 +1678,12 @@ mod tests {
     /// Serves `app` on a socket pair and returns the client side.
     fn serve_on_pair(app: Router) -> TestClient {
         let (io, client) = pair();
-        tokio::spawn(serve_connection(io, app, CancellationToken::new()));
+        tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            Admissions::default(),
+        ));
         TestClient::new(client)
     }
 
@@ -1688,6 +1875,76 @@ mod tests {
         response
     }
 
+    /// A session of a response answered as one document: the one step it takes,
+    /// or a body that is over at once.
+    struct DocumentSession {
+        step: Option<Step>,
+    }
+
+    impl Session for DocumentSession {
+        fn poll_step(&mut self, _cx: &mut Context<'_>) -> Poll<Step> {
+            match self.step.take() {
+                Some(step) => Poll::Ready(step),
+                None => Poll::Ready(Step::Ended),
+            }
+        }
+
+        fn migrate(&mut self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+
+        fn freeze(&mut self) -> Option<stream::Application> {
+            Some(stream::Application::ChatResponse(Default::default()))
+        }
+
+        fn abort(&mut self) {}
+
+        fn detach(&mut self) {}
+    }
+
+    /// The response of a handoffable body that holds its head: one document,
+    /// whose status is its outcome.
+    fn held_response(
+        session: Box<dyn Session>,
+        registration: Arc<Registration>,
+        request_id: &str,
+    ) -> Response<Body> {
+        let stream = ResponseStream::start_held(session, false);
+        let body = HandedBody::new(stream, Some(registration), request_id.to_owned())
+            .expect("a registration makes a body handoffable");
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .expect("a response");
+        stream::attach(&mut response, body);
+        response
+    }
+
+    /// Serves one held-head response on a socket pair and answers the client
+    /// side of it.
+    fn serve_document(step: Option<Step>) -> TestClient {
+        let step = Arc::new(std::sync::Mutex::new(step));
+        let registry = Handoff::new();
+        let registration = registry.register();
+        let app = Router::new().route(
+            "/document",
+            get(move || {
+                let step = step.lock().expect("the session's step").take();
+                let registration = Arc::clone(&registration);
+                async move { held_response(Box::new(DocumentSession { step }), registration, "r") }
+            }),
+        );
+        let (io, client) = pair();
+        tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            Admissions::default(),
+        ));
+        TestClient::new(client)
+    }
+
     /// Serves one handoffable response on a socket pair, and hands the test the
     /// client side, the frames' producer and the registry the response
     /// registers in.
@@ -1698,6 +1955,36 @@ mod tests {
         pair: fn() -> (Io, UnixStream),
     ) -> (TestClient, mpsc::UnboundedSender<Bytes>) {
         serve_handed_freezable(registry, registration, request_id, pair, true)
+    }
+
+    /// A daemon that is handing the deployment over takes no new request: a
+    /// connection that sends one ends at that boundary without a response,
+    /// and its client reaches the successor by reconnecting (design §7.5.1
+    /// step 1). A response already in flight is what the pause is for, and it
+    /// is not this connection.
+    #[tokio::test]
+    async fn a_connection_ends_between_requests_when_the_daemon_stops_admitting() {
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        let admitting = Admissions::default();
+        admitting.close();
+        let (io, client) = pair();
+        let serving = tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            admitting,
+        ));
+
+        let mut client = TestClient::new(client);
+        client
+            .send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+            .await
+            .expect("the connection ends")
+            .expect("the connection task")
+            .expect("the connection ends without an error");
+        assert_eq!(client.fill().await, 0, "the connection wrote no response");
     }
 
     /// The same, for a response that cannot be handed over when `freezable`
@@ -1738,7 +2025,12 @@ mod tests {
             }),
         );
         let (io, client) = pair();
-        tokio::spawn(serve_connection(io, app, CancellationToken::new()));
+        tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            Admissions::default(),
+        ));
         let _ = registry;
         (TestClient::new(client), frames)
     }
@@ -1775,6 +2067,7 @@ mod tests {
         let read_ahead = conn_head("GET /hello HTTP/1.1");
         let http = handoff::Http {
             keep_alive: true,
+            head_held: false,
             unwritten: Vec::new(),
             read_ahead: read_ahead.clone().into_bytes(),
             written: head.len() as u64,
@@ -1782,7 +2075,23 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&ended);
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = std::sync::Arc::clone(&started);
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            Admissions::default(),
+            move || {
+                recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        ));
 
         let response = client.read_response().await;
         assert_eq!(response.status, 200);
@@ -1790,6 +2099,16 @@ mod tests {
         // The client sends nothing: these bytes came from the predecessor.
         let ahead = client.read_response().await;
         assert_eq!(ahead.body, "hello");
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a response with no frame left is still recorded as adopted, once"
+        );
+        assert_eq!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the adopted response ended before its connection went on to the next one"
+        );
         drop(client);
         adopted
             .await
@@ -1829,6 +2148,7 @@ mod tests {
 
         let http = handoff::Http {
             keep_alive: false,
+            head_held: false,
             unwritten: Vec::new(),
             read_ahead: Vec::new(),
             written: head.len() as u64,
@@ -1836,7 +2156,23 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+        let recorded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let going_on = std::sync::Arc::clone(&recorded);
+        let ended = std::sync::Arc::clone(&recorded);
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            Admissions::default(),
+            move || going_on.store(true, std::sync::atomic::Ordering::SeqCst),
+            move || {
+                assert!(
+                    ended.load(std::sync::atomic::Ordering::SeqCst),
+                    "a response is recorded as adopted before it is recorded as ended"
+                );
+            },
+        ));
 
         let response = client.read_response().await;
         assert_eq!(response.body, "data: a\n\n");
@@ -1971,6 +2307,7 @@ mod tests {
         let unwritten = b"9\r\ndata: b\n\n\r\n".to_vec();
         let http = handoff::Http {
             keep_alive: true,
+            head_held: false,
             unwritten: unwritten.clone(),
             read_ahead: Vec::new(),
             written: written.len() as u64,
@@ -1978,7 +2315,15 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            Admissions::default(),
+            || {},
+            || {},
+        ));
         frames.send(Bytes::from_static(b"data: c\n\n")).unwrap();
         drop(frames);
 
@@ -2094,5 +2439,188 @@ mod tests {
         let raw = client.read_to_end().await;
         assert!(raw.len() < big.len(), "the rest went to the successor");
         drop(frames);
+    }
+
+    /// A one-document response whose generation fails before it writes anything
+    /// answers the failure's own status and document: the head was held for
+    /// exactly this (§7.5.1 step 4).
+    #[tokio::test]
+    async fn a_one_body_response_states_its_failure_in_the_head_it_held() {
+        let document = Bytes::from_static(
+            br#"{"error":{"message":"the engine failed","type":"server_error"}}"#,
+        );
+        let mut client = serve_document(Some(Step::Failed {
+            error: crate::openai::error::ApiError::server_error("the engine failed".to_owned()),
+            frames: vec![Bytes::clone(&document)],
+        }));
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 500, "{}", response.headers);
+        assert!(
+            response.headers.contains("content-type: application/json"),
+            "{}",
+            response.headers
+        );
+        assert_eq!(
+            response
+                .headers
+                .contains(&format!("content-length: {}", document.len())),
+            true,
+            "{}",
+            response.headers
+        );
+        assert_eq!(response.body, String::from_utf8_lossy(&document));
+    }
+
+    /// The document a one-document response produces goes out under the head
+    /// the connection held for it.
+    #[tokio::test]
+    async fn a_one_body_response_writes_its_document_under_the_head_it_held() {
+        let document = Bytes::from_static(br#"{"id":"r","object":"chat.completion"}"#);
+        let mut client = serve_document(Some(Step::Frames(vec![Bytes::clone(&document)])));
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 200, "{}", response.headers);
+        assert!(
+            response.headers.contains("content-type: application/json"),
+            "{}",
+            response.headers
+        );
+        assert_eq!(response.body, String::from_utf8_lossy(&document));
+    }
+
+    /// A one-document response whose body ends before producing its document is
+    /// a failure, not an empty success.
+    #[tokio::test]
+    async fn a_one_body_response_that_ends_early_states_a_server_error() {
+        let mut client = serve_document(None);
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 500, "{}", response.headers);
+        assert!(
+            response
+                .body
+                .contains("the response ended before it wrote its document"),
+            "{}",
+            response.body
+        );
+    }
+
+    /// A successor that takes over a response whose head its predecessor held
+    /// and never wrote states the outcome itself: the bytes it inherits are a
+    /// status the predecessor had not committed to (§7.5.1 step 4).
+    #[tokio::test]
+    async fn an_adopted_one_body_response_states_its_own_failure() {
+        let document = Bytes::from_static(
+            br#"{"error":{"message":"the engine failed","type":"server_error"}}"#,
+        );
+        let body = ResponseStream::start_held(
+            Box::new(DocumentSession {
+                step: Some(Step::Failed {
+                    error: crate::openai::error::ApiError::server_error(
+                        "the engine failed".to_owned(),
+                    ),
+                    frames: vec![Bytes::clone(&document)],
+                }),
+            }),
+            false,
+        );
+        let (server, client) = pair();
+        let Either::Right(mut predecessor) = server else {
+            unreachable!("a socket pair is a Unix stream")
+        };
+        let mut client = TestClient::new(client);
+        // The head the predecessor held, with nothing written: a provisional
+        // success the successor must not commit to.
+        let held = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+        let descriptor = predecessor
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("a duplicate of the socket");
+        let http = handoff::Http {
+            keep_alive: true,
+            head_held: true,
+            unwritten: held.to_vec(),
+            read_ahead: Vec::new(),
+            written: 0,
+            frames: 0,
+            chunked: true,
+            content_length: None,
+        };
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            Admissions::default(),
+            || {},
+            || {},
+        ));
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 500, "{}", response.headers);
+        assert_eq!(response.body, String::from_utf8_lossy(&document));
+        drop(client);
+        let _ = adopted.await;
+    }
+
+    /// The same successor writes the head it inherited when the body produces
+    /// its document: the inherited bytes are right for an outcome that is not a
+    /// failure.
+    #[tokio::test]
+    async fn an_adopted_one_body_response_writes_the_head_its_predecessor_held() {
+        let document = Bytes::from_static(br#"{"id":"r","object":"chat.completion"}"#);
+        let body = ResponseStream::start_held(
+            Box::new(DocumentSession {
+                step: Some(Step::Frames(vec![Bytes::clone(&document)])),
+            }),
+            false,
+        );
+        let (server, client) = pair();
+        let Either::Right(mut _predecessor) = server else {
+            unreachable!("a socket pair is a Unix stream")
+        };
+        let mut client = TestClient::new(client);
+        let held = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+        let descriptor = _predecessor
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("a duplicate of the socket");
+        let http = handoff::Http {
+            keep_alive: true,
+            head_held: true,
+            unwritten: held.to_vec(),
+            read_ahead: Vec::new(),
+            written: 0,
+            frames: 0,
+            chunked: true,
+            content_length: None,
+        };
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            Admissions::default(),
+            || {},
+            || {},
+        ));
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 200, "{}", response.headers);
+        assert_eq!(response.body, String::from_utf8_lossy(&document));
+        drop(client);
+        let _ = adopted.await;
     }
 }

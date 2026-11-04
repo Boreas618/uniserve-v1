@@ -60,7 +60,7 @@ pub struct Memory {
     /// The products of cross-call tensors.
     pub products: ProductStore,
     /// The banks of the layers a request keeps per slot.
-    pub slots: RequestSlots,
+    pub(crate) slots: RequestSlots,
     /// The page-locked host blocks copies go through.
     pub pinned: Arc<PinnedPool>,
     /// The device this rank's memory lives on, as the plan states it.
@@ -154,7 +154,7 @@ pub fn open_memory(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) 
             width: request.width,
             request_pool_size: info.request_slots,
             devices: request.devices,
-            max_feature_bytes: u64::from(info.encoder_entry_bytes),
+            max_feature_bytes: info.encoder_entry_bytes,
             relay_depth: plan.arena.relay_depth,
             import_capacity: info.max_unresolved_calls as usize,
             conversion: request.conversion,
@@ -302,7 +302,7 @@ impl Memory {
         let Memory {
             prefix_cache,
             latents,
-            mut products,
+            products,
             slots,
             pinned,
             device,
@@ -311,8 +311,7 @@ impl Memory {
         drop((device, pools));
         // The products go first: their reads retain views into the cache, and the cache's
         // segments are the last thing an epoch gives back.
-        let drained = products.close();
-        drop(drained);
+        products.close();
         lock(&prefix_cache).close()?;
         drop(latents);
         drop(slots);

@@ -235,6 +235,7 @@ mod tests {
             base_extent: 0,
             exported_extent: 0,
             compute_dtype: "bfloat16".into(),
+            state: Vec::new(),
         }
     }
 
