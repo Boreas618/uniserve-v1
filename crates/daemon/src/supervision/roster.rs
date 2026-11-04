@@ -376,7 +376,7 @@ impl Roster for ProcessRoster {
         &mut self,
         mut spawn: Spawn,
         launch: &crate::engine::launch::Launch,
-    ) -> Result<u32, String> {
+    ) -> Result<crate::updates::switch::Spawned, String> {
         // The process's own identity, from the deployment's one allocator: a
         // launch file per process, so an epoch of two nodes never writes one
         // number for two children (§2.3, §7.4), and a fresh generation of a
@@ -431,7 +431,12 @@ impl Roster for ProcessRoster {
             launch.pid = Some(spawned.pid);
         }
         self.row(generation, ProcessState::Starting);
-        Ok(spawned.pid)
+        // The generation the process was actually started at, which is what a
+        // stop names and what a restore binds to.
+        Ok(crate::updates::switch::Spawned {
+            generation,
+            pid: spawned.pid,
+        })
     }
 
     fn stop(&mut self, _host: &str, group: &str, generation: Option<u64>) {
@@ -697,12 +702,10 @@ mod tests {
             state: ProcessState::Serving,
         }]);
 
-        assert_eq!(
-            roster
-                .spawn(spawn("n0", 7), &launch())
-                .expect("the node starts it"),
-            4242
-        );
+        let spawned = roster
+            .spawn(spawn("n0", 7), &launch())
+            .expect("the node starts it");
+        assert_eq!(spawned.pid, 4242);
         let rows = epochs.processes();
         assert_eq!(rows.len(), 2, "the frontend's row survives the write");
         assert_eq!(rows[1].state, ProcessState::Starting);

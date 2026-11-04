@@ -106,6 +106,15 @@ pub(crate) enum Event {
     },
 }
 
+/// What a spawn produced: the process's own launch generation, which is the
+/// number the supervisor keys its launches by, and its pid. The switch keeps
+/// the generation, because it is what a later stop names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Spawned {
+    pub(crate) generation: u64,
+    pub(crate) pid: u32,
+}
+
 /// What the switch asks of the nodes: claim a world's storage, start and
 /// stop main processes, command one generation's main process, command the
 /// frontend, and take the events that arrive. The daemon's supervision is
@@ -122,12 +131,12 @@ pub(crate) trait Roster {
         scopes: &[process::Scope],
         retire: &[u64],
     ) -> Result<(), String>;
-    /// Starts `spawn` and returns the child's process id.
+    /// Starts `spawn` and returns the child's own generation and process id.
     fn spawn(
         &mut self,
         spawn: Spawn,
         launch: &crate::engine::launch::Launch,
-    ) -> Result<u32, String>;
+    ) -> Result<Spawned, String>;
     /// Stops one launch generation of `group` on `host`; every generation
     /// when `generation` is `None`.
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>);
@@ -168,7 +177,7 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
         &mut self,
         spawn: Spawn,
         launch: &crate::engine::launch::Launch,
-    ) -> Result<u32, String> {
+    ) -> Result<Spawned, String> {
         (**self).spawn(spawn, launch)
     }
 
@@ -248,6 +257,10 @@ pub(crate) struct Switch {
     /// `previous_generation + 1` (§2.5). A promoted standby must never reach
     /// this number, or one number would name two epochs.
     spawn_generation: u64,
+    /// What the roster actually started: host and the process's own launch
+    /// generation, which is what a stop names. A target that fails before it
+    /// reports has no model generation yet, so the switch stops these.
+    spawned: Vec<(String, u64)>,
     /// The previous epoch's launch generation.
     previous_generation: u64,
     /// The target's generation as its child reported it: authoritative, and
@@ -326,6 +339,7 @@ impl Switch {
             target,
             previous,
             spawn_generation,
+            spawned: Vec::new(),
             previous_generation,
             generation: None,
             record,
@@ -429,17 +443,21 @@ impl Switch {
                 environment: self.start.environment.clone(),
                 inherit: Vec::new(),
             };
-            if let Err(reason) = roster.spawn(spawn, &self.start.launch) {
-                self.failed(
-                    roster,
-                    Failure {
-                        kind: "spawn_failed".to_owned(),
-                        reason,
-                        device: None,
-                    },
-                );
-                return;
-            }
+            let spawned = match roster.spawn(spawn, &self.start.launch) {
+                Ok(spawned) => spawned,
+                Err(reason) => {
+                    self.failed(
+                        roster,
+                        Failure {
+                            kind: "spawn_failed".to_owned(),
+                            reason,
+                            device: None,
+                        },
+                    );
+                    return;
+                }
+            };
+            self.spawned.push((node.host.clone(), spawned.generation));
         }
         let retire = std::mem::take(&mut self.retire);
         for node in &self.nodes {
@@ -590,9 +608,18 @@ impl Switch {
         self.record.status = Status::Purged;
         self.epochs.record(self.target, self.record.clone());
         self.update.revert();
-        let generation = self.target_generation();
-        for node in &self.nodes {
-            roster.stop(&node.host, &self.group, Some(generation));
+        // The target's processes are stopped by the generation each one was
+        // actually started at: before the first report no model generation
+        // exists, and the epoch's spawn generation is only a floor.
+        if self.spawned.is_empty() {
+            let generation = self.target_generation();
+            for node in &self.nodes {
+                roster.stop(&node.host, &self.group, Some(generation));
+            }
+        } else {
+            for (host, generation) in &self.spawned {
+                roster.stop(host, &self.group, Some(*generation));
+            }
         }
         self.phase = Phase::Abandoned;
     }
@@ -982,6 +1009,10 @@ mod tests {
         scripted: Vec<Event>,
         fail_spawn: Option<String>,
         fail_claim: Option<String>,
+        /// The generation the roster allocates for the first process it
+        /// starts, and each one after it: the real adapter allocates every
+        /// process's number, which is not the epoch's spawn generation.
+        allocate_from: Option<u64>,
     }
 
     impl Fake {
@@ -1024,13 +1055,16 @@ mod tests {
             &mut self,
             spawn: Spawn,
             _launch: &crate::engine::launch::Launch,
-        ) -> Result<u32, String> {
+        ) -> Result<Spawned, String> {
             if let Some(reason) = &self.fail_spawn {
                 return Err(reason.clone());
             }
             let pid = self.spawns.len() as u32 + 1;
+            let generation = self
+                .allocate_from
+                .map_or(spawn.generation, |base| base + u64::from(pid) - 1);
             self.spawns.push(spawn);
-            Ok(pid)
+            Ok(Spawned { generation, pid })
         }
 
         fn stop(&mut self, host: &str, group: &str, generation: Option<u64>) {
@@ -1357,6 +1391,41 @@ mod tests {
             roster
                 .stops
                 .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
+        );
+    }
+
+    /// The roster allocates every process's own generation, so a target that
+    /// dies before it reports is stopped where it was actually started — not
+    /// at the epoch's spawn generation, which no process need ever have had.
+    #[test]
+    fn a_target_that_dies_before_it_reports_is_stopped_where_it_was_started() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake {
+            allocate_from: Some(41),
+            ..Fake::default()
+        };
+        switch.start(&mut roster);
+        roster.scripted = vec![exit_event("n0", 41)];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert!(
+            roster
+                .stops
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(41)))
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n1".to_owned(), "engine:0".to_owned(), Some(42))),
+            "the other node's child, at the generation its spawn allocated"
+        );
+        assert!(
+            !roster
+                .stops
+                .iter()
+                .any(|(_, _, generation)| *generation == Some(6)),
+            "no stop names the epoch's spawn generation, which no process had"
         );
     }
 

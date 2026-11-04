@@ -214,9 +214,10 @@ mod tests {
             &mut self,
             spawn: Spawn,
             _launch: &crate::engine::launch::Launch,
-        ) -> Result<u32, String> {
+        ) -> Result<crate::updates::switch::Spawned, String> {
+            let generation = spawn.generation;
             self.spawns.push(spawn);
-            Ok(1)
+            Ok(crate::updates::switch::Spawned { generation, pid: 1 })
         }
 
         fn stop(&mut self, _host: &str, _group: &str, _generation: Option<u64>) {}
