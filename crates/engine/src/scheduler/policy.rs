@@ -471,6 +471,10 @@ pub struct Candidate {
     /// The guest calls the trial made, which the counters carry once the
     /// candidate is adopted.
     calls: u64,
+    /// The snapshot the instance was instantiated on: the state its own
+    /// knowledge starts from, which the mechanism seeds the recorder with when
+    /// the candidate starts serving (§4.4).
+    state: Snapshot,
 }
 
 /// What an epoch's policy has cost so far, in the two counters `Metrics`
@@ -670,10 +674,14 @@ pub struct PolicySlot {
     /// The module and program of the policy a revert puts back. `None` before
     /// the first switchover and after a revert: no older policy exists then.
     previous: Option<(PolicyProgram, PolicyModule)>,
-    /// The instance and module a precopy prepared, put in by the switchover.
-    candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
+    /// The instance, module and state a precopy prepared, put in by the
+    /// switchover.
+    candidate: Option<Candidate>,
     /// The stage asked for and not yet applied, applied at the next boundary.
     pending: Option<Stage>,
+    /// The snapshot the serving instance was instantiated on: the state its own
+    /// knowledge starts from (§4.4).
+    state: Snapshot,
     /// What this scheduler's policy has cost (§12).
     cost: Cost,
 }
@@ -692,6 +700,7 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
+            state: candidate.state,
             cost: Cost::default(),
         }
     }
@@ -721,8 +730,16 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
+            state: init.state,
             cost: Cost::default(),
         })
+    }
+
+    /// The snapshot the serving instance was instantiated on: the state the
+    /// policy knows, which the mechanism's recorder is seeded from when this
+    /// instance starts serving (§4.4).
+    pub fn instantiated_on(&self) -> &Snapshot {
+        &self.state
     }
 
     /// The program the slot serves now.
@@ -854,6 +871,7 @@ impl PolicySlot {
             module,
             instance,
             calls,
+            state: init.state,
         })
     }
 
@@ -864,7 +882,7 @@ impl PolicySlot {
     /// switchover means.
     pub fn adopt(&mut self, candidate: Candidate) {
         self.cost.trial(candidate.calls);
-        self.candidate = Some((candidate.program, candidate.module, candidate.instance));
+        self.candidate = Some(candidate);
     }
 
     /// A precopy on the calling thread: [`Self::prepare`] and [`Self::adopt`].
@@ -943,13 +961,14 @@ impl PolicySlot {
     /// A switchover without a prepared candidate leaves the serving policy in
     /// place: the daemon's precopy failed and the update is discarded.
     fn switch_over(&mut self) {
-        let Some((program, module, instance)) = self.candidate.take() else {
+        let Some(candidate) = self.candidate.take() else {
             tracing::warn!("a policy switchover arrived without a policy prepared by a precopy");
             return;
         };
-        let replaced_program = std::mem::replace(&mut self.program, program);
-        let replaced_module = std::mem::replace(&mut self.module, module);
-        let replaced = std::mem::replace(&mut self.instance, instance);
+        let replaced_program = std::mem::replace(&mut self.program, candidate.program);
+        let replaced_module = std::mem::replace(&mut self.module, candidate.module);
+        let replaced = std::mem::replace(&mut self.instance, candidate.instance);
+        self.state = candidate.state;
         self.cost.replace(&replaced);
         // §7.3 step 5: the replaced module stays until the next precopy, which
         // replaces it; committing therefore keeps it, and a revert finds it.
@@ -979,6 +998,7 @@ impl PolicySlot {
         let _ = std::mem::replace(&mut self.program, program);
         let _ = std::mem::replace(&mut self.module, module);
         let replaced = std::mem::replace(&mut self.instance, instance);
+        self.state = init.state;
         self.cost.replace(&replaced);
         Ok(())
     }
@@ -1080,7 +1100,10 @@ pub struct RoutePolicy {
     module: PolicyModule,
     instance: PolicyInstance,
     previous: Option<(PolicyProgram, PolicyModule)>,
-    candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
+    candidate: Option<Candidate>,
+    /// The snapshot the serving instance was instantiated on: the state its own
+    /// knowledge starts from (§4.4).
+    state: Snapshot,
     /// What the control thread's policy has cost (§12).
     cost: Cost,
 }
@@ -1106,6 +1129,7 @@ impl RoutePolicy {
             instance,
             previous: None,
             candidate: None,
+            state: init.state,
             cost: Cost::default(),
         })
     }
@@ -1121,8 +1145,16 @@ impl RoutePolicy {
             instance: candidate.instance,
             previous: None,
             candidate: None,
+            state: candidate.state,
             cost: Cost::default(),
         }
+    }
+
+    /// The snapshot the serving instance was instantiated on: the state the
+    /// policy knows, which the mechanism's recorder is seeded from when this
+    /// instance starts serving (§4.4).
+    pub fn instantiated_on(&self) -> &Snapshot {
+        &self.state
     }
 
     /// The program the route instance runs.
@@ -1187,13 +1219,14 @@ impl RoutePolicy {
             module,
             instance,
             calls,
+            state: init.state,
         })
     }
 
     /// Keeps a candidate a precopy prepared, for the switchover to put in.
     pub fn adopt(&mut self, candidate: Candidate) {
         self.cost.trial(candidate.calls);
-        self.candidate = Some((candidate.program, candidate.module, candidate.instance));
+        self.candidate = Some(candidate);
     }
 
     /// A precopy on the calling thread: [`Self::prepare`] and [`Self::adopt`].
@@ -1218,13 +1251,14 @@ impl RoutePolicy {
 
     /// §7.3 step 3 for the control thread's instance.
     pub fn switchover(&mut self) {
-        let Some((program, module, instance)) = self.candidate.take() else {
+        let Some(candidate) = self.candidate.take() else {
             tracing::warn!("a route policy switchover arrived without a prepared instance");
             return;
         };
-        let replaced_program = std::mem::replace(&mut self.program, program);
-        let replaced_module = std::mem::replace(&mut self.module, module);
-        let replaced = std::mem::replace(&mut self.instance, instance);
+        let replaced_program = std::mem::replace(&mut self.program, candidate.program);
+        let replaced_module = std::mem::replace(&mut self.module, candidate.module);
+        let replaced = std::mem::replace(&mut self.instance, candidate.instance);
+        self.state = candidate.state;
         self.cost.replace(&replaced);
         self.previous = Some((replaced_program, replaced_module));
     }
