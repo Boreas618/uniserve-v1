@@ -131,6 +131,14 @@ impl Block {
 /// The buffer borrows the block from its pool; it is valid until it is passed
 /// back to [`Allocator::free`] or the allocator is dropped, whichever comes
 /// first.
+///
+/// A buffer a captured graph addresses — a graph-pool activation — must not be
+/// freed while any executable of that graph can still run: freeing returns the
+/// block to its pool, which may hand the same address to the next allocation,
+/// and the graph would then read or write someone else's storage. The graph's
+/// owner keeps its activations for as long as the executable lives (design 4.1
+/// and 7.3), which is what makes two generations of graphs over one buffer
+/// replay correctly in turn.
 pub struct Buffer {
     block: Arc<Block>,
     address: u64,
