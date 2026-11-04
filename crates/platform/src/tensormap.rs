@@ -218,3 +218,63 @@ pub enum OobFill {
     /// which avoids a separate predicate; floating-point types only.
     NanRequestZeroFma = 1,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A description whose arrays do not match its rank is the caller's
+    /// mistake, named before the driver sees it; the checks below therefore
+    /// need no device.
+    #[test]
+    fn a_tensor_map_description_is_checked_against_its_rank() {
+        let address = 1 << 20;
+        let dim = [16u64, 16];
+        let strides = [64u64];
+        let boxes = [4u32, 4];
+        let element = [1u32, 1];
+        let valid = TensorMapSpec {
+            data_type: TensorDataType::Float32,
+            global_address: address,
+            global_dim: &dim,
+            global_strides: &strides,
+            box_dim: &boxes,
+            element_strides: &element,
+            interleave: Interleave::None,
+            swizzle: Swizzle::None,
+            l2_promotion: L2Promotion::None,
+            oob_fill: OobFill::None,
+        };
+
+        for spec in [
+            TensorMapSpec {
+                global_dim: &[16, 16, 16, 16, 16, 16],
+                ..valid
+            },
+            TensorMapSpec {
+                global_strides: &[64, 128],
+                ..valid
+            },
+            TensorMapSpec {
+                box_dim: &[4],
+                ..valid
+            },
+            TensorMapSpec {
+                element_strides: &[1, 1, 1],
+                ..valid
+            },
+            TensorMapSpec {
+                global_address: 0,
+                ..valid
+            },
+        ] {
+            assert!(
+                matches!(
+                    TensorMap::encode_tiled(&spec),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{spec:?}"
+            );
+        }
+    }
+}
