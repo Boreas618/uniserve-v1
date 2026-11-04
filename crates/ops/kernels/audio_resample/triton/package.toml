@@ -1,0 +1,36 @@
+# The audio_resample operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The direction is part of the compilation: a downsample is a strided convolution and
+# an upsample its transpose followed by a crop, so the two are different programs.
+# The key is the one `Descriptor`'s `Display` prints, e.g.
+# `mode_downsample_dtype_f32_channels_128_kernel_12_ratio_2_block_256_pdl_false`.
+
+op = "audio_resample"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/audio_resample.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { mode = ["upsample", "downsample"], dtype = ["f32", "bf16", "f16"], channels = ["8", "16", "32", "64", "128", "256", "512", "1024", "1536", "2048"], kernel = ["12", "16", "24"], ratio = ["2", "4", "6"], block = ["256", "512", "1024"], pdl = ["true", "false"] }
+
+[parameters]
