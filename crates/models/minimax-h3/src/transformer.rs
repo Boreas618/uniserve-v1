@@ -436,7 +436,10 @@ fn fuse_block(
 }
 
 /// A checkpoint tensor's values as FP32, for a derivation that must be exact on the host.
-fn host_f32(dtype: nn::DType, bytes: &[u8], name: &str) -> Result<Vec<f32>> {
+///
+/// Shared with the decoders' load-boundary folds, which read the checkpoint's own bytes for the same
+/// reason: a host product is only exact if nothing rounds on the way in.
+pub(crate) fn host_f32(dtype: nn::DType, bytes: &[u8], name: &str) -> Result<Vec<f32>> {
     match dtype {
         nn::DType::BF16 => Ok(bytes
             .as_chunks::<2>()
@@ -459,7 +462,7 @@ fn host_f32(dtype: nn::DType, bytes: &[u8], name: &str) -> Result<Vec<f32>> {
 
 /// FP32 values as the little-endian bytes of `dtype`, rounded the way the checkpoint's own type
 /// rounds (BF16: round to nearest even).
-fn host_bytes(dtype: nn::DType, values: &[f32]) -> Result<Vec<u8>> {
+pub(crate) fn host_bytes(dtype: nn::DType, values: &[f32]) -> Result<Vec<u8>> {
     match dtype {
         nn::DType::BF16 => {
             let mut bytes = Vec::with_capacity(values.len() * 2);

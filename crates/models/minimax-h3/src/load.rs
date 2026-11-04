@@ -156,6 +156,28 @@ pub fn load(
                         component.name()
                     )));
                 }
+                // The decoder's three reference steps before its transformer - denormalise,
+                // post-quantise, project - are one affine, composed here from the checkpoint's own
+                // bytes. Its element type is the type those weights are stored in: `dtype = "auto"`
+                // converts nothing, and the reference reads the projection's type for the same reason.
+                let vae = checkpoint.component(component.directories()[0])?;
+                let (width, dtype, weight, bias) =
+                    crate::video_vae::folded_input(vae, &config.video_vae)?;
+                let latent = u64::from(config.video_vae.latent_channels);
+                let weight = loader.constant(
+                    "video_decoder.input.weight",
+                    dtype,
+                    nn::Shape::new(&[width, latent]),
+                    &weight,
+                )?;
+                let bias = loader.constant(
+                    "video_decoder.input.bias",
+                    dtype,
+                    nn::Shape::new(&[width]),
+                    &bias,
+                )?;
+                let input =
+                    nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
                 // A VAE directory holds both halves; the decoder reads its own keys from it.
                 let source = checkpoint.component(component.directories()[0])?;
                 let mut shards = loader.reborrow(source)?;
@@ -163,6 +185,8 @@ pub fn load(
                     &config.video_vae,
                     canvas,
                     attention,
+                    dtype,
+                    input,
                     &mut shards,
                 )?;
                 Block::Decoder(Box::new(decoder))
