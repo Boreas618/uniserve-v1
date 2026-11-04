@@ -283,6 +283,25 @@ pub fn tensor_dtype(checkpoint: &nn::Checkpoint, component: &str, name: &str) ->
     Ok(location.dtype)
 }
 
+/// The bytes a resident pool must reserve to publish `keys` at `granularity`.
+///
+/// A pool reserves once and gives out of that reservation, so a reservation short of the weights
+/// fails inside a publish, naming a tensor rather than the plan that sized it. Two things make the
+/// sum larger than the index's: the pool hands out whole blocks, so every tensor costs its size
+/// rounded up to `granularity` (the driver's own answer, `HandleType::granularity`), and every
+/// constant the loader publishes from the host costs one block of its own. A name the component
+/// does not hold counts nothing here - the loader is what refuses it, with the layer that asked.
+pub fn resident_bytes(component: &nn::Checkpoint, keys: &[String], granularity: u64) -> u64 {
+    let block = granularity.max(1);
+    keys.iter()
+        .filter_map(|key| component.tensor(key))
+        .map(|location| {
+            let bytes = location.shape.numel() * u64::from(location.dtype.bits()) / 8;
+            bytes.max(1).next_multiple_of(block)
+        })
+        .sum()
+}
+
 /// Load the deployment this rank places.
 ///
 /// The place and the blocks are the `partition`'s: it names the degrees and the rank's position in

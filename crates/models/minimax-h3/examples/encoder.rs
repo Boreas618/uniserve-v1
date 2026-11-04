@@ -439,7 +439,7 @@ impl DeviceWeights {
     fn new(device: &platform::Device, requested: u64) -> Result<Self> {
         let budget = std::sync::Arc::new(NoLimit);
         let mut pools = platform::Allocator::new(device, budget)?;
-        let mut wanted = requested.max(8 << 30);
+        let mut wanted = requested.max(1 << 30);
         let mut reserved = None;
         while wanted >= (1 << 30) {
             if pools
@@ -800,7 +800,27 @@ fn stage_encode(args: &Args) -> Result<()> {
     //    type and shape as it is handed over, so a checkpoint this encoder cannot read is refused
     //    here rather than at the first launch.
     //
-    let mut weights = DeviceWeights::new(&device, 0)?;
+    // The pool's size is the components' own weights, summed from the index before a byte is
+    // mapped: the pool reserves once and gives out of that reservation, so a reservation short of
+    // the weights fails inside a publish and names a tensor rather than the plan. The 8 GiB floor
+    // this harness used to take was 80 MiB short of the export's text encoder alone.
+    let granularity =
+        u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
+    let mut resident_keys = TextEncoder::keys(text);
+    resident_keys.extend(VisionTower::keys(&text.vision));
+    let mut needed = load::resident_bytes(&source, &resident_keys, granularity);
+    // The tower builds its residual coefficient as ones of its own width (`vision::ones`), which the
+    // loader publishes like a weight: one block of the pool, and it is not in the index.
+    let constant = u64::from(text.vision.hidden_size) * u64::from(dtype.bits()) / 8;
+    needed += constant.max(1).next_multiple_of(granularity.max(1));
+    println!(
+        "weights: {} tensors, {} MiB of the index plus {} MiB of constants, {} MiB blocks",
+        resident_keys.len(),
+        needed / (1 << 20),
+        constant / (1 << 20),
+        granularity
+    );
+    let mut weights = DeviceWeights::new(&device, needed)?;
     let encoder = {
         let mut loader = WeightLoader::new(source, &mut weights, stated, None);
         TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?
