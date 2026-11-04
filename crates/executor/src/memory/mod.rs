@@ -14,6 +14,7 @@ pub mod encoders;
 pub mod latent;
 pub mod output;
 pub mod pinned_pool;
+pub mod products;
 pub mod prefix_cache;
 pub mod request_slots;
 pub mod retained;
