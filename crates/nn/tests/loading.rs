@@ -1,8 +1,8 @@
 //! The loading boundary's behaviour: a checkpoint read through its index, its file identities, and
 //! the loader's conversion, fusion and key reuse.
 //!
-//! These tests build their own shards with the safetensors crate, so they need no checkpoint and no
-//! device: a weight is published to a stub store that records what it was given.
+//! These tests write their own shards — the header and the payload, by hand — so they need no
+//! checkpoint and no device: a weight is published to a stub store that records what it was given.
 
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
@@ -10,7 +10,6 @@ use std::path::Path;
 
 use nn::weights::{RetainedWeights, WeightRequest};
 use nn::{Checkpoint, DType, DevicePtr, Shape, WeightKey, WeightLayout, WeightLoader};
-use safetensors::tensor::{Dtype, TensorView};
 
 /// The bytes of `values` as BF16.
 fn bf16(values: &[f32]) -> Vec<u8> {
@@ -20,38 +19,67 @@ fn bf16(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// Write one shard holding `tensors` and answer the path.
-fn shard(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
+/// The format's name for an element type: the header states the name, not a number.
+fn dtype_name(dtype: DType) -> &'static str {
+    match dtype {
+        DType::U8 => "U8",
+        DType::I16 => "I16",
+        DType::I32 => "I32",
+        DType::I64 => "I64",
+        DType::F16 => "F16",
+        DType::BF16 => "BF16",
+        DType::F32 => "F32",
+        DType::F8E4M3 => "F8_E4M3",
+        DType::F4E2M1 => "F4_E2M1",
+    }
+}
+
+/// Write one shard holding `tensors` — name, element type, extents, bytes — and answer the path.
+///
+/// The header is written here rather than by a crate: an encoded expert's fields are not all bytes
+/// (its packed FP4 values and block scales are one byte each, its tensor scale an FP32 scalar), and
+/// a calibrated export's block scales are `F8_E4M3`, which the safetensors crate's own `DType`
+/// cannot express — the same gap the library's reader exists to close. A shape and a byte count that
+/// disagree are a bug in the fixture, so they are refused here rather than in the loader.
+fn shard_typed(
+    dir: &Path,
+    name: &str,
+    tensors: &[(&str, DType, Vec<u64>, Vec<u8>)],
+) -> std::path::PathBuf {
     let path = dir.join(name);
-    let views: Vec<(String, TensorView<'_>)> = tensors
-        .iter()
-        .map(|(tensor, shape, bytes)| {
-            let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
-            (
-                (*tensor).to_owned(),
-                TensorView::new(Dtype::BF16, shape, bytes).unwrap(),
-            )
-        })
-        .collect();
-    safetensors::serialize_to_file(views, &None, &path).unwrap();
+    let mut header = String::from("{");
+    let mut payload: Vec<u8> = Vec::new();
+    for (tensor, dtype, shape, bytes) in tensors {
+        let expected: u64 = shape.iter().product::<u64>() * dtype.bytes().unwrap();
+        assert_eq!(
+            expected,
+            bytes.len() as u64,
+            "the fixture's `{tensor}` says {shape:?} of {dtype}, which is {expected} bytes, not {}",
+            bytes.len()
+        );
+        let start = payload.len() as u64;
+        payload.extend_from_slice(bytes);
+        let extents: Vec<String> = shape.iter().map(u64::to_string).collect();
+        header.push_str(&format!(
+            r#""{tensor}":{{"dtype":"{}","shape":[{}],"data_offsets":[{start},{}]}},"#,
+            dtype_name(*dtype),
+            extents.join(","),
+            payload.len()
+        ));
+    }
+    header.pop();
+    header.push('}');
+    shard_with_header(dir, name, &header, &payload);
     path
 }
 
-/// Write one shard whose tensors are byte buffers, and answer the path.
-fn shard_u8(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
-    let path = dir.join(name);
-    let views: Vec<(String, TensorView<'_>)> = tensors
+/// Write one shard holding BF16 tensors and answer the path.
+fn shard(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
+    let typed: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
         .iter()
-        .map(|(tensor, shape, bytes)| {
-            let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
-            (
-                (*tensor).to_owned(),
-                TensorView::new(Dtype::U8, shape, bytes).unwrap(),
-            )
-        })
+        .map(|(tensor, shape, bytes)| (*tensor, DType::BF16, shape.clone(), bytes.clone()))
         .collect();
-    safetensors::serialize_to_file(views, &None, &path).unwrap();
-    path
+    shard_typed(dir, name, &typed)
 }
 
 /// A store that keeps what it was given, in host memory.
@@ -408,12 +436,12 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
     // `[4, 64]` encoded: 32 bytes a row of packed pairs, four block scales a row.
     let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
     let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
-    shard_u8(
+    shard_typed(
         directory,
         "model.safetensors",
         &[
-            ("w", vec![4, 32], values.clone()),
-            ("w_scale", vec![4, 4], scales.clone()),
+            ("w", DType::U8, vec![4, 32], values.clone()),
+            ("w_scale", DType::U8, vec![4, 4], scales.clone()),
         ],
     );
 
@@ -453,10 +481,13 @@ fn the_block_scales_must_have_the_layout_s_shape() {
     let directory = directory.path();
     let values: Vec<u8> = vec![0; 128];
     let scales: Vec<u8> = vec![0x38; 16];
-    shard_u8(
+    shard_typed(
         directory,
         "model.safetensors",
-        &[("w", vec![4, 32], values), ("w_scale", vec![4, 4], scales)],
+        &[
+            ("w", DType::U8, vec![4, 32], values),
+            ("w_scale", DType::U8, vec![4, 4], scales),
+        ],
     );
 
     let checkpoint = Checkpoint::open(directory).unwrap();
@@ -475,14 +506,14 @@ fn the_block_scales_must_have_the_layout_s_shape() {
 }
 
 /// An expert stack is its experts' encoded tensors concatenated in the operator's reading order —
-/// expert-major, up before gate — and its tensor scales become one reciprocal per expert, because a
-/// stack's scale varies per expert where a single matrix has one.
+/// expert-major, up before gate — and its tensor scales become one reciprocal per expert **and
+/// projection**, because the checkpoint gives each expert's up and gate their own `weight_scale_2`.
 #[test]
 fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection() {
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
     // Two experts, `[2, 64]` packed (32 bytes a row), two projections each, four block scales a row.
-    let mut tensors: Vec<(String, Vec<u64>, Vec<u8>)> = Vec::new();
+    let mut tensors: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
     let mut expected = Vec::new();
     for expert in 0..2u8 {
         for (index, projection) in ["up", "gate"].iter().enumerate() {
@@ -494,20 +525,26 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 .map(|byte| 0x20 + byte as u8 + expert * 8 + index as u8)
                 .collect();
             expected.extend_from_slice(&values);
-            tensors.push((format!("{stem}.weight"), vec![2, 32], values));
-            tensors.push((format!("{stem}.weight_scale"), vec![2, 4], scales.clone()));
+            tensors.push((format!("{stem}.weight"), DType::U8, vec![2, 32], values));
+            tensors.push((
+                format!("{stem}.weight_scale"),
+                DType::U8,
+                vec![2, 4],
+                scales.clone(),
+            ));
             tensors.push((
                 format!("{stem}.weight_scale_2"),
+                DType::F32,
                 vec![1],
                 (0.5f32 * (expert + 1) as f32).to_le_bytes().to_vec(),
             ));
         }
     }
-    let views: Vec<(&str, Vec<u64>, Vec<u8>)> = tensors
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
         .iter()
-        .map(|(name, shape, bytes)| (name.as_str(), shape.clone(), bytes.clone()))
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
         .collect();
-    shard_u8(directory, "model.safetensors", &views);
+    shard_typed(directory, "model.safetensors", &views);
 
     let checkpoint = Checkpoint::open(directory).unwrap();
     let mut store = Recording::default();
@@ -527,7 +564,11 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
     assert_eq!(stack.values.shape().dims(), &[2, 4, 32]);
     assert_eq!(stack.values.dtype(), DType::U8);
     assert_eq!(stack.scales.shape().dims(), &[2, 4, 4]);
-    assert_eq!(stack.global_scale.shape().dims(), &[2]);
+    assert_eq!(
+        stack.global_scale.shape().dims(),
+        &[2, 2],
+        "two experts, and one scalar per projection within each"
+    );
     assert_eq!(stack.global_scale.dtype(), DType::F32);
     // The store received the values in reading order, then the scales, then the reciprocals.
     assert_eq!(store.published.len(), 3);
@@ -541,7 +582,11 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         .iter()
         .map(|word| f32::from_le_bytes(*word))
         .collect();
-    assert_eq!(reciprocals, [2.0, 1.0], "1 / (0.5 · (e + 1))");
+    assert_eq!(
+        reciprocals,
+        [2.0, 2.0, 1.0, 1.0],
+        "1 / (0.5 · (e + 1)), expert-major and then projection-major"
+    );
 
     // A second load of the same checkpoint publishes nothing: the three keys hit the store.
     let again = {
@@ -566,16 +611,41 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
     let byte = |values: usize| vec![0u8; values];
-    shard_u8(
+    shard_typed(
         directory,
         "model.safetensors",
         &[
-            ("experts.0.up_proj.weight", vec![2, 32], byte(64)),
-            ("experts.0.up_proj.weight_scale", vec![2, 4], byte(8)),
-            ("experts.0.up_proj.weight_scale_2", vec![1], byte(4)),
-            ("experts.1.up_proj.weight", vec![4, 32], byte(128)),
-            ("experts.1.up_proj.weight_scale", vec![4, 4], byte(16)),
-            ("experts.1.up_proj.weight_scale_2", vec![1], byte(4)),
+            ("experts.0.up_proj.weight", DType::U8, vec![2, 32], byte(64)),
+            (
+                "experts.0.up_proj.weight_scale",
+                DType::U8,
+                vec![2, 4],
+                byte(8),
+            ),
+            (
+                "experts.0.up_proj.weight_scale_2",
+                DType::F32,
+                vec![1],
+                1.0f32.to_le_bytes().to_vec(),
+            ),
+            (
+                "experts.1.up_proj.weight",
+                DType::U8,
+                vec![4, 32],
+                byte(128),
+            ),
+            (
+                "experts.1.up_proj.weight_scale",
+                DType::U8,
+                vec![4, 4],
+                byte(16),
+            ),
+            (
+                "experts.1.up_proj.weight_scale_2",
+                DType::F32,
+                vec![1],
+                1.0f32.to_le_bytes().to_vec(),
+            ),
         ],
     );
     let checkpoint = Checkpoint::open(directory).unwrap();
@@ -703,4 +773,255 @@ fn a_pipeline_root_holds_its_components() {
         Err(error) => error,
     };
     assert!(format!("{error}").contains("fp8"), "{error}");
+}
+
+/// An export over a base is one checkpoint whose file set spans both: the union is per tensor, the
+/// export's own tensors shadow the base's, a component only the base carries still answers, and a
+/// tensor only the base carries inside a unioned component comes from the base.
+#[test]
+fn an_export_over_a_base_shadows_per_tensor_across_roots() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let base = root.join("base");
+    let export = root.join("export");
+    for (dir, files) in [
+        (&base, vec!["transformer", "text_encoder"]),
+        (&export, vec!["transformer"]),
+    ] {
+        for component in files {
+            std::fs::create_dir_all(dir.join(component)).unwrap();
+        }
+    }
+    // The base: `transformer` with two tensors, and a `text_encoder` the export does not carry.
+    shard(
+        &base.join("transformer"),
+        "model.safetensors",
+        &[
+            ("shared", vec![2], bf16(&[1.0, 2.0])),
+            ("base_only", vec![1], bf16(&[3.0])),
+        ],
+    );
+    shard(
+        &base.join("text_encoder"),
+        "model.safetensors",
+        &[("weight", vec![1], bf16(&[4.0]))],
+    );
+    // The export overrides `shared` and says nothing about the other two.
+    shard(
+        &export.join("transformer"),
+        "model.safetensors",
+        &[("shared", vec![2], bf16(&[9.0, 9.0]))],
+    );
+
+    let unioned = Checkpoint::open_roots(&[&export, &base]).unwrap();
+
+    // The export's root is the one a log names.
+    assert_eq!(unioned.root(), export.as_path());
+    // The override wins, and it is the export's *bytes*, not a duplicate-key refusal.
+    let transformer = unioned.component("transformer").unwrap();
+    assert_eq!(
+        transformer.read("shared").unwrap().bytes,
+        bf16(&[9.0, 9.0]),
+        "the export shadows the base's tensor of the same name"
+    );
+    // The tensor only the base carries inside the unioned component comes from the base.
+    assert_eq!(
+        transformer.read("base_only").unwrap().bytes,
+        bf16(&[3.0]),
+        "a unioned component is not all-or-nothing"
+    );
+    // A component the export does not carry is the base's.
+    assert_eq!(
+        unioned
+            .component("text_encoder")
+            .unwrap()
+            .read("weight")
+            .unwrap()
+            .bytes,
+        bf16(&[4.0]),
+        "a component only the base carries still answers"
+    );
+    assert_eq!(
+        unioned.components().collect::<Vec<_>>(),
+        ["text_encoder", "transformer"]
+    );
+    // One root is what `open` already means.
+    let single = Checkpoint::open_roots(&[&export]).unwrap();
+    assert_eq!(single.root(), export.as_path());
+    assert!(single.component("text_encoder").is_err());
+}
+
+/// A name neither root holds is refused with the tensor and the roots, in precedence order: in a
+/// union spanning an export and a base, a bare "not found" is the report that costs an hour.
+#[test]
+fn a_missing_tensor_in_a_union_names_the_roots_it_searched() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let base = root.join("base");
+    let export = root.join("export");
+    for dir in [&base, &export] {
+        std::fs::create_dir_all(dir.join("transformer")).unwrap();
+        shard(
+            &dir.join("transformer"),
+            "model.safetensors",
+            &[("weight", vec![1], bf16(&[1.0]))],
+        );
+    }
+
+    let unioned = Checkpoint::open_roots(&[&export, &base]).unwrap();
+    let text = match unioned.read("layers.0.mlp.experts.0.up_proj.weight") {
+        Ok(_) => panic!("neither root holds that tensor"),
+        Err(error) => format!("{error}"),
+    };
+    assert!(
+        text.contains("layers.0.mlp.experts.0.up_proj.weight"),
+        "{text}"
+    );
+    let export_at = text.find("export").expect("the export is named");
+    let base_at = text.find("base").expect("the base is named");
+    assert!(
+        export_at < base_at,
+        "precedence order is the export's first: {text}"
+    );
+}
+
+/// Write a shard whose header is written by hand, so the test can name a dtype the safetensors
+/// crate's own `DType` cannot express — which is the whole reason the library reads headers itself.
+fn shard_with_header(dir: &Path, name: &str, header: &str, payload: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(payload);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// A calibrated checkpoint's header names FP8 and FP4 dtypes, which `safetensors` 0.3.3's `DType`
+/// has no variants for: the library reads the header itself and maps the format's names onto the
+/// types our operators speak, with the offsets the payload actually has.
+#[test]
+fn a_header_naming_fp8_and_fp4_opens_with_those_types() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    // Four tensors, laid out back to back: 16 packed bytes, 4 block scales, 2 bytes, 4 bf16s.
+    let payload: Vec<u8> = (0..48).map(|byte| byte as u8).collect();
+    let header = concat!(
+        r#"{"__metadata__":{"format":"pt"},"#,
+        r#""packed":{"dtype":"F4_E2M1","shape":[2,8],"data_offsets":[0,16]},"#,
+        r#""scales":{"dtype":"F8_E4M3","shape":[4],"data_offsets":[16,20]},"#,
+        r#""pair":{"dtype":"U8","shape":[2],"data_offsets":[20,22]},"#,
+        r#""weight":{"dtype":"BF16","shape":[2],"data_offsets":[22,26]}}"#
+    );
+    shard_with_header(root, "model.safetensors", header, &payload);
+
+    let checkpoint = Checkpoint::open(root).unwrap();
+    let packed = checkpoint.read("packed").unwrap();
+    assert_eq!(packed.dtype, DType::F4E2M1);
+    assert_eq!(packed.shape.dims(), &[2, 8]);
+    assert_eq!(packed.bytes, payload[0..16]);
+    let scales = checkpoint.read("scales").unwrap();
+    assert_eq!(scales.dtype, DType::F8E4M3);
+    assert_eq!(scales.bytes, payload[16..20]);
+    assert_eq!(checkpoint.read("pair").unwrap().dtype, DType::U8);
+    let weight = checkpoint.read("weight").unwrap();
+    assert_eq!(weight.dtype, DType::BF16);
+    assert_eq!(weight.bytes, payload[22..26]);
+}
+
+/// A dtype name the operator ABI has no type for is refused by name at open, not read as something
+/// it is not, and neither is an offset the payload cannot hold.
+#[test]
+fn a_header_the_abi_cannot_express_is_refused_by_name() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let payload = vec![0u8; 4];
+    shard_with_header(
+        root,
+        "model.safetensors",
+        r#"{"flag":{"dtype":"BOOL","shape":[1],"data_offsets":[0,1]}}"#,
+        &payload,
+    );
+    let text = match Checkpoint::open(root) {
+        Ok(_) => panic!("BOOL has no operator ABI type"),
+        Err(error) => format!("{error}"),
+    };
+    assert!(text.contains("BOOL"), "{text}");
+    assert!(text.contains("flag"), "the tensor is named too: {text}");
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    shard_with_header(
+        root,
+        "model.safetensors",
+        r#"{"weight":{"dtype":"BF16","shape":[8],"data_offsets":[0,64]}}"#,
+        &payload,
+    );
+    let text = match Checkpoint::open(root) {
+        Ok(_) => panic!("the payload is four bytes"),
+        Err(error) => format!("{error}"),
+    };
+    assert!(text.contains("claims bytes"), "{text}");
+}
+
+/// A real NVFP4 export stores its block scales as `F8_E4M3`, one byte per sixteen elements: the
+/// loader publishes exactly that type and does not require `U8`, which was a fixture's habit.
+#[test]
+fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut payload: Vec<u8> = Vec::new();
+    let mut header = String::from("{");
+    let mut offset = 0_u64;
+    for expert in 0..2 {
+        for projection in ["up", "gate"] {
+            let stem = format!("experts.{expert}.{projection}_proj");
+            for (suffix, dtype, bytes) in [
+                (".weight", "U8", 64_u64),
+                (".weight_scale", "F8_E4M3", 8),
+                (".weight_scale_2", "F32", 4),
+            ] {
+                payload.extend(std::iter::repeat_n(0x3c_u8, bytes as usize));
+                header.push_str(&format!(
+                    r#""{stem}{suffix}":{{"dtype":"{dtype}","shape":{},"data_offsets":[{offset},{}]}},"#,
+                    match suffix {
+                        ".weight" => "[2, 32]".to_owned(),
+                        ".weight_scale" => "[2, 4]".to_owned(),
+                        _ => "[1]".to_owned(),
+                    },
+                    offset + bytes,
+                ));
+                offset += bytes;
+                if suffix == ".weight_scale_2" {
+                    // A positive tensor scale: the fixture writes `0x3c3c3c3c`, a small positive f32.
+                    let start = payload.len() - 4;
+                    payload[start..].copy_from_slice(&0.5f32.to_le_bytes());
+                }
+            }
+        }
+    }
+    header.pop();
+    header.push('}');
+    shard_with_header(root, "model.safetensors", &header, &payload);
+
+    let checkpoint = Checkpoint::open(root).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let stack = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up_gate",
+            "experts",
+            &["up", "gate"],
+            2,
+            ops::fp4::ScaleLayout::Linear,
+        )
+        .unwrap();
+    assert_eq!(
+        stack.scales.dtype(),
+        DType::F8E4M3,
+        "the checkpoint's scale type is published unchanged"
+    );
+    assert_eq!(stack.values.dtype(), DType::U8);
+    assert_eq!(stack.scales.shape().dims(), &[2, 4, 4]);
+    assert_eq!(stack.global_scale.shape().dims(), &[2, 2]);
 }

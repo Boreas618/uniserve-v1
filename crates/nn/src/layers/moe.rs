@@ -277,6 +277,41 @@ impl Moe {
                         ),
                     ));
                 }
+                // The block scales are the checkpoint's own one-byte type, which the product's
+                // descriptor states: `F8_E4M3` for a calibrated export, `U8` where an export labels
+                // the same bytes as raw. Nothing converts them here, so a stack that is neither is
+                // refused where the descriptor would be composed, with both dtypes named.
+                for (name, stack) in [("up/gate", &up_gate.scales), ("down", &down.scales)] {
+                    let scales = stack.dtype();
+                    if !matches!(scales, DType::U8 | DType::F8E4M3) {
+                        return Err(Error::shape(
+                            "Moe",
+                            format!(
+                                "the {name} block scales are {scales}, and a product's kernel \
+                                 reads one-byte scales: F8_E4M3 or U8"
+                            ),
+                        ));
+                    }
+                }
+                // The tensor scales are the checkpoint's per expert and per projection: the fused
+                // up/gate stack carries two scalars per expert and the down stack one. A table of
+                // another shape would dequantize one projection with another's scale, which is a
+                // wrong product with nothing to show for it, so it is refused here.
+                for (name, stack, projections) in [
+                    ("up/gate", &up_gate.global_scale, 2),
+                    ("down", &down.global_scale, 1),
+                ] {
+                    if stack.shape().dims() != [u64::from(local), projections] {
+                        return Err(Error::shape(
+                            "Moe",
+                            format!(
+                                "the {name} tensor scales are {:?}, [{local}, {projections}] \
+                                 expected: one per expert and projection",
+                                stack.shape().dims()
+                            ),
+                        ));
+                    }
+                }
                 // `[experts, 2·intermediate, hidden/2]` and `[experts, hidden, intermediate/2]`, so
                 // the logical widths are twice the packed ones.
                 let up = Shape::new(&[packed.dim(0), packed.dim(1), packed.dim(2) * 2]);
@@ -1079,16 +1114,16 @@ pub(super) mod tests {
             None,
             WeightOrder::NxK,
         )?;
-        let stack = |rows: u64, columns: u64| QuantizedStack {
+        let stack = |rows: u64, columns: u64, projections: u64| QuantizedStack {
             values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
-            global_scale: weight(DType::F32, &[u64::from(experts)]),
+            global_scale: weight(DType::F32, &[u64::from(experts), projections]),
             layout: ops::fp4::ScaleLayout::Linear,
         };
         Moe::quantized(
             router,
-            stack(2 * intermediate, hidden),
-            stack(hidden, intermediate),
+            stack(2 * intermediate, hidden, 2),
+            stack(hidden, intermediate, 1),
             None,
             experts,
             8,
@@ -1123,18 +1158,18 @@ pub(super) mod tests {
             WeightOrder::NxK,
         )
         .unwrap();
-        let stack = |rows: u64, columns: u64| QuantizedStack {
+        let stack = |rows: u64, columns: u64, projections: u64| QuantizedStack {
             values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
-            global_scale: weight(DType::F32, &[u64::from(experts)]),
+            global_scale: weight(DType::F32, &[u64::from(experts), projections]),
             layout: ops::fp4::ScaleLayout::Linear,
         };
         // Down's contraction is the gated width, so 512 experts' contraction does not fit 768.
         assert!(
             Moe::quantized(
                 router,
-                stack(1536, 2048),
-                stack(2048, 512),
+                stack(1536, 2048, 2),
+                stack(2048, 512, 1),
                 None,
                 experts,
                 8,

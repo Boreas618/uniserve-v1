@@ -123,7 +123,10 @@ impl HostGroup {
     }
 
     /// A group of one member, which needs no connections.
-    pub(crate) fn single(rank: usize) -> Self {
+    /// A group of one member, which needs no connections: a rank that serves
+    /// alone still agrees its block size and slot count over a group, so the
+    /// planners take one shape for every deployment size.
+    pub fn single(rank: usize) -> Self {
         Self {
             rank: 0,
             ranks: vec![rank],
