@@ -1,60 +1,58 @@
-"""The cross_fade package's compile script: what this program would be, and why it cannot be built.
+"""The cross_fade package's compile script: one descriptor -> one module.
 
-`cross_fade` blends the seam between two decoded tiles: over the leading `extent` voxels along one
-axis, `out = previous · (1 − i/extent) + current · (i/extent)`, and `current` everywhere after them.
-The blend is a position's ratio, so a kernel must know **where a voxel sits along the blended
-axis**, and that needs the tile's inner extents.
+``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
+argument signature in the order the operator launches them, the compile-time values the descriptor
+dimensions give, and the compilation options.
 
-**The operator's launch does not carry them.** `cross_fade.rs` passes
-`previous, current, out, extent, axis, channels, frames, block, pdl`: the height and the width of
-the `[channels, frames, height, width]` tile are not in the argument pack. The only thing a kernel
-could recover is their *product* — the grid's voxel count divided by `channels · frames` — and the
-seam needs each extent separately: for `axis = 3` the width alone, for `axis = 2` both. Deriving one
-from the other, or from a stride, or fading a neighbouring grid instead, would compute a different
-filter from the one the reference applies, and a wrong fade is worse than a refusal.
-
-So this script refuses every descriptor with that reason, in the message the store shows the
-caller. The package exists so the refusal is articulate and attributed: a `prepare` of any
-`cross_fade` key fails here, naming what is missing, rather than reporting the operator as one
-nobody packaged or, worse, building a module that blends the wrong axis.
-
-When `cross_fade.rs` passes `dims[2]` and `dims[3]`, this script becomes the usual Triton build —
-the kernel walks the output, decodes the voxel into (channel, frame, row, column), blends inside the
-leading `extent` positions of the named axis and copies elsewhere — and the package needs an hour.
-
-The Program Server runs this script with `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`,
-`UNISERVE_PACKAGE` and `UNISERVE_OUT` in the environment; `--package`, `--descriptor`, `--target`
-and `--out` name the same values on the command line.
+The axis is a ``constexpr``: the blend's position is the column on axis 3 and the row on axis 2, and
+the previous tile's band sits at the opposite end of that axis, so the read and the mask both follow
+from it. `extent`, the four extents and the destination's three strides are the launch's words,
+which is why the fixture's two extent axes are two cells rather than one program that branches.
 """
 
-import argparse
-import os
+import _compile
+import cross_fade as kernels
 
-#: The two words the operator's launch does not carry.
-MISSING = "dims[2] and dims[3] (the frame grid's inner extents)"
-
-
-def arguments():
-    """The descriptor and target this build was asked for, for the refusal's message."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    for flag in ("package", "descriptor", "target", "out"):
-        reader.add_argument(f"--{flag}")
-    known, _unused = reader.parse_known_args()
-    descriptor = known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR", "a descriptor")
-    target = known.target or os.environ.get("UNISERVE_TARGET", "a target")
-    return descriptor, target
+#: The element types a decoded tile is stored in.
+DTYPES = {"f16": "fp16", "bf16": "bf16", "f32": "fp32"}
 
 
-def main():
-    """Refuse, naming the two values the operator's call structure is missing."""
-    descriptor, target = arguments()
-    raise SystemExit(
-        f"cross_fade {descriptor} for {target}: the operator's launch does not carry {MISSING}, so "
-        "no kernel can address the blend band along axis 2 or 3. This package is written and "
-        "waiting for those two words in `crates/ops/src/cross_fade.rs`; until then it refuses "
-        "rather than fade a grid it cannot locate."
-    )
+def warps_of(block):
+    """The warp count one block of voxels needs."""
+    return 8 if block >= 1024 else 4
+
+
+def spec(fields, parameters, target):
+    """The compilation of one cross_fade descriptor."""
+    block = int(fields["block"])
+    dtype = DTYPES[fields["dtype"]]
+    return {
+        "kernel": kernels._cross_fade_kernel,
+        "signature": {
+            "previous_ptr": "*" + dtype,
+            "current_ptr": "*" + dtype,
+            "out_ptr": "*" + dtype,
+            "extent": "u32",
+            "axis": "u32",
+            "channels": "u32",
+            "frames": "u32",
+            "rows": "u32",
+            "columns": "u32",
+            "out_stride0": "u32",
+            "out_stride1": "u32",
+            "out_stride2": "u32",
+            "block": "u32",
+            "pdl": "i32",
+            "AXIS": "constexpr",
+            "BLOCK": "constexpr",
+        },
+        "constexprs": {"AXIS": int(fields["axis"]), "BLOCK": block},
+        "options": {
+            "num_warps": warps_of(block),
+            "launch_pdl": fields["pdl"] == "true",
+        },
+    }
 
 
 if __name__ == "__main__":
-    main()
+    _compile.main(spec)

@@ -1,14 +1,12 @@
 # The cross_fade operator's Triton backend: design 5.2's program package.
 #
-# The package declares the descriptor cells the operator declares and **refuses every build**:
-# the operator's launch passes the tile's channels and frames but not its height and width, and
-# a blend along axis 2 or 3 cannot locate its band without them. `src/build.py` states the
-# reason it refuses and `src/cross_fade.py` states what the kernel becomes when the two words
-# arrive in `crates/ops/src/cross_fade.rs`.
+# One module per descriptor: the seam between two decoded video tiles, blended over the leading
+# `extent` positions of the height (axis 2) or the width (axis 3) of a
+# [channels, frames, height, width] tile. The weights are the decoded dtype's own arithmetic, so the
+# operator's tolerance is exact and one implementation produces the reference's bits.
 #
-# A refusing package is deliberate: `prepare` reports the reason and the operator, which is
-# better than an operator with no package at all (a bare absence) and far better than a kernel
-# that blends the wrong grid.
+# The axis and the block are compiled; `extent`, the tile's four extents, the destination's three
+# outer strides and the PDL flag are the launch's words. `out` may alias `current`.
 
 op = "cross_fade"
 backend = "triton"
@@ -23,14 +21,15 @@ form = "cubin"
 
 [source]
 kind = "triton"
-files = ["src/cross_fade.py", "src/build.py"]
+files = ["src/cross_fade.py", "src/build.py", "src/_compile.py"]
 script = "src/build.py"
 
 [kernel]
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `dtype_f16_extent_5_axis_2_block_1024_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["f16", "bf16", "f32"], extent = ["5"], axis = ["2", "3"], block = ["1024"], pdl = ["false", "true"] }
+dimensions = { dtype = ["f16", "bf16", "f32"], extent = ["3", "4", "5", "6", "8"], axis = ["2", "3"], block = ["1024"], pdl = ["false", "true"] }
 
 [parameters]
