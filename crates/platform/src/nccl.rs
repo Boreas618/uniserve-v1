@@ -15,13 +15,13 @@ use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, R
 /// builds against does not define it at all, and only newer NCCL headers carry
 /// `#define NCCL_SUSPEND_MEM 0x01`. It is therefore a flag from the
 /// documentation rather than a header number, and
-/// [`tests::the_nccl_constants_are_the_headers`] does not table it: naming it
+/// `tests::the_nccl_constants_are_the_headers` does not table it: naming it
 /// there would fail on every machine whose header lacks it.
 const NCCL_SUSPEND_MEM: i32 = 0x01;
 
 /// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes,
 /// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
-/// [`tests::the_nccl_constants_are_the_headers`].
+/// `tests::the_nccl_constants_are_the_headers`.
 const NCCL_SPLIT_NOCOLOR: i32 = -1;
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
