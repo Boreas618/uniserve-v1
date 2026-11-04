@@ -49,7 +49,7 @@ pub use crate::executor::{
     WorkerExecError, WorkerFailure, WorkerGroupId, WorkerResult,
 };
 pub use crate::handle::{
-    CacheChange, Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EngineEvent, EventRx,
+    CacheChange, Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EventRx,
     EventSendError, EventTx, HookBarrier, RankBudgets, StreamCancelCause, Submission, SubmitError,
     Successor, Wake, WeightsInFlight,
 };
@@ -62,9 +62,9 @@ pub use crate::scheduler::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
     ExecutionDomainStats, GeneralStats, GroupCache, PREFETCH_FLOOR_TOKENS, ParkedCache,
     PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyStore,
-    PrefixCacheUsage, PrefixStats, RefillPolicy, RoutePolicy, Scheduler, SchedulerConfig,
-    SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState, Validators,
-    WorkerStats, arrival_view, backend_name, ceilings_of, parameters_of, program_of,
+    PrefixCacheUsage, PrefixStats, RefillPolicy, RoutePolicy, RouteTrial, Scheduler,
+    SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
+    Validators, WorkerStats, arrival_view, backend_name, ceilings_of, parameters_of, program_of,
 };
 pub use crate::service::{continuation_slot, run_engine, serve_requests};
 #[cfg(feature = "testing")]

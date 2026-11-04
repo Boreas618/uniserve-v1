@@ -165,6 +165,9 @@ impl Scheduler {
             Command::DescribeRequests(answer) => {
                 let _ = answer.send(self.migrating_cache().1);
             }
+            Command::TakePolicyReport(answer) => {
+                let _ = answer.send(self.take_policy_report());
+            }
             Command::DescribePolicyState { ranks, answer } => {
                 // No policy, no state a policy is instantiated with: the epoch
                 // waits for its first switchover (lead's ruling).

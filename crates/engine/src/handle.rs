@@ -272,17 +272,6 @@ pub enum StreamCancelCause {
     StopStringMatched,
 }
 
-/// What a scheduler reports about the engine itself, rather than about one
-/// request.
-#[derive(Clone, Debug)]
-pub enum EngineEvent {
-    /// The scheduler's policy failed after the update committed, and the
-    /// scheduler serves on under the previous policy (§7.3). The control thread
-    /// forwards this to every daemon, which records the previous policy as the
-    /// epoch's current one.
-    PolicyReverted(crate::scheduler::PolicyReverted),
-}
-
 /// Request-submission failures visible to engine clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
@@ -642,6 +631,9 @@ pub enum Command {
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
     /// Accepted prefixes of running requests that can move to another world.
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
+    /// Hands the control thread a policy failure this scheduler recorded: it
+    /// reverted to the previous policy and serves on (§7.3).
+    TakePolicyReport(crossbeam_channel::Sender<Option<crate::scheduler::PolicyReverted>>),
     /// Reports the state a policy is instantiated with, as seen from this
     /// scheduler with every rank's load the control thread named (§7.3).
     DescribePolicyState {
@@ -1011,6 +1003,16 @@ impl CommandSender {
         let (answer, described) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::DescribeCache(answer));
         described
+    }
+
+    /// Takes the policy failure this scheduler recorded since the last call,
+    /// if it recorded one: the control thread forwards it to the daemons.
+    pub fn take_policy_report(
+        &self,
+    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::PolicyReverted>> {
+        let (answer, report) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::TakePolicyReport(answer));
+        report
     }
 
     /// Reports the state a policy is instantiated with at the scheduler's next
