@@ -166,10 +166,21 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         latent_seed: 0,
     };
     let model_name = first.model_name().to_owned();
+    // The control thread routes every submission by an instance of the same
+    // program the schedulers carry: `policy_on` installed it on each core, and
+    // the engine installs it here for the route. Without one the engine has no
+    // policy to route a request with and refuses every submission.
+    let policy = {
+        let (program, module) = engine::packaged_policy(engine::BatchCapacity::of(first.info()));
+        engine::EpochPolicy {
+            program,
+            module: std::sync::Arc::new(engine::PolicyBytes::new(module)),
+        }
+    };
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
         .name("sim-engine".into())
-        .spawn(move || engine::serve_requests(engine, cores))
+        .spawn(move || engine::serve_requests(engine, cores, Some(policy)))
         .expect("start the simulated engine");
     EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))

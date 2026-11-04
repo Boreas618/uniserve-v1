@@ -623,7 +623,11 @@ struct Attachment {
 /// # Errors
 ///
 /// Fails when the connection fails or the event threads cannot start.
-pub fn serve_requests(stream: UnixStream, schedulers: Vec<SchedulerHandle>) -> anyhow::Result<()> {
+pub fn serve_requests(
+    stream: UnixStream,
+    schedulers: Vec<SchedulerHandle>,
+    policy: Option<EpochPolicy>,
+) -> anyhow::Result<()> {
     let writer = stream
         .try_clone()
         .context("sharing the daemon's connection")?;
@@ -633,7 +637,25 @@ pub fn serve_requests(stream: UnixStream, schedulers: Vec<SchedulerHandle>) -> a
         schedulers,
         None,
         None,
+        policy,
     )
+}
+
+/// The policy an epoch starts with, when its owner installs it directly
+/// rather than through the process interface (§7.3).
+///
+/// Production installs an epoch's policy with the daemon's `Precopy` and
+/// `Switchover` commands, which the epoch's command thread applies. A caller
+/// that owns the engine's connection itself and sends no commands — the
+/// daemon library's in-process client is one — names the same installation
+/// here, and the engine serves its requests under it from the first one. The
+/// program's decisions are what the control thread routes by; the schedulers
+/// carry the policy their own installation gave them.
+pub struct EpochPolicy {
+    /// The program the route decisions follow, with its parameters.
+    pub program: PolicyProgram,
+    /// The module the program's decisions are instantiated from.
+    pub module: Arc<dyn PolicySource + Send + Sync>,
 }
 
 /// [`serve_requests`] over a connection read through `reader` and written
@@ -648,6 +670,7 @@ fn serve(
     schedulers: Vec<SchedulerHandle>,
     attachment: Option<Attachment>,
     policies: Option<Arc<dyn PolicySource + Send + Sync>>,
+    start: Option<EpochPolicy>,
 ) -> anyhow::Result<()> {
     let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
     let count = schedulers.len();
@@ -681,6 +704,17 @@ fn serve(
         Ordering::Release,
     );
     anyhow::ensure!(!routing.slots.is_empty(), "the engine runs no scheduler");
+    // A caller that names the epoch's starting policy installs it before the
+    // first submission is read: the control thread's route instance answers
+    // from it, and without one every request is refused as unroutable.
+    if let Some(policy) = start {
+        routing
+            .precopy_route(policy.module.as_ref(), policy.program)
+            .and_then(|()| routing.switchover_route())
+            .map_err(|reason| {
+                anyhow::anyhow!("the epoch's starting policy was not installed: {reason}")
+            })?;
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     // The daemon's commands for the epoch's policy run beside the requests: a
@@ -2508,6 +2542,7 @@ pub fn run_engine(
         schedulers,
         Some(Attachment { engine, info }),
         policies,
+        None,
     )
 }
 
@@ -2620,7 +2655,7 @@ fn precopy_failed(reason: impl Into<String>) -> proto::process::Report {
 ///
 /// A trait so the commands can be run against a double in a test, where no
 /// scheduler exists; the engine's implementation is [`Routing`].
-trait EpochPolicy {
+trait PolicyStages {
     /// §7.3 step 2: prepare `program`'s policy on the current state, on every
     /// scheduler and on the control thread, executing nothing.
     fn precopy(
@@ -2651,7 +2686,7 @@ trait EpochPolicy {
     fn purge(&self) -> Result<(), String>;
 }
 
-impl EpochPolicy for Routing {
+impl PolicyStages for Routing {
     fn precopy(
         &self,
         policies: &Arc<dyn PolicySource + Send + Sync>,
@@ -2776,7 +2811,7 @@ fn answer_stage(answer: crossbeam_channel::Receiver<Result<(), String>>) -> Resu
 /// purge names the generation it means, and one this engine has already reached
 /// changes nothing.
 fn apply_process_command(
-    policy: &dyn EpochPolicy,
+    policy: &dyn PolicyStages,
     generations: &Mutex<Generations>,
     policies: Option<&Arc<dyn PolicySource + Send + Sync>>,
     command: proto::process::Command,
@@ -3108,7 +3143,7 @@ mod tests {
         }
     }
 
-    impl EpochPolicy for Recording {
+    impl PolicyStages for Recording {
         fn precopy(
             &self,
             _policies: &Arc<dyn PolicySource + Send + Sync>,
