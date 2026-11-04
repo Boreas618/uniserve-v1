@@ -26,6 +26,7 @@
 
 mod call;
 mod plan;
+mod slots;
 
 use super::*;
 use crate::scheduler::views;
