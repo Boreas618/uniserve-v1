@@ -492,6 +492,13 @@ impl Buckets {
         let mut rows = 0;
         let mut tokens = 0;
         for bucket in self.iter() {
+            // A media computation is admitted by its own plan (`select_media`), and its rows and
+            // tokens are not a language-model batch size: counting one here would let a decode
+            // clip's single row or a denoising step's zero tokens move the admission bound a
+            // scheduler states for the token path.
+            if bucket.extent != Extent::None {
+                continue;
+            }
             rows = rows.max(bucket.rows);
             tokens = tokens.max(bucket.tokens);
         }
@@ -658,6 +665,10 @@ mod tests {
             plan.select_media(&encode),
             Some(Bucket::prefill(1, 512, Variant::Encode))
         );
+
+        // The admission bound is the token path's: a media bucket's rows and tokens are not a
+        // language-model batch size and must not move it.
+        assert_eq!(plan.bounds(), (1, 512));
 
         // A call no variant states is served nowhere, and the mechanism reads that as the
         // capability it is.
