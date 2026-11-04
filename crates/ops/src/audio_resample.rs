@@ -264,6 +264,8 @@ impl Op for AudioResample {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // One output sample is one dot product of the filter's `kernel` taps with the input, summed
+        // in FP32 and rounded once into the output type.
         Tolerance::dot(u64::from(descriptor.kernel), DType::F32, descriptor.dtype)
     }
 }

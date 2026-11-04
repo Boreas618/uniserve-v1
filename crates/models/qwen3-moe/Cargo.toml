@@ -15,5 +15,11 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+# The encoded-checkpoint test writes its own shards, the way `crates/nn/tests/loading.rs` does: a
+# synthetic NVFP4 expert stack has to be a real safetensors file for the loader to read.
+safetensors = "0.3"
+tempfile.workspace = true
+
 [lints]
 workspace = true
