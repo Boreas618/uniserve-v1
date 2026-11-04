@@ -10,6 +10,11 @@ leading ``ROTATED`` channels of a head turn; a multimodal transformer rotates
 part of a head (H3 rotates 96 of 128) and the rest keeps its normalized value.
 The result is rounded once into the output dtype.
 
+The learned scale is **one weight per channel**, a `[head_dim]` vector shared by every head of that
+side (the operator requires that shape, `rope.rs`'s `q_weight`/`k_weight` check): the kernel loads
+`weight + column`, not `weight + head · head_dim`. A caller that handed it a `[heads, head_dim]` table
+would get the first head's weights for all of them, which looks like a kernel defect and is not.
+
 The numbers are the ones UniServe's kernel computed
 (``uniserve_kernels/src/uniserve_kernels/rope.py``): FP32 sum of squares over
 the head, ``x · rsqrt(mean + eps) · weight``, one product and one sum per
