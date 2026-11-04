@@ -716,7 +716,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             // so that one stage is written and not compared: the head's logits are what carry the
             // end of the model, and a difference there is not a difference in the stack.
             if index < config.num_hidden_layers {
-                report_stage(&args, &name, index, &values, rows, width, &mut first_above)?;
+                report_stage(args, &name, index, &values, rows, width, &mut first_above)?;
             } else {
                 if let Some(dir) = args.dump.as_deref() {
                     write_npy(&dir.join(&name), &values, rows, width)?;
