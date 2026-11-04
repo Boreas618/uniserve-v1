@@ -422,6 +422,55 @@ impl Update {
     }
 }
 
+/// One phase of an update, as the daemon's event log names it (§7.2, §7.3):
+/// the program layer's steps and the probation's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The new generation's programs are being prepared in the serving main
+    /// processes (§7.3 step 2).
+    Precopy,
+    /// Every main process prepared them.
+    Precopied,
+    /// The switchover to the new generation is under way (§7.3 step 3).
+    Switchover,
+    /// Every main process executes the new generation.
+    Switched,
+    /// The new generation serves while the previous one is kept (§7.3
+    /// step 4).
+    Probation,
+    /// The probation ended in favour of the new generation (§7.3 step 5).
+    Committed,
+    /// The probation ended by returning to the previous generation, with
+    /// the reason it did.
+    Reverted,
+    /// The generation the probation kept is gone (§7.3 step 6).
+    Purged,
+    /// A main process could not prepare the new generation's programs; the
+    /// serving one is untouched (§7.3 step 2).
+    PrecopyFailed,
+    /// A scheduling policy failed and the main process reinstantiated the
+    /// previous one (§4.4).
+    PolicyReverted,
+}
+
+impl Phase {
+    /// The name the event log and the update's readers use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Precopy => "precopy",
+            Self::Precopied => "precopied",
+            Self::Switchover => "switchover",
+            Self::Switched => "switched",
+            Self::Probation => "probation",
+            Self::Committed => "committed",
+            Self::Reverted => "reverted",
+            Self::Purged => "purged",
+            Self::PrecopyFailed => "precopy_failed",
+            Self::PolicyReverted => "policy_reverted",
+        }
+    }
+}
+
 /// The epochs a deployment's daemon keeps and the processes it manages on
 /// its node: the state `GET /admin/config` reports and a change is routed
 /// by (§7.2).
@@ -474,13 +523,14 @@ impl Epochs {
     }
 
     /// The epochs and the process table as `GET /admin/config` reports
-    /// them: the records of §5.1, with the programs in the form the daemon
-    /// records, and one entry per process the daemon manages.
+    /// them: one array entry per epoch, ascending by number, with the
+    /// programs in the form the daemon records, and one entry per process
+    /// the daemon manages.
     pub fn report(&self) -> Value {
         let epochs = locked(&self.records)
             .iter()
-            .map(|(epoch, record)| (epoch.to_string(), record_report(record)))
-            .collect::<Map<String, Value>>();
+            .map(|(epoch, record)| record_report(*epoch, record))
+            .collect::<Vec<_>>();
         let processes = locked(&self.processes)
             .iter()
             .map(process_report)
@@ -489,9 +539,10 @@ impl Epochs {
     }
 }
 
-/// One epoch record as JSON: the build config, the programs by operator and
-/// phase, the previous generation, and the status, as the design names them.
-fn record_report(record: &EpochRecord) -> Value {
+/// One epoch record as JSON: its number, the build config, the programs by
+/// operator and phase, the previous generation, and the status, as the
+/// design names them.
+fn record_report(epoch: u64, record: &EpochRecord) -> Value {
     let kernels = record
         .kernels
         .iter()
@@ -515,6 +566,7 @@ fn record_report(record: &EpochRecord) -> Value {
         })
         .collect::<Vec<_>>();
     serde_json::json!({
+        "epoch": epoch,
         "build_config": serde_json::to_value(&record.build_config).unwrap_or(Value::Null),
         "kernels": kernels,
         "policy": program_report(&record.policy),
@@ -1191,15 +1243,21 @@ mod tests {
             Some((1, Status::Probation))
         );
 
+        // The epochs are one array, ascending, each naming its number.
         let report = epochs.report();
-        assert_eq!(report["epochs"]["1"]["status"], Value::from("probation"));
-        assert_eq!(report["epochs"]["2"]["status"], Value::from("precopy"));
+        let entries = report["epochs"].as_array().expect("epochs is an array");
         assert_eq!(
-            report["epochs"]["2"]["kernels"][0]["phase"],
-            Value::from("decode")
+            entries
+                .iter()
+                .map(|entry| entry["epoch"].as_u64())
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
         );
+        assert_eq!(entries[0]["status"], Value::from("probation"));
+        assert_eq!(entries[1]["status"], Value::from("precopy"));
+        assert_eq!(entries[1]["kernels"][0]["phase"], Value::from("decode"));
         assert_eq!(
-            report["epochs"]["2"]["kernels"][0]["program"]["backend"],
+            entries[1]["kernels"][0]["program"]["backend"],
             Value::from("trtllm")
         );
     }
