@@ -990,8 +990,13 @@ impl Moe {
     }
 
     /// The combine's descriptor: the routes summed in FP32 and rounded once to `output`.
+    ///
+    /// The routes arrive in **permuted** rows, which is the convention `route_gemm` writes and the
+    /// one the combine's module is compiled for; it is a descriptor field so a chain that ever
+    /// writes expanded rows names its own module instead of reading this one's buffer wrongly.
     pub fn combine_descriptor(&self, product: DType, output: DType) -> combine::Descriptor {
         combine::Descriptor {
+            layout: combine::Layout::Permuted,
             hidden: self.hidden,
             top: self.top,
             experts: self.experts,
@@ -1383,6 +1388,7 @@ impl Moe {
         // 6. Each received row's routes summed with their FP32 weights, in receive order.
         let combined = arena.tensor(hidden.dtype, Shape::new(&[received, hidden_width]))?;
         let combine_descriptor = combine::Descriptor {
+            layout: combine::Layout::Permuted,
             hidden: self.hidden,
             top: self.top,
             experts: self.experts,
@@ -1426,6 +1432,7 @@ impl Moe {
             ExpertStacks::Encoded { .. } => DType::BF16,
         };
         MoeUnpermute::tolerance(&combine::Descriptor {
+            layout: combine::Layout::Permuted,
             hidden: self.hidden,
             top: self.top,
             experts: self.experts,
@@ -1675,6 +1682,7 @@ pub(super) mod tests {
         assert_eq!(
             block.tolerance(),
             MoeUnpermute::tolerance(&combine::Descriptor {
+                layout: combine::Layout::Permuted,
                 hidden: 2048,
                 top: 8,
                 experts: 128,

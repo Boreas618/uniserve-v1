@@ -30,9 +30,45 @@ use crate::{Error, Op, Result, Twins};
 
 use super::{address, dtype_code, to_i64};
 
+/// Which row convention the combine's input buffer is in.
+///
+/// The two products write different conventions and the combine's module is compiled for one of
+/// them, so the choice is a descriptor field - one key per convention - rather than a constant in
+/// the entry: `route_gemm`'s dense path writes one row per **expanded** route (`token · top + route`),
+/// its encoded path writes one row per **permuted** row, and a module compiled for the wrong one
+/// indexes a buffer with numbers that mean something else.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Layout {
+    /// One row per permuted row; `expanded_to_permuted` names the row of each `(token, route)`.
+    Permuted,
+    /// One row per expanded route, in `token · top + route` order; the map is not read.
+    Expanded,
+}
+
+impl Layout {
+    /// The member the call structure carries.
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::Permuted => 0,
+            Self::Expanded => 1,
+        }
+    }
+}
+
+impl fmt::Display for Layout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Permuted => "permuted",
+            Self::Expanded => "expanded",
+        })
+    }
+}
+
 /// One compilation of `moe_unpermute`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
+    /// The row convention the input buffer is in.
+    pub layout: Layout,
     /// Hidden elements of a token.
     pub hidden: u32,
     /// Routes per token.
@@ -50,6 +86,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
+            .field("layout", self.layout)
             .field("hidden", self.hidden)
             .field("top", self.top)
             .field("experts", self.experts)
@@ -63,7 +100,8 @@ impl fmt::Display for Descriptor {
 /// The arguments of one combine.
 #[derive(Clone, Copy)]
 pub struct UnpermuteArgs {
-    /// `[tokens · top, hidden]` every route's expert product.
+    /// `[rows, hidden]` every route's expert product, in the descriptor's [`Layout`]: permuted (one
+    /// row per permuted row, found through `expanded_to_permuted`) or expanded (`token · top + route`).
     pub routes: TensorView,
     /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, `-1` when absent.
     ///
@@ -93,12 +131,14 @@ pub struct Call {
     pub input_dtype: i64,
     pub scales_dtype: i64,
     pub output_dtype: i64,
+    /// [`Layout`] as an `i64`: 0 permuted, 1 expanded.
+    pub layout: i64,
     pub error: [u8; 512],
 }
 
 /// The size and field offsets the package's header must mirror, in bytes.
 pub const UNPERMUTE_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 600,
+    size: 608,
     routes: 0,
     out: 8,
     expanded_to_permuted: 16,
@@ -110,7 +150,8 @@ pub const UNPERMUTE_CALL_LAYOUT: CallLayout = CallLayout {
     input_dtype: 64,
     scales_dtype: 72,
     output_dtype: 80,
-    error: 88,
+    layout: 88,
+    error: 96,
 };
 
 /// The layout of [`Call`], for the header's mirror and its test.
@@ -128,6 +169,7 @@ pub struct CallLayout {
     pub input_dtype: usize,
     pub scales_dtype: usize,
     pub output_dtype: usize,
+    pub layout: usize,
     pub error: usize,
 }
 
@@ -220,6 +262,7 @@ impl Op for MoeUnpermute {
             input_dtype: dtype_code(descriptor.input),
             scales_dtype: dtype_code(descriptor.scales),
             output_dtype: dtype_code(descriptor.output),
+            layout: descriptor.layout.as_i64(),
             error: [0; 512],
         };
         // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
@@ -273,12 +316,14 @@ mod tests {
             std::mem::offset_of!(Call, output_dtype),
             layout.output_dtype
         );
+        assert_eq!(std::mem::offset_of!(Call, layout), layout.layout);
         assert_eq!(std::mem::offset_of!(Call, error), layout.error);
     }
 
     #[test]
     fn the_bound_is_the_route_reduction() {
         let descriptor = Descriptor {
+            layout: Layout::Permuted,
             hidden: 2048,
             top: 8,
             experts: 128,

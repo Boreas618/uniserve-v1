@@ -195,6 +195,7 @@ fn main() {
     lines.push((
         "moe_unpermute".to_owned(),
         key(&moe::combine::Descriptor {
+            layout: moe::combine::Layout::Permuted,
             hidden: HIDDEN,
             top: TOP,
             experts: EXPERTS,

@@ -12,9 +12,9 @@
 // One combine launch. The call struct is the operator's, byte for byte; `stream`
 // is the CUstream of the device the executor drives.
 //
-// `routes` is [routes_rows, hidden] in permuted order, `expanded_to_permuted`
-// [tokens, top] i32 mapping a route to its row of `routes` (-1 skips it), `scales`
-// [tokens, top] the route weights, and `out` [tokens, hidden].
+// `routes` is [routes_rows, hidden] in the row convention `layout` names - permuted (found through
+// `expanded_to_permuted`, [tokens, top] i32, -1 skipping a route) or expanded (`token * top + route`)
+// - `scales` is [tokens, top] the route weights, and `out` [tokens, hidden].
 struct uniserve_unpermute_call {
   const void* routes;
   void* out;
@@ -27,6 +27,8 @@ struct uniserve_unpermute_call {
   int64_t input_dtype;
   int64_t scales_dtype;
   int64_t output_dtype;
+  // // The input buffer's row convention (`ops::moe::combine::Layout`): 0 permuted, 1 expanded.
+  int64_t layout;
   char error[512];
 };
 
@@ -42,9 +44,9 @@ enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_F4E2M1 = 7,
 };
 
-static_assert(offsetof(uniserve_unpermute_call, error) == 88,
+static_assert(offsetof(uniserve_unpermute_call, error) == 96,
               "the call's error message must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_unpermute_call) == 600,
+static_assert(sizeof(uniserve_unpermute_call) == 608,
               "the call must be the size of the operator's layout");
 
 // Combine one route set into the tokens' rows. Returns 0, or a nonzero status
