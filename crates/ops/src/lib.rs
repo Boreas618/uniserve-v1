@@ -85,6 +85,7 @@ pub mod error;
 pub mod exchange;
 pub mod fp4;
 pub mod frame;
+pub mod gelu;
 pub mod gemm;
 pub mod generation;
 pub mod install;

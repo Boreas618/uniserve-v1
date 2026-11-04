@@ -110,6 +110,7 @@ const OPERATORS: &[&str] = &[
     <crate::resize::AntialiasedResizeUint8 as Op>::NAME,
     <crate::snake::Snake as Op>::NAME,
     <crate::bias::BiasAdd as Op>::NAME,
+    <crate::gelu::Gelu as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.
