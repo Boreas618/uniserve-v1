@@ -192,6 +192,31 @@ pub fn load(
         let block = match component {
             Component::TextEncoder => {
                 let source = checkpoint.component("text_encoder")?;
+                // The encoder composes its names with `format!` inside its layers, so a name the
+                // export lacks used to surface as a read error from inside a layer, naming no
+                // block. `keys` is the same list as data - the language stack and the vision tower
+                // are separate lists because they are separate components of one block, and the
+                // report says which of the two is short. Both live in one index, so one source
+                // answers both, and no degree renames a tensor: the degree splits rows.
+                let encoder_keys = TextEncoder::keys(&config.text_encoder);
+                let tower_keys = crate::vision::VisionTower::keys(&config.text_encoder.vision);
+                for (what, keys) in [
+                    ("the language stack", &encoder_keys),
+                    ("the vision tower", &tower_keys),
+                ] {
+                    let missing =
+                        crate::checkpoint::absent(keys, |key| source.tensor(key).is_some());
+                    if !missing.is_empty() {
+                        return Err(Error::checkpoint(format!(
+                            "the {} block's {what} asks {} tensors and {} of them are not in \
+                             text_encoder/: {}",
+                            component.name(),
+                            keys.len(),
+                            missing.len(),
+                            missing[..missing.len().min(8)].join(", ")
+                        )));
+                    }
+                }
                 let dtype = component.activation();
                 let mut shards = loader.reborrow(source)?;
                 let encoder = Arc::new(TextEncoder::load(
