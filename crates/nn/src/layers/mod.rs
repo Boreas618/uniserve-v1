@@ -20,7 +20,6 @@
 
 mod activation;
 mod attention;
-mod bias;
 mod conv;
 mod embedding;
 mod exchange;
@@ -34,12 +33,12 @@ mod norm;
 mod pool;
 mod residual;
 mod rope;
+mod rows;
 mod sampler;
 mod segments;
 
 pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Snake, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
-pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
@@ -48,7 +47,7 @@ pub use head::{ParallelLMHead, gather_rows};
 pub use linear::Linear;
 pub use modulation::ModulatedRmsNorm;
 pub use moe::Moe;
-pub use noise::Noise;
+pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::rope::Rotation;
 pub use pool::AdaptivePool;
@@ -56,6 +55,7 @@ pub use residual::{
     ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };
 pub use rope::Rotary;
+pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use segments::VsaTiles;
 
