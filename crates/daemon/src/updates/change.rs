@@ -2,11 +2,14 @@
 //! applying it changed, and how in-flight requests continue.
 //!
 //! `http/admin.rs` builds an [`ApplyRequest`] and lowers an [`Applied`]; the
-//! epoch layer reads both before it starts a switch. The types keep the names
+//! epoch layer reads both before it starts a switch. [`resolve`] is the one
+//! place a request becomes a target configuration, so the target an operator
+//! sees planned is the target the leader applies. The types keep the names
 //! and wire shapes the API already uses.
 
 use serde::{Deserialize, Serialize};
 
+use crate::leader::UpdateError;
 use crate::options::ServeConfig;
 
 /// How the requests in flight at a promotion continue when the new world
@@ -108,4 +111,41 @@ mod tests {
         assert!(request.dry_run);
         assert!(request.force);
     }
+}
+
+/// Resolves `request` against the serving configuration `current`: the target
+/// configuration, the fields the request stated and the target's update
+/// options, which [`crate::epoch::layer`] and the update entry decide on. The
+/// admin API resolves a change here before it routes it, so the target an
+/// operator sees planned is the target the leader applies.
+pub(crate) fn resolve(
+    current: &ServeConfig,
+    request: &ApplyRequest,
+) -> Result<
+    (
+        ServeConfig,
+        crate::options::Stated,
+        crate::options::UpdateOptions,
+    ),
+    UpdateError,
+> {
+    let (mut target, stated) = match &request.config {
+        Some(text) => crate::options::resolve_text(text, &request.set),
+        None => crate::options::overridden(current, &request.set)
+            .map(|(config, paths)| (config, crate::options::Stated::from_paths(paths))),
+    }
+    .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+    target
+        .validate(&stated)
+        .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+    let update = target.update_config.clone();
+    if request.config.is_none() {
+        target.update_config = current.update_config.clone();
+    }
+    if target.served_model_name() != current.served_model_name() {
+        return Err(UpdateError::Refused(
+            "the served model name names the deployment: deploy another one instead".into(),
+        ));
+    }
+    Ok((target, stated, update))
 }
