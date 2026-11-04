@@ -171,7 +171,7 @@ impl JobQueue {
     ) -> Result<JobId> {
         let mut state = lock(&self.state);
         if state.closed {
-            return Err(Error::State("the job queue is closed".into()));
+            return Err(Error::State("the job queue is closed"));
         }
         let id = JobId(state.next);
         state.next += 1;
@@ -203,7 +203,7 @@ impl JobQueue {
     pub(crate) fn requeue(&self, entry: &Entry, command: Command) -> Result<JobId> {
         let mut state = lock(&self.state);
         if state.closed {
-            return Err(Error::State("the job queue is closed".into()));
+            return Err(Error::State("the job queue is closed"));
         }
         let id = JobId(state.next);
         state.next += 1;
@@ -489,7 +489,7 @@ mod tests {
         };
         queue.complete(
             entry,
-            Err(Error::State("the purge failed".into())),
+            Err(Error::State("the purge failed")),
             Some(capture.describe()),
         );
 
@@ -615,7 +615,7 @@ mod tests {
             .expect("the first step of the command");
         queue.complete(
             entry,
-            Err(Error::State("the shadow comparison failed".into())),
+            Err(Error::State("the shadow comparison failed")),
             None,
         );
         assert!(matches!(precopy.outcome(), Some(Outcome::Failed(_))));

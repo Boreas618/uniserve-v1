@@ -1035,9 +1035,9 @@ impl crate::memory::weights::WeightStorage for Retained {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
         let (staging, descriptor) = Storage::host_retainable(device, bytes.len())?;
-        // SAFETY: the staging storage holds `bytes.len()` writable bytes and the
-        // source slice is at least that long; the server imports the mapping
-        // when the record below is published.
+        // SAFETY: the staging storage holds at least `bytes.len()` writable bytes
+        // and the source slice is that long; the server imports the mapping when
+        // the record below is published.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -1045,10 +1045,14 @@ impl crate::memory::weights::WeightStorage for Retained {
                 bytes.len(),
             );
         }
+        // The allocation is a whole number of the driver's granules, so the record
+        // states the allocation's length: the server imports exactly that. The
+        // tensor states the weight's true length, and the tail of the last granule
+        // is never read.
         let record = ::storage::StorageRecord {
             placement: Placement::Host { numa_node: None },
             segment: None,
-            bytes: bytes.len() as u64,
+            bytes: staging.bytes() as u64,
             fabric: None,
         };
         let tensor = ::storage::TensorRecord {
