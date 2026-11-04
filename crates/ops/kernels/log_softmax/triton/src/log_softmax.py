@@ -26,14 +26,16 @@ def _log_softmax_kernel(
     out_ptr,
     columns,
     pdl,
-    TILE: tl.constexpr,
+    STEP: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):
     """Write the log-softmax of one row per program.
 
     ``x`` is ``[rows, columns]`` in the descriptor's dtype, ``out`` the same
     shape in FP32, ``columns`` the row width and ``pdl`` the launch's copy of the
-    descriptor's flag. Grid: (rows,).
+    descriptor's flag. The row is walked in ``STEP`` wide tiles, so a descriptor
+    tile larger than a program's registers costs more steps, not a bigger block.
+    Grid: (rows,).
     """
     _pdl_prologue(PDL)
 
@@ -42,22 +44,22 @@ def _log_softmax_kernel(
 
     # Pass one: the row's maximum, which keeps the exponentials in range.
     running_max = tl.full((), -float("inf"), tl.float32)
-    for start in range(0, columns, TILE):
-        offsets = start + tl.arange(0, TILE)
+    for start in range(0, columns, STEP):
+        offsets = start + tl.arange(0, STEP)
         values = tl.load(x_ptr + base + offsets, mask=offsets < columns, other=-float("inf"))
         running_max = tl.maximum(running_max, tl.max(values.to(tl.float32), axis=0))
 
     # Pass two: the log-sum-exp normalizer, accumulated in FP32.
     total = tl.zeros((), dtype=tl.float32)
-    for start in range(0, columns, TILE):
-        offsets = start + tl.arange(0, TILE)
+    for start in range(0, columns, STEP):
+        offsets = start + tl.arange(0, STEP)
         values = tl.load(x_ptr + base + offsets, mask=offsets < columns, other=-float("inf"))
         total += tl.sum(tl.exp(values.to(tl.float32) - running_max), axis=0)
     logsumexp = running_max + tl.log(total)
 
     # Pass three: the log-probabilities.
-    for start in range(0, columns, TILE):
-        offsets = start + tl.arange(0, TILE)
+    for start in range(0, columns, STEP):
+        offsets = start + tl.arange(0, STEP)
         mask = offsets < columns
         values = tl.load(x_ptr + base + offsets, mask=mask, other=0.0)
         tl.store(out_ptr + base + offsets, values.to(tl.float32) - logsumexp, mask=mask)

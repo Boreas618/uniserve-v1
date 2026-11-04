@@ -8,6 +8,9 @@ from the grid.
 import _compile
 import log_softmax as kernels
 
+#: The largest column tile a program holds in registers in one step.
+LANES = 4096
+
 #: The input logits' dtype.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
 
@@ -23,11 +26,11 @@ def spec(fields, parameters, target):
             "out_ptr": "*fp32",
             "columns": "i32",
             "pdl": "i32",
-            "TILE": "constexpr",
+            "STEP": "constexpr",
             "PDL": "constexpr",
         },
-        "constexprs": {"TILE": tile, "PDL": pdl},
-        "options": {"num_warps": 8 if tile >= 2048 else 4, "launch_pdl": pdl},
+        "constexprs": {"STEP": min(tile, LANES), "PDL": pdl},
+        "options": {"num_warps": 8 if min(tile, LANES) >= 2048 else 4, "launch_pdl": pdl},
     }
 
 

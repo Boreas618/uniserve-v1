@@ -1,10 +1,13 @@
-# The sampler_shape operator's triton backend: design 5.2's program package.
+# The logits_shape operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program penalizes one block of one row and divides by its temperature; the
+# row count is a launch value. A block wider than a program's registers is walked
+# in step tiles, so one module serves the vocabulary whatever its size.
 
-op = "sampler_shape"
+op = "logits_shape"
 backend = "triton"
 
 [toolchain]
@@ -18,16 +21,15 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/sampler_shape.py", "src/build.py", "src/_compile.py"]
+files = ["src/logits_shape.py", "src/build.py", "src/_compile.py"]
 script = "src/build.py"
 
 [kernel]
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `dtype_bf16_vocabulary_151936_block_262144_extras_0_divide_true_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "fp32"], extras = ["0", "1", "4"], divide = ["true", "false"] }
+dimensions = { dtype = ["bf16", "fp16", "fp32"], vocabulary = ["151936", "152064", "248320", "2048"], block = ["262144", "4096", "8192", "2048"], extras = ["0", "8", "16", "64"], divide = ["true", "false"], pdl = ["true", "false"] }
 
 [parameters]
-block = 2048
-warps = 4
