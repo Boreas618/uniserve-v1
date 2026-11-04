@@ -75,6 +75,11 @@ impl Rgb {
             * u64::from(Self::CHANNELS)
     }
 
+    /// The frames the decoder's own workspace holds: the longest clip, the last, which keeps its tail.
+    pub const fn workspace_frames() -> u32 {
+        25
+    }
+
     /// The extent of one overlap block, `[channels, OVERLAP_FRAMES, height, width]` as the decoder
     /// keeps it between clips.
     pub fn overlap_elements(&self) -> u64 {
@@ -242,6 +247,7 @@ mod tests {
         let rgb = Rgb::of(107, 768, 1344);
         assert_eq!(rgb.bytes(), 107 * 768 * 1344 * 3);
         assert_eq!(rgb.overlap_elements(), 3 * 5 * 768 * 1344);
+        assert_eq!(Rgb::workspace_frames(), 25);
         // A clip writes 17 frames and shares 5; the last writes all 25.
         assert_eq!(Splice::CLIP.frames(), 17);
         assert_eq!(Splice::LAST.frames(), 25);
