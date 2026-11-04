@@ -455,12 +455,12 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 // The video decoder's transformer.
 // ---------------------------------------------------------------------------------------------
 
+use nn::Forward;
 use nn::layers::Rotation;
 use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::Forward;
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
 use ops::gemm::WeightOrder;
 
@@ -997,6 +997,36 @@ impl VideoDecoder {
         self.table_bytes(video.height, video.width, out)
     }
 
+    /// The transformer's scratch for one tile, reserved once per clip and reused by every tile.
+    ///
+    /// Every buffer here is sized by the block's own canvas - one tile's rows and voxels - so a clip's
+    /// tiles share one set: they are used sequentially, and the arena never rewinds, so a per-tile
+    /// reservation would grow the clip's footprint by the tile count. The plan states these once
+    /// ([`crate::decoding::video_arena`]) and this is what makes that true.
+    pub fn scratch(&self, f: &Forward) -> Result<TileScratch> {
+        let rows = self.canvas.rows();
+        let voxels = self.canvas.voxels();
+        let width = u64::from(self.width);
+        let ffn = width * u64::from(self.ffn_mult);
+        let half = u64::from(rotary(&self.config)?.0 / 2);
+        Ok(TileScratch {
+            stream: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            projected: f.arena().tensor(self.dtype, Shape::new(&[voxels, width]))?,
+            cosine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
+            sine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
+            normalized: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            query: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            key: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            value: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            rotated_query: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            rotated_key: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            attended: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            update: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            gate_up: f.arena().tensor(self.dtype, Shape::new(&[rows, 2 * ffn]))?,
+            gated: f.arena().tensor(self.dtype, Shape::new(&[rows, ffn]))?,
+        })
+    }
+
     /// Decode one clip's latent rows into the pixel block of every token.
     ///
     /// `latents` is `[voxels, latent_channels]` — one row per latent voxel, in the raster order the
@@ -1011,11 +1041,10 @@ impl VideoDecoder {
         latents: TensorView,
         positions: TensorView,
         out: TensorView,
+        scratch: &TileScratch,
     ) -> Result<()> {
         let rows = self.canvas.rows();
         let voxels = self.canvas.voxels();
-        let width = u64::from(self.width);
-        let ffn = width * u64::from(self.ffn_mult);
         if latents.shape.rank() != 2 || latents.shape.dim(0) != voxels {
             return Err(Error::config(format!(
                 "the decoder reads {voxels} latent rows, not {:?}",
@@ -1041,8 +1070,8 @@ impl VideoDecoder {
             )));
         }
 
-        let stream = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let projected = f.arena().tensor(self.dtype, Shape::new(&[voxels, width]))?;
+        let stream = scratch.stream;
+        let projected = scratch.projected;
         self.input.forward(f, latents, projected)?;
         self.place
             .replace(f, stream, projected, self.voxel_rows.view())?;
@@ -1051,23 +1080,15 @@ impl VideoDecoder {
         self.place
             .replace(f, stream, self.zero_row.view(), self.zero_rows.view())?;
 
-        let (rotated, _) = rotary(&self.config)?;
-        let half = u64::from(rotated / 2);
-        let cosine = f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?;
-        let sine = f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?;
+        let (cosine, sine) = (scratch.cosine, scratch.sine);
         self.rotary.factors(f, positions, cosine, sine)?;
 
         let (head, heads) = (self.head, self.heads);
-        let normalized = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let query = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let key = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let value = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let rotated_query = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let rotated_key = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let attended = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let update = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
-        let gate_up = f.arena().tensor(self.dtype, Shape::new(&[rows, 2 * ffn]))?;
-        let gated = f.arena().tensor(self.dtype, Shape::new(&[rows, ffn]))?;
+        let normalized = scratch.normalized;
+        let (query, key, value) = (scratch.query, scratch.key, scratch.value);
+        let (rotated_query, rotated_key) = (scratch.rotated_query, scratch.rotated_key);
+        let (attended, update) = (scratch.attended, scratch.update);
+        let (gate_up, gated) = (scratch.gate_up, scratch.gated);
         let hidden = stream;
         let per_head = |view: TensorView| view.reshape(Shape::new(&[rows, heads, head]));
 
@@ -1112,6 +1133,25 @@ impl VideoDecoder {
         self.norm.forward(f, hidden, normalized)?;
         Ok(self.output.forward(f, normalized, out)?)
     }
+}
+
+/// The transformer's scratch for one tile: fourteen buffers, reserved once per clip.
+#[derive(Clone, Copy)]
+pub struct TileScratch {
+    stream: TensorView,
+    projected: TensorView,
+    cosine: TensorView,
+    sine: TensorView,
+    normalized: TensorView,
+    query: TensorView,
+    key: TensorView,
+    value: TensorView,
+    rotated_query: TensorView,
+    rotated_key: TensorView,
+    attended: TensorView,
+    update: TensorView,
+    gate_up: TensorView,
+    gated: TensorView,
 }
 
 impl Decoder for VideoDecoder {
@@ -1386,6 +1426,15 @@ pub(crate) mod tests {
         }
         // The one table a layout declares is the one this decoder reads, and its descriptor is the
         // extent the layout states - the adapter adds no arithmetic of its own.
+        //
+        // Two different quantities live in this one table, and three rounds were spent on this test
+        // for want of saying so. Its **rows** are a row per row of the largest tile - the tile's voxels
+        // plus the four register rows and the trailing zero row, 1,792 + 5 = 1,797 on every canvas - and
+        // one clip's rows are the whole of it, because how many clips a request has is the runner's and
+        // the splice's question, never this table's. Its **three** is the coordinate axis, which is a
+        // dimension of its own: the values are `3 · rows` in a flat buffer and `[3, rows]` as declared,
+        // so the twenty-four-radian frame row of each axis is contiguous. Neither number is a frame
+        // count and neither multiplies the other.
         let layout = nn::capability::Layout {
             video: nn::capability::LatentShape {
                 channels: config.latent_channels,
@@ -1402,8 +1451,41 @@ pub(crate) mod tests {
             table_specs(&config, layout.video.height, layout.video.width).expect("specs");
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].name, "video_positions");
-        assert_eq!(declared[0].shape.dim(1), 3 * tile.rows());
+        // `[3, rows]`: the coordinate axis first, then one row per row of the largest tile.
+        assert_eq!(declared[0].shape.rank(), 2);
+        assert_eq!(declared[0].shape.dim(0), 3);
+        assert_eq!(declared[0].shape.dim(1), tile.rows());
         assert_eq!(declared[0].dtype, DType::F32);
+    }
+
+    #[test]
+    fn the_position_table_is_one_upload_for_every_canvas() {
+        // The tiles are uniform, so the table is the largest tile's however large the canvas is: a
+        // layout costs the executor one upload of the same size whatever its extents. The two canvases
+        // here are the served ones - 768p at 768 x 1344 (48 x 84 latents) and 672p at 672 x 1536
+        // (42 x 96) - and they are the same table, not two of the same shape by coincidence.
+        let config = video_config();
+        let mut vertical = vec![Vec::new()];
+        let mut wide = vec![Vec::new()];
+        table_bytes_into(&config, 48, 84, &mut vertical).expect("the vertical canvas");
+        table_bytes_into(&config, 42, 96, &mut wide).expect("the wide canvas");
+        assert_eq!(vertical[0].len(), wide[0].len());
+        let tables = table_specs(&config, 48, 84).expect("the one table");
+        // The buffer is the descriptor's own expression: elements times the element's size. Written as
+        // a number it was `5,391` elements against `21,564` bytes - the same table in two units.
+        let expected = tables[0].shape.numel() * u64::from(tables[0].dtype.bits()) / 8;
+        assert_eq!(vertical[0].len() as u64, expected);
+    }
+
+    #[test]
+    fn a_layout_with_the_wrong_number_of_tables_is_refused() {
+        // The executor sizes `out` from `table_specs`, so a count that disagrees with the block is a
+        // protocol error and must surface as one rather than as a partially written table.
+        let config = video_config();
+        let mut none: Vec<Vec<u8>> = Vec::new();
+        assert!(table_bytes_into(&config, 48, 84, &mut none).is_err());
+        let mut two = vec![Vec::new(), Vec::new()];
+        assert!(table_bytes_into(&config, 48, 84, &mut two).is_err());
     }
 
     #[test]

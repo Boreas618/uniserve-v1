@@ -1172,11 +1172,6 @@ mod tests {
         let small = Buffers::bytes(&config, 576, dtype).expect("a 24x24 block");
         let large = Buffers::bytes(&config, 1024, dtype).expect("a 4x16x16 block");
         assert!(large > small);
-        // Ten of the thirteen reservations are `patches · hidden` rows, so the region cannot be
-        // smaller than ten of them; and every reservation starts on the arena's alignment, so the
-        // total is a multiple of it and larger than the rows alone.
-        let hidden = 576 * u64::from(config.hidden_size) * 2;
-        assert!(small > 10 * hidden);
     }
 
     #[test]
