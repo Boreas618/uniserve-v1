@@ -18,9 +18,9 @@
 //! caller's view: the block composes this layer with its attention projections and its cache, and
 //! the executor owns the buffers.
 
-use ops::TensorView;
 use ops::descriptor::Float;
 use ops::segments::{self, MAX_MEMBERS};
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -126,6 +126,90 @@ impl VsaTiles {
     /// Features per head.
     pub const fn width(&self) -> u32 {
         self.width
+    }
+
+    /// The descriptor one launch of each of this layer's five programs takes.
+    ///
+    /// Five, not one: the chain's five launches are five different operators (`vsa_prepare_tiles`,
+    /// `vsa_zero_padding`, `vsa_add_gated_tiles`, `vsa_compose_gated_rows`, `vsa_select_tiles`), so a
+    /// walk that asks which programs a model launches needs each by its own name and with the
+    /// geometry that launch reads.
+    pub fn prepare_tiles_descriptor(
+        &self,
+        query: TensorView,
+        key: TensorView,
+        value: TensorView,
+        cosine: Option<TensorView>,
+    ) -> segments::PrepareTilesDescriptor {
+        segments::PrepareTilesDescriptor {
+            dtype: query.dtype,
+            heads: self.heads,
+            width: self.width,
+            rotated: self.rotated,
+            tile_rows: self.tile_rows,
+            block_rows: self.block_rows,
+            epsilon: Float::from(self.eps),
+            norm: self.norm,
+            query_row_stride: query.strides.get(0),
+            query_head_stride: query.strides.get(1),
+            key_row_stride: key.strides.get(0),
+            key_head_stride: key.strides.get(1),
+            value_row_stride: value.strides.get(0),
+            value_head_stride: value.strides.get(1),
+            factor_stride: cosine.map(|table| table.strides.get(0)).unwrap_or(0),
+        }
+    }
+
+    /// The descriptor one `vsa_zero_padding` launch takes.
+    pub fn zero_padding_descriptor(&self, dtype: DType) -> segments::ZeroPaddingDescriptor {
+        segments::ZeroPaddingDescriptor {
+            dtype,
+            heads: self.heads,
+            tile_rows: self.tile_rows,
+            width: self.width,
+            block_rows: self.block_rows,
+        }
+    }
+
+    /// The descriptor one `vsa_add_gated_tiles` launch takes.
+    pub fn add_gated_tiles_descriptor(&self, dtype: DType) -> segments::AddGatedTilesDescriptor {
+        segments::AddGatedTilesDescriptor {
+            dtype,
+            tile_rows: self.tile_rows,
+            width: self.width,
+            block_rows: self.block_rows,
+        }
+    }
+
+    /// The descriptor one `vsa_compose_gated_rows` launch takes.
+    ///
+    /// The gate's member table is a descriptor field — a contiguous `[members]` array the program
+    /// reads as it starts — so it enters the key with the count beside it.
+    pub fn compose_descriptor(
+        &self,
+        dtype: DType,
+        slots: &[u32],
+    ) -> segments::ComposeGatedRowsDescriptor {
+        let mut table = [0_u32; MAX_MEMBERS];
+        table[..slots.len()].copy_from_slice(slots);
+        segments::ComposeGatedRowsDescriptor {
+            dtype,
+            heads: self.heads,
+            tile_rows: self.tile_rows,
+            width: self.width,
+            block_rows: self.block_rows,
+            slots: table,
+            members: slots.len() as u32,
+        }
+    }
+
+    /// The descriptor one `vsa_select_tiles` launch takes, for `tiles` key tiles.
+    pub fn select_descriptor(&self, tiles: u64) -> Result<segments::SelectTilesDescriptor> {
+        Ok(segments::SelectTilesDescriptor {
+            block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
+                Error::shape("VsaTiles", format!("{tiles} key tiles in one query tile"))
+            })?,
+        })
     }
 
     /// What a preparation needs of its at-rest arguments: [`Self::prepare`] calls this before it
@@ -522,6 +606,20 @@ impl VsaTiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The selection's block is the key-tile count rounded up to a power of two: the program's own
+    /// table width, so a walk that reads the accessor sees the same key the launch would.
+    #[test]
+    fn the_select_block_is_the_tile_count_rounded_up() {
+        let layer = VsaTiles::with_default_tile(4, 128, 1e-6).unwrap();
+        assert_eq!(layer.select_descriptor(1).unwrap().block, 1);
+        assert_eq!(layer.select_descriptor(5).unwrap().block, 8);
+        assert_eq!(layer.select_descriptor(64).unwrap().block, 64);
+        // The member table is the layer's own statement of the gate's slots.
+        let compose = layer.compose_descriptor(DType::BF16, &[2, 5]);
+        assert_eq!(compose.members, 2);
+        assert_eq!(&compose.slots[..2], &[2, 5]);
+    }
     use ops::{DType, DevicePtr, Shape};
 
     /// A view of `shape` at a host address: these tests never launch, so the address is a marker.

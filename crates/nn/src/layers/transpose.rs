@@ -47,6 +47,19 @@ impl Transpose {
     /// axis folds it into the rows — `[1, channels, frames]` is the `[channels, frames]` matrix this
     /// takes, because the batch is the caller's and not the transpose's. A rank that is not two is
     /// refused with the shape in the message rather than reinterpreted.
+    /// The descriptor this layer's launch takes, for a walk that asks a model which programs it
+    /// launches with no device.
+    ///
+    /// No caller's element type: a transpose is typed by the matrix it was built for, and both
+    /// operands are that type.
+    pub fn descriptor(&self) -> transpose::Descriptor {
+        transpose::Descriptor {
+            dtype: self.dtype,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     pub fn forward(&self, f: &Forward, source: TensorView, out: TensorView) -> Result<()> {
         for (name, view) in [("source", source), ("out", out)] {
             if view.shape.rank() != 2 {
@@ -80,11 +93,7 @@ impl Transpose {
                 ),
             ));
         }
-        let descriptor = transpose::Descriptor {
-            dtype: self.dtype,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor();
         f.operate::<TransposeOp>(&descriptor, transpose::Args { input: source, out })
     }
 }
