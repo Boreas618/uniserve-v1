@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use nn::KvPlanes;
 use ops::{DType, DevicePtr, Shape, Strides, TensorView};
-use platform::{DeviceAllocation, DeviceId, Stream};
+use platform::{Buffer, PoolKind, Stream};
+
+use crate::arena::Pools;
 
 use super::causal_lm::KvProvider;
 use crate::memory::allocation::ElementType;
@@ -34,15 +36,19 @@ pub struct ResidentCache {
 }
 
 /// One group's gathered block table: the device storage and the shape of the view over it.
+///
+/// The storage is carved from the device's one pool set (`PoolKind::Resident`), never mapped
+/// directly: a mapping outside that allocator would not be booked against the device's budget
+/// (4.1).
 struct Table {
-    buffer: DeviceAllocation,
+    buffer: Buffer,
     rows: u32,
     width: u32,
 }
 
 impl Table {
-    /// Allocates `rows x width` i32 for one group.
-    fn new(device: DeviceId, rows: u32, width: u32) -> Result<Self> {
+    /// Allocates `rows x width` i32 for one group from the device's pools.
+    fn new(pools: &std::sync::Mutex<Pools>, rows: u32, width: u32) -> Result<Self> {
         if rows == 0 || width == 0 {
             return Err(Error::Invalid(
                 "a block table needs at least one row and one page".into(),
@@ -50,8 +56,11 @@ impl Table {
         }
         let bytes = usize::try_from(u64::from(rows) * u64::from(width) * 4)
             .map_err(|_| Error::Resource("a block table is larger than memory".into()))?;
+        let mut pools = pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(Self {
-            buffer: DeviceAllocation::linear(device, bytes)?,
+            buffer: pools.allocate(PoolKind::Resident, bytes as u64)?,
             rows,
             width,
         })
@@ -77,7 +86,11 @@ impl ResidentCache {
     ///
     /// `rows` is the bucket's row count, padding included: every captured graph addresses a table
     /// of exactly that height, so the gather column is allocated once, here, and never grows.
-    pub fn new(cache: Arc<PrefixCache>, device: DeviceId, rows: u32) -> Result<Self> {
+    pub fn new(
+        cache: Arc<PrefixCache>,
+        pools: &std::sync::Mutex<Pools>,
+        rows: u32,
+    ) -> Result<Self> {
         let groups = cache.groups();
         if groups == 0 {
             return Err(Error::Invalid(
@@ -88,7 +101,7 @@ impl ResidentCache {
         let (_, _, width) = cache.unit_tables();
         let mut tables = Vec::with_capacity(groups);
         for _ in 0..groups {
-            tables.push(Table::new(device, rows, width)?);
+            tables.push(Table::new(pools, rows, width)?);
         }
         Ok(Self {
             cache,
