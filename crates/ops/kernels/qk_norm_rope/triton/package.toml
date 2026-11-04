@@ -8,7 +8,7 @@ op = "qk_norm_rope"
 backend = "triton"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 packages = []
 

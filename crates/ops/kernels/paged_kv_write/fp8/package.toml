@@ -13,7 +13,7 @@ op = "paged_kv_write"
 backend = "fp8"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 packages = []
 
