@@ -266,8 +266,8 @@ struct FusedHeads {
     ///
     /// FP32 because the reference builds a student's head FP32 (`transformer.py:307-311`): the fused
     /// row is a sum of the checkpoint's BF16 rows and rounding it back would round a number the
-    /// reference keeps exact. The projection that reads it takes the stack's BF16 rows, so the only
-    /// rounding is the store into the velocity.
+    /// reference keeps exact. The projection reads the widened FP32 rows (`Transformer::wide`), so
+    /// its two operands are one type and the only rounding is the store into the velocity.
     weight: Weight,
     /// `[blocks, out]`: block `b`'s fused bias.
     bias: Weight,
