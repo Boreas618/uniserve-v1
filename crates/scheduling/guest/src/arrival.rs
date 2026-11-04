@@ -234,7 +234,7 @@ impl<K: Order> Arrival<K> {
         let share = shares.tokens().min(shares.prefill());
         let chunk = prefill_chunk(
             start,
-            view.prompt_tokens,
+            view.prefill_tokens.max(view.prompt_tokens),
             self.limits.chunked_prefill_size,
             share,
             room.page_tokens,
@@ -780,6 +780,8 @@ mod tests {
             arrived_at: Nanos(arrived),
             admitted_at: None,
             prompt_tokens: 100,
+            // Nothing to commit: a request with no block commit states its prompt length.
+            prefill_tokens: 100,
             generated_tokens: 0,
             cached_prefix_tokens: 0,
             prefilled_tokens: 0,

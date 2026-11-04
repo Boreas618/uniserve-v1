@@ -645,7 +645,8 @@ impl Scheduler {
             let mut rows = 0usize;
             let mut blocks = Vec::new();
             let mut block_tokens = 0u32;
-            let mut block = self.scheduled_context(id)?.blocks;
+            let sc = self.scheduled_context(id);
+            let mut block = sc?.blocks;
             // In-flight context prefills hold the leading features.
             let in_flight = state.blocks_between(state.block_cursor(), block);
             loop {

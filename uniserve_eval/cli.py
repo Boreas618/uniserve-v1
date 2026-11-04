@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG, load_config, server_launch
+from .pipeline.compare import compare_runs
 from .pipeline.run import run_point
 from .pipeline.setup import (
     applied_environment,
@@ -184,6 +186,26 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(2)
 
 
+def compare(args: argparse.Namespace) -> None:
+    """Compare a candidate GSM8K run against its reference run.
+
+    Prints the comparison report as JSON. Exits with status 0 when the
+    candidate is accepted, 2 when the difference is outside the confidence
+    interval, and 1 when a bundle is missing or the two runs are not
+    comparable.
+    """
+    try:
+        report = compare_runs(
+            args.reference, args.candidate, confidence=args.confidence
+        )
+    except (OSError, ValueError) as error:
+        print(f"uniserve-eval compare: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if report["verdict"] != "accepted":
+        raise SystemExit(2)
+
+
 def _log_path(
     output_root: Path, point: BenchmarkPoint, index: int, replicated: bool
 ) -> Path:
@@ -226,6 +248,14 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--reuse-deployment", action="store_true")
     command.add_argument("--keep-going", action="store_true")
     command.set_defaults(function=run)
+
+    # `compare` reads two completed result bundles; it starts no server and
+    # is the acceptance step of the quality confirmation that `run` feeds.
+    command = subparsers.add_parser("compare")
+    command.add_argument("reference", type=Path)
+    command.add_argument("candidate", type=Path)
+    command.add_argument("--confidence", type=float, default=0.95)
+    command.set_defaults(function=compare)
     return parser
 
 
