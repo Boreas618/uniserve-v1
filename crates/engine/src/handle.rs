@@ -631,6 +631,25 @@ pub enum Command {
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
     /// Accepted prefixes of running requests that can move to another world.
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
+    /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
+    /// without putting it in. The load and the instantiation run on a blocking
+    /// thread; the answer says whether a candidate was prepared.
+    PrecopyPolicy {
+        program: crate::scheduler::PolicyProgram,
+        source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// §7.3 step 3: the prepared policy answers from the next boundary.
+    SwitchoverPolicy {
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// §7.3 step 6: forget the policy a revert could return to.
+    CommitPolicy,
+    /// §7.3 step 4: serve the previous policy again, instantiated on the
+    /// scheduler's current state.
+    RevertPolicy {
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
     /// Hands the control thread a policy failure this scheduler recorded: it
     /// reverted to the previous policy and serves on (§7.3).
     TakePolicyReport(crossbeam_channel::Sender<Option<crate::scheduler::PolicyReverted>>),
@@ -1003,6 +1022,43 @@ impl CommandSender {
         let (answer, described) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::DescribeCache(answer));
         described
+    }
+
+    /// Prepares `program`'s policy on this scheduler's state without putting it
+    /// in (§7.3 step 2); the answer arrives when the blocking thread is done.
+    pub fn precopy_policy(
+        &self,
+        program: crate::scheduler::PolicyProgram,
+        source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PrecopyPolicy {
+            program,
+            source,
+            answer,
+        });
+        done
+    }
+
+    /// Puts the prepared policy in from the scheduler's next boundary (§7.3
+    /// step 3).
+    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::SwitchoverPolicy { answer });
+        done
+    }
+
+    /// Forgets the policy this scheduler could revert to (§7.3 step 6).
+    pub fn commit_policy(&self) {
+        let _ = self.send(Command::CommitPolicy);
+    }
+
+    /// Serves the previous policy again, on the scheduler's current state
+    /// (§7.3 step 4).
+    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::RevertPolicy { answer });
+        done
     }
 
     /// Takes the policy failure this scheduler recorded since the last call,

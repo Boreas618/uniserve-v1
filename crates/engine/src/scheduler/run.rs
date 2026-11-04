@@ -232,6 +232,8 @@ impl Scheduler {
             output: output::OutputSender::default(),
             policy: None,
             policy_report: None,
+            policy_precopy: None,
+            policy_prepared: None,
             recorder: mechanism::Recorder::default(),
             watchdog: mechanism::Watchdog::default(),
             step: 0,
