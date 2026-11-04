@@ -1210,6 +1210,17 @@ impl Leader {
         if crate::epoch::layer(&previous, &next) != crate::epoch::Layer::Epoch {
             return Ok(None);
         }
+        // One update at a time (§7.2): a program update on probation is the
+        // record of what serves, so an epoch switch over it is refused by
+        // name, before the build config is written or a child is started.
+        if let Some(in_flight) = crate::updates::in_flight(
+            self.updates.running(),
+            self.epochs().program_update().is_some(),
+        ) {
+            return Err(UpdateError::Refused(format!(
+                "another update is in flight: {in_flight}"
+            )));
+        }
         // One main process per node and one launch file per process: the file
         // names its peers' request addresses, which this daemon does not know
         // for a node it does not run on, so it can state a world of one only.
