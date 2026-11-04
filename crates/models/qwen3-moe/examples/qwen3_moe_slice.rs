@@ -674,15 +674,15 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             let width = usize::try_from(plan.hidden).unwrap_or(0);
             let values = download_bf16(&stream, rows, tokens_usize(&batch), width)?;
             let mut first_above = None;
-            report_stage(
-                args,
-                &format!("hidden_{:02}.npy", layer + 1),
-                layer + 1,
-                &values,
-                tokens_usize(&batch),
+            let name = format!("hidden_{:02}.npy", layer + 1);
+            let stage = Walked {
+                file: &name,
+                label: &stage_name(layer + 1),
+                index: layer + 1,
+                rows: tokens_usize(&batch),
                 width,
-                &mut first_above,
-            )?;
+            };
+            report_stage(args, stage, &values, &mut first_above)?;
         }
         return Ok(());
     }
@@ -700,43 +700,36 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         let rows = tokens_usize(&batch);
         let mut first_above = None;
         let embedded = download_bf16(&stream, hidden, rows, width)?;
-        report_stage(
-            args,
-            "hidden_00.npy",
-            0,
-            &embedded,
+        let stage = Walked {
+            file: "hidden_00.npy",
+            label: &stage_name(0),
+            index: 0,
             rows,
             width,
-            &mut first_above,
-        )?;
+        };
+        report_stage(args, stage, &embedded, &mut first_above)?;
         // Every call reserves a step's scratch, and nothing returns it: the arena is sized for one
         // forward and not for forty-eight, so each layer's rows are read back to the host and the
         // arena is then released to the mark taken before the first call. Without the release the
         // walk would stop a few layers in, with the arena exhausted.
+        // The layer walk ends one short of the stack: the reference's last file is the output of
+        // the whole run, after the final norm, and a layer's own output is the state before it. The
+        // walk covers `hidden_01..hidden_{L-1}` and the full run below answers `hidden_L`.
         let mark = arena.mark();
-        for layer in 0..config.num_hidden_layers {
+        for layer in 0..config.num_hidden_layers.saturating_sub(1) {
             let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
             stream.synchronize()?;
             let values = download_bf16(&stream, out, rows, width)?;
             let index = layer + 1;
             let name = format!("hidden_{index:02}.npy");
-            // The reference's last file is after the final norm while a layer's output is before it,
-            // so that one stage is written and not compared: the head's logits are what carry the
-            // end of the model, and a difference there is not a difference in the stack.
-            if index < config.num_hidden_layers {
-                report_stage(args, &name, index, &values, rows, width, &mut first_above)?;
-            } else {
-                if let Some(dir) = args.dump.as_deref() {
-                    write_npy(&dir.join(&name), &values, rows, width)?;
-                    println!("dump: {name} is {}", stage_name(index));
-                }
-                if args.reference.is_some() {
-                    println!(
-                        "reference: {name} is not compared - the reference's file is after the final \
-                         norm and this stage is before it; the logits below carry the end of the model"
-                    );
-                }
-            }
+            let stage = Walked {
+                file: &name,
+                label: &stage_name(index),
+                index,
+                rows,
+                width,
+            };
+            report_stage(args, stage, &values, &mut first_above)?;
             arena.release(mark);
         }
         match first_above {
@@ -754,6 +747,32 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     }
 
     model.forward(&forward, &batch, &cache, hidden)?;
+    // The run's output norm writes into `hidden`, so this is the state a reference's last file
+    // holds: the output after the final norm, which no layer's own output is.
+    if args.dump.is_some() || args.reference.is_some() {
+        stream.synchronize()?;
+        let rows = tokens_usize(&batch);
+        let width = usize::try_from(plan.hidden).unwrap_or(0);
+        let values = download_bf16(&stream, hidden, rows, width)?;
+        let index = config.num_hidden_layers;
+        let name = format!("hidden_{index:02}.npy");
+        let mut first_above = None;
+        let stage = Walked {
+            file: &name,
+            label: &final_stage_name(index),
+            index,
+            rows,
+            width,
+        };
+        report_stage(args, stage, &values, &mut first_above)?;
+        if let Some(index) = first_above {
+            println!(
+                "reference: the first stage past {:.0}% is hidden_{index:02}, {}",
+                RELATIVE_BUDGET * 100.0,
+                final_stage_name(index)
+            );
+        }
+    }
     let logits = arena.tensor(
         DType::F32,
         Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
@@ -848,20 +867,38 @@ fn stage_name(index: usize) -> String {
     }
 }
 
+/// The last stage's name, which is the run's output after the final norm and not a layer's output.
+fn final_stage_name(index: usize) -> String {
+    format!("the output after the final norm (hidden_{index:02})")
+}
+
 /// Write one stage's rows when `--dump` asked, and compare them against the reference when
 /// `--reference` did, recording the first stage that passes [`RELATIVE_BUDGET`].
-fn report_stage(
-    args: &Args,
-    name: &str,
+/// One stage of the walk: which file it is, what it follows, and the shape of its rows.
+struct Walked<'a> {
+    file: &'a str,
+    label: &'a str,
     index: usize,
-    values: &[f32],
     rows: usize,
     width: usize,
+}
+
+fn report_stage(
+    args: &Args,
+    stage: Walked<'_>,
+    values: &[f32],
     first_above: &mut Option<usize>,
 ) -> Result<()> {
+    let Walked {
+        file: name,
+        label,
+        index,
+        rows,
+        width,
+    } = stage;
     if let Some(dir) = args.dump.as_deref() {
         write_npy(&dir.join(name), values, rows, width)?;
-        println!("dump: {name} is {}", stage_name(index));
+        println!("dump: {name} is {label}");
     }
     let Some(dir) = args.reference.as_deref() else {
         return Ok(());
@@ -886,7 +923,7 @@ fn report_stage(
     println!(
         "reference: {name}, {}, rms {ours:.4e} against the reference's {scale:.4e} \
          — rms/scale {relative:.3e}, max |diff| {worst:.3e}{marker}",
-        stage_name(index)
+        label
     );
     Ok(())
 }
