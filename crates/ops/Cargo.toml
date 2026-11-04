@@ -10,7 +10,6 @@ publish = false
 # no model, no layer and no runtime object (specs/worker.md 3, 4.2).
 [dependencies]
 platform = { path = "../platform" }
-serde.workspace = true
 thiserror.workspace = true
 
 [lints]

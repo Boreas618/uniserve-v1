@@ -2,19 +2,16 @@
 //!
 //! A kernel program may be split by phase: prefill and decode attention are different programs, and
 //! diffusion distinguishes encoding, denoising and decoding. The phase is part of a program's
-//! selection key (specs/worker.md 5.2) and travels with the epoch record, so it is a plain
-//! serializable value with no runtime state.
+//! selection key (specs/worker.md 5.2) and travels with the epoch record as its name, so it is a
+//! plain value with no runtime state and no encoding of its own.
 //!
 //! Variants are appended, never reordered: the record's encoding names them, and a program built
 //! against an older list keeps its meaning.
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
-
 /// The phase of a request a call belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum PhaseKind {
     /// One forward over the whole prompt.
     Prefill,
