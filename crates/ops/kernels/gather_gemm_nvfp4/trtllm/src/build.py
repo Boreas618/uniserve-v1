@@ -67,6 +67,10 @@ SF_LAYOUTS = {"linear": 0, "8x4": 1, "8x16": 2, "swizzled_128x4": 3}
 DEFINES = [
     "TLLM_GEN_EXPORT_INTERFACE",
     "TLLM_GEN_EXPORT_FLASHINFER",
+    # The artifact's `KernelParamsSetup` -- the function that turns an options record into the
+    # pointers and launch geometry a cubin takes -- is inside `#ifdef TLLM_ENABLE_CUDA`, so a build
+    # that leaves the macro off sees an empty namespace and fails on the runner's own call into it.
+    "TLLM_ENABLE_CUDA",
     "ENABLE_BF16",
     "ENABLE_FP8",
     "ENABLE_FP4",
