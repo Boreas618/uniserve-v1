@@ -18,10 +18,15 @@ use ops::fp4::ScaleLayout;
 use qwen3_moe::weights::ExpertSource;
 use tempfile::TempDir;
 
-/// Two experts, a `4 × 32` contraction: two E2M1 codes a byte along the contraction (a 16-byte
+/// Two experts, a `32 × 32` contraction: two E2M1 codes a byte along the contraction (a 16-byte
 /// packed row) and two scale blocks of sixteen per row.
+///
+/// The rows are a whole shuffle block on purpose. A deployment arranges the values in the product's
+/// row order, and that arrangement permutes blocks of thirty-two rows, so a fixture with fewer rows
+/// than one block cannot be published in the deployment's own layout — the loader refuses it, which
+/// is the check `a_stack_smaller_than_one_shuffle_block_is_refused` states.
 const EXPERTS: u32 = 2;
-const ROWS: u64 = 4;
+const ROWS: u64 = 32;
 const CONTRACTION: u64 = 32;
 const BLOCK_ELEMENTS: u64 = 16;
 
@@ -228,12 +233,13 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
     // ModelOpt export stores it as E4M3, and a loader that relabelled it U8 would hide which byte
     // the kernel decodes.
     assert_eq!(stack.scales.view.dtype, DType::F8E4M3);
-    // One tensor scale per (expert, projection), in the reading order the stack fuses: a checkpoint
-    // carries one `weight_scale_2` per projection tensor, so the two halves of `up_gate` generally
-    // differ and a kernel that used one for both would be wrong by their ratio.
+    // One tensor scale per (projection, expert). A checkpoint carries one `weight_scale_2` per
+    // projection tensor, so the two halves of `up_gate` generally differ and a kernel that used one
+    // for both would be wrong by their ratio; the published table is projection-major because the
+    // batched entry reads one packed row per projection.
     assert_eq!(
         stack.global_scale.view.shape.dims(),
-        &[u64::from(EXPERTS), 2]
+        &[2, u64::from(EXPERTS)]
     );
     let published = store
         .published
@@ -247,9 +253,10 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
         .iter()
         .map(|word| f32::from_le_bytes(*word))
         .collect();
-    // The fixture's tensor scales, expert-major and projection-minor: 1, 2 for expert 0's up and
-    // gate, then 17, 18 for expert 1's — published as their reciprocals.
-    let expected: Vec<f32> = [1.0_f32, 2.0, 17.0, 18.0].iter().map(|s| 1.0 / s).collect();
+    // The shard states the tensor scales in its own reading order — 1 and 2 for expert 0's up and
+    // gate, then 17 and 18 for expert 1's — and the published table is their reciprocals,
+    // projection-major: up's two experts, then gate's.
+    let expected: Vec<f32> = [1.0_f32, 17.0, 2.0, 18.0].iter().map(|s| 1.0 / s).collect();
     assert_eq!(reciprocals.len(), expected.len());
     for (found, want) in reciprocals.iter().zip(&expected) {
         assert!(
