@@ -35,7 +35,10 @@
 //! *replicated* on every rank: it is small, every rank needs its features, and its row-parallel
 //! projections would otherwise need a bias added once after the reduction.
 
-use nn::capability::{Encoder, EncoderInputs, EncoderOutputs};
+use nn::capability::{
+    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
+    StateTable,
+};
 use nn::layers::{
     Attention, Embedding, GatedActivation, Linear, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
@@ -50,7 +53,7 @@ use crate::config::TextEncoderConfig;
 use crate::load::Component;
 use crate::partition::Partition;
 use crate::positions::{self, Mrope};
-use crate::vision::{ones, Geometry, Outputs, VisionTower};
+use crate::vision::{ones, Geometry, ImageTables, Outputs, ROPE_THETA, VisionTower};
 use crate::{Error, Result};
 
 /// The language layers' gate: the checkpoint states `hidden_act: "silu"` and H3 fixes it.
@@ -59,19 +62,27 @@ const ACTIVATION: Activation = Activation::Silu;
 /// The checkpoint's tensor names under the text encoder's component.
 const PREFIX: &str = "model.language_model";
 
-/// What one encode call of a plan covers.
+/// What one encode call of a layout covers.
 ///
 /// The runner plans a bucket from these numbers: the prompt's rows, the images of the request (one
 /// patch grid each) and the widths this rank holds. [`Plan::bytes`] then states the arena region one
 /// such call reserves, which the executor keeps for as long as a captured graph addresses it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Plan {
-    /// Rows of the prompt: the packed tokens, placeholders included.
-    pub tokens: u32,
+    /// Rows the call writes: the packed prompt tokens, placeholders included.
+    ///
+    /// An encoder's output is one row per presented token, so this is the batch's `num_tokens`; the
+    /// layout's `rows` is the capacity an executor reserves and must equal it (the model refuses a
+    /// padded output, whose rows the batch's offsets do not describe).
+    pub rows: u32,
     /// Merged vision rows of all the request's images together.
     pub merged: u32,
     /// Patch rows per image, in prompt order.
     pub images: Vec<u32>,
+    /// Time steps per image, in prompt order.
+    pub time: Vec<u32>,
+    /// The images' patch grids as the layout stated them; empty in a plan built from a call.
+    pub grids: Vec<[u32; 3]>,
     /// Width of one query projection on this rank.
     pub query: u32,
     /// Width of one key/value projection on this rank.
@@ -98,26 +109,28 @@ impl Plan {
         grids: &[[u32; 3]],
     ) -> Result<Self> {
         let rank = Rank::new(config, partition)?;
-        let mut images = Vec::with_capacity(grids.len());
-        let mut merged = 0_u32;
-        for &grid in grids {
-            let geometry = Geometry::of(&config.vision, grid)?;
-            merged = merged.checked_add(geometry.merged).ok_or_else(|| {
-                Error::config(format!(
-                    "the request's images merge to more than {merged} vision rows"
-                ))
-            })?;
-            images.push(geometry.patches);
-        }
         if tokens == 0 {
             return Err(Error::config(
                 "a prompt of no tokens has nothing to encode".to_owned(),
             ));
         }
+        let mut images = Vec::with_capacity(grids.len());
+        let mut time = Vec::with_capacity(grids.len());
+        let mut merged = 0_u32;
+        for &grid in grids {
+            let geometry = Geometry::of(&config.vision, grid)?;
+            merged = merged
+                .checked_add(geometry.merged)
+                .ok_or_else(|| Error::config("the images merge to more than a u32 of rows".to_owned()))?;
+            images.push(geometry.patches);
+            time.push(geometry.time);
+        }
         Ok(Self {
-            tokens,
+            rows: tokens,
             merged,
             images,
+            time,
+            grids: grids.to_vec(),
             query: rank.query,
             key_value: rank.key_value,
             intermediate: rank.intermediate,
@@ -128,12 +141,45 @@ impl Plan {
     }
 
     /// The plan of a text-only prompt of `tokens` rows.
-    pub fn of_text(
+    pub fn of_text(config: &TextEncoderConfig, partition: &Partition, tokens: u32) -> Result<Self> {
+        Self::new(config, partition, tokens, &[])
+    }
+
+    /// The plan of the layout an executor prepared.
+    ///
+    /// A layout that reserves more output rows than the prompt presents is refused: the batch's
+    /// query offsets describe exactly the presented rows, and nothing masks a pad row.
+    pub fn of_layout(
         config: &TextEncoderConfig,
         partition: &Partition,
-        tokens: u32,
+        layout: &EncoderLayout,
     ) -> Result<Self> {
-        Self::new(config, partition, tokens, &[])
+        let grids = layout
+            .images
+            .iter()
+            .map(|image| image.grid)
+            .collect::<Vec<_>>();
+        let plan = Self::new(config, partition, layout.tokens, &grids)?;
+        if layout.rows != plan.rows {
+            return Err(Error::config(format!(
+                "the layout reserves {} output rows for a {} token prompt",
+                layout.rows, plan.rows
+            )));
+        }
+        Ok(plan)
+    }
+
+    /// The layout this plan describes, as the executor keys its state by.
+    pub fn layout(&self) -> EncoderLayout {
+        EncoderLayout {
+            rows: self.rows,
+            tokens: self.rows,
+            images: self
+                .grids
+                .iter()
+                .map(|grid| ImageShape { grid: *grid })
+                .collect(),
+        }
     }
 
     /// The bytes one encode call of this plan reserves in the arena.
@@ -262,7 +308,7 @@ struct Buffers {
 impl Buffers {
     /// Reserve the prompt's buffers; the tower's per-image buffers follow in the same arena.
     fn new(arena: &Arena, plan: &Plan, dtype: nn::DType) -> Result<Self> {
-        let tokens = u64::from(plan.tokens);
+        let tokens = u64::from(plan.rows);
         let hidden = u64::from(plan.hidden);
         let query = u64::from(plan.query);
         let key_value = u64::from(plan.key_value);
@@ -322,6 +368,15 @@ impl Buffers {
             u64::from(heads),
             u64::from(head_dim),
         ])))
+    }
+
+    /// The `count` elements of a one-dimensional view starting at `first`.
+    fn span_of(view: TensorView, first: u64, count: u64) -> TensorView {
+        TensorView::new(
+            view.offset_elements(first),
+            view.dtype,
+            Shape::new(&[count]),
+        )
     }
 
     /// The `count` rows of `view` starting at `first`, as a contiguous `[count, columns]` view.
@@ -523,8 +578,8 @@ impl Layer {
                 f,
                 buffers.as_heads(buffers.query, heads.0, encoder.config.head_dim)?,
                 buffers.as_heads(buffers.key, heads.1, encoder.config.head_dim)?,
-                self.query_norm.view(),
-                self.key_norm.view(),
+                Some(self.query_norm.view()),
+                Some(self.key_norm.view()),
                 cosine,
                 sine,
                 buffers.as_heads(buffers.rotated_query, heads.0, encoder.config.head_dim)?,
@@ -537,8 +592,8 @@ impl Layer {
                 buffers.as_heads(buffers.rotated_query, heads.0, encoder.config.head_dim)?,
                 buffers.as_heads(buffers.rotated_key, heads.1, encoder.config.head_dim)?,
                 buffers.as_heads(buffers.value, heads.1, encoder.config.head_dim)?,
-                offsets,
-                offsets,
+                Some(offsets),
+                Some(offsets),
                 buffers.as_heads(buffers.attended, heads.0, encoder.config.head_dim)?,
             )
             .map_err(Error::from)?;
@@ -710,6 +765,176 @@ impl TextEncoder {
         Plan::new(&self.config, &self.partition, tokens, grids)
     }
 
+    /// The table names and shapes a layout needs, in the order [`TextEncoder::prepare_state`] fills
+    /// them.
+    ///
+    /// Two tables follow the *prompt* - its M-RoPE positions and the prompt rows its vision rows
+    /// land on - so their bytes change with every request; the five vision tables follow the
+    /// *layout* alone, so an executor uploads them once per bucket. A layout with no images needs
+    /// the two prompt tables only.
+    fn tables(&self, plan: &Plan, rows: u32) -> Vec<StateTable> {
+        table_specs(&self.config, rows, &plan.images, &plan.time, plan.merged)
+    }
+
+    /// Write the host bytes of every table of `layout`, in [`TextEncoder::tables`]' order.
+    ///
+    /// The arithmetic is the reference's request arithmetic, evaluated in FP32 on the host
+    /// (`positions::*`): a captured call reads only the device copies. Nothing here allocates or
+    /// touches the device.
+    fn state_bytes(
+        &self,
+        prompt: &EncoderPrompt<'_>,
+        layout: &EncoderLayout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()> {
+        let plan = Plan::of_layout(&self.config, &self.partition, layout)?;
+        let tables = self.tables(&plan, layout.rows);
+        if out.len() != tables.len() {
+            return Err(Error::config(format!(
+                "{} buffers for {} tables",
+                out.len(),
+                tables.len()
+            )));
+        }
+        let vision = &self.config.vision;
+        let merge = vision.spatial_merge_size;
+        let tokens = plan.rows as usize;
+        if prompt.ids.len() != tokens {
+            return Err(Error::config(format!(
+                "{} token ids for a {tokens} token prompt",
+                prompt.ids.len()
+            )));
+        }
+
+        // A vision grid reaches `rope_index` in the shape the prompt presents it: an image block is
+        // one run of `time · rows · columns` placeholders with its whole grid, a video block is one
+        // run per temporal patch, each of `rows · columns` placeholders on a single time step
+        // (`uniserve/models/qwen3_vl/positions.py:31-52`).
+        let (image_grids, video_grids) = run_grids(
+            prompt.ids,
+            &plan.grids,
+            self.config.image_token_id,
+            self.config.video_token_id,
+            merge,
+        )?;
+        let coordinates = positions::rope_index(
+            prompt.ids,
+            &image_grids,
+            &video_grids,
+            self.config.image_token_id,
+            self.config.video_token_id,
+            merge,
+        )?;
+        // `[tokens][3]` to the operator's `[axes, tokens]`.
+        let axes = self.config.mrope_sections.len();
+        let mut positions = vec![0_i32; axes * tokens];
+        for (token, coordinate) in coordinates.iter().enumerate() {
+            for axis in 0..axes {
+                positions[axis * tokens + token] = i32::try_from(coordinate[axis]).map_err(|_| {
+                    Error::config("an M-RoPE coordinate wider than an i32".to_owned())
+                })?;
+            }
+        }
+        write_i32(&mut out[0], &positions, "prompt_positions")?;
+
+        let destinations = positions::vision_destinations(
+            prompt.ids,
+            self.config.image_token_id,
+            self.config.video_token_id,
+        );
+        if destinations.len() != plan.merged as usize {
+            return Err(Error::config(format!(
+                "{} placeholders for {} merged vision rows",
+                destinations.len(),
+                plan.merged
+            )));
+        }
+        write_i32(&mut out[1], &destinations, "vision_destinations")?;
+        if plan.images.is_empty() {
+            return Ok(());
+        }
+
+        let side = Geometry::position_grid(vision)?;
+        let head_dim = Geometry::head_dim(vision)?;
+        let rotary = positions::VisionRotary::new(head_dim)?;
+        let frequencies = positions::inverse_frequencies(head_dim / 2, ROPE_THETA)?;
+        let mut index = Vec::new();
+        let mut weight = Vec::new();
+        let mut cosine = Vec::new();
+        let mut sine = Vec::new();
+        let mut lengths = Vec::new();
+        for (grid, patches) in plan.grids.iter().zip(&plan.images) {
+            let [time, height, width] = *grid;
+            let (step_index, step_weight) = positions::position_samples(side, height, width, merge)?;
+            let step_coordinates = positions::rotary_coordinates(height, width, merge)?;
+            let columns = (head_dim / 2) as usize;
+            for _ in 0..time {
+                index.extend(step_index.iter().flatten().copied());
+                weight.extend(step_weight.iter().flatten().copied());
+                let mut step_cosine = vec![0.0_f32; step_coordinates.len() * columns];
+                let mut step_sine = vec![0.0_f32; step_coordinates.len() * columns];
+                rotary
+                    .factors(
+                        &step_coordinates,
+                        &frequencies,
+                        &mut step_cosine,
+                        &mut step_sine,
+                    )
+                    .map_err(|error| {
+                        Error::config(format!("the rotary factors of {grid:?}: {error}"))
+                    })?;
+                cosine.extend_from_slice(&step_cosine);
+                sine.extend_from_slice(&step_sine);
+            }
+            lengths.extend_from_slice(&positions::vision_lengths(time, height, width)?);
+            let expected = *patches as usize;
+            if index.len() != expected * positions::POSITION_TAPS as usize
+                || weight.len() != expected * positions::POSITION_TAPS as usize
+                || cosine.len() != expected * columns
+            {
+                return Err(Error::config(format!(
+                    "the tables of {grid:?} cover {} patches, {expected} expected",
+                    cosine.len() / columns
+                )));
+            }
+        }
+        write_i32(&mut out[2], &index, "vision_position_index")?;
+        write_f32(&mut out[3], &weight, "vision_position_weight")?;
+        write_f32(&mut out[4], &cosine, "vision_cosine")?;
+        write_f32(&mut out[5], &sine, "vision_sine")?;
+        write_i32(&mut out[6], &lengths, "vision_lengths")
+    }
+
+    /// The encoder's tables read the way a call reads them.
+    fn prepared<'a>(&self, inputs: &EncoderInputs<'a>, plan: &Plan) -> Result<Prepared<'a>> {
+        let tables = self.tables(plan, plan.rows);
+        let state = inputs.state;
+        if state.len() != tables.len() {
+            return Err(invalid_input(format!(
+                "{} state tables for a layout of {}",
+                state.len(),
+                tables.len()
+            )));
+        }
+        for (view, table) in state.iter().zip(&tables) {
+            if view.dtype != table.dtype || view.shape != table.shape {
+                return Err(invalid_input(format!(
+                    "the {} table is {:?} {:?}, {:?} {:?} expected",
+                    table.name,
+                    view.dtype,
+                    view.shape.dims(),
+                    table.dtype,
+                    table.shape.dims()
+                )));
+            }
+        }
+        Ok(Prepared {
+            positions: state[0],
+            destinations: state[1],
+            vision: &state[2..],
+        })
+    }
+
     /// The encoder as the executor sees it: one block under the deployment's component name.
     pub fn into_block(self) -> (BlockName, Block) {
         (
@@ -733,17 +958,38 @@ impl TextEncoder {
         group.all_reduce_sum(view, f.stream).map_err(Error::from)
     }
 
-    /// Refuse a call whose tables, rows or outputs do not describe `plan`.
-    fn check(&self, inputs: &EncoderInputs<'_>, out: &EncoderOutputs, plan: &Plan) -> Result<()> {
-        let tokens = u64::from(plan.tokens);
-        let hidden = u64::from(plan.hidden);
-        let axes = u64::from(self.config.mrope_sections.len() as u32);
-        if inputs.ids.numel() != tokens {
+    /// Refuse a call whose batch, layout or outputs do not agree.
+    ///
+    /// The tables are checked against their declared shapes by [`TextEncoder::prepared`]; this
+    /// checks the three host values a captured call is addressed by.
+    fn check(
+        &self,
+        inputs: &EncoderInputs<'_>,
+        out: &EncoderOutputs,
+        plan: &Plan,
+    ) -> Result<()> {
+        let layout = inputs.layout;
+        let tokens = u64::from(plan.rows);
+        if layout.tokens != plan.rows {
             return Err(invalid_input(format!(
-                "{} token ids for a {tokens} row prompt",
-                inputs.ids.numel()
+                "the layout presents {} tokens and the plan {}",
+                layout.tokens, plan.rows
             )));
         }
+        if inputs.batch.num_tokens != plan.rows {
+            return Err(invalid_input(format!(
+                "the batch packs {} tokens and the layout {}",
+                inputs.batch.num_tokens, plan.rows
+            )));
+        }
+        if layout.rows != plan.rows {
+            return Err(invalid_input(format!(
+                "the layout reserves {} output rows for a {} token prompt: an encoder writes one \
+                 row per presented token",
+                layout.rows, plan.rows
+            )));
+        }
+        let hidden = u64::from(plan.hidden);
         if out.hidden.rows() != tokens || out.hidden.last() != hidden {
             return Err(invalid_input(format!(
                 "the output is {} rows of {}, a {tokens} row prompt of {hidden} expected",
@@ -751,28 +997,15 @@ impl TextEncoder {
                 out.hidden.last()
             )));
         }
-        if inputs.tables.positions.numel() != axes * tokens {
+        if inputs.ids.numel() != tokens {
             return Err(invalid_input(format!(
-                "{} position coordinates for {axes} axes of {tokens} tokens",
-                inputs.tables.positions.numel()
-            )));
-        }
-        if inputs.tables.vision_destinations.numel() != u64::from(plan.merged) {
-            return Err(invalid_input(format!(
-                "{} vision destinations for {} merged vision rows",
-                inputs.tables.vision_destinations.numel(),
-                plan.merged
-            )));
-        }
-        if inputs.batch.num_tokens != plan.tokens {
-            return Err(invalid_input(format!(
-                "the batch packs {} tokens and the plan {}",
-                inputs.batch.num_tokens, plan.tokens
+                "{} token ids for a {tokens} row prompt",
+                inputs.ids.numel()
             )));
         }
         if inputs.images.len() != plan.images.len() {
             return Err(invalid_input(format!(
-                "{} images for a plan of {}",
+                "{} images for a layout of {}",
                 inputs.images.len(),
                 plan.images.len()
             )));
@@ -790,14 +1023,16 @@ impl TextEncoder {
         out: EncoderOutputs,
     ) -> Result<()> {
         let grids = inputs
+            .layout
             .images
             .iter()
-            .map(|image| image.grid_shape)
+            .map(|image| image.grid)
             .collect::<Vec<_>>();
-        let plan = self.plan(inputs.batch.num_tokens, &grids)?;
+        let plan = self.plan(inputs.layout.tokens, &grids)?;
         self.check(&inputs, &out, &plan)?;
+        let prepared = self.prepared(&inputs, &plan)?;
 
-        let mut buffers = Buffers::new(f.arena(), &plan, self.dtype)?;
+        let buffers = Buffers::new(f.arena(), &plan, self.dtype)?;
         let hidden = out.hidden;
 
         // The diagnosis of specs/worker.md 10 asks for two values the runner cannot otherwise
@@ -805,6 +1040,7 @@ impl TextEncoder {
         // Both arrive as borrowed views, are used in place of the arena's own buffers, and change
         // no number; a serving call passes none.
         let diagnostics = inputs.diagnostics;
+        let mut buffers = buffers;
         if !diagnostics.is_empty() && diagnostics.len() != 2 {
             return Err(invalid_input(format!(
                 "{} diagnostic views, [vision_hidden, merged] or none expected",
@@ -825,23 +1061,34 @@ impl TextEncoder {
             buffers.features = merged;
         }
 
-        // 1. The vision tower, one call per image, in prompt order: the k-th placeholder of the
-        //    prompt takes the k-th merged row, and an image's placeholders are one run.
+        // 1. The vision tower, one call per image, in prompt order: the k-th merged row of the
+        //    concatenation takes the k-th vision placeholder of the prompt.
         let merged = u64::from(plan.merged);
         let mut offset = 0_u64;
+        let mut patch_offset = 0_u64;
+        let mut length_offset = 0_u64;
         let mut deepstack = Vec::with_capacity(self.deepstack_layers.len());
-        for image in inputs.images {
-            let geometry = Geometry::of(&self.config.vision, image.grid_shape)?;
-            let mut tower = self.tower.buffers(f.arena(), geometry.patches)?;
+        for (index, image) in inputs.images.iter().enumerate() {
+            let patches = plan.images[index];
+            let time = plan.time[index];
+            let tables = [
+                Buffers::rows_of(prepared.vision[0], patch_offset, u64::from(patches)),
+                Buffers::rows_of(prepared.vision[1], patch_offset, u64::from(patches)),
+                Buffers::rows_of(prepared.vision[2], patch_offset, u64::from(patches)),
+                Buffers::rows_of(prepared.vision[3], patch_offset, u64::from(patches)),
+                Buffers::span_of(prepared.vision[4], length_offset, u64::from(time) + 1),
+            ];
+            let image_tables =
+                ImageTables::new(&self.config.vision, image, patches, time, &tables)?;
+            let mut tower = self.tower.buffers(f.arena(), patches)?;
             if let Some(stream) = vision_hidden {
                 tower = tower.with_stream(stream).map_err(|error| {
                     invalid_input(format!(
-                        "the diagnostic stream of the {:?} image: {error}",
-                        image.grid_shape
+                        "the diagnostic stream of the {patches} patch block: {error}"
                     ))
                 })?;
             }
-            let rows = u64::from(geometry.merged);
+            let rows = u64::from(image_tables.geometry.merged);
             for table in 0..self.tower.deepstack_features() {
                 deepstack.push(Buffers::rows_of(
                     buffers.deepstack,
@@ -851,7 +1098,7 @@ impl TextEncoder {
             }
             self.tower.encode(
                 f,
-                image,
+                &image_tables,
                 &tower,
                 Outputs {
                     features: Buffers::rows_of(buffers.features, offset, rows),
@@ -859,6 +1106,8 @@ impl TextEncoder {
                 },
             )?;
             offset += rows;
+            patch_offset += u64::from(patches);
+            length_offset += u64::from(time) + 1;
         }
         debug_assert_eq!(offset, merged);
 
@@ -867,17 +1116,13 @@ impl TextEncoder {
             .forward(f, inputs.ids, hidden)
             .map_err(Error::from)?;
         if !inputs.images.is_empty() {
-            self.rows.replace(
-                f,
-                hidden,
-                buffers.features,
-                inputs.tables.vision_destinations,
-            )?;
+            self.rows
+                .replace(f, hidden, buffers.features, prepared.destinations)?;
         }
 
         // 3. The prompt's M-RoPE factors, once for the whole stack.
         self.rotary
-            .factors(f, inputs.tables.positions, buffers.cosine, buffers.sine)
+            .factors(f, prepared.positions, buffers.cosine, buffers.sine)
             .map_err(Error::from)?;
 
         // 4. The retained layers, with each DeepStack table added after the block it came from.
@@ -903,17 +1148,14 @@ impl TextEncoder {
             {
                 // The reference's cut: the layer's own output joins the stream, then its features,
                 // and the next layer normalizes the stream alone.
-                let rows = u64::from(plan.merged);
                 self.residual
                     .forward(f, hidden, buffers.down)
                     .map_err(Error::from)?;
-                if rows > 0 {
-                    let features = Buffers::rows_of(
-                        buffers.deepstack,
-                        next as u64 * rows,
-                        rows,
-                    );
-                    self.rows.add(f, hidden, features, inputs.tables.vision_destinations)?;
+                if merged > 0 {
+                    let features =
+                        Buffers::rows_of(buffers.deepstack, next as u64 * merged, merged);
+                    self.rows
+                        .add(f, hidden, features, prepared.destinations)?;
                 }
                 carried = None;
                 next += 1;
@@ -929,6 +1171,41 @@ impl TextEncoder {
 }
 
 impl Encoder for TextEncoder {
+    /// The layout of a batch and its images.
+    ///
+    /// The encoder writes one row per presented token, so the row capacity is the batch's; a grid
+    /// that cannot be served is refused where a failure can be reported - [`Encoder::prepare_state`]
+    /// and [`Encoder::encode`] - because this method answers with the layout alone.
+    fn prepare_layout(&self, batch: &nn::capability::TokenBatch, images: &[ImageShape]) -> EncoderLayout {
+        EncoderLayout {
+            rows: batch.num_tokens,
+            tokens: batch.num_tokens,
+            images: images.to_vec(),
+        }
+    }
+
+    fn state_tables(&self, layout: &EncoderLayout) -> Vec<StateTable> {
+        match Plan::of_layout(&self.config, &self.partition, layout) {
+            Ok(plan) => self.tables(&plan, layout.rows),
+            // A layout the model cannot serve still needs its table list answered; the shapes are
+            // arithmetic on the grids, and `prepare_state` refuses the layout itself.
+            Err(_) => {
+                let merge = self.config.vision.spatial_merge_size;
+                let (patches, time, merged) = layout_counts(layout, merge);
+                table_specs(&self.config, layout.rows, &patches, &time, merged)
+            }
+        }
+    }
+
+    fn prepare_state(
+        &self,
+        prompt: &EncoderPrompt<'_>,
+        layout: &EncoderLayout,
+        out: &mut [Vec<u8>],
+    ) -> nn::Result<()> {
+        self.state_bytes(prompt, layout, out).map_err(capability)
+    }
+
     fn encode(
         &self,
         f: &Forward,
@@ -937,6 +1214,216 @@ impl Encoder for TextEncoder {
     ) -> nn::Result<()> {
         self.encode_prompt(f, inputs, out).map_err(capability)
     }
+}
+
+/// The tables a call reads, in the order [`TextEncoder::tables`] declares them.
+struct Prepared<'a> {
+    /// `[axes, tokens]` I32: the prompt's M-RoPE coordinates.
+    positions: TensorView,
+    /// `[merged]` I32: the prompt row of every merged vision row, in prompt order.
+    destinations: TensorView,
+    /// The five vision tables, concatenated over the prompt's images in order.
+    vision: &'a [TensorView],
+}
+
+/// The five vision tables' names and shapes for a concatenation of `patches` patch rows over
+/// `time` time steps.
+///
+/// Total in its arguments: the shapes are arithmetic on the row counts, so an executor can ask for
+/// them before it knows whether the layout can be served.
+fn table_specs(
+    config: &TextEncoderConfig,
+    rows: u32,
+    patches: &[u32],
+    time: &[u32],
+    merged: u32,
+) -> Vec<StateTable> {
+    let tokens = u64::from(rows);
+    let patch_rows: u64 = patches.iter().map(|patches| u64::from(*patches)).sum();
+    let steps: u64 = time.iter().map(|time| u64::from(*time) + 1).sum();
+    let columns = u64::from(config.head_dim / 2);
+    let table = |name: &'static str, dtype: nn::DType, shape: Shape| StateTable {
+        name,
+        dtype,
+        shape,
+    };
+    let mut tables = vec![
+        table(
+            "prompt_positions",
+            nn::DType::I32,
+            Shape::new(&[u64::from(config.mrope_sections.len() as u32), tokens]),
+        ),
+        table(
+            "vision_destinations",
+            nn::DType::I32,
+            Shape::new(&[u64::from(merged)]),
+        ),
+    ];
+    if !patches.is_empty() {
+        tables.push(table(
+            "vision_position_index",
+            nn::DType::I32,
+            Shape::new(&[patch_rows, positions::POSITION_TAPS]),
+        ));
+        tables.push(table(
+            "vision_position_weight",
+            nn::DType::F32,
+            Shape::new(&[patch_rows, positions::POSITION_TAPS]),
+        ));
+        tables.push(table(
+            "vision_cosine",
+            nn::DType::F32,
+            Shape::new(&[patch_rows, columns]),
+        ));
+        tables.push(table(
+            "vision_sine",
+            nn::DType::F32,
+            Shape::new(&[patch_rows, columns]),
+        ));
+        tables.push(table(
+            "vision_lengths",
+            nn::DType::I32,
+            Shape::new(&[steps]),
+        ));
+    }
+    tables
+}
+
+/// The patch rows, time steps and merged rows a layout states, by plain arithmetic.
+///
+/// Used where a failure cannot be reported (a table list) so that the caller still learns the
+/// shapes; [`Plan::of_layout`] is what refuses a grid that cannot be served.
+fn layout_counts(layout: &EncoderLayout, merge: u32) -> (Vec<u32>, Vec<u32>, u32) {
+    let mut patches = Vec::with_capacity(layout.images.len());
+    let mut time = Vec::with_capacity(layout.images.len());
+    let mut merged = 0_u32;
+    for image in &layout.images {
+        let [steps, height, width] = image.grid;
+        let rows = steps.saturating_mul(height).saturating_mul(width);
+        let blocks = (height / merge.max(1))
+            .saturating_mul(width / merge.max(1))
+            .max(1);
+        patches.push(rows);
+        time.push(steps);
+        merged = merged.saturating_add(steps.saturating_mul(blocks));
+    }
+    (patches, time, merged)
+}
+
+/// The two grid lists [`positions::rope_index`] reads, one entry per vision placeholder run.
+///
+/// A vision grid reaches `rope_index` in the shape the prompt presents it
+/// (`uniserve/models/qwen3_vl/positions.py:31-52`): an image block is one run of
+/// `time · rows · columns` placeholders under its whole grid, a video block is one run per temporal
+/// patch, each of `rows · columns` placeholders on a single time step. The run lengths are what
+/// tells the two apart, and the grids arrive in the prompt's block order.
+fn run_grids(
+    ids: &[u32],
+    grids: &[[u32; 3]],
+    image_token_id: u32,
+    video_token_id: u32,
+    merge: u32,
+) -> Result<(Vec<[u32; 3]>, Vec<[u32; 3]>)> {
+    if merge == 0 {
+        return Err(Error::config("the merge side must be positive".to_owned()));
+    }
+    // The prompt's vision runs, in order: which placeholder they hold and how many.
+    let mut runs: Vec<(u32, u64)> = Vec::new();
+    let mut row = 0;
+    while row < ids.len() {
+        let id = ids[row];
+        if id != image_token_id && id != video_token_id {
+            row += 1;
+            continue;
+        }
+        let start = row;
+        while row < ids.len() && ids[row] == id {
+            row += 1;
+        }
+        runs.push((id, (row - start) as u64));
+    }
+
+    let mut images = Vec::with_capacity(grids.len());
+    let mut videos = Vec::new();
+    let mut next = 0_usize;
+    for &grid in grids {
+        let [time, height, width] = grid;
+        if height % merge != 0 || width % merge != 0 {
+            return Err(Error::config(format!(
+                "the vision grid {grid:?} does not hold whole {merge}x{merge} merge blocks"
+            )));
+        }
+        let step = u64::from(height / merge) * u64::from(width / merge);
+        let Some(&(id, run)) = runs.get(next) else {
+            return Err(Error::config(format!(
+                "the vision grid {grid:?} has no placeholder run"
+            )));
+        };
+        if id == image_token_id {
+            if run != step * u64::from(time) {
+                return Err(Error::config(format!(
+                    "an image run of {run} placeholders for a {grid:?} grid of {}",
+                    step * u64::from(time)
+                )));
+            }
+            images.push(grid);
+            next += 1;
+            continue;
+        }
+        for _ in 0..time {
+            let Some(&(id, run)) = runs.get(next) else {
+                return Err(Error::config(format!(
+                    "the video grid {grid:?} has fewer than {time} placeholder runs"
+                )));
+            };
+            if id != video_token_id || run != step {
+                return Err(Error::config(format!(
+                    "a video run of {run} placeholders of type {id} for one {height}x{width} \
+                     time step of {step}"
+                )));
+            }
+            videos.push([1, height, width]);
+            next += 1;
+        }
+    }
+    if next != runs.len() {
+        return Err(Error::config(format!(
+            "{} vision placeholder runs for {} grids",
+            runs.len() - next,
+            grids.len()
+        )));
+    }
+    Ok((images, videos))
+}
+
+/// Write `values` into `buffer` as little-endian up to its stated length.
+fn write_i32(buffer: &mut [u8], values: &[i32], name: &'static str) -> Result<()> {
+    let bytes = values.len() * 4;
+    if buffer.len() != bytes {
+        return Err(Error::config(format!(
+            "the {name} table holds {} bytes for {bytes}",
+            buffer.len()
+        )));
+    }
+    for (chunk, value) in buffer.chunks_exact_mut(4).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Write `values` into `buffer` as little-endian FP32 up to its stated length.
+fn write_f32(buffer: &mut [u8], values: &[f32], name: &'static str) -> Result<()> {
+    let bytes = values.len() * 4;
+    if buffer.len() != bytes {
+        return Err(Error::config(format!(
+            "the {name} table holds {} bytes for {bytes}",
+            buffer.len()
+        )));
+    }
+    for (chunk, value) in buffer.chunks_exact_mut(4).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// The capability boundary's view of this crate's failures: an `nn` failure is already one, and
@@ -1110,7 +1597,7 @@ mod tests {
             &[[1, 24, 24], [4, 16, 16]],
         )
         .expect("a prompt with two images");
-        assert_eq!(plan.tokens, 4096);
+        assert_eq!(plan.rows, 4096);
         assert_eq!(plan.images, [576, 1024]);
         assert_eq!(plan.merged, 144 + 256);
         assert_eq!(plan.deepstack, 3);
@@ -1124,7 +1611,7 @@ mod tests {
         let plan = Plan::of_text(&config, &Partition::single(), 128).expect("one prompt");
         assert!(plan.images.is_empty());
         assert_eq!(plan.merged, 0);
-        assert_eq!(plan.tokens, 128);
+        assert_eq!(plan.rows, 128);
     }
 
     #[test]

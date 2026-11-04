@@ -69,15 +69,16 @@ pub const ROPE_THETA: f32 = 10_000.0;
 /// The checkpoint's tensor names under the text encoder's component.
 const PREFIX: &str = "model.visual";
 
-/// One image block's patch grid and the row counts its forward covers.
+/// One image block's row counts, as its forward and its tables see them.
+///
+/// The grid's two spatial extents are a host fact of the *request*: they are known when the tables
+/// are prepared (`Geometry::of`) and are carried by the tables themselves at call time, because a
+/// model may not read `ImageInput.grid` back and a descriptor that only counts points does not need
+/// them (`Geometry::of_counts`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Geometry {
     /// Temporal patches of the block: one for a still image.
     pub time: u32,
-    /// Patch rows per time step.
-    pub height: u32,
-    /// Patch columns per time step.
-    pub width: u32,
     /// Patch rows the block holds: `time * height * width`.
     pub patches: u32,
     /// Merged rows the block produces: `patches / merge²`, one language-width token each.
@@ -90,9 +91,9 @@ impl Geometry {
     /// The geometry of the grid `(time, height, width)` in patches.
     ///
     /// The grid is refused when a side is not a whole number of merge blocks (every merged token
-    /// reads whole `merge x merge` blocks of patches) or when one time step holds more patches than
-    /// the learned position table has entries: the table is the deployment's declared bound on an
-    /// image's grid, and the attention descriptor's key bound follows it.
+    /// reads whole `merge x merge` blocks of patches). Nothing else bounds it here: the learned
+    /// position table is resampled to the grid, and the tower's attention descriptor takes each
+    /// time step's own `height · width` as its key bound.
     pub fn of(config: &VisionConfig, grid: [u32; 3]) -> Result<Self> {
         let [time, height, width] = grid;
         let merge = config.spatial_merge_size;
@@ -108,18 +109,11 @@ impl Geometry {
                 format!("the grid {height}x{width} is not whole {merge}x{merge} merge blocks"),
             ));
         }
+        // The learned table bounds nothing: it is resampled to whatever grid an image has
+        // (`PositionEmbedding.interpolate`), and the processor's own pixel cap is far above the
+        // table's entry count - H3's 768x1280 keyframe is 48x80 patches against a 48x48 table.
         let patches = u64::from(time) * u64::from(height) * u64::from(width);
         let sequence = u64::from(height) * u64::from(width);
-        let bound = u64::from(config.num_position_embeddings);
-        if sequence > bound {
-            return Err(invalid(
-                "VisionTower",
-                format!(
-                    "one time step of the grid {height}x{width} holds {sequence} patches and the \
-                     learned position table has {bound} entries"
-                ),
-            ));
-        }
         let patches = u32::try_from(patches).map_err(|_| {
             invalid(
                 "VisionTower",
@@ -130,8 +124,40 @@ impl Geometry {
             .map_err(|_| invalid("VisionTower", "an attention sequence longer than a u32"))?;
         Ok(Self {
             time,
-            height,
-            width,
+            patches,
+            merged: patches / (merge * merge),
+            sequence,
+        })
+    }
+
+    /// The geometry a call's tables describe: `patches` rows of one time step each, over `time`
+    /// time steps.
+    ///
+    /// The tables are what a captured call has; their row counts fix `patches` (`cosine`'s rows)
+    /// and `time` (`lengths`'). The spatial split is not needed: every table already holds the grid.
+    pub fn of_counts(config: &VisionConfig, patches: u32, time: u32) -> Result<Self> {
+        let merge = config.spatial_merge_size;
+        if time == 0 || patches == 0 {
+            return Err(invalid(
+                "VisionTower",
+                format!("a block of {patches} patches over {time} time steps"),
+            ));
+        }
+        if !patches.is_multiple_of(time) {
+            return Err(invalid(
+                "VisionTower",
+                format!("{patches} patches do not spread over {time} time steps"),
+            ));
+        }
+        let sequence = patches / time;
+        if !sequence.is_multiple_of(merge * merge) {
+            return Err(invalid(
+                "VisionTower",
+                format!("a time step of {sequence} patches is not whole {merge}x{merge} merge blocks"),
+            ));
+        }
+        Ok(Self {
+            time,
             patches,
             merged: patches / (merge * merge),
             sequence,
@@ -245,6 +271,9 @@ pub struct Buffers {
     down: TensorView,
     /// `[merged, merged_width]` a merger's first projection.
     merged: TensorView,
+    /// `[merged, merged_width]` its activation: a merged row is `merge² · hidden` wide, which the
+    /// MLP's `[patches, intermediate]` buffers do not fit.
+    merged_activated: TensorView,
 }
 
 impl Buffers {
@@ -276,6 +305,7 @@ impl Buffers {
             activated: reserve(Shape::new(&[rows, intermediate]))?,
             down: reserve(Shape::new(&[rows, hidden]))?,
             merged: reserve(Shape::new(&[blocks, width]))?,
+            merged_activated: reserve(Shape::new(&[blocks, width]))?,
         })
     }
 
@@ -331,6 +361,65 @@ impl Buffers {
     }
 }
 
+/// The prepared tables of one image block: what the request's grid becomes on the device.
+///
+/// Every value depends only on the block's patch grid, so the runner uploads one set per layout
+/// (`Encoder::state_tables`) and a captured call reads them. The two spatial extents are not among
+/// them: each table already carries the grid, and a model never reads a device view back.
+#[derive(Clone, Copy)]
+pub struct ImageTables {
+    /// `[patches, 4]` I32: the learned table rows each patch blends (`positions::position_samples`).
+    pub position_index: TensorView,
+    /// `[patches, 4]` F32: their bilinear weights.
+    pub position_weight: TensorView,
+    /// `[patches, head_dim / 2]` F32: each patch's 2-D rotary cosine.
+    pub cosine: TensorView,
+    /// `[patches, head_dim / 2]` F32: its sine.
+    pub sine: TensorView,
+    /// `[time + 1]` I32: the attention offsets, one sequence per time step (`positions::vision_lengths`).
+    pub lengths: TensorView,
+    /// The block's row counts, as the tables state them.
+    pub geometry: Geometry,
+    /// The patches the block reads, `[patches, tubelet]`.
+    pub pixels: TensorView,
+    /// The block's grid as the request stated it, `[1, 3]` I32: carried for the shape check only.
+    pub grid: TensorView,
+}
+
+impl ImageTables {
+    /// The tables of `image`, whose row counts are `patches` over `time` time steps.
+    ///
+    /// The caller states the counts because a table's *shape* is a host value it already holds
+    /// (`EncoderLayout`); the model checks that every table agrees with them.
+    pub fn new(
+        config: &VisionConfig,
+        image: &ImageInput,
+        patches: u32,
+        time: u32,
+        tables: &[TensorView],
+    ) -> Result<Self> {
+        let [position_index, position_weight, cosine, sine, lengths] = tables else {
+            return Err(invalid(
+                "VisionTower",
+                format!(
+                    "{} prepared tables for one image, five expected",
+                    tables.len()
+                ),
+            ));
+        };
+        Ok(Self {
+            position_index: *position_index,
+            position_weight: *position_weight,
+            cosine: *cosine,
+            sine: *sine,
+            lengths: *lengths,
+            geometry: Geometry::of_counts(config, patches, time)?,
+            pixels: image.pixels,
+            grid: image.grid,
+        })
+    }
+}
+
 /// Where one image block's features go.
 pub struct Outputs<'a> {
     /// `[merged, out_hidden]`: the merger's language-width tokens.
@@ -373,7 +462,8 @@ impl Block {
         &self,
         tower: &VisionTower,
         f: &Forward,
-        image: &ImageInput,
+        image: &ImageTables,
+        attention: &Attention,
         buffers: &Buffers,
     ) -> Result<()> {
         let heads = tower.config.num_heads;
@@ -407,13 +497,13 @@ impl Block {
             )?;
         }
 
-        tower.attention.attend_dense(
+        attention.attend_dense(
             f,
             buffers.as_heads(buffers.rotated_query, heads, head_dim)?,
             buffers.as_heads(buffers.rotated_key, heads, head_dim)?,
             buffers.as_heads(buffers.value, heads, head_dim)?,
-            image.lengths,
-            image.lengths,
+            Some(image.lengths),
+            Some(image.lengths),
             buffers.as_heads(buffers.attended, heads, head_dim)?,
         )?;
         self.output
@@ -539,11 +629,13 @@ impl Merger {
                 buffers.merged.reshape(merged),
             )
             .map_err(Error::from)?;
-        tower
-            .merger_gelu
-            .forward(f, buffers.merged.reshape(merged), buffers.gate.reshape(merged))?;
+        tower.merger_gelu.forward(
+            f,
+            buffers.merged.reshape(merged),
+            buffers.merged_activated.reshape(merged),
+        )?;
         self.second
-            .forward(f, buffers.gate.reshape(merged), out)
+            .forward(f, buffers.merged_activated.reshape(merged), out)
             .map_err(Error::from)
     }
 }
@@ -556,7 +648,9 @@ pub struct VisionTower {
     position: Weight,
     /// The learned table's side and the side it is resampled from: one square grid.
     position_grid: u32,
-    attention: Attention,
+    /// The query/key geometry of one dense bidirectional call; its key bound is the grid's.
+    heads: u32,
+    head_dim: u32,
     rotate: Rotate,
     layers: Vec<Block>,
     /// The layers whose hidden state a DeepStack merger reads, in checkpoint order.
@@ -597,23 +691,17 @@ impl VisionTower {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        // The position table's entries bound one time step's patch count, and with it the keys the
-        // tower's one dense attention call reads. The bound is a descriptor value of the
-        // deployment (specs/worker.md 9), so it is fixed here and not per call.
-        let bound = config.num_position_embeddings;
-        let attention =
-            Attention::dense(head_dim, heads, heads, bound, false, None, (head_dim as f32).sqrt().recip())
-                .map_err(Error::from)?;
         Ok(Self {
             deepstack_layers: deepstack_layers(config)?,
             patch: projection(loader, &format!("{PREFIX}.patch_embed.proj"), hidden, tubelet)?,
             position: region(
                 loader,
                 &format!("{PREFIX}.pos_embed.weight"),
-                Shape::new(&[u64::from(bound), hidden]),
+                Shape::new(&[u64::from(config.num_position_embeddings), hidden]),
             )?,
             position_grid,
-            attention,
+            heads,
+            head_dim,
             rotate: Rotate::new(head_dim, heads, Rotation::Half).map_err(Error::from)?,
             layers,
             merger: Merger::load(loader, &format!("{PREFIX}.merger"), config, false)?,
@@ -662,17 +750,19 @@ impl VisionTower {
 
     /// Encode one image block's patches into `out`.
     ///
-    /// `image` carries the patches and the four prepared tables of its grid; `out` receives tokens
+    /// `image` carries the patches and the five prepared tables of its grid; `out` receives tokens
     /// of the language model's width, `merge²` patches each: the tower's own features and one table
-    /// per DeepStack block. One call per block, in prompt order.
+    /// per DeepStack block. One call per block, in prompt order (`uniserve/models/qwen3_vl/vision.py`
+    /// runs one call over the concatenation of every block; the rows of one block never meet another
+    /// block's, so a call per block is the same arithmetic row by row).
     pub fn encode(
         &self,
         f: &Forward,
-        image: &ImageInput,
+        image: &ImageTables,
         buffers: &Buffers,
         out: Outputs<'_>,
     ) -> Result<()> {
-        let geometry = Geometry::of(&self.config, image.grid_shape)?;
+        let geometry = image.geometry;
         if out.deepstack.len() != self.deepstack.len() {
             return Err(invalid(
                 "VisionTower",
@@ -690,14 +780,16 @@ impl VisionTower {
         self.patch
             .forward(f, image.pixels, buffers.hidden)
             .map_err(Error::from)?;
-        // The resample's descriptor names both grids, so the layer is built for the image's own
-        // (rectangular) patch grid; the taps and weights are the request's tables.
+        // The resample reads the request's own tables and only counts output points, so the
+        // descriptor names the learned side and the point count. The block's two spatial extents
+        // exist on the host (`positions::position_samples`) and nowhere in a captured call: a model
+        // may not read the grid tensor back.
         PositionInterpolate::new(
             self.dtype,
             u64::from(self.config.hidden_size),
             self.position_grid,
-            geometry.height,
-            geometry.width,
+            geometry.patches,
+            1,
         )
         .map_err(Error::from)?
         .forward(
@@ -712,9 +804,23 @@ impl VisionTower {
             .forward(f, buffers.hidden, buffers.normalized)
             .map_err(Error::from)?;
 
+        // One bidirectional call per time step of this grid: the descriptor's key bound is the
+        // grid's own `height · width` (the reference's attention declares none), and its scale the
+        // head's `head_dim^-0.5` (`uniserve/nn/attention/layer.py:90`).
+        let attention = Attention::dense(
+            self.head_dim,
+            self.heads,
+            self.heads,
+            geometry.sequence,
+            false,
+            None,
+            (self.head_dim as f32).sqrt().recip(),
+        )
+        .map_err(Error::from)?;
+
         let mut next = 0;
         for (index, block) in self.layers.iter().enumerate() {
-            block.forward(self, f, image, buffers)?;
+            block.forward(self, f, image, &attention, buffers)?;
             if self
                 .deepstack_layers
                 .get(next)
@@ -728,10 +834,10 @@ impl VisionTower {
             .forward(self, f, buffers.hidden, buffers, out.features)
     }
 
-    /// Refuse a block whose prepared tables, buffers or outputs do not describe its grid.
+    /// Refuse a block whose prepared tables, buffers or outputs do not describe its row counts.
     fn check(
         &self,
-        image: &ImageInput,
+        image: &ImageTables,
         geometry: &Geometry,
         buffers: &Buffers,
         out: &Outputs<'_>,
@@ -757,9 +863,11 @@ impl VisionTower {
                 return Err(invalid(
                     "VisionTower",
                     format!(
-                        "the {name} table is {:?} for a {:?} block, {shape:?} expected",
+                        "the {name} table is {:?} for a {}-patch block over {} time steps, \
+                         {shape:?} expected",
                         view.shape.dims(),
-                        image.grid_shape
+                        geometry.patches,
+                        geometry.time
                     ),
                 ));
             }
@@ -769,10 +877,10 @@ impl VisionTower {
                 return Err(invalid(
                     "VisionTower",
                     format!(
-                        "a DeepStack output is {:?} for a {:?} block, [{merged}, {out_hidden}] \
+                        "a DeepStack output is {:?} for a {}-patch block, [{merged}, {out_hidden}] \
                          expected",
                         deepstack.shape.dims(),
-                        image.grid_shape
+                        geometry.patches
                     ),
                 ));
             }
@@ -802,13 +910,13 @@ impl VisionTower {
             return Err(invalid(
                 "VisionTower",
                 format!(
-                    "the block's buffers hold {} rows of {} and {} merged rows of {}, the {:?} \
-                     grid needs {patches}, {hidden}, {merged} and {width}",
+                    "the block's buffers hold {} rows of {} and {} merged rows of {}, a {} row \
+                     block needs {patches}, {hidden}, {merged} and {width}",
                     buffers.hidden.rows(),
                     buffers.hidden.last(),
                     buffers.merged.rows(),
                     buffers.merged.last(),
-                    image.grid_shape
+                    geometry.patches
                 ),
             ));
         }
@@ -959,11 +1067,31 @@ mod tests {
     }
 
     #[test]
-    fn a_time_step_larger_than_the_position_table_is_refused() {
+    fn a_calls_geometry_follows_the_tables_row_counts() {
         let config = config();
-        // 48 x 48 is the table's own grid; 50 x 50 patches have no entry for every row.
+        // The tables state a block's patch rows and its time steps; the grid's split is a host fact
+        // the tables already carry.
+        let of_grid = Geometry::of(&config, [4, 16, 24]).expect("four steps of 16x24");
+        let of_counts =
+            Geometry::of_counts(&config, of_grid.patches, of_grid.time).expect("the same block");
+        assert_eq!(of_counts, of_grid);
+        assert!(Geometry::of_counts(&config, 1000, 3).is_err());
+        assert!(Geometry::of_counts(&config, 0, 1).is_err());
+        // A time step of six patches is not whole 2x2 merge blocks.
+        assert!(Geometry::of_counts(&config, 6, 1).is_err());
+    }
+
+    #[test]
+    fn a_grid_larger_than_the_position_table_is_resampled_not_refused() {
+        let config = config();
+        // The table is 48 x 48 entries; H3's own 768x1280 keyframe is 48 x 80 patches, and the
+        // processor's pixel cap allows far more, so the grid is never bounded by the table.
         assert!(Geometry::of(&config, [1, 48, 48]).is_ok());
-        assert!(Geometry::of(&config, [1, 50, 50]).is_err());
+        let keyframe = Geometry::of(&config, [1, 48, 80]).expect("a 768x1280 keyframe");
+        assert_eq!(keyframe.patches, 3840);
+        assert_eq!(keyframe.merged, 960);
+        assert_eq!(keyframe.sequence, 3840);
+        assert!(Geometry::of(&config, [1, 256, 256]).is_ok());
     }
 
     #[test]
