@@ -70,8 +70,8 @@ use std::fmt;
 
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::{self, DevicePtr, Stream};
-use crate::tensor::{DType, Shape, TensorView};
+use crate::platform::{self, Stream};
+use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 

@@ -30,8 +30,8 @@ use std::fmt;
 
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::{self, DevicePtr, Stream};
-use crate::tensor::{DType, Shape, TensorView};
+use crate::platform::{self, Stream};
+use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -125,22 +125,22 @@ impl Op for TopkSoftmax {
         let tokens = args.scores.rows();
 
         if !matches!(descriptor.scores, DType::F32 | DType::BF16 | DType::F16) {
-            return Err(Error::unsupported(
-                Self::NAME,
-                format!("scores of {} are not routeable", descriptor.scores),
-            ));
+            return Err(Error::Unsupported {
+                operator: Self::NAME,
+                problem: format!("scores of {} are not routeable", descriptor.scores),
+            });
         }
         if descriptor.experts == 0 || descriptor.experts > MAX_EXPERTS {
-            return Err(Error::unsupported(
-                Self::NAME,
-                format!("{} experts are outside 1..={MAX_EXPERTS}", descriptor.experts),
-            ));
+            return Err(Error::Unsupported {
+                operator: Self::NAME,
+                problem: format!("{} experts are outside 1..={MAX_EXPERTS}", descriptor.experts),
+            });
         }
         if descriptor.top == 0 || descriptor.top > MAX_TOP || u64::from(descriptor.top) > experts {
-            return Err(Error::unsupported(
-                Self::NAME,
-                format!("top {} is outside 1..={MAX_TOP}", descriptor.top),
-            ));
+            return Err(Error::Unsupported {
+                operator: Self::NAME,
+                problem: format!("top {} is outside 1..={MAX_TOP}", descriptor.top),
+            });
         }
 
         args.scores
@@ -172,9 +172,9 @@ impl Op for TopkSoftmax {
                         format!("expected {dtype} scales, found {}", scale.dtype),
                     ));
                 }
-                (address(scale.ptr) as usize, Self::score_kind(dtype))
+                (Some(scale.ptr), Self::score_kind(dtype))
             }
-            (None, None) => (0, -1),
+            (None, None) => (None, -1),
             (Some(_), None) => {
                 return Err(Error::argument(
                     Self::NAME,
@@ -189,22 +189,26 @@ impl Op for TopkSoftmax {
             }
         };
 
-        let metadata = cubin_metadata(kernel, Self::NAME, WARPS_PER_BLOCK)?;
+        cubin_metadata(kernel, Self::NAME, WARPS_PER_BLOCK)?;
         let grid = LaunchGrid::covering(tokens, TOKENS_PER_BLOCK)?;
         let mut arguments = Arguments::new();
         arguments
             .view(args.scores)
             .i32(Self::score_kind(descriptor.scores))
-            .i64(to_i64(row_stride(&args.scores))?)
-            .i32(to_i32(tokens)?)
-            .i32(to_i32(experts)?)
-            .i32(to_i32(top)?)
-            .i32(i32::from(descriptor.renormalize))
-            .pointer(DevicePtr::from_u64(scale as u64))
-            .i32(scale_kind)
-            .view(args.ids)
-            .view(args.weights);
-        let _ = metadata;
+            .i64(to_i64(Self::NAME, row_stride(&args.scores))?)
+            .i32(to_i32(Self::NAME, tokens)?)
+            .i32(to_i32(Self::NAME, experts)?)
+            .i32(to_i32(Self::NAME, top)?)
+            .i32(i32::from(descriptor.renormalize));
+        match scale {
+            Some(pointer) => {
+                arguments.pointer(pointer).i32(scale_kind);
+            }
+            None => {
+                arguments.u64(0).i32(scale_kind);
+            }
+        }
+        arguments.view(args.ids).view(args.weights);
         kernel.launch(grid, &mut arguments, stream)
     }
 
@@ -222,8 +226,8 @@ impl Op for TopkSoftmax {
         let accumulate = DType::F32;
         // The softmax's maximum, its `expf` (one ulp of FP32), the butterfly sum and the divide cost
         // at most a few `u` on top of the reduction's own `γₙ`; the ids are exact.
-        Tolerance::rounding(reduction, accumulate, DType::F32)
-            .with_rtol_extra(4.0 * accumulate.unit_roundoff())
+        let rounding = Tolerance::rounding(reduction, accumulate, DType::F32);
+        Tolerance::new(rounding.atol, (f64::from(rounding.rtol) + 4.0 * accumulate.unit_roundoff()) as f32)
     }
 }
 
@@ -271,14 +275,14 @@ impl Op for ExpertGather {
             }
         }
 
-        let metadata = cubin_metadata(kernel, Self::NAME, 1)?;
-        let grid = LaunchGrid::covering(args.ids.numel(), u64::from(metadata.threads()))?;
+        let threads = u64::from(cubin_metadata(kernel, Self::NAME, 1)?.threads());
+        let grid = LaunchGrid::covering(args.ids.numel(), threads)?;
         let mut arguments = Arguments::new();
         arguments
             .view(args.ids)
             .view(args.map)
             .view(args.out)
-            .i64(to_i64(args.ids.numel())?);
+            .i64(to_i64(Self::NAME, args.ids.numel())?);
         kernel.launch(grid, &mut arguments, stream)
     }
 
@@ -333,10 +337,10 @@ fn address(pointer: DevicePtr) -> u64 {
     platform::address(pointer)
 }
 
-fn to_i64(value: u64) -> Result<i64> {
-    i64::try_from(value).map_err(|_| Error::argument("topk_softmax", "an extent above i64::MAX"))
+fn to_i64(operator: &'static str, value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::argument(operator, "an extent above i64::MAX"))
 }
 
-fn to_i32(value: u64) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::argument("topk_softmax", "an extent above i32::MAX"))
+fn to_i32(operator: &'static str, value: u64) -> Result<i32> {
+    i32::try_from(value).map_err(|_| Error::argument(operator, "an extent above i32::MAX"))
 }
