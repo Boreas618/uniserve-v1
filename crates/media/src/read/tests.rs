@@ -438,6 +438,65 @@ fn conditions_refuse_an_encoded_prefix_longer_than_the_decoded_clip() {
 }
 
 #[test]
+fn conditions_read_a_reference_videos_soundtrack_from_its_file() {
+    // The video and its soundtrack come from one file: the frames decode on a
+    // thread while the track decodes on this one.
+    let case = &video_cases()[2];
+    let directory = fixtures().join("video");
+    let values: Vec<usize> = std::fs::read_to_string(directory.join("soundtrack.audio.txt"))
+        .unwrap()
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect();
+    let plan = AudioPlan {
+        native_rate: values[0] as u32,
+        start: values[1],
+        source_samples: values[2],
+        samples: values[3],
+        rate: values[4] as u32,
+    };
+    let expected = floats(&std::fs::read(directory.join("soundtrack.audio")).unwrap());
+    let area = case.clip.canvas.0 as usize * case.clip.canvas.1 as usize;
+    let rows = case.clip.vae_frames as usize * area;
+    let file = std::fs::File::open(&case.file).unwrap();
+    let mut pixels = vec![0u8; rows * 3];
+    let mut samples = vec![0.0f32; plan.samples * 2];
+    let decoded = read_conditions(
+        &ffmpeg(),
+        &[ConditionRead {
+            source: ConditionSource::File(&file),
+            image: None,
+            video: Some(case.clip),
+            audio: Some(plan),
+            pixels: 0..rows,
+            samples: 0..plan.samples,
+        }],
+        &mut ConditionProducts {
+            pixels: Some(&mut pixels),
+            samples: Some(&mut samples),
+        },
+    )
+    .unwrap();
+    let frames_difference = difference(&pixels, &case.expected);
+    assert!(
+        frames_difference <= 2,
+        "the soundtrack clip's frames differ by {frames_difference} per channel"
+    );
+    let samples_difference = samples
+        .iter()
+        .zip(&expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        samples_difference <= 1e-5,
+        "the soundtrack differs from the reference by {samples_difference}"
+    );
+    let video = decoded[0].as_ref().unwrap();
+    assert_eq!(video.clip, case.clip);
+    assert_eq!(video.pixels, case.expected);
+}
+
+#[test]
 fn conditions_refuse_rows_that_do_not_fill_their_products() {
     let image = &image_cases()[0];
     let rows = image.plan.window.2 as usize * image.plan.window.3 as usize;
