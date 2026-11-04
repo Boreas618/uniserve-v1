@@ -529,8 +529,47 @@ impl Qwen3Moe {
                 plan.hidden
             )));
         }
-        let (update, residual, buffers) = self.walk(f, batch, cache, hidden, last, None)?;
-        self.fold(f, update, residual, buffers.normalized)
+        self.forward_from(
+            f,
+            batch,
+            cache,
+            hidden,
+            Run {
+                start: 0,
+                last,
+                stage: None,
+            },
+        )
+    }
+
+    /// Run layers `start..=last` on the caller's rows, and answer the state after `last` (with
+    /// `stage = None`) or that cut inside it.
+    ///
+    /// This is the clean-input measurement: the rows handed in become the run's residual stream, so
+    /// the first layer of the run normalizes them alone instead of adding a previous layer's output,
+    /// and nothing of `0..start` enters the answer's error. It is how a reference's own
+    /// `hidden_start` measures one layer or a range of them without inheriting a prefix's divergence.
+    ///
+    /// Two facts a caller needs. **The cache planes are per layer**, and a run touches only the
+    /// planes of the layers it runs: the keys and values the attention reads are the ones those
+    /// layers write from these rows, so a prefill needs a cache whose pages hold no other sequence's
+    /// rows and a decode needs the prefix already written into those same planes by an earlier run.
+    /// And **the answer carries the layers' own roundings, no more**: the state after `last` is the
+    /// fold of its block's update into the stream, computed by the same launch the next layer's input
+    /// norm runs, so a cut inside a layer and the state above it differ by one such fold.
+    pub fn forward_from(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        cache: &KvView<'_>,
+        hidden: TensorView,
+        run: Run,
+    ) -> Result<TensorView> {
+        let (update, residual, buffers) = self.walk(f, batch, cache, hidden, run)?;
+        match run.stage {
+            Some(_) => Ok(update),
+            None => self.fold(f, update, residual, buffers.normalized),
+        }
     }
 
     /// The state after a layer: its block's update folded into the residual stream.
@@ -585,8 +624,17 @@ impl Qwen3Moe {
         layer: usize,
         stage: Substage,
     ) -> Result<TensorView> {
-        self.walk(f, batch, cache, hidden, layer, Some(stage))
-            .map(|(out, _, _)| out)
+        self.forward_from(
+            f,
+            batch,
+            cache,
+            hidden,
+            Run {
+                start: 0,
+                last: layer,
+                stage: Some(stage),
+            },
+        )
     }
 
     /// Run layers `0..=last`, or `0..last` and then `last` up to `tail`, and answer the rows the
@@ -602,14 +650,14 @@ impl Qwen3Moe {
         batch: &TokenBatch,
         cache: &KvView<'_>,
         hidden: TensorView,
-        last: usize,
-        tail: Option<Substage>,
+        run: Run,
     ) -> Result<(TensorView, TensorView, Buffers)> {
+        let Run { start, last, stage } = run;
         let tokens = batch.tokens();
         let plan = self.plan(tokens)?;
-        if last >= self.layers.len() {
+        if start > last || last >= self.layers.len() {
             return Err(Error::Config(format!(
-                "layer {last} was asked for but the model has {}",
+                "layers {start}..={last} were asked for and the model has {}",
                 self.layers.len()
             )));
         }
@@ -642,7 +690,8 @@ impl Qwen3Moe {
         let buffers = Buffers::reserve(f.arena, &plan, self.dtype)?;
         let mut residual = hidden;
         let mut input = hidden;
-        for (index, layer) in self.layers[..=last].iter().enumerate() {
+        for (offset, layer) in self.layers[start..=last].iter().enumerate() {
+            let index = start + offset;
             // One layer's scratch is dead once its launches are enqueued: the plan is one layer
             // deep and the next layer is handed the same addresses, which is what a replayed graph
             // expects. The layer-independent buffers above were reserved before this mark.
@@ -652,13 +701,14 @@ impl Qwen3Moe {
                 batch,
                 cache,
                 index,
+                offset == 0,
                 &buffers,
                 residual,
                 buffers.residual,
                 cosine,
                 sine,
                 input,
-                if index == last { tail } else { None },
+                if index == last { stage } else { None },
             )?;
             f.arena.release(mark);
             // The first layer read the embedding in `hidden` and wrote the first sum into the
@@ -719,7 +769,8 @@ impl DecoderLayer {
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
-        index: usize,
+        layer: usize,
+        first: bool,
         buffers: &Buffers,
         residual: TensorView,
         residual_out: TensorView,
@@ -731,7 +782,11 @@ impl DecoderLayer {
         let normalized = buffers.normalized;
         let update = buffers.update;
 
-        if index == 0 {
+        // `first` is the first layer *of this run*, which is layer 0 for the whole model and layer
+        // `start` for a run that begins part way up: its input residual is the caller's rows, so it
+        // normalizes alone and the addition starts at the next layer. `layer` is the cache plane and
+        // the rotary table's layer, which is always the model's own index.
+        if first {
             self.input_norm
                 .forward(f, hidden, normalized)
                 .map_err(Error::from)?;
@@ -745,7 +800,7 @@ impl DecoderLayer {
         }
 
         self.attention.forward(
-            f, batch, cache, index, buffers, normalized, cosine, sine, update,
+            f, batch, cache, layer, buffers, normalized, cosine, sine, update,
         )?;
         if stop == Some(Substage::Attended) {
             return Ok(update);
@@ -883,6 +938,21 @@ fn headed(projection: TensorView, norm: &Weight) -> Result<Shape> {
     Ok(Shape::new(&[rows, columns / head_dim, head_dim]))
 }
 
+/// Which layers a walk runs, and whether it stops inside the last of them.
+///
+/// The two ends are named rather than passed side by side: `forward_from(start, last)` with adjacent
+/// `usize`s is a transposition waiting for a busy afternoon, and a run that silently executed
+/// `last..=start` would answer a question nobody asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Run {
+    /// The first layer the run executes.
+    pub start: usize,
+    /// The last layer it executes.
+    pub last: usize,
+    /// Where inside `last` it stops, or `None` to run that layer whole.
+    pub stage: Option<Substage>,
+}
+
 /// How far through one layer an in-layer walk goes.
 ///
 /// A whole-run bisection answers which *layer* diverges; a layer is four operators deep and its
@@ -977,7 +1047,17 @@ impl CausalLm for Qwen3Moe {
                 capability(Error::Config("the model has no decoder layer".into()))
             })?;
         let (input, residual, _) = self
-            .walk(f, batch, cache, hidden, last, None)
+            .walk(
+                f,
+                batch,
+                cache,
+                hidden,
+                Run {
+                    start: 0,
+                    last,
+                    stage: None,
+                },
+            )
             .map_err(capability)?;
 
         // The output norm: the last layer's output added into the residual stream and normalized.
