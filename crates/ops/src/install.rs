@@ -78,6 +78,7 @@ const OPERATORS: &[&str] = &[
     <crate::residual::ScaledResidualRmsNorm as Op>::NAME,
     <crate::residual::ScaledResidualLayerNorm as Op>::NAME,
     <crate::residual::ScaledResidual as Op>::NAME,
+    <crate::residual::ScaledAdd as Op>::NAME,
     <crate::rope::RotaryFactors as Op>::NAME,
     <crate::rope::QkNormRope as Op>::NAME,
     <crate::sampler::LogitsShape as Op>::NAME,
@@ -111,6 +112,14 @@ const OPERATORS: &[&str] = &[
     <crate::snake::Snake as Op>::NAME,
     <crate::bias::BiasAdd as Op>::NAME,
     <crate::gelu::Gelu as Op>::NAME,
+    <crate::activation::Silu as Op>::NAME,
+    <crate::adaptive_pool::AdaptivePool as Op>::NAME,
+    <crate::rows::Rows as Op>::NAME,
+    <crate::position::PositionInterpolate as Op>::NAME,
+    <crate::audio_activation::AudioActivation as Op>::NAME,
+    <crate::patch::Patch as Op>::NAME,
+    <crate::rope::RopeApply as Op>::NAME,
+    <crate::pcm::PcmInterleave as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.

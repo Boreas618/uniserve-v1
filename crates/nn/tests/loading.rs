@@ -474,7 +474,7 @@ fn the_block_scales_must_have_the_layout_s_shape() {
     assert!(store.published.is_empty());
 }
 
-/// A pipeline's components keep their indexes apart; one loader borrows another checkpoint and
+/// A pipeline's components keep their indexes apart; one loader reborrows another checkpoint and
 /// keeps the store, so the two components share the conversion path and its retained weights.
 #[test]
 fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
@@ -501,7 +501,7 @@ fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
             .unwrap();
         assert_eq!(first.dtype(), DType::F32);
         {
-            let mut vae_loader = loader.for_checkpoint(&vae);
+            let mut vae_loader = loader.reborrow(&vae).unwrap();
             let second = vae_loader
                 .load(&WeightRequest::region("weight", 0, Shape::new(&[2])))
                 .unwrap();
@@ -521,4 +521,63 @@ fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
     assert_ne!(store.published[0].0.files, store.published[1].0.files);
     assert_eq!(store.published[0].1, store.published[1].1);
     assert_eq!(again_ptr, first_ptr);
+}
+
+/// A pipeline root holds one component per subdirectory, each with its own index and its own file
+/// identities, and one loader reads them all through one store.
+#[test]
+fn a_pipeline_root_holds_its_components() {
+    let root = tempfile::tempdir().unwrap();
+    let transformer = root.path().join("transformer");
+    let vae = root.path().join("vae");
+    std::fs::create_dir_all(&transformer).unwrap();
+    std::fs::create_dir_all(&vae).unwrap();
+    shard(
+        &transformer,
+        "model.safetensors",
+        &[("weight", vec![2], bf16(&[1.0, 2.0]))],
+    );
+    shard(
+        &vae,
+        "model.safetensors",
+        &[("weight", vec![2], bf16(&[3.0, 4.0]))],
+    );
+    // A file that is not a shard set is not a component.
+    std::fs::write(root.path().join("config.json"), b"{}").unwrap();
+
+    let pipeline = Checkpoint::open(root.path()).unwrap();
+    assert!(pipeline.is_pipeline());
+    assert_eq!(
+        pipeline.components().collect::<Vec<_>>(),
+        vec!["transformer", "vae"]
+    );
+
+    let transformer = pipeline.component("transformer").unwrap();
+    let vae = pipeline.component("vae").unwrap();
+    let transformer_component = pipeline.component("transformer").unwrap();
+    assert_eq!(transformer.read("weight").unwrap().bytes, bf16(&[1.0, 2.0]));
+    assert_eq!(vae.read("weight").unwrap().bytes, bf16(&[3.0, 4.0]));
+    // The identities name the file each component's tensors came from, not the root's directory.
+    assert_ne!(
+        transformer.identity("weight").unwrap(),
+        vae.identity("weight").unwrap()
+    );
+    // The root itself holds no tensor: a component's tensors are read from that component.
+    assert!(pipeline.tensor("weight").is_none());
+    assert!(pipeline.component("audio_vae").is_err());
+
+    // The loader's policy is kept across the components, and a policy the component does not
+    // describe is refused rather than read as something else.
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(vae, &mut store, None, None);
+    assert!(
+        loader.reborrow(transformer_component).is_ok(),
+        "the same policy, another component"
+    );
+    let mut fp8 = WeightLoader::new(vae, &mut store, None, Some(nn::Quantization::Fp8));
+    let error = match fp8.reborrow(transformer_component) {
+        Ok(_) => panic!("a BF16 component is not an FP8 checkpoint"),
+        Err(error) => error,
+    };
+    assert!(format!("{error}").contains("fp8"), "{error}");
 }
