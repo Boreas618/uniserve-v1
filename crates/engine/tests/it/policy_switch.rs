@@ -15,7 +15,10 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
-use engine::{CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor};
+use engine::{
+    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor, Stage,
+    StageApplied,
+};
 use scheduling::guest::decision::Plan;
 use scheduling::guest::limits::Limits;
 use scheduling::guest::view::ExpertOrder;
@@ -169,23 +172,163 @@ impl World {
         answer(self.handle.precopy_policy(program, source))
     }
 
-    /// The switchover's answer.
-    fn switch_over(&self) -> Result<(), String> {
-        answer(self.handle.switchover_policy())
+    /// The switchover's answer: the step it applied at.
+    fn switch_over(&self) -> Result<StageApplied, String> {
+        answer(self.handle.stage(Stage::Switchover))
     }
 
-    /// The revert's answer.
+    /// The revert's answer, as the caller that does not use the step reads it.
     fn revert(&self) -> Result<(), String> {
         answer(self.handle.revert_policy())
+    }
+
+    /// The step the scheduler reached, as it reports it.
+    fn step(&self) -> u64 {
+        self.handle
+            .progress()
+            .recv_timeout(ANSWER)
+            .expect("the scheduler reports its step")
+            .step
     }
 }
 
 /// Blocks until a command answers, and answers its result.
-fn answer(receiver: Receiver<Result<(), String>>) -> Result<(), String> {
+fn answer<T>(receiver: Receiver<Result<T, String>>) -> Result<T, String> {
     match receiver.recv_timeout(ANSWER) {
         Ok(result) => result,
         Err(error) => Err(format!("the scheduler did not answer: {error}")),
     }
+}
+
+#[test]
+fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
+    let world = World::start();
+    let programs = |world: &World| {
+        world
+            .handle
+            .policy_programs()
+            .recv_timeout(ANSWER)
+            .expect("the scheduler answers with its slot's programs")
+    };
+    let named = |program: Option<PolicyProgram>| {
+        program.map(|program| (program.backend, program.revision))
+    };
+
+    // Nothing serves and nothing waits before the epoch's first precopy.
+    let empty = programs(&world);
+    assert!(named(empty.running).is_none());
+    assert!(named(empty.prepared).is_none());
+
+    // A precopy prepares a candidate without putting it in.
+    world.precopy("fcfs", 1, toy()).expect("the first precopy");
+    let prepared = programs(&world);
+    assert!(named(prepared.running).is_none());
+    assert_eq!(
+        named(prepared.prepared),
+        Some(("fcfs".to_owned(), 1)),
+        "the slot names the program a precopy prepared"
+    );
+
+    // The switchover puts it in: it serves, and nothing waits.
+    world.switch_over().expect("the first switchover");
+    let serving = programs(&world);
+    assert_eq!(
+        named(serving.running),
+        Some(("fcfs".to_owned(), 1)),
+        "the slot names the program serving"
+    );
+    assert!(named(serving.prepared).is_none());
+
+    // The slot's counters agree with the step the scheduler reports, and the
+    // policy that just took over has cost calls — its trial's, carried in with
+    // the candidate (§12).
+    let counters = world
+        .handle
+        .counters()
+        .recv_timeout(ANSWER)
+        .expect("the scheduler answers with its counters");
+    assert_eq!(counters.steps, world.step(), "the steps are the policy's");
+    assert!(
+        counters.policy_calls > 0,
+        "the serving policy has answered at least its trial's calls"
+    );
+    assert_eq!(
+        (counters.kernel_launches, counters.device_ns),
+        (0, 0),
+        "the device's counters are the executor's, not this mechanism's"
+    );
+}
+
+#[test]
+fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
+    let world = World::start();
+
+    // A precopy's policy module belongs to the process holding the Program
+    // Server's client, which resolves it once and precopies each scheduler; the
+    // command is answered with that rather than half applied.
+    let precopy = ipc::ProgramCommand::Precopy {
+        generation: 1,
+        programs: Box::default(),
+        policy: program_server::Program {
+            backend: "fcfs".to_owned(),
+            revision: 1,
+            arguments: Default::default(),
+        },
+    };
+    let refused = answer(world.handle.program_command(precopy))
+        .expect_err("a precopy needs its source");
+    assert!(
+        refused.contains("Program Server"),
+        "the refusal names the owner of the program: {refused}"
+    );
+
+    // A switchover that names the step its expert group agreed applies at that
+    // step: this scheduler has taken none, so step zero is now.
+    world.precopy("fcfs", 1, toy()).expect("the first precopy");
+    answer(world.handle.program_command(ipc::ProgramCommand::Switchover {
+        generation: 1,
+        step: Some(0),
+    }))
+    .expect("a switchover at the step the scheduler is at applies");
+
+    // One that names a step still ahead waits for it instead of applying early.
+    world.precopy("priority", 2, toy()).expect("the second precopy");
+    let waiting = world.handle.program_command(ipc::ProgramCommand::Switchover {
+        generation: 2,
+        step: Some(3),
+    });
+    assert!(
+        waiting.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a switchover for a later step does not apply at this one"
+    );
+
+    // The boundary belongs to the stage that took it: a second one is refused
+    // with the waiting stage's name, so the first caller's answer is not lost.
+    let refused = answer(world.handle.commit_policy())
+        .expect_err("a stage waits for the boundary already claimed");
+    assert!(
+        refused.contains("switchover"),
+        "the refusal names the stage that owns the boundary: {refused}"
+    );
+}
+
+#[test]
+fn a_consumers_position_is_the_connections_and_a_scheduler_refuses_it() {
+    let world = World::start();
+    let command = proto::request::wire::Command {
+        request: 7,
+        kind: Some(proto::request::wire::command::Kind::Consumed(
+            proto::request::wire::Consumed { events: 3 },
+        )),
+    };
+    let refused = world
+        .handle
+        .request_command(command)
+        .expect_err("a consumer's position is not a scheduler's to record");
+    assert!(
+        refused.contains("connection"),
+        "the refusal says whose bookkeeping it is: {refused}"
+    );
 }
 
 #[test]
@@ -197,18 +340,30 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
     world
         .precopy("fcfs", 1, toy())
         .expect("the first program's precopy");
-    world.switch_over().expect("the first switchover");
+    let first = world.switch_over().expect("the first switchover");
+    // A stage names the boundary it applied at: the step the scheduler had
+    // reached, which is zero before any policy step ran.
+    assert_eq!(
+        first.step,
+        world.step(),
+        "a switchover answers the step it applied at"
+    );
 
     // The next program is precopied while the first serves, then switched in;
     // the first is kept for a revert.
     world
         .precopy("priority", 2, toy())
         .expect("the second program's precopy");
-    world.switch_over().expect("the second switchover");
+    let second = world.switch_over().expect("the second switchover");
+    assert_eq!(
+        second.step,
+        world.step(),
+        "a later switchover names the boundary it applied at as well"
+    );
 
     // A commit keeps the replaced policy until the next precopy (§7.3 step 5),
     // so a revert still finds it and brings it back.
-    world.handle.commit_policy();
+    answer(world.handle.commit_policy()).expect("the commit applies at a boundary");
     world.revert().expect("the commit kept the previous policy");
 
     // The revert consumed it: there is nothing older to revert to.

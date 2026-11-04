@@ -1,4 +1,4 @@
-//! `patch`: the diffusion transformer's packed rows against its latent, in either direction.
+//! `patch`: the diffusion transformer's latent, packed into its rows.
 //!
 //! The DiT reads packed rows — `[video | audio | prefix | padding]` — and one video row is one
 //! `1×2×2` patch of the latent's `channels` channels, so a row is `channels · 4` values wide. The
@@ -6,16 +6,18 @@
 //! evaluation converts rows to latent and back:
 //!
 //! ```text
-//! patchify    x [channels, frames, height, width] -> r [rows, channels · 4]
-//!             row    = ((f · height/2) + i) · (width/2) + j      f, i, j in raster order
-//!             column = ((c · 2) + a) · 2 + b                     c major, then the patch's (a, b)
-//!             r[row, column] = x[c, f, 2·i + a, 2·j + b]
-//! unpatchify  r [rows, channels · 4] -> x [channels, frames, height, width]   the exact inverse
+//! x [channels, frames, height, width] -> r [rows, channels · 4]
+//! row    = ((f · height/2) + i) · (width/2) + j      f, i, j in raster order
+//! column = ((c · 2) + a) · 2 + b                     c major, then the patch's (a, b)
+//! r[row, column] = x[c, f, 2·i + a, 2·j + b]
 //! ```
 //!
-//! One operator with a mode, because it is one index arithmetic read in two directions and the two
-//! callers are the same step; the descriptor carries the geometry and no index table, so a captured
-//! step replays it and no host-side permutation is needed. The move is elementwise and exact.
+//! One direction, because it is the only one the transformer's input needs: the latent is packed
+//! once per evaluation before the denoiser reads it. The inverse — the sampler's result or a
+//! decoder's raster — is `unpatchify_video` at `1×2×2`, the generic operator both rasters use, so
+//! there is one inverse in the tree rather than a `2×2`-only one beside it. The descriptor carries
+//! the geometry and no index table, so a captured step replays it and no host-side permutation is
+//! needed. The move is elementwise and exact.
 //!
 //! `frames` is a launch parameter, not a field of the descriptor: a request's frame count varies
 //! while `channels`, `height` and `width` are the model's, so one compiled program serves every
@@ -34,24 +36,6 @@ use crate::{Error, Op, Result, Twins};
 /// Elements one thread block handles along a destination row.
 pub const BLOCK: u32 = 1024;
 
-/// Which way the mapping is applied.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Mode {
-    /// Latent to packed rows: the DiT's input.
-    Patchify,
-    /// Packed rows to latent: what the sampler's result becomes.
-    Unpatchify,
-}
-
-impl fmt::Display for Mode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Patchify => "patchify",
-            Self::Unpatchify => "unpatchify",
-        })
-    }
-}
-
 /// One compilation of `patch`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
@@ -63,8 +47,6 @@ pub struct Descriptor {
     pub height: u32,
     /// The latent's width, which must be even: a patch is `2` wide.
     pub width: u32,
-    /// Which direction this module was compiled for.
-    pub mode: Mode,
     /// Elements one thread block handles along a row.
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
@@ -83,7 +65,6 @@ impl Descriptor {
         channels: u32,
         height: u32,
         width: u32,
-        mode: Mode,
         block: u32,
         pdl: bool,
     ) -> Result<Self> {
@@ -106,7 +87,6 @@ impl Descriptor {
             channels,
             height,
             width,
-            mode,
             block,
             pdl,
         })
@@ -134,7 +114,6 @@ impl fmt::Display for Descriptor {
             .field("channels", self.channels)
             .field("height", self.height)
             .field("width", self.width)
-            .field("mode", self.mode)
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -144,17 +123,15 @@ impl fmt::Display for Descriptor {
 /// The arguments of one mapping.
 #[derive(Clone, Copy)]
 pub struct Args {
-    /// `Patchify`: the latent `[channels, frames, height, width]`. `Unpatchify`: the rows
-    /// `[rows, channels · 4]`. One view serves both, and the mode says which it is.
+    /// The latent `[channels, frames, height, width]`.
     pub x: TensorView,
-    /// `Unpatchify`: the latent `[channels, frames, height, width]`. `Patchify`: the rows
-    /// `[rows, channels · 4]`.
+    /// The packed rows `[rows, channels · 4]`, `rows = frames · height/2 · width/2`.
     pub out: TensorView,
     /// Frames in the latent; the packed row count is `frames · rows_per_frame`.
     pub frames: u32,
 }
 
-/// The packed-row mapping, in either direction.
+/// The latent-to-rows mapping.
 pub struct Patch;
 
 impl Op for Patch {
@@ -198,13 +175,9 @@ impl Op for Patch {
         let latent = Shape::new(&[channels, frames, height, width]);
         let packed = Shape::new(&[rows, row_width]);
 
-        let (latent_view, packed_view) = match descriptor.mode {
-            Mode::Patchify => (args.x, args.out),
-            Mode::Unpatchify => (args.out, args.x),
-        };
-        latent_view.require_shape(Self::NAME, latent)?;
-        packed_view.require_shape(Self::NAME, packed)?;
-        for (name, view) in [("latent", latent_view), ("rows", packed_view)] {
+        args.x.require_shape(Self::NAME, latent)?;
+        args.out.require_shape(Self::NAME, packed)?;
+        for (name, view) in [("latent", args.x), ("rows", args.out)] {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
@@ -229,9 +202,9 @@ impl Op for Patch {
             .u32(descriptor.width)
             .u32(descriptor.block)
             .flag(descriptor.pdl);
-        // The grid walks the destination's rows: one block per (row, element block). A destination
-        // element is written by exactly one block, and its source is a single element, so the order
-        // between blocks never matters and a replay is deterministic.
+        // The grid walks the rows: one block per (row, element block). A row element is written by
+        // exactly one block and reads a single latent element, so the order between blocks never
+        // matters and a replay is deterministic.
         kernel.launch(
             LaunchGrid::new([rows, row_width.div_ceil(u64::from(descriptor.block)), 1])?,
             &mut arguments,
@@ -257,40 +230,33 @@ impl Op for Patch {
 mod tests {
     use super::*;
 
-    fn descriptor(mode: Mode) -> Descriptor {
+    fn descriptor() -> Descriptor {
         Descriptor {
             dtype: DType::BF16,
             channels: 24,
             height: 32,
             width: 48,
-            mode,
             block: BLOCK,
             pdl: false,
         }
     }
 
     #[test]
-    fn a_row_is_the_channels_patch_and_the_two_directions_are_one_key_apart() {
-        let patchify = descriptor(Mode::Patchify);
-        assert_eq!(patchify.row_width(), 96);
-        assert_eq!(patchify.rows_per_frame(), 16 * 24);
-        // The modes are separate compilations: the grid walks the destination, and the destination
-        // is the rows one way and the latent the other.
-        assert_ne!(
-            patchify.to_string(),
-            descriptor(Mode::Unpatchify).to_string()
-        );
+    fn a_row_is_the_channels_patch_and_a_frame_is_one_raster_of_them() {
+        let patch = descriptor();
+        assert_eq!(patch.row_width(), 96);
+        assert_eq!(patch.rows_per_frame(), 16 * 24);
         assert_eq!(
-            patchify.to_string(),
-            "dtype_bf16_channels_24_height_32_width_48_mode_patchify_block_1024_pdl_false"
+            patch.to_string(),
+            "dtype_bf16_channels_24_height_32_width_48_block_1024_pdl_false"
         );
     }
 
     #[test]
     fn the_frames_are_a_launch_value_so_one_module_serves_every_request() {
-        // Only the frame count differs between a 5-frame and a 121-frame request, and the key is
-        // the same: the program derives `rows` from it at launch.
-        assert_eq!(descriptor(Mode::Patchify), descriptor(Mode::Patchify));
+        // Only the frame count travels at launch; it changes `rows`, which is not a descriptor field,
+        // so a 5-frame and a 121-frame request share one compiled program.
+        assert_eq!(descriptor(), descriptor());
     }
 
     #[test]
@@ -298,17 +264,14 @@ mod tests {
         // A canvas side is a multiple of 32 and a latent side is that over 16, so every raster a
         // request can produce is even. An odd one is a geometry bug, refused here rather than
         // arriving later as a missing kernel.
-        assert!(Descriptor::new(DType::BF16, 24, 48, 48, Mode::Patchify, BLOCK, false).is_ok());
-        assert!(Descriptor::new(DType::BF16, 24, 48, 21, Mode::Patchify, BLOCK, false).is_err());
-        assert!(Descriptor::new(DType::BF16, 24, 21, 48, Mode::Patchify, BLOCK, false).is_err());
-        assert!(Descriptor::new(DType::BF16, 0, 48, 48, Mode::Patchify, BLOCK, false).is_err());
+        assert!(Descriptor::new(DType::BF16, 24, 48, 48, BLOCK, false).is_ok());
+        assert!(Descriptor::new(DType::BF16, 24, 48, 21, BLOCK, false).is_err());
+        assert!(Descriptor::new(DType::BF16, 24, 21, 48, BLOCK, false).is_err());
+        assert!(Descriptor::new(DType::BF16, 0, 48, 48, BLOCK, false).is_err());
     }
 
     #[test]
     fn the_mapping_is_exact() {
-        assert_eq!(
-            Patch::tolerance(&descriptor(Mode::Patchify)),
-            Tolerance::exact()
-        );
+        assert_eq!(Patch::tolerance(&descriptor()), Tolerance::exact());
     }
 }

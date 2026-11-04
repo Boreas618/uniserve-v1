@@ -367,6 +367,8 @@ impl Scheduler {
             logical_position: 0,
             cache_visible_len: 0,
             cache_computed_len: 0,
+            // A request draws its first token at position zero of its stream.
+            sampling_position: 0,
             next_token: next_token.0,
             num_generated_tokens: generated,
             image_id: u32::try_from(images).unwrap_or(u32::MAX),
@@ -444,7 +446,7 @@ impl Scheduler {
                 .ok_or(MediaOutputError::Unserved(product.call))?;
             let (_, bound, info) = self
                 .placement
-                .component_candidates(self.executor.as_ref(), CallKind::Media(product.call), name)
+                .component_candidates(self.executor.inner(), CallKind::Media(product.call), name)
                 .next()
                 .ok_or_else(|| MediaOutputError::Unplaced(name.clone()))?;
             let component = info
@@ -583,7 +585,7 @@ impl Scheduler {
                 .flatten();
             let candidates = self
                 .placement
-                .component_candidates(self.executor.as_ref(), CallKind::Media(call), &component)
+                .component_candidates(self.executor.inner(), CallKind::Media(call), &component)
                 .filter(|(worker, _, _)| {
                     admissible.is_none_or(|encoders| encoders.contains(*worker))
                         && self.executor.is_ready(worker)
@@ -1564,7 +1566,7 @@ impl Scheduler {
         let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
-                self.executor.as_ref(),
+                self.executor.inner(),
                 &self.info,
                 CallKind::Forward(ForwardMode::Prefill),
             )
@@ -1675,12 +1677,20 @@ impl Scheduler {
         self.placement
             .affinity
             .insert((request_key, target.1), target.0);
-        st.allocations = Some(RequestAllocations {
-            request_slot,
-            prefix_cache,
-            latent: None,
-            buffers: HashMap::new(),
-        });
+        if st
+            .allocations
+            .replace(RequestAllocations {
+                request_slot,
+                prefix_cache,
+                latent: None,
+                buffers: HashMap::new(),
+            })
+            .is_none()
+        {
+            // The request holds a pool row from now until its execution ends,
+            // which is what `Room::slots` counts without walking the residents.
+            self.rows_held = self.rows_held.saturating_add(1);
+        }
 
         // Queue latency is finalized at the same timestamp exposed through the
         // public scheduling event.

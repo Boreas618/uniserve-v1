@@ -904,6 +904,12 @@ impl WorkerGroup {
         &self.info
     }
 
+    /// The launch arguments the group was started with, which recovery
+    /// relaunches it from.
+    pub fn process_args(&self) -> &WorkerProcessArgs {
+        &self.process_args
+    }
+
     /// Return the same bindings used to initialize this group's transports.
     pub(crate) fn transfer_config(&self) -> &crate::executor::TransferConfig {
         &self.process_args.transfer

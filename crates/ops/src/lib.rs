@@ -53,6 +53,7 @@
 //! | [`conv::Conv3d`] | `conv3d` | [`conv`] |
 //! | [`conv::Conv1d`] | `conv1d` | [`conv`] |
 //! | [`conv::ConvTranspose1d`] | `conv_transpose1d` | [`conv`] |
+//! | [`transpose::Transpose`] | `transpose` | [`transpose`] |
 //! | [`exchange::scatter`], [`exchange::gather`] | `ulysses_exchange` | [`exchange`] |
 //!
 //! The attention and mixture-of-experts operators are `attention` and `moe`, beside these.
@@ -110,6 +111,7 @@ pub mod prefix_cache;
 pub mod replicate_pad;
 pub mod residual;
 pub mod resize;
+pub mod rgb;
 pub mod rope;
 pub mod rows;
 pub mod sampler;
@@ -119,6 +121,7 @@ pub mod snake;
 pub mod snake_beta;
 pub mod tensor;
 pub mod tolerance;
+pub mod transpose;
 pub mod twins;
 pub mod unpatchify;
 

@@ -81,6 +81,10 @@ pub struct Batch {
     pub generation: u64,
 }
 
+/// The commit table's own definition, so a producer outside this crate writes its rows against
+/// the columns and modes the kernels read instead of a copy of them.
+pub use ops::commit;
+
 /// The host columns of one batch, in the layout the phase's kernels read.
 ///
 /// The mechanism writes these from the request state it owns; the executor stages them into the
@@ -375,6 +379,76 @@ pub trait Batches: Send + Sync {
     fn shadow(&self, batch: Batch) -> Result<Submission>;
 }
 
+/// The mechanism's `Batches` over a rank's devices (2.4, 4.4): a batch goes to the device whose
+/// runners serve its phase.
+///
+/// A rank's executors are its devices, and a device's runners are the blocks of the model placed
+/// on it; the mechanism addresses a batch by phase, not by device. This is the one place that
+/// translation happens, so a scheduler never needs to know how many devices a rank holds. It is a
+/// plain route on purpose: the phase list is fixed at spawn, so no lock, no schedule, no retry.
+pub struct Executors {
+    executors: Vec<crate::device::Executor>,
+}
+
+impl Executors {
+    /// The rank's devices, in the order they were spawned.
+    ///
+    /// Every phase a batch can name must be served by exactly one of them; a rank that spawns two
+    /// devices serving one phase is refused, because a batch could go to either and the two would
+    /// disagree about the model's state.
+    pub fn new(executors: Vec<crate::device::Executor>) -> Result<Self> {
+        let mut served: Vec<PhaseId> = Vec::new();
+        for executor in &executors {
+            for phase in executor.phases() {
+                if served.contains(phase) {
+                    return Err(Error::Invalid(format!(
+                        "two devices of this rank serve phase {phase:?}"
+                    )));
+                }
+                served.push(*phase);
+            }
+        }
+        Ok(Self { executors })
+    }
+
+    /// The device that serves `phase`.
+    fn route(&self, phase: PhaseId) -> Result<&crate::device::Executor> {
+        self.executors
+            .iter()
+            .find(|executor| executor.serves(phase))
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "no device of this rank serves phase {phase:?}; its {} device(s) serve {:?}",
+                    self.executors.len(),
+                    self.executors
+                        .iter()
+                        .flat_map(|executor| executor.phases().iter().copied())
+                        .collect::<Vec<_>>()
+                ))
+            })
+    }
+
+    /// How many devices the rank hands batches to.
+    pub fn len(&self) -> usize {
+        self.executors.len()
+    }
+
+    /// Whether the rank has no device at all.
+    pub fn is_empty(&self) -> bool {
+        self.executors.is_empty()
+    }
+}
+
+impl Batches for Executors {
+    fn submit(&self, batch: Batch) -> Result<Submission> {
+        self.route(batch.phase)?.submit(batch)
+    }
+
+    fn shadow(&self, batch: Batch) -> Result<Submission> {
+        self.route(batch.phase)?.shadow(batch)
+    }
+}
+
 /// What the device executor is doing, as the control thread's stall report and probe name it (2.4).
 ///
 /// A batch is one command even when it becomes several jobs: the stall report names the batch the
@@ -402,6 +476,8 @@ pub enum JobKind {
     Revert,
     /// Releasing an old generation's graphs (7.3 step 6).
     Purge,
+    /// Releasing a prepared generation that never served (an abandoned precopy, 7.3 step 2).
+    Discard,
     /// A storage job: the copies, fills and fences a storage owner recorded.
     Issue,
     /// A job that only waits for the events it was given.
@@ -422,6 +498,7 @@ impl JobKind {
             Self::Switchover => "switchover",
             Self::Revert => "revert",
             Self::Purge => "purge",
+            Self::Discard => "discard",
             Self::Issue => "issue",
             Self::After => "after",
         }

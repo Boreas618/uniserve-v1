@@ -127,11 +127,7 @@ impl ProgramCommand {
         use proto::process::command::Kind;
 
         let kind = match self {
-            Self::Precopy {
-                generation,
-                programs,
-                policy,
-            } => Kind::Precopy(proto::process::Precopy {
+            Self::Precopy { programs, policy, .. } => Kind::Precopy(proto::process::Precopy {
                 kernels: programs
                     .iter()
                     .map(|(slot, program)| proto::process::KernelProgram {
@@ -141,7 +137,6 @@ impl ProgramCommand {
                     })
                     .collect(),
                 policy: Some(program_to_wire(policy)),
-                generation: *generation,
             }),
             Self::Switchover { generation, .. } => {
                 Kind::Switchover(proto::process::Switchover {
@@ -198,7 +193,10 @@ impl ProgramCommand {
                     .policy
                     .ok_or_else(|| program_error("a precopy states no policy"))?;
                 Self::Precopy {
-                    generation: precopy.generation,
+                    // The daemon's precopy states no number: the main process
+                    // numbers the generation it prepares (design 7.3 step 2),
+                    // and `Report::Precopied` echoes it back.
+                    generation: current + 1,
                     programs: Box::new(programs),
                     policy: program_from_wire(policy)?,
                 }

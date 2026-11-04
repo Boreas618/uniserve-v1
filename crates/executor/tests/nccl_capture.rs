@@ -42,6 +42,7 @@ impl platform::Budget for Unbounded {
 #[derive(Debug)]
 struct RankReport {
     rank: i32,
+    #[allow(dead_code, reason = "printed with the rank's readings when the probe reports")]
     device: DeviceId,
     /// The four f32 the buffer held after one uncaptured collective.
     eager: [f32; 4],
@@ -91,7 +92,7 @@ fn run_rank(
         .synchronize()
         .map_err(|error| format!("synchronize after the fill: {error}"))?;
 
-    let mut communicator = Communicator::init(device, size, rank, &id)
+    let communicator = Communicator::init(device, size, rank, &id)
         .map_err(|error| format!("Communicator::init: {error}"))?;
 
     // Question 1: an uncaptured collective. A refusal here is about one process holding both

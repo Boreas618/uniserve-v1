@@ -10,11 +10,14 @@
 //! on a hot restart together with its connections and the streams in flight
 //! (§7.5.1). Its modules are layered, each using only those below it:
 //!
+//! - `control`: the link to the daemon that commands the frontend, which says
+//!   which epoch serves, drains it and gates its admissions;
 //! - `tokenizer`: the served checkpoint's tokenizer and incremental decoding;
 //! - `model`: the served checkpoint's files, configuration and family
 //!   profile;
 //! - `options`: the deployment-file values the application reads.
 
+pub mod control;
 pub mod model;
 pub mod options;
 pub mod tokenizer;
