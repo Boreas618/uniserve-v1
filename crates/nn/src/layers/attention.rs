@@ -817,6 +817,30 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
+        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        // A cache of the projection's own type and an E4M3 cache are two programs, because the
+        // quantizing write applies a page scale the scatter never sees.
+        assert_ne!(
+            attention
+                .write_descriptor(DType::BF16, DType::BF16)
+                .to_string(),
+            attention
+                .write_descriptor(DType::BF16, DType::F8E4M3)
+                .to_string()
+        );
+        // A prefill reads a whole sequence and a decode one token: one attention program each.
+        assert_ne!(
+            attention
+                .descriptor(Phase::Prefill, DType::BF16, DType::BF16, DType::BF16)
+                .to_string(),
+            attention
+                .descriptor(Phase::Decode, DType::BF16, DType::BF16, DType::BF16)
+                .to_string()
+        );
+    }
+
+    #[test]
     fn a_dense_layer_states_its_mask_and_its_bound() {
         let encoder = Attention::dense(128, 32, 4, 8_192, true, None, 0.088).unwrap();
         assert_eq!(encoder.backend(), AttentionBackend::Dense);

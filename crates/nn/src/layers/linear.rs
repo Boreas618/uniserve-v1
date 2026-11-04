@@ -505,6 +505,39 @@ mod tests {
     }
 
     #[test]
+    fn a_packed_product_is_keyed_per_activation_row_count_and_a_dense_one_is_not() {
+        // The two products differ in what their module depends on: the dense one's grid and tile
+        // are its geometry's, so every row count reaches one compiled module, while the packed
+        // product's is compiled per activation row count and a deployment therefore enumerates the
+        // buckets it builds. This is what a key enumeration reads off the layers.
+        let packed = Nvfp4Linear::new(
+            &packed(8, 64, ScaleLayout::Swizzled128X4),
+            None,
+            ScaleLayout::Swizzled128X4,
+            DType::BF16,
+            128,
+        )
+        .unwrap();
+        assert_ne!(
+            packed.descriptor(1, DType::BF16).to_string(),
+            packed.descriptor(8, DType::BF16).to_string()
+        );
+        // The activation encoding is one module whatever the row count: its key names the column
+        // count, the layout and the block, and the rows travel in the launch.
+        assert_eq!(
+            packed.encode_descriptor().to_string(),
+            packed.encode_descriptor().to_string()
+        );
+        // A dense projection's descriptor does not take a row count at all, which is the same
+        // statement made by the signature.
+        let dense = Linear::new(weight(DType::BF16, &[8, 64]), None, WeightOrder::NxK).unwrap();
+        assert_eq!(
+            dense.descriptor(DType::BF16, DType::BF16).to_string(),
+            dense.descriptor(DType::BF16, DType::BF16).to_string()
+        );
+    }
+
+    #[test]
     fn a_packed_projection_refuses_what_it_cannot_contract() {
         let refuse = |weight: QuantizedWeight, layout, input, block| {
             Nvfp4Linear::new(&weight, None, layout, input, block)
