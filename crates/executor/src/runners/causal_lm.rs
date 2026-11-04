@@ -446,6 +446,165 @@ impl Columns {
     }
 }
 
+/// The commit table of a warm pose: `COMMIT_FIELDS` columns of `rows` i64 values, every row's slot
+/// and task `-1` and every other field zero.
+///
+/// The kernel treats a row with a negative slot as having no destination (no store of any kind) and
+/// a row with a negative task as having sampled nothing, so this table commits nothing while the
+/// launch that reads it is still recorded in the bucket's graph - which is what makes the graph a
+/// warmup captures the graph a serving batch replays.
+fn inert_commit(rows: usize) -> Vec<i64> {
+    let mut table = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+    for row in 0..rows {
+        table[ops::commit::column::SLOT * rows + row] = -1;
+        table[ops::commit::column::TASK * rows + row] = -1;
+    }
+    table
+}
+
+/// The rows the largest bucket of `buckets` holds, which sizes the columns bound once.
+fn largest_rows(buckets: &Buckets) -> Result<u32> {
+    buckets
+        .iter()
+        .map(|bucket| bucket.rows)
+        .max()
+        .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))
+}
+
+/// The token-state commit's operands (`ops::commit`), bound once and rewritten per batch.
+///
+/// A batch's sampled tokens must advance its slots' state - the histories the repetition,
+/// frequency and presence penalties subtract, and the positions a verify row carries. Without the
+/// launch a slot's state never moves, so the second decode step is computed against an empty
+/// history. It runs once per batch, after the sampler and before the read-back, inside the bucket's
+/// capture, so a replay advances the state exactly once.
+///
+/// Every operand is allocated when the runner binds and only the table's contents change per
+/// batch: the warm pose writes it with every row's slot and task `-1`, which the kernel treats as
+/// inert on every store, so the graph recorded at warmup is the graph a serving batch replays.
+struct CommitColumns {
+    /// `[COMMIT_FIELDS, capacity]` i32, column-major: the table the mechanism's rows fill.
+    table: Column,
+    /// `[rows]` i32 whether a row's token is valid, and whether its slot is active.
+    valid: Column,
+    active: Column,
+    /// `[1]` u8 continuation flag and `[1]` i32 accepted points: a plain decode's rows use neither.
+    continuation: Column,
+    points: Column,
+    /// `[slots]` the per-slot next-input predicate, logical position, sampling position and
+    /// verification length. A decode row advances the two positions by one.
+    predicates: Column,
+    logical: Column,
+    sampling: Column,
+    verified: Column,
+    /// `[slots]` i32 one next-input token per slot: a decode without speculation drafts none.
+    future: Column,
+    /// The table's leading stride, which the descriptor states.
+    capacity: u64,
+    /// The launch's block, which must cover every row of the largest bucket.
+    block: u32,
+}
+
+impl CommitColumns {
+    /// The commit operands of a runner whose largest bucket has `rows` rows over `slots` slots.
+    fn new(device: DeviceId, rows: u32, slots: u32) -> Result<Self> {
+        let capacity = u64::from(rows.max(1));
+        let mut columns = Self {
+            table: Column::new(device, DType::I32, u64::from(ops::commit::COMMIT_FIELDS as u32) * capacity)?,
+            valid: Column::new(device, DType::I32, capacity)?,
+            active: Column::new(device, DType::I32, capacity)?,
+            continuation: Column::new(device, DType::U8, 1)?,
+            points: Column::new(device, DType::I32, 1)?,
+            predicates: Column::new(device, DType::U8, u64::from(slots.max(1)))?,
+            logical: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            sampling: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            verified: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            future: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
+            capacity,
+            block: rows.max(1).next_power_of_two(),
+        };
+        // The roles a decode step leaves inert hold their starting values; only `table` is written
+        // again per batch.
+        let mut encoded = Vec::new();
+        let ones = vec![1_i32; capacity as usize];
+        encode_i32(&mut encoded, &ones);
+        columns.valid.write(&encoded)?;
+        columns.active.write(&encoded)?;
+        let zeros = vec![0_i32; slots.max(1) as usize];
+        encode_i32(&mut encoded, &zeros);
+        for column in [&mut columns.logical, &mut columns.sampling, &mut columns.verified, &mut columns.future] {
+            column.write(&encoded)?;
+        }
+        let zeros_i32 = vec![0_i32; 1];
+        encode_i32(&mut encoded, &zeros_i32);
+        columns.points.write(&encoded)?;
+        let zeros_u8 = vec![0_u8; 1];
+        columns.continuation.write(&zeros_u8)?;
+        let zeros_u8 = vec![0_u8; slots.max(1) as usize];
+        columns.predicates.write(&zeros_u8)?;
+        Ok(columns)
+    }
+
+    /// Writes the staged commit table - `[COMMIT_FIELDS, rows]` i64, column-major - as the i32 table
+    /// the descriptor asks for, then hands every operand to the device.
+    fn stage(&mut self, commit: &[i64], staged_rows: usize, capacity: usize) -> Result<()> {
+        if commit.is_empty() {
+            return Ok(());
+        }
+        let fields = ops::commit::COMMIT_FIELDS;
+        if commit.len() != fields * staged_rows {
+            return Err(Error::Invariant(format!(
+                "the commit table holds {} values, {fields} fields of {staged_rows} rows",
+                commit.len()
+            )));
+        }
+        // The table is `[fields][capacity]` on the device: the staged rows are its first `rows`
+        // columns and the rest keep the previous batch's values behind `dim(1) >= count`.
+        let mut table = vec![0_i32; fields * capacity];
+        for field in 0..fields {
+            for row in 0..staged_rows.min(capacity) {
+                let value = commit[field * staged_rows + row];
+                table[field * capacity + row] = i32::try_from(value).map_err(|_| {
+                    Error::Invalid(format!("a commit column value {value} does not fit i32"))
+                })?;
+            }
+        }
+        let mut encoded = Vec::new();
+        encode_i32(&mut encoded, &table);
+        self.table.write(&encoded)?;
+        Ok(())
+    }
+
+    /// The `[COMMIT_FIELDS, capacity]` i32 view the kernel reads.
+    fn table_view(&self) -> TensorView {
+        TensorView::with_strides(
+            self.table.device.ptr,
+            DType::I32,
+            ops::Shape::new(&[ops::commit::COMMIT_FIELDS as u64, self.capacity]),
+            ops::Strides::new(&[self.capacity, 1]),
+        )
+    }
+
+    /// Copies every operand the batch rewrote into its device buffer.
+    fn upload(&self, stream: &platform::Stream) -> Result<()> {
+        for column in [
+            &self.table,
+            &self.valid,
+            &self.active,
+            &self.continuation,
+            &self.points,
+            &self.predicates,
+            &self.logical,
+            &self.sampling,
+            &self.verified,
+            &self.future,
+        ] {
+            column.upload(stream)?;
+        }
+        Ok(())
+    }
+}
+
 /// Where one bucket's sampler wrote its ids: the first `rows` i32 of the plan's sampler block.
 #[derive(Clone, Copy)]
 struct Sampled {
@@ -611,6 +770,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     geometry: Geometry,
     /// Every bucket's per-step columns, whom the captured graphs address directly.
     columns: Columns,
+    /// The token-state commit's operands, written per batch and launched inside the capture.
+    commit: CommitColumns,
     /// The sampling step's own state, when any bucket samples.
     sampling: Option<Sampling>,
     /// The sampling row's output views, per bucket's plan, written by `sample` and read by the
@@ -704,6 +865,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ) -> Result<Self> {
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
+        let commit_rows = largest_rows(&buckets)?;
         let columns = Columns::new(device, &buckets)?;
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
             Some(Sampling::new(device, &stream, geometry)?)
@@ -727,6 +889,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             shadow: None,
             geometry,
             columns,
+            commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             encoded: Vec::new(),
@@ -1452,6 +1615,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
         encode_f32(&mut self.encoded, &self.draws);
         self.columns.draws.write(&self.encoded)?;
 
+        self.commit
+            .stage(self.staging.commit(), rows, self.commit.capacity as usize)?;
+
         for column in [
             &self.columns.positions,
             &self.columns.input_ids,
@@ -1466,6 +1632,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         ] {
             column.upload(&self.stream)?;
         }
+        self.commit.upload(&self.stream)?;
         Ok(())
     }
 
@@ -1624,7 +1791,65 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.bucket_samples
             .borrow_mut()
             .insert(bucket, Sampled { tokens: samples.tokens });
+        self.commit_step(forward, bucket, &samples)?;
         Ok(())
+    }
+
+    /// Launches the token-state commit of `bucket`'s rows: their sampled tokens advance their
+    /// slots' history, so the next step's penalties are computed against it (4.4, `ops::commit`).
+    ///
+    /// It runs inside the bucket's capture, after the sampler and before the read-back, so a replay
+    /// advances the state exactly once. A batch with no commit table (a shadow batch, a chunk that
+    /// commits nothing) launches nothing, and the graph recorded for a bucket always carries the
+    /// launch, because the warm pose stages an inert table rather than an empty one.
+    fn commit_step(
+        &self,
+        forward: &Forward<'_>,
+        bucket: Bucket,
+        samples: &Samples,
+    ) -> Result<()> {
+        if self.staging.commit().is_empty() {
+            return Ok(());
+        }
+        let rows = u64::from(bucket.rows);
+        let descriptor = ops::commit::CommitDescriptor {
+            index: DType::I32,
+            verified: DType::I32,
+            penalties: DType::I32,
+            // The table's leading stride, which `CommitColumns::table_view` states.
+            stride: self.commit.capacity,
+            future_stride: 1,
+            vocab: self.geometry.vocabulary,
+            block: self.commit.block,
+        };
+        let slots = u64::from(self.geometry.slots.max(1));
+        let args = ops::commit::CommitArgs {
+            columns: self.commit.table_view(),
+            tokens: samples.tokens,
+            valid: self.commit.valid.extent(0..rows),
+            active: self.commit.active.extent(0..rows),
+            continuation: self.commit.continuation.extent(0..1),
+            points: self.commit.points.extent(0..1),
+            future: TensorView::with_strides(
+                self.commit.future.device.ptr,
+                DType::I32,
+                ops::Shape::new(&[slots, 1]),
+                ops::Strides::new(&[1, 1]),
+            ),
+            predicates: self.commit.predicates.extent(0..slots),
+            logical: self.commit.logical.extent(0..slots),
+            sampling: self.commit.sampling.extent(0..slots),
+            verified: self.commit.verified.extent(0..slots),
+            penalties: self
+                .sampling
+                .as_ref()
+                .map(|sampling| sampling.counts)
+                .ok_or_else(|| Error::State("a sampling batch has no count table".into()))?,
+            count: rows,
+        };
+        forward
+            .operate::<ops::commit::SlotCommit>(&descriptor, args)
+            .map_err(|error| Error::Interface(error.to_string()))
     }
 
     /// Stages a batch of the bucket's full size with nothing to write: what a warmup capture
@@ -1636,8 +1861,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
             rows: nn::BatchRows {
                 positions: vec![0; tokens],
                 slot_mapping: vec![-1; tokens],
-                seq_lens: vec![1; rows],
-                query_offsets: (0..=rows as i32).collect(),
+                // One row carries the bucket's whole token run and the rest carry none: a prefill
+                // graph's attention reads `query_offsets` as a partition of `num_tokens`, so a warm
+                // pose that gave every row one token would describe a batch of `rows` tokens wearing
+                // a `tokens`-token extent. A decode bucket has rows == tokens and gets the identity.
+                seq_lens: {
+                    let mut lengths = vec![1_i32; rows];
+                    lengths[0] = bucket.tokens as i32;
+                    lengths
+                },
+                query_offsets: {
+                    let mut offsets = vec![bucket.tokens as i32; rows + 1];
+                    offsets[0] = 0;
+                    offsets
+                },
                 logits_rows: vec![-1; rows],
                 calls: vec![nn::BatchRow {
                     request: 0,
@@ -1653,7 +1890,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
             parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
-            commit: Vec::new(),
+            // An inert table, not an empty one: a row whose slot and task are `-1` commits
+            // nothing, and the launch is still recorded, so a serving replay of this bucket
+            // advances the slots it names.
+            commit: inert_commit(rows),
             page_size: 1,
             max_kv_len: 1,
         };
@@ -1837,6 +2077,7 @@ mod tests {
         ]);
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
+        let commit_rows = largest_rows(&buckets)?;
 
         let bucket = Bucket::decode(4, Variant::DecodeGreedy);
         let staged = staging.stage(
@@ -1865,6 +2106,24 @@ mod tests {
         Ok(())
     }
 
+    /// A warm pose's commit table is inert and complete: every column is present, no row names a
+    /// slot or a task, and nothing counts a penalty. The launch is recorded and the state stays as
+    /// it was, so the first request does not start from a history warmup invented.
+    #[test]
+    fn a_warm_pose_commits_nothing_but_is_recorded() {
+        let rows = 5;
+        let table = inert_commit(rows);
+        assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * rows);
+        for field in 0..ops::commit::COMMIT_FIELDS {
+            let column = &table[field * rows..(field + 1) * rows];
+            if field == ops::commit::column::SLOT || field == ops::commit::column::TASK {
+                assert_eq!(column, &[-1_i64; 5], "field {field} names no destination");
+            } else {
+                assert!(column.iter().all(|value| *value == 0), "field {field} is zero");
+            }
+        }
+    }
+
     /// The staged ids are the batch's, in order, padded after them: the forward embeds these, so a
     /// row's embedding comes from its own token and a padding token embeds nothing a request sees.
     #[test]
@@ -1875,6 +2134,7 @@ mod tests {
         ]);
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
+        let commit_rows = largest_rows(&buckets)?;
 
         staging.stage(
             &prefill_columns(),
