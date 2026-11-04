@@ -399,7 +399,10 @@ impl Leader {
             .epochs()
             .serving()
             .map_or(0, |(epoch, _)| epoch);
-        if let Some(update) = self.apply_programs(epoch, &target, request.dry_run).await? {
+        if let Some(update) = self
+            .apply_programs(epoch, &target, request.force, request.dry_run)
+            .await?
+        {
             return Ok(Applied::Program(serde_json::json!({
                 "change": "program",
                 "epoch": epoch,
