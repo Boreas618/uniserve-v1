@@ -35,6 +35,15 @@ pub fn set_sink(sink: Option<&mut (dyn Sink + 'static)>) {
     SINK.with(|cell| cell.set(pointer));
 }
 
+/// Whether a sink is installed on this thread.
+///
+/// A launch that would report itself asks this first: [`launched`] already returns at once when no
+/// sink is installed, but its caller formats the descriptor key beforehand, and that is an
+/// allocation on the serving path for a capture that is not happening.
+pub fn installed() -> bool {
+    SINK.with(|cell| cell.get().is_some())
+}
+
 /// Tell the installed sink about a launch, if one is installed.
 ///
 /// Called by the layer that launches, right after the launch: `operator` is [`crate::Op::NAME`] and
