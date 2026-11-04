@@ -2113,9 +2113,13 @@ fn forward_events(
                     // the epoch's current one (§7.3). A scheduler's report is
                     // named here, since a scheduler does not know its index.
                     //
-                    // The report is an engine-level event, not a request's: it
-                    // waits for the process interface's report frame, and until
-                    // that frame carries it this log is where a revert is seen.
+                    // The report is an engine-level event, not a request's. A
+                    // scheduler is asked for its report on one tick and its
+                    // answer is read on a later one, so a tick never waits on a
+                    // scheduler; the control thread's own instance keeps its
+                    // reports where it failed them. Each one goes to the daemons
+                    // as the process interface's report frame, and the log line
+                    // is this process's own record of it.
                     let mut reverted: Vec<PolicyReverted> = Vec::new();
                     {
                         let mut asked = crate::lock(&routing.policy_reports);
