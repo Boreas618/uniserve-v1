@@ -24,6 +24,7 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::epoch::Phase;
 use crate::leader::{Leader, LeaderStatus, UpdateError};
 use crate::openai::ApiError;
 use crate::worlds::{Applied, ApplyRequest, InFlight};
@@ -101,10 +102,6 @@ pub(crate) struct Admin {
     /// Set once a hot restart handed the deployment to a successor, which
     /// takes the operations from then on.
     handed_over: AtomicBool,
-    /// The epochs the deployment executes and the processes this node's
-    /// daemon manages, which `GET /admin/config` reports and a configuration
-    /// change is routed by (`crate::epoch`).
-    epochs: crate::epoch::Epochs,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -131,15 +128,15 @@ impl Admin {
             shutdown,
             retire,
             handed_over: AtomicBool::new(false),
-            epochs: crate::epoch::Epochs::new(),
         })
     }
 
-    /// The epochs the deployment executes and the processes this node's
-    /// daemon manages, which the configuration routes changes by and
-    /// `GET /admin/config` reports.
-    pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
-        &self.epochs
+    /// The number of the operation that runs, which is the number an update it
+    /// starts carries; 0 when none runs.
+    fn running_number(&self) -> u64 {
+        locked(&self.running)
+            .as_ref()
+            .map_or(0, |operation| operation.id)
     }
 
     /// The event log and the operations' record, for the successor of a hot
@@ -506,7 +503,7 @@ async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
     // configuration and its worlds: `EpochRecord`s are the daemon's record
     // of what it executes, not the engine's (`crate::epoch`).
     if let Some(object) = body.as_object_mut() {
-        let report = state.admin.epochs().report();
+        let report = state.leader.epochs().report();
         object.insert("epochs".to_owned(), report["epochs"].clone());
         object.insert("processes".to_owned(), report["processes"].clone());
     }
@@ -541,6 +538,14 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
             dry_run: body.dry_run,
             force: body.force,
         };
+        // The program layer is tried first, and only on a target resolved
+        // against the serving configuration: a change that fills other
+        // programs moves the main processes in place, and the world path would
+        // answer `none` for it because its build config is unchanged (§7.2,
+        // §7.3).
+        if let Some(program) = program_update(&admin, &leader, &request, body.dry_run).await? {
+            return Ok(program);
+        }
         // The change's future holds the model files it resolves.
         match Box::pin(leader.apply(request)).await {
             Ok(Applied::Daemon {
@@ -628,7 +633,37 @@ pub(crate) fn apply_after_restart(
 /// (`Leader::commit`).
 async fn commit(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
+    let admin = Arc::clone(&state.admin);
     run(&state.admin, "commit", true, async move {
+        // A program-layer probation ends first: its commit and purge are the
+        // main processes', and the epoch keeps no previous generation
+        // afterwards (§7.3 steps 5-6). Only when no program-layer update is in
+        // flight does the configuration's own commit run.
+        // The update the probation belongs to is the one this operation ends,
+        // numbered when it was applied — not this operation's own number.
+        let epochs = leader.epochs();
+        let probation = epochs.program_update();
+        if let Some(program) = probation {
+            let number = program.update.number;
+            match leader.commit_programs(number).await {
+                Ok(true) => {
+                    program_phase(&admin, &epochs, Phase::Committed, program.epoch, &program.update);
+                    program_phase(&admin, &epochs, Phase::Purged, program.epoch, &program.update);
+                    return Ok(json!({
+                        "change": "program",
+                        "epoch": program.epoch,
+                        "state": "committed",
+                    }));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err((
+                        update_status(&error),
+                        format!("{:#}", anyhow::Error::from(error)),
+                    ));
+                }
+            }
+        }
         leader.commit().await.map_err(|error| {
             (
                 update_status(&error),
@@ -637,6 +672,135 @@ async fn commit(State(state): State<AdminState>) -> Response {
         })
     })
     .await
+}
+
+/// Applies a change at the program layer, answering what it did, or `None`
+/// when the change moves nothing there and the world path decides it (§7.2).
+///
+/// The layer is decided on the target resolved against the serving
+/// configuration, and nothing is compared before the target's programs are
+/// prepared at every host's Program Server: a newly installed revision at an
+/// unchanged configuration is a program-layer change.
+async fn program_update(
+    admin: &Arc<Admin>,
+    leader: &Arc<Leader>,
+    request: &ApplyRequest,
+    dry_run: bool,
+) -> Result<Option<serde_json::Value>, (StatusCode, String)> {
+    let Ok(current) = leader.serving_config() else {
+        // No replica serves: the world path answers that account itself.
+        return Ok(None);
+    };
+    let Ok((target, _, _)) = crate::worlds::resolve(&current, request) else {
+        // The change itself is refused; the world path answers it the same way.
+        return Ok(None);
+    };
+    let epochs = leader.epochs();
+    let number = admin.running_number();
+    let planned = match leader.apply_programs(number, &target, true).await {
+        Ok(Some(planned)) => planned,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(refused_precopy(admin, &epochs, number, &error)),
+    };
+    if dry_run {
+        return Ok(Some(json!({
+            "change": "program",
+            "plan": programs_report(&planned.target.programs),
+        })));
+    }
+    let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
+    program_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
+    match leader.apply_programs(number, &target, false).await {
+        Ok(Some(update)) => {
+            // The main processes prepared, switched to and now serve the new
+            // generation; the probation decides it (§7.3 steps 2-4).
+            for phase in [Phase::Precopied, Phase::Switchover, Phase::Switched, Phase::Probation] {
+                program_phase(admin, &epochs, phase, epoch, &update);
+            }
+            Ok(Some(json!({
+                "change": "program",
+                "epoch": epoch,
+                "state": "probation",
+                "update": update.number,
+            })))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(refused_precopy(admin, &epochs, number, &error)),
+    }
+}
+
+/// Reports a program layer that could not take the target's programs and
+/// answers why: what serves is untouched (§7.3 step 2).
+fn refused_precopy(
+    admin: &Arc<Admin>,
+    epochs: &crate::epoch::Epochs,
+    number: u64,
+    error: &UpdateError,
+) -> (StatusCode, String) {
+    let reason = format!("{error:#}");
+    let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
+    admin.update_event(
+        number,
+        Phase::PrecopyFailed,
+        epoch,
+        [
+            ("change", json!("program")),
+            ("reason", json!(reason)),
+        ],
+    );
+    (
+        update_status(error),
+        format!("precopy failed: {reason}"),
+    )
+}
+
+/// Reports one phase of a program-layer update on the event log: the phase,
+/// the update and the epoch it moves, the change it is, the generation that
+/// executes and the programs it carries (`data`).
+fn program_phase(
+    admin: &Arc<Admin>,
+    epochs: &crate::epoch::Epochs,
+    phase: Phase,
+    epoch: u64,
+    update: &crate::epoch::Update,
+) {
+    let generation = epochs
+        .get(epoch)
+        .map(|record| record.generation)
+        .map_or(serde_json::Value::Null, serde_json::Value::from);
+    admin.update_event(
+        update.number,
+        phase,
+        epoch,
+        [
+            ("change", json!("program")),
+            ("generation", generation),
+            ("programs", programs_report(&update.target.programs)),
+        ],
+    );
+}
+
+/// The programs an update carries, by operator and revision, as an event's
+/// `data.programs` names them (§7.3).
+fn programs_report(programs: &crate::epoch::FilledPrograms) -> serde_json::Value {
+    let kernels = programs
+        .kernels
+        .iter()
+        .map(|(slot, program)| {
+            json!({
+                "op": slot.op,
+                "backend": program.backend,
+                "revision": program.revision,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "kernels": kernels,
+        "policy": {
+            "backend": programs.policy.backend,
+            "revision": programs.policy.revision,
+        },
+    })
 }
 
 /// The body of `POST /admin/config/rollback`.
@@ -660,10 +824,39 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
         }
     };
     let leader = Arc::clone(&state.leader);
+    let admin = Arc::clone(&state.admin);
     run(&state.admin, "rollback", true, async move {
         let reason = body
             .reason
             .unwrap_or_else(|| "the operator rolled the trial back".to_owned());
+        // A program-layer probation returns to the generation before it first,
+        // with the reason the operator gave (§7.3 step 5); the configuration's
+        // own rollback runs only when no program-layer update is in flight.
+        // The update the probation belongs to is the one this operation ends,
+        // numbered when it was applied — not this operation's own number.
+        let epochs = leader.epochs();
+        let probation = epochs.program_update();
+        if let Some(program) = probation {
+            let number = program.update.number;
+            match leader.rollback_programs(number, &reason).await {
+                Ok(true) => {
+                    program_phase(&admin, &epochs, Phase::Reverted, program.epoch, &program.update);
+                    program_phase(&admin, &epochs, Phase::Purged, program.epoch, &program.update);
+                    return Ok(json!({
+                        "change": "program",
+                        "epoch": program.epoch,
+                        "state": "reverted",
+                    }));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err((
+                        update_status(&error),
+                        format!("{:#}", anyhow::Error::from(error)),
+                    ));
+                }
+            }
+        }
         leader.rollback(reason).await.map_err(|error| {
             (
                 update_status(&error),

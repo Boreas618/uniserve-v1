@@ -64,6 +64,7 @@ use proto::request::{
     DiffusionRequest, Event, FeedbackImage, FeedbackSource, GeneratedImage, GenerationRequest,
     MigrationCause, Request, RequestId, Trajectory,
 };
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 use crate::engine::client::{EventStream, StreamCancelCause, SubmitError};

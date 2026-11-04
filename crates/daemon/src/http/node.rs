@@ -260,8 +260,13 @@ async fn serve_deployment(
         .to_owned();
     let retire = Arc::new(AtomicBool::new(false));
     let served = async {
+        // The daemon's channel down to the main processes, which the epoch's
+        // first program switch commands through.
+        let commands = daemon.commands();
         let engine = tokio::select! {
-            engine = Leader::start(config, stated, address) => Arc::new(engine?),
+            engine = Leader::start(config, stated, address, commands.as_ref()) => {
+                Arc::new(engine?)
+            }
             () = token.cancelled() => return Ok(()),
         };
         let admin = Admin::new(token.clone(), Arc::clone(&retire));

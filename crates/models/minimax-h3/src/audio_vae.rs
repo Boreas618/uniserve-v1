@@ -139,7 +139,7 @@ impl Resample {
             kernel,
             pad: kernel / ratio - 1,
             pad_left: (kernel / ratio - 1) * ratio + (kernel - ratio) / 2,
-            pad_right: (kernel / ratio - 1) * ratio + (kernel - ratio + 1) / 2,
+            pad_right: (kernel / ratio - 1) * ratio + (kernel - ratio).div_ceil(2),
         })
     }
 
@@ -461,20 +461,21 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
 /// The anti-aliased multi-periodicity blocks one decoder stage holds.
 pub const BLOCKS_PER_STAGE: usize = 3;
 
-/// One dilated branch of an anti-aliased multi-periodicity block: two convolutions with the same
-/// kernel, dilation and padding.
+/// One dilation step of an anti-aliased multi-periodicity block.
+///
+/// A step is two convolutions of the block's kernel: the first is dilated by `dilation` and padded by
+/// `dilation · (kernel − 1) / 2`, the second is dilated by one and padded by `(kernel − 1) / 2`. Both
+/// keep the length.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Branch {
-    /// The convolution's kernel.
-    pub kernel: u32,
-    /// Its dilation.
+pub struct Step {
+    /// The first convolution's dilation.
     pub dilation: u32,
-    /// Its zero padding, `dilation · (kernel − 1) / 2`, which keeps the length.
+    /// The first convolution's zero padding; the second's is `(kernel − 1) / 2`.
     pub padding: u32,
 }
 
-impl Branch {
-    /// The branch of `kernel` and `dilation`.
+impl Step {
+    /// The step of `kernel` at `dilation`.
     pub fn new(kernel: u32, dilation: u32) -> Result<Self> {
         if kernel == 0 || dilation == 0 || !(kernel - 1).is_multiple_of(2) {
             return Err(Error::config(format!(
@@ -482,67 +483,71 @@ impl Branch {
             )));
         }
         Ok(Self {
-            kernel,
             dilation,
             padding: dilation * (kernel - 1) / 2,
         })
     }
+
+    /// The second convolution's padding, which undoes no dilation.
+    pub fn padding_plain(kernel: u32) -> u32 {
+        (kernel - 1) / 2
+    }
 }
 
-/// One anti-aliased multi-periodicity block.
+/// One anti-aliased multi-periodicity block: one residual kernel run at each of its dilations.
 ///
-/// A block runs its branches in parallel on the same input, sums them and divides by the branch
-/// count; each branch is an alias-free activation, a dilated convolution, a second activation and a
-/// one-by-one convolution back to the block's width.
+/// The steps accumulate rather than run in parallel — each adds its convolutional residual to the
+/// running value — and a block's kernel is fixed, so a stage holds one block per residual kernel and
+/// sums their outputs, dividing by the kernel count.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Block {
     /// The stage the block belongs to.
     pub stage: usize,
-    /// The block's index within its stage.
+    /// The block's index within its stage, which is also its residual kernel's index.
     pub index: usize,
+    /// The block's residual kernel.
+    pub kernel: u32,
     /// Channels in and out: the stage's width.
     pub channels: u32,
-    /// The branches, in the order the checkpoint names them.
-    pub branches: Vec<Branch>,
+    /// The dilation steps, in the order the checkpoint names them.
+    pub steps: Vec<Step>,
 }
 
-impl Block {
-    /// The divisor the summed branches are averaged by.
-    pub fn scale(&self) -> u32 {
-        self.branches.len() as u32
-    }
-}
-
-/// The decoder's blocks, in stage order: three per stage, one branch per residual kernel.
+/// The decoder's blocks, in stage order: one per residual kernel, three per stage.
+///
+/// A block runs its kernel at every dilation the configuration lists for that kernel, so a kernel with
+/// three dilations contributes six convolutions; the stage sums its three blocks and divides by three.
 pub fn blocks(config: &AudioVaeConfig) -> Result<Vec<Block>> {
     let stages = stages(config)?;
+    if config.resblock_kernel_sizes.len() != BLOCKS_PER_STAGE
+        || config.resblock_dilation_sizes.len() != BLOCKS_PER_STAGE
+    {
+        return Err(Error::config(format!(
+            "the audio decoder names {} residual kernels and {} dilation lists, not {BLOCKS_PER_STAGE}",
+            config.resblock_kernel_sizes.len(),
+            config.resblock_dilation_sizes.len()
+        )));
+    }
     let mut blocks = Vec::with_capacity(stages.len() * BLOCKS_PER_STAGE);
     for (index, stage) in stages.iter().enumerate() {
         for block in 0..BLOCKS_PER_STAGE {
-            let branches = config
-                .resblock_kernel_sizes
-                .iter()
-                .zip(config.resblock_dilation_sizes.iter())
-                .map(|(kernel, dilations)| {
-                    if dilations.len() != 1 {
-                        return Err(Error::config(format!(
-                            "the audio residual kernel {kernel} names {} dilations, not one",
-                            dilations.len()
-                        )));
-                    }
-                    Branch::new(*kernel, dilations[0])
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if branches.is_empty() {
-                return Err(Error::config(
-                    "the audio decoder has a block with no branch".to_owned(),
-                ));
+            let kernel = config.resblock_kernel_sizes[block];
+            let dilations = &config.resblock_dilation_sizes[block];
+            if dilations.is_empty() {
+                return Err(Error::config(format!(
+                    "the audio residual kernel {kernel} names no dilation"
+                )));
             }
+            let steps = dilations
+                .iter()
+                .map(|dilation| Step::new(kernel, *dilation))
+                .collect::<Result<Vec<_>>>()?;
             blocks.push(Block {
                 stage: index,
                 index: block,
+                kernel,
                 channels: stage.channels_out,
-                branches,
+                steps,
             });
         }
     }
@@ -712,7 +717,7 @@ pub(crate) mod tests {
         assert_eq!(samples_per_latent(&config), 800);
         assert_eq!(latent_frames(&config, 800).expect("one frame"), 1);
         assert_eq!(latent_frames(&config, 801).expect("two frames"), 2);
-        assert_eq!(latent_frames(&config, 0).is_err(), true);
+        assert!(latent_frames(&config, 0).is_err());
         assert_eq!(track_samples(&config, 5), 4000);
         // A five-second track at 32 kHz.
         let samples = 5 * 32000;
@@ -787,15 +792,15 @@ pub(crate) mod tests {
     fn the_workspace_grows_to_one_stereo_track() {
         let config = audio_config();
         let buffers = workspace(&config, 1).expect("workspace");
-        // One latent frame is 800 samples: the projection, the pre-convolution, seven stages and the
-        // mono output.
-        assert_eq!(buffers.len(), 2 + 7 + 1);
+        // One latent frame is 800 samples: the projection's own buffer, one per stage and the mono
+        // output. The pre-convolution shares the projection's width, so it needs no buffer of its own.
+        assert_eq!(buffers.len(), 1 + 7 + 1);
         assert_eq!(buffers[0].samples, 1);
         assert_eq!(buffers[0].channels, 2048);
         let samples: Vec<u32> = buffers.iter().map(|buffer| buffer.samples).collect();
         assert_eq!(samples, vec![1, 5, 25, 50, 100, 200, 400, 800, 800]);
         let channels: Vec<u32> = buffers.iter().map(|buffer| buffer.channels).collect();
-        assert_eq!(channels, vec![2048, 1024, 512, 256, 128, 64, 32, 16, 1]);
+        assert_eq!(channels, vec![2048, 512, 256, 128, 64, 32, 16, 8, 1]);
         // A whole second of audio is forty latent frames and 32000 samples.
         let buffers = workspace(&config, 40).expect("workspace");
         assert_eq!(buffers.last().expect("the output").samples, 32000);
@@ -804,47 +809,56 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_block_has_one_branch_per_residual_kernel() {
+    fn every_block_runs_its_kernel_at_every_dilation() {
         let config = audio_config();
         let table = blocks(&config).expect("the blocks");
-        // Seven stages of three blocks: BigVGAN's 21, with 126 convolutions between them.
+        // Seven stages of three blocks, one block per residual kernel: BigVGAN's 21, with 126
+        // convolutions between them — six per block, two per dilation.
         assert_eq!(table.len(), 21);
-        let convolutions: usize = table.iter().map(|block| block.branches.len() * 2).sum();
+        let convolutions: usize = table.iter().map(|block| block.steps.len() * 2).sum();
         assert_eq!(convolutions, 126);
         let first = &table[0];
         assert_eq!((first.stage, first.index), (0, 0));
+        assert_eq!(first.kernel, 3);
         assert_eq!(first.channels, 512);
-        assert_eq!(first.scale(), 3);
+        // Kernel 3 at dilations 1, 3 and 5: padding `dilation · (kernel − 1) / 2`.
         assert_eq!(
-            first.branches,
+            first.steps,
             vec![
-                Branch {
-                    kernel: 3,
+                Step {
                     dilation: 1,
                     padding: 1
                 },
-                Branch {
-                    kernel: 7,
+                Step {
                     dilation: 3,
-                    padding: 9
+                    padding: 3
                 },
-                Branch {
-                    kernel: 11,
+                Step {
                     dilation: 5,
-                    padding: 25
+                    padding: 5
                 },
             ]
         );
-        // A branch keeps its length: `length + 2·padding − dilation·(kernel − 1) = length`.
-        for branch in &first.branches {
-            let reach = branch.dilation * (branch.kernel - 1);
-            assert_eq!(2 * branch.padding, reach);
+        // Each step's two convolutions keep the length: `2·padding = dilation · (kernel − 1)` for the
+        // dilated one, and `kernel − 1` for the plain one.
+        for step in &first.steps {
+            assert_eq!(2 * step.padding, step.dilation * (first.kernel - 1));
         }
+        assert_eq!(2 * Step::padding_plain(first.kernel), first.kernel - 1);
+        // The three blocks of a stage are the three residual kernels.
+        let kernels: Vec<u32> = table[0..3].iter().map(|block| block.kernel).collect();
+        assert_eq!(kernels, vec![3, 7, 11]);
+        assert_eq!(table[1].steps.len(), 3);
+        assert_eq!(table[1].steps[0].padding, 3);
         // The last stage is the narrowest.
         assert_eq!(table.last().expect("a block").channels, 8);
-        // A kernel with two dilations is refused rather than silently taking the first.
+        // A kernel with no dilation is refused rather than silently contributing nothing.
         let mut broken = config.clone();
-        broken.resblock_dilation_sizes[0].push(2);
+        broken.resblock_dilation_sizes[0].clear();
+        assert!(blocks(&broken).is_err());
+        // So is a configuration that does not name three residual kernels.
+        let mut broken = config.clone();
+        broken.resblock_kernel_sizes.pop();
         assert!(blocks(&broken).is_err());
     }
 
@@ -856,11 +870,14 @@ pub(crate) mod tests {
             .iter()
             .filter(|source| matches!(source.tensor, Tensor::Normalized { .. }))
             .count();
-        // 135 convolutions: the pre- and post-convolutions, seven upsamplers, 126 AMP convolutions.
-        assert_eq!(normalized, 135);
+        // 136 weighted convolutions: the input projection, the pre- and post-convolutions, seven
+        // upsamplers and the 126 anti-aliased multi-periodicity convolutions.
+        assert_eq!(normalized, 136);
         // 127 activations of four tensors each, plus the input projection's pair, the two
         // convolution biases, the seven upsampler biases and the 126 AMP biases.
-        assert_eq!(table.len(), 135 + 127 * 4 + 2 + 2 + 7 + 126);
+        // 127 alias-free activations of four tensors each, their convolutions' own biases (126), the
+        // upsamplers' and the two bias-carrying projections' — the post-convolution has none.
+        assert_eq!(table.len(), 136 + 127 * 4 + 126 + 7 + 2);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
