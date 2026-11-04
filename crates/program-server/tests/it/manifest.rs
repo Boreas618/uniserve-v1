@@ -25,6 +25,7 @@ fn package(text: &str, files: &[&str]) -> tempfile::TempDir {
 const REASONABLE: &str = r#"
 op = "rms_norm"
 backend = "triton"
+tuning = ["tuning/tactics.json"]
 
 [toolchain]
 kind = "triton"
@@ -47,8 +48,6 @@ selection = { tile = 1024 }
 
 [parameters]
 tile = 1024
-
-tuning = ["tuning/tactics.json"]
 "#;
 
 #[test]
