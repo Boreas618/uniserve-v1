@@ -1849,6 +1849,32 @@ fn the_one_dimensional_reference_is_the_definition() {
     assert_eq!(y[1], -0.375);
 }
 
+/// The other two host references, against values computed by hand from the same
+/// definitions: the three-dimensional one takes its taps at `o − padding + j`
+/// in each axis, and the transposed one scatters `i·stride − padding + j·dilation`.
+/// Each had, or could have, the tap sign reversed in silence.
+#[test]
+fn the_three_dimensional_and_transposed_references_are_the_definitions() {
+    // One channel, a kernel of three along the width, padding 1, so output 0
+    // reads the padding and inputs 0 and 1: 0·1 + 1·10 + 2·100 = 210. Output 1
+    // reads all three: 1·1 + 2·10 + 3·100 = 321. Output 2 reads inputs 1 and 2
+    // and the padding: 2·1 + 3·10 = 32. The reversed tap (`o + padding − j`)
+    // would answer 12, 123 and 230 instead.
+    let x = [1.0f32, 2.0, 3.0];
+    let w = [1.0f32, 10.0, 100.0];
+    let y = forward_reference_3d(&x, [1, 1, 1, 1, 3], &w, [1, 1, 1, 1, 3], [1, 1, 1, 1, 3], 1);
+    assert_eq!(y, vec![210.0, 321.0, 32.0]);
+
+    // The transposed reference on the transposed test's own inputs, generated
+    // as that test generates them: output 0 is scattered to by
+    // `i·2 − 1 + j = 0`, which is `i = 0, j = 1` only — x[0]·w[0][0][1] =
+    // -0.5·0 = 0 and x[1]·w[1][0][1] = 0.5·-0.25 = -0.125.
+    let xt: Vec<f32> = (0..8).map(|i| (i % 5) as f32 * 0.25 - 0.5).collect();
+    let wt: Vec<f32> = (0..24).map(|i| ((i * 7) % 5) as f32 * 0.25 - 0.5).collect();
+    let z = transposed_reference(&xt, [1, 2, 4], &wt, [2, 3, 4], [1, 3, 8], 2, 1, 1);
+    assert_eq!(z[0], -0.125);
+}
+
 /// The definition of a one-dimensional transposed convolution, computed on
 /// the host: every input element is scattered through the filter,
 /// `y[n][k][i · stride - padding + j · dilation] += x[n][c][i] · w[c][k][j]`.
