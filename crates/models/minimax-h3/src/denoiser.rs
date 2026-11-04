@@ -2765,13 +2765,23 @@ impl Denoiser {
         for value in &table {
             entry_bytes.extend_from_slice(&value.to_le_bytes());
         }
-        // One row per *time* of the merged ladder, not per solver step: the ladder's distinct
-        // noise levels are what `table` maps a step to, and `entries` is their count - one more
-        // than the steps a request takes, because the last point is a level and not a step.
+        // One row per timestep of the ladder, and the row count comes from the table itself: the
+        // grid holds a level for the clean end as well, so a 49-evaluation schedule states 50 rows
+        // (one more than the steps a request takes), while `entries` counts the *distinct* levels
+        // those rows point at - which dedup can make fewer than the rows. Declaring `evaluations` or
+        // `entries` rows made the bytes and the shape disagree and the load refused.
+        let entry_rows = u64::try_from(table.len() / groups.count() as usize).map_err(|_| {
+            Error::checkpoint("an AdaLN entry table wider than u64::MAX rows".to_owned())
+        })?;
+        if entry_rows < u64::from(evaluations) {
+            return Err(Error::checkpoint(format!(
+                "the AdaLN entry table has {entry_rows} rows for {evaluations} evaluations"
+            )));
+        }
         let entry_table = loader.constant(
             "minimax_h3.adaln.entries",
             DType::I32,
-            Shape::new(&[entries, u64::from(groups.count())]),
+            Shape::new(&[entry_rows, u64::from(groups.count())]),
             &entry_bytes,
         )?;
 

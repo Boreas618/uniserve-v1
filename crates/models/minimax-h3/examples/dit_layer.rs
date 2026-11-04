@@ -58,10 +58,11 @@ const ADALN_COLUMNS: u64 = 18;
 /// Not a key list: the store is searched for every committed module of these operators, and `ops`
 /// binds the descriptor a launch asks for. An operator with no directory in the store is skipped
 /// here and named at the launch that needs it.
-const OPERATORS: [&str; 12] = [
+const OPERATORS: [&str; 11] = [
     "gemm",
     "silu",
-    "gather_rows",
+    // The row gathers are `logits_gather` launches: `nn::layers::gather_rows` binds that operator
+    // with the gathered width in its key, so the store directory to look for is this one.
     "logits_gather",
     "modulated_rms_norm",
     "qk_norm_rope",
@@ -645,11 +646,21 @@ fn adaln_memory(
     for value in &table {
         entry_bytes.extend_from_slice(&value.to_le_bytes());
     }
+    // One row per timestep of the ladder - the clean end included - so the row count comes from the
+    // table the entries were built into, not from the evaluation count.
     let steps = schedule.num_steps()?;
+    let rows = u64::try_from(table.len() / groups.count() as usize).map_err(|_| {
+        Failure::message("an AdaLN entry table wider than u64::MAX rows".to_owned())
+    })?;
+    if rows < u64::from(steps) {
+        return Err(Failure::message(format!(
+            "the AdaLN entry table has {rows} rows for {steps} evaluations"
+        )));
+    }
     let entries_table = loader.constant(
         "minimax_h3.adaln.entries",
         DType::I32,
-        Shape::new(&[u64::from(steps), u64::from(groups.count())]),
+        Shape::new(&[rows, u64::from(groups.count())]),
         &entry_bytes,
     )?;
     let zeros = vec![0_u8; usize::try_from(entries * columns * 4).unwrap_or(0)];

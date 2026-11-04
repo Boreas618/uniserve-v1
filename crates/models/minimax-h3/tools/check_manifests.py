@@ -116,6 +116,17 @@ def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, 
         (18 * hidden, "modulation.rs: the per-layer table"),
     ):
         add(("logits_gather/triton", "columns", str(width), why))
+    # The gathers of whole hidden rows: the video's and the audio's at every evaluation, and the
+    # conditioner's prefix rows once per request. They are `logits_gather` launches, not a separate
+    # operator, because `nn::layers::gather_rows` binds `LogitsGather` with the width in the key.
+    add(
+        (
+            "logits_gather/triton",
+            "columns",
+            str(hidden),
+            "denoiser.rs: the video, audio and prefix row gathers",
+        )
+    )
     add(("logits_gather/triton", "dtype", "i32", "modulation.rs: the step→entry gather is i32"))
     add(("logits_gather/triton", "columns", "1", "solver.rs: the coefficient table"))
 
