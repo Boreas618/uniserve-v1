@@ -135,7 +135,7 @@ impl Staging {
             )));
         }
         let tokens = columns.rows.tokens();
-        let rows = columns.rows.calls.len();
+        let rows = columns.rows.rows();
         if tokens > bucket.tokens as usize || rows > bucket.rows as usize {
             return Err(Error::Invalid(format!(
                 "the batch's {rows} rows and {tokens} tokens do not fit bucket {bucket}"
@@ -234,7 +234,8 @@ impl Staging {
         self.commit.clear();
         self.commit.extend_from_slice(&columns.commit);
         if !columns.commit.is_empty() {
-            let columns = columns.commit.len() / rows.max(1);
+            // The commit table's rows are per call, not per row of the batch.
+            let columns = columns.commit.len() / calls.max(1);
             self.commit.resize(columns * bucket_rows, 0);
             for column in 0..columns {
                 for row in rows..bucket_rows {
