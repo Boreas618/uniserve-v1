@@ -34,10 +34,10 @@
 //!
 //! # What a scheduler cannot tell a view
 //!
-//! - `Room::graph_tiers` and `Room::warming` are the mechanism's: it holds the
-//!   build config's captured tiers and the precopy's claimed order. It builds
-//!   the facts with [`room_facts`], fills those two, and turns them into the
-//!   `Room` with [`room_view`]; [`room`] leaves both empty.
+//! - `Room::graph_tiers` is the mechanism's: it holds the build config's
+//!   captured tiers. It builds the facts with [`room_facts`], fills the tiers,
+//!   and turns them into the `Room` with [`room_view`]; [`room`] leaves them
+//!   empty. (`Room::warming` is read here, from the claimed precopy pages.)
 //! - `Snapshot::ranks` and a trial's `arrival` need the ranks' load, which the
 //!   routing table on the control thread holds and a scheduler does not: a
 //!   scheduler knows one rank's load, its own. [`trial_state`] therefore trips
@@ -644,9 +644,33 @@ pub(crate) fn room_facts(scheduler: &Scheduler, step: u64) -> RoomFacts {
         )
         .unwrap_or(u32::MAX),
         capacity_units: scheduler.storage.capacity_units() as u64,
-        // `warming::Warming::reserved` is private to its module.
-        warming: Vec::new(),
+        warming: warming(scheduler),
     }
+}
+
+/// The requests an epoch's precopy warms, in the order the mechanism claimed
+/// them, each with its pages in prefix order.
+///
+/// The claim order is the reservation list's own: each reserved page names the
+/// cache resume it serves, and a request's pages keep the order they were
+/// claimed in.
+fn warming(scheduler: &Scheduler) -> Vec<WarmingView> {
+    let mut views: Vec<WarmingView> = Vec::new();
+    for reserved in &scheduler.warming.reserved {
+        let Some(unit) = reserved.reference.units().first().copied() else {
+            continue;
+        };
+        let request = ViewRequestId(reserved.resume.request_id);
+        let page = device_page(unit.0);
+        match views.iter_mut().find(|view| view.request == request) {
+            Some(view) => view.pages.push(page),
+            None => views.push(WarmingView {
+                request,
+                pages: vec![page],
+            }),
+        }
+    }
+    views
 }
 
 /// The storage the mechanism finds short right now, for `reclaim`.
