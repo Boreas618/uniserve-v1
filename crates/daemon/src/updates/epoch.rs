@@ -79,7 +79,10 @@ pub(crate) fn epoch_arm(
         .request_socket()
         .to_string_lossy()
         .into_owned();
-    let record = record(previous, target, change.previous, epochs)?;
+    let mut record = record(previous, target, change.previous, epochs)?;
+    // The world allocation this epoch executes: the epoch number today, so
+    // the switch's claims and the record name the same world.
+    record.world = change.target;
 
     if dry_run {
         // Nothing is written and nothing starts: the plan names what the
@@ -138,6 +141,9 @@ fn record(
     record.previous_kernels = serving.kernels;
     record.previous_policy = Some(serving.policy);
     record.status = Status::Precopy;
+    // The target's own generation is set only by a child's report (M904);
+    // the previous epoch's names another process.
+    record.generation = None;
     // The record is the serving one with the target's build and programs, so
     // that a field added to `EpochRecord` needs no change here. The target's
     // own launch generation is not part of the record yet; when it is added,
@@ -299,6 +305,8 @@ mod tests {
             previous_kernels: BTreeMap::new(),
             previous_policy: None,
             status: Status::Serving,
+            generation: Some(4),
+            world: 11,
         }
     }
 

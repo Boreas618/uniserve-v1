@@ -988,11 +988,15 @@ mod tests {
             policy: Program {
                 backend: "fcfs".to_owned(),
                 revision: 0,
-                arguments: HashMap::new(),
+                arguments: toml::Table::new(),
             },
             previous_kernels: BTreeMap::new(),
             previous_policy: None,
             status: Status::Serving,
+            generation: None,
+            // The record is kept under epsilon 12 in this test's switch, and
+            // `apply` fills the world allocation with the epoch number.
+            world: 12,
         }
     }
 
