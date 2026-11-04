@@ -2359,7 +2359,9 @@ impl Denoiser {
             frequencies,
             evaluations,
             refiner,
-            rank: partition.tensor_rank as u32,
+            // The denoiser's own rank, not the text encoder's: the two shards are independent, and
+            // with one tensor shard every rank's `tensor_rank` is 0 (`partition.rs`).
+            rank: partition.sequence_rank as u32,
             shard: partition.ulysses_degree as u32,
         })
     }
