@@ -1,31 +1,27 @@
-"""The expert_map package's compile script: one descriptor -> one module.
+"""The expert_gather package's compile script: one descriptor -> one module.
 
 A descriptor is the expert count the permutation covers and the top-k width.
-One program maps one token's picks, so the token count stays a runtime value.
+The token count stays a runtime value through ``entries``, which the launch
+computes as ``tokens · top``.
 """
 
 import _compile
-import expert_map as kernels
+import expert_gather as kernels
 
 
 def spec(fields, parameters, target):
-    """The compilation of one expert_map descriptor."""
-    top = int(fields["top"])
+    """The compilation of one expert_gather descriptor."""
     return {
-        "kernel": kernels._expert_map_kernel,
+        "kernel": kernels._expert_gather_kernel,
         "signature": {
             "ids_ptr": "*i32",
             "map_ptr": "*i32",
             "out_ptr": "*i32",
-            "top": "constexpr",
-            "block": "constexpr",
+            "entries": "i64",
+            "BLOCK": "constexpr",
         },
-        "constexprs": {
-            "top": top,
-            # One lane per pick, rounded up to a warp-wide tile.
-            "block": 1 << max(5, (top - 1).bit_length()),
-        },
-        "options": {"num_warps": 1},
+        "constexprs": {"BLOCK": int(parameters["block"])},
+        "options": {"num_warps": 4},
     }
 
 

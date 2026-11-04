@@ -1,34 +1,33 @@
-"""The sampler_logprobs package's compile script: one descriptor -> one module.
+"""The log_softmax package's compile script: one descriptor -> one module.
 
-A descriptor is the logits dtype. The vocabulary and every stride are runtime
-values, so one module serves every row count and vocabulary.
+A descriptor is the input logits' dtype, the row width, the program's tile and
+the dependent-launch flag. The output is FP32 in every case; the row count comes
+from the grid.
 """
 
 import _compile
-import sampler_logprobs as kernels
+import log_softmax as kernels
 
-#: The logits dtypes the kernel reads; it scores in FP32 in every case.
-DTYPES = {"fp32": "fp32", "bf16": "bf16", "fp16": "fp16"}
+#: The input logits' dtype.
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
 
 
 def spec(fields, parameters, target):
-    """The compilation of one sampler_logprobs descriptor."""
+    """The compilation of one log_softmax descriptor."""
+    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    tile = int(fields["tile"])
     return {
-        "kernel": kernels._logprobs_kernel,
+        "kernel": kernels._log_softmax_kernel,
         "signature": {
-            "logits_ptr": "*" + DTYPES[fields["dtype"]],
-            "rows_ptr": "*i32",
-            "tokens_ptr": "*i64",
-            "scores_ptr": "*fp32",
-            "ranks_ptr": "*i32",
-            "vocab": "i32",
-            "logits_stride": "i64",
-            "rows_stride": "i64",
-            "tokens_stride": "i64",
-            "block": "constexpr",
+            "x_ptr": "*" + DTYPES[fields["dtype"]],
+            "out_ptr": "*fp32",
+            "columns": "i32",
+            "pdl": "i32",
+            "TILE": "constexpr",
+            "PDL": "constexpr",
         },
-        "constexprs": {"block": int(parameters["block"])},
-        "options": {"num_warps": int(parameters["warps"])},
+        "constexprs": {"TILE": tile, "PDL": pdl},
+        "options": {"num_warps": 8 if tile >= 2048 else 4, "launch_pdl": pdl},
     }
 
 

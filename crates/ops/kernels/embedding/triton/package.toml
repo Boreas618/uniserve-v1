@@ -1,8 +1,10 @@
-# The embedding operator's triton backend: design 5.2's program package.
+# The embedding operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program copies the hidden rows of `block` tokens out of this shard's
+# vocabulary weight; the token count is a launch value.
 
 op = "embedding"
 backend = "triton"
@@ -25,9 +27,10 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `dtype_bf16_ids_i64_hidden_2048_first_0_rows_151936_block_4_pdl_true`.
 [kernel.descriptors]
-dimensions = { ids = ["i64", "i32"], dtype = ["bf16", "fp16", "fp32"], width = ["2048"] }
+dimensions = { dtype = ["bf16", "fp16", "fp32"], ids = ["i64", "i32"], hidden = ["2048", "4096", "7168", "5120"], first = ["0", "151936", "75968"], rows = ["151936", "75968", "248320", "152064"], block = ["1", "2", "4", "8"], pdl = ["true", "false"] }
 
 [parameters]
-block = 1024
-warps = 4
+# Columns one inner tile copies.
+tile = 256

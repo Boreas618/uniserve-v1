@@ -1,10 +1,12 @@
-# The rope_factors operator's triton backend: design 5.2's program package.
+# The rotary_factors operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program stores a block of scaled cosine and sine factors; the token count
+# is a launch value, so one module serves every sequence length.
 
-op = "rope_factors"
+op = "rotary_factors"
 backend = "triton"
 
 [toolchain]
@@ -18,16 +20,15 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/rope_factors.py", "src/build.py", "src/_compile.py"]
+files = ["src/rotary_factors.py", "src/build.py", "src/_compile.py"]
 script = "src/build.py"
 
 [kernel]
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `dtype_fp32_positions_i64_columns_64_block_256_scale_0x3f800000_pdl_true`.
 [kernel.descriptors]
-dimensions = { positions = ["i32", "i64"], factors = ["fp32", "bf16"], half_dim = ["64", "128"], layout = ["sequence"] }
+dimensions = { dtype = ["fp32", "bf16", "fp16"], positions = ["i32", "i64"], columns = ["32", "64", "128"], block = ["256", "512", "1024"], scale = ["0x3f800000"], pdl = ["true", "false"] }
 
 [parameters]
-scale = 1.0
-block = 256

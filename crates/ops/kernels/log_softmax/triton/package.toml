@@ -1,15 +1,12 @@
-# The sampler_logprobs operator's Triton backend: design 5.2's program package.
+# The log_softmax operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
 #
-# One program scores one output row in three streaming passes over its logits
-# row: the maximum, the log-sum-exp normalizer, then the selected token's score
-# and its competition rank. The top-k logprob fields of the operator need a
-# device top-k selection, which this package does not have yet.
+# One program scores one row in three streaming passes; the row count comes from
+# the grid, so one module serves every row count.
 
-op = "sampler_logprobs"
+op = "log_softmax"
 backend = "triton"
 
 [toolchain]
@@ -23,18 +20,15 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/sampler_logprobs.py", "src/build.py", "src/_compile.py"]
+files = ["src/log_softmax.py", "src/build.py", "src/_compile.py"]
 script = "src/build.py"
 
 [kernel]
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_fp32`.
+# `dtype_fp32_columns_151936_tile_4096_pdl_true`.
 [kernel.descriptors]
-dimensions = { dtype = ["fp32", "bf16", "fp16"] }
+dimensions = { dtype = ["fp32", "bf16", "fp16"], columns = ["151936", "152064", "248320", "2048", "128"], tile = ["1024", "2048", "4096", "8192"], pdl = ["true", "false"] }
 
 [parameters]
-# Elements one pass step reads.
-block = 4096
-warps = 8

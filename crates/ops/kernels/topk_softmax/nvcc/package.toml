@@ -1,11 +1,17 @@
-# The routing_softmax_topk operator's cuda backend: design 5.2's program package.
+# The topk_softmax operator's CUDA backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The module is a cubin. The descriptor bakes the scores a lane walks (the
+# expert count in whole warps) and the renormalizing butterfly's width (the
+# top-k width rounded up to a power of two); one warp routes one token and a
+# four-warp block routes four, which is the grid the operator computes. The
+# scores' and the optional scale's storage kinds are launch values.
 
-op = "routing_softmax_topk"
-backend = "cuda"
+op = "topk_softmax"
+backend = "nvcc"
 
 [toolchain]
 kind = "nvcc"
@@ -13,24 +19,20 @@ version = "13.0.48"
 packages = []
 
 [module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_routing_softmax_topk"
+form = "cubin"
+metadata = "metadata.json"
 
 [source]
 kind = "cuda"
-files = ["src/topk_softmax.cu", "src/topk_softmax.h"]
+files = ["src/topk_softmax.cu", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `scores_bf16_experts_128_top_8_renormalize_true_scale_none`.
 [kernel.descriptors]
-dimensions = { scores = ["bf16", "fp16", "fp32"], experts = ["128", "256"], top = ["8"], scale = ["none", "present"] }
+dimensions = { scores = ["bf16", "fp16", "f32"], experts = ["128", "256", "64", "32"], top = ["8", "4", "2", "1"], renormalize = ["true", "false"], scale = ["none", "bf16", "fp16", "f32"] }
 
 [parameters]
-standard = "c++20"
-optimization = "-O3"
-link = "shared"
