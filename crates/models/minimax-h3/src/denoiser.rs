@@ -198,6 +198,49 @@ impl Layouts {
         Ok(bound)
     }
 
+    /// The segment packing of a sparse layout, rebuilt from the layout's own extents.
+    ///
+    /// The tile capacities a sparse layout holds are tile-rounded, so a rebuild from the layout's
+    /// numbers must return the same extent: a mismatch is a layout this deployment did not pack,
+    /// and the tables built from it would address rows that are not there.
+    pub fn segment_of(&self, layout: &Layout) -> Result<packing::SegmentPacking> {
+        let tile = match self.config.attention {
+            crate::config::AttentionKind::Sparse { tile, .. } => tile,
+            crate::config::AttentionKind::Dense => {
+                return Err(Error::config(
+                    "a dense deployment has no segment packing".to_owned(),
+                ));
+            }
+        };
+        let frames = frame_count(layout.video.frames)?;
+        let canvas = canvas_of_latents(layout)?;
+        let packed = packing::segment_packing(
+            frames,
+            &canvas,
+            layout.text_rows,
+            layout.condition_rows,
+            tile,
+            tile,
+        )?;
+        let extent = &packed.extent;
+        let raster = packing::latent_raster(&canvas)?;
+        let video_rows = extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2;
+        // The layout's capacities are rows of whole tokens; a segment packing rounds each prefix
+        // capacity up to its tile, and its audio and video rows are the layout's own.
+        let tiles = |rows: u32| rows.div_ceil(tile) * tile;
+        if u64::from(video_rows) != u64::from(layout.video.frames) * raster.patch_rows() as u64
+            || extent.audio_rows != packing::audio_rows(frames)
+            || extent.text_rows != tiles(layout.text_rows)
+            || extent.condition_rows != tiles(layout.condition_rows)
+        {
+            return Err(Error::config(format!(
+                "the layout's {:?} extents are not a segment packing this deployment builds",
+                layout.video
+            )));
+        }
+        Ok(packed)
+    }
+
     /// The layout a request is laid out in, without packing it.
     ///
     /// The capability asks for a layout and cannot refuse one, so this snaps the request the way
@@ -298,6 +341,14 @@ impl Layouts {
     /// [`packing::dense_packing`]'s for the frame count and canvas those extents imply, and the two
     /// must agree - a disagreement is a layout this model did not build.
     pub fn packing_of(&self, layout: &Layout) -> Result<DensePacking> {
+        if matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        ) {
+            return Err(Error::config(
+                "a sparse deployment packs its layout in tiles, not densely".to_owned(),
+            ));
+        }
         let canvas = canvas_of_latents(layout)?;
         let frames = frame_count(layout.video.frames)?;
         let packing = packing::dense_packing(
@@ -1248,6 +1299,43 @@ mod tests {
             conditions: &[],
             vision_spans: &[],
         }
+    }
+
+    fn sparse_layouts() -> Layouts {
+        let mut config = layouts().config;
+        config.attention = AttentionKind::sparse(64, 0.8, None).unwrap();
+        Layouts::new(config, layouts().arrangement).unwrap()
+    }
+
+    #[test]
+    fn a_sparse_layout_rebuilds_its_segment_packing() {
+        let rule = sparse_layouts();
+        // The dense layout carries the capacities a request names; the segment packing rounds each
+        // prefix capacity up to its tile and pads the rows to whole tiles.
+        let (layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let packed = rule.segment_of(&layout).unwrap();
+        assert_eq!(packed.extent.tile, 64);
+        assert_eq!(packed.extent.text_rows, 128);
+        assert_eq!(packed.extent.condition_rows, 64);
+        assert_eq!(packed.extent.padded_tokens % 64, 0);
+        assert_eq!(
+            packed.video_variable_block_sizes.len() as u32,
+            packed.extent.video_tiles
+        );
+        // A dense deployment has no segment packing to give, and says so rather than guessing.
+        assert!(layouts().segment_of(&layout).is_err());
+    }
+
+    #[test]
+    fn a_layout_built_densely_is_not_a_segment_packing_a_sparse_deployment_builds() {
+        // The same request read by the two deployments: only the sparse one pads to whole tiles, and
+        // a layout whose raster does not match its frame count is refused by both.
+        let (layout, dense) = layouts().layout(&request(121, 1344, 768)).unwrap();
+        let packed = sparse_layouts().segment_of(&layout).unwrap();
+        assert!(packed.extent.padded_tokens > dense.padded_tokens);
+        let mut broken = layout;
+        broken.video.frames = 24;
+        assert!(sparse_layouts().segment_of(&broken).is_err());
     }
 
     #[test]
