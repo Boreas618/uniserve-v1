@@ -138,6 +138,13 @@ fn record(
     record.previous_kernels = serving.kernels;
     record.previous_policy = Some(serving.policy);
     record.status = Status::Precopy;
+    // The record is the serving one with the target's build and programs, so
+    // that a field added to `EpochRecord` needs no change here. The target's
+    // own launch generation is not part of the record yet; when it is added,
+    // it is cleared here rather than inherited — a generation is set only from
+    // a child's own report (M904), and the serving epoch's would name a
+    // process of another epoch.
+    //
     // The previous deployment is not used otherwise: it names the epoch, and
     // `layer` has already said the change is an epoch one.
     let _ = previous;
@@ -237,8 +244,11 @@ mod tests {
         }
 
         fn command(&mut self, host: &str, generation: u64, command: process::Command) {
-            self.commands
-                .push((host.to_owned(), generation, command.kind.expect("a command")));
+            self.commands.push((
+                host.to_owned(),
+                generation,
+                command.kind.expect("a command"),
+            ));
         }
 
         fn serve(&mut self, epoch: u64, requests: &str) {
@@ -344,9 +354,17 @@ mod tests {
         let mut running = None;
         let mut roster = Fake::default();
         assert!(
-            epoch_arm(&previous, &host, change(12), &epochs, &mut roster, &mut running, false)
-                .expect("the host layer is another path")
-                .is_none()
+            epoch_arm(
+                &previous,
+                &host,
+                change(12),
+                &epochs,
+                &mut roster,
+                &mut running,
+                false
+            )
+            .expect("the host layer is another path")
+            .is_none()
         );
         assert!(running.is_none());
 
