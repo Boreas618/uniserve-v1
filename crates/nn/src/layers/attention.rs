@@ -743,6 +743,27 @@ impl Attention {
                 ));
             }
         }
+        // The page table is the cache's and it carries one row per sequence of this batch. The
+        // operator sees only the table, so a table of another rank or another row count would read
+        // another batch's pages there; the batch's arity is known here and is checked here.
+        let sequences = batch.query_offsets.numel().saturating_sub(1);
+        let table = group_view.block_tables;
+        if table.shape.rank() != 2 || table.shape.dim(0) != sequences {
+            return Err(Error::shape(
+                "Attention::attend",
+                format!(
+                    "the page table is {:?}, [{sequences}, pages] expected: one row per sequence \
+                     of this batch",
+                    table.shape.dims()
+                ),
+            ));
+        }
+        if table.dtype != DType::I32 {
+            return Err(Error::shape(
+                "Attention::attend",
+                format!("the page table is {} pages, not i32", table.dtype),
+            ));
+        }
         let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype);
         // An FP8 plane stores each page divided by its own FP32 scale; the plane's element type
         // decides whether the call carries one, so a mismatch in either direction is an argument
