@@ -1647,6 +1647,38 @@ impl Cudnn {
             Operation::graph(self.api, &forward, &self.handle)
         );
 
+        // The public path, exercised beside the walk: what `engines` offers
+        // for this shape and which engine `plan` picks. The walk above is the
+        // descriptor-by-descriptor story; these two are what ops and the model
+        // actually call, and they are the answer the convolution tests read.
+        match self.engines(convolution, 8) {
+            Ok(engines) => {
+                let indices: Vec<i64> =
+                    engines.iter().map(|engine| engine.global_index()).collect();
+                steps.push((
+                    format!(
+                        "engines: {} offered for this shape, global indices {indices:?}",
+                        engines.len()
+                    ),
+                    None,
+                ));
+            }
+            Err(error) => steps.push((String::from("engines"), Some(error.to_string()))),
+        }
+        match self.plan(convolution, None) {
+            Ok(plan) => steps.push((
+                format!(
+                    "plan: engine {}, {} bytes of workspace, x {} w {} y {} bytes",
+                    plan.engine().global_index(),
+                    plan.workspace_bytes(),
+                    plan.bytes().x,
+                    plan.bytes().w,
+                    plan.bytes().y
+                ),
+                None,
+            )),
+            Err(error) => steps.push((String::from("plan"), Some(error.to_string()))),
+        }
         let heuristic = stage!(
             "engine heuristic: mode A, operation graph, finalize",
             Self::heuristic(self.api, &graph, HEURISTIC_MODE_A)
