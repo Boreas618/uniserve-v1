@@ -186,7 +186,7 @@ fn nodes(config: &ServeConfig) -> Result<Vec<Node>, UpdateError> {
 }
 
 /// The switch as the operator sees it right after it started.
-fn report(switch: &Switch) -> Value {
+pub(crate) fn report(switch: &Switch) -> Value {
     json!({
         "change": "epoch",
         "phase": switch.phase().name(),
