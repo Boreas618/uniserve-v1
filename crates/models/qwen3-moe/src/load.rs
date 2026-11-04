@@ -12,12 +12,12 @@
 //!
 //! ## Partitioning
 //!
-//! A region of a checkpoint tensor is contiguous and row-major, so a shard along the *first* axis
-//! is `start = rank × rows × width`; the vocabulary, the query/key/value projections and the
-//! router are sharded that way. A shard along the *last* axis (`o_proj`, a dense `down_proj`) is
-//! strided, which [`nn::weights::WeightSource`] does not yet express; a deployment that needs one
-//! is refused here with the reason instead of silently loading a wrong region. The BF16 vertical
-//! slice is one rank, so every shard below is the whole tensor.
+//! A regional shard of a checkpoint tensor is row-major, so a shard along the *first* axis is
+//! `start = rank × rows × width`, and a shard along the *last* axis is a gather of rows that start
+//! `full_width` elements apart — `WeightSource::Strided`, one row block per rank. The vocabulary,
+//! the query/key/value projections and the router are sharded on their rows; `o_proj` and a dense
+//! `down_proj` are sharded on their reduction axis, whose region is strided. Both go through one
+//! loader, and a rank that owns the whole axis reads the same region either way.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -336,11 +336,11 @@ fn projection(
     Linear::new(weight, bias, WeightOrder::NxK).map_err(Error::from)
 }
 
-/// The row-parallel output projection: `[hidden, query]`.
+/// The row-parallel output projection: `[hidden, reduction]`, this rank's block of the reduction.
 ///
-/// It is sharded along its reduction axis, whose region is strided in the checkpoint's row-major
-/// tensor; until the retained weight source expresses a strided region, only one tensor rank is
-/// loadable.
+/// The checkpoint stores the whole `[hidden, reduction × ranks]` matrix row-major, so this rank's
+/// block is every row's own `reduction` elements: a gather of rows `reduction × ranks` apart,
+/// which the loader converts into one contiguous retained weight. The bias is not sharded.
 fn output_projection(
     loader: &mut WeightLoader<'_>,
     sources: &HashMap<String, String>,
@@ -350,19 +350,13 @@ fn output_projection(
     reduction: u64,
     bias: bool,
 ) -> Result<Linear> {
-    if partition.tensor_parallel != 1 {
-        return Err(Error::Unsupported(format!(
-            "{parameter}: a row-parallel shard of the reduction axis is strided in the checkpoint; \
-             tensor parallelism above one needs a strided retained region"
-        )));
-    }
-    let weight = region(
-        loader,
-        sources,
-        &format!("{parameter}.weight"),
-        0,
-        Shape::new(&[hidden, reduction]),
+    let request = row_parallel_region(
+        partition,
+        checkpoint_name(sources, &format!("{parameter}.weight"))?,
+        hidden,
+        reduction,
     )?;
+    let weight = loader.load(&request).map_err(Error::from)?;
     let bias = if bias {
         Some(region(
             loader,
@@ -473,6 +467,38 @@ fn expert_block(
         )
         .map_err(Error::from)
     }
+}
+
+/// The region of a row-parallel projection's checkpoint tensor this rank owns.
+///
+/// The checkpoint holds `[rows, columns × tensor_parallel]` row-major, so the rank's block is its
+/// own `columns` elements of every row: `Strided` with the first element at `rank × columns` and
+/// rows `columns × tensor_parallel` apart. One rank lays the same region out contiguously, so the
+/// two degrees share the one request form and nothing downstream can tell them apart.
+fn row_parallel_region(
+    partition: &Partition,
+    tensor: &str,
+    rows: u64,
+    columns: u64,
+) -> Result<WeightRequest> {
+    let rank = as_u64(partition.tensor_rank, "the tensor rank")?;
+    let ranks = as_u64(partition.tensor_parallel, "the tensor parallel width")?;
+    let full = columns.checked_mul(ranks).ok_or_else(|| {
+        Error::Config(format!(
+            "{tensor}: {columns} columns over {ranks} ranks overflows"
+        ))
+    })?;
+    let start = rank.checked_mul(columns).ok_or_else(|| {
+        Error::Config(format!(
+            "{tensor}: rank {rank} of {ranks} starts past the reduction axis"
+        ))
+    })?;
+    Ok(WeightRequest::strided(
+        tensor,
+        start,
+        Shape::new(&[rows, columns]),
+        full,
+    ))
 }
 
 /// One dense layer's feed-forward block.
@@ -635,6 +661,7 @@ fn frequency_bytes(frequencies: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::{Config, YaRn};
+    use nn::weights::WeightSource;
 
     fn config() -> Config {
         Config {
@@ -659,6 +686,64 @@ mod tests {
             decoder_sparse_step: 1,
             mlp_only_layers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_row_parallel_projection_reads_its_own_column_block_of_every_row() {
+        // Two ranks over a `[2048, 1536]` matrix: rank 1 owns columns 768..1536, which in the
+        // checkpoint's row-major order is every row's second half.
+        let sharded = Partition {
+            tensor_parallel: 2,
+            tensor_rank: 1,
+            expert_parallel: 1,
+            expert_rank: 0,
+        };
+        let request = row_parallel_region(&sharded, "o_proj.weight", 2048, 768).unwrap();
+        assert_eq!(request.shape, Shape::new(&[2048, 768]));
+        match &request.source {
+            WeightSource::Strided {
+                tensor,
+                start,
+                shape,
+                row_stride,
+            } => {
+                assert_eq!(tensor, "o_proj.weight");
+                assert_eq!(*start, 768);
+                assert_eq!(*shape, Shape::new(&[2048, 768]));
+                assert_eq!(*row_stride, 1536);
+            }
+            source => panic!("rank 1 of 2 read {source:?} instead of its column block"),
+        }
+
+        // Rank 0 reads the first block, and one rank reads the whole axis: the same form, the
+        // region then being every row's own columns.
+        let first = row_parallel_region(
+            &Partition {
+                tensor_rank: 0,
+                ..sharded
+            },
+            "o_proj.weight",
+            2048,
+            768,
+        )
+        .unwrap();
+        assert!(matches!(
+            first.source,
+            WeightSource::Strided {
+                start: 0,
+                row_stride: 1536,
+                ..
+            }
+        ));
+        let whole = row_parallel_region(&Partition::single(), "o_proj.weight", 2048, 768).unwrap();
+        assert!(matches!(
+            whole.source,
+            WeightSource::Strided {
+                start: 0,
+                row_stride: 768,
+                ..
+            }
+        ));
     }
 
     #[test]
