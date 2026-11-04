@@ -1,37 +1,33 @@
-# The rope_factors operator's Triton backend.
+# The rope_factors operator's triton backend: design 5.2's program package.
 #
-# One program stores a block of compact cosine and sine factors for strided
-# positions, with full-range FP32 trigonometry. A module covers one (positions
-# dtype, factor dtype, half head width, layout, target).
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
 op = "rope_factors"
 backend = "triton"
 
 [toolchain]
-kind = "triton"
+kind = "python"
 version = "3.7.1"
 packages = []
 
 [module]
 form = "cubin"
-metadata = "triton"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
 files = ["src/rope_factors.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
 
-architectures = ["sm_100a", "sm_90a"]
+[kernel]
 target = "arch"
+architectures = ["sm_100a", "sm_90a"]
 
-# `positions_i64_factors_fp32_half_dim_64_layout_sequence`.
-[descriptors]
-positions = ["i32", "i64"]
-factors = ["fp32", "bf16"]
-half_dim = ["64", "128"]
-layout = ["sequence"]
+[kernel.descriptors]
+dimensions = { positions = ["i32", "i64"], factors = ["fp32", "bf16"], half_dim = ["64", "128"], layout = ["sequence"] }
 
 [parameters]
-# The factor scale `RotaryEmbedding` bakes into its tables; 1.0 for YaRN with
-# no attention scaling.
 scale = 1.0
-# Elements one program covers.
 block = 256

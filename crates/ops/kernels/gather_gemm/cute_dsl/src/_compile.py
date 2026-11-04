@@ -149,7 +149,7 @@ def compile_one(package, target, key, out, spec):
     # no device is read and none is needed.
     os.environ["CUTE_DSL_ARCH"] = target
     manifest = tomllib.loads((package / "package.toml").read_text())
-    fields = parse_key(key, manifest["descriptors"])
+    fields = parse_key(key, manifest["kernel"]["descriptors"]["dimensions"])
     described = spec(fields, manifest.get("parameters", {}), target)
     compiled = cute.compile(
         described["kernel"],
@@ -198,13 +198,33 @@ def compile_one(package, target, key, out, spec):
     print(json.dumps({"descriptor": key, "target": target, "entry": described["entry"]}))
 
 
-def main(spec):
-    """``build.py --package <dir> --descriptor <key> --target <sm_XX> --out <dir>``."""
-    arguments = dict(zip(sys.argv[1::2], sys.argv[2::2]))
-    compile_one(
-        Path(arguments["--package"]),
-        arguments["--target"],
-        arguments["--descriptor"],
-        Path(arguments["--out"]),
-        spec,
+def arguments():
+    """The build's arguments: the Program Server's environment, or flags.
+
+    The Program Server runs a package's script with `UNISERVE_PACKAGE`,
+    `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET` and `UNISERVE_OUT` set, and
+    `MAX_JOBS` capping the job's own parallelism. A direct run states the same
+    four as flags, which is how a package is proved to compile outside it.
+    """
+    if os.environ.get("UNISERVE_OUT"):
+        package = Path(os.environ["UNISERVE_PACKAGE"])
+        manifest = tomllib.loads((package / "package.toml").read_text())
+        target = os.environ.get("UNISERVE_TARGET") or manifest["kernel"]["architectures"][0]
+        return (
+            package,
+            target,
+            os.environ["UNISERVE_DESCRIPTOR"],
+            Path(os.environ["UNISERVE_OUT"]),
+        )
+    flags = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+    return (
+        Path(flags["--package"]),
+        flags["--target"],
+        flags["--descriptor"],
+        Path(flags["--out"]),
     )
+
+
+def main(spec):
+    """Compile the descriptor the build names into its output directory."""
+    compile_one(*arguments(), spec)

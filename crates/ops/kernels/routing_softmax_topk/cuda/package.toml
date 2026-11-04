@@ -1,14 +1,9 @@
-# The routing_softmax_topk operator's CUDA backend.
+# The routing_softmax_topk operator's cuda backend: design 5.2's program package.
 #
-# One warp routes one token: FP32 softmax over the router scores, the k largest
-# probabilities with equal ones in ascending expert order, optional
-# renormalization clamped below by FLT_EPSILON, and an optional per-expert
-# scale. Outputs are int32 expert ids and float32 weights, [tokens, top].
-#
-# The module is a native library because the launch code selects the score
-# layout, the per-lane iteration count and the top-k specialization by the
-# launch's arguments: one library serves every descriptor this package
-# declares, and the operator's Rust side only fills the C entry's arguments.
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
 op = "routing_softmax_topk"
 backend = "cuda"
 
@@ -19,24 +14,21 @@ packages = []
 
 [module]
 form = "native"
+entry = "uniserve_routing_softmax_topk"
 
 [source]
 kind = "cuda"
 files = ["src/topk_softmax.cu", "src/topk_softmax.h"]
-entry = "uniserve_routing_softmax_topk"
+script = "src/build.py"
 
-architectures = ["sm_100a", "sm_90a"]
+[kernel]
 target = "arch"
+architectures = ["sm_100a", "sm_90a"]
 
-# `scores_bf16_experts_128_top_8_scale_none`.
-[descriptors]
-scores = ["bf16", "fp16", "fp32"]
-experts = ["128", "256"]
-top = ["8"]
-scale = ["none", "present"]
+[kernel.descriptors]
+dimensions = { scores = ["bf16", "fp16", "fp32"], experts = ["128", "256"], top = ["8"], scale = ["none", "present"] }
 
 [parameters]
-# nvcc invocation: C++20, -O3, a shared library exporting the C entry.
 standard = "c++20"
 optimization = "-O3"
 link = "shared"

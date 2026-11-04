@@ -1,28 +1,29 @@
-# The expert_map operator's Triton backend.
+# The expert_map operator's triton backend: design 5.2's program package.
 #
-# One program maps a token's top-k logical expert ids to their physical experts
-# through the epoch's expert permutation. The expert count is a compile-time
-# bound of the permutation table; the token count is not.
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
 op = "expert_map"
 backend = "triton"
 
 [toolchain]
-kind = "triton"
+kind = "python"
 version = "3.7.1"
 packages = []
 
 [module]
 form = "cubin"
-metadata = "triton"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
 files = ["src/expert_map.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
 
-architectures = ["sm_100a", "sm_90a"]
+[kernel]
 target = "arch"
+architectures = ["sm_100a", "sm_90a"]
 
-# `experts_128_top_8`.
-[descriptors]
-experts = ["128", "256"]
-top = ["8"]
+[kernel.descriptors]
+dimensions = { experts = ["128", "256"], top = ["8"] }
