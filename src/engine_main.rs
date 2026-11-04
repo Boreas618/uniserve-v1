@@ -414,6 +414,11 @@ fn claim(
         // host KV cache with no rank holding a page of it.
         host_kv_cache,
         tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
+        // The deployment's *storage* peers - where another node's Storage Server is reached for the
+        // weights a rank receives from it - are empty because nothing this process is told states
+        // them: the claim's answer carries this node's own server only. A deployment of several
+        // hosts needs them before a cross-host weight transfer can be planned, and until then this
+        // rank maps what its own node holds (a named gap for 7.4, not a default).
         peers: Vec::new(),
         world: launch.world,
         // The standby role is the epoch layer's (§2.5, §7.4): a standby maps its scope's storage
