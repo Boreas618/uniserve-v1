@@ -1,6 +1,6 @@
 //! Behavior against a real driver. These tests need a CUDA device and use a
 //! few megabytes of storage on device 0; run them with
-//! `cargo test -p cuda -- --ignored`.
+//! `cargo test -p platform --test it -- --ignored --test-threads=1`.
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
