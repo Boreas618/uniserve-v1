@@ -184,7 +184,18 @@ pub struct BatchColumns {
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
+    ///
+    /// A row is one sequence's query, and a call owns a half-open range of them: a verification's
+    /// candidate tokens are several rows of one call, so this is the rows' count and not the calls'.
     pub fn rows(&self) -> usize {
+        self.rows.rows()
+    }
+
+    /// The number of calls the columns describe.
+    ///
+    /// The sampler's slots and parameters are per row; the commit table's rows are per call, since
+    /// a call states how the step advances its slot's state once, however many rows it evaluated.
+    pub fn calls(&self) -> usize {
         self.rows.calls.len()
     }
 
@@ -197,7 +208,8 @@ impl BatchColumns {
     /// batch fails before a launch rather than after one.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
-        let rows = self.rows.calls.len();
+        let rows = self.rows.rows();
+        let calls = self.rows.calls.len();
         for (name, actual, expected) in [
             ("input_ids", self.input_ids.len(), tokens),
             ("slots", self.slots.len(), rows),
@@ -213,9 +225,9 @@ impl BatchColumns {
                 )));
             }
         }
-        if self.commit.len() % rows.max(1) != 0 {
+        if self.commit.len() % calls.max(1) != 0 {
             return Err(Error::Invalid(format!(
-                "commit has {} entries, not a whole number of columns over {rows} rows",
+                "commit has {} entries, not a whole number of columns over {calls} calls",
                 self.commit.len()
             )));
         }
@@ -452,7 +464,13 @@ pub trait Batches: Send + Sync {
     /// units, cache geometry or model length are absent here is a pool it refuses to serve rather
     /// than one it assumes, because a scheduler that guesses a rank's cache makes the host KV path
     /// disappear at runtime.
-    fn inventory(&self) -> &[Inventory];
+    ///
+    /// Empty means an executor that has not stated its pools; the mechanism refuses to construct a
+    /// scheduler over it, so the omission is a visible failure at construction and never a silent
+    /// default. An executor that serves batches states them.
+    fn inventory(&self) -> &[Inventory] {
+        &[]
+    }
 }
 
 /// One pool of the deployment an executor serves (4.2, 7.3).
