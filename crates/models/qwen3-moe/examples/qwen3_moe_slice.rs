@@ -47,7 +47,7 @@ use std::process::ExitCode;
 use nn::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
 use nn::{
     Arena, Backing, CausalLm, Checkpoint, DType, DevicePtr, Forward, PhaseKind, RetainedWeights,
-    Shape, TensorView, WeightKey, WeightLoader,
+    Sampler, SamplerState, Samples, Shape, TensorView, WeightKey, WeightLoader,
 };
 use ops::{Generation, KernelEntry};
 use qwen3_moe::{Config, LoadOptions, Partition, Plan, Run, Substage};
@@ -136,6 +136,30 @@ struct Args {
     /// router is visible as a scale, because the softmax that follows maps any monotone compression
     /// of a row onto nearly uniform weights.
     scores: bool,
+    /// How many tokens to generate after the prompt.
+    ///
+    /// The prompt is one prefill of `count` rows; every generated token is a **one-row decode step
+    /// appended to the cache the prefill filled**, at the token's own position. That is the batch
+    /// shape serving runs, and the only way to see whether the cache the prefill wrote is the one a
+    /// continuation reads.
+    generate: Option<usize>,
+    /// Where a generated token id comes from: `nn::Sampler::greedy`, or a host argmax over the same
+    /// row when the store has no program for the sampler's launches.
+    greedy: Greedy,
+    /// The reference's greedy continuation, as JSON with an `ids` list: the run compares as it goes
+    /// and stops at the first step that differs, which is the step the defect is in.
+    expect: Option<PathBuf>,
+}
+
+/// Where a generated token id comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Greedy {
+    /// `nn::Sampler::greedy`: the shaping operator and the argmax a request's zero-temperature row
+    /// takes. It is the path a served request runs, which is what makes its id evidence.
+    Sampler,
+    /// A host argmax over the downloaded logits row: the same question with no launch, so a store
+    /// without the sampler's programs still produces a token to compare later.
+    Host,
 }
 
 /// The four stages of the run.
@@ -162,6 +186,9 @@ impl Args {
         let mut from = None;
         let mut routing = false;
         let mut scores = false;
+        let mut generate = None;
+        let mut greedy = Greedy::Sampler;
+        let mut expect = None;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -209,6 +236,25 @@ impl Args {
                 }
                 "--routing" => routing = true,
                 "--scores" => scores = true,
+                "--generate" => {
+                    let number = value("--generate")?;
+                    generate = Some(number.parse().map_err(|_| {
+                        Failure::message(format!("--generate takes a token count, not `{number}`"))
+                    })?);
+                }
+                "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
+                "--greedy" => {
+                    let name = value("--greedy")?;
+                    greedy = match name.as_str() {
+                        "sampler" => Greedy::Sampler,
+                        "host" => Greedy::Host,
+                        other => {
+                            return Err(Failure::message(format!(
+                                "--greedy {other:?} names no path; the paths are sampler and host"
+                            )));
+                        }
+                    };
+                }
                 "--substage" => {
                     let name = value("--substage")?;
                     substage = Some(Substage::parse(&name).ok_or_else(|| {
@@ -230,14 +276,14 @@ impl Args {
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
                          [--tokens ID,ID,...] [--dump DIR] [--reference DIR] \
-                         [--substage normalized|attended|mlp_out] [--from NN] [--routing]",
+                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
                          --device, --layer, --tokens, --from, --substage, --routing, --scores, \
-                         --dump or --reference"
+                         --generate, --greedy, --expect, --dump or --reference"
                     )));
                 }
             }
@@ -271,6 +317,25 @@ impl Args {
                 "--from reads the reference's own state, so it needs --reference <dir>",
             ));
         }
+        if generate.is_some() && stage != Stage::Decode {
+            return Err(Failure::message(
+                "--generate continues a prefill, so it belongs to --stage decode",
+            ));
+        }
+        if generate.is_some() && reference.is_some() {
+            return Err(Failure::message(
+                "--generate compares nothing against a reference stack: the reference records one \
+                 prompt's activations and no continuation, so the two would be different questions",
+            ));
+        }
+        if expect.is_some() && generate.is_none() {
+            return Err(Failure::message(
+                "--expect compares a generation step by step, so it needs --generate N",
+            ));
+        }
+        if generate == Some(0) {
+            return Err(Failure::message("--generate takes at least one token"));
+        }
         Ok(Self {
             stage,
             checkpoint,
@@ -285,6 +350,9 @@ impl Args {
             from,
             routing,
             scores,
+            generate,
+            greedy,
+            expect,
         })
     }
 }
@@ -481,7 +549,7 @@ fn stage_embedding(args: &Args) -> Result<()> {
     //    missing package is reported as coverage rather than as the first operator to launch.
     // Only the operator this stage launches is required: a key the stage never calls must be
     // reported, not fatal, or a missing sampler program would read as a broken embedding.
-    let needed = needed_keys(&store_root, Stage::Embedding)?;
+    let needed = needed_keys(&store_root, Stage::Embedding, false)?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
     // 3. Weights on the device, through the loader's own boundary.
@@ -577,6 +645,7 @@ fn decode_arena_bytes(
     config: &Config,
     page_size: u64,
     pages: u64,
+    sampling: bool,
 ) -> qwen3_moe::Result<u64> {
     let layers = u64::try_from(config.num_hidden_layers).unwrap_or(0);
     let kv_heads = u64::try_from(config.num_key_value_heads).unwrap_or(0);
@@ -602,8 +671,30 @@ fn decode_arena_bytes(
         .saturating_add(pages)
         .saturating_add(64)
         .saturating_mul(4);
+    // A generation's arena must hold the prefill's step and one decode step at once, because the
+    // prefill's answer is read while its reservation is still held, plus a zero count row and a
+    // shaped row, each one vocabulary wide, of which the shaped row is claimed and released per
+    // step. The second step's workspace is the plan's own, which the attention program's 512 MiB
+    // dominates; naming it here is what makes an arena that is one step short fail at the region's
+    // stated size and not at an offset nobody can interpret.
+    let sampling_bytes = match sampling {
+        true => u64::try_from(config.vocab_size)
+            .unwrap_or(0)
+            .saturating_mul(4)
+            .saturating_mul(4)
+            .saturating_add(16_384)
+            .saturating_add(plan.workspace),
+        false => 0,
+    };
     let mut total = 0_u64;
-    for bytes in [planes, flags, rows, metadata, plan.bytes(DType::BF16)?] {
+    for bytes in [
+        planes,
+        flags,
+        rows,
+        metadata,
+        sampling_bytes,
+        plan.bytes(DType::BF16)?,
+    ] {
         total = total
             .saturating_add(bytes.next_multiple_of(256))
             .saturating_add(256);
@@ -652,7 +743,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
-    let needed = needed_keys(&store_root, Stage::Decode)?;
+    let needed = needed_keys(&store_root, Stage::Decode, args.generate.is_some())?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
     let mut weights = DeviceWeights::new(&device, args.resident)?;
@@ -670,7 +761,14 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let plan = model.plan(count)?;
     let page_size = 64_u64;
     let pages = count.div_ceil(page_size).max(1);
-    let bytes = decode_arena_bytes(&plan, count, &config, page_size, pages)?;
+    let bytes = decode_arena_bytes(
+        &plan,
+        count,
+        &config,
+        page_size,
+        pages,
+        args.generate.is_some(),
+    )?;
     let allocator = weights.allocator();
     let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
     allocator.reserve(platform::PoolKind::Graph, reserve)?;
@@ -1080,6 +1178,16 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         }
     }
 
+    // A step of the forward reserves the plan's own scratch - the attention program's workspace
+    // among it - and nothing returns it. A generation step runs the same forward again, so the mark
+    // is taken here and released once the last row's values are on the host; without it the second
+    // step asks for the whole step a second time past the region's end. The logits plane is
+    // allocated before the mark because every step reads into it and it must outlive the release.
+    let logits = arena.tensor(
+        DType::F32,
+        Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
+    )?;
+    let prefill = arena.mark();
     model.forward(&forward, &batch, &cache, hidden)?;
     // The run's output norm writes into `hidden`, so this is the state a reference's last file
     // holds: the output after the final norm, which no layer's own output is.
@@ -1106,10 +1214,6 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     if !misaligned {
         summarize(&table, config.num_hidden_layers);
     }
-    let logits = arena.tensor(
-        DType::F32,
-        Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
-    )?;
     let last_row = TensorView::new(
         DevicePtr::new(hidden.ptr.address() + (count - 1) * plan.hidden * 2),
         DType::BF16,
@@ -1121,6 +1225,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The last row's log-softmax, on the host, and its ten best tokens.
     let vocabulary = config.vocab_size;
     let values = download_f32(&stream, logits, vocabulary)?;
+    arena.release(prefill);
     if let Some(dir) = args.dump.as_deref() {
         write_npy(&dir.join("logits.npy"), &values, 1, vocabulary)?;
         println!("dump: logits.npy is the last row, 1 x {vocabulary} f32");
@@ -1133,7 +1238,498 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     for (token, logprob) in &best {
         println!("  {token}\t{logprob:.6}");
     }
+    if args.generate.is_some() {
+        generate(
+            args,
+            &forward,
+            &stream,
+            &arena,
+            &model,
+            &cache,
+            &batch,
+            &block_table,
+            logits,
+            values,
+        )?;
+    }
     Ok(())
+}
+
+/// Continue a prefill: one token per step, each a one-row decode batch on the cache it filled.
+///
+/// `prompt` is the prefill's own last row - the row that answers the token at position `count` - and
+/// every step here appends the token it chooses at that token's own position, so the cache a
+/// continuation reads is the one the prefill wrote. The walk is `CausalLm::forward`, the same call
+/// the prefill makes: a second implementation of the stack would answer a question about itself.
+#[allow(clippy::too_many_arguments)]
+fn generate(
+    args: &Args,
+    forward: &Forward<'_>,
+    stream: &platform::Stream,
+    arena: &Arena,
+    model: &qwen3_moe::Qwen3Moe,
+    cache: &KvView<'_>,
+    batch: &TokenBatch,
+    block_table: &[i32],
+    logits: TensorView,
+    prompt: Vec<f32>,
+) -> Result<()> {
+    let Some(steps) = args.generate else {
+        return Ok(());
+    };
+    let vocabulary = prompt.len();
+    let capacity = u64::from(batch.max_kv_len);
+    println!(
+        "generate: {steps} token(s) after a {} row prompt, greedy by {}",
+        batch.num_tokens,
+        match args.greedy {
+            Greedy::Sampler => "`nn::Sampler::greedy`",
+            Greedy::Host => "a host argmax over the downloaded logits row",
+        }
+    );
+    // The sampler and its request state: one row, one slot, one candidate. A greedy row is a
+    // temperature-scaled one whose argmax is taken, and `logits_shape` divides by the temperature
+    // unconditionally (its key carries `divide`), so the row carries 1.0 rather than the 0.0 the
+    // reference's table uses to name a greedy request. Every penalty column is zero, and a zero
+    // count row cannot move any column even if one were not.
+    let sampler = match args.greedy {
+        Greedy::Sampler => Some(Sampler::new(
+            u32::try_from(vocabulary).unwrap_or(u32::MAX),
+            1,
+            1,
+            0,
+        )?),
+        Greedy::Host => None,
+    };
+    let mut parameters =
+        vec![0.0_f32; usize::try_from(ops::sampler::PARAMETER_COLUMNS).unwrap_or(0)];
+    parameters[usize::try_from(ops::sampler::TEMPERATURE).unwrap_or(0)] = 1.0;
+    let state = sampler
+        .as_ref()
+        .map(|_| -> Result<SamplerState> {
+            Ok(SamplerState {
+                counts: upload_shaped_i32(
+                    stream,
+                    arena,
+                    Shape::new(&[1, u64::try_from(vocabulary).unwrap_or(0)]),
+                    &vec![0_i32; vocabulary],
+                )?,
+                parameters: upload_f32(
+                    stream,
+                    arena,
+                    Shape::new(&[1, u64::from(ops::sampler::PARAMETER_COLUMNS)]),
+                    &parameters,
+                )?,
+                slots: upload_i32(stream, arena, &[0])?,
+                extras: None,
+            })
+        })
+        .transpose()?;
+    let samples = Samples::reserve(arena, DType::I32, 1, false)?;
+    let hidden_width = model.plan(1)?.hidden;
+    let expected = match args.expect.as_deref() {
+        Some(path) => Some(read_expectation(path, &args.tokens)?),
+        None => None,
+    };
+    let start = u64::from(batch.num_tokens);
+    // The loop's arithmetic, stated once: step k appends the token at position `start + k`, writes
+    // the slot of that same position and carries a sequence length one past it. A position or a
+    // slot that drifts by one is invisible in an id list that happens to be right, and this is the
+    // line that makes the drift visible.
+    let last = start.saturating_add(u64::try_from(steps.saturating_sub(1)).unwrap_or(0));
+    let page_size = u64::from(batch.page_size);
+    // The slot a token writes is the one the attention will read for it: the page its sequence's
+    // table names, times the page size, plus the position's offset inside that page. It is one
+    // number derived twice - here, and by `kv_write` from the same table - so a mismatch is a write
+    // nobody reads, which shows up as a repeated token rather than as an error.
+    let first_slot = slot_for(start, page_size, block_table)?;
+    let last_slot = slot_for(last, page_size, block_table)?;
+    println!(
+        "generate: step k (k = 0..{}) appends position {start}+k at slot \
+         page_table[position/{page_size}]*{page_size} + position%{page_size}, seq_len {}+k; \
+         positions {start}..{last}, slots {first_slot}..{last_slot}, page capacity {capacity}",
+        steps.saturating_sub(1),
+        start.saturating_add(1),
+    );
+    let mut row = prompt;
+    let mut chosen_ids: Vec<i32> = Vec::with_capacity(steps);
+    let mut agreed = 0_usize;
+    let mut differed = false;
+    for step in 0..steps {
+        // The prompt's row answers the token at position `start`; a decode step's row answers the
+        // one after it, so the position of this step's token is `start + step`.
+        let position = start.saturating_add(u64::try_from(step).unwrap_or(0));
+        let slot = slot_for(position, page_size, block_table)?;
+        check_continuation(
+            start,
+            step,
+            position,
+            slot,
+            position.saturating_add(1),
+            capacity,
+        )?;
+        let mark = arena.mark();
+        let mut chosen = argmax_over(&row);
+        let mut source = "host argmax";
+        if let (Some(sampler), Some(state)) = (sampler.as_ref(), state.as_ref()) {
+            match sampler.greedy(forward, logits, state, &samples) {
+                Ok(()) => {
+                    stream.synchronize()?;
+                    let theirs = download_i32(stream, samples.tokens, 1)?;
+                    source = "sampler";
+                    let theirs = theirs.first().copied().unwrap_or(-1);
+                    // Two reads of one row: the sampler's shaped argmax and the host's over the raw
+                    // logits. They agree unless the shaping moved the row, so a disagreement is a
+                    // finding about the sampler and not about the model.
+                    if theirs != chosen {
+                        println!(
+                            "generate: step {}: `Sampler::greedy` chose {theirs} and the raw row's \
+                             argmax is {chosen}",
+                            step + 1
+                        );
+                    }
+                    chosen = theirs;
+                }
+                Err(error) => {
+                    // A decode answers through `greedy` or it does not answer: a host argmax here
+                    // would produce an id list that cannot say which path chose it, and a decode
+                    // run is the only evidence the decode path has.
+                    return Err(Failure::message(format!(
+                        "generate: step {}: the sampler path did not run ({error}); pass \
+                         `--greedy host` to ask for the host argmax deliberately",
+                        step + 1
+                    )));
+                }
+            }
+        }
+        let best = top_logprobs(&row, 5);
+        println!(
+            "generate: step {step} of {steps}: position {position}, slot {slot}, seq_len {}, token \
+             {chosen} ({source})",
+            position.saturating_add(1)
+        );
+        for (token, logprob) in &best {
+            println!("  {token}\t{logprob:.6}");
+        }
+        chosen_ids.push(chosen);
+        if let Some(dir) = args.dump.as_deref() {
+            // The file carries the reference's own index, so a first difference names its file.
+            let file = dir.join(format!("logits_step_{step:02}.npy"));
+            write_npy(&file, &row, 1, vocabulary)?;
+            println!(
+                "dump: {} is step {step}'s row, 1 x {vocabulary} f32",
+                file.display()
+            );
+        }
+        // The comparison is the measurement: a list that differs says nothing about where, and the
+        // first differing step names the launch the defect is in - step 0 is the prefill's own
+        // answer, step 1 is the decode's first launch, and a later step is the slot or the page.
+        if let Some(expected) = expected.as_deref() {
+            match expected.get(step) {
+                Some(want) if *want == chosen => agreed += 1,
+                Some(want) => {
+                    differed = true;
+                    println!(
+                        "generate: FIRST DIFFERENCE at reference index {step} (position \
+                         {position}): chose {chosen}, the reference chose {want}; {step} of {steps} \
+                         ids agree before it"
+                    );
+                    println!("generate: step {step}'s top-5, on our row:");
+                    for (token, logprob) in &best {
+                        println!("  {token}\t{logprob:.6}");
+                    }
+                    arena.release(mark);
+                    break;
+                }
+                None => {}
+            }
+        }
+        if step + 1 == steps {
+            arena.release(mark);
+            break;
+        }
+        // The decode step: this token enters the cache at its own position, and the batch carries
+        // one query row whose sequence length counts the tokens already cached.
+        // A row that carries no slot writes no keys and is attended over as if it were not there,
+        // which reads as a repeated token and not as an error. This batch has one token, so a slot
+        // it cannot express is a refusal and not a wrap: `-1` is the value that makes `kv_write`
+        // skip the write.
+        let position = i32::try_from(position).map_err(|_| {
+            Failure::message(format!(
+                "position {position} does not fit a batch's i32 positions"
+            ))
+        })?;
+        let slot = i32::try_from(slot).map_err(|_| {
+            Failure::message(format!(
+                "slot {slot} does not fit a batch's i32 slot mapping"
+            ))
+        })?;
+        if position < 0 || slot < 0 {
+            return Err(Failure::message(format!(
+                "a decode step at position {position} carries slot {slot}: a negative slot writes \
+                 no keys, and a one-token row that writes nothing attends the prompt alone"
+            )));
+        }
+        let ids = upload_i32(stream, arena, &[chosen])?;
+        let positions = upload_i32(stream, arena, &[position])?;
+        let slots = upload_i32(stream, arena, &[slot])?;
+        let seq_lens = upload_i32(stream, arena, &[position.saturating_add(1)])?;
+        let query_offsets = upload_i32(stream, arena, &[0, 1])?;
+        let logits_rows = upload_i32(stream, arena, &[0])?;
+        let next = TokenBatch {
+            positions,
+            slot_mapping: slots,
+            seq_lens,
+            query_offsets,
+            logits_rows,
+            phase: PhaseKind::Decode,
+            page_size: batch.page_size,
+            num_tokens: 1,
+            max_kv_len: batch.max_kv_len,
+            draft_lens: None,
+        };
+        next.check()?;
+        let hidden = arena.tensor(DType::BF16, Shape::new(&[1, hidden_width]))?;
+        model.embed_input_ids(forward, ids, hidden)?;
+        model.forward(forward, &next, cache, hidden)?;
+        model.logits(forward, hidden, logits)?;
+        stream.synchronize()?;
+        row = download_f32(stream, logits, vocabulary)?;
+        arena.release(mark);
+    }
+    // One line, so a reader or a `diff` sees the whole continuation at once.
+    let ids = chosen_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("generate: ids {ids}");
+    match expected.as_deref() {
+        Some(expected) => {
+            let total = expected.len().min(steps);
+            if differed {
+                println!(
+                    "generate: {agreed} of {total} ids agree with the reference before the first \
+                     difference; the ids after it were not run"
+                );
+            } else {
+                println!("generate: all {total} ids agree with the reference");
+            }
+        }
+        None => println!(
+            "generate: {} tokens, no reference to compare against (pass --expect <file>)",
+            chosen_ids.len()
+        ),
+    }
+    Ok(())
+}
+
+/// Read a reference continuation: JSON with an `ids` list, and the prompt it continues.
+///
+/// The prompt is the reason this file can be compared at all: a continuation of another prompt is a
+/// different question, and an id list that differs then says nothing about the model.
+fn read_expectation(path: &std::path::Path, tokens: &str) -> Result<Vec<i32>> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        Failure::message(format!(
+            "reading the expectation {}: {error}",
+            path.display()
+        ))
+    })?;
+    let list = |key: &str| -> Option<Vec<i32>> {
+        let at = text.find(&format!("\"{key}\""))?;
+        let open = text[at..].find('[').map(|offset| offset + at)?;
+        let close = text[open..].find(']').map(|offset| offset + open)?;
+        Some(
+            text[open + 1..close]
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect(),
+        )
+    };
+    if let (Some(theirs), prompt) = (list("prompt_ids"), tokens) {
+        let ours: Vec<i32> = prompt
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect();
+        if !theirs.is_empty() && !ours.is_empty() && theirs != ours {
+            return Err(Failure::message(format!(
+                "{} continues a {} token prompt and this run's --tokens names {}: a continuation of \
+                 another prompt would disagree from the first step and say nothing about the \
+                 decode",
+                path.display(),
+                theirs.len(),
+                ours.len()
+            )));
+        }
+    }
+    let ids = list("ids").ok_or_else(|| {
+        Failure::message(format!(
+            "{} holds no `\"ids\": [...]` list to compare against",
+            path.display()
+        ))
+    })?;
+    if ids.is_empty() {
+        return Err(Failure::message(format!(
+            "{} holds an empty `ids` list",
+            path.display()
+        )));
+    }
+    Ok(ids)
+}
+
+/// The two numbers a continuation's batch must satisfy, checked before it is built.
+///
+/// A decode step's slot is the token's own position and its sequence length is one past it: the
+/// cache a prefill filled holds positions `0..position`, and the new token is the one at `position`.
+/// A stage that carries a position shows the one it carried - the sibling of the `hidden_00` guard,
+/// because a wrong slot is a plausible number that writes a token's keys over another token's, and
+/// no output looks wrong until a later token attends over the wrong rows.
+fn check_continuation(
+    start: u64,
+    step: usize,
+    position: u64,
+    slot: u64,
+    seq_len: u64,
+    capacity: u64,
+) -> Result<()> {
+    let wanted = start.saturating_add(u64::try_from(step).unwrap_or(0));
+    if position != wanted {
+        return Err(Failure::message(format!(
+            "decode step {step} of a {start} row prompt is at position {position}, and the token it \
+             appends is the one at {wanted}: a continuation that skips or repeats a position writes \
+             its keys beside another token's"
+        )));
+    }
+    if slot != position {
+        return Err(Failure::message(format!(
+            "a decode step at position {position} carries slot {slot}: the KV contract writes a \
+             token's keys at the token's own position"
+        )));
+    }
+    if seq_len != position.saturating_add(1) {
+        return Err(Failure::message(format!(
+            "a decode step at position {position} carries seq_len {seq_len}, and the token makes it \
+             {}",
+            position.saturating_add(1)
+        )));
+    }
+    if position >= capacity {
+        return Err(Failure::message(format!(
+            "position {position} has no page: the page table holds {capacity} positions"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{argmax_over, check_continuation, slot_for};
+
+    /// The line a continuation's batch must satisfy, on the numbers a prompt of fifteen tokens
+    /// produces: the first generated token is the one at position 15, its sequence length is 16, and
+    /// the page table holds more than that.
+    #[test]
+    fn a_continuation_appends_at_the_prompts_own_position() {
+        check_continuation(15, 0, 15, 15, 16, 64).expect("position 15 of a 64 page table");
+        check_continuation(15, 1, 16, 16, 17, 64).expect("the second token is at position 16");
+    }
+
+    /// A counter used as a slot is the defect this check exists for: step 0's counter is 0, which
+    /// writes the sixteenth token's keys over the first token's page.
+    #[test]
+    fn a_counter_slot_is_refused() {
+        let refused = check_continuation(15, 0, 15, 0, 16, 64).expect_err("slot 0 for position 15");
+        assert!(refused.to_string().contains("own position"), "{refused}");
+    }
+
+    /// A position that skips or repeats is refused before the batch is built.
+    #[test]
+    fn a_skipped_position_is_refused() {
+        let refused =
+            check_continuation(15, 0, 16, 16, 17, 64).expect_err("position 16 for step 0");
+        assert!(refused.to_string().contains("appends"), "{refused}");
+    }
+
+    /// A sequence length that does not count the token being appended is refused.
+    #[test]
+    fn a_short_sequence_length_is_refused() {
+        let refused = check_continuation(15, 0, 15, 15, 15, 64).expect_err("seq_len 15 for 16");
+        assert!(refused.to_string().contains("seq_len"), "{refused}");
+    }
+
+    /// A position past the page table has no page to write, which is a refusal and not a launch.
+    #[test]
+    fn a_position_past_the_page_table_is_refused() {
+        let refused = check_continuation(63, 0, 63, 63, 64, 64).expect_err("position 64 of 64");
+        assert!(refused.to_string().contains("no page"), "{refused}");
+    }
+
+    /// The slot a decode writes is the page table's own arithmetic: the page's unit times the page
+    /// size plus the offset. An identity table makes it the position, which is why a slot that
+    /// drifts is invisible until a sequence spans two non-adjacent pages.
+    #[test]
+    fn the_slot_is_the_page_tables_arithmetic() {
+        assert_eq!(slot_for(15, 64, &[0]).unwrap(), 15);
+        // Position 70 is offset 6 of the sequence's second page, and that page is unit 3.
+        assert_eq!(slot_for(70, 64, &[0, 3]).unwrap(), 3 * 64 + 6);
+    }
+
+    /// A page that is not a page writes no keys, so it is refused rather than skipped.
+    #[test]
+    fn a_page_out_of_the_table_is_refused() {
+        let refused = slot_for(15, 64, &[]).expect_err("no pages");
+        assert!(
+            refused.to_string().contains("page table names"),
+            "{refused}"
+        );
+        let refused = slot_for(15, 64, &[-1]).expect_err("page -1");
+        assert!(refused.to_string().contains("no cache"), "{refused}");
+    }
+
+    /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
+    #[test]
+    fn the_argmax_takes_the_first_largest() {
+        assert_eq!(argmax_over(&[0.5, 2.0, 2.0, -1.0]), 1);
+        assert_eq!(argmax_over(&[-3.0, -2.0, -4.0]), 1);
+    }
+}
+
+/// The slot a token at `position` occupies: its sequence's page from the table, times the page size,
+/// plus the position's offset in that page.
+///
+/// This is the number `kv_write` computes from the same two inputs, so printing it beside the
+/// position is what separates "the write landed where the read looks" from "the write landed
+/// elsewhere and the attention read the prompt alone". A page the table does not name, and a page
+/// named `-1`, are refusals: both are a token with no cache.
+fn slot_for(position: u64, page_size: u64, block_table: &[i32]) -> Result<u64> {
+    let unit = position / page_size;
+    let index = usize::try_from(unit).unwrap_or(usize::MAX);
+    let entry = block_table.get(index).ok_or_else(|| {
+        Failure::message(format!(
+            "position {position} lives in page {unit}, and the page table names {} page(s)",
+            block_table.len()
+        ))
+    })?;
+    let page = u64::try_from(*entry).map_err(|_| {
+        Failure::message(format!(
+            "page {unit} of the page table names {entry}: a page that is not a page is a token \
+             with no cache"
+        ))
+    })?;
+    Ok(page
+        .saturating_mul(page_size)
+        .saturating_add(position % page_size))
+}
+
+/// The largest value's first index, on the host.
+fn argmax_over(row: &[f32]) -> i32 {
+    let mut best = (0_usize, f32::NEG_INFINITY);
+    for (at, value) in row.iter().enumerate() {
+        if *value > best.1 {
+            best = (at, *value);
+        }
+    }
+    i32::try_from(best.0).unwrap_or(-1)
 }
 
 /// The batch's token count, as a `usize`, for the host-side readbacks.
@@ -1637,7 +2233,7 @@ fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
 }
 
 /// The (operator, key) pairs the fixture names for the slice, which is what the store must hold.
-fn needed_keys(store_root: &Path, stage: Stage) -> Result<Vec<(String, String)>> {
+fn needed_keys(store_root: &Path, stage: Stage, sampling: bool) -> Result<Vec<(String, String)>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/programs/qwen3-moe-keys.txt");
     let text = std::fs::read_to_string(&fixture).map_err(|error| {
@@ -1657,7 +2253,7 @@ fn needed_keys(store_root: &Path, stage: Stage) -> Result<Vec<(String, String)>>
         let (Some(operator), Some(descriptor)) = (fields.next(), fields.next()) else {
             continue;
         };
-        if !required(stage, operator) {
+        if !required(stage, operator, sampling) {
             continue;
         }
         keys.push((operator.to_owned(), descriptor.to_owned()));
@@ -1670,16 +2266,26 @@ fn needed_keys(store_root: &Path, stage: Stage) -> Result<Vec<(String, String)>>
 /// A stage that needs one operator must not be blocked by a key the model uses elsewhere: the store
 /// coverage is the caller's report (`notes/programs/store-coverage.md`), and this harness's job is
 /// to launch what it says it launches.
-fn required(stage: Stage, operator: &str) -> bool {
+fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
     match stage {
         Stage::Weights => false,
         Stage::Embedding => operator == "embedding",
-        // The model's own operators: the fixture also keys the executor's path and the sampling
-        // chain, neither of which this stage calls -- and requiring them would report a missing
-        // sampler program as a missing kernel for the decoder.
-        Stage::Block | Stage::Decode => MODEL_OPERATORS.contains(&operator),
+        // The model's own operators, plus the sampling chain when `--generate` runs it: a store
+        // without those programs would otherwise fail at the first launch with a key nobody checked.
+        Stage::Block | Stage::Decode => {
+            MODEL_OPERATORS.contains(&operator)
+                || (sampling && SAMPLER_OPERATORS.contains(&operator))
+        }
     }
 }
+
+/// The operators `nn::Sampler::greedy` launches: the shaping operator and the argmax.
+///
+/// A greedy step asks for no candidates, no cutoffs and no draw, so `top_k`, `filter_candidates`,
+/// `candidate_order`, `inverse_cdf` and the two gathers are not launched and are not required. The
+/// log-probability of the chosen token is computed on the host from the same row, which keeps this
+/// list at two and keeps a missing `log_softmax` program out of the way of a token's id.
+const SAMPLER_OPERATORS: &[&str] = &["logits_shape", "argmax"];
 
 /// The operators `Qwen3Moe`'s own forward launches, in the order a layer composes them.
 ///
@@ -1970,6 +2576,34 @@ fn upload_shaped_i32(
     values: &[i32],
 ) -> Result<ops::TensorView> {
     let tensor = arena.tensor(DType::I32, shape)?;
+    if tensor.shape.numel() != u64::try_from(values.len()).unwrap_or(u64::MAX) {
+        return Err(Failure::message(format!(
+            "{} values for the extents {:?}",
+            values.len(),
+            shape.dims()
+        )));
+    }
+    // SAFETY: `values` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            tensor.ptr.address(),
+            values.as_ptr() as u64,
+            std::mem::size_of_val(values),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(tensor)
+}
+
+/// Upload `values` as an f32 plane of `shape`.
+fn upload_f32(
+    stream: &platform::Stream,
+    arena: &Arena,
+    shape: Shape,
+    values: &[f32],
+) -> Result<ops::TensorView> {
+    let tensor = arena.tensor(DType::F32, shape)?;
     if tensor.shape.numel() != u64::try_from(values.len()).unwrap_or(u64::MAX) {
         return Err(Failure::message(format!(
             "{} values for the extents {:?}",
