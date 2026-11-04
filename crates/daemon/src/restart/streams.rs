@@ -309,7 +309,11 @@ fn take_over(
     let descriptor = next()?;
     let body = match application {
         handoff::stream::Application::ChatStream(chat) => {
-            let events = leader.take_over_request(&chat)?;
+            let events = leader.take_over_request(
+                chat.engine_replica,
+                &chat.engine_request_id,
+                chat.consumed_events,
+            )?;
             let started = crate::output::run::started_instant(
                 chat.lowering
                     .as_ref()
@@ -328,17 +332,11 @@ fn take_over(
             ResponseStream::start(Box::new(run), true)
         }
         handoff::stream::Application::ChatResponse(chat) => {
-            // `Leader::take_over_request` reads the three position fields the
-            // two handed states share, so a `ChatStream` carrying only those
-            // names the same engine stream. The leader takes the fields
-            // themselves next; this adapter goes with it.
-            let position = handoff::ChatStream {
-                engine_replica: chat.engine_replica,
-                engine_request_id: chat.engine_request_id.clone(),
-                consumed_events: chat.consumed_events,
-                ..Default::default()
-            };
-            let events = leader.take_over_request(&position)?;
+            let events = leader.take_over_request(
+                chat.engine_replica,
+                &chat.engine_request_id,
+                chat.consumed_events,
+            )?;
             let started = crate::output::run::started_instant(
                 chat.lowering
                     .as_ref()
