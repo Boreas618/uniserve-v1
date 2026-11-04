@@ -719,6 +719,9 @@ impl Epochs {
     /// 2-4). The probation lasts until [`Self::commit_programs`] or
     /// [`Self::revert_programs`].
     ///
+    /// Refuses an update a revert marked unavailable unless `force` asks for
+    /// it anyway (§7.2).
+    ///
     /// # Errors
     ///
     /// Fails with the first failure and leaves what serves untouched: a
@@ -729,6 +732,7 @@ impl Epochs {
         &self,
         update: Update,
         processes: Vec<crate::engine::control::EpochProcess>,
+        force: bool,
     ) -> Result<(), Failure> {
         let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
             kind: "no_command_channel".to_owned(),
@@ -740,6 +744,20 @@ impl Epochs {
             reason: "the daemon executes no epoch".to_owned(),
             device: None,
         })?;
+        // §7.2: an update that a revert marked unavailable is refused until
+        // it is applied with `force`, whatever it says about itself.
+        if !force {
+            if let Some(failure) = self.unavailable(&update.target) {
+                return Err(Failure {
+                    kind: "unavailable".to_owned(),
+                    reason: format!(
+                        "this update was reverted and is unavailable after a {} failure: {}",
+                        failure.kind, failure.reason
+                    ),
+                    device: failure.device,
+                });
+            }
+        }
         let programs = update.target.programs.clone();
         let mut switch = crate::engine::control::ProgramSwitch::new(&commands, processes, update.clone());
         switch.precopy(&programs.kernels, &programs.policy)?;
@@ -1298,7 +1316,7 @@ mod tests {
         target.programs = programs.clone();
         let update = Update::new(1, target);
         epochs
-            .apply_programs(update, vec![process("rank-0", 7), process("rank-1", 8)])
+            .apply_programs(update, vec![process("rank-0", 7), process("rank-1", 8)], false)
             .expect("both main processes took the programs");
 
         // The epoch is on probation from the generation the update switched
@@ -1371,7 +1389,7 @@ mod tests {
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
         target.programs = programs;
         epochs
-            .apply_programs(Update::new(2, target), vec![process("rank-0", 7)])
+            .apply_programs(Update::new(2, target), vec![process("rank-0", 7)], false)
             .expect("the main process took the programs");
         assert!(
             epochs.revert_programs("a trial refused it").expect("the revert was answered")
@@ -1392,6 +1410,53 @@ mod tests {
         );
         let update = epochs.update().expect("the update is recorded");
         assert_eq!(update.state, UpdateState::Reverted);
+    }
+
+    /// An update a revert marked unavailable is refused until it is applied
+    /// with `force`, which is the whole of §7.2's refusal: the same target,
+    /// applied again, is not taken twice by accident.
+    #[test]
+    fn a_reverted_update_is_refused_until_it_is_forced() {
+        use crate::engine::stand_in::{main_processes, process, Answer};
+
+        let (commands, _) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+
+        let mut target = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        target.programs = programs;
+
+        let processes = || vec![process("rank-0", 7), process("rank-1", 8)];
+        epochs
+            .apply_programs(Update::new(1, target.clone()), processes(), false)
+            .expect("the first application is taken");
+        epochs
+            .revert_programs("the policy refused a decision")
+            .expect("the revert is answered");
+
+        let refused = epochs
+            .apply_programs(Update::new(1, target.clone()), processes(), false)
+            .expect_err("a reverted update is unavailable");
+        assert_eq!(refused.kind, "unavailable");
+        assert!(refused.reason.contains("the policy refused a decision"), "{}", refused.reason);
+        assert!(epochs.program_update().is_none());
+
+        epochs
+            .apply_programs(Update::new(1, target), processes(), true)
+            .expect("force applies it anyway");
+        assert!(epochs.program_update().is_some());
     }
 
     /// A refused precopy changes nothing that serves, and an update in flight
@@ -1424,7 +1489,7 @@ mod tests {
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
         target.programs = programs;
         let failure = epochs
-            .apply_programs(Update::new(3, target), vec![process("rank-0", 7)])
+            .apply_programs(Update::new(3, target), vec![process("rank-0", 7)], false)
             .expect_err("a refused precopy fails the update");
         assert_eq!(failure.kind, "precopy_failed");
         assert!(epochs.program_update().is_none());

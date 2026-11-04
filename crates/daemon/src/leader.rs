@@ -1322,7 +1322,8 @@ impl Leader {
     /// which is where a caller falls through to the world path.
     ///
     /// With `dry_run`, the routing decision alone is made and nothing is
-    /// applied, so a caller can answer what a change would move.
+    /// applied, so a caller can answer what a change would move. `force`
+    /// applies an update a revert marked unavailable (§7.2).
     ///
     /// # Errors
     ///
@@ -1335,6 +1336,7 @@ impl Leader {
         number: u64,
         target: &ServeConfig,
         dry_run: bool,
+        force: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
         let current = self.serving_config()?;
         let Some(update) = self.route(&current, target, false).await? else {
@@ -1348,7 +1350,7 @@ impl Leader {
         let epochs = Arc::clone(&self.epochs);
         let processes = self.main_processes();
         let recorded = update.clone();
-        tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes))
+        tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes, force))
             .await
             .map_err(|error| UpdateError::Failed(anyhow::anyhow!("applying the update: {error}")))?
             .map_err(|failure| {
