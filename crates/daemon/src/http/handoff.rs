@@ -16,9 +16,14 @@
 //! state cannot be frozen is a defect, and its connection ends it rather than
 //! keeping it here (see [`crate::http::stream`]).
 //!
-//! A response that registers after the restart began pausing is asked to
-//! pause too, so the restart never hands over a connection whose next response
-//! is already being written.
+//! A pause closes the daemon's admissions when it starts: from then on the
+//! deployment's new requests belong to the successor, and a connection ends at
+//! its next request boundary instead of starting a response this process
+//! cannot hand over (design §7.5.1 step 1). A response that registers while the
+//! pause's round runs is asked to pause too, so the restart never hands over a
+//! connection whose next response is already being written; the round clears
+//! `pausing` when it ends, so `pausing` is true exactly while a round runs and
+//! will read what a response reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,6 +68,38 @@ pub(crate) enum Decision {
     Adopt,
 }
 
+/// Whether this daemon admits new requests, as its connections read it.
+///
+/// A hot restart closes admissions when its pause starts: from then on the
+/// deployment's new requests belong to the successor (design §7.5.1 step 1),
+/// and a connection that would send one ends at that boundary instead of being
+/// served by a process that is leaving. A response already in flight is
+/// unaffected — it is what the pause is for.
+///
+/// It reopens when a handoff gives the deployment back ([`Handoff::release`]):
+/// a successor that gives up leaves this daemon serving, and then it must
+/// admit again. An atomic rather than a `CancellationToken`, because a
+/// cancellation is final and this state is not.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Admissions(Arc<AtomicBool>);
+
+impl Admissions {
+    /// Whether a request may be admitted now.
+    pub(crate) fn open(&self) -> bool {
+        !self.0.load(Ordering::Acquire)
+    }
+
+    /// Stops admitting: the deployment's next request is the successor's.
+    pub(crate) fn close(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Admits again, after a pause that handed nothing over.
+    fn reopen(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// One response in flight, frozen at an event boundary: everything a
 /// successor needs of it besides the state and the socket.
 #[derive(Debug)]
@@ -94,8 +131,11 @@ pub(crate) struct Handoff {
 struct Inner {
     next: AtomicU64,
     /// Whether a hot restart is handing the deployment over: a response that
-    /// registers now pauses at once.
+    /// registers now pauses at once. True exactly while a pause's round runs,
+    /// which is what makes the round the reader of every report it asks for.
     pausing: AtomicBool,
+    /// Whether new requests are admitted; closed for the whole handover.
+    admitting: Admissions,
     /// The responses in flight, weakly: the connection owns its registration,
     /// and the registry must not keep one alive — a response that ended has to
     /// reach `Drop` for the pause to see it go.
@@ -128,8 +168,11 @@ impl Handoff {
         crate::leader::locked(&self.inner.streaming).insert(id, Arc::downgrade(&registration));
         // A restart that began pausing before this response started must not
         // hand over a connection whose next response is already being
-        // written: ask this one to pause too.
-        if self.inner.pausing.load(Ordering::Acquire) {
+        // written: ask this one to pause too. `pausing` is true only while the
+        // round runs, and the round reads every registration it asked, so a
+        // response that starts after it is written here rather than parked for
+        // a decision the finished round will not make.
+        if self.pausing() {
             registration.request();
         }
         registration
@@ -145,10 +188,16 @@ impl Handoff {
     ///
     /// Responses that end before they freeze are not returned, and neither
     /// are responses that cannot be handed over: the connection ends such a
-    /// one rather than keeping it. Responses that register while the restart
-    /// pauses are asked too, so the set is the responses in flight when the
-    /// last of them stops.
+    /// one rather than keeping it. Responses that register while the round
+    /// runs are asked too, so the set is the responses in flight when the last
+    /// of them stops; the round ends when the registry is stable, and closing
+    /// admissions first is what bounds it.
     pub(crate) async fn pause(&self) -> Vec<FrozenStream> {
+        // Design §7.5.1 step 1: the successor takes the deployment's listener,
+        // so this daemon takes no new request from here on. Closing before the
+        // round is also what keeps the round conclusive — a connection cannot
+        // start a request that would register after it.
+        self.inner.admitting.close();
         self.inner.pausing.store(true, Ordering::Release);
         let mut asked = BTreeSet::new();
         let mut frozen = Vec::new();
@@ -174,26 +223,33 @@ impl Handoff {
                     .filter_map(std::sync::Weak::upgrade)
                     .all(|registration| asked.contains(&registration.id));
                 if all_asked {
+                    // The round is over, and `pausing` stops being true: a
+                    // response that starts now is written here, and the
+                    // registrations it asked stop watching for a boundary.
+                    self.end_pause();
                     return frozen;
                 }
                 continue;
             }
-            for registration in &fresh {
-                asked.insert(registration.id);
-                registration.request();
-            }
             for registration in fresh {
+                // Claim the report before asking for it: a response waits for
+                // a decision only when a round holds its report, and a
+                // response whose report nobody claimed resumes at once
+                // (`Registration::report`). A registration an earlier claim
+                // already took is never asked twice.
                 let answered = {
                     let mut slot = registration.frozen.lock().await;
                     slot.take()
                 };
+                asked.insert(registration.id);
+                let Some(answered) = answered else {
+                    continue;
+                };
+                registration.request();
                 // This loop's own reference goes before the wait: a response
                 // that ends now must reach `Drop`, which is what tells the
                 // pause it left (the registry holds the registration weakly).
                 drop(registration);
-                let Some(answered) = answered else {
-                    continue;
-                };
                 if let Ok(Some(stream)) = answered.await {
                     frozen.push(stream);
                 }
@@ -201,9 +257,9 @@ impl Handoff {
         }
     }
 
-    /// Ends a pause that did not hand the responses over: they go on being
-    /// written here.
-    pub(crate) fn release(&self) {
+    /// Ends the pause's round: no response asks for a boundary any more, and
+    /// a response that starts from here on is written here.
+    fn end_pause(&self) {
         self.inner.pausing.store(false, Ordering::Release);
         for registration in crate::leader::locked(&self.inner.streaming)
             .values()
@@ -211,6 +267,19 @@ impl Handoff {
         {
             registration.release();
         }
+    }
+
+    /// Gives the deployment back to this daemon: the pause ended without a
+    /// handover, so the responses in flight go on being written here and new
+    /// requests are admitted again.
+    pub(crate) fn release(&self) {
+        self.end_pause();
+        self.inner.admitting.reopen();
+    }
+
+    /// Whether new requests are admitted, for the connections that serve them.
+    pub(crate) fn admissions(&self) -> Admissions {
+        self.inner.admitting.clone()
     }
 }
 
@@ -274,6 +343,15 @@ impl Registration {
             let _ = reported.send(None);
             return Decision::Resume;
         };
+        // A pause claims a registration's report before it asks it to freeze,
+        // so an unclaimed report means no round is waiting for this one: the
+        // response is written here. That is the belt for the one registration
+        // admissions cannot exclude — a request admitted just before the pause
+        // whose handler registered just after it — and it is what keeps a
+        // response from waiting for a decision nobody will make.
+        if self.frozen.lock().await.is_some() {
+            return Decision::Resume;
+        }
         let (decide, decided) = oneshot::channel();
         frozen.decision = decide;
         if reported.send(Some(frozen)).is_err() {
@@ -361,6 +439,71 @@ mod tests {
         assert_eq!(paused[0].request_id, "kept");
 
         // The restart's decision reaches the response that froze.
+        paused
+            .into_iter()
+            .next()
+            .expect("the frozen response")
+            .decision
+            .send(Decision::Resume)
+            .expect("the response awaits its decision");
+        assert_eq!(freezing.await.expect("the freeze task"), Decision::Resume);
+    }
+
+    /// A response that registers after the pause's round ended is written
+    /// here: no round will read what it reports, so it is neither asked to
+    /// pause nor left waiting for a decision.
+    #[tokio::test]
+    async fn a_response_that_registers_after_the_pause_is_written_here() {
+        let handoff = Handoff::new();
+        let paused = handoff.pause().await;
+        assert!(paused.is_empty(), "no response was in flight");
+        assert!(!handoff.pausing(), "the round ended with the pause");
+        assert!(
+            !handoff.admissions().open(),
+            "the daemon takes no new request while it hands the deployment over"
+        );
+
+        let late = handoff.register();
+        assert!(!late.paused(), "the finished round asks nothing to pause");
+        // A connection that froze it anyway — a request admitted just before
+        // the pause, whose handler registered just after — is answered at
+        // once, because no round holds its report.
+        let decision = tokio::time::timeout(
+            Duration::from_secs(10),
+            late.report(Some(frozen(late.id(), "late"))),
+        )
+        .await
+        .expect("the response is not left waiting for a decision");
+        assert_eq!(decision, Decision::Resume, "the response goes on here");
+    }
+
+    /// A pause that hands nothing over gives the deployment back: this daemon
+    /// admits again, and the next handover pauses and hands over the responses
+    /// in flight then — a daemon hands a deployment over more than once.
+    #[tokio::test]
+    async fn a_released_pause_admits_again_and_the_next_one_hands_over() {
+        let handoff = Handoff::new();
+        assert!(handoff.pause().await.is_empty());
+        handoff.release();
+        assert!(handoff.admissions().open(), "the daemon admits again");
+
+        let kept = handoff.register();
+        let freezing = tokio::spawn({
+            let kept = Arc::clone(&kept);
+            async move {
+                assert!(kept.pausing().await, "the second round asks it to pause");
+                kept.report(Some(frozen(kept.id(), "kept"))).await
+            }
+        });
+        let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
+            .await
+            .expect("the second pause ends");
+        assert!(
+            !handoff.admissions().open(),
+            "the second handover took the new requests"
+        );
+        assert_eq!(paused.len(), 1, "the response in flight is handed over");
+        assert_eq!(paused[0].request_id, "kept");
         paused
             .into_iter()
             .next()

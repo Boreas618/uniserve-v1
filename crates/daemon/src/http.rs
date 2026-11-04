@@ -337,15 +337,26 @@ async fn serve_on(
         server,
         video_body_limit(&config.media_config),
         Arc::clone(admin),
-        restarter,
+        restarter.clone(),
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
+
+    // The daemon admits requests until its handoff's pause starts: from then
+    // on the deployment's next request is the successor's, and each connection
+    // ends at its next request boundary (design §7.5.1 step 1). The registry
+    // exists once the router is built, and a daemon that cannot hand over (no
+    // restarter) admits for as long as it serves.
+    let admitting = restarter
+        .as_ref()
+        .and_then(|restarter| restarter.handoff())
+        .map_or_else(handoff::Admissions::default, |handoff| handoff.admissions());
 
     // The responses the daemon this one replaced handed over go on here: each
     // connection writes the bytes the predecessor did not write and then goes
     // on with the resumed body (design §7.5.1 step 4).
     for stream in crate::restart::streams::take_adopted() {
         let app = app.clone();
+        let admitting = admitting.clone();
         tokio::spawn(async move {
             let request_id = stream.request_id.clone();
             let frozen_at_ns = stream.frozen_at_ns;
@@ -361,6 +372,7 @@ async fn serve_on(
                 stream.http,
                 stream.body,
                 app,
+                admitting.clone(),
                 move || {
                     crate::restart::streams::adopted(&adopted, frozen_at_ns);
                 },
@@ -376,7 +388,7 @@ async fn serve_on(
         });
     }
 
-    let serving = conn::serve(listener, app, accepting.clone());
+    let serving = conn::serve(listener, app, accepting.clone(), admitting);
     let drain = async {
         serving.await.context("HTTP server failed")?;
         jobs.wait().await;

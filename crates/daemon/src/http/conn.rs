@@ -47,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 use tracing::{debug, trace, warn};
 
-use crate::http::handoff::{self, Decision, FrozenStream};
+use crate::http::handoff::{self, Admissions, Decision, FrozenStream};
 use crate::http::listener::Listener;
 use crate::http::stream::{Handed, HandedBody, Pause};
 
@@ -70,11 +70,14 @@ const BODY_CHUNK: usize = 64 << 10;
 ///
 /// A cancelled `accepting` ends each connection between two requests, as
 /// `axum::serve(...).with_graceful_shutdown(...)` did, and the caller bounds
-/// the wait (`server_config.shutdown_timeout`).
+/// the wait (`server_config.shutdown_timeout`). A closed `admitting` ends them
+/// there too, for the other reason a daemon takes no new request: it is
+/// handing the deployment over (design §7.5.1 step 1).
 pub(crate) async fn serve(
     mut listener: Listener,
     app: Router,
     accepting: CancellationToken,
+    admitting: Admissions,
 ) -> anyhow::Result<()> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -84,8 +87,9 @@ pub(crate) async fn serve(
             (io, _address) = axum::serve::Listener::accept(&mut listener) => {
                 let app = app.clone();
                 let stopping = accepting.clone();
+                let admitting = admitting.clone();
                 connections.spawn(async move {
-                    if let Err(error) = serve_connection(io, app, stopping).await {
+                    if let Err(error) = serve_connection(io, app, stopping, admitting).await {
                         debug!(%error, "a connection ended with an error");
                     }
                 });
@@ -122,11 +126,12 @@ pub(crate) async fn adopt(
     http: proto::handoff::Http,
     mut body: crate::http::stream::ResponseStream,
     app: Router,
+    admitting: Admissions,
     started: impl FnOnce(),
     finished: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let io = socket_of(descriptor).context("taking over a handed connection")?;
-    let mut connection = Connection::new(io, app, CancellationToken::new());
+    let mut connection = Connection::new(io, app, CancellationToken::new(), admitting);
     connection.buffer = BytesMut::from(http.read_ahead.as_slice());
     // The counters continue the record the pause made.
     connection.written = http.written;
@@ -198,8 +203,13 @@ fn socket_of(descriptor: OwnedFd) -> io::Result<Io> {
 
 /// Serves one accepted connection until the client closes it, the server stops
 /// serving, or the connection ends it.
-async fn serve_connection(io: Io, app: Router, accepting: CancellationToken) -> anyhow::Result<()> {
-    let mut connection = Connection::new(io, app, accepting);
+async fn serve_connection(
+    io: Io,
+    app: Router,
+    accepting: CancellationToken,
+    admitting: Admissions,
+) -> anyhow::Result<()> {
+    let mut connection = Connection::new(io, app, accepting, admitting);
     connection.run().await
 }
 
@@ -209,6 +219,9 @@ struct Connection {
     io: Io,
     app: Router,
     accepting: CancellationToken,
+    /// Whether the daemon admits new requests; a hot restart closes it, and
+    /// the connection then ends at its next request boundary.
+    admitting: Admissions,
     /// Bytes read from the socket and not yet processed: the next request's
     /// head and body, or bytes of the request in flight its reader has not
     /// asked for yet.
@@ -226,11 +239,12 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(io: Io, app: Router, accepting: CancellationToken) -> Self {
+    fn new(io: Io, app: Router, accepting: CancellationToken, admitting: Admissions) -> Self {
         Self {
             io,
             app,
             accepting,
+            admitting,
             buffer: BytesMut::new(),
             peer_closed: false,
             pending: BytesMut::new(),
@@ -242,9 +256,12 @@ impl Connection {
     /// Serves requests on the connection until it ends.
     async fn run(&mut self) -> anyhow::Result<()> {
         loop {
-            // A server that is shutting down takes no request it did not
-            // already read: the request in flight ends and the connection
-            // closes.
+            // A server that is shutting down, or handing the deployment
+            // over, takes no request it did not already read: the request in
+            // flight ends and the connection closes.
+            if !self.admitting.open() && self.buffer.is_empty() {
+                return Ok(());
+            }
             if self.accepting.is_cancelled() && self.buffer.is_empty() {
                 return Ok(());
             }
@@ -274,7 +291,7 @@ impl Connection {
             );
             match outcome {
                 Outcome::KeepAlive => {
-                    if self.accepting.is_cancelled() {
+                    if self.accepting.is_cancelled() || !self.admitting.open() {
                         return Ok(());
                     }
                 }
@@ -1524,7 +1541,12 @@ mod tests {
     /// Serves `app` on a socket pair and returns the client side.
     fn serve_on_pair(app: Router) -> TestClient {
         let (io, client) = pair();
-        tokio::spawn(serve_connection(io, app, CancellationToken::new()));
+        tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            Admissions::default(),
+        ));
         TestClient::new(client)
     }
 
@@ -1728,6 +1750,36 @@ mod tests {
         serve_handed_freezable(registry, registration, request_id, pair, true)
     }
 
+    /// A daemon that is handing the deployment over takes no new request: a
+    /// connection that sends one ends at that boundary without a response,
+    /// and its client reaches the successor by reconnecting (design §7.5.1
+    /// step 1). A response already in flight is what the pause is for, and it
+    /// is not this connection.
+    #[tokio::test]
+    async fn a_connection_ends_between_requests_when_the_daemon_stops_admitting() {
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        let admitting = Admissions::default();
+        admitting.close();
+        let (io, client) = pair();
+        let serving = tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            admitting,
+        ));
+
+        let mut client = TestClient::new(client);
+        client
+            .send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+            .await
+            .expect("the connection ends")
+            .expect("the connection task")
+            .expect("the connection ends without an error");
+        assert_eq!(client.fill().await, 0, "the connection wrote no response");
+    }
+
     /// The same, for a response that cannot be handed over when `freezable`
     /// is false.
     fn serve_handed_freezable(
@@ -1766,7 +1818,12 @@ mod tests {
             }),
         );
         let (io, client) = pair();
-        tokio::spawn(serve_connection(io, app, CancellationToken::new()));
+        tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            Admissions::default(),
+        ));
         let _ = registry;
         (TestClient::new(client), frames)
     }
@@ -1819,6 +1876,7 @@ mod tests {
             http,
             body,
             app(),
+            Admissions::default(),
             move || {
                 recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
@@ -1897,6 +1955,7 @@ mod tests {
             http,
             body,
             app(),
+            Admissions::default(),
             move || going_on.store(true, std::sync::atomic::Ordering::SeqCst),
             move || {
                 assert!(
@@ -2046,7 +2105,15 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), || {}, || {}));
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            Admissions::default(),
+            || {},
+            || {},
+        ));
         frames.send(Bytes::from_static(b"data: c\n\n")).unwrap();
         drop(frames);
 
