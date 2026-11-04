@@ -170,6 +170,15 @@ pub struct Batch {
     pub columns: BatchColumns,
     /// The generation whose kernels serve this batch (4.2, 7.3).
     pub generation: u64,
+    /// What the mechanism allocated for this batch's cache pages: per group, the units it acquired
+    /// and the `(source, destination)` copies a leased prefix needs before a call reads it.
+    ///
+    /// The mechanism computes these and owns the source lease, which runs to completion; the
+    /// executor applies them on the batch's stream before the forward, so a destination holds the
+    /// source's bytes by stream order and the graph needs no extra barrier. A batch that reads a
+    /// fresh prefix carries no allocation, and one that reuses a cached prefix cannot be served
+    /// correctly without it (`ipc::batch::CacheUnitAllocation`).
+    pub cache_units: Vec<ipc::CacheUnitAllocation>,
 }
 
 /// The commit table's own definition, so a producer outside this crate writes its rows against

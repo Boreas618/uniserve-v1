@@ -1539,10 +1539,24 @@ impl CachePlanes {
         for &(from, to) in copies {
             self.require_unit(from.0)?;
             self.require_unit(to.0)?;
-            if from.0 == 0 || to.0 == 0 || from == to || inherited.contains(&to.0) {
-                return Err(Error::Invalid(
-                    "cache unit copies require a writable new destination".into(),
-                ));
+            // A refusal names the pair: the scheduler's allocation is what a caller has to look
+            // at, and "unit 0" or "already the source" is what tells them which entry is wrong.
+            let reason = if from.0 == 0 {
+                Some("the source is unit 0, the block tables' sentinel")
+            } else if to.0 == 0 {
+                Some("the destination is unit 0, the block tables' sentinel")
+            } else if from == to {
+                Some("the destination is the source")
+            } else if inherited.contains(&to.0) {
+                Some("the destination is an inherited read-only unit of the predecessor world")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(Error::Invalid(format!(
+                    "cache unit copy {} -> {} is refused: {reason}",
+                    from.0, to.0
+                )));
             }
             for column in 0..self.plan.columns {
                 for field in 0..2 {
@@ -1849,6 +1863,75 @@ mod layer_view_tests {
             .released_from
             .store(1, Ordering::Release);
         assert_eq!(pool.mapped_bytes(), full - 2 * 128);
+        Ok(())
+    }
+
+    /// A refused copy names the pair and the reason: the deployment's reader has the scheduler's
+    /// allocation to look at, and "1 -> 0, the block tables' sentinel" is what tells them which
+    /// entry of it is wrong.
+    #[test]
+    fn a_refused_unit_copy_names_the_pair_and_the_reason() {
+        let pool = pool(vec![group(2, 1)], 2, 4, false);
+        let batch = crate::stream::recorded::Batch::new(None, crate::stream::EventPool::new());
+        let refused = |copies: &[(ipc::UnitId, ipc::UnitId)]| {
+            pool.copy_units(copies, batch.on().host())
+                .expect_err("this copy is refused")
+                .to_string()
+        };
+        let sentinel = refused(&[(ipc::UnitId(1), ipc::UnitId(0))]);
+        assert!(
+            sentinel.contains("1 -> 0"),
+            "the pair is not named: {sentinel}"
+        );
+        assert!(
+            sentinel.contains("sentinel"),
+            "the reason is not named: {sentinel}"
+        );
+        let same = refused(&[(ipc::UnitId(2), ipc::UnitId(2))]);
+        assert!(same.contains("the destination is the source"), "{same}");
+    }
+
+    /// A unit copy moves a page's bytes into the units a batch was newly given: after it, the
+    /// destination's plane of each column holds what the source's held.
+    ///
+    /// This is the whole of what a cache-unit allocation asks of the pool - the source's bytes on
+    /// the destination's cells - so a run that reuses a cached prefix reads the destination and
+    /// finds the source's tokens.
+    #[test]
+    fn a_unit_copy_moves_a_pages_bytes_into_its_destination() -> Result<()> {
+        let pool = pool(vec![group(2, 1)], 2, 4, false);
+        let plane_bytes = pool.plan.plane_bytes as usize;
+        let cells = 2 * 4;
+        let address = pool.value_storage(0)?.address();
+        // SAFETY: the storage holds `cells` planes of `plane_bytes` bytes and is owned by `pool`;
+        // the test holds the only handle to it.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(address as *mut u8, cells * plane_bytes);
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::try_from(index % 251).expect("a byte");
+            }
+        }
+        let events = crate::stream::EventPool::new();
+        let batch = crate::stream::recorded::Batch::new(None, events);
+        pool.copy_units(&[(ipc::UnitId(1), ipc::UnitId(2))], batch.on().host())?;
+        batch.perform()?;
+        // Cell `column * num_units + unit`: unit 1 and unit 2 of column 0.
+        let expected: Vec<u8> = (plane_bytes..2 * plane_bytes)
+            .map(|index| u8::try_from(index % 251).expect("a byte"))
+            .collect();
+        let read = |cell: usize| {
+            // SAFETY: the same storage, still owned by `pool`, still `cells * plane_bytes` long.
+            unsafe {
+                std::slice::from_raw_parts(address as *const u8, cells * plane_bytes)
+                    [cell * plane_bytes..(cell + 1) * plane_bytes]
+                    .to_vec()
+            }
+        };
+        assert_eq!(
+            read(2),
+            expected,
+            "the destination did not take the source's bytes"
+        );
         Ok(())
     }
 

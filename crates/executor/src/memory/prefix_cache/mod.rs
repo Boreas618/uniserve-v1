@@ -361,7 +361,18 @@ impl PrefixCache {
             .iter()
             .map(|(_, target)| (target.0, 0, self.plan().unit_tokens()))
             .collect();
-        self.accesses.require_reusable(&spans)?;
+        // A destination an export, an import or a running call still reads is refused here; the
+        // message names the units so the allocation that produced them can be looked at.
+        if let Err(error) = self.accesses.require_reusable(&spans) {
+            let units: Vec<String> = copies
+                .iter()
+                .map(|(from, to)| format!("{} -> {}", from.0, to.0))
+                .collect();
+            return Err(Error::Invalid(format!(
+                "cache unit copies [{}] are refused: {error}",
+                units.join(", ")
+            )));
+        }
         self.planes.copy_units(copies, issue)
     }
 

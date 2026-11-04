@@ -330,6 +330,79 @@ struct Scratch {
 }
 
 impl KvProvider for ResidentCache {
+    /// Applies what the mechanism allocated for a batch's pages: the units become this cache's, then
+    /// the leased prefix's copies are issued on the batch's stream.
+    ///
+    /// The order is the only order that is correct. A destination is a unit of *this* cache, so it
+    /// is taken first - `reset_units` clears the previous owner's values and flags, which is what
+    /// makes the page new - and the copies come second. They read the sources the mechanism still
+    /// leases, and they are issued on the batch's stream, so the forward that reads the destinations
+    /// runs after them by stream order and takes no barrier.
+    ///
+    /// Three things are refused **by name**, because a reader of the deployment's log needs the unit
+    /// and the reason rather than the fact that a seam existed: a unit outside the pool's range, a
+    /// group this pool does not hold, and a copy whose destination this allocation did not name
+    /// (a destination the cache never took is not a destination).
+    fn apply_cache_units(
+        &mut self,
+        units: &[ipc::CacheUnitAllocation],
+        stream: &Stream,
+    ) -> Result<()> {
+        if units.is_empty() {
+            return Ok(());
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let groups = cache.groups();
+        for allocation in units {
+            let group = allocation.group_id as usize;
+            if group >= groups {
+                return Err(Error::Invalid(format!(
+                    "the mechanism allocated units of cache group {group}, but this pool has \
+                     {groups} group(s)"
+                )));
+            }
+            let pages = cache.pages(group).map_err(|error| {
+                Error::Invalid(format!(
+                    "the mechanism allocated units of cache group {group}, which this pool \
+                     cannot describe: {error}"
+                ))
+            })?;
+            let held = |unit: ipc::UnitId, what: &str| -> Result<()> {
+                // Unit zero is the block tables' sentinel, so a page is one of `1..pages`.
+                if unit.0 == 0 || unit.0 >= pages {
+                    return Err(Error::Invalid(format!(
+                        "the mechanism named cache unit {} of group {group} as {what}, outside \
+                         the pool's {} units (unit 0 is the block tables' sentinel)",
+                        unit.0, pages
+                    )));
+                }
+                Ok(())
+            };
+            for &unit in &allocation.unit_ids {
+                held(unit, "a new unit")?;
+            }
+            for &(source, destination) in &allocation.copies {
+                held(source, "a copy's source")?;
+                held(destination, "a copy's destination")?;
+                if !allocation.unit_ids.contains(&destination) {
+                    return Err(Error::Invalid(format!(
+                        "the mechanism copies into cache unit {} of group {group}, which this \
+                         allocation did not name among the units it acquired",
+                        destination.0
+                    )));
+                }
+            }
+            // The units are this cache's before anything is written into them.
+            let acquired: Vec<u32> = allocation.unit_ids.iter().map(|unit| unit.0).collect();
+            cache.reset_units(&acquired, stream)?;
+            cache.copy_units(&allocation.copies, stream)?;
+        }
+        Ok(())
+    }
+
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) -> Result<()> {
         if !self.tables.is_empty() {
             return Ok(());
