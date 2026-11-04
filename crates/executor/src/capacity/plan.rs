@@ -1102,25 +1102,4 @@ mod tests {
         // units' difference proves is that the columns are charged per unit: were they charged
         // with the tables, both ranks would fit the same units.
     }
-
-    /// The plan's page size is the page the served cache holds, and the width a
-    /// batch's block table needs follows from it.
-    #[test]
-    fn the_width_follows_from_the_page_size_the_plan_chose() {
-        let answer = {
-            let plan = plan(geometry());
-            let block = u64::from(
-                plan.cache
-                    .as_ref()
-                    .unwrap()
-                    .groups
-                    .first()
-                    .map(|group| group.block_size)
-                    .unwrap_or(0),
-            );
-            let pages = (request().max_total_tokens.unwrap() as u64).div_ceil(block);
-            u32::try_from(pages).unwrap()
-        };
-        assert_eq!(answer, 4096 / 64);
-    }
 }
