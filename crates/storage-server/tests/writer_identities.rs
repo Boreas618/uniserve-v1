@@ -229,19 +229,23 @@ fn one_process_holds_two_rank_writer_identities() {
         "every tensor of this process names this process as its writer, got {writers:?}"
     );
 
-    // The server is still usable: rank 0 reads its own tensor back.
+    // The server is still usable: rank 0 takes its own exclusive tensor for
+    // writing again. `Mode::Read` is refused for an exclusive tensor by the
+    // server's rules whatever the caller, so the writer's own write access is
+    // the check that the refusal above left the tensor where it was.
     let got = rank0
-        .get(vec![key(1)], Mode::Read, Vec::new())
-        .expect("rank 0 reads its own tensor");
+        .get(vec![key(1)], Mode::Write, Vec::new())
+        .expect("rank 0 takes its own tensor for writing");
     assert_eq!(got.tensors.len(), 1);
 
-    if admitted {
-        println!(
-            "probe(writers): ANSWER §2.5 - one process can hold both rank writer identities; scopes of one process are not kept apart"
-        );
+    // The design's two questions, kept apart: the publish step answered whether
+    // one process can hold both rank writer identities (both `put`s succeeded),
+    // and the cross request answered whether one scope can take another's tensor.
+    let identities = "one process holds both rank writer identities";
+    let scopes = if admitted {
+        "one scope of a process took another scope's tensor, so the server does not keep them apart"
     } else {
-        println!(
-            "probe(writers): ANSWER §2.5 - one process cannot hold both rank writer identities; the server keeps the scopes apart"
-        );
-    }
+        "a scope of the same process was refused another scope's tensor, so the server keeps scopes apart"
+    };
+    println!("probe(writers): ANSWER §2.5 - {identities}; {scopes}");
 }
