@@ -549,6 +549,11 @@ pub(crate) struct MainProcess {
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
     executors: Vec<Arc<Executor>>,
     memory: Option<Memory>,
+    /// The rank's Storage Server client, kept for the two calls of §2.5 that reach its ledger and no
+    /// other: a park gives the cache's segments back, and a wake maps them again. Every caller takes
+    /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
+    /// hold one beside the control thread without a lock.
+    storage: Option<Arc<Retained>>,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
     modules: Lane<Install>,
@@ -719,6 +724,9 @@ impl MainProcess {
         let storage = claim(&mut process, launch, &epoch.host, host_kv_cache)?;
         let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
             .context("connecting to the Storage Server")?;
+        // The client outlives every world of the epoch, and §2.5's park and wake reach its ledger
+        // through the memory owners: kept here so the park does not have to hold the connect.
+        let retained = Arc::clone(&client);
         // A weight's region is one device's address, so the store maps on the device this rank's
         // model is loaded for; the client is shared, the mapping is not.
         let weight_device = *plan
@@ -800,6 +808,7 @@ impl MainProcess {
             schedulers,
             executors,
             memory: Some(memory),
+            storage: Some(retained),
             blocking,
             modules,
             update,
@@ -867,6 +876,17 @@ impl MainProcess {
     /// sends the epoch's programs.
     fn park_standby(&mut self) -> Result<()> {
         self.serving = false;
+        // The same release the `Park` command makes: this process serves nothing from here until a
+        // promotion, and a standby holding the cache's segments while a successor loads is the
+        // memory the handover needs. A pool that is not segmented has nothing to give back, and the
+        // line says so.
+        if let Err(error) = self.give_back_segments() {
+            tracing::warn!(
+                %error,
+                "this standby could not give the cache's segments back; it parks with them still \
+                 mapped"
+            );
+        }
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Parked(
                 proto::process::Parked {
@@ -874,6 +894,32 @@ impl MainProcess {
                 },
             )),
         });
+        Ok(())
+    }
+
+    /// §2.5: gives the parked process's cache segments back to the Storage Server, and states what
+    /// went back and what stayed.
+    ///
+    /// The segments are the only pool a sleep releases: the graph pools and the scratch region are
+    /// reservations whose captures keep their addresses (the segments' offsets are fixed inside one
+    /// reserved range, so a wake is a remap and never a recapture), and the resident owners map
+    /// through the same ledger for the process's life. A pool that is not segmented has nothing to
+    /// give back, and the line says that rather than reading as a release that happened.
+    fn give_back_segments(&mut self) -> Result<()> {
+        let (Some(storage), Some(memory)) = (self.storage.clone(), self.memory.as_ref()) else {
+            return Ok(());
+        };
+        let cache = memory.shared_cache();
+        let kept_before = memory.mapped_resident();
+        executor::memory::sleep(&cache, &mut &*storage)
+            .context("giving the parked process's cache segments back")?;
+        let kept = memory.mapped_resident();
+        tracing::info!(
+            given_back = kept_before.saturating_sub(kept),
+            kept,
+            pool = "the cache's segments",
+            "the park gave back the segments it no longer serves, and kept the pools it serves with"
+        );
         Ok(())
     }
 
@@ -1239,6 +1285,18 @@ impl MainProcess {
                 // after `Promoted`.
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
+                    // §2.5: the schedulers are parked and nothing is in flight, so the cache's
+                    // segments can go back to the Storage Server - a parked process that keeps them
+                    // holds a successor's memory. A park that cannot give them back is still a park:
+                    // the process serves nothing, and failing the epoch over a release would end a
+                    // process that a promotion can still use. It says so instead.
+                    if let Err(error) = self.give_back_segments() {
+                        tracing::warn!(
+                            %error,
+                            "the park could not give the cache's segments back; it is parked with \
+                             them still mapped"
+                        );
+                    }
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Parked(
                             proto::process::Parked {
