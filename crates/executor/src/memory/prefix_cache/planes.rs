@@ -1106,11 +1106,26 @@ impl CachePlanes {
     /// report, so it counts mapped storage only: a sleeping rank's released
     /// segments are not in it.
     pub fn mapped_bytes(&self) -> u64 {
+        // A sleeping rank gives segments back from `released_from` on, and the
+        // storages keep their size while their segments are absent, so the
+        // value planes count what is still mapped rather than what was reserved.
+        let released = match &self.segmenting {
+            Some(segmenting) => {
+                let from = segmenting.released_from.load(Ordering::Acquire);
+                segmenting
+                    .parts_of(from..segmenting.count())
+                    .into_iter()
+                    .map(|part| segmenting.parts[part].length as u64)
+                    .sum::<u64>()
+            }
+            None => 0,
+        };
         let values = self
             .values
             .iter()
             .map(|storage| storage.bytes() as u64)
-            .sum::<u64>();
+            .sum::<u64>()
+            .saturating_sub(released);
         let initialized = self
             .initialized
             .iter()
@@ -1552,6 +1567,53 @@ mod layer_view_tests {
 
         let second = pool.key_scale(0, 3)?.expect("an FP8 pool holds scales");
         assert_eq!(second.shape(), &[4, 1, 1, 1]);
+        Ok(())
+    }
+
+    /// A sleeping rank's given-back segments are not resident: the storages
+    /// keep their size, and the figure follows the segments that are still
+    /// mapped, so a wake brings every byte back.
+    #[test]
+    fn given_back_segments_are_not_resident() -> Result<()> {
+        let mut pool = pool(vec![group(2, 0)], 2, 8, true);
+        let full = pool.mapped_bytes();
+        assert!(full > 0);
+
+        let segment = |ordinal| ipc::CacheSegment {
+            world: 1,
+            ordinal,
+            units: 4,
+        };
+        let parts = (0..4)
+            .flat_map(|column| {
+                (0..2).map(move |ordinal| crate::memory::retained::SegmentPart {
+                    length: 128,
+                    column,
+                    segment: segment(ordinal),
+                    inherited: false,
+                    create: true,
+                })
+            })
+            .collect::<Vec<_>>();
+        let segmenting = Segmenting {
+            segments: vec![
+                (segment(0), AtomicBool::new(false)),
+                (segment(1), AtomicBool::new(false)),
+            ],
+            released_from: AtomicU32::new(2),
+            parts,
+        };
+        pool.segmenting = Some(segmenting);
+        assert_eq!(pool.mapped_bytes(), full);
+
+        // The second segment is given back: one column's worth of its two
+        // columns is no longer mapped.
+        pool.segmenting
+            .as_ref()
+            .expect("just set")
+            .released_from
+            .store(1, Ordering::Release);
+        assert_eq!(pool.mapped_bytes(), full - 2 * 128);
         Ok(())
     }
 
