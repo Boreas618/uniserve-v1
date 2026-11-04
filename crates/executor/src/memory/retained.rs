@@ -543,14 +543,22 @@ impl Retained {
             .into_iter()
             .nth(index)
             .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
-        // A weight is published as a DEVICE block (`Storage::retainable`) and imported by its
-        // shareable handle, so a kernel reads it at a device address. The host branch is what a
-        // record published before that change still needs, and what the page pool and the link
-        // scratch use: host storage is mapped and registered with the device, never handed to the
-        // VMM import - a memfd is not a CUDA shareable handle.
+        // A weight is the Storage Server's retained storage, mapped read-only by its shareable
+        // handle: the publisher allocates an exportable device block, copies the bytes in, exports
+        // it and records `Placement::Device`, and a kernel then reads the weight at a device
+        // address with no copy at load time (4.1).
+        //
+        // A record that states Host placement is refused rather than mapped: host storage
+        // registered with the device is addressable from a kernel, but every forward would read the
+        // model's bytes across the CPU link - which is the defect this path exists to remove, and a
+        // silent fallback would hide it behind a slow run instead of naming it.
         let storage = match record.placement {
             ::storage::Placement::Host { .. } => {
-                Storage::import_host(descriptor, record.bytes as usize, device)?
+                return Err(Error::Interface(format!(
+                    "the weight {} is published as host storage; a weight is retained as a device \
+                     block (Placement::Device) and mapped by handle, so it must be republished",
+                    String::from_utf8_lossy(&key.0)
+                )));
             }
             ::storage::Placement::Device { .. } => Storage::import(
                 descriptor,
