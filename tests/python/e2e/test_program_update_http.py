@@ -30,6 +30,12 @@ not exist:
 - ``UNISERVE_PROGRAM_WRONG_PACKAGE``: a package of the rebind operator whose
   result is outside ``Op::tolerance``.
 - ``UNISERVE_PROGRAM_TARGET``: the Program Server's target (``sm_100a``).
+
+The admin surface is front's (M488): `POST /admin/config/commit` and
+`/admin/config/rollback`, events whose `data.phase` names the phase and whose
+`kind` is `deployment`, and `/admin/config`'s `epochs` array whose elements
+carry `kernels` and `previous_kernels` as a list of
+`{op, phase, program: {backend, revision, arguments}}`.
 """
 
 from __future__ import annotations
@@ -326,17 +332,22 @@ def wait_for_phases(
 
 
 def epoch_record(base_url: str) -> dict:
-    """The epoch the deployment serves, as the daemon records it (5.1)."""
+    """The epoch the deployment serves, as the daemon records it (5.1).
+
+    `/admin/config` reports every epoch, ascending; the one that serves is the
+    highest-numbered epoch in `serving` or `probation`, and `/admin/events`
+    names it by number (`data.epoch`).
+    """
     response = httpx.get(f"{base_url}/admin/config", timeout=60.0)
     response.raise_for_status()
     epochs = response.json()["epochs"]
-    serving = [
+    live = [
         epoch
         for epoch in epochs
-        if epoch.get("status") in ("serving", "probation", "precopy")
+        if epoch.get("status") in ("serving", "probation")
     ]
-    assert len(serving) == 1, f"expected one serving epoch, got {epochs}"
-    return serving[0]
+    assert live, f"the deployment serves no epoch: {epochs}"
+    return max(live, key=lambda epoch: epoch["epoch"])
 
 
 def metrics(
@@ -399,11 +410,14 @@ def test_a_kernel_program_is_swapped_by_rebind_while_requests_stream(
     assert after["kernels"] != before["kernels"], (
         "the program-layer update did not change the recorded kernel programs"
     )
-    assert any(
-        str(revision) in json.dumps(entry)
-        for entry in after["kernels"].values()
-        if isinstance(entry, dict)
-    ), f"the recorded programs name no revision {revision}: {after['kernels']}"
+    revisions = {
+        entry["program"]["revision"]
+        for entry in after["kernels"]
+        if isinstance(entry.get("program"), dict)
+    }
+    assert revision in revisions, (
+        f"the recorded programs name no revision {revision}: {after['kernels']}"
+    )
 
     end_update(server, "commit")
     wait_for_phases(server, COMMITTED)
@@ -444,6 +458,9 @@ def test_revert_restores_the_previous_generation(
     before = epoch_record(server)
     end_update(server, "rollback")
     wait_for_phases(server, REVERTED)
+    assert before["previous_kernels"] is not None, (
+        "the epoch on probation kept no previous kernel programs to revert to"
+    )
     after = epoch_record(server)
     assert after["kernels"] == before["previous_kernels"], (
         "the revert did not restore the previous kernel programs"
