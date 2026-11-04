@@ -1,1 +1,525 @@
-//! Placeholder: this module lands with its owner (see `notes/h3/map.md`).
+//! The denoiser's layout: what one request reserves, and the tables that describe it.
+//!
+//! A request is snapped to a legal frame count and a legal canvas, packed into the row order the
+//! transformer reads (`[video | audio | prefix | padding]`, [`crate::packing`]), and evaluated once
+//! per schedule point. This module owns what surrounds the evaluation: the layout the executor
+//! captures against, and the tables that make a captured graph independent of the prompt.
+//!
+//! ## Layouts, not requests
+//!
+//! A graph is captured per **layout** - the frame count, canvas, text capacity and condition
+//! capacity - and replayed for every request that fits it. So the layout snaps: frames to `17n + 5`
+//! ([`crate::packing::align_num_frames`]), sides to the checkpoint's 32-pixel grid, and both prefix
+//! capacities up to whole capacity units (64 rows under dense attention, the sparse tile
+//! otherwise). Two requests of one layout share one set of tables, and the executor keys its
+//! storage by `(layout, name)`.
+//!
+//! ## Host bytes
+//!
+//! Everything a request changes arrives as device tables the executor allocates: the rotary
+//! coordinates, the modulation tags, the timestep groups, the prefix index of every packed row, the
+//! AdaLN row each row reads, and the step index. [`Layouts::prepare_state`] writes their host bytes
+//! in the order [`Layouts::state_tables`] names them; nothing of a request reaches a capture as a
+//! host value, and no table is uploaded from inside a forward.
+
+use nn::capability::{Layout, LatentShape, StateTable, VideoRequest};
+use nn::Shape;
+
+use crate::config::{Canvas, DenoiserConfig};
+use crate::packing::{self, DensePacking};
+use crate::{Error, Result};
+
+/// The row capacities and the sequence degree a deployment serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Arrangement {
+    /// Text rows every layout of this deployment holds, a whole number of capacity units.
+    pub text_rows: u32,
+    /// Condition rows it holds, in capacity units.
+    pub condition_rows: u32,
+    /// Rows of one sequence shard: the Ulysses degree.
+    pub shard: u32,
+}
+
+impl Arrangement {
+    /// A deployment's arrangement, checked against the attention kind's capacity unit.
+    pub fn new(config: &DenoiserConfig, text_rows: u32, condition_rows: u32, shard: u32) -> Result<Self> {
+        let unit = config.attention.capacity_rows();
+        if shard == 0 || !shard.is_power_of_two() {
+            return Err(Error::config(format!(
+                "a sequence shard of {shard} rows is not a power of two"
+            )));
+        }
+        for (name, rows) in [("text", text_rows), ("condition", condition_rows)] {
+            if rows == 0 || !rows.is_multiple_of(unit) {
+                return Err(Error::config(format!(
+                    "a {name} capacity of {rows} rows is not a multiple of the {unit}-row unit"
+                )));
+            }
+        }
+        Ok(Self {
+            text_rows,
+            condition_rows,
+            shard,
+        })
+    }
+}
+
+/// The deployment's layout rule: how a request snaps, and what its tables are.
+pub struct Layouts {
+    config: DenoiserConfig,
+    arrangement: Arrangement,
+}
+
+impl Layouts {
+    /// The rule of a checkpoint and a deployment.
+    pub fn new(config: DenoiserConfig, arrangement: Arrangement) -> Result<Self> {
+        if config.transformer.head_dim == 0 || config.transformer.num_attention_heads == 0 {
+            return Err(Error::config(
+                "a denoiser's transformer has attention heads".to_owned(),
+            ));
+        }
+        Ok(Self {
+            config,
+            arrangement,
+        })
+    }
+
+    /// The arrangement this rule serves.
+    pub const fn arrangement(&self) -> Arrangement {
+        self.arrangement
+    }
+
+    /// The layout a request is served in, with the packing of its row extents.
+    ///
+    /// The canvas comes from the request's raster and the frames are snapped; the prefix capacities
+    /// are the deployment's, because a layout holds every prompt that fits it.
+    pub fn layout(&self, request: &VideoRequest) -> Result<(Layout, DensePacking)> {
+        let frames = packing::align_num_frames(request.frames);
+        let canvas = canvas_of(request)?;
+        let packing = packing::dense_packing(
+            frames,
+            &canvas,
+            self.arrangement.text_rows,
+            self.arrangement.condition_rows,
+            self.arrangement.shard,
+        )?;
+        let layout = self.layout_of(&packing, &canvas)?;
+        Ok((layout, packing))
+    }
+
+    /// The layout of a packing and the canvas it packs.
+    pub fn layout_of(&self, packing: &DensePacking, canvas: &Canvas) -> Result<Layout> {
+        let raster = packing::latent_raster(canvas)?;
+        let frames = packing::video_latent_frames(packing.video_rows / raster.patch_rows())?;
+        Ok(Layout {
+            video: LatentShape {
+                channels: self.config.transformer.video_channels,
+                frames,
+                height: raster.height,
+                width: raster.width,
+            },
+            audio: Some(LatentShape {
+                channels: self.config.transformer.audio_channels,
+                frames: packing.audio_rows / crate::config::AUDIO_CHANNELS,
+                height: 1,
+                width: 1,
+            }),
+            text_rows: packing.text_rows,
+            condition_rows: packing.condition_rows,
+        })
+    }
+
+    /// The packing a layout's extents came from.
+    ///
+    /// A layout states the latent extents and the two capacities; the packing is
+    /// [`packing::dense_packing`]'s for the frame count and canvas those extents imply, and the two
+    /// must agree - a disagreement is a layout this model did not build.
+    pub fn packing_of(&self, layout: &Layout) -> Result<DensePacking> {
+        let canvas = canvas_of_latents(layout)?;
+        let frames = frame_count(layout.video.frames)?;
+        let packing = packing::dense_packing(
+            frames,
+            &canvas,
+            layout.text_rows,
+            layout.condition_rows,
+            self.arrangement.shard,
+        )?;
+        let rebuilt = self.layout_of(&packing, &canvas)?;
+        if rebuilt.video.frames != layout.video.frames
+            || rebuilt.video.height != layout.video.height
+            || rebuilt.video.width != layout.video.width
+            || rebuilt.text_rows != layout.text_rows
+            || rebuilt.condition_rows != layout.condition_rows
+        {
+            return Err(Error::config(format!(
+                "the layout's {:?} latent extents are not a frame count and canvas this model packs",
+                layout.video
+            )));
+        }
+        Ok(packing)
+    }
+
+    /// The tables one request of `layout` needs, in the order [`Layouts::prepare_state`] fills them.
+    ///
+    /// Sorted by name, so the order is a property of the layout alone and two requests of one shape
+    /// share one set. Every table is one the forward reads; none is a host value the executor would
+    /// otherwise have to pass through a launch.
+    pub fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        let packing = self.packing_of(layout)?;
+        let rows = u64::from(packing.padded_tokens);
+        let mut tables = vec![
+            StateTable {
+                name: "groups",
+                dtype: nn::DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "modulation_indices",
+                dtype: nn::DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "position_ids",
+                dtype: nn::DType::F32,
+                shape: Shape::new(&[rows, 3]),
+            },
+            StateTable {
+                name: "prefix_index",
+                dtype: nn::DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "token_tags",
+                dtype: nn::DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            // The step the schedule evaluates, written by the executor before each replay. One
+            // value per (request, capture), not per row.
+            StateTable {
+                name: "step",
+                dtype: nn::DType::I64,
+                shape: Shape::new(&[1]),
+            },
+        ];
+        tables.sort_by_key(|table| table.name);
+        Ok(tables)
+    }
+
+    /// Write one request's tables, in [`Layouts::state_tables`]' order.
+    ///
+    /// The bytes are host bytes in each table's own element type: the executor uploads them once
+    /// per request, before the capture it will replay. `text_tokens` is the prompt's row count,
+    /// which the media clock starts at; a prompt that does not fit the layout's capacity is
+    /// refused here rather than captured.
+    pub fn prepare_state(
+        &self,
+        request: &VideoRequest,
+        text_tokens: u32,
+        layout: &Layout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()> {
+        let packing = self.packing_of(layout)?;
+        if text_tokens > layout.text_rows {
+            return Err(Error::config(format!(
+                "a prompt of {text_tokens} rows does not fit a text capacity of {}",
+                layout.text_rows
+            )));
+        }
+        let frames = frame_count(layout.video.frames)?;
+        let canvas = canvas_of_latents(layout)?;
+        let conditions = conditions_of(request);
+        let segments = packing::condition_segments(&conditions, &canvas)?;
+        let tables = packing::dense_tables(
+            &packing,
+            frames,
+            &canvas,
+            text_tokens,
+            &segments,
+            // The prompt's vision rows arrive with `VideoRequest`'s condition shapes; until then a
+            // prompt is all text and every row takes the text clock.
+            &[],
+        )?;
+        let mut written = 0;
+        for (name, bytes) in [
+            ("groups", integers(&tables.groups)),
+            (
+                "modulation_indices",
+                modulation_indices(&tables.groups, &tables.token_tags),
+            ),
+            ("position_ids", coordinates(&tables.position_ids)),
+            ("prefix_index", integers(&tables.prefix_index)),
+            ("token_tags", integers(&tables.token_tags)),
+        ] {
+            let Some(buffer) = out.get_mut(written) else {
+                return Err(Error::config(format!(
+                    "the executor holds no buffer for {name}"
+                )));
+            };
+            if buffer.len() != bytes.len() {
+                return Err(Error::config(format!(
+                    "{name} is {} bytes, its buffer {}",
+                    bytes.len(),
+                    buffer.len()
+                )));
+            }
+            buffer.copy_from_slice(&bytes);
+            written += 1;
+        }
+        // The step is the executor's to write: it is the one table a replay changes.
+        if let Some(buffer) = out.get_mut(written)
+            && !buffer.is_empty()
+            && buffer.len() != 8
+        {
+            return Err(Error::config(format!(
+                "the step table is {} bytes, not one i64",
+                buffer.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The frame count a request is snapped to.
+pub fn frames_of(request: &VideoRequest) -> u32 {
+    packing::align_num_frames(request.frames)
+}
+
+/// The canvas a request renders, on the checkpoint's 32-pixel grid.
+fn canvas_of(request: &VideoRequest) -> Result<Canvas> {
+    let width = round_up(request.width, crate::CANVAS_MULTIPLE);
+    let height = round_up(request.height, crate::CANVAS_MULTIPLE);
+    let divisor = gcd(width, height);
+    Ok(Canvas {
+        short_edge: width.min(height),
+        aspect: (width / divisor, height / divisor),
+        width,
+        height,
+    })
+}
+
+/// The canvas a layout's latent raster came from.
+fn canvas_of_latents(layout: &Layout) -> Result<Canvas> {
+    let canvas = Canvas {
+        short_edge: (layout.video.height * 16).min(layout.video.width * 16),
+        aspect: (layout.video.width, layout.video.height),
+        width: layout.video.width * 16,
+        height: layout.video.height * 16,
+    };
+    packing::latent_raster(&canvas)?;
+    Ok(canvas)
+}
+
+/// The generated frame count a latent frame count came from: `5n + 2` latent frames are `17n + 5`
+/// generated frames ([`crate::packing::video_latent_frames`], inverted).
+fn frame_count(latent_frames: u32) -> Result<u32> {
+    if latent_frames < 2 || !(latent_frames - 2).is_multiple_of(crate::CLIP_LATENTS) {
+        return Err(Error::config(format!(
+            "{latent_frames} latent frames are not 5n + 2"
+        )));
+    }
+    Ok((latent_frames - 2) / crate::CLIP_LATENTS * crate::CLIP_FRAMES + crate::CLIP_LATENTS)
+}
+
+/// The request's conditions in the geometry the packing places them by.
+fn conditions_of(request: &VideoRequest) -> Vec<packing::Condition> {
+    let _ = request;
+    // The conditions' roles and rasters arrive with `VideoRequest`'s condition shapes
+    // (nn::capability::ConditionShape); until they do, an unconditioned layout is the one this
+    // build can pack, which is `t2va`.
+    Vec::new()
+}
+
+/// Round `value` up to the next multiple of `unit`.
+fn round_up(value: u32, unit: u32) -> u32 {
+    value.div_ceil(unit) * unit
+}
+
+/// The greatest common divisor, for the aspect ratio a raster states.
+fn gcd(left: u32, right: u32) -> u32 {
+    if right == 0 {
+        left
+    } else {
+        gcd(right, left % right)
+    }
+}
+
+/// Coordinates as little-endian FP32.
+fn coordinates(points: &[[f64; 3]]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(points.len() * 3 * 4);
+    for point in points {
+        for value in point {
+            bytes.extend_from_slice(&(*value as f32).to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// Integers as little-endian int32.
+fn integers(values: &[i32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// The AdaLN row of every packed row: `3 * group + tag`.
+fn modulation_indices(groups: &[i32], tags: &[i32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(groups.len() * 4);
+    for (group, tag) in groups.iter().zip(tags) {
+        bytes.extend_from_slice(&(3 * group + tag).to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AttentionKind, DenoiserConfig, ScheduleSpec, Shifts, TransformerConfig};
+
+    fn transformer() -> TransformerConfig {
+        TransformerConfig {
+            hidden_size: 5376,
+            num_attention_heads: 56,
+            head_dim: 128,
+            num_hidden_layers: 50,
+            num_refiner_layers: 2,
+            intermediate_size: 14336,
+            video_channels: 24,
+            audio_channels: 32,
+            text_dim: 5120,
+            frequency_dim: 256,
+            time_hidden_dim: 5376,
+            time_dim: 2688,
+            rope_frequency_dim: 16,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            qk_norm_eps: 1e-5,
+            output_heads: 1,
+        }
+    }
+
+    fn layouts() -> Layouts {
+        let config = DenoiserConfig {
+            transformer: transformer(),
+            schedule: ScheduleSpec::Uniform {
+                points: 50,
+                shifts: Shifts { video: 12.0, audio: 3.0 },
+            },
+            attention: AttentionKind::DENSE,
+            tasks: vec![nn::capability::VideoTask::TextToVideoAudio],
+            canvases: None,
+        };
+        Layouts::new(
+            config,
+            Arrangement {
+                text_rows: 128,
+                condition_rows: 64,
+                shard: 1,
+            },
+        )
+        .unwrap()
+    }
+
+    fn request(frames: u32, width: u32, height: u32) -> VideoRequest {
+        VideoRequest {
+            task: nn::capability::VideoTask::TextToVideoAudio,
+            width,
+            height,
+            frames,
+            fps: 24,
+            first_frames: 0,
+            last_frames: 0,
+            references: 0,
+        }
+    }
+
+    #[test]
+    fn a_request_snaps_to_a_legal_frame_count_and_raster() {
+        let rule = layouts();
+        let (layout, packing) = rule.layout(&request(100, 1344, 768)).unwrap();
+        // 100 frames snap to 107 (6 clips of 17 plus 5), which is 32 latent frames and 32 * 42 * 24
+        // video rows.
+        assert_eq!(packing.video_rows, 32 * 42 * 24);
+        assert_eq!(layout.video.frames, 32);
+        assert_eq!((layout.video.height, layout.video.width), (48, 84));
+        // Four stereo rows per audio latent step.
+        assert_eq!(packing.audio_rows, 4 * 179);
+        assert_eq!(layout.audio.unwrap().frames, 179);
+        assert_eq!(layout.text_rows, 128);
+        assert_eq!(layout.condition_rows, 64);
+    }
+
+    #[test]
+    fn the_tables_are_the_layout_s_and_the_step_is_last() {
+        let rule = layouts();
+        let (layout, packing) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let tables = rule.state_tables(&layout).unwrap();
+        let names: Vec<_> = tables.iter().map(|table| table.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "groups",
+                "modulation_indices",
+                "position_ids",
+                "prefix_index",
+                "step",
+                "token_tags"
+            ]
+        );
+        // Every table but the step covers one row per packed row.
+        let rows = u64::from(packing.padded_tokens);
+        for table in &tables {
+            if table.name == "step" {
+                assert_eq!(table.shape.dims(), &[1]);
+                continue;
+            }
+            assert_eq!(table.shape.dim(0), rows, "{}", table.name);
+        }
+        assert_eq!(tables[2].shape.last(), 3);
+    }
+
+    #[test]
+    fn the_state_bytes_fill_the_tables_the_layout_names() {
+        let rule = layouts();
+        let request = request(121, 1344, 768);
+        let (layout, _) = rule.layout(&request).unwrap();
+        let tables = rule.state_tables(&layout).unwrap();
+        let mut out: Vec<Vec<u8>> = tables
+            .iter()
+            .map(|table| {
+                vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
+            })
+            .collect();
+        rule.prepare_state(&request, 12, &layout, &mut out).unwrap();
+        // A prompt of 12 rows is text, so every write index points into the text rows and every
+        // generated row takes the prefix's zero row.
+        let prefix: Vec<i32> = decode_i32(&out[3]);
+        assert_eq!(prefix.len(), tables[3].shape.dim(0) as usize);
+        assert!(prefix[..12].iter().enumerate().all(|(row, column)| *column == row as i32));
+        // The modulation index of the first text row is `3 * video_group + text`.
+        let indices = decode_i32(&out[1]);
+        assert_eq!(indices[0], 1);
+    }
+
+    #[test]
+    fn a_prompt_wider_than_the_capacity_is_refused() {
+        let rule = layouts();
+        let request = request(121, 1344, 768);
+        let (layout, _) = rule.layout(&request).unwrap();
+        let tables = rule.state_tables(&layout).unwrap();
+        let mut out: Vec<Vec<u8>> = tables
+            .iter()
+            .map(|table| vec![0_u8; table.shape.numel() as usize * table.dtype.bytes().unwrap() as usize])
+            .collect();
+        let refused = rule.prepare_state(&request, 129, &layout, &mut out);
+        assert!(refused.is_err());
+    }
+
+    fn decode_i32(bytes: &[u8]) -> Vec<i32> {
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    }
+}
