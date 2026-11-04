@@ -19,6 +19,7 @@
 //! tensor views, and every device operation is a call to a layer.
 
 pub mod config;
+pub mod keys;
 pub mod load;
 pub mod model;
 pub mod partition;
