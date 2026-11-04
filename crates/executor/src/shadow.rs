@@ -16,6 +16,15 @@
 //!
 //! The comparison copies each pair to host page-locked staging and compares there; it runs in
 //! precopy only, never on a serving path, so the copy cost is paid where it cannot delay a batch.
+//!
+//! ## Why a wrong kernel never passed probation
+//!
+//! Until the scratch page set was published (`PrefixCache::scratch`), every paired forward refused
+//! at the cache provider: there was no page set it was allowed to write, and writing a resident one
+//! would have overwritten the KV of the very batch it was walking. A stated refusal is why the
+//! delivery test could not be fooled by a deliberately wrong kernel in the meantime - there was no
+//! shadow pass to fool. Now the set exists, the walk stages its own slot column into it, and the
+//! refusal is gone; what remains is the comparison itself.
 
 use std::sync::Arc;
 

@@ -1061,11 +1061,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// The shape of the bucket a batch is served from.
     fn bucket_for(&self, shape: &Shape) -> Result<Bucket> {
-        self.buckets.select(shape).ok_or_else(|| {
-            Error::Invalid(format!(
-                "no captured bucket holds {shape}: the bucket plan and the batch disagree"
-            ))
-        })
+        self.buckets.require(shape)
     }
 }
 
