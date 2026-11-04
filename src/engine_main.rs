@@ -21,25 +21,35 @@
 //! The one `match` on a model class (§4.3) is here too: this executable links
 //! the model crates, and nothing else in the tree names a concrete model.
 //!
-//! ## Interfaces this file is written against
+//! ## What this module still waits for
 //!
-//! Three parties publish the calls the assembly and the driver make, and none of
-//! them is in this branch's tree yet. Their names here are the ones exec asked
-//! for, so that the merge is a compile, not a rewrite:
+//! Each of these is one named publisher, and the code is written against the
+//! name so the merge is a compile rather than a rewrite:
 //!
-//! - program-server: `BuildConfig` (design §5.1's epoch record) and the
-//!   `Client`/`Program`/`Programs` precopy resolves modules with.
-//! - sched (`crates/engine`): `Scheduler` with its `PolicySlot` for §7.3 steps
-//!   2-5 (`precopy`, `discard`, `request(Stage::{Switchover, Revert, Commit,
-//!   Purge})`, `boundary`) and the shadow batches of the currently resident
-//!   requests, `Scheduler::shadow`.
-//! - model (`crates/ops`): `install(device, operator, descriptor, module)` and
-//!   `operator_name(name)`, the only place the driver crosses a program's name
-//!   with the operator that fills it.
-//! `Client::resolve`, the `Program`/`Programs` an epoch record names, and the
-//! build config all come from program-server, so the three bullets above name
-//! that one crate twice by design of the record, not by accident.
+//! - **sched** (`crates/engine`): `SchedulerHandle::{start(config,
+//!   Arc<dyn Batches>), submit, shadow, stage, command, engine_command,
+//!   counters, stop}` (M505, M714). `stage(Stage, generation)` applies §7.3
+//!   steps 3-6 at a batch boundary and answers the step it applied at, because
+//!   an expert group's executors must switch at the same step on every rank.
+//!   `schedulers` stays empty until it exists, and a node that holds no
+//!   scheduler serves only what its peers ask of it.
+//! - **front** (`crates/proto`): the epoch's programs and the serving revision
+//!   on the welcome (§5.1, §7.3), the program commands and statuses in
+//!   `process.proto` mirroring [`ipc::ProgramCommand`]/[`ipc::ProgramStatus`],
+//!   and the per-device counters `FromEngine::Device` that [`Self::send_metrics`]
+//!   fills (§2.3).
+//! - **builder03** (`crates/executor`): `capacity::plan(&CapacityRequest) ->
+//!   Result<Plan>`, whose producer is still `crates/worker/src/worker/planning.rs`
+//!   and still entangled with the launch machinery §4 deletes, and the Storage
+//!   Server client's publish/map surface that a weight store stands on.
+//! - **nobody yet**: the `nn::RetainedWeights` production implementation. Its two
+//!   methods (`retained`, `publish`) are all a checkpoint load needs, and the
+//!   only implementor in the tree is a test double, so no main process can load
+//!   a model until it exists.
 //!
+//! The driver of §7.3 below does not wait on any of them: it is one function over
+//! a command enum (`Self::program`), so a new wire arm is one `match` line.
+
 //! A serving batch's `BatchOutput` is emitted from here too: the daemon's
 //! request interface carries `Emitted` events, and the tokens come back with the
 //! scheduler's completed batch in logits order.
@@ -299,7 +309,6 @@ impl MainProcess {
             schedulers,
             executors,
             memory,
-            record,
             blocking,
             modules,
             update,
@@ -974,59 +983,42 @@ impl MainProcess {
     /// Sends the engine's counters to the daemon, one report a second and a
     /// final flush when the process ends (`specs/worker.md` §2.3).
     ///
-    /// Sources: sched owns `steps`, `batches`, `tokens`, `policy_fuel` and
-    /// `policy_calls`; the executor owns `kernel_launches`, `device_ns`, each
-    /// rank's queue depth and the device's mapped pools. The scheduler
-    /// counters stay zero until the scheduler handle states them (§7.3's seam,
-    /// M505); they are reported as an honest zero rather than a guess.
+    /// One message per device. The executor states every figure: the launches
+    /// and device nanoseconds its runners counted, the jobs in flight the
+    /// control thread's watchdog reads, and the pools the arena books against
+    /// the rank's budget (§4.1, §8). The scheduler-owned counters of §2.3
+    /// (`steps`, `batches`, `tokens`, the policy's fuel and calls) are reported
+    /// by the schedulers' own handle.
     fn send_metrics(&mut self) {
-        let mut kernel_launches = 0_u64;
-        let mut device_ns = 0_u64;
-        let mut queue = Vec::with_capacity(self.executors.len());
-        let mut memory = Vec::with_capacity(self.executors.len());
-        for (rank, executor) in self.executors.iter().enumerate() {
+        for executor in &self.executors {
             let counters = executor.counters();
-            kernel_launches += counters.kernel_launches;
-            device_ns += counters.device_ns;
-            // The jobs in flight on this device: what the control thread's
-            // watchdog polls, and the depth the daemon graphs.
-            queue.push(proto::request::wire::QueueDepth {
-                rank: rank as u32,
-                depth: executor.watchdog().jobs.len() as u32,
-            });
-            // The device's pools: the arena books every mapped byte against the
-            // budget §4.1 and §8 state, so a device never maps more than its
-            // budget allows.
-            if let Some(pools) = executor.pool_metrics() {
-                memory.push(proto::request::wire::DeviceMemory {
-                    device: executor.device().0 as u32,
-                    budget: pools.budget,
-                    pools: vec![proto::request::wire::PoolMemory {
-                        pool: "graph".to_owned(),
-                        mapped: pools.mapped,
-                    }],
-                });
+            let pools = executor.pool_metrics();
+            let report = proto::request::wire::Device {
+                device: executor.device().0 as u32,
+                kernel_launches: counters.kernel_launches,
+                device_ns: counters.device_ns,
+                queue_depth: executor.watchdog().jobs.len() as u32,
+                memory: pools
+                    .map(|pools| {
+                        vec![proto::request::wire::DeviceMemory {
+                            budget: pools.budget,
+                            pools: vec![proto::request::wire::PoolMemory {
+                                pool: "graph".to_owned(),
+                                mapped: pools.mapped,
+                            }],
+                        }]
+                    })
+                    .unwrap_or_default(),
+            };
+            if let Err(error) = self
+                .control
+                .daemon_mut()
+                .send(&proto::request::wire::FromEngine {
+                    kind: Some(proto::request::wire::from_engine::Kind::Device(report)),
+                })
+            {
+                tracing::warn!(%error, "reporting a device's counters failed");
             }
-        }
-        let metrics = proto::request::wire::Metrics {
-            steps: 0,
-            batches: 0,
-            tokens: 0,
-            kernel_launches,
-            device_ns,
-            queue,
-            policy_fuel: 0,
-            policy_calls: 0,
-            memory,
-        };
-        if let Err(error) = self
-            .control
-            .daemon_mut()
-            .send(&proto::request::wire::FromEngine {
-                kind: Some(proto::request::wire::from_engine::Kind::Metrics(metrics)),
-            })
-        {
-            tracing::warn!(%error, "reporting the engine's metrics failed");
         }
     }
 
@@ -1310,9 +1302,16 @@ fn completed<T>(outcome: Outcome<T>) -> Result<()> {
     }
 }
 
-/// The handshake with the daemon, which answers with the engine spec and the
-/// epoch record (§2.3).
-fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> Result<EpochRecord> {
+/// The handshake with the daemon, which answers with the epoch this node serves
+/// (`specs/worker.md` §2.3).
+///
+/// The daemon states three things: that this build may serve the epoch, the
+/// programs that fill the epoch's operators and its scheduling interface (their
+/// names and arguments, never their content, §5.1), and the program revision the
+/// daemon numbered for the generation that serves once this node switches over
+/// (§7.3). The build config is the one the daemon wrote for this node, read
+/// before the handshake; the welcome confirms it is the same epoch.
+fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: args.engine,
         node_rank: args.node_rank,
@@ -1327,7 +1326,15 @@ fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> R
     if !welcome.refusal.is_empty() {
         bail!("the daemon refused this main process: {}", welcome.refusal);
     }
-    EpochRecord::from_welcome(&welcome, build).context("the daemon's engine spec")
+    // The epoch's programs and the revision that serves from the first
+    // switchover are front's fields on the welcome (`crates/proto`'s
+    // `Welcome`/`process.proto`); until they are in the schema this process
+    // serves nothing, which is the state a standby main process is in anyway.
+    Ok(Epoch {
+        build: build.clone(),
+        programs: Programs::new(),
+        generation: 0,
+    })
 }
 
 /// The model class a checkpoint declares, as its `config.json` states it.
