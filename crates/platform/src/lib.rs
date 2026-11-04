@@ -1,4 +1,6 @@
-//! CUDA driver, virtual memory, NVML and NCCL bindings for the UniServe worker.
+//! The CUDA boundary of UniServe: driver, virtual memory, device memory and
+//! allocator, streams, events, graphs, kernel launch, NVML, NCCL, cuBLASLt and
+//! cuDNN bindings. No other crate calls CUDA.
 //!
 //! Every native library is opened at runtime with `libloading`: building this
 //! crate needs no CUDA toolkit, and a machine without a driver fails only when

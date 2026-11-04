@@ -181,7 +181,7 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
         for context in &transfer.contexts {
             println!(
                 "transfer server context on {}: {} bytes",
-                cuda::DeviceUuid(context.gpu),
+                platform::DeviceUuid(context.gpu),
                 context.bytes
             );
         }

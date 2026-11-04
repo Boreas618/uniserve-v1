@@ -219,7 +219,7 @@ impl Planned {
     pub(crate) fn allocations(
         &self,
         live: &[Arc<Storage>],
-    ) -> Result<BTreeMap<Key, Arc<cuda::PhysicalAllocation>>> {
+    ) -> Result<BTreeMap<Key, Arc<platform::PhysicalAllocation>>> {
         let mut allocations = BTreeMap::new();
         for (storage, layout) in self.targets(live)?.iter().zip(&self.storages) {
             if storage.allocation().is_some() {
@@ -311,7 +311,7 @@ impl Rebalance {
     pub(crate) fn commit(
         mut self,
         retained: &Retained,
-        allocations: &mut BTreeMap<Key, Arc<cuda::PhysicalAllocation>>,
+        allocations: &mut BTreeMap<Key, Arc<platform::PhysicalAllocation>>,
         resident: Option<(Handle, Vec<Arc<Storage>>)>,
     ) -> Result<(WeightKeys, Vec<Arc<Storage>>)> {
         let descriptors = self

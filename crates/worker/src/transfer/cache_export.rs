@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use cuda::{CopyBatch, SourceOrder};
+use platform::{CopyBatch, SourceOrder};
 use ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
 
 use super::exports::{self, Exports, Location};
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA device"]
     fn device_exports_larger_than_the_vmm_pool_reach_vmm_readers() -> Result<()> {
-        use cuda::{DeviceId, Stream};
+        use platform::{DeviceId, Stream};
 
         let device = DeviceId(0);
         let stream = Stream::new(device)?;
@@ -715,7 +715,7 @@ mod tests {
                 checkpoints: Vec::new(),
                 handle: crate::ffi::Handle::none(),
             });
-            let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
+            let granularity = platform::HandleType::Descriptor.granularity(device)? as u64;
             let layout = crate::storage::PlaneLayout::own(0, 2, plan.plane_bytes, granularity);
             let planes = CachePlanes::allocate(
                 Arc::clone(&plan),
