@@ -21,13 +21,13 @@
 //! daemon records the wire form ([`crate::proto`]'s `process::Program`)
 //! until that crate lands.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use proto::request::ModelDtype;
-use program_server::{PhaseKind, Program, ProgramSlot};
+pub use program_server::{PhaseKind, Program, ProgramSlot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -364,12 +364,31 @@ impl Failure {
                 reason: format!("non-finite logits for request {}", logits.request),
                 device: None,
             }),
-            Kind::PolicyReverted(_) => Some(Self {
+            Kind::PolicyReverted(reverted) => Some(Self {
                 kind: "policy_reverted".to_owned(),
-                reason: "the scheduling policy failed and the previous one serves".to_owned(),
+                reason: {
+                    // Presence is the contract (§4.4): absent is the route
+                    // instance the engine's control thread runs, a value one
+                    // scheduler thread's policy.
+                    let instance = match reverted.scheduler {
+                        Some(scheduler) => format!("scheduler {scheduler}"),
+                        None => "the engine's control thread".to_owned(),
+                    };
+                    let fatal = if reverted.fatal {
+                        ", and no previous policy module is left"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "the policy of {instance} (backend {} revision {}) failed: {}{fatal}",
+                        reverted.backend, reverted.revision, reverted.reason
+                    )
+                },
                 device: None,
             }),
-            Kind::Precopied(_)
+            Kind::Parked(_)
+            | Kind::Promoted(_)
+            | Kind::Precopied(_)
             | Kind::Switched(_)
             | Kind::Committed(_)
             | Kind::Reverted(_)
@@ -1195,6 +1214,48 @@ mod tests {
         assert_eq!(
             Failure::of_report(&stalled).map(|failure| failure.kind),
             Some("stalled".to_owned())
+        );
+
+        // The policy's failure names the instance, the backend and the
+        // revision, and whether no previous module is left (§4.4).
+        let reverted = proto::process::Report {
+            kind: Some(Kind::PolicyReverted(proto::process::PolicyReverted {
+                scheduler: Some(2),
+                backend: "trtllm".to_owned(),
+                revision: 7,
+                reason: "the fuel budget is exhausted".to_owned(),
+                fatal: false,
+            })),
+        };
+        let failure = Failure::of_report(&reverted).expect("a policy revert fails the update");
+        assert_eq!(failure.kind, "policy_reverted");
+        assert!(failure.reason.contains("scheduler 2"), "{}", failure.reason);
+        assert!(failure.reason.contains("trtllm"), "{}", failure.reason);
+        assert!(failure.reason.contains("revision 7"), "{}", failure.reason);
+        assert!(
+            failure.reason.contains("the fuel budget is exhausted"),
+            "{}",
+            failure.reason
+        );
+        let route = proto::process::Report {
+            kind: Some(Kind::PolicyReverted(proto::process::PolicyReverted {
+                scheduler: None,
+                backend: "fcfs".to_owned(),
+                revision: 1,
+                reason: "a decision was refused".to_owned(),
+                fatal: true,
+            })),
+        };
+        let failure = Failure::of_report(&route).expect("a fatal policy revert fails the update");
+        assert!(
+            failure.reason.contains("the engine's control thread"),
+            "{}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("no previous policy module is left"),
+            "{}",
+            failure.reason
         );
 
         for acknowledged in [
