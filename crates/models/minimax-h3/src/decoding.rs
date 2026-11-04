@@ -138,13 +138,14 @@ impl Track {
 ///
 /// The executor sizes the arena from these; the model never allocates. Names are the ones the arena
 /// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place - **and the order
-/// is the order the model reserves them in**, because the arena is one cursor: `VideoDecoder::decode`
-/// reserves the per-tile scratch of each tile as it goes, so a buffer listed before another is also
-/// reserved before it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// is the order the model reserves them in**, because the arena is one cursor: a buffer listed before
+/// another is also reserved before it, and anything the code reserves inside a loop is multiplied. The
+/// transformer's fourteen are reserved once per clip (`VideoDecoder::scratch`) and handed to every tile;
+/// the token buffers are per tile, so their entry is the grid's sum.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Buffer {
-    /// The buffer's name.
-    pub name: &'static str,
+    /// The buffer's name, unique within its plan: the executor keys storage by it.
+    pub name: String,
     /// Its element type: `f16`, `f32` or `u8`.
     pub element: &'static str,
     /// How many elements it holds.
@@ -152,14 +153,29 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// The width of one element, by the name the plans use.
+    ///
+    /// The names below are the whole set a plan may declare: the four the arena holds floats and bytes in,
+    /// and `i32` for the index buffers a gather reads. `f16` and `bf16` are two bytes each, `i32` and `f32`
+    /// are four, which is the difference between a 200 MiB buffer and a 400 MiB one. An unknown name is
+    /// refused rather than assumed, because the assumption - four bytes - would be half the budget for a
+    /// reduced-precision buffer.
+    pub fn width(&self) -> Result<u64> {
+        match self.element {
+            "u8" => Ok(1),
+            "f16" | "bf16" => Ok(2),
+            "i32" | "f32" => Ok(4),
+            other => Err(Error::config(format!(
+                "{other} is not an element type a plan declares: u8, f16, bf16, i32 or f32"
+            ))),
+        }
+    }
+
     /// The bytes the buffer occupies.
     pub fn bytes(&self) -> u64 {
-        let width = match self.element {
-            "u8" => 1,
-            "f16" => 2,
-            _ => 4,
-        };
-        self.elements * width
+        // A plan with an unknown element name is caught by [`Self::width`]; this answers for the four
+        // names the crate's plans use and treats anything else as four bytes so a *report* never panics.
+        self.elements * self.width().unwrap_or(4)
     }
 }
 
@@ -233,96 +249,94 @@ pub fn video_arena(
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
     // **The order is the reservation order**: the clip-level buffers are reserved once, before the
-    // tile loop, and live across the whole clip; the per-tile ones are reserved inside it and reused by
-    // every tile. `VideoDecoder::decode` reserves them in this list's order, and the executor sizes the
-    // arena by the sum, because the clip-level buffers are live while the per-tile ones are in use.
+    // tile loop, and live across the whole clip; the transformer's fourteen are reserved there too, once
+    // (`VideoDecoder::scratch`), and reused by every tile - the arena never rewinds, so a per-tile
+    // reservation would grow the clip's footprint by the tile count. The token buffers *are* per tile,
+    // because each tile's decode owns its own, and their sum is the `tokens` entry. The executor sizes
+    // the arena by the sum. There is no entry for the clip's blended raster: the blend's destination is
+    // the caller's `DecodedMedia.video`, which is the runner's buffer and not the arena's.
     let patch = u64::from(config.out_channels)
         * u64::from(config.temporal_compression())
         * u64::from(config.spatial_compression())
         * u64::from(config.spatial_compression());
     Ok(vec![
         Buffer {
-            name: "decoded",
+            name: "decoded".to_owned(),
             element: "f16",
             elements: raster * channels,
         },
         Buffer {
-            name: "blended",
-            element: "f16",
-            elements: raster * channels,
-        },
-        Buffer {
-            name: "tokens",
+            name: "tokens".to_owned(),
             element: "f16",
             elements: rows * patch,
         },
         Buffer {
-            name: "stream",
+            name: "stream".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "projected",
+            name: "projected".to_owned(),
             element: "f16",
             elements: voxels * columns,
         },
         Buffer {
-            name: "cosine",
+            name: "cosine".to_owned(),
             element: "f32",
             elements: rows * u64::from(rotated / 2),
         },
         Buffer {
-            name: "sine",
+            name: "sine".to_owned(),
             element: "f32",
             elements: rows * u64::from(rotated / 2),
         },
         Buffer {
-            name: "normalized",
+            name: "normalized".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "query",
+            name: "query".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "key",
+            name: "key".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "value",
+            name: "value".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "rotated_query",
+            name: "rotated_query".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "rotated_key",
+            name: "rotated_key".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "attended",
+            name: "attended".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "update",
+            name: "update".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "gate_up",
+            name: "gate_up".to_owned(),
             element: "f16",
             elements: rows * 2 * columns * ffn,
         },
         Buffer {
-            name: "gated",
+            name: "gated".to_owned(),
             element: "f16",
             elements: rows * columns * ffn,
         },
@@ -581,10 +595,15 @@ impl ClipDecoder {
                 out.shape.dims()
             )));
         }
-        // The clip-level buffers, reserved once: the raster every tile is decoded into and then read
-        // from as a neighbour. `out` is the stitched result, so the two rasters the seam needs are
-        // these two and the plan's `decoded` is the only clip-level reservation this call makes.
+        // The clip-level buffers, reserved once: `decoded` holds every tile as it was decoded and is read
+        // as an unmodified neighbour, and `out` - the caller's raster - takes the stitch, which is why the
+        // plan lists no third raster. `scratch` is the transformer's fourteen, reserved here so that every
+        // tile of the clip shares them.
         let decoded = f.arena().tensor(out.dtype, out.shape)?;
+        // The transformer's fourteen buffers, reserved **once per clip** and reused by every tile: the
+        // arena never rewinds, so a per-tile reservation would grow the clip's footprint by the tile
+        // count while the plan states them once.
+        let scratch = decoder.scratch(f)?;
         let patch = self.patch;
         let mut start = 0_u64;
         for tile in tiles {
@@ -600,7 +619,7 @@ impl ClipDecoder {
             let tokens = f
                 .arena()
                 .tensor(out.dtype, Shape::new(&[tile_rows, patch]))?;
-            decoder.decode(f, latent, positions, tokens)?;
+            decoder.decode(f, latent, positions, tokens, &scratch)?;
             self.write_tile(f, tile, tokens, decoded, out)?;
             start += tile_voxels;
         }
@@ -614,6 +633,25 @@ mod tests {
     use crate::video_vae::Tiles;
 
     /// The ImageNet constants as the model publishes them: host memory, one f32 per channel.
+    #[test]
+    fn a_plans_element_names_are_a_closed_set_with_stated_widths() {
+        // A reduced-precision buffer counted as four bytes doubles its budget, and an unknown name used to
+        // fall through to that same four, so the set is closed here and every width is stated. `i32` is the
+        // index buffers a gather reads, four bytes like `f32` but not a float.
+        let buffer = |element: &'static str| Buffer {
+            name: format!("probe.{element}"),
+            element,
+            elements: 1024,
+        };
+        for (element, width) in [("u8", 1), ("f16", 2), ("bf16", 2), ("i32", 4), ("f32", 4)] {
+            let buffer = buffer(element);
+            assert_eq!(buffer.width().expect(element), width, "{element}");
+            assert_eq!(buffer.bytes(), 1024 * width, "{element}");
+        }
+        // Anything else is refused rather than assumed, at the widths a budget depends on.
+        assert!(buffer("f64").width().is_err());
+    }
+
     #[test]
     fn a_four_second_video_is_six_clips() {
         // 4 s at 24 fps rounds to 96 frames, extended to the next 17n + 5: 107.
@@ -884,10 +922,14 @@ mod tests {
         // The clip-level buffers come first and the per-tile ones after, which is the order the model
         // reserves them in: a plan that lists them the other way round is a plan the code does not
         // follow.
-        let clip_level: Vec<&str> = arena.iter().take(3).map(|buffer| buffer.name).collect();
-        assert_eq!(clip_level, ["decoded", "blended", "tokens"]);
+        let clip_level: Vec<&str> = arena
+            .iter()
+            .take(2)
+            .map(|buffer| buffer.name.as_str())
+            .collect();
+        assert_eq!(clip_level, ["decoded", "tokens"]);
         // Every buffer is named once and no buffer is empty.
-        let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name).collect();
+        let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name.as_str()).collect();
         let count = names.len();
         names.sort_unstable();
         names.dedup();

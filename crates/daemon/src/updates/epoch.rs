@@ -24,6 +24,19 @@ use crate::options::ServeConfig;
 use crate::updates::change::Applied;
 use crate::updates::switch::{Node, Roster, Start, Switch};
 
+/// A configuration a revert marked unavailable, and why: a target that failed
+/// on probation keeps its build from being tried again until an operator says
+/// otherwise (§7.4).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Unavailable {
+    pub digest: String,
+    /// The world that executed it and was rolled back.
+    pub world: u64,
+    pub reason: String,
+    /// Seconds since the Unix epoch.
+    pub at: f64,
+}
+
 /// What `apply` hands the epoch arm that the two deployments cannot state.
 pub(crate) struct EpochChange {
     /// The epoch that serves now, whose record the target's keeps as its
@@ -51,7 +64,7 @@ pub(crate) struct EpochChange {
 /// Returns `Ok(None)` when `epoch::layer` answers `Host`, `Program` or
 /// `None`, so the caller takes its other path; `Ok(Some(Applied::Planned))`
 /// under `dry_run`, having started nothing and written nothing; and
-/// `Ok(Some(Applied::World))` with the switch's first report once the
+/// `Ok(Some(Applied::Epoch))` with the switch's first report once the
 /// target's main processes are asked to start, the switch itself kept in
 /// `running` for the caller to advance, commit or revert.
 ///
@@ -238,10 +251,15 @@ mod tests {
             Ok(())
         }
 
-        fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
+        fn spawn(
+            &mut self,
+            spawn: Spawn,
+            _launch: &crate::engine::launch::Launch,
+        ) -> Result<crate::updates::switch::Spawned, String> {
             let pid = self.spawns.len() as u32 + 1;
+            let generation = spawn.generation;
             self.spawns.push(spawn);
-            Ok(pid)
+            Ok(crate::updates::switch::Spawned { generation, pid })
         }
 
         fn stop(&mut self, host: &str, group: &str, generation: Option<u64>) {
@@ -319,7 +337,26 @@ mod tests {
             start: Start {
                 executable: "/opt/uniserve".to_owned(),
                 build: Some("2.0.0+new".to_owned()),
-                arguments: vec!["engine".to_owned()],
+                launch: crate::engine::launch::Launch {
+                    build_config: "/run/build-config-13.json".into(),
+                    model: "/models/qwen3".into(),
+                    requests: "unix:/run/requests.sock".to_owned(),
+                    processes: "unix:/run/processes.sock".to_owned(),
+                    engine: 7,
+                    program_server: "/run/programs.sock".to_owned(),
+                    devices: vec![0],
+                    group: "engine".to_owned(),
+                    rank: 0,
+                    deployment: "qwen3".to_owned(),
+                    world: 13,
+                    scheduler_node: true,
+                    peers: Vec::new(),
+                    watchdog_timeout_s: None,
+                    rollback_s: None,
+                    queue_depth: 4,
+                    world_size: 1,
+                    standby: false,
+                },
                 environment: HashMap::new(),
             },
             previous_generation: 5,

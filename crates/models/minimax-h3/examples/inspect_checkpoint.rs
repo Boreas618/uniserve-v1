@@ -109,5 +109,158 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             component.activation()
         );
     }
+
+    // Which keys each block asks for, checked against the checkpoint's index without loading it.
+    //
+    // `load` publishes every tensor through `RetainedWeights`, which only the executor implements,
+    // so no test in this crate can execute a block's load path; the failure that hides there is the
+    // narrow one: a key the loader names that the checkpoint does not hold. The index states every
+    // tensor's name whether or not its shard is present, so that failure is a host fact and this
+    // walks it. Each prefix is one the loader builds - the loader is the authority and this table
+    // only quotes it, one line per group - and a group with no match is an error, not a count.
+    let prefixes: &[(&str, &str, &[&str])] = &[
+        (
+            "vae",
+            "video encoder",
+            &[
+                "encoder.conv_in.",
+                "encoder.norm_out.",
+                "encoder.conv_out.",
+                "encoder.down_blocks.",
+                "encoder.down_blocks.0.resnets.",
+                "quant_conv.",
+            ],
+        ),
+        (
+            "vae",
+            "video decoder",
+            &[
+                "decoder.proj_in.",
+                "decoder.register_tokens",
+                "decoder.transformer_blocks.",
+                "decoder.norm_out.",
+                "decoder.proj_out.",
+            ],
+        ),
+        (
+            "audio_vae",
+            "audio encoder",
+            &["encoder.block.", "pre_block.", "mean_proj."],
+        ),
+        (
+            "audio_vae",
+            "audio decoder",
+            &[
+                "decoder.conv_pre",
+                "decoder.ups.",
+                "decoder.resblocks.",
+                "decoder.activation_post",
+                "decoder.conv_post",
+            ],
+        ),
+        (
+            "text_encoder",
+            "text encoder",
+            &[
+                "model.language_model.layers.",
+                "model.language_model.embed_tokens.",
+                // The tower's groups, from `vision.rs`'s own prefix. Its final norm is removed, so
+                // a table naming `model.visual.norm` would ask for a tensor nothing reads.
+                "model.visual.patch_embed.",
+                "model.visual.pos_embed.",
+                "model.visual.blocks.",
+                "model.visual.merger.",
+                "model.visual.deepstack_merger_list.",
+            ],
+        ),
+    ];
+    let mut names_by_directory = std::collections::BTreeMap::new();
+    // The DiT partitions are checked against their own `keys`, not against prefixes, so their
+    // directories are read here whether or not the prefix table names them.
+    let dit_directories = config
+        .denoisers
+        .keys()
+        .map(|dit| dit.directory())
+        .collect::<Vec<_>>();
+    let prefix_directories = prefixes
+        .iter()
+        .map(|(directory, _, _)| *directory)
+        .chain(dit_directories.iter().copied())
+        .collect::<Vec<_>>();
+    for directory in prefix_directories {
+        if names_by_directory.contains_key(directory) {
+            continue;
+        }
+        let mut names = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root.join(directory)) {
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().to_string();
+                if !file.ends_with(".index.json") {
+                    continue;
+                }
+                let index: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(entry.path())?)?;
+                if let Some(map) = index["weight_map"].as_object() {
+                    names.extend(map.keys().cloned());
+                }
+            }
+        }
+        names_by_directory.insert(directory.to_owned(), names);
+    }
+    // A DiT partition states its own keys, so this half is exact in both directions: every name
+    // the block asks for is in the index, and every name in the index is asked for. A prefix table
+    // could say the first of the two only.
+    let mut missing = Vec::new();
+    for (dit, denoiser) in &config.denoisers {
+        let block = format!("{} DiT", dit.directory());
+        let names = &names_by_directory[dit.directory()];
+        if names.is_empty() {
+            println!(
+                "keys {block}: {} states no index here, so its keys are unread",
+                dit.directory()
+            );
+            continue;
+        }
+        let keys = minimax_h3::denoiser::Denoiser::keys(denoiser);
+        let absent =
+            minimax_h3::checkpoint::absent(&keys, |key| names.iter().any(|name| name == key));
+        let unread = names
+            .iter()
+            .filter(|name| !keys.iter().any(|key| key == *name))
+            .count();
+        println!(
+            "keys {block}: {} asked, {} in the index, {} missing, {} unread",
+            keys.len(),
+            keys.len() - absent.len(),
+            absent.len(),
+            unread
+        );
+        for key in absent {
+            missing.push(format!("{block} asks for {key} and its index holds none"));
+        }
+    }
+    for (directory, block, groups) in prefixes {
+        let names = &names_by_directory[*directory];
+        if names.is_empty() {
+            println!("keys {block}: {directory} states no index here, so its keys are unread");
+            continue;
+        }
+        for group in *groups {
+            let found = names.iter().filter(|name| name.starts_with(group)).count();
+            if found == 0 {
+                missing.push(format!(
+                    "{block} asks for {group}* and {directory} holds none"
+                ));
+            } else {
+                println!("keys {block}: {group}* {found} tensors");
+            }
+        }
+    }
+    if !missing.is_empty() {
+        for line in &missing {
+            eprintln!("missing key: {line}");
+        }
+        return Err(format!("{} key groups the blocks ask for are absent", missing.len()).into());
+    }
     Ok(())
 }

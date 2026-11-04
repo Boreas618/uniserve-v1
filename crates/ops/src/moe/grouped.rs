@@ -34,7 +34,7 @@ use std::fmt;
 
 use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
-use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
+use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
 use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
@@ -275,14 +275,6 @@ impl Op for GatherGemm {
             .require_shape(Self::NAME, Shape::new(&[experts, 2 * intermediate, hidden]))?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        if args.ids.dtype != DType::I32 {
-            return Err(Error::argument(
-                Self::NAME,
-                format!("expected i32 route ids, found {}", args.ids.dtype),
-            ));
-        }
         for view in [
             &args.tile_to_expert,
             &args.tile_to_limit,
@@ -295,7 +287,7 @@ impl Op for GatherGemm {
                     format!("expected i32 sort metadata, found {}", view.dtype),
                 ));
             }
-            view.require_row(Self::NAME, DType::I32, 1)?;
+            super::require_i32_vector(Self::NAME, view)?;
         }
         // The sort pads its permuted rows up to whole tiles, so the map holds at least one row per
         // route and exactly the rows the product writes.
@@ -425,7 +417,7 @@ impl Op for RouteGemm {
                     format!("expected i32 sort metadata, found {}", view.dtype),
                 ));
             }
-            view.require_row(Self::NAME, DType::I32, 1)?;
+            super::require_i32_vector(Self::NAME, view)?;
         }
         if rows != args.permuted_to_expanded.numel() {
             return Err(Error::argument(
@@ -602,8 +594,8 @@ pub struct GatherGemmNvfp4Descriptor {
     pub top: u32,
     /// The gated activation.
     pub activation: Activation,
-    /// Element type of the activations and of the output. The weights are packed, so this is the
-    /// unpacked element type rather than the stored one.
+    /// Element type of the output — the type the accumulator rounds to. The weights *and* the
+    /// activations are packed E2M1, so neither is this type; it is the epilogue's.
     pub dtype: DType,
     /// Element type of the block scales, as the checkpoint stores them: `F8_E4M3` for a ModelOpt
     /// export, `U8` for a shard that already holds the codes. One byte either way, and never
@@ -640,19 +632,31 @@ impl fmt::Display for GatherGemmNvfp4Descriptor {
 /// The arguments of one encoded FC1 launch.
 #[derive(Clone, Copy)]
 pub struct GatherGemmNvfp4Args {
-    /// `[routes, hidden]` the gathered activations.
+    /// `[tokens, hidden/2]` U8: the activations, encoded — two E2M1 codes a byte along the
+    /// contraction, exactly what `nvfp4_quantize` produces. **Token-major**: the product gathers its
+    /// rows itself, through the route map the cta maps and `permuted_to_expanded` describe, which is
+    /// what every kernel in the artifact with an E2M1 weight and a BF16 output does (their routing
+    /// implementation is `Ldgsts` or `Tma`, never `NoRoute`). A route-major buffer here would be
+    /// read as tokens and gathered a second time.
     pub hidden: TensorView,
+    /// `[tokens, hidden/16]` the activations' block scales, one per sixteen elements of the
+    /// contraction, of the descriptor's `scale` type in its `layout`.
+    pub hidden_scale: TensorView,
+    /// `[tokens]` f32: the encoder's per-token scale factor. The artifact's FP4 kernels carry one
+    /// beside the block scales (`Bb16tokFp32`), and it is the product's `perTokenScales` argument:
+    /// a caller that passes the block scales alone leaves the kernel reading a null table.
+    pub hidden_token_scale: TensorView,
     /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte along the contraction.
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
     pub scales: TensorView,
-    /// `[experts, 2]` f32: the reciprocals of each expert's tensor scales, one **per projection** in
-    /// the fused reading order — column 0 is the value half (up), column 1 the gate half. A
-    /// checkpoint carries one tensor scale per projection, so the two columns are generally
-    /// different numbers and a program may not use one for both.
+    /// `[2, experts]` f32, contiguous: the reciprocals of each expert's tensor scales, one **per
+    /// projection** in the fused reading order — row 0 is the value half (up), row 1 the gate half. A
+    /// checkpoint carries two separate per-expert scalar tables, and the product's kernel reads each
+    /// as its own array of `experts` floats, so the two halves are two *rows* here and not an
+    /// interleaved `[experts, 2]`: an interleaved table cannot be handed to a reader that indexes
+    /// `array[expert]`.
     pub global_scale: TensorView,
-    /// `[tokens, top]` i32: the experts each token's routes selected.
-    pub ids: TensorView,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: TensorView,
     /// `[tiles]` i32: the local row limit of that tile.
@@ -663,6 +667,214 @@ pub struct GatherGemmNvfp4Args {
     pub num_non_exiting_tiles: TensorView,
     /// `[routes, intermediate]` the gated product.
     pub out: TensorView,
+    /// `[bytes]` U8: scratch the program needs for its own bookkeeping. The size its tactic needs is
+    /// the artifact's plan, not something `ops` can restate; a view shorter than the plan is refused
+    /// by name at the point of use, never grown — a step that allocates is a host allocation inside a
+    /// captured graph, and the address the pool baked is the wrong one the moment the step grows.
+    pub workspace: TensorView,
+}
+
+/// Check the scratch view both encoded products carry.
+///
+/// A workspace is bytes the program uses for its own bookkeeping, and the size the tactic needs is the
+/// artifact's plan rather than anything `ops` can restate — so this checks only what is a property of
+/// the operand itself: plain bytes, and at least one of them. The floor is the *plan's*, checked at
+/// the point of use by the entry, where a short buffer is a named refusal; it is never grown, because
+/// the step runs inside a captured graph and an allocation there lands at an address the pool did not
+/// bake into the capture.
+fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> {
+    workspace.require_rank(operator, 1)?;
+    if workspace.dtype != DType::U8 {
+        return Err(Error::argument(
+            operator,
+            format!("expected u8 workspace bytes, found {}", workspace.dtype),
+        ));
+    }
+    if workspace.numel() == 0 {
+        return Err(Error::argument(
+            operator,
+            "a workspace of no bytes: the plan's size is a caller's to provide",
+        ));
+    }
+    Ok(())
+}
+
+/// One encoded FC1 launch, as the trtllm-gen batched-GEMM entry reads it.
+///
+/// The call is a plain structure of pointers and extents rather than a packed argument list, because
+/// a native module's entry takes one: `uniserve_gather_gemm_nvfp4(call, stream)`. The descriptors'
+/// choices that are *compiled* into the program — the tile, the cluster, the activation, the block
+/// scale layout — travel as well, since the entry checks the call against the module it was built as
+/// and refuses a mismatch by name rather than launching a kernel with another tactic's assumptions.
+#[repr(C)]
+pub struct GatherNvfp4Call {
+    /// `[tokens, hidden/2]` U8: the activations, two E2M1 codes a byte, token-major.
+    pub hidden: *const c_void,
+    /// The activations' block scales.
+    pub hidden_scale: *const c_void,
+    /// `[tokens]` f32: the encoder's per-token scale factor.
+    pub hidden_token_scale: *const c_void,
+    /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte.
+    pub weights: *const c_void,
+    /// The block scales, one per sixteen elements of the contraction.
+    pub scales: *const c_void,
+    /// `[experts]` f32: the reciprocals of the experts' tensor scales for the value (up) projection.
+    pub global_scale: *const c_void,
+    /// `[experts]` f32: the same for the gate projection.
+    pub global_scale_gate: *const c_void,
+    /// `[tiles]` i32: the expert a tile's rows belong to.
+    pub tile_to_expert: *const i32,
+    /// `[tiles]` i32: the local row limit of that tile.
+    pub tile_to_limit: *const i32,
+    /// `[routes]` i32: the gathered row of each route.
+    pub permuted_to_expanded: *const i32,
+    /// `[1]` i32: the number of tiles that have work.
+    pub num_non_exiting_tiles: *const i32,
+    /// `[routes, intermediate]`: the gated product.
+    pub out: *mut c_void,
+    /// The scratch the program may use; the entry grows it itself when it is short.
+    pub workspace: *mut c_void,
+    /// Bytes of `workspace`.
+    pub workspace_bytes: i64,
+    /// Rows of the activations: the token count.
+    pub tokens: i64,
+    /// Rows of the gated product: the permuted row count, padded to whole tiles.
+    pub routes: i64,
+    /// The contraction length.
+    pub hidden_size: i64,
+    /// The expert width of one half of the gated product.
+    pub intermediate: i64,
+    /// Experts the weight stack holds.
+    pub experts: i64,
+    /// Routes per token.
+    pub top: i64,
+    /// The compiled MMA tile, rows by columns.
+    pub tile_m: i64,
+    pub tile_n: i64,
+    /// The compiled cluster, rows by columns.
+    pub cluster_m: i64,
+    pub cluster_n: i64,
+    /// The element type of the activations and the output, as `DType::as_i64`.
+    pub dtype: i64,
+    /// A NUL-terminated refusal, when the entry returns nonzero.
+    pub error: [u8; 512],
+}
+
+/// The offsets of [`GatherNvfp4Call`] its header mirrors, stated once for the test below.
+pub struct GatherNvfp4CallLayout {
+    pub size: usize,
+    pub hidden_scale: usize,
+    pub hidden_token_scale: usize,
+    pub global_scale: usize,
+    pub global_scale_gate: usize,
+    pub workspace: usize,
+    pub workspace_bytes: usize,
+    pub dtype: usize,
+    pub error: usize,
+}
+
+impl GatherNvfp4Call {
+    /// The offsets the C header must agree with.
+    pub const LAYOUT: GatherNvfp4CallLayout = GatherNvfp4CallLayout {
+        size: 712,
+        hidden_scale: 8,
+        hidden_token_scale: 16,
+        global_scale: 40,
+        global_scale_gate: 48,
+        workspace: 96,
+        workspace_bytes: 104,
+        dtype: 192,
+        error: 200,
+    };
+}
+
+impl NativeCall for GatherNvfp4Call {
+    fn message(&self) -> Option<&str> {
+        let end = self.error.iter().position(|&byte| byte == 0)?;
+        std::str::from_utf8(&self.error[..end]).ok()
+    }
+}
+
+/// One encoded FC2 launch, as the trtllm-gen batched-GEMM entry reads it.
+#[repr(C)]
+pub struct RouteNvfp4Call {
+    /// `[routes, intermediate/2]` U8: the gated rows FC1 produced, encoded.
+    pub hidden: *const c_void,
+    /// The rows' block scales.
+    pub hidden_scale: *const c_void,
+    /// `[routes]` f32: the encoder's per-token scale factor.
+    pub hidden_token_scale: *const c_void,
+    /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte.
+    pub weights: *const c_void,
+    /// The block scales, one per sixteen elements of the contraction.
+    pub scales: *const c_void,
+    /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale.
+    pub global_scale: *const c_void,
+    /// `[tiles]` i32: the expert a tile's rows belong to.
+    pub tile_to_expert: *const i32,
+    /// `[tiles]` i32: the local row limit of that tile.
+    pub tile_to_limit: *const i32,
+    /// `[routes]` i32: the gathered row of each route.
+    pub permuted_to_expanded: *const i32,
+    /// `[1]` i32: the number of tiles that have work.
+    pub num_non_exiting_tiles: *const i32,
+    /// `[routes, hidden]`: the contracted rows.
+    pub out: *mut c_void,
+    /// The scratch the program may use; the entry grows it itself when it is short.
+    pub workspace: *mut c_void,
+    /// Bytes of `workspace`.
+    pub workspace_bytes: i64,
+    /// Rows of the gated product and of the output: the padded route count.
+    pub routes: i64,
+    /// The contraction length: the expert width of FC1.
+    pub hidden_size: i64,
+    /// The output width.
+    pub intermediate: i64,
+    /// Experts the weight stack holds.
+    pub experts: i64,
+    /// The compiled MMA tile, rows by columns.
+    pub tile_m: i64,
+    pub tile_n: i64,
+    /// The compiled cluster, rows by columns.
+    pub cluster_m: i64,
+    pub cluster_n: i64,
+    /// The element type of the activations and the output, as `DType::as_i64`.
+    pub dtype: i64,
+    /// A NUL-terminated refusal, when the entry returns nonzero.
+    pub error: [u8; 512],
+}
+
+impl RouteNvfp4Call {
+    /// The offsets the C header must agree with.
+    pub const LAYOUT: RouteNvfp4CallLayout = RouteNvfp4CallLayout {
+        size: 696,
+        hidden_scale: 8,
+        hidden_token_scale: 16,
+        global_scale: 40,
+        workspace: 88,
+        workspace_bytes: 96,
+        dtype: 176,
+        error: 184,
+    };
+}
+
+/// The offsets of [`RouteNvfp4Call`] its header mirrors.
+pub struct RouteNvfp4CallLayout {
+    pub size: usize,
+    pub hidden_scale: usize,
+    pub hidden_token_scale: usize,
+    pub global_scale: usize,
+    pub workspace: usize,
+    pub workspace_bytes: usize,
+    pub dtype: usize,
+    pub error: usize,
+}
+
+impl NativeCall for RouteNvfp4Call {
+    fn message(&self) -> Option<&str> {
+        let end = self.error.iter().position(|&byte| byte == 0)?;
+        std::str::from_utf8(&self.error[..end]).ok()
+    }
 }
 
 /// The routed first matrix over a packed, block-scaled expert stack.
@@ -682,6 +894,8 @@ impl GatherGemmNvfp4 {
         let experts = u64::from(descriptor.experts);
         let top = u64::from(descriptor.top);
         let routes = args.out.rows();
+        // The activation operands are token-major: the product gathers its rows itself.
+        let tokens = args.hidden.rows();
 
         if args.out.shape.dims().last().copied().unwrap_or(0) != intermediate {
             return Err(Error::argument(
@@ -694,6 +908,55 @@ impl GatherGemmNvfp4 {
         }
         args.out
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
+        // The activations are encoded the same way the weights are: two codes a byte along the
+        // contraction. A BF16 row here would be read as packed codes and produce a product of half
+        // the contraction, so the operand's width is the encoding's and is refused when it is not.
+        args.hidden
+            .require_shape(Self::NAME, Shape::new(&[tokens, hidden / 2]))?;
+        if args.hidden.dtype != DType::U8 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the gathered activations as packed u8, found {}: the product's kernels \
+                     take an E2M1 activation, and `nvfp4_quantize` is the program that encodes one",
+                    args.hidden.dtype
+                ),
+            ));
+        }
+        if args.hidden_scale.dtype != descriptor.scale {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} activation block scales, found {}",
+                    descriptor.scale, args.hidden_scale.dtype
+                ),
+            ));
+        }
+        args.hidden_token_scale
+            .require_shape(Self::NAME, Shape::new(&[tokens]))?;
+        if args.hidden_token_scale.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected one f32 per-token scale, found {}: the artifact's FP4 kernels read the \
+                     encoder's per-token factor beside the block scales",
+                    args.hidden_token_scale.dtype
+                ),
+            ));
+        }
+        // The scales cover the contraction in blocks of sixteen, one per *token*: the product gathers
+        // rows, so the table is indexed by the same token rows the activations are.
+        let activation_blocks = hidden.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
+        let covered: u64 = args.hidden_scale.shape.dims().iter().product();
+        if covered < tokens * activation_blocks {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{covered} activation block scales cover fewer than {tokens} rows of \
+                     {activation_blocks} blocks"
+                ),
+            ));
+        }
         // The packed field holds two codes a byte along the contraction, so its width is half the
         // contraction and no more: a wider one would read past the expert's weights.
         args.weights.require_shape(
@@ -750,7 +1013,7 @@ impl GatherGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts, 2]))?;
+            .require_shape(Self::NAME, Shape::new(&[2, experts]))?;
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -760,26 +1023,37 @@ impl GatherGemmNvfp4 {
                 ),
             ));
         }
+        // The kernel reads each projection's table as `experts` consecutive floats, so the two rows
+        // must be packed: a `[2, experts]` view with any other step would hand it one projection's
+        // scales for both.
+        if args.global_scale.strides.get(0) != experts || args.global_scale.strides.last() != 1 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the tensor scales step {}/{}, and the product reads each projection's table as \
+                     {experts} consecutive f32: the operand must be packed `[2, {experts}]`",
+                    args.global_scale.strides.get(0),
+                    args.global_scale.strides.last()
+                ),
+            ));
+        }
         // `routes` is the permuted row count -- the output's rows, which the sort pads to whole tiles
-        // -- while the activations are the caller's *token* rows and `ids` holds one row of routes per
-        // token. The program gathers through `permuted_to_expanded`, as the dense product does, so
-        // checking the activations against the permuted count would refuse every launch whose sort
-        // pads anything.
+        // -- while the activations are the caller's *token* rows. The product gathers through
+        // `permuted_to_expanded`, so checking the activations against the permuted count would
+        // refuse every launch whose sort pads anything. Neither artifact launch reads a per-route
+        // expert id: the routing is the sort's, and the product takes the tile maps the sort
+        // computed.
         let tokens = args.hidden.rows();
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
-        for (name, view) in [
-            ("ids", args.ids),
-            ("permuted_to_expanded", args.permuted_to_expanded),
-        ] {
-            if view.dtype != DType::I32 {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!("expected i32 {name}, found {}", view.dtype),
-                ));
-            }
+        if args.permuted_to_expanded.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected i32 permuted rows, found {}",
+                    args.permuted_to_expanded.dtype
+                ),
+            ));
         }
         args.hidden
             .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
@@ -807,55 +1081,44 @@ impl Op for GatherGemmNvfp4 {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (_, intermediate, routes) = Self::validate(descriptor, &args)?;
-
-        // The activation is compiled into the program (it is in the key), so no launch value names
-        // it; what a launch carries is the geometry the grid and the addressing need.
-        let mut arguments = Arguments::new();
-        arguments
-            .view(args.hidden)
-            .view(args.weights)
-            .view(args.scales)
-            .view(args.global_scale)
-            .view(args.ids)
-            .view(args.tile_to_expert)
-            .view(args.tile_to_limit)
-            .view(args.permuted_to_expanded)
-            .view(args.num_non_exiting_tiles)
-            .view(args.out)
-            .u32(descriptor.hidden)
-            .u32(descriptor.intermediate)
-            .u32(descriptor.experts)
-            .u32(descriptor.top)
-            .u32(u32::try_from(routes).unwrap_or(u32::MAX))
-            .u32(descriptor.tile.0)
-            .u32(descriptor.tile.1)
-            .u32(descriptor.cluster.0)
-            .u32(descriptor.cluster.1);
-        // One block per (expert tile, column tile) of the gated product, the geometry the package
-        // compiled for: the tile and cluster are the descriptor's, so the grid is a function of the
-        // problem rather than of a backend's tactic.
-        // Axis 0 is the *tile buffer's* count, a launch-fixed geometry: one block per tile the sort
-        // could produce, each returning immediately when its index is past the live count on the
-        // device. Reading `num_non_exiting_tiles` here would be a host read of a device value, and
-        // `[1]` means the launch would always compute one tile.
-        let tiles = args
-            .tile_to_expert
-            .shape
-            .dims()
-            .first()
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        kernel.launch(
-            LaunchGrid::new([
-                tiles,
-                (2 * intermediate).div_ceil(u64::from(descriptor.tile.1)),
-                1,
-            ])?,
-            &mut arguments,
-            stream,
-        )
+        let (hidden, intermediate, routes) = Self::validate(descriptor, &args)?;
+        check_workspace(Self::NAME, args.workspace)?;
+        let tokens = args.hidden.rows();
+        let mut call = GatherNvfp4Call {
+            hidden: address(args.hidden.ptr) as usize as *const c_void,
+            hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
+            hidden_token_scale: address(args.hidden_token_scale.ptr) as usize as *const c_void,
+            weights: address(args.weights.ptr) as usize as *const c_void,
+            scales: address(args.scales.ptr) as usize as *const c_void,
+            global_scale: address(args.global_scale.ptr) as usize as *const c_void,
+            // The gate half's row: the two tables are consecutive `experts` floats, so the second
+            // row is the first address plus the row stride the operand is validated for.
+            global_scale_gate: (address(args.global_scale.ptr)
+                + 4 * args.global_scale.strides.get(0)) as usize
+                as *const c_void,
+            tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
+            tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
+            permuted_to_expanded: address(args.permuted_to_expanded.ptr) as usize as *const i32,
+            num_non_exiting_tiles: address(args.num_non_exiting_tiles.ptr) as usize as *const i32,
+            out: address(args.out.ptr) as usize as *mut c_void,
+            workspace: address(args.workspace.ptr) as usize as *mut c_void,
+            workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
+            tokens: to_i64(Self::NAME, tokens)?,
+            routes: to_i64(Self::NAME, routes)?,
+            hidden_size: to_i64(Self::NAME, hidden)?,
+            intermediate: to_i64(Self::NAME, intermediate)?,
+            experts: to_i64(Self::NAME, u64::from(descriptor.experts))?,
+            top: to_i64(Self::NAME, u64::from(descriptor.top))?,
+            tile_m: i64::from(descriptor.tile.0),
+            tile_n: i64::from(descriptor.tile.1),
+            cluster_m: i64::from(descriptor.cluster.0),
+            cluster_n: i64::from(descriptor.cluster.1),
+            dtype: dtype_code(descriptor.dtype),
+            error: [0; 512],
+        };
+        // SAFETY: `GatherNvfp4Call` is the structure this package's entry declares, and its layout is
+        // pinned by the offsets above and by the test below.
+        unsafe { kernel.native(&mut call, stream) }
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -1020,7 +1283,7 @@ pub struct RouteGemmNvfp4Descriptor {
     pub experts: u32,
     /// Routes per token.
     pub top: u32,
-    /// Element type of the rows and of the output; the weights are packed.
+    /// Element type of the output; the weights and the rows are both packed E2M1.
     pub dtype: DType,
     /// Element type of the block scales.
     pub scale: DType,
@@ -1054,18 +1317,23 @@ impl fmt::Display for RouteGemmNvfp4Descriptor {
 /// The arguments of one encoded FC2 launch.
 #[derive(Clone, Copy)]
 pub struct RouteGemmNvfp4Args {
-    /// `[routes, intermediate]` the gated product.
+    /// `[routes, intermediate/2]` U8: the gated rows, encoded as `nvfp4_quantize` produces them —
+    /// two E2M1 codes a byte along the contraction. FC1's epilogue is a BF16 row, so the encoding
+    /// between the two products is a program of its own, not a wider operand of this one.
     pub hidden: TensorView,
+    /// The rows' block scales, one per sixteen elements of the contraction, of the descriptor's
+    /// `scale` type in its `layout`.
+    pub hidden_scale: TensorView,
+    /// `[routes]` f32: the encoder's per-token scale factor, beside the block scales.
+    pub hidden_token_scale: TensorView,
     /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte along the contraction.
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
     pub scales: TensorView,
-    /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale, one **per projection** —
-    /// this product fuses a single projection, so the table has one column and the shape still says
-    /// which half of a two-projection stack it is.
+    /// `[experts]` f32: the reciprocal of each expert's tensor scale, one **per projection** — this
+    /// product fuses a single projection, so the table is one array of `experts` floats, the shape a
+    /// reader that indexes `array[expert]` takes.
     pub global_scale: TensorView,
-    /// `[routes]` i32: the expert each row belongs to.
-    pub ids: TensorView,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: TensorView,
     /// `[tiles]` i32: the local row limit of that tile.
@@ -1077,6 +1345,9 @@ pub struct RouteGemmNvfp4Args {
     /// `[routes, hidden]` the contracted rows, one per route: the `top` repeats are combined by
     /// `moe_unpermute`, not here.
     pub out: TensorView,
+    /// `[bytes]` U8: scratch for the program's own bookkeeping, as FC1's is: the plan's size or more,
+    /// refused at the point of use when it is short.
+    pub workspace: TensorView,
 }
 
 /// FC2 of an encoded, block-scaled expert block.
@@ -1124,6 +1395,49 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
+        args.hidden
+            .require_shape(Self::NAME, Shape::new(&[routes, intermediate / 2]))?;
+        if args.hidden.dtype != DType::U8 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the gated rows as packed u8, found {}: FC1's epilogue emits \
+                     {:?}, and `nvfp4_quantize` is the program that encodes it",
+                    args.hidden.dtype, descriptor.dtype
+                ),
+            ));
+        }
+        if args.hidden_scale.dtype != descriptor.scale {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} activation block scales, found {}",
+                    descriptor.scale, args.hidden_scale.dtype
+                ),
+            ));
+        }
+        args.hidden_token_scale
+            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+        if args.hidden_token_scale.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected one f32 per-token scale per route, found {}",
+                    args.hidden_token_scale.dtype
+                ),
+            ));
+        }
+        let row_blocks = intermediate.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
+        let covered: u64 = args.hidden_scale.shape.dims().iter().product();
+        if covered < routes * row_blocks {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{covered} activation block scales cover fewer than {routes} rows of \
+                     {row_blocks} blocks"
+                ),
+            ));
+        }
         args.weights
             .require_shape(Self::NAME, Shape::new(&[experts, hidden, intermediate / 2]))?;
         if args.weights.dtype != DType::U8 {
@@ -1156,7 +1470,13 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts, 1]))?;
+            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+        if args.global_scale.strides.last() != 1 {
+            return Err(Error::argument(
+                Self::NAME,
+                "the tensor scales must be one packed f32 per expert",
+            ));
+        }
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1166,57 +1486,47 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
-        for (name, view) in [
-            ("ids", args.ids),
-            ("permuted_to_expanded", args.permuted_to_expanded),
-        ] {
-            view.require_shape(Self::NAME, Shape::new(&[routes]))?;
-            if view.dtype != DType::I32 {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!("expected i32 {name}, found {}", view.dtype),
-                ));
-            }
+        args.permuted_to_expanded
+            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+        if args.permuted_to_expanded.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected i32 permuted rows, found {}",
+                    args.permuted_to_expanded.dtype
+                ),
+            ));
         }
 
-        let mut arguments = Arguments::new();
-        arguments
-            .view(args.hidden)
-            .view(args.weights)
-            .view(args.scales)
-            .view(args.global_scale)
-            .view(args.ids)
-            .view(args.tile_to_expert)
-            .view(args.tile_to_limit)
-            .view(args.permuted_to_expanded)
-            .view(args.num_non_exiting_tiles)
-            .view(args.out)
-            .u32(descriptor.hidden)
-            .u32(descriptor.intermediate)
-            .u32(descriptor.experts)
-            .u32(descriptor.top)
-            .u32(u32::try_from(routes).unwrap_or(u32::MAX))
-            .u32(descriptor.tile.0)
-            .u32(descriptor.tile.1)
-            .u32(descriptor.cluster.0)
-            .u32(descriptor.cluster.1);
-        // Axis 0 is the *tile buffer's* count, a launch-fixed geometry: one block per tile the sort
-        // could produce, each returning immediately when its index is past the live count on the
-        // device. Reading `num_non_exiting_tiles` here would be a host read of a device value, and
-        // `[1]` means the launch would always compute one tile.
-        let tiles = args
-            .tile_to_expert
-            .shape
-            .dims()
-            .first()
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        kernel.launch(
-            LaunchGrid::new([tiles, hidden.div_ceil(u64::from(descriptor.tile.1)), 1])?,
-            &mut arguments,
-            stream,
-        )
+        check_workspace(Self::NAME, args.workspace)?;
+        let mut call = RouteNvfp4Call {
+            hidden: address(args.hidden.ptr) as usize as *const c_void,
+            hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
+            hidden_token_scale: address(args.hidden_token_scale.ptr) as usize as *const c_void,
+            weights: address(args.weights.ptr) as usize as *const c_void,
+            scales: address(args.scales.ptr) as usize as *const c_void,
+            global_scale: address(args.global_scale.ptr) as usize as *const c_void,
+            tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
+            tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
+            permuted_to_expanded: address(args.permuted_to_expanded.ptr) as usize as *const i32,
+            num_non_exiting_tiles: address(args.num_non_exiting_tiles.ptr) as usize as *const i32,
+            out: address(args.out.ptr) as usize as *mut c_void,
+            workspace: address(args.workspace.ptr) as usize as *mut c_void,
+            workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
+            routes: to_i64(Self::NAME, routes)?,
+            hidden_size: to_i64(Self::NAME, intermediate)?,
+            intermediate: to_i64(Self::NAME, hidden)?,
+            experts: to_i64(Self::NAME, experts)?,
+            tile_m: i64::from(descriptor.tile.0),
+            tile_n: i64::from(descriptor.tile.1),
+            cluster_m: i64::from(descriptor.cluster.0),
+            cluster_n: i64::from(descriptor.cluster.1),
+            dtype: dtype_code(descriptor.dtype),
+            error: [0; 512],
+        };
+        // SAFETY: `RouteNvfp4Call` is the structure this package's entry declares, and its layout is
+        // pinned by the offsets declared beside it and by the test below.
+        unsafe { kernel.native(&mut call, stream) }
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -1268,29 +1578,30 @@ mod nvfp4_launch_tests {
     /// the permuted rows past `tokens · top`.
     fn fc1_args() -> GatherGemmNvfp4Args {
         GatherGemmNvfp4Args {
-            hidden: table(DType::BF16, &[3, 2048]),
+            hidden: table(DType::U8, &[3, 1024]),
+            hidden_scale: table(DType::F8E4M3, &[3, 128]),
+            hidden_token_scale: table(DType::F32, &[3]),
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
-            global_scale: table(DType::F32, &[128, 2]),
-            ids: table(DType::I32, &[3, 8]),
+            global_scale: table(DType::F32, &[2, 128]),
             tile_to_expert: table(DType::I32, &[2]),
             tile_to_limit: table(DType::I32, &[2]),
             permuted_to_expanded: table(DType::I32, &[32]),
             num_non_exiting_tiles: table(DType::I32, &[1]),
             out: table(DType::BF16, &[32, 768]),
+            workspace: table(DType::U8, &[4096]),
         }
     }
 
     #[test]
     fn the_activations_are_the_token_rows_and_the_output_the_permuted_ones() {
         // Builder01's M963: `routes` (the output's rows) is the sort's padded count and is never the
-        // activation count. The invariant is `ids = [tokens, top]`, `hidden = [tokens, hidden]` and
+        // activation count. The invariant is `hidden = [tokens, hidden]` and
         // `permuted_to_expanded = [routes]`, which is what the program gathers through.
         let descriptor = fc1();
         let args = fc1_args();
         assert_eq!(args.hidden.rows(), 3);
         assert_eq!(args.out.rows(), 32);
-        assert_eq!(args.ids.shape.dims(), &[3, 8]);
         assert_eq!(args.permuted_to_expanded.shape.dims()[0], 32);
         // The scales cover one block per output row along the contraction, not one row's worth.
         assert_eq!(args.scales.shape.dims(), &[128, 1536, 128]);
@@ -1324,5 +1635,68 @@ mod nvfp4_launch_tests {
         args.scales = table(DType::F8E4M3, &[127, 1536, 128]);
         let error = GatherGemmNvfp4::validate(&fc1(), &args).unwrap_err();
         assert!(format!("{error}").contains("do not cover"));
+    }
+}
+
+#[cfg(test)]
+mod nvfp4_call_layout_tests {
+    use super::*;
+
+    /// The two encoded calls' offsets, as the C headers that mirror them must state them.
+    ///
+    /// A call structure is read by a compiled entry, so a field at the wrong offset is a corrupted
+    /// launch rather than a failed one; this test is the Rust side of the pair `header.h`'s
+    /// `static_assert`s are the other half of.
+    #[test]
+    fn the_encoded_calls_are_the_size_and_shape_their_headers_state() {
+        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 712);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden), 0);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden_scale), 8);
+        assert_eq!(
+            std::mem::offset_of!(GatherNvfp4Call, hidden_token_scale),
+            16
+        );
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, weights), 24);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, scales), 32);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale), 40);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 48);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_expert), 56);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_limit), 64);
+        assert_eq!(
+            std::mem::offset_of!(GatherNvfp4Call, permuted_to_expanded),
+            72
+        );
+        assert_eq!(
+            std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
+            80
+        );
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, out), 88);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace), 96);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace_bytes), 104);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, dtype), 192);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, error), 200);
+
+        assert_eq!(std::mem::size_of::<RouteNvfp4Call>(), 696);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden), 0);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden_scale), 8);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden_token_scale), 16);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, weights), 24);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, scales), 32);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, global_scale), 40);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, tile_to_expert), 48);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, tile_to_limit), 56);
+        assert_eq!(
+            std::mem::offset_of!(RouteNvfp4Call, permuted_to_expanded),
+            64
+        );
+        assert_eq!(
+            std::mem::offset_of!(RouteNvfp4Call, num_non_exiting_tiles),
+            72
+        );
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, out), 80);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace), 88);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace_bytes), 96);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, dtype), 176);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, error), 184);
     }
 }

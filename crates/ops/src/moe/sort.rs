@@ -218,12 +218,11 @@ impl Op for MoeSort {
         }
         for view in [&args.tile_to_expert, &args.tile_to_limit] {
             view.require_shape(Self::NAME, Shape::new(&[tiles]))?;
-            view.require_row(Self::NAME, DType::I32, 1)?;
+            super::require_i32_vector(Self::NAME, view)?;
         }
         args.expanded_to_permuted
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        args.expanded_to_permuted
-            .require_row(Self::NAME, DType::I32, 1)?;
+        super::require_i32_vector(Self::NAME, &args.expanded_to_permuted)?;
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[permuted]))?;
         args.total_padded_tokens

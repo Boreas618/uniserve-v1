@@ -59,20 +59,32 @@ def split_key(dimensions, key):
     return pairs
 
 
-def covers(package, key):
-    kernel = package["manifest"].get("kernel")
-    if kernel is None:
-        return False
-    descriptors = kernel["descriptors"]
+def shapes(kernel):
+    """The descriptor tables a package declares: one, or one per shape."""
+    descriptors = kernel.get("descriptors")
+    if descriptors is None:
+        return []
+    return descriptors if isinstance(descriptors, list) else [descriptors]
+
+
+def covers_one(descriptors, key):
     if key in descriptors.get("keys", []):
         return True
-    dimensions = descriptors.get("dimensions", {})
+    dimensions = descriptors.get("dimensions") or {}
     if not dimensions:
         return False
     pairs = split_key(dimensions, key)
     if pairs is None:
         return False
     return all(value in dimensions.get(name, []) for name, value in pairs)
+
+
+def covers(package, key):
+    """Whether the package covers this key: it covers one of the shapes it declares."""
+    kernel = package["manifest"].get("kernel")
+    if kernel is None:
+        return False
+    return any(covers_one(descriptors, key) for descriptors in shapes(kernel))
 
 
 def build(package, key, target, out_dir):
@@ -160,6 +172,34 @@ def main():
         for line in Path(args.fixture).read_text().splitlines()
         if line.strip() and not line.startswith("#")
     ]
+
+    # A key names one program, so exactly one package may claim it. Two packages claiming one key
+    # would let two hosts that build the same fixture store different modules under the same name,
+    # with nothing in the build log saying so — and the loader, which keys modules by (operator, key),
+    # would then run whichever the directory walk offered last. The claim is checked over the whole
+    # fixture before anything compiles, because a build that succeeds differently on another host is
+    # worse than one that stops.
+    claims = {}
+    for op, key in rows:
+        claiming = [
+            package for package in packages.get(op, [])
+            if covers(package, key)
+            and args.target in package["manifest"]["kernel"]["architectures"]
+        ]
+        if len(claiming) > 1:
+            claims.setdefault((op, key), []).append(claiming)
+    if claims:
+        report = []
+        for (op, key), _ in sorted(claims.items()):
+            directories = " and ".join(
+                str(package["root"]) for package in packages[op] if covers(package, key)
+                and args.target in package["manifest"]["kernel"]["architectures"]
+            )
+            report.append(f"  {op}\t{key}\n    claimed by {directories}")
+        sys.exit(
+            "the store cannot be built: a key must name one program, and these name two or more\n"
+            + "\n".join(report)
+        )
 
     built, skipped = [], []
     for op, key in rows:

@@ -610,9 +610,9 @@ struct Attachment {
     info: wire::EngineInfo,
 }
 
-/// Serves the daemon's requests on `stream` with `schedulers` until the
-/// daemon commands a shutdown or closes the connection, then shuts every
-/// scheduler down.
+/// Serves the daemon's requests on `stream` with `schedulers`, under `policy`,
+/// until the daemon commands a shutdown or closes the connection, then shuts
+/// every scheduler down.
 ///
 /// The connection has said hello and been welcomed, and the engine has
 /// reported itself ready; from here on it carries submissions, commands,
@@ -620,9 +620,17 @@ struct Attachment {
 /// engine reports itself failed and goes on answering each submission with
 /// an error.
 ///
+/// `policy` is the epoch's first policy, installed before the first
+/// submission (§7.3 steps 2 and 3). A daemon that owns the engine's process
+/// interface commands its epochs' policies there instead, and starts the
+/// engine with none (§[`run_engine`]); a caller that runs the schedulers
+/// itself has no process interface to command one, and an engine with no
+/// route instance places no request.
+///
 /// # Errors
 ///
-/// Fails when the connection fails or the event threads cannot start.
+/// Fails when the connection fails, the event threads cannot start, or
+/// `policy` cannot be prepared or switched in.
 pub fn serve_requests(
     stream: UnixStream,
     schedulers: Vec<SchedulerHandle>,
@@ -631,18 +639,21 @@ pub fn serve_requests(
     let writer = stream
         .try_clone()
         .context("sharing the daemon's connection")?;
+    let policies = policy
+        .as_ref()
+        .map(|policy| Arc::clone(&policy.module) as Arc<dyn PolicySource + Send + Sync>);
     serve(
         Connection::from_unix(stream)?,
         Connection::from_unix(writer)?,
         schedulers,
         None,
-        None,
+        policies,
         policy,
     )
 }
 
-/// The policy an epoch starts with, when its owner installs it directly
-/// rather than through the process interface (§7.3).
+/// The policy an epoch starts with, when its owner names it directly rather
+/// than through the process interface (§7.3).
 ///
 /// Production installs an epoch's policy with the daemon's `Precopy` and
 /// `Switchover` commands, which the epoch's command thread applies. A caller
@@ -652,7 +663,7 @@ pub fn serve_requests(
 /// program's decisions are what the control thread routes by; the schedulers
 /// carry the policy their own installation gave them.
 pub struct EpochPolicy {
-    /// The program the route decisions follow, with its parameters.
+    /// The program the route decisions follow.
     pub program: PolicyProgram,
     /// The module the program's decisions are instantiated from.
     pub module: Arc<dyn PolicySource + Send + Sync>,
@@ -704,16 +715,16 @@ fn serve(
         Ordering::Release,
     );
     anyhow::ensure!(!routing.slots.is_empty(), "the engine runs no scheduler");
-    // A caller that names the epoch's starting policy installs it before the
-    // first submission is read: the control thread's route instance answers
-    // from it, and without one every request is refused as unroutable.
-    if let Some(policy) = start {
+
+    // §7.3 steps 2 and 3 for an engine whose caller states the policy it
+    // serves: the route instance answers before the first submission, because
+    // nothing else installs one here. A daemon that commands its epochs'
+    // policies over the process interface states none, and its precopy does.
+    if let Some(start) = start {
         routing
-            .precopy_route(policy.module.as_ref(), policy.program)
-            .and_then(|()| routing.switchover_route())
-            .map_err(|reason| {
-                anyhow::anyhow!("the epoch's starting policy was not installed: {reason}")
-            })?;
+            .precopy_route(start.module.as_ref(), start.program)
+            .map_err(anyhow::Error::msg)?;
+        routing.switchover_route().map_err(anyhow::Error::msg)?;
     }
 
     let stop = Arc::new(AtomicBool::new(false));

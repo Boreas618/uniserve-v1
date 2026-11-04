@@ -381,7 +381,7 @@ impl Pools {
         let streams = streams.max(1);
         let mut allocator = allocator;
         let size = usize::try_from(graph)
-            .map_err(|_| Error::Resource("the graph storage is larger than memory".into()))?;
+            .map_err(|_| Error::Resource("the graph storage is larger than memory"))?;
         allocator.reserve(PoolKind::Graph, size)?;
         // The other two kinds in the same book (4.1): a pool whose figure is zero is not reserved,
         // and the three reservations are one allowance.
@@ -417,7 +417,7 @@ impl Pools {
     /// storage (the resident planes, a scratch page set).
     pub fn allocate(&mut self, pool: PoolKind, bytes: u64) -> Result<Buffer> {
         let size = usize::try_from(bytes)
-            .map_err(|_| Error::Resource("an allocation is larger than memory".into()))?;
+            .map_err(|_| Error::Resource("an allocation is larger than memory"))?;
         Ok(self.allocator.allocate(pool, size)?)
     }
 
@@ -456,7 +456,7 @@ impl Pools {
             return Ok(());
         }
         let size = usize::try_from(bytes)
-            .map_err(|_| Error::Resource("the shadow region is larger than memory".into()))?;
+            .map_err(|_| Error::Resource("the shadow region is larger than memory"))?;
         self.allocator.reserve(PoolKind::Scratch, size)?;
         self.scratch_reserved = true;
         Ok(())
@@ -642,9 +642,8 @@ impl Pools {
     fn pool(&mut self, stream: StreamId) -> Result<&mut Pool> {
         if !self.pools.contains_key(&stream) {
             self.ledger.open(stream)?;
-            let bytes = usize::try_from(self.ledger.reservation).map_err(|_| {
-                Error::Resource("a stream's graph range is larger than memory".into())
-            })?;
+            let bytes = usize::try_from(self.ledger.reservation)
+                .map_err(|_| Error::Resource("a stream's graph range is larger than memory"))?;
             let buffer = self.allocator.allocate(PoolKind::Graph, bytes)?;
             self.pools.insert(
                 stream,

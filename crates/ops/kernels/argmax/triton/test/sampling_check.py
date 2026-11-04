@@ -491,7 +491,10 @@ def run_argmax(case):
         values[1, width - 1] = 100.0
     out = torch.full((rows,), -1, dtype=torch.int32)
 
-    kernels._argmax_kernel[(rows,)](values, out, rows, WIDTH=width)
+    # The program walks one row in tiles of BLOCK, so a row wider than the tile exercises the
+    # walk rather than a single load: the width this operator sees in service is 151936.
+    block = 1024 if width > 1024 else width
+    kernels._argmax_kernel[(rows,)](values, out, rows, WIDTH=width, BLOCK=block)
 
     exact = values.cpu()
     wanted = (

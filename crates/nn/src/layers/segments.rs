@@ -18,9 +18,9 @@
 //! caller's view: the block composes this layer with its attention projections and its cache, and
 //! the executor owns the buffers.
 
-use ops::TensorView;
 use ops::descriptor::Float;
 use ops::segments::{self, MAX_MEMBERS};
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -38,6 +38,8 @@ pub struct VsaTiles {
     rotated: u32,
     norm: bool,
     block_rows: u32,
+    /// The bound on the key tiles one compression reduces over, when the model stated it.
+    max_tiles: u32,
 }
 
 impl VsaTiles {
@@ -66,7 +68,24 @@ impl VsaTiles {
             rotated: 0,
             norm: false,
             block_rows: segments::BLOCK_ROWS,
+            max_tiles: 0,
         })
+    }
+
+    /// The bound on the key tiles a compression reduces over: the deployment's own tile count.
+    ///
+    /// It is not derived here because it is a property of the sequence length the deployment
+    /// serves, not of a tile's geometry, and the tolerance of the compression is written against
+    /// it. A model that never compresses needs nothing; one that does states it once.
+    pub fn with_tile_bound(mut self, tiles: u32) -> Result<Self> {
+        if tiles == 0 {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a tile bound of zero leaves the compression nothing to reduce".to_owned(),
+            ));
+        }
+        self.max_tiles = tiles;
+        Ok(self)
     }
 
     /// The default tile of a video sparse attention block.
@@ -107,6 +126,90 @@ impl VsaTiles {
     /// Features per head.
     pub const fn width(&self) -> u32 {
         self.width
+    }
+
+    /// The descriptor one launch of each of this layer's five programs takes.
+    ///
+    /// Five, not one: the chain's five launches are five different operators (`vsa_prepare_tiles`,
+    /// `vsa_zero_padding`, `vsa_add_gated_tiles`, `vsa_compose_gated_rows`, `vsa_select_tiles`), so a
+    /// walk that asks which programs a model launches needs each by its own name and with the
+    /// geometry that launch reads.
+    pub fn prepare_tiles_descriptor(
+        &self,
+        query: TensorView,
+        key: TensorView,
+        value: TensorView,
+        cosine: Option<TensorView>,
+    ) -> segments::PrepareTilesDescriptor {
+        segments::PrepareTilesDescriptor {
+            dtype: query.dtype,
+            heads: self.heads,
+            width: self.width,
+            rotated: self.rotated,
+            tile_rows: self.tile_rows,
+            block_rows: self.block_rows,
+            epsilon: Float::from(self.eps),
+            norm: self.norm,
+            query_row_stride: query.strides.get(0),
+            query_head_stride: query.strides.get(1),
+            key_row_stride: key.strides.get(0),
+            key_head_stride: key.strides.get(1),
+            value_row_stride: value.strides.get(0),
+            value_head_stride: value.strides.get(1),
+            factor_stride: cosine.map(|table| table.strides.get(0)).unwrap_or(0),
+        }
+    }
+
+    /// The descriptor one `vsa_zero_padding` launch takes.
+    pub fn zero_padding_descriptor(&self, dtype: DType) -> segments::ZeroPaddingDescriptor {
+        segments::ZeroPaddingDescriptor {
+            dtype,
+            heads: self.heads,
+            tile_rows: self.tile_rows,
+            width: self.width,
+            block_rows: self.block_rows,
+        }
+    }
+
+    /// The descriptor one `vsa_add_gated_tiles` launch takes.
+    pub fn add_gated_tiles_descriptor(&self, dtype: DType) -> segments::AddGatedTilesDescriptor {
+        segments::AddGatedTilesDescriptor {
+            dtype,
+            tile_rows: self.tile_rows,
+            width: self.width,
+            block_rows: self.block_rows,
+        }
+    }
+
+    /// The descriptor one `vsa_compose_gated_rows` launch takes.
+    ///
+    /// The gate's member table is a descriptor field — a contiguous `[members]` array the program
+    /// reads as it starts — so it enters the key with the count beside it.
+    pub fn compose_descriptor(
+        &self,
+        dtype: DType,
+        slots: &[u32],
+    ) -> segments::ComposeGatedRowsDescriptor {
+        let mut table = [0_u32; MAX_MEMBERS];
+        table[..slots.len()].copy_from_slice(slots);
+        segments::ComposeGatedRowsDescriptor {
+            dtype,
+            heads: self.heads,
+            tile_rows: self.tile_rows,
+            width: self.width,
+            block_rows: self.block_rows,
+            slots: table,
+            members: slots.len() as u32,
+        }
+    }
+
+    /// The descriptor one `vsa_select_tiles` launch takes, for `tiles` key tiles.
+    pub fn select_descriptor(&self, tiles: u64) -> Result<segments::SelectTilesDescriptor> {
+        Ok(segments::SelectTilesDescriptor {
+            block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
+                Error::shape("VsaTiles", format!("{tiles} key tiles in one query tile"))
+            })?,
+        })
     }
 
     /// What a preparation needs of its at-rest arguments: [`Self::prepare`] calls this before it
@@ -335,6 +438,125 @@ impl VsaTiles {
         f.operate::<segments::VsaScores>(&descriptor, args)
     }
 
+    /// Each query tile's softmax over the live key tiles weights their pooled values.
+    ///
+    /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous, exactly what [`Self::scores`]
+    /// writes; `values` is `[tiles, heads, width]` FP32, what the pooling writes; `sizes` is
+    /// `[tiles]` i32, each key tile's live rows. A tile of no live rows is masked out of the softmax
+    /// rather than zeroed, because a zeroed pooled value under a live score would still take weight
+    /// and scale the others down.
+    ///
+    /// `out` is `[heads, query tiles, width]` in the attention's own element type — the layout the
+    /// gate step reads, and one row per (head, query tile) rather than one per row, because every
+    /// row of a query tile compresses to the same vector.
+    pub fn compress(
+        &self,
+        f: &Forward,
+        scores: TensorView,
+        values: TensorView,
+        sizes: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        self.check_compress(scores, values, sizes, out)?;
+        let descriptor = segments::CompressPooledDescriptor::new(
+            out.dtype,
+            self.heads,
+            self.width,
+            self.max_tiles,
+            self.width.next_power_of_two(),
+            false,
+        );
+        let args = segments::CompressPooledArgs {
+            scores,
+            values,
+            sizes,
+            out,
+        };
+        f.operate::<segments::VsaCompressPooled>(&descriptor, args)
+    }
+
+    /// The checks [`Self::compress`] makes before it launches, reachable without a device.
+    ///
+    /// Every refusal the layer can raise lives here rather than behind `&Forward`, because a
+    /// `Forward` needs a live stream and context and no host test can build one; the layer's own
+    /// test asserts these, and [`Self::compress`] calls this first so the two cannot drift.
+    pub fn check_compress(
+        &self,
+        scores: TensorView,
+        values: TensorView,
+        sizes: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if self.max_tiles == 0 {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a compression needs the deployment's key-tile bound: call with_tile_bound"
+                    .to_owned(),
+            ));
+        }
+        if scores.shape.rank() != 3 || values.shape.rank() != 3 {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the scores are [heads, query tiles, tiles] and the values [tiles, heads, \
+                     width], not {:?} and {:?}",
+                    scores.shape.dims(),
+                    values.shape.dims()
+                ),
+            ));
+        }
+        if scores.shape.dim(0) != u64::from(self.heads)
+            || values.shape.dim(1) != u64::from(self.heads)
+        {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the compression is over {} heads, and the views carry {} and {}",
+                    self.heads,
+                    scores.shape.dim(0),
+                    values.shape.dim(1)
+                ),
+            ));
+        }
+        if values.shape.dim(2) != u64::from(self.width) {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the pooled values carry {} features, and the block's heads carry {}",
+                    values.shape.dim(2),
+                    self.width
+                ),
+            ));
+        }
+        if sizes.shape.numel() != values.shape.dim(0) {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "{} key tiles of pooled values against {} live sizes",
+                    values.shape.dim(0),
+                    sizes.shape.numel()
+                ),
+            ));
+        }
+        if out.shape.rank() != 3
+            || out.shape.dim(0) != u64::from(self.heads)
+            || out.shape.dim(1) != scores.shape.dim(1)
+            || out.shape.dim(2) != u64::from(self.width)
+        {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the compression is [heads, query tiles, width] = [{}, {}, {}], not {:?}",
+                    self.heads,
+                    scores.shape.dim(1),
+                    self.width,
+                    out.shape.dims()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Choose each query tile's key tiles from its pooled scores.
     ///
     /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous; `segments` and `sizes` are
@@ -384,6 +606,20 @@ impl VsaTiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The selection's block is the key-tile count rounded up to a power of two: the program's own
+    /// table width, so a walk that reads the accessor sees the same key the launch would.
+    #[test]
+    fn the_select_block_is_the_tile_count_rounded_up() {
+        let layer = VsaTiles::with_default_tile(4, 128, 1e-6).unwrap();
+        assert_eq!(layer.select_descriptor(1).unwrap().block, 1);
+        assert_eq!(layer.select_descriptor(5).unwrap().block, 8);
+        assert_eq!(layer.select_descriptor(64).unwrap().block, 64);
+        // The member table is the layer's own statement of the gate's slots.
+        let compose = layer.compose_descriptor(DType::BF16, &[2, 5]);
+        assert_eq!(compose.members, 2);
+        assert_eq!(&compose.slots[..2], &[2, 5]);
+    }
     use ops::{DType, DevicePtr, Shape};
 
     /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
@@ -495,6 +731,82 @@ mod tests {
         assert!(
             format!("{}", too_many.unwrap_err()).contains(&MAX_MEMBERS.to_string()),
             "the table's size is named"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compress_tests {
+    use ops::{DType, DevicePtr, Shape};
+
+    use super::*;
+
+    fn view(dtype: DType, shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1_0000), dtype, Shape::new(shape))
+    }
+
+    /// A block of `heads` heads of `width` features over 128-row tiles, with a tile bound stated.
+    fn tiles() -> VsaTiles {
+        VsaTiles::new(128, 4, 64, 1e-6)
+            .unwrap()
+            .with_tile_bound(4_096)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_compression_needs_the_deployments_tile_bound() {
+        // The bound is what the tolerance is written against, so an unstated one is refused rather
+        // than guessed: a compression accepted for four thousand tiles cannot be compared on the
+        // bound of an arbitrary one.
+        let unset = VsaTiles::new(128, 4, 64, 1e-6).unwrap();
+        let error = unset
+            .check_compress(
+                view(DType::F32, &[4, 8, 16]),
+                view(DType::F32, &[16, 4, 64]),
+                view(DType::I32, &[16]),
+                view(DType::BF16, &[4, 8, 64]),
+            )
+            .expect_err("a compression without a tile bound");
+        assert!(error.to_string().contains("with_tile_bound"), "{error}");
+        assert!(unset.with_tile_bound(0).is_err());
+    }
+
+    #[test]
+    fn a_compression_refuses_views_that_would_sum_another_block() {
+        let tiles = tiles();
+        let scores = view(DType::F32, &[4, 8, 16]);
+        let values = view(DType::F32, &[16, 4, 64]);
+        let sizes = view(DType::I32, &[16]);
+        let out = view(DType::BF16, &[4, 8, 64]);
+        assert!(tiles.check_compress(scores, values, sizes, out).is_ok());
+        // Another head count on either side would weight another block's rows.
+        assert!(
+            tiles
+                .check_compress(view(DType::F32, &[2, 8, 16]), values, sizes, out)
+                .is_err()
+        );
+        assert!(
+            tiles
+                .check_compress(scores, view(DType::F32, &[16, 2, 64]), sizes, out)
+                .is_err()
+        );
+        // Another feature width is another head's arithmetic.
+        assert!(
+            tiles
+                .check_compress(scores, view(DType::F32, &[16, 4, 32]), sizes, out)
+                .is_err()
+        );
+        // The live sizes are one per key tile.
+        assert!(
+            tiles
+                .check_compress(scores, values, view(DType::I32, &[12]), out)
+                .is_err()
+        );
+        // The result is one row per (head, query tile) of the block's width.
+        assert!(
+            tiles
+                .check_compress(scores, values, sizes, view(DType::BF16, &[4, 8, 32]))
+                .is_err()
         );
     }
 }

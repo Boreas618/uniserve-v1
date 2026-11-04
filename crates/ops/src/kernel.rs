@@ -364,29 +364,32 @@ impl Arguments {
         let Some(metadata) = metadata.filter(|metadata| !metadata.signature.is_empty()) else {
             return Ok(());
         };
-        // The global and the profile scratch address follow the kernel's own parameters whatever the
-        // scratch sizes are. A module built with Triton's own metadata records them in the signature
-        // (as the last two entries); one built without records only the kernel's own parameters. Both
-        // are one list to the operator, so the two the signature already names are not counted twice.
-        let scratch = 2;
-        let named = metadata
+        // `parameters` appends the global and the profile scratch address after the packed words, so
+        // the launch passes two more words than the operator packed, whatever the scratch sizes are.
+        //
+        // The signature is held to the packed words alone, with any entry naming one of those two
+        // addresses left out. A module the compiler builds today names neither: `_embedding_kernel`'s
+        // signature is its seven parameters and `global_scratch_size`/`profile_scratch_size` are
+        // separate fields, so its nine-parameter PTX is those seven plus the two appended here. A
+        // module whose metadata does name them states two entries this operator never packs, and
+        // filtering keeps that from being counted twice. Either way the count is "what the operator
+        // states", which is the only thing it can be held to.
+        let declared: Vec<&Parameter> = metadata
             .signature
             .iter()
-            .filter(|parameter| Self::is_scratch(&parameter.name))
-            .count();
-        let scratch = scratch - named.min(scratch);
-        let expected = metadata.signature.len() + scratch;
+            .filter(|parameter| !Self::is_scratch(&parameter.name))
+            .collect();
+        let expected = declared.len();
         let supplied = self.kinds.len();
         if expected != supplied {
             return Err(Error::Metadata(format!(
-                "{} takes {expected} parameters ({}) and the operator packed {supplied} ({})",
+                "{} declares {expected} parameters ({}) and the operator packed {supplied} ({})",
                 metadata.name,
-                Self::describe(&metadata.signature, scratch),
+                Self::describe(&metadata.signature),
                 Self::describe_packed(&self.kinds),
             )));
         }
-        for (position, (parameter, word)) in metadata.signature.iter().zip(&self.kinds).enumerate()
-        {
+        for (position, (parameter, word)) in declared.iter().zip(&self.kinds).enumerate() {
             if parameter.is_pointer() != (*word == Word::Pointer) {
                 return Err(Error::Metadata(format!(
                     "{} parameter {position} `{}` is `{}` and the operator packed a {} there",
@@ -404,16 +407,12 @@ impl Arguments {
     }
 
     /// The parameters of a signature, for error text.
-    fn describe(signature: &[Parameter], scratch: usize) -> String {
-        let mut names: Vec<String> = signature
+    fn describe(signature: &[Parameter]) -> String {
+        signature
             .iter()
             .map(|parameter| format!("`{}`: {}", parameter.name, parameter.ty))
-            .collect();
-        if scratch > 0 {
-            names.push("`global_scratch`: *i8".to_owned());
-            names.push("`profile_scratch`: *i8".to_owned());
-        }
-        names.join(", ")
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// The packed words, for error text.
@@ -866,9 +865,9 @@ mod tests {
 
     #[test]
     fn a_signature_that_names_its_scratch_is_not_counted_twice() {
-        // Triton's own metadata records the two scratch addresses as the last two entries; the
-        // operator packs them itself, so a module of three parameters plus its two scratch words
-        // takes five and packs five. Counting the named ones again refused every such module.
+        // Triton 3.7's metadata records the two scratch addresses inside the signature, and the launch
+        // appends those two slots itself. A module of two parameters therefore takes two packed
+        // words, not four: counting the named entries again refused every module built that way.
         let module = metadata(
             r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}}"#,
         );
@@ -878,7 +877,7 @@ mod tests {
         let mut long = Arguments::new();
         long.pointer(DevicePtr::new(0x1000)).u32(7).u32(1);
         let error = long.parameters(Some(&module)).unwrap_err().to_string();
-        assert!(error.contains("takes 4 parameters"), "{error}");
+        assert!(error.contains("declares 2 parameters"), "{error}");
         assert!(error.contains("packed 3"), "{error}");
     }
 
@@ -890,7 +889,7 @@ mod tests {
         short.pointer(DevicePtr::new(0x1000)).u32(7);
         let error = short.parameters(Some(&module)).unwrap_err().to_string();
         assert!(error.contains("_kernel"), "{error}");
-        assert!(error.contains("takes 5 parameters"), "{error}");
+        assert!(error.contains("declares 3 parameters"), "{error}");
         assert!(error.contains("packed 2"), "{error}");
         assert!(error.contains("`eps`: fp32"), "{error}");
     }

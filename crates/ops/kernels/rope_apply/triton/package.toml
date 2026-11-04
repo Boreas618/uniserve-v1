@@ -43,6 +43,6 @@ architectures = ["sm_100a", "sm_90a"]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["72", "128", "64"], heads = ["16", "8", "32"], rotation = ["half", "interleaved"], rows = ["8", "1", "4"], block = ["128", "64"], pdl = ["true", "false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "96", "64"], heads = ["16", "8", "32"], rotation = ["half", "interleaved"], rows = ["8", "1"], block = ["128", "64"], pdl = ["true", "false"], rotated = ["96", "64", "32"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "96", "64"], heads = ["16", "8", "32", "56"], rotation = ["half", "interleaved"], rows = ["8", "1"], block = ["128", "64"], pdl = ["true", "false"], rotated = ["96", "64", "32"] }
 
 [parameters]

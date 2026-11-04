@@ -140,13 +140,11 @@ struct Takeover {
     listener: HandedListener,
     replicas: Vec<ReplicaHandoff>,
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
-    commit: Option<crate::worlds::Commit>,
-    pending: std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>,
     service: HandedService,
     service_descriptors: usize,
     admin: HandedAdmin,
     jobs: Vec<(VideoJob, Option<u64>)>,
-    then: Option<crate::worlds::ApplyRequest>,
+    then: Option<crate::updates::change::ApplyRequest>,
     /// Whether new requests waited when the predecessor handed over. The
     /// successor's gate starts as the predecessor's ended: a hot restart must
     /// not reopen admissions (§7.5.1), and the in-process hold alone would
@@ -168,7 +166,7 @@ struct ReplicaHandoff {
     paused: bool,
     asleep: bool,
     sleep_paused: bool,
-    unavailable: Vec<crate::worlds::Unavailable>,
+    unavailable: Vec<crate::updates::epoch::Unavailable>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -243,7 +241,7 @@ impl Restarter {
         &self,
         executable: Option<String>,
         config: Option<crate::options::ServeConfig>,
-        then: Option<Box<crate::worlds::ApplyRequest>>,
+        then: Option<Box<crate::updates::change::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -254,6 +252,11 @@ impl Restarter {
         };
         // No world change, rollback or relaunch replaces the engine meanwhile.
         let _quiet = leader.quiesce().await;
+        // The parked standbys are this daemon's processes (§2.5): the successor
+        // numbers and starts its own once it has adopted the engines, so ending
+        // them here keeps a second engine's memory off the device across the
+        // handover instead of leaving the old daemon's copies parked behind it.
+        leader.end_standbys().await;
         let handoff = leader.engine_handoff()?;
         let (ours, theirs) = UnixStream::pair().context("creating the handoff socket")?;
         // The persistent reply reader must yield to the continuations it
@@ -370,8 +373,6 @@ impl Restarter {
                     listener,
                     replicas,
                     adapters: crate::leader::locked(&leader.replicas.adapters).clone(),
-                    commit: crate::leader::locked(&leader.replicas.commit).clone(),
-                    pending: crate::leader::locked(&leader.replicas.pending).clone(),
                     service,
                     service_descriptors: service_count,
                     admin: admin.hand_over(),
@@ -388,33 +389,31 @@ impl Restarter {
             replica.client.attach(&requests);
         }
 
-        let (pid, taken) = 'serving: loop {
-            match recv(&mut channel).await? {
-                (Message::Adopted { pid, streams }, _) => {
-                    info!(
-                        count = streams.len(),
-                        "the successor took the responses in flight over"
-                    );
-                    break 'serving (0, Some((pid, streams)));
-                }
-                (Message::Serving { pid }, _) => break (pid, None),
-                (Message::Failed { reason }, _) => {
-                    anyhow::bail!("the successor took the service and gave up: {reason}")
-                }
-                (other, _) => anyhow::bail!("the successor answered {other:?}"),
+        // The successor answers once: it either took the responses in flight
+        // over, or serves without them, or gave up.
+        let (pid, taken) = match recv(&mut channel).await? {
+            (Message::Adopted { pid, streams }, _) => {
+                info!(
+                    count = streams.len(),
+                    "the successor took the responses in flight over"
+                );
+                (pid, Some((pid, streams)))
             }
+            (Message::Serving { pid }, _) => (pid, None),
+            (Message::Failed { reason }, _) => {
+                anyhow::bail!("the successor took the service and gave up: {reason}")
+            }
+            (other, _) => anyhow::bail!("the successor answered {other:?}"),
         };
+        // The successor's own id either way: it is the process the `handoff ...
+        // adopted` record names, and the one every response it did not take
+        // stays paused behind here.
         match taken {
             Some((successor_pid, streams)) => paused.decide(&streams, successor_pid),
             // A successor that serves without taking any response over: every
             // response in flight stays here.
-            None => {
-                let pid = std::process::id();
-                let _ = pid;
-                paused.decide(&[], std::process::id());
-            }
+            None => paused.decide(&[], pid),
         }
-        let pid = pid;
         info!(
             pid,
             "the successor serves; this daemon finishes its requests"
@@ -671,8 +670,6 @@ async fn prepared_successor(
         listener,
         replicas,
         adapters,
-        commit,
-        pending,
         service,
         service_descriptors,
         admin,
@@ -738,7 +735,7 @@ async fn prepared_successor(
                 let (options, _) = crate::options::resolve_text(&replica.config, &[])?;
                 let options = crate::options::with_daemon_options(&options, &daemon_options);
                 let served = wire::EngineSpec::decode(replica.served.as_slice())?;
-                let observer = Arc::new(crate::worlds::Observer::default());
+                let observer = Arc::new(crate::observe::Observer::default());
                 let sink = stats_sink(options.model().to_owned(), Arc::clone(&observer), index);
                 let client = adopting.adopt(
                     replica.engine,
@@ -757,6 +754,7 @@ async fn prepared_successor(
     let mut adopted = adopted.into_iter();
     let (handed, options, served, observer, client) =
         adopted.next().context("the takeover names no replicas")?;
+    let adopted_world = served.world;
     let leader = Arc::new(Leader::finish(
         &config,
         prepared,
@@ -766,6 +764,14 @@ async fn prepared_successor(
         observer,
         updates,
     )?);
+    // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
+    {
+        let (record, process) = adopted_epoch(adopted_world, handed.engine, &options);
+        epoch_records.record(adopted_world, record);
+        let mut processes = epoch_records.processes();
+        processes.push(process);
+        epoch_records.set_processes(processes);
+    }
     if frontend_paused {
         // The predecessor was gated when it handed over, so the successor's
         // gate starts closed: the in-process hold is re-asserted here (its
@@ -779,6 +785,10 @@ async fn prepared_successor(
     *crate::leader::locked(&first.config) = options;
     first.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
     first.adopt_unavailable(handed.unavailable);
+    // §2.5 continues across the handoff: the successor adopts the engines and
+    // then keeps a standby of its own, or the deployment would serve without one
+    // until the next restart.
+    first.start_standby();
     for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
             &options,
@@ -793,6 +803,7 @@ async fn prepared_successor(
         replica.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
         replica.adopt_unavailable(handed.unavailable);
         replica.monitor();
+        replica.start_standby();
         leader
             .replicas
             .serving
@@ -800,16 +811,6 @@ async fn prepared_successor(
     }
 
     *crate::leader::locked(&leader.replicas.adapters) = adapters;
-    *crate::leader::locked(&leader.replicas.commit) = commit;
-    *crate::leader::locked(&leader.replicas.pending) = pending;
-    if crate::leader::locked(&leader.replicas.commit).is_some() {
-        let committing = Arc::clone(&leader);
-        tokio::spawn(async move {
-            if let Err(error) = committing.commit().await {
-                tracing::error!(%error, "the handed-over commit remains pending");
-            }
-        });
-    }
     let retire = Arc::new(AtomicBool::new(false));
     let admin = Admin::resume(shutdown.clone(), Arc::clone(&retire), admin);
     admin.record(
@@ -949,4 +950,71 @@ async fn prepared_successor(
     }
     let served = served.map(drop);
     crate::http::finish(&config, &leader, daemon, retire, handed_over, served).await
+}
+
+/// The epoch record and the process row of an epoch a restarting daemon
+/// adopts: the build config and the programs the adopted configuration
+/// fills, serving, at the launch generation the child reported (which is the
+/// identity it runs under, §7.4). The record's own generation stays `None`:
+/// that field is the MODEL generation the adopted child numbers for its
+/// programs, and a daemon that adopted it never saw that number — the launch
+/// generation belongs to the process row alone.
+///
+/// Without the record the epoch layer says no epoch serves and refuses the
+/// next switch; without the row the next launch would be numbered 1 again,
+/// under a live child's generation (§2.5).
+fn adopted_epoch(
+    world: u64,
+    engine: u64,
+    options: &crate::options::ServeConfig,
+) -> (crate::epoch::EpochRecord, crate::epoch::ManagedProcess) {
+    let deployment = crate::epoch::Deployment::of(options.clone());
+    let record = crate::epoch::EpochRecord {
+        build_config: deployment.build_config.clone(),
+        kernels: deployment.programs.kernels.clone(),
+        policy: deployment.programs.policy.clone(),
+        previous_kernels: std::collections::BTreeMap::new(),
+        previous_policy: None,
+        status: crate::epoch::Status::Serving,
+        generation: None,
+        world,
+    };
+    let process = crate::epoch::ManagedProcess {
+        role: crate::epoch::Role::MainProcess,
+        group: crate::engine::control::ENGINE_GROUP.to_owned(),
+        rank: 0,
+        pid: None,
+        epoch: Some(world),
+        build: deployment.build_config.executable.clone(),
+        generation: engine,
+        state: crate::epoch::ProcessState::Serving,
+    };
+    (record, process)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The adopted epoch states the configuration it serves, and its process
+    /// row the launch generation its child reported, so a later switch
+    /// compares against it and numbers its children above it. The record's
+    /// generation is the model generation, which the adopting daemon did not
+    /// see and does not invent.
+    #[test]
+    fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
+        let options = crate::options::ServeConfig::default();
+        let (record, process) = adopted_epoch(7, 12, &options);
+        assert_eq!(record.status, crate::epoch::Status::Serving);
+        assert_eq!(record.world, 7);
+        assert_eq!(
+            record.generation, None,
+            "the model generation is not the launch generation the child reported"
+        );
+        assert_eq!(record.build_config, crate::epoch::BuildConfig::of(&options));
+        assert_eq!(process.generation, 12);
+        assert_eq!(process.epoch, Some(7));
+        assert_eq!(process.state, crate::epoch::ProcessState::Serving);
+        assert_eq!(process.role, crate::epoch::Role::MainProcess);
+    }
 }

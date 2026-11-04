@@ -39,12 +39,13 @@
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::forward::ALIGNMENT;
 use nn::layers::{
-    Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu,
+    Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu, TILE_ROWS,
     TRTLLM_WORKSPACE_BYTES,
 };
 use nn::model::{Block, BlockName, Model};
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, TensorView};
+use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
 
@@ -55,6 +56,13 @@ pub struct LoadOptions {
     pub attention_workspace_bytes: u64,
     /// Tokens one prefix-cache page holds; the deployment's cache decides it.
     pub page_tokens: u32,
+    /// Whether the checkpoint's experts were read as calibrated NVFP4, which makes every routed
+    /// layer's step encode its activations and read the packed products.
+    ///
+    /// It is a load option because it is a property of the checkpoint the loader read, and the plan
+    /// has to know it: the encoded step's buffers are the plan's to reserve, and a plan built for
+    /// dense experts would size an arena the encoded step writes past.
+    pub experts_encoded: bool,
 }
 
 impl Default for LoadOptions {
@@ -64,6 +72,7 @@ impl Default for LoadOptions {
         Self {
             attention_workspace_bytes: TRTLLM_WORKSPACE_BYTES,
             page_tokens: 64,
+            experts_encoded: false,
         }
     }
 }
@@ -140,17 +149,29 @@ pub struct Plan {
     pub factors: u64,
     /// Elements per dense feed-forward row; zero when every layer routes to experts.
     pub feed_forward: u64,
+    /// Elements per row of this rank's vocabulary shard: the head's output width.
+    pub vocabulary: u64,
+    /// Elements per row of the gathered logits matrix, `vocabulary × tensor parallel`; zero when
+    /// one rank projects the whole vocabulary and no gather happens.
+    pub gathered: u64,
     /// Bytes of the attention program's workspace.
     pub workspace: u64,
+    /// Bytes the encoded expert step reserves in the routed layers; zero when the experts are dense
+    /// or no layer routes.
+    ///
+    /// One reservation serves every routed layer, as the rest of the plan does: the step's buffers
+    /// are reused as the layer loop advances.
+    pub moe: u64,
 }
 
 impl Plan {
-    /// The plan of one forward over `tokens` tokens.
+    /// The plan of one forward over `tokens` tokens of `dtype`'s activations.
     pub fn new(
         config: &Config,
         partition: &Partition,
         tokens: u64,
         options: &LoadOptions,
+        dtype: DType,
     ) -> Result<Self> {
         Ok(Self {
             tokens,
@@ -169,7 +190,40 @@ impl Plan {
             } else {
                 0
             },
+            vocabulary: element(
+                partition.padded_vocabulary_shard(config.vocab_size),
+                "the vocabulary shard",
+            )?,
+            gathered: if partition.tensor_parallel > 1 {
+                element(
+                    partition.padded_vocabulary_shard(config.vocab_size)
+                        * partition.tensor_parallel,
+                    "the gathered vocabulary",
+                )?
+            } else {
+                0
+            },
             workspace: options.attention_workspace_bytes,
+            moe: if options.experts_encoded && config.num_experts > 0 {
+                // The activation encoding's block scales are the CUTLASS product's plain layout.
+                nn::layers::encoded_bytes(
+                    tokens,
+                    nn::layers::EncodedGeometry {
+                        hidden: element(config.hidden_size, "hidden_size")?,
+                        intermediate: element(
+                            config.moe_intermediate_size,
+                            "moe_intermediate_size",
+                        )?,
+                        top: element(config.num_experts_per_tok, "num_experts_per_tok")?,
+                        experts: element(config.num_experts, "num_experts")?,
+                        tile: u64::from(TILE_ROWS),
+                    },
+                    ops::fp4::ScaleLayout::Linear,
+                    dtype,
+                )?
+            } else {
+                0
+            },
         })
     }
 
@@ -191,6 +245,9 @@ impl Plan {
             (self.tokens * self.query, dtype),        // attended output
             (self.tokens * self.feed_forward, dtype), // dense gate
             (self.tokens * self.feed_forward, dtype), // dense up
+            (self.moe, DType::U8),                    // the encoded expert step
+            (self.tokens * self.vocabulary, dtype),   // the vocabulary shard's logits
+            (self.tokens * self.gathered, dtype),     // the gathered logits, absent on one rank
         ] {
             let bytes = element
                 .bytes()
@@ -341,8 +398,34 @@ impl Qwen3Moe {
     }
 
     /// The activation plan of a forward over `tokens` tokens.
+    /// The vocabulary embedding.
+    pub(crate) fn embedding(&self) -> &Embedding {
+        &self.embedding
+    }
+
+    /// The decoder layers, in order.
+    pub(crate) fn layers(&self) -> &[DecoderLayer] {
+        &self.layers
+    }
+
+    /// The final normalization.
+    pub(crate) fn norm(&self) -> &RmsNorm {
+        &self.norm
+    }
+
+    /// The vocabulary head.
+    pub(crate) fn head(&self) -> &ParallelLMHead {
+        &self.head
+    }
+
     pub fn plan(&self, tokens: u64) -> Result<Plan> {
-        Plan::new(&self.config, &self.partition, tokens, &self.options)
+        Plan::new(
+            &self.config,
+            &self.partition,
+            tokens,
+            &self.options,
+            self.dtype,
+        )
     }
 
     /// Run the decoder layers `0..=last` over `hidden`, and answer the layer's output rows.
@@ -406,7 +489,7 @@ impl Qwen3Moe {
     pub fn into_model(self) -> Model {
         Model::new(vec![(
             BlockName::new("backbone"),
-            Block::CausalLm(Box::new(self)),
+            Block::CausalLm(Arc::new(self)),
         )])
     }
 
@@ -673,16 +756,34 @@ impl CausalLm for Qwen3Moe {
 
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> nn::Result<()> {
         let rows = hidden.rows();
+        let plan = self.plan(rows).map_err(capability)?;
+        // The plan's two widths are the model's, not the launch's: a loaded head whose shard width
+        // disagrees with the partition would otherwise be given a buffer of the wrong width and
+        // write past it.
+        if plan.vocabulary != u64::from(self.head.padded()) {
+            return Err(capability(Error::Config(format!(
+                "the plan reserves {} columns for the vocabulary shard, the head projects {}",
+                plan.vocabulary,
+                self.head.padded()
+            ))));
+        }
         let projected = f
             .arena
-            .tensor(
-                self.dtype,
-                Shape::new(&[rows, u64::from(self.head.padded())]),
-            )
+            .tensor(self.dtype, Shape::new(&[rows, plan.vocabulary]))
             .map_err(Error::from)
             .map_err(capability)?;
+        let gathered = if plan.gathered == 0 {
+            None
+        } else {
+            Some(
+                f.arena
+                    .tensor(self.dtype, Shape::new(&[rows, plan.gathered]))
+                    .map_err(Error::from)
+                    .map_err(capability)?,
+            )
+        };
         self.head
-            .forward(f, hidden, projected, None, out)
+            .forward(f, hidden, projected, gathered, out)
             .map_err(Error::from)
             .map_err(capability)
     }
@@ -746,13 +847,23 @@ mod tests {
 
     #[test]
     fn the_plan_of_the_slice() {
-        let plan = Plan::new(&config(), &Partition::single(), 4, &LoadOptions::default()).unwrap();
+        let plan = Plan::new(
+            &config(),
+            &Partition::single(),
+            4,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
         assert_eq!(plan.hidden, 2048);
         assert_eq!(plan.query, 32 * 128);
         assert_eq!(plan.key_value, 4 * 128);
         assert_eq!(plan.factors, 64);
         // Every layer routes to experts, so no dense feed-forward buffer is planned.
         assert_eq!(plan.feed_forward, 0);
+        // One rank projects the whole vocabulary and gathers nothing.
+        assert_eq!(plan.vocabulary, 151936);
+        assert_eq!(plan.gathered, 0);
     }
 
     #[test]
@@ -760,7 +871,14 @@ mod tests {
         let mut config = config();
         config.mlp_only_layers = vec![1];
         assert!(config.has_dense_layers());
-        let plan = Plan::new(&config, &Partition::single(), 2, &LoadOptions::default()).unwrap();
+        let plan = Plan::new(
+            &config,
+            &Partition::single(),
+            2,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
         assert_eq!(plan.feed_forward, 6144);
     }
 
@@ -768,9 +886,79 @@ mod tests {
     fn tensor_parallel_heads_divide_the_projection() {
         let config = config();
         let partition = Partition::new(&config, 4, 1, 1, 0).unwrap();
-        let plan = Plan::new(&config, &partition, 3, &LoadOptions::default()).unwrap();
+        let plan = Plan::new(&config, &partition, 3, &LoadOptions::default(), DType::BF16).unwrap();
         assert_eq!(plan.query, 8 * 128);
         assert_eq!(plan.key_value, 128);
+    }
+
+    /// A sharded head plans both logits matrices: its own padded shard, and the gather every rank
+    /// writes into. The plan is what sizes the arena, so a gather it forgot would be a write past
+    /// the reservation on the first sharded deployment.
+    #[test]
+    fn a_sharded_head_plans_its_shard_and_the_gather() {
+        let config = config();
+        let single = Plan::new(
+            &config,
+            &Partition::single(),
+            1,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
+        let sharded = Plan::new(
+            &config,
+            &Partition::new(&config, 2, 0, 1, 0).unwrap(),
+            1,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
+        assert_eq!(sharded.vocabulary, 75968);
+        assert_eq!(sharded.gathered, 151936);
+        assert_eq!(single.gathered, 0);
+        assert!(
+            sharded.bytes(DType::BF16).unwrap() > sharded.vocabulary * 2,
+            "the gather's own rows are reserved"
+        );
+    }
+
+    /// An encoded expert step's buffers are the plan's to reserve: the arena is sized from the
+    /// plan, and the step writes past a plan that forgot them. So the plan states them when the
+    /// checkpoint's experts were read as NVFP4, and nothing when they were dense.
+    #[test]
+    fn an_encoded_expert_step_is_planned_and_a_dense_one_is_not() {
+        let config = config();
+        let partition = Partition::single();
+        let dense = Plan::new(
+            &config,
+            &partition,
+            15,
+            &LoadOptions::default(),
+            DType::BF16,
+        )
+        .unwrap();
+        assert_eq!(dense.moe, 0);
+        let encoded = Plan::new(
+            &config,
+            &partition,
+            15,
+            &LoadOptions {
+                experts_encoded: true,
+                ..LoadOptions::default()
+            },
+            DType::BF16,
+        )
+        .unwrap();
+        // The permutation's worst case: 120 expanded routes over 128 experts at 128-row tiles is one
+        // tile per route, so the step reserves 15360 permuted rows rather than 120.
+        let routes = 120 * 128;
+        let down_rows = routes * 2048 * 2;
+        assert!(
+            encoded.moe >= down_rows,
+            "the encoded step reserves {} bytes, the down product's rows alone are {down_rows}",
+            encoded.moe
+        );
+        assert!(encoded.bytes(DType::BF16).unwrap() > dense.bytes(DType::BF16).unwrap());
     }
 
     #[test]
@@ -778,14 +966,22 @@ mod tests {
         let config = config();
         let partition = Partition::single();
         let bytes = |tokens: u64| {
-            Plan::new(&config, &partition, tokens, &LoadOptions::default())
-                .unwrap()
-                .bytes(DType::BF16)
-                .unwrap()
+            Plan::new(
+                &config,
+                &partition,
+                tokens,
+                &LoadOptions::default(),
+                DType::BF16,
+            )
+            .unwrap()
+            .bytes(DType::BF16)
+            .unwrap()
         };
         // Per token: two F32 factor columns, three hidden buffers, three query-width buffers
-        // (query, rotated query, attended output) and three key/value-width buffers.
-        let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 3 * 4096 * 2 + 3 * 512 * 2;
+        // (query, rotated query, attended output), three key/value-width buffers and the logits'
+        // row. Two rank's worth of logits are planned only where a gather happens, and the single
+        // rank plans none.
+        let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 3 * 4096 * 2 + 3 * 512 * 2 + 151936 * 2;
         assert_eq!(bytes(2) - bytes(1), per_token);
     }
 }

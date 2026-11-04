@@ -6,10 +6,11 @@
 //! and its heads carry no learned norm — so it needs only the rotation, applied to tables it has in
 //! hand: `ops::rope::RopeApply`.
 //!
-//! The tables are `[tokens, head_dim / 2]` FP32 (cosine and sine of each token's phase); the values
+//! The tables are `[tokens, rotated / 2]` FP32 (cosine and sine of each token's phase); the values
 //! are `[tokens, heads, head_dim]` and the result is the same shape, rotated and stored in the
 //! output's element type. No frequencies, no sections and no scale live here: a sectioned rotation
-//! is [`crate::layers::Rotary`]'s, and this layer never guesses an axis cut.
+//! is [`crate::layers::Rotary`]'s, and this layer never guesses an axis cut - a model whose heads
+//! turn only their leading channels says so with [`Rotate::rotated`].
 
 use ops::TensorView;
 use ops::rope::{RopeApply, RopeApplyArgs, RopeApplyDescriptor};
@@ -29,6 +30,7 @@ const BLOCK: u32 = 128;
 #[derive(Clone, Copy)]
 pub struct Rotate {
     head_dim: u32,
+    rotated: u32,
     heads: u32,
     rotation: Rotation,
 }
@@ -59,9 +61,34 @@ impl Rotate {
         }
         Ok(Self {
             head_dim,
+            rotated: head_dim,
             heads,
             rotation,
         })
+    }
+
+    /// Turn only the leading `rotated` channels of each head, copying the rest unchanged.
+    ///
+    /// The default is the whole head. A model whose heads interleave a rotation of a few axes with
+    /// channels that must keep their value states that cut here - the descriptor has carried the
+    /// count all along, and this is the layer's way of saying it instead of pinning it to
+    /// `head_dim`.
+    ///
+    /// The count must be positive, even, and no wider than the head; the tables are then
+    /// `[tokens, rotated / 2]`. Each count is a separate compilation, so one the store does not
+    /// carry yet is a load-time gap rather than a wrong result.
+    pub fn rotated(mut self, rotated: u32) -> Result<Self> {
+        if rotated == 0 || !rotated.is_multiple_of(2) || rotated > self.head_dim {
+            return Err(Error::shape(
+                "Rotate",
+                format!(
+                    "a rotation of {rotated} of {} channels is not a positive even count within the head",
+                    self.head_dim
+                ),
+            ));
+        }
+        self.rotated = rotated;
+        Ok(self)
     }
 
     /// The width of one head.
@@ -76,9 +103,8 @@ impl Rotate {
 
     /// Rotate `x` `[tokens, heads, head_dim]` into `out` by the `cosine` and `sine` tables.
     ///
-    /// Both tables are `[tokens, head_dim / 2]` FP32 and were evaluated by the caller; the whole
-    /// head turns, because a tower that wanted part of it would say which cut it means and only
-    /// [`crate::layers::Rotary`] states that.
+    /// Both tables are `[tokens, rotated / 2]` FP32 and were evaluated by the caller; the leading
+    /// `rotated` channels turn and the rest are copied.
     pub fn apply(
         &self,
         f: &Forward,
@@ -93,7 +119,7 @@ impl Rotate {
             head_dim: self.head_dim,
             heads: self.heads,
             rotation: self.rotation,
-            rotated: self.head_dim,
+            rotated: self.rotated,
             rows: ROWS,
             block: BLOCK,
             pdl: PDL,

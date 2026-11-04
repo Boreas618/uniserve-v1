@@ -75,12 +75,30 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// Every checkpoint tensor one stack layer reads, as complete names.
+    ///
+    /// [`Layer::load`]'s own requests, in its order: the two norms, the feed-forward's two
+    /// projections, then the attention's.
+    pub fn keys(index: u32, kind: AttentionKind) -> Vec<String> {
+        let prefix = format!("transformer_blocks.{index}");
+        let mut keys: Vec<String> = ["norm1.weight", "norm2.weight"]
+            .iter()
+            .map(|suffix| format!("{prefix}.{suffix}"))
+            .collect();
+        for name in ["ff.net.0.proj.weight", "ff.net.2.weight"] {
+            keys.push(format!("{prefix}.{name}"));
+        }
+        keys.extend(attention::Layer::keys(index, kind));
+        keys
+    }
+
     /// Read layer `index` of a partition.
     fn load(
         kind: AttentionKind,
         index: u32,
         config: &TransformerConfig,
         rows: u32,
+        tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
@@ -96,6 +114,7 @@ impl Layer {
                 config,
                 rows,
                 &ROTATED_AXES,
+                tile_bound,
                 partition,
                 loader,
             )?,
@@ -246,7 +265,12 @@ pub struct StudentHeads {
 
 /// One modality's fused heads: the weight and bias rows of every evaluation block.
 struct FusedHeads {
-    /// `[blocks, out * hidden]` in the checkpoint's own type: block `b`'s fused weight.
+    /// `[blocks, out * hidden]` FP32: block `b`'s fused weight.
+    ///
+    /// FP32 because the reference builds a student's head FP32 (`transformer.py:307-311`): the fused
+    /// row is a sum of the checkpoint's BF16 rows and rounding it back would round a number the
+    /// reference keeps exact. The projection that reads it takes the stack's BF16 rows, so the only
+    /// rounding is the store into the velocity.
     weight: Weight,
     /// `[blocks, out]`: block `b`'s fused bias.
     bias: Weight,
@@ -419,15 +443,15 @@ impl FusedHeads {
         Ok(Self {
             weight: loader.constant(
                 &format!("denoiser.{modality_name}.student_heads.weight"),
-                dtype,
+                nn::DType::F32,
                 Shape::new(&[blocks, per_head]),
-                &host_bytes(dtype, &fused)?,
+                &host_bytes(nn::DType::F32, &fused)?,
             )?,
             bias: loader.constant(
                 &format!("denoiser.{modality_name}.student_heads.bias"),
-                dtype,
+                nn::DType::F32,
                 Shape::new(&[blocks, out]),
-                &host_bytes(dtype, &fused_bias)?,
+                &host_bytes(nn::DType::F32, &fused_bias)?,
             )?,
             out: u32::try_from(out)
                 .map_err(|_| Error::checkpoint(format!("{name}'s width exceeds u32")))?,
@@ -442,7 +466,7 @@ impl FusedHeads {
 ///
 /// The stacked heads are `[heads * out, hidden]` and `[heads * out]`, head-major, so head `h`'s
 /// weight row `o` starts at `(h * out + o) * hidden` and its bias at `h * out + o`. The products and
-/// the sum stay FP32; the caller rounds the result to the checkpoint's type once.
+/// the sum stay FP32, and so does the table the caller stores them in (`transformer.py:307-311`).
 fn fuse_block(
     values: &[f32],
     biases: &[f32],
@@ -521,11 +545,34 @@ pub(crate) fn host_bytes(dtype: nn::DType, values: &[f32]) -> Result<Vec<u8>> {
 }
 
 impl Transformer {
+    /// Every checkpoint tensor one DiT partition of the stack reads, as complete names.
+    ///
+    /// The four end projections and the output norm are the block's own; the per-layer tensors and
+    /// the attention's come from [`Layer::keys`]. A student's stacked heads are the same `proj_out`
+    /// and `audio_proj_out` tensors, fused at load, so the list is one list for both forms.
+    pub fn keys(config: &TransformerConfig, kind: AttentionKind) -> Vec<String> {
+        let mut keys = Vec::new();
+        for name in ["proj_in", "audio_proj_in", "proj_out", "audio_proj_out"] {
+            keys.push(format!("{name}.weight"));
+            keys.push(format!("{name}.bias"));
+        }
+        keys.push("norm_out.norm.weight".to_owned());
+        for index in 0..config.num_hidden_layers {
+            keys.extend(Layer::keys(index, kind));
+        }
+        keys
+    }
+
     /// Project one modality's patchified audio rows into the hidden width.
     pub fn project_audio(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
         let audio = self.audio_proj_in.as_ref().ok_or_else(|| {
             Error::Unsupported("this H3 partition has no audio input projection".to_owned())
         })?;
+        // The audio input projection is FP32 in the reference like the video's, and the widening that
+        // would feed it is refused here until `scaled_add` enumerates `columns = 32`: the store holds
+        // a module for 96 and 5376 columns and none for the audio width, and a launch with no module
+        // is a hard failure at bind, which is worse than the rounding this leaves in place. The one
+        // line to restore is `let rows = self.wide(f, rows)?;` above this call.
         Ok(audio.forward(f, rows, out)?)
     }
 
@@ -574,7 +621,11 @@ impl Transformer {
         let dtype = hidden.dtype;
         let normalized = arena.tensor(dtype, hidden.shape)?;
         norm.forward(f, hidden, None, rows, normalized, None, None)?;
-        self.project_head(f, normalized, modality, block, step, out)
+        // The final modulation is the checkpoint's own type (`modulation.py:62-75` multiplies the
+        // BF16 norm by the BF16 table), and the projection that follows is FP32 - so the widening is
+        // here, between them, and not inside the norm.
+        let wide = self.wide(f, normalized)?;
+        self.project_head(f, wide, modality, block, step, out)
     }
 }
 
@@ -658,6 +709,14 @@ pub struct Transformer {
 }
 
 impl Transformer {
+    /// The element type the checkpoint's weights and the activations they produce are in.
+    ///
+    /// One type for the whole stack: the precision rule keeps the checkpoint's own representation,
+    /// and every layer's operands are of it.
+    pub fn dtype(&self) -> nn::DType {
+        self.proj_in.weight().dtype
+    }
+
     /// Read one DiT partition of the checkpoint.
     ///
     /// `rows` bounds one call's keys: the largest packed row count the deployment's layouts hold,
@@ -666,6 +725,7 @@ impl Transformer {
         config: &TransformerConfig,
         kind: AttentionKind,
         rows: u32,
+        tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
         heads: Option<StudentHeads>,
@@ -697,7 +757,7 @@ impl Transformer {
         let video_in = u64::from(config.video_channels) * 4;
         let audio_in = u64::from(config.audio_channels);
         let layers = (0..config.num_hidden_layers)
-            .map(|index| Layer::load(kind, index, config, rows, partition, loader))
+            .map(|index| Layer::load(kind, index, config, rows, tile_bound, partition, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             proj_in: projection_with_bias(loader, "proj_in", hidden, video_in)?,
@@ -737,25 +797,31 @@ impl Transformer {
         &self.config
     }
 
-    /// Project one modality's packed rows into the hidden width.
-    pub fn project(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
-        Ok(self.proj_in.forward(f, rows, out)?)
+    /// The FP32 view an FP32 projection reads when `source` is not FP32 already.
+    ///
+    /// The reference builds all four of the transformer's end projections as FP32 parameters
+    /// (`transformer.py:366-372`, `:404-421`) and its `Linear` casts the activation up before the
+    /// product, so the projection reads FP32 whatever the stack's own element type is. The
+    /// checkpoint's weights need no conversion: a BF16 value is exactly representable in FP32, so a
+    /// product of FP32 inputs against them is the same arithmetic as against widened FP32 weights -
+    /// widening changes no value and the accumulation is FP32 either way. What the copy buys is the
+    /// input's rounding, which is the last place the stack's element type would otherwise reach the
+    /// prediction.
+    fn wide(&self, f: &Forward, source: TensorView) -> Result<TensorView> {
+        if source.dtype == nn::DType::F32 {
+            return Ok(source);
+        }
+        let out = f.arena().tensor(nn::DType::F32, source.shape)?;
+        // `target <- 1 * source + 0 * target`: a widening, and the zero beta means the target is
+        // never read, so an uninitialised buffer is the right operand.
+        nn::layers::ScaledAdd.forward(f, out, source, 1.0, 0.0)?;
+        Ok(out)
     }
 
-    /// Project one modality's hidden rows back to its velocity at one evaluation.
-    ///
-    /// `step` is the executor's `[1]` int32 step view: a student's head is chosen by it on the
-    /// device, so the same graph serves every evaluation.
-    pub fn predict(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        modality: Modality,
-        block: u32,
-        step: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        self.project_head(f, hidden, modality, block, step, out)
+    /// Project one modality's packed rows into the hidden width.
+    pub fn project(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
+        let wide = self.wide(f, rows)?;
+        Ok(self.proj_in.forward(f, wide, out)?)
     }
 
     /// The output projection of `hidden` at one evaluation, for either form of the heads.
