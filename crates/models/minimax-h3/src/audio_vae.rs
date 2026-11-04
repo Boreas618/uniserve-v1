@@ -1044,13 +1044,24 @@ impl Decoder for AudioDecoder {
 }
 
 /// The 1-d convolution geometry: `kernel` taps, `stride`, `padding`, no dilation of its own, one group.
-fn geometry(kernel: u32, stride: u32, padding: u32) -> Result<ConvGeometry> {
+pub(crate) fn geometry(kernel: u32, stride: u32, padding: u32) -> Result<ConvGeometry> {
+    dilated_geometry(kernel, stride, padding, 1)
+}
+
+/// A one-dimensional convolution's geometry with a dilation, which the encoder's residual units use at
+/// `1`, `3` and `9`.
+pub(crate) fn dilated_geometry(
+    kernel: u32,
+    stride: u32,
+    padding: u32,
+    dilation: u32,
+) -> Result<ConvGeometry> {
     Ok(ConvGeometry::new(
         1,
         [kernel; 3],
         [stride; 3],
         [padding; 3],
-        [1; 3],
+        [dilation; 3],
         1,
     )?)
 }
@@ -1066,14 +1077,14 @@ fn rows(view: TensorView) -> Result<TensorView> {
 }
 
 /// The parameters of one load, with every table entry tracked so none is skipped.
-struct Binder<'a, 'b> {
+pub(crate) struct Binder<'a, 'b> {
     loader: &'a mut WeightLoader<'b>,
     table: Vec<Source>,
     used: Vec<bool>,
 }
 
 impl<'a, 'b> Binder<'a, 'b> {
-    fn new(loader: &'a mut WeightLoader<'b>, table: Vec<Source>) -> Self {
+    pub(crate) fn new(loader: &'a mut WeightLoader<'b>, table: Vec<Source>) -> Self {
         let used = vec![false; table.len()];
         Self {
             loader,
@@ -1107,7 +1118,7 @@ impl<'a, 'b> Binder<'a, 'b> {
     }
 
     /// A weight-normalized convolution's folded weight.
-    fn normalized(&mut self, parameter: &str) -> Result<Weight> {
+    pub(crate) fn normalized(&mut self, parameter: &str) -> Result<Weight> {
         match self.entry(parameter)? {
             Tensor::Normalized { value, gain } => {
                 Ok(self.loader.weight_norm(parameter, &value, &gain)?)
@@ -1119,12 +1130,30 @@ impl<'a, 'b> Binder<'a, 'b> {
     }
 
     /// One tensor, read at `shape`.
-    fn region(&mut self, parameter: &str, shape: &[u64]) -> Result<Weight> {
+    pub(crate) fn region(&mut self, parameter: &str, shape: &[u64]) -> Result<Weight> {
         match self.entry(parameter)? {
             Tensor::Region(tensor) => {
                 Ok(self
                     .loader
                     .load(&WeightRequest::region(tensor, 0, Shape::new(shape)))?)
+            }
+            other => Err(Error::checkpoint(format!(
+                "{parameter}: the parameter is not one tensor: {other:?}"
+            ))),
+        }
+    }
+
+    /// `shape` elements of one tensor, starting `offset` elements into it.
+    ///
+    /// A row slice of a fused matrix is contiguous, which is what splits the audio encoder's query-key-
+    /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
+    /// then read on its own by its own linear layer.
+    pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
+        match self.entry(parameter)? {
+            Tensor::Region(tensor) => {
+                Ok(self
+                    .loader
+                    .load(&WeightRequest::region(tensor, offset, Shape::new(shape)))?)
             }
             other => Err(Error::checkpoint(format!(
                 "{parameter}: the parameter is not one tensor: {other:?}"
@@ -1156,7 +1185,7 @@ impl<'a, 'b> Binder<'a, 'b> {
     }
 
     /// Fail if the table names a parameter the load did not read.
-    fn finish(self) -> Result<()> {
+    pub(crate) fn finish(self) -> Result<()> {
         match self.table.iter().zip(&self.used).find(|(_, used)| !**used) {
             Some((source, _)) => Err(Error::checkpoint(format!(
                 "{}: the checkpoint's parameter is never bound",
