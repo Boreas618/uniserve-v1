@@ -25,16 +25,16 @@
 
 use std::ffi::c_void;
 
+pub use platform::DataType as CollectiveType;
+pub use platform::DevicePtr as PlatformDevicePtr;
 pub use platform::Error as PlatformError;
 pub use platform::nccl::{Communicator, ReduceOp};
 pub use platform::{
-    Allocator, Buffer, Cluster, Device, Function, FunctionAttribute, LaunchConfig, Library,
-    NativeLibrary, PoolKind, Stream,
+    Allocator, Buffer, Cluster, Device, DeviceRange, Function, FunctionAttribute, LaunchConfig,
+    Library, NativeLibrary, PoolKind, Stream,
 };
-pub use platform::{DataType as CollectiveType, DeviceRange};
 
 pub use crate::tensor::DevicePtr;
-pub use platform::DevicePtr as RangePointer;
 
 use crate::tensor::DType;
 
@@ -152,12 +152,15 @@ pub(crate) fn copy_bytes(
 /// until the collective completes.
 pub(crate) fn all_to_all(
     communicator: &mut Communicator,
-    send: DeviceRange,
-    receive: DeviceRange,
+    send: DevicePtr,
+    receive: DevicePtr,
     count: usize,
     dtype: CollectiveType,
     stream: &Stream,
 ) -> crate::Result<()> {
+    let bytes = dtype.bytes() * count;
+    let send = DeviceRange::new(PlatformDevicePtr::from_address(send.address()), bytes);
+    let receive = DeviceRange::new(PlatformDevicePtr::from_address(receive.address()), bytes);
     communicator
         .all_to_all(stream, send, receive, count, dtype)
         .map_err(crate::Error::Platform)

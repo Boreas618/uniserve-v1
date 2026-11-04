@@ -110,7 +110,9 @@ pub use generation::{Generation, KernelEntry};
 pub use kernel::{Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, NativeCall, NativeEntry};
 pub use op::Op;
 pub use phase::PhaseKind;
-pub use platform::{CollectiveType, Communicator, DeviceRange, ReduceOp, Stream, collective_type};
+pub use platform::{
+    CollectiveType, Communicator, DeviceRange, PlatformDevicePtr, ReduceOp, Stream, collective_type,
+};
 pub use tensor::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tolerance::Tolerance;
 pub use twins::{Twin, Twins};
