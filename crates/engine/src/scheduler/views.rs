@@ -988,6 +988,21 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
     views
 }
 
+/// Every page of the device KV cache, keyed by id: the table `Live` checks a
+/// named page against.
+///
+/// Named so the cost is visible: it walks the whole prefix cache, so it belongs
+/// where a snapshot is built (once per epoch), not in a step. The pages that
+/// appear and go reach a policy as `Cached` and `Freed`, which is the per-step
+/// source, and the mechanism asks the pool itself whether a named page still
+/// exists.
+pub(crate) fn page_index(scheduler: &Scheduler) -> std::collections::BTreeMap<PageId, PageView> {
+    pages(scheduler)
+        .into_iter()
+        .map(|page| (page.id, page))
+        .collect()
+}
+
 /// Every live encoder cache entry.
 ///
 /// Each entry is named by [`encoding_id`] of its key and carries the tick the
