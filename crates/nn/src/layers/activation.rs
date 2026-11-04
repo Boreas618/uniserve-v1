@@ -299,3 +299,117 @@ impl PackedSwiGlu {
         f.operate::<activation::ValueFirstSwiglu>(&descriptor, args)
     }
 }
+
+/// GELU over a row-major `[rows, columns]` activation.
+///
+/// H3's audio VAE and its diffusion transformer take PyTorch's tanh form
+/// (`gelu_pytorch_tanh`); a checkpoint whose config says plain `gelu` takes the exact one. They are
+/// separate compilations, so the layer states which it is (specs/worker.md 9, "GELU";
+/// `ops::gelu`).
+pub struct Gelu {
+    approximation: ops::gelu::Approximation,
+}
+
+impl Gelu {
+    /// PyTorch's `gelu_pytorch_tanh`: `x·sigmoid(√(8/π)(x + 0.044715x³))`.
+    pub const fn tanh() -> Self {
+        Self {
+            approximation: ops::gelu::Approximation::Tanh,
+        }
+    }
+
+    /// PyTorch's `gelu`: `0.5x(1 + erf(x/√2))`.
+    pub const fn exact() -> Self {
+        Self {
+            approximation: ops::gelu::Approximation::Exact,
+        }
+    }
+
+    /// Which formula this layer evaluates.
+    pub const fn approximation(&self) -> ops::gelu::Approximation {
+        self.approximation
+    }
+
+    /// `out = gelu(x)` over the rows.
+    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+        if x.shape.rank() != 2 || x.shape != out.shape {
+            return Err(Error::shape(
+                "Gelu",
+                format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
+            ));
+        }
+        let columns = u32::try_from(x.shape.last())
+            .map_err(|_| Error::shape("Gelu", "more columns than a descriptor holds".to_owned()))?;
+        let descriptor = ops::gelu::Descriptor {
+            dtype: x.dtype,
+            columns,
+            block: BLOCK,
+            approximate: self.approximation,
+            pdl: PDL,
+        };
+        f.operate::<ops::gelu::Gelu>(&descriptor, ops::gelu::Args { x, out })
+    }
+}
+
+/// The audio VAE's periodic activation, `x + sin²(α·x)/(α + 1e-9)`, one frequency per channel.
+///
+/// The encoder's blocks apply it and the decoder's alias-free activation composes it; `α` is the
+/// checkpoint's raw per-channel parameter, not a log-space pair (specs/worker.md 9, "Snake";
+/// `ops::snake`).
+pub struct Snake {
+    channels: u64,
+}
+
+impl Snake {
+    /// The activation of `channels` audio channels: the length of every `α`.
+    pub fn new(channels: u64) -> Result<Self> {
+        if channels == 0 {
+            return Err(Error::shape(
+                "Snake",
+                "an audio activation has channels".to_owned(),
+            ));
+        }
+        Ok(Self { channels })
+    }
+
+    /// `out = snake(x, alpha)` over `[rows, channels, width]`.
+    ///
+    /// `alpha` is `[channels]` in the activation's element type; the signal is row-major in and out.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        x: TensorView,
+        alpha: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if x.shape.rank() != 3 || x.shape.dim(1) != self.channels {
+            return Err(Error::shape(
+                "Snake",
+                format!(
+                    "{:?} is not [rows, {}, width]",
+                    x.shape.dims(),
+                    self.channels
+                ),
+            ));
+        }
+        if alpha.shape.numel() != self.channels {
+            return Err(Error::shape(
+                "Snake",
+                format!(
+                    "{} frequencies for {} channels",
+                    alpha.shape.numel(),
+                    self.channels
+                ),
+            ));
+        }
+        let descriptor = ops::snake::Descriptor {
+            dtype: x.dtype,
+            channels: u32::try_from(self.channels).map_err(|_| {
+                Error::shape("Snake", "more channels than a descriptor holds".to_owned())
+            })?,
+            block: BLOCK,
+            pdl: PDL,
+        };
+        f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })
+    }
+}
