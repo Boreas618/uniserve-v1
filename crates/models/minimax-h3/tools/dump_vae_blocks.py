@@ -490,37 +490,31 @@ def run_encode_rows(options) -> int:
     layout = module.output_layout(size)["video"]
     shape = tuple(int(extent) for extent in layout.shape)
     print(f"layout  {shape}, the conditioner's input rows")
-    # The posterior is given noise, and the reference's draw is **deterministic**: `draw_noise`
-    # seeds it with the module's fixed `POSTERIOR_SEED`, not with the request's, so this half
-    # contains no convention to reproduce and the reference draws rather than reads. Substituting the
-    # case's own draw would hide a defect here instead of showing it - a crate that seeded the
-    # posterior differently would compare its arithmetic against *its own* draw and agree.
-    #
-    # The case's draw is read all the same, and compared: a difference between the two streams is
-    # the convention defect, printed as a number, and it is not an arithmetic residual.
+    # The posterior is given noise, and the reference's is the **encoder's own** draw: `draw_noise`
+    # seeds a fresh generator with the module's `POSTERIOR_SEED`, element zero every time, so a
+    # condition always encodes to the same latent. The request's draw is the *anchor's* alone
+    # (`denoiser.py:524`), a different stream - so the case's `noise_file` is not comparable with
+    # this one and is not compared: a difference here is the design, not a defect.
     shape_noise = tuple(int(extent) for extent in module.posterior_shape(size))
     draw = torch.empty(shape_noise, dtype=torch.float32, device=device)
     module.draw_noise(size, draw)
-    print(f"noise   the reference's own stream at the module's fixed seed, {shape_noise}")
+    print(
+        f"noise   the encoder's own draw at the module's POSTERIOR_SEED, {shape_noise}"
+        f" - the request's draw is the anchor's alone"
+    )
     stated_noise = case.get("noise_file")
     if isinstance(stated_noise, str):
         noise_path = Path(stated_noise)
         if not noise_path.is_absolute():
             noise_path = stack / noise_path
         if noise_path.is_file():
-            theirs = read_tensor(noise_path).to(device=device, dtype=torch.float32)
-            if tuple(int(extent) for extent in theirs.shape) != shape_noise:
-                raise SystemExit(
-                    f"{noise_path} holds {tuple(theirs.shape)} where the encoder's posterior"
-                    f" takes {shape_noise}: the case names a draw of another shape"
-                )
-            apart = (theirs - draw).abs().max().item()
+            theirs = read_tensor(noise_path)
             print(
-                f"noise   the case's draw differs from the reference's by {apart:.4g}"
-                f" at the largest element"
+                f"noise   {noise_path.name} is the anchor's draw,"
+                f" {tuple(theirs.shape)} {theirs.dtype}: a different stream, not compared"
             )
         else:
-            print(f"noise   {noise_path} is absent; only the reference's stream is used")
+            print(f"noise   {noise_path} is absent; the anchor's draw is not read here")
     # The pattern the harness writes is an integer over 255, so scaling back is exact.
     frames_rgb = (
         pixels.mul(255.0).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 3, 0)
