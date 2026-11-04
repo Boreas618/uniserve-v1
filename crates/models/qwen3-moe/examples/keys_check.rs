@@ -51,6 +51,10 @@ fn main() -> ExitCode {
         .join("../../../notes/programs/qwen3-moe-keys.txt");
     let mut capacity = 0u32;
     let mut page_tokens = 64u32;
+    let mut buckets: Vec<u32> = Vec::new();
+    let mut experts_encoded = false;
+    let mut projections_packed = false;
+    let mut print = false;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -66,6 +70,21 @@ fn main() -> ExitCode {
                 Some(parsed) => page_tokens = parsed,
                 None => return usage("--page-tokens takes a number"),
             },
+            "--buckets" => match value() {
+                Some(list) => {
+                    buckets = list
+                        .split(',')
+                        .filter_map(|entry| entry.trim().parse().ok())
+                        .collect();
+                }
+                None => return usage("--buckets takes a comma-separated row list"),
+            },
+            // A checkpoint whose expert stacks are calibrated NVFP4, and whose projections are too:
+            // the walk states those rows itself, and the store needs them per captured bucket.
+            "--experts-encoded" => experts_encoded = true,
+            "--projections-packed" => projections_packed = true,
+            // Print the walk's rows for the full-precision deployment, the form the fixture merges.
+            "--print" => print = true,
             other => return usage(&format!("unknown argument {other}")),
         }
     }
@@ -85,6 +104,44 @@ fn main() -> ExitCode {
         }
     };
 
+    if print {
+        match keys(
+            &config,
+            &Partition::single(),
+            ops::DType::BF16,
+            page_tokens,
+            ops::DType::BF16,
+            capacity,
+            &buckets,
+            experts_encoded,
+            projections_packed,
+        ) {
+            Ok(walked) => {
+                println!(
+                    "# deployment: tensor_parallel 1 tensor_rank 0 expert_parallel 1 expert_rank 0 \
+                     cache bf16 capacity {capacity} page {page_tokens} buckets {}",
+                    if buckets.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        buckets
+                            .iter()
+                            .map(|bucket| bucket.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }
+                );
+                for (operator, key) in walked {
+                    println!("{operator}\t{key}");
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     let mut failures = Vec::new();
     for (label, cache) in [("bf16", ops::DType::BF16), ("E4M3", ops::DType::F8E4M3)] {
         let walked = match keys(
@@ -94,9 +151,9 @@ fn main() -> ExitCode {
             page_tokens,
             cache,
             capacity,
-            &[],
-            false,
-            false,
+            &buckets,
+            experts_encoded,
+            projections_packed,
         ) {
             Ok(walked) => walked,
             Err(error) => {
@@ -117,9 +174,9 @@ fn main() -> ExitCode {
                 page_tokens,
                 ops::DType::BF16,
                 capacity,
-                &[],
-                false,
-                false,
+                &buckets,
+                experts_encoded,
+                projections_packed,
             )
             .unwrap_or_default();
             let mut differs: Vec<String> = Vec::new();
