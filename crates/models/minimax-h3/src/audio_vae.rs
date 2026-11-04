@@ -287,8 +287,8 @@ pub fn receptive_field(config: &AudioVaeConfig) -> Result<u32> {
     }
     spread += activation_spread(rate) + convolution(7, 1, rate);
 
-    // The spread covers both sides of one dependency, so one side is half.
-    Ok(spread.div_ceil(2.0) as u32)
+    // The spread covers both sides of one dependency, so one side is half, rounded up.
+    Ok((spread / 2.0).ceil() as u32)
 }
 
 /// The arithmetic of the stereo PCM the audio decoder ends in.
