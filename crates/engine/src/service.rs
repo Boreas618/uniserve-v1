@@ -240,15 +240,27 @@ impl Routing {
 
     /// `Emitted` and `Finished`, as the daemon's events show them: the route
     /// instance sees the usage the scheduler threads' instances see (§4.4).
+    ///
+    /// Delivered when they happen rather than kept for the next arrival: a
+    /// policy's per-tenant usage is what `route` orders by, and an engine that
+    /// admits nothing for a while must not grow a backlog of events no arrival
+    /// drains. The cost is one `observe` per event, which is what the events
+    /// themselves cost — proportional to state changes, not to the requests
+    /// resident.
     fn observe_route(&self, events: Vec<PolicyEvent>) {
         if events.is_empty() {
             return;
         }
         let mut state = crate::lock(&self.route);
-        if state.instance.is_none() {
-            return;
+        let outcome = match state.instance.as_mut() {
+            Some(policy) => policy.observe(&events),
+            // No instance: the epoch has no policy to tell, and the next one
+            // is instantiated on a snapshot that already carries these facts.
+            None => return,
+        };
+        if let Err(error) = outcome {
+            self.policy_failed(&mut state, error);
         }
-        state.pending.extend(events);
     }
 
     /// A failed route instance: the previous policy, instantiated on the state
