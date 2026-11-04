@@ -286,24 +286,6 @@ pub struct TransformerConfig {
     pub output_heads: u32,
 }
 
-/// The checkpoint field each [`TransformerConfig`] field is read from.
-const TRANSFORMER_FIELDS: [(&str, &str); 14] = [
-    ("num_attention_heads", "num_attention_heads"),
-    ("attention_head_dim", "head_dim"),
-    ("hidden_size", "hidden_size"),
-    ("num_layers", "num_hidden_layers"),
-    ("num_refiner_layers", "num_refiner_layers"),
-    ("ffn_dim", "intermediate_size"),
-    ("in_channels", "video_channels"),
-    ("audio_in_channels", "audio_channels"),
-    ("text_dim", "text_dim"),
-    ("freq_dim", "frequency_dim"),
-    ("time_embed_hidden_dim", "time_hidden_dim"),
-    ("time_embed_dim", "time_dim"),
-    ("rope_freq_dim", "rope_frequency_dim"),
-    ("rope_theta", "rope_theta"),
-];
-
 impl TransformerConfig {
     /// Read a DiT's `config.json`.
     ///
