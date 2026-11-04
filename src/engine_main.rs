@@ -343,6 +343,10 @@ pub(crate) struct MainProcess {
     program_server: PathBuf,
     /// Set by the daemon's `Shutdown`: the epoch ends at the end of this pass (§2.3).
     stopping: bool,
+    /// The admitted requests' event streams, by the daemon's request identity: the scheduler
+    /// answers a submission with the stream of what the request produced, and this process is what
+    /// carries those events back to the daemon (§2.3). A stream leaves when its request ends.
+    streams: Vec<(u64, engine::EventRx)>,
 }
 
 impl MainProcess {
@@ -465,6 +469,7 @@ impl MainProcess {
             targets: plan.targets().to_vec(),
             program_server: plan.program_server().to_path_buf(),
             stopping: false,
+            streams: Vec::new(),
         })
     }
 
@@ -505,6 +510,9 @@ impl MainProcess {
                     Ready::Woken | Ready::Idle => {}
                 }
             }
+
+            // What the admitted requests produced since the last pass.
+            self.forward_events();
 
             // A precopy in flight advances one stage per pass, never waiting on
             // its builds or its devices (§7.3 step 2).
@@ -627,15 +635,43 @@ impl MainProcess {
             proto::request::wire::to_engine::Kind::Submit(submit) => {
                 // Every request of one submission is queued before the next
                 // batch is formed (§2.3).
-                for request in submit.requests {
-                    let request = proto::request::Request::from_wire(request).map_err(|error| {
-                        anyhow::anyhow!("a submission did not convert: {error}")
-                    })?;
+                for wire in submit.requests {
+                    let id = wire.id;
+                    let request = match proto::request::Request::from_wire(wire) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            // A request that does not convert is the daemon's, not this process's:
+                            // it ends with the refusal's event and every other request of the
+                            // submission is still admitted.
+                            self.reject(id, proto::request::RejectionKind::Invalid, error.to_string());
+                            continue;
+                        }
+                    };
                     let rank = self.route(&request);
                     let Some(scheduler) = self.schedulers.get(rank) else {
                         bail!("a request was routed to rank {rank}, which holds no scheduler");
                     };
-                    scheduler.submit(request)?;
+                    match scheduler.submit(request) {
+                        Ok(stream) => {
+                            self.streams.push((id, stream));
+                            self.send_event(
+                                proto::request::wire::from_engine::Kind::Accepted(
+                                    proto::request::wire::Accepted {
+                                        request: id,
+                                        scheduler: rank as u32,
+                                    },
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            let kind = match error {
+                                engine::SubmitError::Closed | engine::SubmitError::Dead => {
+                                    proto::request::RejectionKind::Overloaded
+                                }
+                            };
+                            self.reject(id, kind, error.to_string());
+                        }
+                    }
                 }
                 Ok(None)
             }
@@ -1332,11 +1368,6 @@ impl MainProcess {
     }
 
     /// Reports a program-layer status to the daemon.
-    ///
-    /// The request interface gains the program-layer statuses as append-only
-    /// fields (`notes/front/executor-root-package.md`); until that field is in
-    /// the schema, the status reaches the daemon through the epoch record the
-    /// daemon itself reads back at `GET /admin/config` and through the log.
     fn report(&mut self, status: ProgramStatus) {
         // §7.3's answers, in the vocabulary the daemon's epoch record reads: a precopy that
         // finished, the switchover, the commit, the revert and the purge, each naming its
@@ -1348,6 +1379,81 @@ impl MainProcess {
             return;
         };
         self.send_report(report);
+    }
+
+    /// Sends one message of the request interface to the daemon (§2.3).
+    fn send_event(&mut self, kind: proto::request::wire::from_engine::Kind) {
+        if let Err(error) = self
+            .control
+            .daemon_mut()
+            .send(&proto::request::wire::FromEngine { kind: Some(kind) })
+        {
+            tracing::warn!(%error, "sending an event of an admitted request failed");
+        }
+    }
+
+    /// Ends one request with its refusal: a submission this process will not admit is answered with
+    /// the event that says so, because the daemon has no other way to learn it (§2.3).
+    fn reject(&mut self, request: u64, kind: proto::request::RejectionKind, message: String) {
+        let event = proto::request::wire::Event {
+            request,
+            kind: Some(proto::request::wire::event::Kind::Rejected(
+                proto::request::wire::Rejected {
+                    kind: kind as i32,
+                    message,
+                },
+            )),
+        };
+        self.send_event(proto::request::wire::from_engine::Kind::Event(event));
+    }
+
+    /// Carries every admitted request's events to the daemon, and forgets a request whose stream
+    /// ended (§2.3).
+    ///
+    /// Nothing here waits: a request that produced nothing this pass produces nothing, and the
+    /// serve loop comes back to it.
+    fn forward_events(&mut self) {
+        // The streams are taken out so that sending an event can borrow the process: the map is
+        // small, and the survivors go back before the pass returns.
+        let streams = std::mem::take(&mut self.streams);
+        let mut running = Vec::with_capacity(streams.len());
+        for (id, mut stream) in streams {
+            loop {
+                match stream.try_recv() {
+                    Ok(event) => {
+                        let terminal = matches!(
+                            event,
+                            engine::Event::Finished { .. }
+                                | engine::Event::Rejected { .. }
+                                | engine::Event::Error { .. }
+                                | engine::Event::Migratable { .. }
+                        );
+                        let (wire, media) = event.to_wire(proto::request::RequestId(id));
+                        if media.is_some() {
+                            // An artifact's bytes travel beside its event (`ArtifactPart`), and this
+                            // process does not carry them yet: the event alone would make a daemon
+                            // wait for bytes that never come, so the request is refused by name.
+                            tracing::warn!(
+                                request = id,
+                                "a request produced media artifacts, which this process does not carry"
+                            );
+                        }
+                        self.send_event(proto::request::wire::from_engine::Kind::Event(wire));
+                        if terminal {
+                            break;
+                        }
+                    }
+                    // A request that produced nothing yet keeps its stream.
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        running.push((id, stream));
+                        break;
+                    }
+                    // The scheduler that served the request is gone, which ends it.
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        self.streams = running;
     }
 
     /// States one report to the daemon (§7.3).
