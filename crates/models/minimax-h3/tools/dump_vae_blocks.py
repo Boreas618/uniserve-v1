@@ -64,10 +64,11 @@ DTYPES = {
 VIDEO_LAYERS = (0, 3)
 CATALOGUE = {
     "video_decoder": (
-        (
-            "decoder.post_quant_conv",
-            "the latents after the 1x1x1 post-quantisation projection, before unpatchifying",
-        ),
+        # The reference's `decoder.post_quant_conv` is deliberately **not** a probe: this implementation
+        # folds the latent statistics, that one-by-one projection and the transformer's input projection
+        # into one affine at load (design 10 declares the composition, and the fold's own test checks the
+        # three steps against it). A probe of it could only ever be "not dumped by the Rust side", which
+        # a report reads as a hole rather than as the declared deviation it is.
         (
             "decoder.decoder.input",
             "the transformer's input projection: one row per latent voxel plus the register tokens",
