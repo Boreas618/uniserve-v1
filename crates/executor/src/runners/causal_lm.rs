@@ -553,6 +553,15 @@ fn commit_table(commit: &[i64], rows: usize, capacity: usize) -> Result<Vec<i32>
         )));
     }
     let mut table = vec![0_i32; fields * capacity];
+    // Rows past the batch's own are **inert**, not zero: a zero slot is slot 0, a real destination,
+    // so a launch that ever ran over the whole capacity would commit thirteen phantom tokens into
+    // the first slot the deployment serves. The staged table already pads its own rows with the
+    // operator's sentinels; this makes the tail inert as well, so the invariant survives whatever
+    // `count` a future launch passes (`ops::commit`'s two sentinels).
+    for row in rows.min(capacity)..capacity {
+        table[ops::commit::column::SLOT * capacity + row] = -1;
+        table[ops::commit::column::TASK * capacity + row] = -1;
+    }
     for field in 0..fields {
         for row in 0..rows.min(capacity) {
             let value = commit[field * rows + row];
