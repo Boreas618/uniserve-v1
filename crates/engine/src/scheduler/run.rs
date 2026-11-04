@@ -923,6 +923,12 @@ impl Scheduler {
             if !self.step_nonblocking() {
                 self.park_for_progress();
             }
+            // Comparing the two sizes is enough because a drain sets
+            // `closing`: nothing enters either pending set while it runs, so
+            // the sizes can only fall. A step that scheduled a batch during a
+            // drain could leave the sizes unchanged while the set changed
+            // underneath them, so a change that lets a drain schedule must
+            // re-read what the sets hold rather than how much they hold.
             let pending = self.drain_pending();
             if pending != held {
                 held = pending;
@@ -930,7 +936,7 @@ impl Scheduler {
                 continue;
             }
             if silent_since.elapsed() >= DRAIN_SILENCE {
-                return Err(self.abandoned_drain(held));
+                return Err(abandoned_drain(&self.inflight, held));
             }
         }
         Ok(())
@@ -948,46 +954,9 @@ impl Scheduler {
     /// Names what a drain that stopped progressing still holds: each batch
     /// with its age and the requests it carries, and the submissions never
     /// accepted.
+    /// Names what a drain that stopped progressing still holds.
     fn abandoned_drain(&self, held: (usize, usize)) -> String {
-        let mut batches: Vec<_> = self.inflight.pending_batches.iter().collect();
-        batches.sort_by_key(|(id, _)| **id);
-        let batches: Vec<String> = batches
-            .into_iter()
-            .map(|(id, batch)| {
-                let mut requests: Vec<_> =
-                    batch.calls.iter().map(|(key, _)| key.request_id.0).collect();
-                requests.sort_unstable();
-                requests.dedup();
-                format!(
-                    "batch {id} ({:?} in flight, {} call(s), request(s) {requests:?})",
-                    batch.started.elapsed(),
-                    batch.calls.len()
-                )
-            })
-            .collect();
-        let queued: Vec<String> = self
-            .inflight
-            .pending_submissions
-            .iter()
-            .map(|batch| {
-                let mut requests: Vec<_> =
-                    batch.requests.iter().map(|(call, _)| call.request_key.request_id.0).collect();
-                requests.sort_unstable();
-                requests.dedup();
-                format!("batch {} (never accepted, request(s) {requests:?})", batch.id)
-            })
-            .collect();
-        format!(
-            "the drain stopped progressing with {} batch(es) and {} submission(s): {}{}",
-            held.0,
-            held.1,
-            batches.join(", "),
-            if queued.is_empty() {
-                String::new()
-            } else {
-                format!("; queued: {}", queued.join(", "))
-            }
-        )
+        abandoned_drain(&self.inflight, held)
     }
 
     /// Runs the worker hook on every worker, its batches complete.
@@ -1043,5 +1012,124 @@ impl Scheduler {
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
+    }
+}
+
+
+/// Names what a drain that stopped progressing still holds: each batch with its
+/// age and the requests it carries, and the submissions the executor never
+/// accepted.
+///
+/// A batch the executor never answered and never finished is named by id, with
+/// how long it has been in flight and which requests it carries, so a hook that
+/// stopped can be diagnosed from its error alone.
+fn abandoned_drain(inflight: &super::inflight::Inflight, held: (usize, usize)) -> String {
+    let mut batches: Vec<_> = inflight.pending_batches.iter().collect();
+    batches.sort_by_key(|(id, _)| **id);
+    let batches: Vec<String> = batches
+        .into_iter()
+        .map(|(id, batch)| {
+            let mut requests: Vec<_> = batch.calls.iter().map(|(key, _)| key.request_id.0).collect();
+            requests.sort_unstable();
+            requests.dedup();
+            format!(
+                "batch {id} ({:?} in flight, {} call(s), request(s) {requests:?})",
+                batch.started.elapsed(),
+                batch.calls.len()
+            )
+        })
+        .collect();
+    let queued: Vec<String> = inflight
+        .pending_submissions
+        .iter()
+        .map(|batch| {
+            let mut requests: Vec<_> = batch
+                .requests
+                .iter()
+                .map(|(call, _)| call.request_key.request_id.0)
+                .collect();
+            requests.sort_unstable();
+            requests.dedup();
+            format!(
+                "batch {} (never accepted, request(s) {requests:?})",
+                batch.id
+            )
+        })
+        .collect();
+    format!(
+        "the drain stopped progressing with {} batch(es) and {} submission(s): {}{}",
+        held.0,
+        held.1,
+        batches.join(", "),
+        if queued.is_empty() {
+            String::new()
+        } else {
+            format!("; queued: {}", queued.join(", "))
+        }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::inflight::{Inflight, PendingBatch};
+    use crate::scheduler::{CallId, RequestKey};
+
+    /// A call identity of `request`'s, as a batch registers it on acceptance.
+    fn key(request: u64) -> RequestKey {
+        RequestKey {
+            engine_id: 1,
+            request_id: RequestId(request),
+            request_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn a_drain_that_stopped_names_the_batch_and_the_requests_it_abandons() {
+        let mut inflight = Inflight::new();
+        inflight.pending_batches.insert(
+            7,
+            PendingBatch {
+                started: Instant::now(),
+                calls: [(key(3), CallId::new(7, 0)), (key(3), CallId::new(7, 1)), (key(9), CallId::new(7, 2))]
+                    .into_iter()
+                    .collect(),
+                commands: Vec::new(),
+                worker_exec_us: 0,
+                prefill: true,
+                measured: None,
+            },
+        );
+
+        let message = abandoned_drain(&inflight, (1, 0));
+
+        assert!(
+            message.contains("1 batch(es) and 0 submission(s)"),
+            "{message}"
+        );
+        assert!(message.contains("batch 7"), "{message}");
+        assert!(message.contains("3 call(s)"), "{message}");
+        // The requests a batch carries are named by id, deduplicated and in
+        // order, so the reader knows which work the abandoned batch held.
+        assert!(message.contains("request(s) [3, 9]"), "{message}");
+    }
+
+    #[test]
+    fn a_drain_that_stopped_names_the_submission_the_executor_never_took() {
+        let mut inflight = Inflight::new();
+        inflight.pending_submissions.push_back(ExecutionBatch::new(
+            11,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let message = abandoned_drain(&inflight, (0, 1));
+
+        assert!(
+            message.contains("0 batch(es) and 1 submission(s)"),
+            "{message}"
+        );
+        assert!(message.contains("batch 11 (never accepted"), "{message}");
     }
 }
