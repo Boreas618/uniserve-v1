@@ -11,10 +11,10 @@
 //!
 //! The registry is the daemon's, not the connection's: a response registers
 //! when its body starts and leaves the registry when it ends, so the restart
-//! sees exactly the responses that are in flight. A response that cannot be
-//! frozen (a chat stream whose request has no facts a continuation could
-//! submit, such as a model family the design retires) stays this daemon's and
-//! keeps running.
+//! sees exactly the responses that are in flight. Every response kind item 1
+//! covers has a state a successor continues from; a covered response whose
+//! state cannot be frozen is a defect, and its connection ends it rather than
+//! keeping it here (see [`crate::http::stream`]).
 //!
 //! A response that registers after the restart began pausing is asked to
 //! pause too, so the restart never hands over a connection whose next response
@@ -27,6 +27,23 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, watch};
 
 use proto::handoff;
+
+/// The current time on `CLOCK_MONOTONIC`, in nanoseconds.
+///
+/// The predecessor records when it stopped a response's socket and the
+/// successor records when it first writes there; both processes of a node
+/// read the same clock, so the difference is the response's pause.
+pub(crate) fn now_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `CLOCK_MONOTONIC` is a valid clock and `time` a valid pointer.
+    let started = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    assert_eq!(started, 0, "CLOCK_MONOTONIC is always readable");
+    u64::try_from(time.tv_sec).expect("a positive monotonic clock") * 1_000_000_000
+        + u64::try_from(time.tv_nsec).expect("nanoseconds below a second")
+}
 
 /// What a restart decides about one frozen response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,10 +131,11 @@ impl Handoff {
     /// Asks every response in flight to stop at its next event boundary and
     /// returns the frozen ones, with their sockets.
     ///
-    /// Responses that end before they freeze, and responses that cannot be
-    /// handed over, are not returned: they stay this daemon's. Responses that
-    /// register while the restart pauses are asked too, so the set is the
-    /// responses in flight when the last of them stops.
+    /// Responses that end before they freeze are not returned, and neither
+    /// are responses that cannot be handed over: the connection ends such a
+    /// one rather than keeping it. Responses that register while the restart
+    /// pauses are asked too, so the set is the responses in flight when the
+    /// last of them stops.
     pub(crate) async fn pause(&self) -> Vec<FrozenStream> {
         self.inner.pausing.store(true, Ordering::Release);
         let mut asked = BTreeSet::new();
@@ -132,11 +150,17 @@ impl Handoff {
                     .collect()
             };
             if fresh.is_empty() {
-                // A response may have registered between the last answer and
-                // this check; give such a one the chance to register.
+                // Every response registered when this round began has
+                // answered, and a response that ended meanwhile is gone from
+                // the registry: the handoff holds everything in flight.
+                //
+                // A response may still register between that round and this
+                // check, so yield and look again before concluding.
                 tokio::task::yield_now().await;
-                let registered = crate::leader::locked(&self.inner.streaming).len();
-                if registered == asked.len() {
+                let all_asked = crate::leader::locked(&self.inner.streaming)
+                    .keys()
+                    .all(|id| asked.contains(id));
+                if all_asked {
                     return frozen;
                 }
                 continue;
@@ -193,6 +217,13 @@ impl Registration {
     /// Whether a pause was asked for.
     pub(crate) fn paused(&self) -> bool {
         *self.requested.borrow()
+    }
+
+    /// Watches for this response being asked to pause, for a connection that
+    /// waits for the next body frame: `changed()` resolves on every request
+    /// and on the restart releasing the responses.
+    pub(crate) fn watch(&self) -> watch::Receiver<bool> {
+        self.requested.clone()
     }
 
     /// Waits until a hot restart asks this response to pause.

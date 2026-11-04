@@ -93,6 +93,17 @@ impl ReasoningParser for SenseNovaReasoningParser {
             .unwrap_or_default();
         self.filter(delta, true)
     }
+
+    /// `None`: the visible-wrapper filter's held text is part of this
+    /// parser's state and is not declared in the handoff schema, so a
+    /// SenseNova response is served where it began. The design retires this
+    /// model family.
+    fn state(&self) -> Option<proto::handoff::Reasoning> {
+        None
+    }
+
+    /// Does nothing: a response this parser serves is not handed over.
+    fn resume(&mut self, _state: &proto::handoff::Reasoning) {}
 }
 
 /// Removes wrapper delimiters from visible text while keeping the wrapped text.

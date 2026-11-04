@@ -26,15 +26,39 @@
 //! The connection translates each frame a body yields into HTTP/1.1 framing,
 //! so a frame always ends in the socket or in the predecessor's unwritten
 //! bytes, never half-written.
+//!
+//! Every kind item 1 covers has a state a successor continues from: a chat
+//! completion streamed as server-sent events (the decoder, the output
+//! processors, the assembler and the emitted-chunk counters), a chat
+//! completion answered as one body, and a video artifact's byte position. A
+//! response of such a kind whose state cannot be frozen is a defect, and the
+//! driver ends it instead of keeping it: the process that hands the
+//! deployment over does not wait for a response to end (design §7.5.1). Only
+//! the families the design retires (the SenseNova and omni readout output
+//! filters, whose requests have no facts a continuation submits) have no
+//! state, and item 2 removes their routes from the covered set.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use std::sync::Arc;
+
+use axum::response::Response;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use proto::handoff;
+
+use crate::http::handoff::Registration;
+
+/// How long a streamed response may wait for its next frame before the
+/// connection writes an SSE comment to keep the connection alive, as the
+/// `Sse` keep-alive the daemon served before did.
+const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The comment a streamed response writes while it waits for its engine.
+const KEEP_ALIVE_COMMENT: &[u8] = b":\n\n";
 
 /// How many body frames a session may produce ahead of the connection.
 ///
@@ -117,28 +141,56 @@ enum Control {
     Adopted,
 }
 
+/// What a connection's pause of one response found.
+pub(crate) enum Pause {
+    /// The response stopped at an event boundary; this is the state a
+    /// successor resumes it from.
+    Frozen(Application),
+    /// The response cannot be handed over. No response kind item 1 covers has
+    /// this path (design §7.5.1): a covered response whose state cannot be
+    /// frozen ends here rather than being kept by the process that is
+    /// leaving.
+    Ended,
+    /// The response ended at its own terminal event; there is nothing to
+    /// carry, and the connection is between responses.
+    Complete,
+}
+
 /// The handle a connection writes one handoffable response body from.
 pub(crate) struct ResponseStream {
     frames: mpsc::Receiver<Bytes>,
     control: mpsc::Sender<Control>,
+    /// Whether to write an SSE comment while the body waits for its engine.
+    keep_alive: bool,
 }
 
 impl ResponseStream {
     /// Starts driving `session` and returns the handle its frames are read
     /// from.
-    pub(crate) fn start(session: Box<dyn Session>) -> Self {
+    ///
+    /// `keep_alive` writes an SSE comment when the body waits for its engine
+    /// longer than the keep-alive interval; it is for server-sent events only,
+    /// where a comment is part of the protocol.
+    pub(crate) fn start(session: Box<dyn Session>, keep_alive: bool) -> Self {
         let (frames, produced) = mpsc::channel(AHEAD);
         let (control, controls) = mpsc::channel(4);
         tokio::spawn(drive(session, frames, controls));
         Self {
             frames: produced,
             control,
+            keep_alive,
         }
     }
 
     /// The next body frame; `None` once the body ended.
     pub(crate) async fn next_frame(&mut self) -> Option<Bytes> {
-        self.frames.recv().await
+        if !self.keep_alive {
+            return self.frames.recv().await;
+        }
+        match tokio::time::timeout(KEEP_ALIVE, self.frames.recv()).await {
+            Ok(frame) => frame,
+            Err(_) => Some(Bytes::from_static(KEEP_ALIVE_COMMENT)),
+        }
     }
 
     /// Takes a frame that is ready without waiting.
@@ -152,18 +204,24 @@ impl ResponseStream {
     /// a successor continues from is returned, or `None` when this response
     /// cannot be handed over or its driver ended meanwhile. Nothing is
     /// produced until [`Self::resume`] or [`Self::adopt`].
-    pub(crate) async fn pause(&mut self, mut keep: impl FnMut(Bytes)) -> Option<Application> {
+    pub(crate) async fn pause(&mut self, mut keep: impl FnMut(Bytes)) -> Pause {
         let (answer, paused) = oneshot::channel();
-        self.control.send(Control::Pause(answer)).await.ok()?;
+        if self.control.send(Control::Pause(answer)).await.is_err() {
+            // The driver ended: the body is over, so there is nothing to
+            // hand over.
+            return Pause::Complete;
+        }
         let mut paused = paused;
         let state = loop {
             tokio::select! {
-                state = &mut paused => break state.ok()?,
+                state = &mut paused => break match state {
+                    Ok(Some(state)) => state,
+                    Ok(None) => return Pause::Ended,
+                    Err(_) => return Pause::Complete,
+                },
                 frame = self.frames.recv() => match frame {
                     Some(frame) => keep(frame),
-                    // The driver ended before it could freeze: the body is
-                    // over, so there is nothing to hand over.
-                    None => return None,
+                    None => return Pause::Complete,
                 },
             }
         };
@@ -172,7 +230,7 @@ impl ResponseStream {
         while let Ok(frame) = self.frames.try_recv() {
             keep(frame);
         }
-        state
+        Pause::Frozen(state)
     }
 
     /// The successor did not take the response over: go on from the pause.
@@ -182,9 +240,64 @@ impl ResponseStream {
 
     /// The successor owns the response: stop driving it, cancelling the
     /// request's engine stream.
-    pub(crate) fn adopt(&mut self) {
-        let _ = self.control.try_send(Control::Adopted);
+    ///
+    /// Waits for the driver: the caller is ending the body, so it cannot
+    /// deadlock, and a dropped message would leave the request running here.
+    pub(crate) async fn adopt(&mut self) {
+        let _ = self.control.send(Control::Adopted).await;
     }
+}
+
+/// A response body a hot restart can move to a successor: the frames the
+/// connection writes, the registry entry that pauses the response, and the
+/// request identity the pause record names.
+pub(crate) struct Handed {
+    /// The frames the body is written from.
+    pub(crate) stream: ResponseStream,
+    /// The registry entry the restart pauses this response through.
+    pub(crate) registration: Arc<Registration>,
+    /// The request's identity as the deployment named it.
+    pub(crate) request_id: String,
+}
+
+/// The connection's handle on a handoffable body, carried in the response's
+/// extensions.
+///
+/// A response that carries one has no body of its own: the session produces
+/// every frame, and the connection takes the handle out before it writes the
+/// response, so the body can be paused between two frames.
+#[derive(Clone, Default)]
+pub(crate) struct HandedBody(Arc<std::sync::Mutex<Option<Handed>>>);
+
+impl HandedBody {
+    /// The handle of one handoffable response body.
+    pub(crate) fn new(
+        stream: ResponseStream,
+        registration: Option<Arc<Registration>>,
+        request_id: String,
+    ) -> Option<Self> {
+        registration.map(|registration| {
+            Self(Arc::new(std::sync::Mutex::new(Some(Handed {
+                stream,
+                registration,
+                request_id,
+            }))))
+        })
+    }
+
+    /// Takes the body out; the connection owns it from then on.
+    pub(crate) fn take(&self) -> Option<Handed> {
+        crate::leader::locked(&self.0).take()
+    }
+}
+
+/// Attaches a handoffable body to `response`.
+///
+/// `registration` is `None` when no hot restart can pause this daemon (a node
+/// other than the leader), in which case the response is written without the
+/// handoff registry entry.
+pub(crate) fn attach(response: &mut Response, body: HandedBody) {
+    response.extensions_mut().insert(body);
 }
 
 /// Drives one response body: one session step at a time, the connection's
@@ -224,9 +337,15 @@ async fn drive(
                 let handable = frozen.is_some();
                 let _ = answer.send(frozen);
                 if !handable {
-                    // The response cannot be handed over, so the connection
-                    // has nothing to wait for: go on serving it.
-                    continue;
+                    // A covered response whose state cannot be frozen must not
+                    // keep running here: the process that hands the deployment
+                    // over does not wait for a response to end (design
+                    // §7.5.1). End it, and let the connection see the body end.
+                    tracing::error!(
+                        "a response in flight cannot be handed over; ending it rather than keeping it"
+                    );
+                    session.abort();
+                    return;
                 }
                 match control.recv().await {
                     Some(Control::Resume) => continue,

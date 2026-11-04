@@ -1061,6 +1061,13 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                     let _ = answer.send(Some(accepted.scheduler));
                 }
             }
+            Some(from_engine::Kind::Metrics(metrics)) => {
+                // The main process's counters for the frontend's `/metrics`
+                // (design §2.3): nothing serves them from the daemon while the
+                // application is still here; delivery item 2/4 wires them into
+                // the metrics registry.
+                let _ = metrics;
+            }
             Some(from_engine::Kind::Stats(report)) => {
                 match SchedulerStats::decode(&report.snapshot) {
                     Ok(snapshot) => stats(
