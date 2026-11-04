@@ -115,7 +115,6 @@ const OPERATORS: &[&str] = &[
     <crate::activation::Silu as Op>::NAME,
     <crate::adaptive_pool::AdaptivePool as Op>::NAME,
     <crate::rows::Rows as Op>::NAME,
-    <crate::patchify::Patchify as Op>::NAME,
     <crate::position::PositionInterpolate as Op>::NAME,
     <crate::audio_activation::AudioActivation as Op>::NAME,
     <crate::patch::Patch as Op>::NAME,
