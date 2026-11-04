@@ -38,6 +38,8 @@ pub struct VsaTiles {
     rotated: u32,
     norm: bool,
     block_rows: u32,
+    /// The bound on the key tiles one compression reduces over, when the model stated it.
+    max_tiles: u32,
 }
 
 impl VsaTiles {
@@ -66,7 +68,24 @@ impl VsaTiles {
             rotated: 0,
             norm: false,
             block_rows: segments::BLOCK_ROWS,
+            max_tiles: 0,
         })
+    }
+
+    /// The bound on the key tiles a compression reduces over: the deployment's own tile count.
+    ///
+    /// It is not derived here because it is a property of the sequence length the deployment
+    /// serves, not of a tile's geometry, and the tolerance of the compression is written against
+    /// it. A model that never compresses needs nothing; one that does states it once.
+    pub fn with_tile_bound(mut self, tiles: u32) -> Result<Self> {
+        if tiles == 0 {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a tile bound of zero leaves the compression nothing to reduce".to_owned(),
+            ));
+        }
+        self.max_tiles = tiles;
+        Ok(self)
     }
 
     /// The default tile of a video sparse attention block.
@@ -335,6 +354,125 @@ impl VsaTiles {
         f.operate::<segments::VsaScores>(&descriptor, args)
     }
 
+    /// Each query tile's softmax over the live key tiles weights their pooled values.
+    ///
+    /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous, exactly what [`Self::scores`]
+    /// writes; `values` is `[tiles, heads, width]` FP32, what the pooling writes; `sizes` is
+    /// `[tiles]` i32, each key tile's live rows. A tile of no live rows is masked out of the softmax
+    /// rather than zeroed, because a zeroed pooled value under a live score would still take weight
+    /// and scale the others down.
+    ///
+    /// `out` is `[heads, query tiles, width]` in the attention's own element type — the layout the
+    /// gate step reads, and one row per (head, query tile) rather than one per row, because every
+    /// row of a query tile compresses to the same vector.
+    pub fn compress(
+        &self,
+        f: &Forward,
+        scores: TensorView,
+        values: TensorView,
+        sizes: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        self.check_compress(scores, values, sizes, out)?;
+        let descriptor = segments::CompressPooledDescriptor::new(
+            out.dtype,
+            self.heads,
+            self.width,
+            self.max_tiles,
+            self.width.next_power_of_two(),
+            false,
+        );
+        let args = segments::CompressPooledArgs {
+            scores,
+            values,
+            sizes,
+            out,
+        };
+        f.operate::<segments::VsaCompressPooled>(&descriptor, args)
+    }
+
+    /// The checks [`Self::compress`] makes before it launches, reachable without a device.
+    ///
+    /// Every refusal the layer can raise lives here rather than behind `&Forward`, because a
+    /// `Forward` needs a live stream and context and no host test can build one; the layer's own
+    /// test asserts these, and [`Self::compress`] calls this first so the two cannot drift.
+    pub fn check_compress(
+        &self,
+        scores: TensorView,
+        values: TensorView,
+        sizes: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if self.max_tiles == 0 {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a compression needs the deployment's key-tile bound: call with_tile_bound"
+                    .to_owned(),
+            ));
+        }
+        if scores.shape.rank() != 3 || values.shape.rank() != 3 {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the scores are [heads, query tiles, tiles] and the values [tiles, heads, \
+                     width], not {:?} and {:?}",
+                    scores.shape.dims(),
+                    values.shape.dims()
+                ),
+            ));
+        }
+        if scores.shape.dim(0) != u64::from(self.heads)
+            || values.shape.dim(1) != u64::from(self.heads)
+        {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the compression is over {} heads, and the views carry {} and {}",
+                    self.heads,
+                    scores.shape.dim(0),
+                    values.shape.dim(1)
+                ),
+            ));
+        }
+        if values.shape.dim(2) != u64::from(self.width) {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the pooled values carry {} features, and the block's heads carry {}",
+                    values.shape.dim(2),
+                    self.width
+                ),
+            ));
+        }
+        if sizes.shape.numel() != values.shape.dim(0) {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "{} key tiles of pooled values against {} live sizes",
+                    values.shape.dim(0),
+                    sizes.shape.numel()
+                ),
+            ));
+        }
+        if out.shape.rank() != 3
+            || out.shape.dim(0) != u64::from(self.heads)
+            || out.shape.dim(1) != scores.shape.dim(1)
+            || out.shape.dim(2) != u64::from(self.width)
+        {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the compression is [heads, query tiles, width] = [{}, {}, {}], not {:?}",
+                    self.heads,
+                    scores.shape.dim(1),
+                    self.width,
+                    out.shape.dims()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Choose each query tile's key tiles from its pooled scores.
     ///
     /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous; `segments` and `sizes` are
@@ -495,6 +633,82 @@ mod tests {
         assert!(
             format!("{}", too_many.unwrap_err()).contains(&MAX_MEMBERS.to_string()),
             "the table's size is named"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compress_tests {
+    use ops::{DType, DevicePtr, Shape};
+
+    use super::*;
+
+    fn view(dtype: DType, shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1_0000), dtype, Shape::new(shape))
+    }
+
+    /// A block of `heads` heads of `width` features over 128-row tiles, with a tile bound stated.
+    fn tiles() -> VsaTiles {
+        VsaTiles::new(128, 4, 64, 1e-6)
+            .unwrap()
+            .with_tile_bound(4_096)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_compression_needs_the_deployments_tile_bound() {
+        // The bound is what the tolerance is written against, so an unstated one is refused rather
+        // than guessed: a compression accepted for four thousand tiles cannot be compared on the
+        // bound of an arbitrary one.
+        let unset = VsaTiles::new(128, 4, 64, 1e-6).unwrap();
+        let error = unset
+            .check_compress(
+                view(DType::F32, &[4, 8, 16]),
+                view(DType::F32, &[16, 4, 64]),
+                view(DType::I32, &[16]),
+                view(DType::BF16, &[4, 8, 64]),
+            )
+            .expect_err("a compression without a tile bound");
+        assert!(error.to_string().contains("with_tile_bound"), "{error}");
+        assert!(unset.with_tile_bound(0).is_err());
+    }
+
+    #[test]
+    fn a_compression_refuses_views_that_would_sum_another_block() {
+        let tiles = tiles();
+        let scores = view(DType::F32, &[4, 8, 16]);
+        let values = view(DType::F32, &[16, 4, 64]);
+        let sizes = view(DType::I32, &[16]);
+        let out = view(DType::BF16, &[4, 8, 64]);
+        assert!(tiles.check_compress(scores, values, sizes, out).is_ok());
+        // Another head count on either side would weight another block's rows.
+        assert!(
+            tiles
+                .check_compress(view(DType::F32, &[2, 8, 16]), values, sizes, out)
+                .is_err()
+        );
+        assert!(
+            tiles
+                .check_compress(scores, view(DType::F32, &[16, 2, 64]), sizes, out)
+                .is_err()
+        );
+        // Another feature width is another head's arithmetic.
+        assert!(
+            tiles
+                .check_compress(scores, view(DType::F32, &[16, 4, 32]), sizes, out)
+                .is_err()
+        );
+        // The live sizes are one per key tile.
+        assert!(
+            tiles
+                .check_compress(scores, values, view(DType::I32, &[12]), out)
+                .is_err()
+        );
+        // The result is one row per (head, query tile) of the block's width.
+        assert!(
+            tiles
+                .check_compress(scores, values, sizes, view(DType::BF16, &[4, 8, 32]))
+                .is_err()
         );
     }
 }

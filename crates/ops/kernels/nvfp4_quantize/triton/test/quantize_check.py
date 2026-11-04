@@ -286,7 +286,9 @@ def stage_producer(module, rows, columns, block, layout, global_scale, seed):
         scale_count = padded_rows * padded_columns
     scales = torch.full((scale_count,), 0xCD, dtype=torch.uint8, device="cuda")
 
-    module.launch((rows * (columns // block), 1, 1), source, values, scales, rows, global_scale)
+    # The global scale is a device operand: one FP32 element, as the operator passes it.
+    scale = torch.tensor([global_scale], dtype=torch.float32, device="cuda")
+    module.launch((rows * (columns // block), 1, 1), source, values, scales, rows, scale)
 
     decoded = decode(values, scales, rows, columns, layout)
     exact = source.to(torch.float64)

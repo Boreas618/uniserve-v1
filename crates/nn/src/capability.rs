@@ -142,6 +142,90 @@ impl TokenBatch {
     pub fn is_decode(&self) -> bool {
         self.phase == PhaseKind::Decode
     }
+
+    /// Check the batch's own parts against each other: the shapes a layer reads by pointer.
+    ///
+    /// The four index tensors are read by arithmetic inside a kernel, so a batch whose slot mapping
+    /// is one entry short, whose offsets end at another token count or whose `max_kv_len` is shorter
+    /// than a page reads the wrong pages with nothing to complain. The layers cannot see the batch's
+    /// intent — only its parts — so the check is here, it is shapes and types only (reading the
+    /// values would need the device), and it is the one place an assembled batch is validated.
+    ///
+    /// `rows` is derived from `seq_lens`, so a batch that states the wrong number of sequences is
+    /// caught by the two vectors that must agree with it rather than by a separate field.
+    pub fn check(&self) -> Result<()> {
+        if self.rows() == 0 || self.tokens() == 0 {
+            return Err(Error::shape(
+                "TokenBatch",
+                "a batch of no rows or no tokens has nothing to run".to_owned(),
+            ));
+        }
+        if self.page_size == 0 {
+            return Err(Error::shape(
+                "TokenBatch",
+                "a page of zero tokens cannot be addressed".to_owned(),
+            ));
+        }
+        if self.max_kv_len < self.page_size {
+            return Err(Error::shape(
+                "TokenBatch",
+                format!(
+                    "a key bound of {} is shorter than the {} tokens of a page",
+                    self.max_kv_len, self.page_size
+                ),
+            ));
+        }
+        let rows = self.rows();
+        let tokens = self.tokens();
+        for (name, view, expected, dtype) in [
+            ("positions", self.positions, tokens, DType::I32),
+            ("slot_mapping", self.slot_mapping, tokens, DType::I32),
+            ("seq_lens", self.seq_lens, rows, DType::I32),
+            ("query_offsets", self.query_offsets, rows + 1, DType::I32),
+        ] {
+            if view.numel() != expected {
+                return Err(Error::shape(
+                    "TokenBatch",
+                    format!(
+                        "{name} is {} elements, {expected} expected for {rows} rows of {tokens} \
+                         tokens",
+                        view.numel()
+                    ),
+                ));
+            }
+            if view.dtype != dtype {
+                return Err(Error::shape(
+                    "TokenBatch",
+                    format!("{name} is {}, not {dtype}", view.dtype),
+                ));
+            }
+        }
+        // Each row names at most one hidden row for its logits, and a row that names none is a row
+        // the sampler does not see.
+        if self.logits_rows.numel() > rows || self.logits_rows.dtype != DType::I32 {
+            return Err(Error::shape(
+                "TokenBatch",
+                format!(
+                    "logits_rows is {} {} elements for {rows} rows, not at most one i32 per row",
+                    self.logits_rows.numel(),
+                    self.logits_rows.dtype
+                ),
+            ));
+        }
+        if let Some(draft_lens) = self.draft_lens
+            && (draft_lens.numel() != rows || draft_lens.dtype != DType::I32)
+        {
+            return Err(Error::shape(
+                "TokenBatch",
+                format!(
+                    "draft_lens is {} {} elements for {rows} rows",
+                    draft_lens.numel(),
+                    draft_lens.dtype
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The key/value planes of one attention layer of one group.
@@ -849,5 +933,71 @@ mod tests {
             layout.condition_elements + video_elements + audio_elements,
             elements + 16 * 13 * 24 * 40 + 8 * 96
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use ops::{DType, DevicePtr, Shape};
+
+    use super::*;
+
+    fn view(dtype: DType, shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x3_0000), dtype, Shape::new(shape))
+    }
+
+    /// A batch of `rows` sequences, one token each, over `page_size`-token pages.
+    fn batch(rows: u64) -> TokenBatch {
+        TokenBatch {
+            positions: view(DType::I32, &[rows]),
+            slot_mapping: view(DType::I32, &[rows]),
+            seq_lens: view(DType::I32, &[rows]),
+            query_offsets: view(DType::I32, &[rows + 1]),
+            logits_rows: view(DType::I32, &[rows]),
+            phase: PhaseKind::Decode,
+            page_size: 64,
+            num_tokens: u32::try_from(rows).unwrap(),
+            max_kv_len: 4_096,
+            draft_lens: None,
+        }
+    }
+
+    #[test]
+    fn a_batch_whose_parts_disagree_is_refused_by_the_part() {
+        // The consistent one passes, or the rest of this test proves nothing.
+        batch(15).check().expect("a consistent batch");
+
+        // A slot short: the write would scatter 14 rows and address a fifteenth slot that is not
+        // there — the exact mistake a hand-built example makes.
+        let mut short = batch(15);
+        short.slot_mapping = view(DType::I32, &[14]);
+        let error = short.check().expect_err("a slot mapping of another length");
+        assert!(format!("{error}").contains("slot_mapping"), "{error}");
+
+        // Offsets that do not close the batch: one entry per sequence plus the end.
+        let mut offsets = batch(15);
+        offsets.query_offsets = view(DType::I32, &[15]);
+        assert!(offsets.check().is_err());
+
+        // A key bound shorter than a page addresses no page at all.
+        let mut unpaged = batch(4);
+        unpaged.max_kv_len = 32;
+        let error = unpaged.check().expect_err("a bound below one page");
+        assert!(format!("{error}").contains("shorter than"), "{error}");
+
+        // More logits rows than rows would have the sampler read past the last row.
+        let mut logits = batch(4);
+        logits.logits_rows = view(DType::I32, &[8]);
+        assert!(logits.check().is_err());
+
+        // Draft counts are one per row, when a batch verifies drafts at all.
+        let mut drafts = batch(4);
+        drafts.draft_lens = Some(view(DType::I32, &[2]));
+        assert!(drafts.check().is_err());
+
+        // And an empty batch is not a batch.
+        let mut empty = batch(4);
+        empty.num_tokens = 0;
+        assert!(empty.check().is_err());
     }
 }
