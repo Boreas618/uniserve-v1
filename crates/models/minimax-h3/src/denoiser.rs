@@ -1113,7 +1113,8 @@ impl nn::capability::Denoiser for Denoiser {
 }
 
 /// The state tables of a request, in the order [`Layouts::state_tables`] sorts them.
-const STATE_TABLES: [&str; 10] = [
+/// The state tables of a dense layout, in `table_specs`' order (sorted by name).
+const DENSE_TABLES: [&str; 10] = [
     "audio_indices",
     "cu_seq_lens_k",
     "cu_seq_lens_q",
@@ -1126,16 +1127,52 @@ const STATE_TABLES: [&str; 10] = [
     "video_indices",
 ];
 
-/// One state view of a request, by name.
-fn state(state: &[TensorView], name: &str) -> Result<TensorView> {
-    let position = STATE_TABLES
-        .iter()
-        .position(|table| *table == name)
-        .ok_or_else(|| Error::config(format!("{name} is not a state table")))?;
-    state
-        .get(position)
-        .copied()
-        .ok_or_else(|| Error::config(format!("the executor passed no {name} table")))
+/// The state tables of a segment layout, in `segment_table_specs`' order (sorted by name).
+///
+/// A segment layout has no `cu_seq_lens` pair and carries four tables a dense one does not, so the
+/// two sets do not share positions: a name resolved against the wrong set silently reads another
+/// tensor. [`Tables`] picks the set from the deployment's attention kind for exactly that reason.
+const SEGMENT_TABLES: [&str; 12] = [
+    "audio_indices",
+    "groups",
+    "modulation_indices",
+    "position_ids",
+    "prefix_index",
+    "segment_keep",
+    "segment_starts",
+    "step",
+    "tile_segments",
+    "token_tags",
+    "variable_block_sizes",
+    "video_indices",
+];
+
+/// One request's state views, resolved by name against its kind's table set.
+struct Tables<'a> {
+    names: &'static [&'static str],
+    views: &'a [TensorView],
+}
+
+impl<'a> Tables<'a> {
+    fn new(kind: crate::config::AttentionKind, views: &'a [TensorView]) -> Self {
+        let names: &'static [&'static str] = match kind {
+            crate::config::AttentionKind::Dense => &DENSE_TABLES,
+            crate::config::AttentionKind::Sparse { .. } => &SEGMENT_TABLES,
+        };
+        Self { names, views }
+    }
+
+    fn get(&self, name: &str) -> Result<TensorView> {
+        let position = self
+            .names
+            .iter()
+            .position(|table| *table == name)
+            .ok_or_else(|| Error::config(format!("{name} is not a state table of this kind")))?;
+        self.views
+            .get(position)
+            .copied()
+            .ok_or_else(|| Error::config(format!("the executor passed no {name} table")))
+    }
 }
 
 impl Denoiser {
@@ -1153,13 +1190,13 @@ impl Denoiser {
         latents: nn::Latents,
         cond: nn::Conditioning<'_>,
     ) -> Result<()> {
-        let tables = cond.state;
+        let tables = Tables::new(self.config.attention, cond.state);
         let video = latents.video;
         let channels = video.shape.dim(0);
         let frames = video.shape.dim(1);
         let height = video.shape.dim(2);
         let width = video.shape.dim(3);
-        let tokens = u64::from(state(tables, "groups")?.shape.dim(0) as u32);
+        let tokens = u64::from(tables.get("groups")?.shape.dim(0) as u32);
         let hidden_size = u64::from(self.config.transformer.hidden_size);
         let dtype = cond.text.dtype;
         let arena = f.arena();
@@ -1167,10 +1204,10 @@ impl Denoiser {
         // The packed rows: every row gathers its prefix source, so a generated row reads the zero
         // row and a text row reads itself.
         let hidden = arena.tensor(dtype, Shape::new(&[tokens, hidden_size]))?;
-        nn::layers::gather_rows(f, cond.text, state(tables, "prefix_index")?, hidden)?;
+        nn::layers::gather_rows(f, cond.text, tables.get("prefix_index")?, hidden)?;
 
         // The video rows: patchify, project, scatter.
-        let video_indices = state(tables, "video_indices")?;
+        let video_indices = tables.get("video_indices")?;
         let video_rows = u64::from(video_indices.shape.dim(0) as u32);
         let patch = nn::layers::Patch::new(channels, height, width)?;
         // The one inverse of the pack above: the DiT's `1x2x2` tiles back into the latent raster.
@@ -1183,7 +1220,7 @@ impl Denoiser {
         nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, projected, video_indices)?;
 
         // The audio rows: one element per channel-step pair, projected like any other row.
-        if let (Some(audio), Ok(audio_indices)) = (latents.audio, state(tables, "audio_indices")) {
+        if let (Some(audio), Ok(audio_indices)) = (latents.audio, tables.get("audio_indices")) {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
             let features = u64::from(self.config.transformer.audio_channels);
             let flat = TensorView::with_strides(
@@ -1208,13 +1245,13 @@ impl Denoiser {
         let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
         let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
         self.transformer
-            .factors(f, state(tables, "position_ids")?, cosine, sine)?;
+            .factors(f, tables.get("position_ids")?, cosine, sine)?;
         // The dense kind reads the whole packed sequence in one go; the sparse kind reads the
         // segment tables instead and has no visibility pair at all.
         let visible = self.config.attention.is_dense().then(|| {
             Ok::<_, Error>(Visible {
-                cu_seq_lens_q: state(tables, "cu_seq_lens_q")?,
-                cu_seq_lens_k: state(tables, "cu_seq_lens_k")?,
+                cu_seq_lens_q: tables.get("cu_seq_lens_q")?,
+                cu_seq_lens_k: tables.get("cu_seq_lens_k")?,
                 key_rows: tokens as u32,
             })
         });
@@ -1231,20 +1268,20 @@ impl Denoiser {
             .then_some(())
             .map_or(Ok(None), |()| {
                 Ok::<_, Error>(Some(crate::attention_sparse::Segments {
-                    sizes: state(tables, "variable_block_sizes")?,
-                    segments: state(tables, "tile_segments")?,
-                    keep: state(tables, "segment_keep")?,
+                    sizes: tables.get("variable_block_sizes")?,
+                    segments: tables.get("tile_segments")?,
+                    keep: tables.get("segment_keep")?,
                 }))
             })?;
 
         // The stack, conditioned by the step's gathered modulation.
-        let step_index = state(tables, "step")?;
+        let step_index = tables.get("step")?;
         self.transformer.forward(
             f,
             &self.cache,
             step_index,
             hidden,
-            state(tables, "modulation_indices")?,
+            tables.get("modulation_indices")?,
             Factors { cosine, sine },
             visible.as_ref(),
             segments.as_ref(),
@@ -1261,7 +1298,7 @@ impl Denoiser {
         let video_hidden = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
         nn::layers::gather_rows(f, hidden, video_indices, video_hidden)?;
         let video_groups = arena.tensor(DType::I32, Shape::new(&[video_rows]))?;
-        nn::layers::gather_rows(f, state(tables, "groups")?, video_indices, video_groups)?;
+        nn::layers::gather_rows(f, tables.get("groups")?, video_indices, video_groups)?;
         let velocity_rows = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
         self.transformer.velocity(
             f,
@@ -1276,12 +1313,12 @@ impl Denoiser {
         self.solver
             .step(f, Modality::Video, video, velocity, step.index)?;
 
-        if let (Some(audio), Ok(audio_indices)) = (latents.audio, state(tables, "audio_indices")) {
+        if let (Some(audio), Ok(audio_indices)) = (latents.audio, tables.get("audio_indices")) {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
             let audio_hidden = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
             nn::layers::gather_rows(f, hidden, audio_indices, audio_hidden)?;
             let audio_groups = arena.tensor(DType::I32, Shape::new(&[audio_rows]))?;
-            nn::layers::gather_rows(f, state(tables, "groups")?, audio_indices, audio_groups)?;
+            nn::layers::gather_rows(f, tables.get("groups")?, audio_indices, audio_groups)?;
             let features = u64::from(self.config.transformer.audio_channels);
             let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, features]))?;
             self.transformer.velocity(
@@ -1891,5 +1928,29 @@ mod tests {
             .iter()
             .map(|chunk| i32::from_le_bytes(*chunk))
             .collect()
+    }
+    #[test]
+    fn each_kind_resolves_its_state_tables_by_its_own_names() {
+        // The names are positional: the executor passes its views in `table_specs`' order, so a set
+        // that is not exactly that order reads another tensor without any shape complaining.
+        let dense = layouts();
+        let layout = dense.cover(&request(22, 1344, 768));
+        let names: Vec<&str> = dense
+            .table_specs(&layout)
+            .unwrap()
+            .iter()
+            .map(|table| table.name)
+            .collect();
+        assert_eq!(names, DENSE_TABLES);
+
+        let sparse = sparse_layouts();
+        let layout = sparse.cover(&request(22, 1344, 768));
+        let names: Vec<&str> = sparse
+            .table_specs(&layout)
+            .unwrap()
+            .iter()
+            .map(|table| table.name)
+            .collect();
+        assert_eq!(names, SEGMENT_TABLES);
     }
 }
