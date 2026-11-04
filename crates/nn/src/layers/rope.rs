@@ -303,13 +303,15 @@ impl Rotary {
             epsilon: self.epsilon.into(),
             rows: QK_NORM_TOKENS,
             block: head_dim.next_power_of_two().min(1024) as u32,
+            // The transformer's per-head norm is trained: both weights are applied.
+            affine: true,
             pdl: PDL,
         };
         let args = QkNormRopeArgs {
             query,
             key,
-            q_weight,
-            k_weight,
+            q_weight: Some(q_weight),
+            k_weight: Some(k_weight),
             cosine,
             sine,
             q_out,

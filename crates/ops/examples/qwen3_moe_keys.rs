@@ -228,6 +228,7 @@ fn main() {
             epsilon: Float::from(1e-6_f32),
             rows: QK_NORM_TOKENS,
             block: row_tile(HEAD_DIM).min(1024),
+            affine: true,
             pdl: PDL,
         }),
     ));

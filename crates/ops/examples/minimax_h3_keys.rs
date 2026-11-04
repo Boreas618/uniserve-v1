@@ -91,9 +91,26 @@ const ACTIVATION_KERNEL: u32 = 12;
 /// The transformer's hidden width (`hidden_size`).
 const HIDDEN: u32 = 5376;
 
+/// The rotary geometry: 16 frequencies per position axis over three axes (time, height, width),
+/// so the leading 96 channels of each 128-channel head rotate and the trailing 32 do not.
+const ROPE_FREQ_DIM: u32 = 16;
+const ROPE_AXES: u32 = 3;
+const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
+const ROPE_THETA: f32 = 10_000.0;
+
+/// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
+const ROTARY_BLOCK: u32 = 256;
+
+/// Tokens one `qk_norm_rope` program handles (`launch::QK_NORM_TOKENS`).
+const QK_NORM_TOKENS: u32 = 1;
+
 /// The attention projections' inner width, `num_attention_heads · attention_head_dim = 7168`: the
 /// contraction length of the output projection (`attention.py`'s `RowParallelLinear(inner, hidden)`).
 const HEADS_TIMES_HEAD_DIM: u32 = 7168;
+
+/// The attention geometry: 56 heads of 128 features (`num_attention_heads`, `attention_head_dim`).
+const HEADS: u32 = 56;
+const HEAD_DIM: u32 = 128;
 
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
@@ -256,6 +273,50 @@ fn main() {
             .to_string(),
         );
     }
+
+    // ---- The DiT's rotation: three position axes of 16 frequencies each, cut into three sections
+    // of the head's rotated columns, and the per-head normalization fused with it.
+    //
+    // `attention.py` normalizes every query and key head with a *learned* RMSNorm (`affine`) and
+    // rotates the leading 96 channels with neox RoPE over (time, height, width).
+    push(
+        "rotary_factors",
+        ops::rope::FactorsDescriptor {
+            dtype: DType::F32,
+            positions: DType::I32,
+            columns: ROTATED / 2,
+            block: ROTARY_BLOCK,
+            scale: ops::Float::from(ROPE_THETA),
+            pdl: PDL,
+            axes: ROPE_AXES,
+            sections: {
+                let mut sections = [0; ops::rope::MAX_AXES];
+                sections[0] = ROPE_FREQ_DIM;
+                sections[1] = ROPE_FREQ_DIM;
+                sections[2] = ROPE_FREQ_DIM;
+                sections
+            },
+        }
+        .to_string(),
+    );
+    push(
+        "qk_norm_rope",
+        ops::rope::QkNormRopeDescriptor {
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            q_heads: HEADS,
+            k_heads: HEADS,
+            // "neox RoPE": adjacent pairs rotate together.
+            rotation: ops::rope::Rotation::Interleaved,
+            epsilon: ops::Float::from(NORM_EPSILON),
+            rows: QK_NORM_TOKENS,
+            block: row_tile(HEAD_DIM).min(1024),
+            affine: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
 
     // ---- The transformer's per-row programs, at `hidden_size`.
     push(
