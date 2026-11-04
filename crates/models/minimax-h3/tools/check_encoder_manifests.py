@@ -109,6 +109,13 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
     "embedding/triton": ("dtype", "ids", "hidden", "first", "rows", "block", "pdl"),
     "gelu/triton": ("dtype", "columns", "block", "approximate", "pdl"),
     "scaled_residual/triton": ("dtype", "columns", "block", "update_bias"),
+    # `rms_norm`'s tile is `row_tile(columns)` - the width rounded up to a power of two - which is the
+    # one derived field this tool computes. A wrong derivation here cannot pass silently: it produces a
+    # MISSING row that names a tile the fixture does not hold, which is a report to read, not a green.
+    "rms_norm/triton": ("dtype", "columns", "tile", "pdl"),
+    "snake/triton": ("dtype", "channels", "block", "pdl"),
+    "frame_moments/nvcc": ("dtype", "epsilon"),
+    "frame_norm_pad/nvcc": ("dtype", "channels_last", "centered", "single_pixel"),
     "rope_apply/triton": (
         "dtype",
         "output",
@@ -225,7 +232,7 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
     calls.append(
         (
             "rms_norm/triton",
-            {"dtype": dtype, "columns": str(hidden)},
+            {"dtype": dtype, "columns": str(hidden), "tile": _row_tile(hidden), "pdl": "false"},
             "text_encoder.rs: a layer's norms",
         )
     )
@@ -388,14 +395,14 @@ def vae_calls(vae: dict) -> list[Call]:
         calls.append(
             (
                 "snake/triton",
-                {"dtype": "f32", "channels": str(width)},
+                {"dtype": "f32", "channels": str(width), "block": "1024", "pdl": "false"},
                 f"encoding.rs: a level's snake at {width} channels",
             )
         )
     calls.append(
         (
             "frame_moments/nvcc",
-            {"dtype": "f32"},
+            {"dtype": "f32", "epsilon": f"0x{_f32_bits(vae['norm_eps']):08x}"},
             "encoding.rs: the frame statistics a pre-activated convolution reads",
         )
     )
@@ -404,7 +411,11 @@ def vae_calls(vae: dict) -> list[Call]:
             "frame_norm_pad/nvcc",
             {
                 "dtype": "f32",
-                "channels_last": "true",
+                # `encoding.rs:998` builds `FrameNormPad::new` and never calls
+                # `with_channels_last`, so the frames are read channel-first (`frame.rs:150`).
+                # `single_pixel` is the request's frame count, not a field this tool can state: a clip
+                # of more than one frame is the encode path's case, and the fixture holds both rows.
+                "channels_last": "false",
                 "centered": "false",
                 "single_pixel": "false",
             },
