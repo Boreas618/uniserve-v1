@@ -188,6 +188,115 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The stage table's weight column, from the checkpoint's own index rather than by hand.
+    //
+    // A component's `total_size` is the index's sum over every tensor it names, so a row cannot
+    // drift from the checkpoint it describes - which is how the three hand-carried rows of the
+    // previous round drifted. The index is read as a small file: the shards themselves are not
+    // needed to know how many bytes they hold. Two components hold a block's encoder and its
+    // decoder in one directory, and the table's split of those into two stages is the loaders' key
+    // sets, so they are printed whole with the table's two rows beside them.
+    let mut component_bytes = std::collections::BTreeMap::new();
+    println!();
+    for component in minimax_h3::partition::Component::ALL {
+        let Some(directory) = component.directories().first().copied() else {
+            continue;
+        };
+        // The two VAEs are each named by two components (a decoder's directory and the condition
+        // encoder that reads its other half), and the byte figure belongs to the directory.
+        if component_bytes.contains_key(directory) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root.join(directory)) else {
+            println!("weights {directory}: no such directory, so the table's figure stands alone");
+            continue;
+        };
+        let mut named = None;
+        let mut single = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".index.json") {
+                named = Some(entry.path());
+            } else if name.ends_with(".safetensors") {
+                single = Some(entry.path());
+            }
+        }
+        // A sharded export states its own total in the index's metadata; an export of one file
+        // states nothing, and its data section is the file less its eight-byte length and header.
+        if let Some(path) = named {
+            let text = std::fs::read_to_string(path)?;
+            let index: serde_json::Value = serde_json::from_str(&text)?;
+            let total = index["metadata"]["total_size"]
+                .as_u64()
+                .or_else(|| index["total_size"].as_u64())
+                .unwrap_or(0);
+            let count = index["weight_map"].as_object().map_or(0, |map| map.len());
+            component_bytes.insert(directory.to_owned(), total);
+            println!(
+                "weights {directory}: {count} tensors in the index, {} MiB",
+                total / (1 << 20)
+            );
+        } else if let Some(path) = single {
+            let bytes = std::fs::metadata(&path)?.len();
+            let mut header = [0_u8; 8];
+            let mut file = std::fs::File::open(&path)?;
+            std::io::Read::read_exact(&mut file, &mut header)?;
+            let header_len = u64::from_le_bytes(header);
+            let data = bytes.saturating_sub(8 + header_len);
+            component_bytes.insert(directory.to_owned(), data);
+            println!(
+                "weights {directory}: one file, {data} bytes of data = {} MiB (its header states no \
+                 count)",
+                data / (1 << 20)
+            );
+        } else {
+            println!(
+                "weights {directory}: no index and no shard beside it here, so the table's figure \
+                 stands alone"
+            );
+        }
+    }
+
+    // The table's weight column is the **kept** tensors of each block, and a component's total is
+    // not that: the text encoder retains 50 of its 64 layers, the denoiser folds `adaln_proj` away,
+    // and the two VAEs are told apart by their key prefixes. Which tensors a block keeps is the
+    // loaders' selection, and restating it here would be a second statement of one rule - so the
+    // index is a bound the table must sit under, not a figure that replaces it. A row that
+    // overstates a block is what the bound catches; one that understates it is caught by
+    // `inspect_checkpoint`, which proves the key groups exist.
+    for deployment in DEPLOYMENTS {
+        // A rank places one DiT partition, so the other one's directory is not part of the bound.
+        let placed = if deployment.contains("ref2va") {
+            Dit::Reference
+        } else {
+            Dit::Base
+        };
+        let unplaced = match placed {
+            Dit::Base => "transformer_ref",
+            Dit::Reference => "transformer",
+        };
+        let all: u64 = component_bytes
+            .iter()
+            .filter(|(directory, _)| directory.as_str() != unplaced)
+            .map(|(_, bytes)| bytes / (1 << 20))
+            .sum();
+        let table: u64 = STAGES
+            .iter()
+            .filter(|stage| stage.deployment == deployment)
+            .map(|stage| stage.weights)
+            .sum();
+        if table > all {
+            return Err(format!(
+                "{deployment} states {table} MiB of weights and the components it places hold \
+                 {all} MiB"
+            )
+            .into());
+        }
+        println!(
+            "weights {deployment}: table {table} MiB, under the {all} MiB its own components hold"
+        );
+    }
+
     // The DiT's plans, from the crate's own function, one line per deployment shape: the base DiT on
     // one rank and on two, and the reference DiT a `ref2va` runs. Each is one evaluation's reservations.
     let ratio = config.video_vae.spatial_compression();
