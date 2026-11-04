@@ -321,6 +321,11 @@ pub fn rotary(config: &VideoVaeConfig) -> Result<(u32, [u32; 3])> {
 /// raster order — frame, then row, then column — followed by the register tokens and the trailing zero
 /// token, whose coordinates are all zero because they are not placed in space.
 ///
+/// The table is `[3, rows]` F32, axis-major, because the rotation reads one leading coordinate per
+/// axis (`Sections::new(&[16, 16, 16])`): a row-major `[rows, 3]` table would be read transposed and
+/// silently rotate every row by another row's angles. Coordinates are in radians — the reference's
+/// cell-centre grid times `2π` — so the raw inverse frequencies give the reference's angle.
+///
 /// The table is a per-layout constant: the runner uploads it once per captured graph
 /// (`notes/h3/runner-interface.md` 2.1, `video_positions`).
 pub fn positions(canvas: &Canvas) -> Result<Vec<f32>> {
@@ -329,22 +334,35 @@ pub fn positions(canvas: &Canvas) -> Result<Vec<f32>> {
             "a decoder canvas of no frame, row or column has no position".to_owned(),
         ));
     }
-    let axis = |index: u32, size: u32| -> f32 {
-        2.0 * ((f64::from(index) + 0.5) / f64::from(size)) as f32 - 1.0
-    };
-    let mut table = Vec::with_capacity(canvas.rows() as usize * 3);
+    let rows = canvas.rows() as usize;
+    let mut table = vec![0.0f32; 3 * rows];
+    let mut row = 0;
     for frame in 0..canvas.frames {
-        let f = axis(frame, canvas.frames);
-        for row in 0..canvas.height {
-            let h = axis(row, canvas.height);
+        for height in 0..canvas.height {
             for column in 0..canvas.width {
-                table.extend_from_slice(&[f, h, axis(column, canvas.width)]);
+                let coordinates = [
+                    axis(frame, canvas.frames),
+                    axis(height, canvas.height),
+                    axis(column, canvas.width),
+                ];
+                for (channel, value) in coordinates.iter().enumerate() {
+                    table[channel * rows + row] = *value;
+                }
+                row += 1;
             }
         }
     }
-    let trailing = (u64::from(canvas.registers) + u64::from(canvas.tail)) as usize;
-    table.resize(table.len() + trailing * 3, 0.0);
     Ok(table)
+}
+
+/// One cell-centre coordinate of an axis of `size`, in radians.
+///
+/// The reference builds cell-centre coordinates in `[-1, 1)` and multiplies them by `2π` at its
+/// rotary call; the frequency table here is the raw inverse frequencies, so the angle comes out as
+/// `2π · position · frequency` with the `2π` folded into the table the runner uploads.
+fn axis(index: u32, size: u32) -> f32 {
+    let centre = (f64::from(index) + 0.5) / f64::from(size);
+    (std::f64::consts::TAU * (2.0 * centre - 1.0)) as f32
 }
 
 /// The tile extent of the checkpoint's decoder, in output pixels.
@@ -1004,10 +1022,12 @@ pub(crate) mod tests {
             registers: 4,
             tail: 1,
         };
+        let rows = canvas.rows() as usize;
         let table = positions(&canvas).expect("positions");
-        assert_eq!(table.len() as u64, canvas.rows() * 3);
+        assert_eq!(table.len(), 3 * rows);
+        let turn = std::f64::consts::TAU;
         // Frame axis of two: -0.5, 0.5. Row axis of two: -0.5, 0.5. Column axis of three: -2/3, 0,
-        // 2/3. Rows are frame-major, then row, then column.
+        // 2/3 — times 2π, and one leading row per axis. The voxel rows go frame, row, column.
         let expected = [
             [-0.5, -0.5, -2.0 / 3.0],
             [-0.5, -0.5, 0.0],
@@ -1023,24 +1043,27 @@ pub(crate) mod tests {
             [0.5, 0.5, 2.0 / 3.0],
         ];
         for (row, values) in expected.iter().enumerate() {
-            for (axis, value) in values.iter().enumerate() {
+            for (channel, value) in values.iter().enumerate() {
+                let want = (turn * value) as f32;
+                let got = table[channel * rows + row];
                 assert!(
-                    (table[row * 3 + axis] - value).abs() < 1e-6,
-                    "row {row} axis {axis}: {} vs {value}",
-                    table[row * 3 + axis]
+                    (got - want).abs() < 1e-5,
+                    "row {row} axis {channel}: {got} vs {want}"
                 );
             }
         }
-        // Every coordinate is inside [-1, 1).
-        assert!(table.iter().all(|value| (-1.0..1.0).contains(value)));
         // The register tokens and the trailing zero token are not placed: their rows are zeros.
-        let trailing = table.len() - 5 * 3;
-        assert!(table[trailing..].iter().all(|value| *value == 0.0));
+        let trailing = 5;
+        for channel in 0..3 {
+            for row in rows - trailing..rows {
+                assert_eq!(table[channel * rows + row], 0.0, "row {row} axis {channel}");
+            }
+        }
         // The checkpoint's clip canvas: 7 latent frames of 16x16 voxels, four registers, one tail.
         let clip = Canvas::clip(&config, 16, 16);
         let table = positions(&clip).expect("positions");
-        assert_eq!(table.len() as u64, clip.rows() * 3);
         assert_eq!(clip.rows(), 7 * 256 + 5);
+        assert_eq!(table.len() as u64, clip.rows() * 3);
     }
 
     #[test]
