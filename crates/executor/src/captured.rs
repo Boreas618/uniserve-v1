@@ -160,18 +160,26 @@ impl Captured {
                     "the captured graph has no launch {launch} of operator {operator}"
                 ))
             })?;
-        if nodes.len() != params.len() {
+        // Only kernel nodes carry launch parameters: a capture also adds the empty nodes that hold
+        // dependencies, and the walk's parameters were collected from the kernels alone.
+        let mut kernels = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if node.kind()? == platform::GraphNodeKind::Kernel {
+                kernels.push(node);
+            }
+        }
+        if kernels.len() != params.len() {
             return Err(Error::Invariant(format!(
-                "operator {operator} ({key}) added {} nodes when captured and {} in the walk; \
+                "operator {operator} ({key}) launched {} kernels when captured and {} in the walk; \
                  the program's launch structure changed and the bucket must be recaptured",
-                nodes.len(),
+                kernels.len(),
                 params.len()
             )));
         }
-        for (node, owned) in nodes.iter().zip(params) {
+        for (node, owned) in kernels.into_iter().zip(params) {
             self.exec.set_kernel_node_params_owned(node.clone(), owned)?;
         }
-        Ok(nodes.len())
+        Ok(params.len())
     }
 
     /// Whether `nodes` is the same launch structure as this graph's: the same launches, in the
