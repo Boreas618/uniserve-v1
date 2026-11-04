@@ -677,6 +677,40 @@ pub struct VisionTower {
 }
 
 impl VisionTower {
+    /// Every checkpoint tensor this tower reads, by name.
+    ///
+    /// The tower is replicated over tensor-parallel ranks - every rank reads the whole of each
+    /// tensor - so the list depends on the configuration alone. `load` asks for these and only
+    /// these: a checkpoint that lacks one is refused by name before a byte is read.
+    pub fn keys(config: &VisionConfig) -> Vec<String> {
+        let mut keys = Vec::new();
+        for index in 0..config.depth {
+            let block = format!("{PREFIX}.blocks.{index}");
+            for norm in ["norm1", "norm2"] {
+                keys.push(format!("{block}.{norm}.weight"));
+                keys.push(format!("{block}.{norm}.bias"));
+            }
+            for projection in ["attn.qkv", "attn.proj", "mlp.linear_fc1", "mlp.linear_fc2"] {
+                keys.push(format!("{block}.{projection}.weight"));
+                keys.push(format!("{block}.{projection}.bias"));
+            }
+        }
+        keys.push(format!("{PREFIX}.patch_embed.proj.weight"));
+        keys.push(format!("{PREFIX}.patch_embed.proj.bias"));
+        keys.push(format!("{PREFIX}.pos_embed.weight"));
+        let mergers = std::iter::once(format!("{PREFIX}.merger")).chain(
+            (0..config.deepstack_visual_indexes.len())
+                .map(|index| format!("{PREFIX}.deepstack_merger_list.{index}")),
+        );
+        for merger in mergers {
+            for tensor in ["norm", "linear_fc1", "linear_fc2"] {
+                keys.push(format!("{merger}.{tensor}.weight"));
+                keys.push(format!("{merger}.{tensor}.bias"));
+            }
+        }
+        keys
+    }
+
     /// The tower of `config`, reading the checkpoint through `loader`.
     ///
     /// `dtype` is the activation element type the loading boundary chose: the checkpoint's own
@@ -1072,6 +1106,26 @@ mod tests {
         crate::config::tests_support::released_config()
             .text_encoder
             .vision
+    }
+
+    /// Every tensor the tower reads is named once, and under the tower's own prefix.
+    ///
+    /// Two properties the checkpoint makes a load depend on: a name asked twice would be read twice
+    /// and reported twice by a missing-name check, and a name outside the prefix would collide with
+    /// the language stack's tensors in the same export.
+    #[test]
+    fn keys_are_unique_and_inside_the_tower() {
+        let keys = VisionTower::keys(&config());
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "a tensor is asked for twice");
+        assert!(
+            keys.iter()
+                .all(|key| key.starts_with(&format!("{PREFIX}."))),
+            "a key lies outside {PREFIX}"
+        );
+        // The tower is one patch embed, one position table, 27 blocks of six projections and two
+        // norms, and the merger with its three DeepStack copies.
+        assert_eq!(keys.len(), 12 * config().depth as usize + 15);
     }
 
     #[test]

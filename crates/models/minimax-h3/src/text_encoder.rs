@@ -650,6 +650,32 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
+    /// Every checkpoint tensor this encoder reads, by name.
+    ///
+    /// The names are the sharded reads' own: a tensor-parallel degree splits a tensor's rows and
+    /// never renames it, so one list answers for every rank of a deployment and needs no partition.
+    /// `load` asks for these and only these, so a checkpoint that lacks one is refused by name
+    /// before a byte is read rather than surfacing as a read error inside a layer.
+    pub fn keys(config: &TextEncoderConfig) -> Vec<String> {
+        let mut keys = vec![format!("{PREFIX}.embed_tokens.weight")];
+        for index in 0..config.num_retained_layers {
+            let name = format!("{PREFIX}.layers.{index}");
+            let attention = format!("{name}.self_attn");
+            for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                keys.push(format!("{attention}.{projection}.weight"));
+            }
+            for norm in ["q_norm", "k_norm"] {
+                keys.push(format!("{attention}.{norm}.weight"));
+            }
+            keys.push(format!("{name}.input_layernorm.weight"));
+            keys.push(format!("{name}.post_attention_layernorm.weight"));
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                keys.push(format!("{name}.mlp.{projection}.weight"));
+            }
+        }
+        keys
+    }
+
     /// The encoder of `config`, reading the checkpoint through `loader`.
     ///
     /// `dtype` is the activation element type the loading boundary chose. The stack is built for
@@ -1615,6 +1641,26 @@ mod tests {
     /// The checkpoint's placeholder token ids.
     const IMAGE: u32 = 151_655;
     const VIDEO: u32 = 151_656;
+
+    /// Every tensor the encoder reads is named once, and under the language stack's prefix.
+    ///
+    /// A name asked twice is read twice and reported twice by a missing-name check; a name outside
+    /// the prefix would collide with the vision tower's tensors in the same export.
+    #[test]
+    fn keys_are_unique_and_inside_the_language_model() {
+        let config = crate::config::tests_support::released_config().text_encoder;
+        let keys = TextEncoder::keys(&config);
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "a tensor is asked for twice");
+        assert!(
+            keys.iter()
+                .all(|key| key.starts_with(&format!("{PREFIX}."))),
+            "a key lies outside {PREFIX}"
+        );
+        // One embedding, then eleven tensors per retained layer: four projections, two per-head
+        // norms, two layer norms and the gated MLP's three.
+        assert_eq!(keys.len(), 11 * config.num_retained_layers as usize + 1);
+    }
 
     /// The released text encoder's configuration.
     fn config() -> TextEncoderConfig {
