@@ -590,6 +590,7 @@ impl Retained {
     /// worker's own and the reclaimable ones as free.
     pub(crate) fn scope_bytes(&self, device: DeviceId) -> Result<ScopeBytes> {
         let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
         let listing = state
             .client
             .list()
