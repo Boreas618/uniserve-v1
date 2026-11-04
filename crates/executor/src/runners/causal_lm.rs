@@ -2817,7 +2817,7 @@ pub fn calls_output(
 /// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
 /// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
 /// host argmax of the row's kept logits (`greedy_first_tokens`).
-fn refuse_mixed_sampling(variant: Variant, parameters: &[f32]) -> Result<()> {
+fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> Result<()> {
     if !variant.is_decode() {
         return Ok(());
     }
@@ -2870,19 +2870,19 @@ mod tests {
         };
 
         assert!(
-            refuse_mixed_sampling(Variant::DecodeGreedy, &rows(&[0.0, 0.0])).is_ok(),
+            refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.0, 0.0])).is_ok(),
             "two greedy rows were refused by a greedy bucket"
         );
         assert!(
-            refuse_mixed_sampling(Variant::DecodeSampled, &rows(&[0.7, 1.0])).is_ok(),
+            refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &rows(&[0.7, 1.0])).is_ok(),
             "two sampled rows were refused by a sampling bucket"
         );
         assert!(
-            refuse_mixed_sampling(Variant::PrefillOutput, &rows(&[0.0, 0.7])).is_ok(),
+            refuse_mixed_sampling(crate::plan::Variant::PrefillOutput, &rows(&[0.0, 0.7])).is_ok(),
             "a prompt-ending greedy row was refused inside a drawing prefill bucket"
         );
 
-        let error = refuse_mixed_sampling(Variant::DecodeSampled, &rows(&[0.7, 0.0]))
+        let error = refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &rows(&[0.7, 0.0]))
             .expect_err("a greedy row was drawn from in a sampling bucket");
         let text = error.to_string();
         assert!(
@@ -2890,7 +2890,7 @@ mod tests {
             "the refusal names neither the bucket nor the row: {text}"
         );
 
-        let error = refuse_mixed_sampling(Variant::DecodeGreedy, &rows(&[0.5]))
+        let error = refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.5]))
             .expect_err("a sampled row was argmaxed in a greedy bucket");
         assert!(
             error.to_string().contains("decode_greedy"),
