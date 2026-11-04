@@ -37,7 +37,13 @@ use crate::{Error, Op, Result, Twins};
 pub struct Descriptor {
     /// Element type of the keys and values being written.
     pub dtype: DType,
-    /// Element type of the cache: the same, or FP8 for an FP8 cache.
+    /// Element type of the cache.
+    ///
+    /// It is the source's own: this operator moves values, it does not encode them. An FP8 cache is
+    /// filled by [`KvQuantize`], which divides by the page's scale on the way in, and a launch that
+    /// asks this one for a narrower cache is refused rather than writing values no reader could
+    /// interpret (a reader of an FP8 plane multiplies by a scale this operator would not have
+    /// applied).
     pub kv: DType,
     /// Tokens per page.
     pub page: u32,
@@ -103,6 +109,19 @@ impl Op for KvWrite {
         let head_dim = u64::from(descriptor.head_dim);
         let row = heads * head_dim;
         let tokens = args.key.rows();
+        // The cache is filled in the source's type. An FP8 cache needs the page's scale applied
+        // first, which is `kv_quantize`'s job: allowing it here would write values that a reader
+        // multiplies by a scale they never had applied, which is wrong by orders of magnitude
+        // rather than by a rounding.
+        if descriptor.kv != descriptor.dtype {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "this writes a {} cache from {} values; an FP8 cache is filled by kv_quantize",
+                    descriptor.kv, descriptor.dtype
+                ),
+            ));
+        }
         args.key
             .require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))?;
         args.value
