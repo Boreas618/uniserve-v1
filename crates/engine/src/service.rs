@@ -1080,8 +1080,11 @@ fn submit_all(
         };
         let arrival = arrival_of(id, &request, recovered);
         let Some(index) = recovered.or_else(|| routing.route(&arrival)) else {
+            // The route policy could not answer — it failed and no previous
+            // policy could take over, or no rank is alive to serve — so the
+            // request cannot be placed in this epoch (§7.3).
             let (event, _) = Event::Error {
-                message: "the engine is unavailable after a worker failure".to_owned(),
+                message: "the engine has no policy to route this request".to_owned(),
             }
             .to_wire(id);
             routing.send(front, Frame::plain(from_engine::Kind::Event(event)));
