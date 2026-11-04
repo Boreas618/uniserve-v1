@@ -1091,6 +1091,39 @@ mod tests {
         }
     }
 
+    /// Submits while letting `pace`'s engine take the step an acceptance
+    /// needs.
+    ///
+    /// A paced simulator executes a batch only when the test sends it a
+    /// permit, and accepting a submission is one of the things it takes a step
+    /// for. A submit that waited for that acceptance while nothing stepped
+    /// would be waiting for the permit the test sends only after it returns:
+    /// a wait of the fixture's making, not the daemon's. The submission is
+    /// polled every grace interval and given a permit while it is still
+    /// pending, so a submission the engine accepts at once is unchanged.
+    async fn submit_stepped(
+        pace: &engine::Pace,
+        what: &str,
+        submitting: impl std::future::Future<Output = Result<(RequestEvents, Option<u32>), SubmitError>>,
+    ) -> Result<(RequestEvents, Option<u32>), SubmitError> {
+        const GRACE: Duration = Duration::from_millis(20);
+        tokio::pin!(submitting);
+        let deadline = Instant::now() + STALL;
+        loop {
+            match tokio::time::timeout(GRACE, &mut submitting).await {
+                Ok(answered) => return answered,
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{what} did not answer within {} s even while its engine stepped",
+                        STALL.as_secs()
+                    );
+                    pace.step();
+                }
+            }
+        }
+    }
+
     /// Steps `pace`'s engine until the consumer of `events` read what
     /// `phase` names, reading every event on the way into `read`.
     async fn advance(
@@ -1180,7 +1213,8 @@ mod tests {
 
         let hold = Arc::new(RequestHold::new());
         hold.serve(Arc::clone(&first));
-        let (mut events, _) = within(
+        let (mut events, _) = submit_stepped(
+            &pace,
             "the migrator's second submit",
             Migrator::new(Arc::clone(&hold), 0).submit(Request::Generation(Box::new(request))),
         )
