@@ -166,10 +166,17 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         latent_seed: 0,
     };
     let model_name = first.model_name().to_owned();
+    // The policy the epoch serves with, installed before the first submission
+    // (§7.3 steps 2 and 3): a simulated engine has no Program Server to
+    // command one, and an engine whose route instance is unset places no
+    // request at all.
+    let (policy, module) = engine::packaged_policy(engine::BatchCapacity::of(first.info()));
+    let source: Arc<dyn engine::PolicySource + Send + Sync> =
+        Arc::new(engine::PolicyBytes::new(module));
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
         .name("sim-engine".into())
-        .spawn(move || engine::serve_requests(engine, cores))
+        .spawn(move || engine::serve_requests(engine, cores, policy, source))
         .expect("start the simulated engine");
     EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
