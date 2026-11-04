@@ -1298,7 +1298,21 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.counters = Some(counters);
     }
 
-    fn discard(&mut self, generation: u64) {
+    fn discard(&mut self, generation: u64) -> Result<()> {
+        // A generation in service is not a prepared one: discarding it would take the graphs that
+        // serve batches away and leave the device able to answer nothing. The engine discards the
+        // update it abandoned on a drain, which is always newer than the serving generation, so a
+        // number that names either of the two live ones is a fault of the caller and is refused by
+        // name rather than obeyed.
+        let serving = self.generation.number();
+        let probation = self.previous.as_ref().map(|previous| previous.number());
+        if generation == serving || probation == Some(generation) {
+            return Err(Error::Invariant(format!(
+                "generation {generation} is one this runner serves (serving {serving}, probation {}) \
+                 and cannot be discarded",
+                probation.map(|number| number.to_string()).unwrap_or_else(|| "none".into())
+            )));
+        }
         // A prepared generation that never served: its graphs go, then their arena regions where
         // no other generation holds the bucket, in `Captured`'s order. The serving generation and
         // probation's old one are keyed separately and are not touched.
@@ -1329,6 +1343,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             generation,
             "discarded a prepared generation that never served"
         );
+        Ok(())
     }
 
     fn purge(&mut self, generation: u64) {

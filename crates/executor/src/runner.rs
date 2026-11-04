@@ -107,7 +107,10 @@ pub trait Runner: Send {
     ///
     /// This is not `purge`, which drops what is *older* than the serving generation: a precopy that
     /// was abandoned leaves a generation *newer* than it, and only this call reaches that.
-    fn discard(&mut self, generation: u64);
+    /// Abandons a prepared generation: its graphs go, then the arena regions no live generation
+    /// holds. A generation this runner serves - the serving one or probation's old one - is refused
+    /// by name: discarding it would take away the graphs that answer batches.
+    fn discard(&mut self, generation: u64) -> Result<()>;
 
     /// Gives the runner the device's graph pools, before its first capture.
     ///
