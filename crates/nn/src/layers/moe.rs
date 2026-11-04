@@ -777,33 +777,44 @@ impl Moe {
         // later step of the block is sized from.
         let routes = self.route(f, hidden)?;
 
-        // 4-6 are not the dense block's, and they are refused here rather than half-built. The
-        // encoded products read E2M1 activations with their own block scales, one FP8 scale per
-        // sixteen elements of the contraction, so each product's activation operand is produced by
-        // `nvfp4_quantize` rather than by the caller: `expert_gather` (`[tokens, hidden]` → the
-        // expanded route rows) → `nvfp4_quantize` → `gather_gemm_nvfp4`, then the gated epilogue →
-        // `nvfp4_quantize` → `route_gemm_nvfp4` → `moe_unpermute`. Two facts of that chain are not
-        // this layer's to settle:
+        // 4-6 are the packed pair's own chain, and they are refused here rather than half-built.
+        // The encoded products read E2M1 activations with their own block scales, so each operand
+        // is produced by `nvfp4_quantize` inside this block:
         //
-        // 1. **The row expansion has no operator.** `expert_gather` maps route ids through the
-        //    expert-parallel table; nothing in the store gathers `[tokens, width]` rows into the
-        //    expanded `[routes, width]` buffer the encoded products require. The dense pair gathers
-        //    its own A inside the product through `permuted_to_expanded`, which is why its operand
-        //    stays `[tokens, hidden]` and why it needs no such step.
-        // 2. **The encoder's one scalar** is the artifact's constant `1 / (448 · 6)`, folded into the
-        //    block scales rather than passed per request: it belongs in `nvfp4_quantize`'s
+        //   1. `nvfp4_quantize(hidden)` — `[tokens, hidden]` BF16 → packed E2M1 values
+        //      `[tokens, hidden / 2]`, activation block scales, and the per-token scale both
+        //      products read as `hidden_token_scale`;
+        //   2. `gather_gemm_nvfp4` — the token-major gather product: it reads the encoding above
+        //      with `numTokens` and `permutedIdxToTokenIdx`, gathers the rows itself, and writes the
+        //      gated BF16 output one row per route;
+        //   3. `nvfp4_quantize(gated)` — the same encoding over `[routes, intermediate]`, whose
+        //      per-token scale is one per route;
+        //   4. `route_gemm_nvfp4` — the down product, one row per route;
+        //   5. `moe_unpermute` — the `top` repeats of each token summed in FP32, one rounding.
+        //
+        // No row-expansion operator appears: the encoded gather is token-major by the design's
+        // ruling, and the product reads `permutedIdxToTokenIdx` to expand as it multiplies. Two
+        // facts of the chain are not this layer's to invent:
+        //
+        // 1. **`nvfp4_quantize` writes no per-token scale.** Its operand set is `input`, `values`,
+        //    `scales` and the checkpoint's `global_scale`; the per-token factor both products take
+        //    as `hidden_token_scale` (`[tokens]` for FC1, `[routes]` for FC2) is computed in the same
+        //    pass over a row as its block scales, so it belongs on the encoder's operand set rather
+        //    than in a second kernel or in this layer.
+        // 2. **The encoder's one scalar** is the artifact's constant `1 / (448 · 6)`, folded into
+        //    the block scales rather than passed per request: it belongs in `nvfp4_quantize`'s
         //    descriptor, and a layer that synthesised a device value for it would be inventing a
         //    number the design puts elsewhere.
         //
         // The scratch the two products need is already stated by [`Self::workspace_bytes`] over the
         // plan's route count, so nothing else in the step waits on this.
         Err(Error::Unsupported(format!(
-            "Moe::forward_encoded: the encoded expert products read E2M1 activations, and this \
-             block does not encode them — the expanded-row gather the encoded operand needs has no \
-             operator in the store, and the encoder's global scale is the artifact's constant \
-             1/(448·6), which belongs in `nvfp4_quantize`'s descriptor rather than in a layer. The \
-             block's {} experts and {} hidden elements are built, its scratch is {} bytes for {} \
-             routes, and the dense path is unaffected",
+            "Moe::forward_encoded: the encoded products read E2M1 activations and the five launches \
+             that produce them are stated, but `nvfp4_quantize` has no per-token scale output — the \
+             `hidden_token_scale` `[tokens]` (FC1) and `[routes]` (FC2) operand both products read — \
+             and its descriptor has no field for the encoder's constant 1/(448·6). The block's {} \
+             experts and {} hidden elements are built, its scratch is {} bytes for {} routes, and \
+             the dense path is unaffected",
             self.experts,
             self.hidden,
             self.workspace_bytes(routes.rows),
