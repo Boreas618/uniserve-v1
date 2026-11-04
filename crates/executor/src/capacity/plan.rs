@@ -461,7 +461,9 @@ pub fn token_plan(
 /// table needs at that page size.
 pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
     let total_bytes = match facts.device {
-        Device::Cuda(index) => crate::capacity::device::total_bytes(index)?,
+        // What the rank may plan into is what is LEFT: the weights are already on the device, so
+        // the pools fit into the free bytes and not into the device's total.
+        Device::Cuda(index) => crate::capacity::device::available_bytes(index)?,
         Device::Cpu => 0,
     };
     let request = CapacityRequest {
