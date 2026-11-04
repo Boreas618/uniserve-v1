@@ -1560,6 +1560,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.generation_named(generation)?;
         let current = self.generation.number();
+        // Preparing a bucket for the generation it already serves from would replace a live graph
+        // under a batch that is running on it. `precopy` names the generation it prepares, and an
+        // update that changes nothing prepares no bucket at all, so this is a disagreement.
+        if generation == current {
+            return Err(Error::Invariant(format!(
+                "a rebind names bucket {bucket}'s serving generation {current} as the one it \
+                 prepares"
+            )));
+        }
         if self.graphs.captured(bucket, current).is_none() {
             return Err(Error::Invariant(format!(
                 "no graph of bucket {bucket} in generation {current}"
