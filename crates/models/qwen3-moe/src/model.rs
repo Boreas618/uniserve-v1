@@ -542,6 +542,51 @@ impl Qwen3Moe {
         )
     }
 
+    /// The router's choice at one layer, from that layer's own input rows.
+    ///
+    /// `hidden` is the layer's input — the reference's `hidden_{layer}`, not its output — `[tokens,
+    /// hidden]`; `ids` and `weights` are the caller's `[tokens, top]` i32 and F32. The layer's input
+    /// norm runs, then its router: no attention, no expert, no other layer, and no fold into the
+    /// stream, so nothing here can be confused with a state.
+    ///
+    /// The ids are the checkpoint's expert indices, before the expert map. This is the only way a
+    /// caller gets the model's own routing for a layer: [`nn::layers::Moe::route`] takes rows the
+    /// input norm has already produced, and the layers are private, so a comparison against a
+    /// reference's `layer.mlp.gate` needs this call or none.
+    ///
+    /// A layer whose MLP is dense has no router, and is refused by name.
+    pub fn route(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        layer: usize,
+        ids: TensorView,
+        weights: TensorView,
+    ) -> Result<()> {
+        if layer >= self.layers.len() {
+            return Err(Error::Config(format!(
+                "layer {layer} was asked for but the model has {}",
+                self.layers.len()
+            )));
+        }
+        let tokens = hidden.rows();
+        let plan = self.plan(tokens)?;
+        if hidden.shape.rank() != 2
+            || hidden.shape.dim(0) != tokens
+            || hidden.shape.dim(1) != plan.hidden
+        {
+            return Err(Error::Config(format!(
+                "hidden is {:?}, [{tokens}, {}] expected",
+                hidden.shape.dims(),
+                plan.hidden
+            )));
+        }
+        let normalized = f
+            .arena()
+            .tensor(hidden.dtype, Shape::new(&[tokens, plan.hidden]))?;
+        self.layers[layer].route(f, hidden, normalized, ids, weights)
+    }
+
     /// Run layers `start..=last` on the caller's rows, and answer the state after `last` (with
     /// `stage = None`) or that cut inside it.
     ///
@@ -760,6 +805,24 @@ impl DecoderLayer {
     /// `stop` cuts the layer short for an in-layer walk and answers the tensor that cut produces;
     /// the sublayers it skips are not launched at all. With `stop = None` the answer is `update`,
     /// the layer's output.
+    /// The router's choice at this layer: its own input norm, then its router, and nothing else.
+    ///
+    /// `hidden` is the layer's *input* — the residual stream below it — and `normalized` is the
+    /// caller's row buffer, because the norm's answer is what the router reads. This is the cut a
+    /// routing comparison needs: the ids it produces come from the same rows through the same norm
+    /// as the forward's, so a reference's `layer.mlp.gate` output compares with them directly.
+    fn route(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        normalized: TensorView,
+        ids: TensorView,
+        weights: TensorView,
+    ) -> Result<()> {
+        self.input_norm.forward(f, hidden, normalized)?;
+        self.mlp.route(f, normalized, ids, weights)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the layer runs the reference's tuple through the plan's buffers"
@@ -890,6 +953,28 @@ impl AttentionLayer {
             group.all_reduce_sum(out, f.stream).map_err(Error::from)?;
         }
         Ok(())
+    }
+}
+
+impl Mlp {
+    /// The router's choice for this sublayer, on rows the layer's input norm already produced.
+    ///
+    /// A dense MLP has no router: the checkpoint's `mlp_only_layers` give such a layer a plain
+    /// gated MLP, so there are no expert ids to answer and this refuses rather than inventing them.
+    fn route(
+        &self,
+        f: &Forward,
+        normalized: TensorView,
+        ids: TensorView,
+        weights: TensorView,
+    ) -> Result<()> {
+        match self {
+            Mlp::Experts(moe) => moe.route(f, normalized, ids, weights).map_err(Error::from),
+            Mlp::Dense(_) => Err(Error::Config(
+                "this layer's MLP is dense: it chooses no experts, so it has no routing to answer"
+                    .to_owned(),
+            )),
+        }
     }
 }
 
