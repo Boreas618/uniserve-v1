@@ -58,14 +58,21 @@ fn main() -> ExitCode {
     };
 
     if !not_walked.is_empty() {
-        println!("# the walk states {} component(s) it does not walk:", not_walked.len());
+        println!(
+            "# the walk states {} component(s) it does not walk:",
+            not_walked.len()
+        );
         for component in &not_walked {
             println!("#   not walked: {component}");
         }
         println!("# a delta below covers only the components the walk reached");
     }
 
-    println!("# {} rows in the fixture, {} in the walk", fixture_rows.len(), walk_rows.len());
+    println!(
+        "# {} rows in the fixture, {} in the walk",
+        fixture_rows.len(),
+        walk_rows.len()
+    );
 
     let only_fixture: Vec<&String> = fixture_rows.difference(&walk_rows).collect();
     let only_walk: Vec<&String> = walk_rows.difference(&fixture_rows).collect();
@@ -84,12 +91,10 @@ fn main() -> ExitCode {
         .iter()
         .filter_map(|row| row.split_once('\t').map(|(operator, _)| operator))
         .collect();
-    let (dangerous, unbound): (Vec<&String>, Vec<&String>) = only_fixture
-        .iter()
-        .partition(|row| {
-            row.split_once('\t')
-                .is_some_and(|(operator, _)| walk_operators.contains(operator))
-        });
+    let (dangerous, unbound): (Vec<&String>, Vec<&String>) = only_fixture.iter().partition(|row| {
+        row.split_once('\t')
+            .is_some_and(|(operator, _)| walk_operators.contains(operator))
+    });
 
     report(
         "only in the fixture, operator the walk also launches",
@@ -101,7 +106,11 @@ fn main() -> ExitCode {
         &unbound,
         "a replaced design, or a component the walk has not bound",
     );
-    report("only in the walk", &only_walk, "the walk states a program the fixture lacks");
+    report(
+        "only in the walk",
+        &only_walk,
+        "the walk states a program the fixture lacks",
+    );
 
     if only_fixture.is_empty() && only_walk.is_empty() {
         println!("# verdict: the fixture is the walk's rows");
@@ -117,7 +126,8 @@ fn main() -> ExitCode {
 
 /// The rows of one print, and the components it says it did not walk.
 fn read(path: &Path) -> Result<(BTreeSet<String>, Vec<String>), String> {
-    let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut rows = BTreeSet::new();
     let mut not_walked = Vec::new();
     for line in text.lines() {
