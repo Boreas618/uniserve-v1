@@ -1122,7 +1122,15 @@ struct GeGlu {
 }
 
 impl AudioEncoder {
-    /// The latent frames `samples` samples encode to, and the channel count of the output.
+    /// The latent frames `samples` samples encode to.
+    ///
+    /// A whole number of latent frames is required, and this is the one place the H3 encoder is
+    /// stricter than the reference's declaration: `encoding.py:244` sizes the output as
+    /// `ceil(samples / latent_rate)`, while its own strided convolutions compute
+    /// `floor((length + 2·ceil(stride/2) − 2·stride) / stride) + 1` per stage, which for the rates
+    /// `2, 4, 4, 5, 5` reaches `samples / 800` only when that division is exact. A reference track of
+    /// any other length would therefore have a declared row that no stage writes; here it is a named
+    /// error instead, and every length the reference can actually encode is accepted unchanged.
     pub fn frames(&self, samples: u64) -> Result<u64> {
         let hop = self.hop();
         if samples == 0 || !samples.is_multiple_of(hop) {
