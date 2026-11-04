@@ -264,7 +264,9 @@ def test_an_incomplete_run_is_not_comparable(tmp_path: Path) -> None:
 def test_a_run_must_score_every_selected_row(tmp_path: Path) -> None:
     """The binomial denominator is the selected sample size."""
     reference = _BundleWriter(tmp_path / "reference").write()
-    candidate = _BundleWriter(tmp_path / "candidate").write(total=1000)
+    candidate = _BundleWriter(tmp_path / "candidate").write(
+        selected_count=1319, total=1000
+    )
 
     with pytest.raises(ValueError, match="rows"):
         compare_runs(reference, candidate)
@@ -292,11 +294,13 @@ def _run_compare(argv: list[str]) -> int:
     previous = sys.argv
     sys.argv = ["uniserve-eval", *argv]
     try:
-        with pytest.raises(SystemExit) as exit_info:
+        try:
             main()
-        return int(exit_info.value.code)
+        except SystemExit as exit_info:
+            return int(exit_info.value.code or 0)
     finally:
         sys.argv = previous
+    return 0
 
 
 def test_command_exit_status_reports_the_verdict(tmp_path: Path) -> None:
