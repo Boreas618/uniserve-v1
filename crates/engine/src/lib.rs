@@ -61,6 +61,8 @@ pub use crate::kv_cache::{HostCacheSize, IndexedPage};
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::submission::Submissions;
 #[cfg(feature = "testing")]
+pub use crate::scheduler::testing::packaged_module;
+#[cfg(feature = "testing")]
 pub use crate::scheduler::testing::packaged_policy;
 pub use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
@@ -72,8 +74,6 @@ pub use crate::scheduler::{
     Validators, WorkerStats, arrival_view, ceilings_of,
 };
 pub use crate::service::{continuation_slot, run_engine, serve_requests};
-#[cfg(feature = "testing")]
-pub use crate::scheduler::testing::{packaged_module, packaged_policy};
 #[cfg(feature = "testing")]
 pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,
