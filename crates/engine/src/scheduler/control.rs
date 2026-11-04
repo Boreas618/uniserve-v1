@@ -40,8 +40,6 @@ fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
     }
 }
 
-
-
 /// Who asked for a stage: the scheduler's own handle, which names the step
 /// the stage applied at, or an engine command, which is answered with
 /// whether it applied.
@@ -70,7 +68,6 @@ impl StageAnswer {
         }
     }
 }
-
 
 /// An update's ask that the following step's batches also run in shadow for a
 /// world generation (§7.3 step 2), with the answer that waits for the step which
@@ -448,15 +445,8 @@ impl Scheduler {
         let engine = policy::process_engine().map_err(|error| error.to_string())?;
         let room = state.room.clone();
         let checked = mechanism::Checked::new(&live, &room);
-        let candidate = PolicySlot::prepare(
-            engine,
-            source,
-            program,
-            state,
-            &ceilings,
-            &checked,
-        )
-        .map_err(|error| error.to_string())?;
+        let candidate = PolicySlot::prepare(engine, source, program, state, &ceilings, &checked)
+            .map_err(|error| error.to_string())?;
         self.policy_prepared = Some(candidate);
         self.request_stage(Stage::Switchover, None, None);
         self.apply_policy_stage();
@@ -664,7 +654,12 @@ impl Scheduler {
     /// `at` is the step an expert group agreed to cut over at, when a peer main
     /// process named it: the stage then waits for that step and refuses to apply
     /// at any other.
-    fn request_stage(&mut self, stage: Stage, answer: Option<handle::StageAnswer>, at: Option<u64>) {
+    fn request_stage(
+        &mut self,
+        stage: Stage,
+        answer: Option<handle::StageAnswer>,
+        at: Option<u64>,
+    ) {
         // One stage owns the next boundary. A second one is refused with the
         // first's name rather than replacing it: replacing it would drop the
         // first caller's answer, and applying both would change the serving
@@ -830,6 +825,20 @@ impl Scheduler {
         selected
     }
 
+    /// Tells the policy that a request ended, when the mechanism ended it
+    /// itself.
+    ///
+    /// A policy's state is append-only: it learns a request from `Arrived` and
+    /// nothing else about it unless the mechanism says so. A queued request the
+    /// mechanism drops without an `End` stays in the policy's own queue, and
+    /// the next `dispatch` names it in `admit`, where the mechanism refuses it
+    /// as "not queued" — a policy failure, on a name the policy could not have
+    /// known was stale. So every pop of a queue the policy did not fill is
+    /// announced here, with the end that pop means.
+    pub(super) fn announce_end(&mut self, id: RequestId, end: scheduling::guest::event::End) {
+        self.recorder.record(views::ended(id, end));
+    }
+
     /// Records cancellation or abortion across queued, media, and running request states.
     ///
     /// A queued request finishes here with `Aborted` or `Cancelled`. A running
@@ -845,6 +854,9 @@ impl Scheduler {
             } else {
                 FinishReason::Cancelled
             };
+            // Both reasons are the client's will: it cancelled the request, or
+            // it asked for it to be dropped, and the epoch goes on either way.
+            self.announce_end(id, scheduling::guest::event::End::Cancelled);
             let _ = submission.event_tx.send(Event::Finished {
                 reason,
                 stop_reason: None,
@@ -883,6 +895,7 @@ impl Scheduler {
         }
         // A request not yet admitted leaves the waiting queue with its reason.
         if let Some(st) = self.remove_waiting(id) {
+            self.announce_end(id, scheduling::guest::event::End::Cancelled);
             let reason = if abort {
                 FinishReason::Aborted
             } else {
@@ -948,6 +961,7 @@ impl Scheduler {
             .collect();
         for id in queued {
             if let Some(st) = self.remove_waiting(id) {
+                self.announce_end(id, scheduling::guest::event::End::Migratable);
                 let _ = st.output.events.event_tx.send(Event::Migratable {
                     cause,
                     denoised_steps: 0,

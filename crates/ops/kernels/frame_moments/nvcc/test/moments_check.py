@@ -182,12 +182,12 @@ def run(module_dir, channels, groups, frames, height, width, epsilon):
     ):
         error = (candidate - expected).abs()
         allowed = bound * expected.abs()
-        violations = int((error > allowed).sum())
+        violations = int((~(error <= allowed)).sum())
         identical = int(
             (candidate.reshape(-1).view(torch.int32) == expected.reshape(-1).view(torch.int32)).sum()
         )
         print(
-            f"{name}: max |error| {error.max().item():.3e}, rtol {bound:.3e}, "
+            f"{name}: max |error| {torch.nan_to_num(error).max().item():.3e}, rtol {bound:.3e}, "
             f"{violations} of {error.numel()} outside the bound, "
             f"{identical} of {error.numel()} bit-identical"
         )

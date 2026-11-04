@@ -297,15 +297,17 @@ def stage_producer(module, rows, columns, block, layout, global_scale, seed):
     bound = half_step(unit) * scale_of_element.abs()
 
     deviation = (decoded - exact).abs()
-    outside = (deviation > bound).sum().item()
-    worst = deviation.max().item()
+    # `~(deviation <= bound)`, not `deviation > bound`: the comparison must fail on a NaN,
+    # and `NaN > bound` is False — an output that is not a number would count as inside.
+    outside = int((~(deviation <= bound)).sum().item())
+    worst = torch.nan_to_num(deviation, nan=float("inf"), posinf=float("inf")).max().item()
     print(
         f"stage 1 (producer): {rows}x{columns} {layout}, global scale {global_scale:.6g}: "
         f"max |decoded - input| {worst:.4e}, {outside} of {rows * columns} elements "
         f"outside half an E2M1 code step"
     )
     if outside:
-        row, column = (deviation > bound).nonzero()[0].tolist()
+        row, column = (~(deviation <= bound)).nonzero()[0].tolist()
         print(
             f"  first: [{row}, {column}] input {exact[row, column].item():.6e} "
             f"decoded {decoded[row, column].item():.6e} "

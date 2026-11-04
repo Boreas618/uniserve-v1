@@ -238,7 +238,7 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   transfer/                   Local, shared-memory, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host pools, capacity planning
-crates/uniserve/              The `uniserve` executable: `serve`, `engine`, `worker` and `storage`
+src/                          The root package, `uniserve`: one module per command (`serve`, `frontend`, `engine`, `worker`, `storage`, `program-server`)
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   runner/                     The Python half of each runner, which the worker runtime calls
   worker.py                   Rank process entry: loads the worker runtime and hands it the library's import function

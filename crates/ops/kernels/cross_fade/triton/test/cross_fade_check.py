@@ -64,31 +64,27 @@ def blend_decoded_overlap(previous, current, extent, dim):
     return torch.cat((blended, current[tuple(remainder)]), dim=dim)
 
 
-def round_to_bf16(values):
-    """FP32 values rounded to BF16 the way hardware rounds them: to nearest, ties to even.
+def truncate_to_bf16(values):
+    """FP32 values as Triton's interpreter leaves them in a BF16 tile: **truncated**.
 
-    Torch's own f32 -> bf16 cast rounds an exact tie **away from zero** on the CPU (measured: 1.005859375
-    becomes 1.0078125 where round-to-nearest-even gives 1.0), while a device's ``cvt.rn.bf16.f32``
-    rounds ties to even. The operator's blend rounds in the tile's dtype three times, so the two rules
-    disagree at ties and a CPU-torch reference is not the device's reference. This is the hardware
-    rule, written in the bit pattern so the check can hold the kernel to it.
+    Measured, not assumed: a store of 4,096 FP32 values into BF16 matches the truncation of all
+    4,096 — the low 16 mantissa bits dropped — and a round-to-nearest cast of only 2,038 of them.
+    F16 and F32 stores round to nearest. So a BF16 kernel's own stores are reproduced exactly by
+    truncating in the reference, which is why the blend can be compared bit for bit in BF16 and not
+    merely on a bound (`notes/programs/kernel-arithmetic-checks.md`).
     """
     bits = values.to(torch.float32).reshape(-1).numpy().view(np.uint32).copy()
-    least_bit = (bits >> np.uint32(16)) & np.uint32(1)
-    bits = (bits + np.uint32(0x7FFF) + least_bit) >> np.uint32(16)
-    rounded = bits.astype(np.uint16).view(np.uint16)
-    as_bits = np.zeros(rounded.shape, dtype=np.uint32)
-    as_bits[:] = rounded
-    return torch.from_numpy((as_bits << np.uint32(16)).view(np.float32)).reshape(values.shape)
+    bits &= np.uint32(0xFFFF0000)
+    return torch.from_numpy(bits.view(np.float32)).reshape(values.shape)
 
 
-def blend_rounding_to_even(previous, current, extent, dim):
-    """``blend_decoded_overlap`` with every step rounded to BF16 by the hardware's rule, in FP32."""
+def blend_narrowed_to_bf16(previous, current, extent, dim):
+    """``blend_decoded_overlap`` with every store narrowed into BF16 by truncation, in FP32."""
     previous = previous.to(torch.float32)
     current = current.to(torch.float32)
-    positions = round_to_bf16(torch.arange(extent, dtype=torch.float32))
-    ratio = round_to_bf16(positions / round_to_bf16(torch.tensor([float(extent)]))[0])
-    previous_weight = round_to_bf16(torch.ones_like(ratio) - ratio)
+    positions = truncate_to_bf16(torch.arange(extent, dtype=torch.float32))
+    ratio = truncate_to_bf16(positions / truncate_to_bf16(torch.tensor([float(extent)]))[0])
+    previous_weight = truncate_to_bf16(torch.ones_like(ratio) - ratio)
 
     shape = [1] * current.ndim
     shape[dim] = extent
@@ -96,9 +92,9 @@ def blend_rounding_to_even(previous, current, extent, dim):
     current_slice = [slice(None)] * current.ndim
     previous_slice[dim] = slice(-extent, None)
     current_slice[dim] = slice(0, extent)
-    blended = round_to_bf16(
-        round_to_bf16(previous[tuple(previous_slice)] * previous_weight.view(shape))
-        + round_to_bf16(current[tuple(current_slice)] * ratio.view(shape))
+    blended = truncate_to_bf16(
+        truncate_to_bf16(previous[tuple(previous_slice)] * previous_weight.view(shape))
+        + truncate_to_bf16(current[tuple(current_slice)] * ratio.view(shape))
     )
     if extent == current.shape[dim]:
         return blended
@@ -167,45 +163,23 @@ def run(module, *, channels, frames, rows, columns, extent, axis, dtype, alias, 
     )
 
     if dtype == "bf16":
-        # The reference's expression, rounded the way a device rounds it: see `round_to_bf16`.
-        expected = blend_rounding_to_even(previous, original, extent, axis)
-        expected = expected.to(torch.bfloat16)
+        # The reference's expression, narrowed the way the interpreter narrows: see
+        # `truncate_to_bf16`. The comparison below is then bit for bit, as for the other two types.
+        expected = blend_narrowed_to_bf16(previous, original, extent, axis).to(torch.bfloat16)
     else:
         expected = blend_decoded_overlap(previous, original, extent, axis)
     got = out
-    # The comparison is in the order the two-bit-wide types' bit patterns: an f16 or f32 kernel must
-    # produce the reference's bits, because every cast on the way is exact or round-to-nearest in
-    # both implementations. BF16 is the exception and the reason is a cast, not the blend: torch's
-    # f32 -> bf16 conversion rounds an exact tie **away from zero**, while NVIDIA's `cvt.rn.bf16`
-    # (and so a device kernel) rounds it to even. The two differ by one ulp of the tile type at a
-    # tie, and only there, so bf16 is compared within one ulp and the differing count is reported.
+    # The comparison is bit for bit in all three types. F16 and F32 round to nearest in the
+    # interpreter as the hardware does; BF16 is narrowed by truncation, which the reference
+    # reproduces (`truncate_to_bf16`), and the measured rule is in
+    # `notes/programs/kernel-arithmetic-checks.md`. What this check therefore proves about a BF16
+    # blend is its arithmetic and its narrowing points, not a bound that could hide one of them.
     got_bits = got.reshape(-1).to(torch.int32) if element == torch.float32 else (
         got.reshape(-1).view(torch.int16).to(torch.int32)
     )
     want_bits = expected.reshape(-1).to(torch.int32) if element == torch.float32 else (
         expected.reshape(-1).view(torch.int16).to(torch.int32)
     )
-    if dtype == "bf16":
-        # BF16 is judged on a bound, and the reason is the interpreter rather than the kernel: its
-        # f32 -> bf16 conversion is not round-to-nearest at an exact tie — measured, 1.005859375
-        # comes out 1.0 while 0.666015625 comes out 0.66796875, so it rounds some ties down and
-        # others up, matching neither torch's cast nor the hardware's. The blend rounds four times
-        # (the two weights and the two products and the sum), each within the tile type's unit
-        # roundoff of the operands, so the bound is `64 · 2**-9` of the larger operand — the same
-        # arithmetic the operator declares exactly, with the interpreter's cast noise allowed for.
-        margin = 64.0 * 2.0**-9 * torch.maximum(original.abs().to(torch.float32),
-                                                previous.abs().to(torch.float32))
-        error = (got.to(torch.float32) - expected.to(torch.float32)).abs()
-        differing = int((error > margin).sum())
-        if differing:
-            position = int((error > margin).reshape(-1).nonzero()[0])
-            raise SystemExit(
-                f"bf16 axis {axis} extent {extent}: {differing} of {got.numel()} values outside "
-                f"the blend's bound; first at {position}: "
-                f"{float(got.reshape(-1)[position])} vs {float(expected.reshape(-1)[position])}, "
-                f"margin {float(margin.reshape(-1)[position]):.3e}"
-            )
-        return got.numel(), int((error != 0).sum())
     distance = (got_bits - want_bits).abs()
     differing = int((distance != 0).sum())
     if differing:
@@ -266,8 +240,7 @@ def main():
     checked += 1
     print(
         f"ok: {checked} launches, f16 and f32 bit for bit (the fixture's cell is f16), both axes, "
-        f"aliased and strided destinations; bf16 on the blend's bound, because the interpreter's "
-        f"f32 -> bf16 cast is not round-to-nearest at a tie"
+        f"aliased and strided destinations, bf16 bit for bit with its truncating store reproduced"
     )
     return 0
 
