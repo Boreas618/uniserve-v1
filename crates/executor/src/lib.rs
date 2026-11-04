@@ -16,17 +16,18 @@
 //!   makes them writable again at the same addresses, so captured graphs stay
 //!   valid (§8).
 
+pub mod blocking;
 pub mod completion;
 pub mod config;
 pub mod error;
 pub mod host;
+pub mod hot_update;
 pub mod keys;
 pub mod memory;
 pub mod parallel;
 pub mod stream;
 pub mod tensor;
 pub mod transfer;
-pub mod blocking;
 pub mod watchdog;
 
 pub use completion::Outcome;
