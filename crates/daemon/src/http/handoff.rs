@@ -50,7 +50,10 @@ pub(crate) fn now_ns() -> u64 {
 pub(crate) enum Decision {
     /// The successor did not take the response over; write it here.
     Resume,
-    /// The successor owns the response; drop it and cancel its request.
+    /// The successor owns the response. This process ends its consumption
+    /// of the request's engine stream without cancelling it (the engine's
+    /// next consumer takes the stream over, design §7.5.1 step 4), drops the
+    /// socket, and never writes on it again.
     Adopt,
 }
 

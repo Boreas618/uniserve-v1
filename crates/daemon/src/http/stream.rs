@@ -99,8 +99,15 @@ pub(crate) trait Session: Send + 'static {
     /// example because its request cannot migrate.
     fn freeze(&mut self) -> Option<Application>;
 
-    /// Ends the response: the client is gone, or the successor owns it now.
+    /// Ends the response because the client is gone or it failed: cancel the
+    /// request on the engine.
     fn abort(&mut self);
+
+    /// Ends this process's part in the response because a successor took it
+    /// over (design §7.5.1): stop reading the request's engine events and
+    /// give the stream up, so the engine's next consumer takes it over where
+    /// this one stopped. Never cancels the request.
+    fn detach(&mut self);
 }
 
 /// The application state of one frozen response, as the `application` of
@@ -137,7 +144,8 @@ enum Control {
     Pause(oneshot::Sender<Option<Application>>),
     /// The successor did not take the response over: go on producing.
     Resume,
-    /// The successor owns the response: stop, dropping the engine request.
+    /// The successor owns the response: stop, releasing the request's engine
+    /// stream to it (never cancelling the request).
     Adopted,
 }
 
@@ -238,8 +246,9 @@ impl ResponseStream {
         let _ = self.control.send(Control::Resume).await;
     }
 
-    /// The successor owns the response: stop driving it, cancelling the
-    /// request's engine stream.
+    /// The successor owns the response: stop driving it and give the
+    /// request's engine stream up without cancelling it, so the engine sends
+    /// the successor the events after the position this process consumed.
     ///
     /// Waits for the driver: the caller is ending the body, so it cannot
     /// deadlock, and a dropped message would leave the request running here.
@@ -349,9 +358,15 @@ async fn drive(
                 }
                 match control.recv().await {
                     Some(Control::Resume) => continue,
-                    // Adopted, or the connection went away: this process no
-                    // longer owns the response.
-                    _ => {
+                    // Adopted: the successor consumes the request's events
+                    // from here on, and the request keeps generating.
+                    Some(Control::Adopted) => {
+                        session.detach();
+                        return;
+                    }
+                    // The connection went away without a decision: the client
+                    // is gone, so the request ends with it.
+                    None => {
                         session.abort();
                         return;
                     }
