@@ -560,6 +560,10 @@ impl EngineControl {
             rollback_s: None,
             queue_depth: placement.queue_depth,
             world_size,
+            // A process that starts beside its predecessor is the serving
+            // process's standby (§2.5): the spec states the predecessor and
+            // the child has to know the role before it claims storage.
+            standby: spec.predecessor.is_some(),
         })
     }
 
