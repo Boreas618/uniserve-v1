@@ -120,8 +120,10 @@ mod tests {
 
     #[test]
     fn a_pcm_conversion_reads_a_float_signal() {
+        // The program is compiled for f32 input, so every other element type is refused here rather
+        // than at a launch: f32 is the decoder's own output and the only type `pcm_interleave` reads.
         assert!(PcmInterleave::new(DType::F32).is_ok());
-        assert!(PcmInterleave::new(DType::BF16).is_ok());
+        assert!(PcmInterleave::new(DType::BF16).is_err());
         assert!(PcmInterleave::new(DType::I16).is_err());
         assert!(PcmInterleave::new(DType::U8).is_err());
     }

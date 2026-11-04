@@ -70,6 +70,30 @@ fn grouped_workspace_bytes(routes: u64, width: u64) -> u64 {
     pad_1k(row_max) + pad_1k(bars) + 4
 }
 
+/// The preamble a product's entry writes into the shared scratch before the artifact's workspace: a
+/// sixteen-byte header holding the padded route count, then a zeroed FP32 bias of one value per output
+/// column.
+///
+/// The bias is the entry's because every BF16-output kernel of the BMM artifact carries
+/// `BiasType = M`, and this operator has none: the entry supplies the additive identity rather than
+/// letting an uninitialized region reach `x · Wᵀ + bias`. The bytes are the entry's rather than the
+/// artifact's, so they cannot be read from `getWorkspaceSizesInBytes`, and a caller that sized from the
+/// artifact alone would be short by exactly this preamble — which the entry refuses with both numbers
+/// named, before any launch.
+fn entry_preamble(columns: u64) -> u64 {
+    16 + 4 * columns
+}
+
+/// The scratch the encoded pair needs for `routes` permuted rows: one buffer serves both products in
+/// turn, so the larger requirement wins, each carrying its own entry's preamble before the artifact's
+/// planes. The first product writes `2 · intermediate` columns, the second `hidden`.
+fn encoded_scratch_bytes(routes: u64, hidden: u64, intermediate: u64) -> u64 {
+    let gated = intermediate.saturating_mul(2);
+    let first = entry_preamble(gated).saturating_add(grouped_workspace_bytes(routes, gated));
+    let second = entry_preamble(hidden).saturating_add(grouped_workspace_bytes(routes, hidden));
+    first.max(second)
+}
+
 /// `bytes` rounded up to a kibibyte, the artifact's padding of one workspace plane.
 const fn pad_1k(bytes: u64) -> u64 {
     bytes.div_ceil(1024) * 1024
@@ -153,8 +177,7 @@ pub fn encoded_bytes(
     let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
     // One byte per block scale in either element type the field may have.
     let scales = |rows: u64, columns: u64| layout.shape(rows, columns).numel();
-    let scratch = grouped_workspace_bytes(routes, intermediate.saturating_mul(2))
-        .max(grouped_workspace_bytes(routes, hidden));
+    let scratch = encoded_scratch_bytes(routes, hidden, intermediate);
     let mut total: u64 = 0;
     for bytes in [
         tokens * (hidden / 2),  // the activation's packed codes, a byte per two codes
@@ -910,16 +933,17 @@ impl Moe {
         }
     }
 
-    /// The scratch one launch of the encoded products needs, for `routes` permuted rows.
+    /// The scratch one launch of the encoded products needs, for `routes` permuted rows — the exact
+    /// number each product's entry compares its request against.
     ///
     /// One buffer serves both products — they run one after the other on the stream and neither keeps
-    /// a view past its launch — so the answer is the larger of the two products' requirements: the
-    /// gated first product writes `2 · intermediate` columns, the second `hidden`.
+    /// a view past its launch — so the answer is the larger of the two, and each side is its entry's
+    /// preamble plus the artifact's own requirement: the gated first product writes
+    /// `2 · intermediate` columns, the second `hidden`. At the caller's geometry (15 360 rows, 768
+    /// intermediate, 2 048 hidden) that is 6 160 + 740 356 for the first and 8 208 + 987 140 for the
+    /// second, so 995 348 bytes.
     pub fn workspace_bytes(&self, routes: u64) -> u64 {
-        let width = u64::from(self.intermediate).saturating_mul(2);
-        let first = grouped_workspace_bytes(routes, width);
-        let second = grouped_workspace_bytes(routes, u64::from(self.hidden));
-        first.max(second)
+        encoded_scratch_bytes(routes, u64::from(self.hidden), u64::from(self.intermediate))
     }
 
     /// The bytes one routed layer's whole expert step reserves from the arena, for `tokens` rows —
@@ -1556,10 +1580,13 @@ pub(super) mod tests {
         )
     }
 
-    /// The scratch is the plan's, computed from the artifact's arithmetic: a bucket of 8 routes over
-    /// 128 experts costs the row-max planes and tile bars of the wider product, and a bucket twice as
-    /// wide costs more. What it must not be is a floor: the size the largest Qwen3-MoE case needs is
-    /// far below the sixteen mebibytes an earlier constant reserved for it.
+    /// The scratch is the plan's, computed from the artifact's arithmetic and each entry's preamble: a
+    /// bucket of 8 routes over 128 experts costs the row-max planes and tile bars of the wider product,
+    /// and a bucket twice as wide costs more. What it must not be is a floor: the size the largest
+    /// Qwen3-MoE case needs is far below the sixteen mebibytes an earlier constant reserved for it.
+    ///
+    /// The number is the one an entry compares its own request against, so it is stated for the
+    /// geometry a deployment runs: the second product's entry asks 16 + 4 · 2 048 + 987 140.
     #[test]
     fn the_scratch_is_sized_from_the_route_count_and_not_from_a_floor() {
         let quantized = quantized_block(2048, 768).unwrap();
@@ -1567,10 +1594,14 @@ pub(super) mod tests {
         let large = quantized.workspace_bytes(4096);
         assert!(small > 0);
         assert!(large > small, "{large} is not more than {small}");
-        // Both planes are kibibyte-padded and the scheduler's counter is four bytes, so every size
-        // the plan can ask for is congruent to four modulo a kibibyte.
-        assert_eq!(small % 1024, 4, "{small}");
         assert!(large < 16 << 20, "{large} exceeds the floor it replaced");
+        // 15 tokens over 128 experts is 120 permuted tiles of 128 rows: the routed rows the caller
+        // launches. The gated product needs 6 160 + 740 356 and the contraction 8 208 + 987 140, so
+        // the shared buffer is the contraction's.
+        assert_eq!(quantized.workspace_bytes(15_360), 995_348);
+        // A bucket small enough that the artifact's planes are a single tile still carries both
+        // preambles: the bias columns do not shrink with the row count.
+        assert_eq!(quantized.workspace_bytes(8), 17_428);
     }
 
     #[test]
