@@ -222,6 +222,39 @@ fn main() {
         }),
     ));
 
+    // A deployment that stores its pages as E4M3 reads them through the same attention program with
+    // one scale per page, and fills them with the write that derives that scale.
+    for phase in [ops::attention::Phase::Prefill, ops::attention::Phase::Decode] {
+        lines.push((
+            "paged_attention".to_owned(),
+            key(&ops::attention::Descriptor {
+                phase,
+                query: dtype,
+                key_value: DType::F8E4M3,
+                output: dtype,
+                head_dim: HEAD_DIM,
+                page_size: PAGE,
+                q_heads: HEADS,
+                kv_heads: KV_HEADS,
+                mask: ops::attention::Mask::Causal,
+                windowed: false,
+                max_kv_len: MAX_KV_LEN,
+            }),
+        ));
+    }
+    lines.push((
+        "kv_write_scaled".to_owned(),
+        key(&ops::kv::ScaledWriteDescriptor {
+            dtype,
+            scale: DType::F32,
+            page: PAGE,
+            heads: KV_HEADS,
+            head_dim: HEAD_DIM,
+            block: kv_tile(HEAD_DIM),
+            pdl: PDL,
+        }),
+    ));
+
     // Normalization, rotation and the embedding. One `rms_norm` width: the model's three
     // normalizations are all `[hidden]` — the output norm and every layer's two pre-norms. A head's
     // 128 features are normalized inside `qk_norm_rope`, which is a program of its own, so a
