@@ -522,20 +522,18 @@ impl Connection {
         // able to freeze it.
         let holds = !head_only && !status_without_body(parts.status) && framed;
         let mut opening = None;
-        if holds
-            && handed
-                .as_ref()
-                .is_some_and(|handed| handed.stream.head_held())
-        {
+        // A held head has a body by construction: the hold is a property the
+        // body's stream states, so the two are read together rather than
+        // asserted apart.
+        let held = if holds {
+            handed.as_mut().filter(|handed| handed.stream.head_held())
+        } else {
+            None
+        };
+        if let Some(handed) = held {
             self.pending
                 .extend_from_slice(&head_bytes(&parts, chunked, content_length, closing));
-            match handed
-                .as_mut()
-                .expect("a held head has a body")
-                .stream
-                .opened()
-                .await
-            {
+            match handed.stream.opened().await {
                 Opened::Frame(frame) => opening = Some(frame),
                 Opened::Failed(error, frames) => {
                     return self.write_failure(error, frames, closing).await;
