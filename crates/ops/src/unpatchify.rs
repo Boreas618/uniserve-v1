@@ -20,6 +20,12 @@
 //! is a single rounding. Tokens past the grid are never read: the launch walks the *output*, so a
 //! token buffer with spare rows is not an error but its spare rows are invisible.
 //!
+//! The descriptor carries no geometry: the program reads the channels, the token grid and the patch
+//! as launch words, so one compiled module serves every raster of an element type. Its key names the
+//! element type, the affine form (whose launch carries two more pointers), the block and the PDL
+//! option — the values that do select a program — so a canvas or a patch is never a reason to compile
+//! a second module, and a shape the manifest did not guess cannot arrive as a missing kernel.
+//!
 //! Scale and bias are the checkpoint's `latents_std` and `latents_mean`, uploaded once as constants;
 //! the decoder's output carries `affine = false` because `proj_out`'s epilogue already adds the bias.
 //! They are `Option` views rather than null pointers: the descriptor's flag says which launch form
@@ -39,14 +45,6 @@ use crate::{Error, Op, Result, Twins};
 pub struct Descriptor {
     /// Element type of the tokens, of the scale and bias, and of the output.
     pub dtype: DType,
-    /// Channels of the raster.
-    pub channels: u32,
-    /// Voxels one token carries along frames.
-    pub patch_frames: u32,
-    /// Rows one token carries.
-    pub patch_height: u32,
-    /// Columns one token carries.
-    pub patch_width: u32,
     /// Whether the launch denormalizes with a per-channel scale and bias.
     pub affine: bool,
     /// Elements one thread block writes.
@@ -55,37 +53,12 @@ pub struct Descriptor {
     pub pdl: bool,
 }
 
-impl Descriptor {
-    /// Voxels one token carries: `patch_frames · patch_height · patch_width`.
-    pub fn patch_volume(&self) -> u64 {
-        u64::from(self.patch_frames) * u64::from(self.patch_height) * u64::from(self.patch_width)
-    }
-
-    /// Values one token row holds: `channels · patch_volume`.
-    pub fn token_width(&self) -> u64 {
-        u64::from(self.channels) * self.patch_volume()
-    }
-
-    /// Tokens in a grid of `frames × height × width` token rows.
-    pub fn tokens(&self, frames: u64, height: u64, width: u64) -> u64 {
-        frames * height * width
-    }
-}
-
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Every field is a shape or a flag: no raw float enters a key, and the affine form is its own
         // variant because the launch carries two more operands.
         Key::new()
             .field("dtype", self.dtype)
-            .field("channels", self.channels)
-            .field(
-                "patch",
-                format_args!(
-                    "{}x{}x{}",
-                    self.patch_frames, self.patch_height, self.patch_width
-                ),
-            )
             .field("affine", self.affine)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -111,6 +84,31 @@ pub struct Args {
     pub height: u32,
     /// Token grid columns.
     pub width: u32,
+    /// Channels of the raster.
+    pub channels: u32,
+    /// Voxels one token carries along frames.
+    pub patch_frames: u32,
+    /// Rows one token carries.
+    pub patch_height: u32,
+    /// Columns one token carries.
+    pub patch_width: u32,
+}
+
+impl Args {
+    /// Voxels one token carries: `patch_frames · patch_height · patch_width`.
+    pub fn patch_volume(&self) -> u64 {
+        u64::from(self.patch_frames) * u64::from(self.patch_height) * u64::from(self.patch_width)
+    }
+
+    /// Values one token row holds: `channels · patch_volume`.
+    pub fn token_width(&self) -> u64 {
+        u64::from(self.channels) * self.patch_volume()
+    }
+
+    /// Tokens in a grid of `frames × height × width` token rows.
+    pub fn tokens(&self) -> u64 {
+        u64::from(self.frames) * u64::from(self.height) * u64::from(self.width)
+    }
 }
 
 /// The packed-token to planar-raster mapping, with an optional per-channel denormalization.
@@ -128,12 +126,12 @@ impl Op for Unpatchify {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let channels = u64::from(descriptor.channels);
-        let volume = descriptor.patch_volume();
+        let channels = u64::from(args.channels);
+        let volume = args.patch_volume();
         let frames = u64::from(args.frames);
         let height = u64::from(args.height);
         let width = u64::from(args.width);
-        let tokens = Descriptor::tokens(descriptor, frames, height, width);
+        let tokens = args.tokens();
         if channels == 0 || frames == 0 || height == 0 || width == 0 || volume == 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -143,15 +141,15 @@ impl Op for Unpatchify {
         }
         let out_shape = Shape::new(&[
             channels,
-            frames * u64::from(descriptor.patch_frames),
-            height * u64::from(descriptor.patch_height),
-            width * u64::from(descriptor.patch_width),
+            frames * u64::from(args.patch_frames),
+            height * u64::from(args.patch_height),
+            width * u64::from(args.patch_width),
         ]);
         args.out.require_shape(Self::NAME, out_shape)?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, out_shape.dims()[0])?;
         args.tokens
-            .require_shape(Self::NAME, Shape::new(&[tokens, descriptor.token_width()]))?;
+            .require_shape(Self::NAME, Shape::new(&[tokens, args.token_width()]))?;
         if args.tokens.dtype != descriptor.dtype {
             return Err(Error::argument(
                 Self::NAME,
@@ -218,13 +216,13 @@ impl Op for Unpatchify {
         // addresses the compiler's launcher appends after these parameters.
         arguments
             .view(args.out)
-            .u32(descriptor.channels)
+            .u32(args.channels)
             .u32(args.frames)
             .u32(args.height)
             .u32(args.width)
-            .u32(descriptor.patch_frames)
-            .u32(descriptor.patch_height)
-            .u32(descriptor.patch_width)
+            .u32(args.patch_frames)
+            .u32(args.patch_height)
+            .u32(args.patch_width)
             .u32(descriptor.block)
             .flag(descriptor.pdl);
         // The grid walks the output's elements: one thread writes one voxel, so a token's voxels are
@@ -259,41 +257,65 @@ mod tests {
     fn latents() -> Descriptor {
         Descriptor {
             dtype: DType::F16,
-            channels: 24,
-            patch_frames: 1,
-            patch_height: 2,
-            patch_width: 2,
             affine: true,
             block: 1024,
             pdl: false,
         }
     }
 
+    fn grid() -> Args {
+        let view = TensorView::with_strides(
+            crate::tensor::DevicePtr::new(0x1000),
+            DType::F16,
+            Shape::new(&[1, 1]),
+            Strides::new(&[1, 1]),
+        );
+        Args {
+            tokens: view,
+            scale: None,
+            bias: None,
+            out: view,
+            frames: 37,
+            height: 24,
+            width: 42,
+            channels: 24,
+            patch_frames: 1,
+            patch_height: 2,
+            patch_width: 2,
+        }
+    }
+
     #[test]
     fn the_patch_volume_and_the_token_width_follow_the_patch() {
-        assert_eq!(latents().patch_volume(), 4);
-        assert_eq!(latents().token_width(), 96);
-        assert_eq!(Descriptor::tokens(&latents(), 37, 24, 42), 37 * 24 * 42);
-        // The decoder's own output: three channels and a 4x16x16 patch.
-        let decoded = Descriptor {
+        assert_eq!(grid().patch_volume(), 4);
+        assert_eq!(grid().token_width(), 96);
+        assert_eq!(grid().tokens(), 37 * 24 * 42);
+        // The decoder's own output: three channels and a 4x16x16 patch, in the same compiled module.
+        let decoded = Args {
             channels: 3,
             patch_frames: 4,
             patch_height: 16,
             patch_width: 16,
-            affine: false,
-            ..latents()
+            frames: 9,
+            height: 8,
+            width: 10,
+            ..grid()
         };
         assert_eq!(decoded.patch_volume(), 1024);
         assert_eq!(decoded.token_width(), 3 * 1024);
-        // The grid is a launch value, so one module serves every clip: only the patch is compiled.
-        assert_eq!(Descriptor::tokens(&decoded, 9, 8, 10), 9 * 8 * 10);
+        assert_eq!(decoded.tokens(), 9 * 8 * 10);
+        // Neither the grid nor the patch reaches the key: the program reads both as words, so the
+        // decoder's raster and the transformer's are one compiled module.
+        let key = latents().to_string();
+        assert!(!key.contains("patch"), "{key}");
+        assert!(!key.contains("channels"), "{key}");
     }
 
     #[test]
     fn the_affine_form_is_its_own_key() {
         assert_eq!(
             latents().to_string(),
-            "dtype_f16_channels_24_patch_1x2x2_affine_true_block_1024_pdl_false"
+            "dtype_f16_affine_true_block_1024_pdl_false"
         );
         assert_ne!(
             latents().to_string(),

@@ -19,10 +19,12 @@
 //! the geometry and no index table, so a captured step replays it and no host-side permutation is
 //! needed. The move is elementwise and exact.
 //!
-//! `frames` is a launch parameter, not a field of the descriptor: a request's frame count varies
-//! while `channels`, `height` and `width` are the model's, so one compiled program serves every
-//! request of a geometry instead of compiling per frame count. `rows` — the packed row count — is
-//! the derived value `frames · height/2 · width/2` and is passed beside it, checked against both.
+//! The geometry is a launch value and the descriptor carries none: the program reads `channels`,
+//! `height`, `width` and `frames` as words, so one compiled module serves every request of every
+//! raster. Its key names the element type, the block and the PDL option — the values that do select a
+//! program — so a canvas is never a reason to compile a second module and a request shape the
+//! manifest did not guess cannot arrive as a missing kernel. `rows` — the packed row count — is the
+//! derived value `frames · height/2 · width/2` and is passed beside the four, checked against them.
 
 use std::fmt;
 
@@ -41,12 +43,6 @@ pub const BLOCK: u32 = 1024;
 pub struct Descriptor {
     /// Element type of the latent and of the rows; the move is exact in either direction.
     pub dtype: DType,
-    /// The latent's channels: `channels · 4` is a row's width.
-    pub channels: u32,
-    /// The latent's height, which must be even: a patch is `2` tall.
-    pub height: u32,
-    /// The latent's width, which must be even: a patch is `2` wide.
-    pub width: u32,
     /// Elements one thread block handles along a row.
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
@@ -54,66 +50,42 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// A patch mapping, refusing a geometry no latent can have.
+    /// A mapping whose module serves every raster of `dtype`.
     ///
-    /// A patch is `1×2×2`, so an odd side is not a request this operator can honour: it is a model
-    /// geometry bug, and it is refused here — before a key is composed and a package looked up —
-    /// rather than at launch, so the failure names the caller's geometry instead of arriving as a
-    /// missing kernel.
-    pub fn new(
-        dtype: DType,
-        channels: u32,
-        height: u32,
-        width: u32,
-        block: u32,
-        pdl: bool,
-    ) -> Result<Self> {
-        if channels == 0
-            || height == 0
-            || width == 0
-            || !height.is_multiple_of(2)
-            || !width.is_multiple_of(2)
-        {
-            return Err(Error::argument(
-                "patch",
-                format!(
-                    "a latent of {channels} channels and {height}×{width} has no 1×2×2 patch \
-                     raster: every side must be nonzero and even"
-                ),
-            ));
-        }
-        Ok(Self {
-            dtype,
-            channels,
-            height,
-            width,
-            block,
-            pdl,
-        })
+    /// The geometry is not a compilation choice — the program reads it as words — so it is checked
+    /// where it is consumed, by [`geometry`], and a canvas never selects a module.
+    pub const fn new(dtype: DType, block: u32, pdl: bool) -> Self {
+        Self { dtype, block, pdl }
     }
+}
 
-    /// Values per packed row: `channels · 4`.
-    pub fn row_width(&self) -> u64 {
-        u64::from(self.channels) * 4
+/// Refuse a geometry no `1×2×2` raster can have, naming it before a launch.
+///
+/// A patch is `1×2×2`, so an odd side is not a request this operator can honour: it is a model
+/// geometry bug, and it is refused here rather than at the launch, so the failure names the caller's
+/// geometry instead of arriving as an indexing fault in a kernel.
+pub fn geometry(channels: u32, height: u32, width: u32) -> Result<()> {
+    if channels == 0
+        || height == 0
+        || width == 0
+        || !height.is_multiple_of(2)
+        || !width.is_multiple_of(2)
+    {
+        return Err(Error::argument(
+            "patch",
+            format!(
+                "a latent of {channels} channels and {height}\u{d7}{width} has no 1\u{d7}2\u{d7}2 patch \
+                 raster: every side must be nonzero and even"
+            ),
+        ));
     }
-
-    /// Packed rows per frame: `height/2 · width/2`.
-    ///
-    /// A launch's row count is exactly `frames · rows_per_frame()`; a destination with more rows
-    /// would leave its tail untouched, which reads as stale latents rather than as an error, so the
-    /// shape check is an equality and not a lower bound.
-    pub fn rows_per_frame(&self) -> u64 {
-        u64::from(self.height / 2) * u64::from(self.width / 2)
-    }
+    Ok(())
 }
 
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("dtype", self.dtype)
-            .field("channels", self.channels)
-            .field("height", self.height)
-            .field("width", self.width)
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -129,6 +101,28 @@ pub struct Args {
     pub out: TensorView,
     /// Frames in the latent; the packed row count is `frames · rows_per_frame`.
     pub frames: u32,
+    /// The latent's channels: `channels · 4` is a row's width.
+    pub channels: u32,
+    /// The latent's height, which must be even: a patch is `2` tall.
+    pub height: u32,
+    /// The latent's width, which must be even: a patch is `2` wide.
+    pub width: u32,
+}
+
+impl Args {
+    /// Values per packed row: `channels · 4`.
+    pub fn row_width(&self) -> u64 {
+        u64::from(self.channels) * 4
+    }
+
+    /// Packed rows per frame: `height/2 · width/2`.
+    ///
+    /// A launch's row count is exactly `frames · rows_per_frame()`; a destination with more rows
+    /// would leave its tail untouched, which reads as stale latents rather than as an error, so the
+    /// shape check is an equality and not a lower bound.
+    pub fn rows_per_frame(&self) -> u64 {
+        u64::from(self.height / 2) * u64::from(self.width / 2)
+    }
 }
 
 /// The latent-to-rows mapping.
@@ -146,32 +140,19 @@ impl Op for Patch {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let channels = u64::from(descriptor.channels);
-        let height = u64::from(descriptor.height);
-        let width = u64::from(descriptor.width);
+        geometry(args.channels, args.height, args.width)?;
+        let channels = u64::from(args.channels);
+        let height = u64::from(args.height);
+        let width = u64::from(args.width);
         let frames = u64::from(args.frames);
-        if descriptor.channels == 0 || frames == 0 {
+        if frames == 0 {
             return Err(Error::argument(
                 Self::NAME,
-                "a latent with no channels or no frames has no rows to map".to_owned(),
+                "a latent with no frames has no rows to map".to_owned(),
             ));
         }
-        // A patch is `1×2×2`: an odd height or width would leave a row of patches off the latent.
-        if descriptor.height == 0
-            || descriptor.width == 0
-            || descriptor.height % 2 != 0
-            || descriptor.width % 2 != 0
-        {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "expected an even height and width for a 1×2×2 patch, found {}×{}",
-                    descriptor.height, descriptor.width
-                ),
-            ));
-        }
-        let rows = frames * descriptor.rows_per_frame();
-        let row_width = descriptor.row_width();
+        let rows = frames * args.rows_per_frame();
+        let row_width = args.row_width();
         let latent = Shape::new(&[channels, frames, height, width]);
         let packed = Shape::new(&[rows, row_width]);
 
@@ -197,9 +178,9 @@ impl Op for Patch {
                     format!("{rows} packed rows do not fit a kernel parameter"),
                 )
             })?)
-            .u32(descriptor.channels)
-            .u32(descriptor.height)
-            .u32(descriptor.width)
+            .u32(args.channels)
+            .u32(args.height)
+            .u32(args.width)
             .u32(descriptor.block)
             .flag(descriptor.pdl);
         // The grid walks the rows: one block per (row, element block). A row element is written by
@@ -229,45 +210,66 @@ impl Op for Patch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::{DevicePtr, Strides};
 
     fn descriptor() -> Descriptor {
         Descriptor {
             dtype: DType::BF16,
-            channels: 24,
-            height: 32,
-            width: 48,
             block: BLOCK,
             pdl: false,
         }
     }
 
     #[test]
-    fn a_row_is_the_channels_patch_and_a_frame_is_one_raster_of_them() {
-        let patch = descriptor();
-        assert_eq!(patch.row_width(), 96);
-        assert_eq!(patch.rows_per_frame(), 16 * 24);
+    fn the_key_names_only_what_selects_a_program() {
+        // The program reads the channels, the height and the width as words, so none of them may
+        // appear in the key: a key that named a canvas would compile one module per canvas for no
+        // compiled difference, and a canvas the manifest missed would be a missing kernel.
+        assert_eq!(descriptor().to_string(), "dtype_bf16_block_1024_pdl_false");
         assert_eq!(
-            patch.to_string(),
-            "dtype_bf16_channels_24_height_32_width_48_block_1024_pdl_false"
+            Descriptor::new(DType::F32, 2048, true).to_string(),
+            "dtype_f32_block_2048_pdl_true"
         );
     }
 
     #[test]
+    fn a_row_is_the_channels_patch_and_a_frame_is_one_raster_of_them() {
+        let view = |shape: &[u64]| {
+            TensorView::with_strides(
+                DevicePtr::new(0x1000),
+                DType::BF16,
+                Shape::new(shape),
+                Strides::row_major(Shape::new(shape)),
+            )
+        };
+        let args = Args {
+            x: view(&[24, 3, 32, 48]),
+            out: view(&[72, 96]),
+            frames: 3,
+            channels: 24,
+            height: 32,
+            width: 48,
+        };
+        assert_eq!(args.row_width(), 96);
+        assert_eq!(args.rows_per_frame(), 16 * 24);
+    }
+
+    #[test]
     fn the_frames_are_a_launch_value_so_one_module_serves_every_request() {
-        // Only the frame count travels at launch; it changes `rows`, which is not a descriptor field,
-        // so a 5-frame and a 121-frame request share one compiled program.
+        // The frame count changes `rows`, which is not a descriptor field, so a 5-frame and a
+        // 121-frame request share one compiled program — as do two rasters of different canvases.
         assert_eq!(descriptor(), descriptor());
     }
 
     #[test]
-    fn an_odd_side_is_refused_before_a_key_is_composed() {
+    fn an_odd_side_is_refused_before_a_launch() {
         // A canvas side is a multiple of 32 and a latent side is that over 16, so every raster a
-        // request can produce is even. An odd one is a geometry bug, refused here rather than
-        // arriving later as a missing kernel.
-        assert!(Descriptor::new(DType::BF16, 24, 48, 48, BLOCK, false).is_ok());
-        assert!(Descriptor::new(DType::BF16, 24, 48, 21, BLOCK, false).is_err());
-        assert!(Descriptor::new(DType::BF16, 24, 21, 48, BLOCK, false).is_err());
-        assert!(Descriptor::new(DType::BF16, 0, 48, 48, BLOCK, false).is_err());
+        // request can produce is even. An odd one is a geometry bug, refused by name rather than
+        // arriving as an indexing fault in a kernel.
+        assert!(geometry(24, 48, 48).is_ok());
+        assert!(geometry(24, 48, 21).is_err());
+        assert!(geometry(24, 21, 48).is_err());
+        assert!(geometry(0, 48, 48).is_err());
     }
 
     #[test]

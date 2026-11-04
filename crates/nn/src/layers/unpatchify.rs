@@ -114,10 +114,6 @@ impl UnpatchifyVideo {
         }
         let descriptor = unpatchify::Descriptor {
             dtype: self.dtype,
-            channels: self.channels,
-            patch_frames: self.temporal,
-            patch_height: self.spatial,
-            patch_width: self.spatial,
             affine: false,
             block: BLOCK,
             pdl: PDL,
@@ -140,6 +136,10 @@ impl UnpatchifyVideo {
                 frames: narrow("frames", frames)?,
                 height: narrow("rows", height)?,
                 width: narrow("columns", width)?,
+                channels: self.channels,
+                patch_frames: self.temporal,
+                patch_height: self.spatial,
+                patch_width: self.spatial,
             },
         )
     }

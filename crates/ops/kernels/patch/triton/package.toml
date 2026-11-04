@@ -5,8 +5,8 @@
 # so the operator's tolerance is exact and the kernel does no arithmetic at all.
 #
 # One direction, because the operator has one: the inverse raster is `unpatchify_video`, whose
-# package owns that direction. The frame count is a launch value, not a field, so one program
-# serves every request of a geometry.
+# package owns that direction. The frames, the channels and the canvas are launch values, not
+# fields, so one program serves every request of every raster.
 
 op = "patch"
 backend = "triton"
@@ -29,11 +29,9 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-# The latents of the H3 deployment's decoding resolutions: one key per geometry.
-# The geometry pairs are the rasters an evaluation decodes, in both orientations: a landscape canvas
-# and its transposed portrait are different latent rasters, so the widths are enumerated with the
-# heights and not derived from one orientation. The pairs are the fixture's own, not
-# their cross product. A key cannot name a mode, because the operator has no mode to name.
-dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["24"], height = ["26", "30", "40", "42", "48", "52", "62", "64", "84", "96"], width = ["26", "30", "40", "42", "48", "52", "62", "64", "84", "96"], block = ["1024"], pdl = ["false", "true"] }
+# One module per element type: the program reads the channels, the frames and the canvas as words,
+# so a raster is a launch value and never a reason to compile. A key cannot name a mode either,
+# because the operator has no mode to name.
+dimensions = { dtype = ["bf16", "f16", "f32"], block = ["1024"], pdl = ["false"] }
 
 [parameters]

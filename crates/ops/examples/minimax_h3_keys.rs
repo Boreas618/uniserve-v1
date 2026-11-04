@@ -436,54 +436,26 @@ fn main() {
         }
         .to_string(),
     );
-    // The DiT's row mapping, one key per latent raster the served canvases produce. The canvas is
-    // divided by the VAE's 16x spatial compression, and each side is even for every served canvas
-    // because the canvas's sides are multiples of the model's own step.
-    // A canvas is named width by height, and `packing::latent_raster` divides each by the VAE's
-    // compression into a raster named height by width - so a landscape canvas gives a wide raster
-    // and a portrait one a tall raster, and the pair is not the canvas's own order.
-    for (height, width) in [
-        (42, 96), // 1536x672
-        (48, 84), // 1344x768
-        (48, 64), // 1024x768
-        (48, 48), // 768x768
-        (64, 48), // 768x1024
-        (48, 42), // 672x768
-        // The 480p class: its caps give pixel sides like 992 and 832, but a canvas side is a
-        // multiple of 32, so every latent side stays even.
-        (26, 62), // 992x416
-        (30, 52), // 832x480
-        (30, 40), // 640x480
-        (30, 30), // 480x480
-        (40, 30), // 480x640
-        (52, 30), // 480x832
-    ] {
-        // One key per raster: the inverse is `unpatchify_video` at 1×2×2, not a mode of this op.
-        push(
-            "patch",
-            ops::patch::Descriptor {
-                dtype: DType::BF16,
-                channels: 24,
-                height,
-                width,
-                block: ops::patch::BLOCK,
-                pdl: PDL,
-            }
-            .to_string(),
-        );
-    }
-    // The two `unpatchify_video` geometries the decoder needs: the latents and the decoder's own
-    // output. The token grid is the request's -- its clip length and its canvas -- so it is a launch
-    // value, and the keys name only the channels, the patch and the affine form.
-    for (channels, patch, affine) in [(24u32, (1u32, 2u32, 2u32), true), (3, (4, 16, 16), false)] {
+    // The DiT's row mapping: one key for every raster, because the program reads the canvas as a
+    // launch word. A canvas is a multiple of the model's own step and the VAE compresses it 16x, so
+    // every latent side a served canvas produces is even — that check is the operator's, at launch.
+    push(
+        "patch",
+        ops::patch::Descriptor {
+            dtype: DType::BF16,
+            block: ops::patch::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The two `unpatchify_video` forms the decoder needs: the latents, whose per-channel scale and
+    // bias denormalize, and the decoder's own output, which does not. The token grid, the channels
+    // and the patch are the request's and travel at launch, so the two forms are the whole set.
+    for affine in [true, false] {
         push(
             "unpatchify_video",
             ops::unpatchify::Descriptor {
                 dtype: DType::F16,
-                channels,
-                patch_frames: patch.0,
-                patch_height: patch.1,
-                patch_width: patch.2,
                 affine,
                 block: 1024,
                 pdl: PDL,
