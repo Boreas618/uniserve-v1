@@ -83,7 +83,22 @@ CATALOGUE = {
         ("velocity_video_e", "velocity_audio_e"),
         "run host: the network's prediction at evaluation `e`, which the runner owns",
     ),
+    "trajectory": (
+        ("latents_video_e0..eN", "latents_audio_e0..eN", "latents_*_final"),
+        "run host: the reference's own trajectory - its draw, then one evaluation per step",
+    ),
 }
+
+# The probe the sampler stage pairs on. It reads the candidate's own prefix source and case, runs the
+# reference's whole denoiser for the case's prefix of the checkpoint's schedule, and writes each
+# evaluation's samples under the candidate's own names, so a page is about arithmetic rather than
+# about who drew the noise.
+TRAJECTORY = "trajectory"
+
+# The schedule kinds a checkpoint can ship, in the reference's class names and the case's words. A
+# kind outside this table is refused rather than compared loosely: a FastH3 contract read as the base
+# grid is the one mistake a trajectory page cannot show.
+SCHEDULE_KINDS = {"UniformGrid": "base", "BlockGrid": "dmd", "PddGrid": "pdd"}
 
 # The probes this script can produce without the reference's runner, a device or weights.
 HOST_PROBES = frozenset({"noise", "rows"})
@@ -91,7 +106,7 @@ HOST_PROBES = frozenset({"noise", "rows"})
 # The probes that need the reference's own modules and the checkpoint's weights, but not its
 # runner: they run on the run host, and a host without the compiled extensions refuses them with
 # the import line rather than a traceback (`reference`).
-WEIGHED_PROBES = frozenset({"stack_out"})
+WEIGHED_PROBES = frozenset({"stack_out", TRAJECTORY})
 
 
 def reference(name: str):
@@ -577,6 +592,283 @@ def run_stack_out(stack: Path, checkpoint: Path, out: Path) -> int:
     return 0
 
 
+def read_tensor(path: Path):
+    """Read one H3D1 tensor: the container this directory writes and the Rust comparator reads."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from dump_tables import load
+
+    try:
+        return load(path)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+
+def trajectory_case(case: dict) -> dict:
+    """The case fields this probe reads, refused by name when the case omits one.
+
+    The case is the candidate harness's own statement of the request, so a field read under another
+    name would be a second convention for the same number: every field this probe uses is required,
+    and a missing one is reported with its name rather than defaulted here.
+    """
+    required = (
+        "task",
+        "width",
+        "height",
+        "frames",
+        "text_tokens",
+        "text_rows",
+        "layers",
+        "hidden",
+        "seed",
+        "evaluations",
+        "schedule",
+    )
+    missing = [name for name in required if name not in case]
+    if missing:
+        raise SystemExit(
+            f"the case omits {', '.join(missing)}; a sampler case carries "
+            f"{', '.join(required)}"
+        )
+    if case["task"] != "t2va":
+        raise SystemExit(
+            f"the case's task is {case['task']!r}, and a conditioned request's rows are not"
+            f" described by this case: this probe runs a `t2va` sampler"
+        )
+    return case
+
+
+def trajectory_denoiser(case: dict, checkpoint: Path, device: str):
+    """The reference's whole denoiser at the case's layer count, on the reference's own load path.
+
+    The layer count is the case's because a trajectory over fifty blocks is a device hour; the
+    checkpoint's own transformer config is narrowed the way the stage-1 producer narrows it, so a
+    case that says two layers runs two of the checkpoint's fifty and says so.
+    """
+    import dataclasses
+
+    torch = reference("torch")
+    h3_config = reference("uniserve.models.minimax_h3.config")
+    denoiser_module = reference("uniserve.models.minimax_h3.denoiser")
+    weights_module = reference("uniserve.models.minimax_h3.weights")
+    from uniserve.loading import loader
+    from uniserve.loading import weights as weight_options
+
+    sidecars = h3_config.read_config(checkpoint, io=None, sources=())
+    config = sidecars.denoisers["transformer"]
+    layers = int(case["layers"])
+    config = dataclasses.replace(
+        config,
+        transformer=dataclasses.replace(
+            config.transformer, num_hidden_layers=layers
+        ),
+    )
+    model = denoiser_module.Denoiser(config)
+    source = stack_source(checkpoint)
+    print(f"load    {source.name} from {source.root} ({len(source.files)} file(s))")
+    reports = loader.load_weights(
+        model,
+        (source,),
+        mapping=lambda _root: tuple(
+            weights_module._denoiser_components("transformer", model)
+        ),
+        device=device,
+        weights=weight_options.Config(dtype=torch.bfloat16),
+    )
+    for report in reports:
+        print(
+            f"loaded  {len(report.loaded)} parameter(s); missing {len(report.missing)}, "
+            f"unexpected {len(report.unexpected)}, incomplete {len(report.incomplete)}"
+        )
+        for name in sorted(report.missing)[:8]:
+            print(f"missing  {name}")
+    return model, config
+
+
+def allocate(configs, device: str) -> dict:
+    """Allocate one dict of buffers from the model's own declarations.
+
+    Each buffer's `host` flag is the model's own statement of where it lives: the native draws and
+    the sample views are host-side and refuse anything else, and the rest are on the device the
+    caller names. Reading the flag rather than deciding here is what keeps the probe from owning a
+    second copy of the model's device rule.
+    """
+    torch = reference("torch")
+
+    buffers = {}
+    for name, config in configs.items():
+        host = bool(getattr(config, "host", False))
+        buffers[name] = torch.zeros(
+            tuple(config.shape),
+            dtype=config.dtype,
+            device="cpu" if host else device,
+        )
+    return buffers
+
+
+def run_trajectory(
+    stack: Path, checkpoint: Path, out: Path, device: str
+) -> int:
+    """Run the reference's own trajectory on the candidate's own prefix source.
+
+    Every number but the draw is the reference's arithmetic: `Denoiser.forward` is one whole
+    evaluation with the solver step inside, so this adds the loop and the files and nothing else.
+    `e0` is the draw and `eN` the final sample, so the noise is on the page as a tensor and a wrong
+    draw cannot hide inside a plausible trajectory; `latents_*_final.h3t` is a copy of `eN` so a
+    comparator pairs the end without knowing how many evaluations ran.
+
+    What it does not prove: the conditioner (the prefix source is the harness's file, stated as
+    synthetic in the case), the text encoder behind it, the decoder after it, and any canvas or
+    frame count but the case's.
+    """
+    # The case and its file are read before anything of the reference is imported, so a wrong path or
+    # a case from another stage refuses by name on a host where the model cannot be built at all.
+    case_path, table_path = stack / "case.json", stack / "text_features.h3t"
+    for path in (case_path, table_path):
+        if not path.is_file():
+            raise SystemExit(
+                f"{path} is absent; --stack names the candidate's `denoiser` directory, and the"
+                f" sampler stage writes `case.json` and `text_features.h3t` into it"
+            )
+    case = trajectory_case(json.loads(case_path.read_text()))
+    table = read_tensor(table_path)
+    print(f"input   {table_path} {tuple(table.shape)} {table.dtype}")
+
+    torch = reference("torch")
+    noise_module = reference("uniserve.diffusion.noise")
+    packing = reference("uniserve.models.minimax_h3.packing")
+
+    model, config = trajectory_denoiser(case, checkpoint, device)
+    canvas = canvas_of({"height": case["height"], "width": case["width"]})
+    size = model.make_size(
+        int(case["frames"]), int(case["text_tokens"]), canvas=canvas
+    )
+    layout = model.layout_size(size)
+    steps = int(model.num_steps)
+    evaluations = int(case["evaluations"])
+    # The schedule is the checkpoint's and the case may only shorten it: a longer one would be a
+    # different schedule, and a shorter one is how a stage's first page costs a minute.
+    if evaluations > steps:
+        raise SystemExit(
+            f"the case asks {evaluations} evaluations and the checkpoint's schedule holds"
+            f" {steps}; a case may shorten the schedule and never lengthen it"
+        )
+    kind = SCHEDULE_KINDS.get(type(config.schedule).__name__)
+    if kind is None:
+        raise SystemExit(
+            f"the checkpoint's schedule {type(config.schedule).__name__} has no name in this"
+            f" probe; the ones it knows are {sorted(SCHEDULE_KINDS)}"
+        )
+    if case["schedule"] != kind:
+        raise SystemExit(
+            f"the case's schedule is {case['schedule']!r} and the checkpoint's is {kind!r};"
+            f" a page cannot show that one was read as the other"
+        )
+    print(
+        f"layout  {layout.num_frames} frames, {layout.num_text_tokens} text rows,"
+        f" {layout.condition_rows} condition rows, {evaluations} of {steps} evaluations"
+    )
+    width = int(config.transformer.hidden_size)
+    if int(case["hidden"]) != width:
+        raise SystemExit(
+            f"the case's hidden size is {case['hidden']} and the checkpoint's is {width}"
+        )
+    # The prefix source is the text rows, the projected condition rows and one zero row the
+    # generated and padding rows gather: the case's table carries the text rows, and the zero row
+    # is the layout's, not the harness's.
+    rows = model.text_condition_rows(layout)
+    if tuple(table.shape) != (layout.num_text_tokens, width):
+        raise SystemExit(
+            f"the prefix source is {tuple(table.shape)} and the layout's text segment is"
+            f" {(layout.num_text_tokens, width)}"
+        )
+    prefix = torch.zeros((rows, width), dtype=table.dtype, device=device)
+    prefix[: layout.num_text_tokens] = table.to(device=device)
+    print(f"prefix  {rows} rows: {layout.num_text_tokens} text, one zero row")
+
+    state = allocate(model.state_buffers(layout), device)
+    constants = allocate(model.constant_buffers(layout), device)
+    workspace = allocate(model.workspace_buffers(layout), device)
+    tables = {
+        name: value
+        for name, value in state.items()
+        if name not in model.modalities
+    }
+    model.prepare_constants(layout, out=constants)
+    model.prepare_state((size,), layouts=(layout,), out=tables)
+    draw = {}
+    for name in model.modalities:
+        draw[name] = torch.empty(
+            model.noise_shape(name, size), dtype=torch.float32, device="cpu"
+        )
+        print(f"draw    {name:<6} {tuple(draw[name].shape)} float32 on the host")
+    noise_module.normal_noise((int(case["seed"]),), out=tuple(draw[name] for name in model.modalities))
+    model.prepare_latents(
+        (size,), noise=draw, state=state, constants=constants, workspace=workspace
+    )
+    print(f"seed    {case['seed']}, drawn in the order {tuple(model.modalities)}")
+
+    latent_height, latent_width = packing.latent_raster(canvas)
+    video_frames = packing.video_latent_frames(int(case["frames"]))
+    channels = int(config.transformer.video_channels)
+    written = []
+
+    def write(index: str) -> None:
+        """Write one evaluation's sample pair under the candidate's own names."""
+        video = packing.unpatchify_video(
+            state["video"],
+            frames=video_frames,
+            height=latent_height,
+            width=latent_width,
+            channels=channels,
+        )[0]
+        for modality, value in (("video", video), ("audio", state["audio"][0])):
+            name = f"denoiser/latents_{modality}_e{index}"
+            block = out / "denoiser"
+            block.mkdir(parents=True, exist_ok=True)
+            dump(out, name, value)
+            written.append(name)
+
+    for index in range(evaluations):
+        write(str(index))
+        step = torch.tensor([index], dtype=torch.int64, device=device)
+        latents = {
+            name: (trajectory_latent_input(torch, state[name][0], step),)
+            for name in model.modalities
+        }
+        inputs = model.bind_inputs(
+            latents=latents,
+            sizes=(size,),
+            step=step,
+            text_features=(prefix,),
+        )
+        model.forward(inputs, state=state, constants=constants, workspace=workspace)
+        print(f"step    {index} evaluated, sample written as latents_*_e{index}")
+    write(str(evaluations))
+    for modality in model.modalities:
+        source = out / "denoiser" / f"latents_{modality}_e{evaluations}.h3t"
+        final = out / "denoiser" / f"latents_{modality}_final.h3t"
+        final.write_bytes(source.read_bytes())
+        written.append(f"denoiser/latents_{modality}_final")
+    print(f"wrote   {len(written)} tensors: e0 the draw, e{evaluations} the final sample and its copy")
+    print(
+        "compare cargo run -p minimax-h3 --example compare_blocks --"
+        f" --reference {out} --candidate {stack.parent if stack.name == 'denoiser' else stack}"
+    )
+    return 0
+
+
+def trajectory_latent_input(torch, sample, step):
+    """One modality's `LatentInput`: this rank's sample rows and the evaluation's step.
+
+    The sample is the state's own view, so the solver step writes through it and the next
+    evaluation reads what the last one left; H3's modulation is gathered from `step`, which is why
+    the two carry the same value.
+    """
+    inputs_module = reference("uniserve.models.minimax_h3.inputs")
+
+    return inputs_module.LatentInput(tensor=sample, timestep=step)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -595,11 +887,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, help="where to write the dump")
     parser.add_argument(
+        "--device",
+        default="cpu",
+        help="the device the reference's model runs on (default: cpu)",
+    )
+    parser.add_argument(
         "--stack",
         type=Path,
         help=(
-            "the candidate's `denoiser` dump directory, holding `stack_in.h3t` and "
-            "`case.json` (`--probe stack_out`)"
+            "the candidate's `denoiser` dump directory: `stack_in.h3t` and `case.json`"
+            " (`--probe stack_out`), or `text_features.h3t` and `case.json`"
+            " (`--probe trajectory`)"
         ),
     )
     options = parser.parse_args(argv)
@@ -612,6 +910,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--probe and --out are required unless --list")
     writes = CATALOGUE[options.probe][0]
     print(f"probe   {options.probe} -> {', '.join(writes)}")
+
+    if options.probe == TRAJECTORY:
+        if options.stack is None or options.checkpoint is None:
+            parser.error(
+                f"--probe {options.probe} needs --stack for the candidate's tree and "
+                "--checkpoint for the weights it runs"
+            )
+        options.out.mkdir(parents=True, exist_ok=True)
+        return run_trajectory(
+            options.stack, options.checkpoint, options.out, options.device
+        )
 
     if options.probe in WEIGHED_PROBES:
         if options.stack is None or options.checkpoint is None:
