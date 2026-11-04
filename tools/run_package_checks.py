@@ -42,6 +42,9 @@ SKIP_MARKERS = (
     "ModuleNotFoundError",
     "No module named",
     "run this with a device",
+    "needs the device",
+    "needs a module directory",
+    "module directory is required",
     "call structure",
 )
 
