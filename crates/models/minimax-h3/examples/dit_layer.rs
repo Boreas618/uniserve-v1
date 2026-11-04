@@ -715,6 +715,16 @@ fn stage_denoise(args: &Args) -> Result<()> {
     let directory = args.out.join("denoiser");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // A stage reuses one output directory across tips, so a trajectory file the last run wrote is
+    // still there when this one stops earlier than it did - and a comparison would then pair this
+    // run's draw with that run's evaluations and report a page no run produced. The files this
+    // stage writes are cleared first, and the count is printed so a reader can see a stale tree
+    // being cleaned rather than wonder where its numbers went. Everything else in the directory
+    // (`case.json`, `walk.txt`, the prefix source) is rewritten by this run anyway.
+    let stale = clear_trajectory(&directory)?;
+    if stale > 0 {
+        println!("cleared {stale} trajectory files from the previous run");
+    }
     // The case's `schedule` is the checkpoint's own word for its grid - `ScheduleGrid::kind()`,
     // which is what the checkpoint's config states - and not the reference's class name
     // (`UniformGrid`, `BlockGrid`, `PddGrid`). One vocabulary, and it is the one the model reads:
@@ -1398,6 +1408,30 @@ fn transpose_positions(
         }
     }
     upload_i32(stream, arena, Shape::new(&[3, tokens]), &values)
+}
+
+/// Remove a previous run's trajectory files from a stage's `denoiser` directory.
+///
+/// The names are the stage's own contract - `latents_<modality>_e<index>.h3t` and
+/// `latents_<modality>_final.h3t` - and nothing else in the directory is touched. Returns how many
+/// were removed.
+fn clear_trajectory(directory: &std::path::Path) -> Result<usize> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    let mut removed = 0;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("latents_") || !name.ends_with(".h3t") {
+            continue;
+        }
+        std::fs::remove_file(entry.path())
+            .map_err(|error| Failure::message(format!("{}: {error}", entry.path().display())))?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// What one eager forward bound: every launch's operator and descriptor key, in launch order.
