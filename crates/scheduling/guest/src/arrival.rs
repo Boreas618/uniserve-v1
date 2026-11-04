@@ -829,6 +829,70 @@ mod tests {
         id
     }
 
+    /// **An admitted request with a prompt left is prefilled, and the phase
+    /// that says which call it is next is the mechanism's to state.**
+    ///
+    /// `fcfs` reproduces today's rule: a queued request the mechanism admitted
+    /// is prefilled in the next step, chunked only by
+    /// `limits().chunked_prefill_size` and the step's budget. It plans that
+    /// work by the phase the views carry (`RequestView::phase`), because the
+    /// phase says which of the request's calls runs next and what it costs;
+    /// without one it plans nothing, since a policy cannot invent a phase id
+    /// and an invented one would execute a call the mechanism never named.
+    ///
+    /// The absence is therefore **the mechanism's defect, not the policy's
+    /// answer**: `crates/engine`'s `views::next_phase` answers `None` when
+    /// `peek_next_call_variant(id)` names no call, and a resident request with
+    /// prompt left always has one to name. Every helper in this module admitted
+    /// a request with `phase: Some(..)` already, which is why no case could
+    /// fail while the mechanism stated `None` and every text test went silent.
+    /// This case pins both halves: no phase, no work; the same request stated
+    /// with its prefill phase, the whole prompt in one chunk.
+    #[test]
+    fn an_admitted_request_is_prefilled_once_the_mechanism_names_its_phase() {
+        let mut fcfs = policy();
+
+        // The mechanism admitted the request and did not name its next call.
+        let mut admitted = view(1, 0, 1);
+        admitted.state = RequestState::Resident;
+        admitted.admitted_at = Some(Nanos(1));
+        admitted.phase = None;
+        fcfs.observe(&[Event::Admitted {
+            request: RequestId(1),
+        }]);
+        fcfs.observe(&[Event::Updated {
+            request: admitted.clone(),
+        }]);
+
+        let plan = fcfs.dispatch(&room(1_024, 4));
+        assert!(
+            plan.work.is_empty(),
+            "a request whose next phase the mechanism did not state has no call a policy can \
+             plan; the absence is the mechanism's to fix, not the policy's to work around: \
+             {plan:?}"
+        );
+
+        // The mechanism names the prefill, and nothing else about the request
+        // moved: the same admission now has a call to plan.
+        let mut named = admitted;
+        named.phase = Some(PhaseId(0));
+        fcfs.observe(&[Event::Updated { request: named }]);
+
+        let plan = fcfs.dispatch(&room(1_024, 4));
+        assert_eq!(
+            plan.work.len(),
+            1,
+            "the admitted request is prefilled once its phase is stated: {plan:?}"
+        );
+        assert_eq!(plan.work[0].request, RequestId(1));
+        assert_eq!(plan.work[0].phase, PhaseId(0));
+        assert_eq!(
+            plan.work[0].tokens, 100,
+            "the whole prompt: it is under the step's budget and the chunk limit, so the rule \
+             plans one chunk"
+        );
+    }
+
     #[test]
     fn the_queue_decides_the_admission_order() {
         let mut fcfs = policy();
