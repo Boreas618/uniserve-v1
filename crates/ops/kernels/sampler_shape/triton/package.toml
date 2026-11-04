@@ -1,35 +1,33 @@
-# The sampler_shape operator's Triton backend.
+# The sampler_shape operator's triton backend: design 5.2's program package.
 #
-# One program penalizes one block of one row's logits over its slot's committed
-# token counts and the row's extra tokens, then divides by the row's
-# temperature. Every FP32 step is a separately rounded intrinsic, so the result
-# is the tensor composition's, bit for bit.
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
 op = "sampler_shape"
 backend = "triton"
 
 [toolchain]
-kind = "triton"
+kind = "python"
 version = "3.7.1"
 packages = []
 
 [module]
 form = "cubin"
-metadata = "triton"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
 files = ["src/sampler_shape.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
 
-architectures = ["sm_100a", "sm_90a"]
+[kernel]
 target = "arch"
+architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_bf16_extras_0_divide_true`.
-[descriptors]
-dtype = ["bf16", "fp16", "fp32"]
-extras = ["0", "1", "4"]
-divide = ["true", "false"]
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "fp32"], extras = ["0", "1", "4"], divide = ["true", "false"] }
 
 [parameters]
-# Elements one program covers of a row.
 block = 2048
 warps = 4

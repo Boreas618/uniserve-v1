@@ -1,40 +1,32 @@
-# The qk_norm_rope operator's Triton backend.
+# The qk_norm_rope operator's triton backend: design 5.2's program package.
 #
-# One program grid RMS-normalizes and rotates Q rows, then K rows: each row's
-# normalization domains, rotary axes and factor table strides are compile-time
-# tuples, and every value accumulates in FP32 with one rounding into the
-# outputs. A module covers one head geometry, dtype, factor dtype, rounding
-# recipe and target.
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
 op = "qk_norm_rope"
 backend = "triton"
 
 [toolchain]
-kind = "triton"
+kind = "python"
 version = "3.7.1"
 packages = []
 
 [module]
 form = "cubin"
-metadata = "triton"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
 files = ["src/qk_norm_rope.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
 
-architectures = ["sm_100a", "sm_90a"]
+[kernel]
 target = "arch"
+architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_bf16_head_dim_128_q_heads_32_k_heads_4_factors_fp32_rounding_once_layout_tokens_heads`.
-[descriptors]
-dtype = ["bf16", "fp16"]
-head_dim = ["128"]
-q_heads = ["32"]
-k_heads = ["4"]
-factors = ["fp32"]
-# `once` rounds after the FP32 normalization and rotation, as the fused launch
-# did; `stepwise` rounds after each eager operation.
-rounding = ["once", "stepwise"]
-layout = ["tokens_heads"]
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16"], head_dim = ["128"], q_heads = ["32"], k_heads = ["4"], factors = ["fp32"], rounding = ["once", "stepwise"], layout = ["tokens_heads"] }
 
 [parameters]
 eps = 1e-06

@@ -1,35 +1,32 @@
-# The gather_request_rows operator's Triton backend.
+# The gather_request_rows operator's triton backend: design 5.2's program package.
 #
-# One launch fills a call's fixed-capacity attention metadata for rows of any
-# length (prefill chunks, verification, padded graph buckets) from the request
-# slots' installed block tables: each table's selected start pages, the block
-# tables, every token's cache slot, and the shared lengths and offsets.
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
 op = "gather_request_rows"
 backend = "triton"
 
 [toolchain]
-kind = "triton"
+kind = "python"
 version = "3.7.1"
 packages = []
 
 [module]
 form = "cubin"
-metadata = "triton"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
 files = ["src/gather_request_rows.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
 
-architectures = ["sm_100a", "sm_90a"]
+[kernel]
 target = "arch"
+architectures = ["sm_100a", "sm_90a"]
 
-# `tables_1_request_width_640_slots_256_rows_4095`.
-[descriptors]
-tables = ["1"]
-request_width = ["640"]
-slots = ["256"]
-# The call's row capacity; the host column array's section length is one more.
-rows = ["127", "255", "511", "1023", "2047", "4095"]
+[kernel.descriptors]
+dimensions = { tables = ["1"], request_width = ["640"], slots = ["256"], rows = ["127", "255", "511", "1023", "2047", "4095"] }
 
 [parameters]
 block = 256

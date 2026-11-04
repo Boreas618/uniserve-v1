@@ -1,32 +1,32 @@
-# The add_rms_norm operator's Triton backend.
+# The add_rms_norm operator's triton backend: design 5.2's program package.
 #
-# One program adds a residual row and normalizes the FP32 sum, writing both the
-# residual stream and its normalized projection. A module covers one (dtype,
-# width, target): the row width and the epsilon are compile-time values of the
-# kernel, and programmatic dependent launch follows the target's capability.
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
 op = "add_rms_norm"
 backend = "triton"
 
 [toolchain]
-kind = "triton"
+kind = "python"
 version = "3.7.1"
 packages = []
 
 [module]
 form = "cubin"
-metadata = "triton"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
 files = ["src/add_rms_norm.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
 
-architectures = ["sm_100a", "sm_90a"]
+[kernel]
 target = "arch"
+architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_bf16_width_2048`.
-[descriptors]
-dtype = ["bf16", "fp16", "fp32"]
-width = ["768", "2048", "4096", "6144"]
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "fp32"], width = ["768", "2048", "4096", "6144"] }
 
 [parameters]
 eps = 1e-06
