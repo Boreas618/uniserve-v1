@@ -472,13 +472,27 @@ message Report {
     // The main process computed non-finite logits for `request` (§7.3 step
     // 4), which rolls the epoch back.
     NonFiniteLogits non_finite_logits = 10;
-    // The frontend drained epoch `epoch`: it admits nothing, and the facts
-    // of the requests in flight are kept for `Serve` (§2.3, §7.4 step 2).
+    // The main process drained epoch `epoch`: it admits nothing, every
+    // request in flight ended migratable at its step boundary with its facts
+    // kept, and it executes nothing (§2.3, §7.4 step 2). The frontend is told
+    // which epoch serves with `Serve` and resubmits the kept facts itself; it
+    // does not report a drain.
     Drained drained = 11;
+    // `Park` took effect: the standby mapped its weights read-only, captured
+    // its graphs on scratch and parked, and is ready to be promoted (§2.5,
+    // §7.4 step 1). The daemon does not promote a child before this report.
+    Parked parked = 12;
   }
 }
 
 message Precopied {
+  uint64 generation = 1;
+}
+
+// A parked standby's readiness (§2.5): its generation is the one it was
+// spawned at, and the daemon promotes it in place (`Command::Promote`) only
+// after this.
+message Parked {
   uint64 generation = 1;
 }
 
