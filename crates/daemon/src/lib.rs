@@ -54,7 +54,6 @@ pub mod observe;
     reason = "the switch lands before the update layer that drives it"
 )]
 pub(crate) mod updates;
-pub mod worlds;
 
 // The application layer's lowest modules are `crates/frontend`'s while the
 // application still serves inside the daemon (delivery item 2, stage A).

@@ -27,6 +27,7 @@
 
 pub(crate) mod change;
 pub(crate) mod driver;
+pub(crate) mod entry;
 pub(crate) mod epoch;
 pub(crate) mod switch;
 

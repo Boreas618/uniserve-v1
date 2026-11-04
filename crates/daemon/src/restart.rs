@@ -140,12 +140,12 @@ struct Takeover {
     listener: HandedListener,
     replicas: Vec<ReplicaHandoff>,
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
-    pending: std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>,
+    pending: std::collections::VecDeque<(usize, crate::updates::change::ApplyRequest)>,
     service: HandedService,
     service_descriptors: usize,
     admin: HandedAdmin,
     jobs: Vec<(VideoJob, Option<u64>)>,
-    then: Option<crate::worlds::ApplyRequest>,
+    then: Option<crate::updates::change::ApplyRequest>,
 }
 
 /// One replica's control connection and executing world. Descriptors follow
@@ -161,7 +161,7 @@ struct ReplicaHandoff {
     paused: bool,
     asleep: bool,
     sleep_paused: bool,
-    unavailable: Vec<crate::worlds::Unavailable>,
+    unavailable: Vec<crate::updates::epoch::Unavailable>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -236,7 +236,7 @@ impl Restarter {
         &self,
         executable: Option<String>,
         config: Option<crate::options::ServeConfig>,
-        then: Option<Box<crate::worlds::ApplyRequest>>,
+        then: Option<Box<crate::updates::change::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -727,7 +727,7 @@ async fn prepared_successor(
                 let (options, _) = crate::options::resolve_text(&replica.config, &[])?;
                 let options = crate::options::with_daemon_options(&options, &daemon_options);
                 let served = wire::EngineSpec::decode(replica.served.as_slice())?;
-                let observer = Arc::new(crate::worlds::Observer::default());
+                let observer = Arc::new(crate::observe::Observer::default());
                 let sink = stats_sink(options.model().to_owned(), Arc::clone(&observer), index);
                 let client = adopting.adopt(
                     replica.engine,
