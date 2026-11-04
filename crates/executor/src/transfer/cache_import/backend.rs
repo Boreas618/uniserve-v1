@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use super::{CacheImport, CacheImporter};
-use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::allocation::StorageView;
 use crate::memory::prefix_cache::conversion::{
     ConversionRequest, ConversionScratch, PageConversion,
 };

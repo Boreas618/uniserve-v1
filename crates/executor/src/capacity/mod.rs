@@ -12,17 +12,14 @@
 //! parameters as [`CapacityRequest`], which the engine builds from the launch
 //! description it already holds.
 
-mod checks;
-pub(crate) mod device;
-pub(crate) mod plan;
+pub mod checks;
+pub mod device;
+mod plan;
 
-pub(crate) use checks::auxiliary;
-pub(crate) use device::{Budget, DeviceBooking, DeviceBudget, total_bytes};
 pub use plan::CapacityRequest;
 
 use ipc::Call;
 
-use crate::memory::LatentPlan;
 use crate::{Error, Result};
 
 /// The smallest cache unit pool a rank keeps when the grant would allow less.

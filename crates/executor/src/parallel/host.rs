@@ -23,10 +23,10 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{Error, Result, lock};
+use crate::{Error, Result};
 
 /// How long startup waits for every member to join the mesh: torch's
 /// default collective timeout.
