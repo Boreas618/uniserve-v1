@@ -12,7 +12,6 @@ from argparse import Namespace
 from decimal import Decimal
 from pathlib import Path
 
-import huggingface_hub
 import pytest
 
 import uniserve_eval
@@ -221,6 +220,7 @@ def test_only_an_unset_path_downloads_the_split(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The Hub copy is fetched at the point's revision only when needed."""
+    import huggingface_hub
     import pyarrow
     import pyarrow.parquet
 
