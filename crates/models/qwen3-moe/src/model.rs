@@ -503,6 +503,12 @@ impl Qwen3Moe {
     ///
     /// The answer is the **state** after layer `last` — the reference's `hidden_{last + 1}` — and
     /// not the block's update, which is one fold short of it (see [`Self::fold`]).
+    ///
+    /// **Each call reserves the plan's step from `f`'s arena and leaves it reserved**, because the
+    /// answer lives in it: the rows a caller compares are the arena's own. A caller that runs two
+    /// measurements in a row — the same layer twice, or a layer and then its prefix — must take a
+    /// mark before the first and release it after it has read the first answer, or the second call
+    /// asks for a second step past the region's end.
     pub fn forward_through(
         &self,
         f: &Forward,
