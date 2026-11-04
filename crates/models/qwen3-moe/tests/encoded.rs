@@ -48,8 +48,9 @@ impl Tensor<'_> {
         match dtype {
             "U8" => 1,
             "F8_E4M3" => 1,
+            "BF16" => 2,
             "F32" => 4,
-            _ => panic!("the fixture uses U8, F8_E4M3 and F32 only"),
+            _ => panic!("the fixture uses U8, F8_E4M3, BF16 and F32 only"),
         }
     }
 }
@@ -373,4 +374,214 @@ fn the_dense_request_names_one_tensor_and_the_encoded_one_names_three() {
         encoded.up.global_scale,
         "model.layers.0.mlp.experts.0.up_proj.weight_scale_2"
     );
+}
+
+/// A whole tiny model whose **attention projections are packed** and whose router, norms and
+/// vocabulary are not — the checkpoint a calibrated export of this architecture states, one layer
+/// deep and small enough to write by hand.
+///
+/// The expert stacks need 128 rows to be published in the product's own arrangement, and a packed
+/// projection needs its contraction whole sixteen-element blocks, so the smallest geometry that can
+/// carry both is 128 wide with 128 experts' worth of intermediate.
+const PACKED_HIDDEN: u64 = 128;
+const PACKED_VOCABULARY: u64 = 256;
+const PACKED_HEAD_DIM: u64 = 8;
+const PACKED_EXPERTS: u64 = 2;
+
+fn packed_model_shard() -> TempDir {
+    let dir = TempDir::new().unwrap_or_else(|error| panic!("a temporary directory: {error}"));
+    let config = format!(
+        r#"{{
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "vocab_size": {PACKED_VOCABULARY},
+            "hidden_size": {PACKED_HIDDEN},
+            "intermediate_size": {PACKED_HIDDEN},
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": {PACKED_HEAD_DIM},
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": false,
+            "num_experts": {PACKED_EXPERTS},
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": {PACKED_HIDDEN},
+            "norm_topk_prob": true,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [],
+            "quantization_config": {{
+                "config_groups": {{"group_0": {{
+                    "weights": {{"num_bits": 4, "type": "float", "group_size": 16}},
+                    "targets": ["Linear"]}}}},
+                "ignore": ["model.layers.0.mlp.gate"]}},
+            "attention_bias": false
+        }}"#
+    );
+    std::fs::write(dir.path().join("config.json"), config)
+        .unwrap_or_else(|error| panic!("the fixture config: {error}"));
+
+    // Every tensor the model reads, in the checkpoint's own spelling. A packed projection carries
+    // four: the pair, the block scales, the weight's tensor scale and the activation's.
+    let bf16 = |elements: u64| vec![0u8; (elements * 2) as usize];
+    let mut owned: Vec<(String, Vec<u64>, String, Vec<u8>)> = vec![
+        (
+            "model.embed_tokens.weight".to_owned(),
+            vec![PACKED_VOCABULARY, PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_VOCABULARY * PACKED_HIDDEN),
+        ),
+        (
+            "lm_head.weight".to_owned(),
+            vec![PACKED_VOCABULARY, PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_VOCABULARY * PACKED_HIDDEN),
+        ),
+        (
+            "model.norm.weight".to_owned(),
+            vec![PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_HIDDEN),
+        ),
+    ];
+    for norm in ["input_layernorm", "post_attention_layernorm"] {
+        owned.push((
+            format!("model.layers.0.{norm}.weight"),
+            vec![PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_HIDDEN),
+        ));
+    }
+    for norm in ["q_norm", "k_norm"] {
+        owned.push((
+            format!("model.layers.0.self_attn.{norm}.weight"),
+            vec![PACKED_HEAD_DIM],
+            "BF16".to_owned(),
+            bf16(PACKED_HEAD_DIM),
+        ));
+    }
+    owned.push((
+        "model.layers.0.mlp.gate.weight".to_owned(),
+        vec![PACKED_EXPERTS, PACKED_HIDDEN],
+        "BF16".to_owned(),
+        bf16(PACKED_EXPERTS * PACKED_HIDDEN),
+    ));
+
+    // The four attention projections, packed: `q` and `o` contract over the hidden width, `k` and `v`
+    // over it too, and every one of them is a whole number of sixteen-element blocks.
+    let mut packed_tensor = |name: String, rows: u64, columns: u64, seed: u8| {
+        owned.push((
+            format!("{name}.weight"),
+            vec![rows, columns / 2],
+            "U8".to_owned(),
+            vec![seed; (rows * columns / 2) as usize],
+        ));
+        owned.push((
+            format!("{name}.weight_scale"),
+            vec![rows, columns / 16],
+            "F8_E4M3".to_owned(),
+            vec![1u8; (rows * columns / 16) as usize],
+        ));
+        owned.push((
+            format!("{name}.weight_scale_2"),
+            Vec::new(),
+            "F32".to_owned(),
+            f32::from(seed).to_le_bytes().to_vec(),
+        ));
+        owned.push((
+            format!("{name}.input_scale"),
+            Vec::new(),
+            "F32".to_owned(),
+            f32::from(seed).to_le_bytes().to_vec(),
+        ));
+    };
+    let query = 2 * PACKED_HEAD_DIM;
+    let key_value = PACKED_HEAD_DIM;
+    packed_tensor(
+        "model.layers.0.self_attn.q_proj".to_owned(),
+        query,
+        PACKED_HIDDEN,
+        3,
+    );
+    packed_tensor(
+        "model.layers.0.self_attn.k_proj".to_owned(),
+        key_value,
+        PACKED_HIDDEN,
+        5,
+    );
+    packed_tensor(
+        "model.layers.0.self_attn.v_proj".to_owned(),
+        key_value,
+        PACKED_HIDDEN,
+        7,
+    );
+    packed_tensor(
+        "model.layers.0.self_attn.o_proj".to_owned(),
+        PACKED_HIDDEN,
+        query,
+        11,
+    );
+    for expert in 0..PACKED_EXPERTS {
+        for (projection, rows, columns, seed) in [
+            ("gate", PACKED_HIDDEN, PACKED_HIDDEN, 13u8),
+            ("up", PACKED_HIDDEN, PACKED_HIDDEN, 17u8),
+            ("down", PACKED_HIDDEN, PACKED_HIDDEN, 19u8),
+        ] {
+            packed_tensor(
+                format!("model.layers.0.mlp.experts.{expert}.{projection}_proj"),
+                rows,
+                columns,
+                seed,
+            );
+        }
+    }
+
+    let borrowed: Vec<Tensor<'_>> = owned
+        .iter()
+        .map(|(name, shape, dtype, bytes)| Tensor {
+            name,
+            shape: shape.clone(),
+            dtype,
+            bytes: bytes.clone(),
+        })
+        .collect();
+    write_shard(dir.path(), &borrowed);
+    dir
+}
+
+#[test]
+fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_dense() {
+    let dir = packed_model_shard();
+    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
+    let mut store = Retaining::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let partition = qwen3_moe::Partition::new(&qwen3_moe::Config::read(dir.path()).expect("the config"), 1, 0, 1, 0)
+        .expect("one rank");
+    let model = qwen3_moe::load::load_checkpoint(
+        dir.path(),
+        partition,
+        &mut loader,
+        qwen3_moe::LoadOptions::default(),
+        ops::fp4::ScaleLayout::Linear,
+    )
+    .expect("the calibrated checkpoint loads");
+
+    // The walk states both: the projections' product once per bucket, and the experts' products which
+    // carry no row count.
+    let keys = model
+        .keys(nn::DType::BF16, 0, &[1, 15])
+        .expect("the deployment's programs");
+    let named: Vec<&str> = keys.iter().map(|(operator, _)| operator.as_str()).collect();
+    // `q` is `[2 · head_dim, hidden]`, `o` is `[hidden, 2 · head_dim]`, and `k` and `v` are one
+    // geometry between them — so three packed products per bucket, and no dense MLP's at all.
+    assert_eq!(
+        named.iter().filter(|operator| **operator == "nvfp4_gemm").count(),
+        3 * 2,
+        "three attention geometries at two buckets, and no dense MLP's: {named:?}"
+    );
+    assert!(named.contains(&"nvfp4_quantize"), "{named:?}");
+    assert!(named.contains(&"gather_gemm_nvfp4"), "{named:?}");
+    assert!(named.contains(&"route_gemm_nvfp4"), "{named:?}");
+    assert!(named.contains(&"topk_softmax"), "the router is dense: {named:?}");
 }

@@ -515,11 +515,11 @@ fn encoded_projection(
         Shape::new(&[rows, columns / 2]),
     );
     let scales = WeightRequest::region(
-        checkpoint_name(sources, &format!("{parameter}.weight_scale"))?,
+        &packed_field(&values, Nvfp4Names::vllm().block_scale)?,
         rank * rows * (columns / 16),
         Shape::new(&[rows, columns / 16]),
     );
-    encoded(loader, sources, parameter, values, scales, bias, layout)
+    encoded(loader, parameter, values, scales, bias, layout)
 }
 
 /// One row-parallel encoded projection: this rank's `columns` of a `[rows, columns × ranks]` matrix.
@@ -543,12 +543,12 @@ fn encoded_output_projection(
         columns * ranks / 2,
     );
     let scales = WeightRequest::strided(
-        checkpoint_name(sources, &format!("{parameter}.weight_scale"))?,
+        &packed_field(&values, Nvfp4Names::vllm().block_scale)?,
         rank * (columns / 16),
         Shape::new(&[rows, columns / 16]),
         columns * ranks / 16,
     );
-    encoded(loader, sources, parameter, values, scales, bias, layout)
+    encoded(loader, parameter, values, scales, bias, layout)
 }
 
 /// The packed weight and the product's alpha, from the checkpoint's four tensors.
@@ -561,7 +561,6 @@ fn encoded_output_projection(
 #[allow(clippy::too_many_arguments)]
 fn encoded(
     loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
     parameter: &str,
     values: WeightRequest,
     scales: WeightRequest,
@@ -574,25 +573,28 @@ fn encoded(
         )));
     }
     let tensor_scale = WeightRequest::region(
-        checkpoint_name(sources, &format!("{parameter}.weight_scale_2"))?,
+        &packed_field(&values, Nvfp4Names::vllm().tensor_scale)?,
         0,
         Shape::new(&[1]),
     );
     let global_scale = loader.tensor_scale(&tensor_scale)?;
     let input_scale = WeightRequest::region(
-        checkpoint_name(sources, &format!("{parameter}.input_scale"))?,
+        &packed_field(&values, Nvfp4Names::vllm().input_scale)?,
         0,
         Shape::new(&[1]),
     );
-    // `layout` here is the **checkpoint's** arrangement — linear, one scale per sixteen elements —
-    // and not the product's: the loader builds the table the programs read and states it back in
+    // `layout` is the **checkpoint's** arrangement — linear, one scale per sixteen elements — and
+    // not the product's, which the loader is given separately and states back in
     // `QuantizedWeight::layout`, so the two cannot be confused for one another.
+    // The file's arrangement is the checkpoint's; the product's is the one `nvfp4_gemm`'s
+    // compilation serves, and the loader permutes between them.
     let quantized = loader.nvfp4(
         &values,
         &scales,
         Some(&input_scale),
         Nvfp4Names::vllm(),
         layout,
+        ScaleLayout::Swizzled128X4,
         global_scale,
     )?;
     let alpha = loader.constant(
@@ -606,6 +608,27 @@ fn encoded(
         linear: Box::new(linear),
         alpha,
     })
+}
+
+/// The checkpoint field a packed projection's values name, beside them.
+///
+/// A calibrated export spells the encoded fields as suffixes of the parameter's own stem —
+/// `…q_proj.weight`, `…q_proj.weight_scale`, `…q_proj.weight_scale_2`, `…q_proj.input_scale` — and the
+/// mapping states only the first, because it is the only one a dense checkpoint has. The other three
+/// are derived here from the same spelling the loader is told to read them in.
+fn packed_field(values: &WeightRequest, suffix: &str) -> Result<String> {
+    let stem = values.tensor.strip_suffix(Nvfp4Names::vllm().values).ok_or_else(|| {
+        Error::Config(format!(
+            "the packed values of {} are not spelled `….{}`, so their block scales and tensor scale \
+             cannot be named beside them",
+            values.tensor,
+            Nvfp4Names::vllm().values
+        ))
+    })?;
+    // The spelling's suffixes are bare words, so the stem loses the dot that joined the values to
+    // their own name: `…q_proj.weight` + `weight_scale` is `…q_proj.weight_scale`, not `..`.
+    let stem = stem.strip_suffix('.').unwrap_or(stem);
+    Ok(format!("{stem}.{suffix}"))
 }
 
 /// One row-sharded projection: `[rows, columns]` starting at this rank's row block.
