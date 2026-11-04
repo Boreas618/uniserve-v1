@@ -758,9 +758,7 @@ pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<V
         let audio_frames = condition.audio_samples.div_ceil(AUDIO_HOP);
         let (kind, anchor) = match (condition.role, &visual) {
             (Role::Reference, None) => (SegmentKind::Audio, None),
-            (Role::Reference, Some(visual)) if visual.frames == 1 => {
-                (SegmentKind::Image, None)
-            }
+            (Role::Reference, Some(visual)) if visual.frames == 1 => (SegmentKind::Image, None),
             (Role::Reference, Some(_)) => (SegmentKind::Video, None),
             (role, Some(frame)) => {
                 if frame.raster != latent_raster(canvas)? {
@@ -776,9 +774,7 @@ pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<V
                 (SegmentKind::Keyframe, Some(anchor))
             }
             (_, None) => {
-                return Err(Error::config(
-                    "an H3 keyframe carries its frame".to_owned(),
-                ));
+                return Err(Error::config("an H3 keyframe carries its frame".to_owned()));
             }
         };
         if kind == SegmentKind::Image && audio_frames > 0 {
@@ -919,7 +915,8 @@ pub fn segment_extent(
     let raster = latent_raster(canvas)?;
     let grid = video_grid(video_latent_frames(num_frames)?, raster);
     let shape = tile_shape(tile)?;
-    let video_tiles = grid.0.div_ceil(shape.0) * grid.1.div_ceil(shape.1) * grid.2.div_ceil(shape.2);
+    let video_tiles =
+        grid.0.div_ceil(shape.0) * grid.1.div_ceil(shape.1) * grid.2.div_ceil(shape.2);
     let audio_rows = audio_rows(num_frames);
     let video_start = text_rows + condition_rows + audio_rows.div_ceil(tile) * tile;
     let end = video_start + video_tiles * tile;
@@ -1180,7 +1177,13 @@ pub fn segment_tables(
                 }
             }
             SegmentKind::Audio => {
-                place_audio(&mut positions, audio, segment.audio_frames, clock, &width_grid);
+                place_audio(
+                    &mut positions,
+                    audio,
+                    segment.audio_frames,
+                    clock,
+                    &width_grid,
+                );
                 clock += f64::from(segment.audio_frames);
             }
             SegmentKind::Video => {
@@ -1189,7 +1192,13 @@ pub fn segment_tables(
                 })?;
                 let (grid, own_width) = frame_grid(visual_segment.raster);
                 if segment.audio_rows() > 0 {
-                    place_audio(&mut positions, audio, segment.audio_frames, clock, &own_width);
+                    place_audio(
+                        &mut positions,
+                        audio,
+                        segment.audio_frames,
+                        clock,
+                        &own_width,
+                    );
                 }
                 let (visual, raster_rows) = video_segment(
                     next_tile,
@@ -1226,7 +1235,12 @@ pub fn segment_tables(
 
     // The generated audio and video start where the references leave the clock; their rows are the
     // layout's own.
-    let audio = dense_rows(extent.audio_start() / tile, extent.audio_rows, tile, &mut block_sizes);
+    let audio = dense_rows(
+        extent.audio_start() / tile,
+        extent.audio_rows,
+        tile,
+        &mut block_sizes,
+    );
     place_audio(
         &mut positions,
         audio.clone(),
@@ -1262,9 +1276,8 @@ pub fn segment_tables(
         let keep = if index + 1 == tile_counts.len() {
             sparsity
         } else {
-            let reference_keep = reference_keep.ok_or_else(|| {
-                Error::config("reference videos need a keep rate".to_owned())
-            })?;
+            let reference_keep = reference_keep
+                .ok_or_else(|| Error::config("reference videos need a keep rate".to_owned()))?;
             1.0 - reference_keep
         };
         segment_keep[index] = kept_tiles(keep, *count) as i32;
@@ -1722,5 +1735,369 @@ mod tests {
             matches!(error, Error::Config(ref problem) if problem.contains("vision spans")),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_sparse_layout_holds_whole_tiles_of_text_conditions_audio_and_video() {
+        let extent = segment_extent(124, &canvas(), 7040, 512, 128, 128).expect("a sparse layout");
+        // 37x24x42 grid in 4x4x8 tiles: 10x6x6 tiles.
+        assert_eq!(extent.video_grid, (37, 24, 42));
+        assert_eq!(extent.video_tiles, 360);
+        assert_eq!(extent.audio_rows, 414);
+        assert_eq!(extent.audio_start(), 7552);
+        assert_eq!(extent.video_start(), 8064);
+        assert_eq!(extent.zero_row(), 7552);
+        // 423 whole tiles, so the alignment adds nothing.
+        assert_eq!(extent.padded_tokens, 423 * 128);
+
+        // With conditions the text tiles are the only ones every request shares.
+        assert_eq!(extent.dense_prefix_tiles(), 55);
+        let unconditioned = segment_extent(124, &canvas(), 7040, 0, 128, 128).expect("a layout");
+        assert_eq!(unconditioned.video_start(), 7040 + 512);
+        assert_eq!(unconditioned.dense_prefix_tiles(), (7040 + 512) / 128);
+
+        // 63 dense tiles and 36 kept of the video's 360.
+        let bounds = extent.key_bounds(0.9);
+        assert_eq!(bounds.len(), 423);
+        assert_eq!(bounds[..63], [423; 63]);
+        assert_eq!(bounds[63..], [99; 360]);
+
+        assert_eq!(extent.audio_rows_below(7552), 0);
+        assert_eq!(extent.audio_rows_below(8000), 414);
+        assert_eq!(extent.video_rows_below(8064).expect("a boundary"), 0);
+        assert_eq!(extent.video_rows_below(8192).expect("a boundary"), 128);
+        assert_eq!(extent.video_rows_below(54144).expect("a boundary"), 37296);
+        assert!(extent.video_rows_below(8100).is_err());
+
+        for (text, conditions, tile, multiple) in [
+            (7039, 512, 128, 128),
+            (7040, 512, 96, 96),
+            (7040, 512, 128, 64),
+            (7040, 513, 128, 128),
+        ] {
+            assert!(
+                segment_extent(124, &canvas(), text, conditions, tile, multiple).is_err(),
+                "{text} {conditions} {tile} {multiple}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generated_video_rows_of_a_sparse_layout_cover_every_patch_once() {
+        let packing = segment_packing(124, &canvas(), 7040, 512, 128, 128).expect("a layout");
+        let extent = packing.extent;
+        assert_eq!(packing.video_indices.len(), 37 * 1008);
+        assert_eq!(packing.video_indices[0], extent.video_start());
+        assert!(
+            packing
+                .video_indices
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert!(
+            packing
+                .video_indices
+                .iter()
+                .all(|row| *row < extent.video_start() + 360 * 128)
+        );
+        assert_eq!(packing.video_variable_block_sizes.len(), 360);
+        assert_eq!(
+            packing.video_variable_block_sizes.iter().sum::<u32>(),
+            37 * 1008
+        );
+        assert!(
+            packing
+                .video_variable_block_sizes
+                .iter()
+                .all(|size| *size <= 128)
+        );
+
+        let mut raster = packing.video_raster_indices.clone();
+        raster.sort_unstable();
+        assert_eq!(raster, (0..37 * 1008).collect::<Vec<_>>());
+        // Each tile's valid rows lead its block, in tile order.
+        let mut taken = 0_u32;
+        let mut start = extent.video_start();
+        for size in &packing.video_variable_block_sizes {
+            assert_eq!(packing.video_indices[taken as usize], start);
+            for offset in 1..*size {
+                assert_eq!(
+                    packing.video_indices[(taken + offset) as usize],
+                    start + offset
+                );
+            }
+            taken += *size;
+            start += 128;
+        }
+        assert_eq!(taken, 37 * 1008);
+
+        assert_eq!(packing.audio_indices(), 7552..7966);
+    }
+
+    #[test]
+    fn a_text_only_sparse_request_fills_its_text_audio_and_video_tiles() {
+        let packing = segment_packing(124, &canvas(), 7040, 512, 128, 128).expect("a layout");
+        let tables = segment_tables(&packing, 124, &canvas(), 1935, &[], &[(5, 10)], 0.9, None)
+            .expect("a sparse request");
+        assert_eq!(tables.variable_block_sizes.len(), 423);
+
+        // The prompt fills 15 whole tiles and 15 rows of the sixteenth.
+        assert_eq!(tables.variable_block_sizes[15], 15);
+        assert_eq!(tables.variable_block_sizes[16], 0);
+        assert_eq!(tables.position_ids[0], [0.0, 0.0, 0.0]);
+        assert_eq!(tables.position_ids[1934], [1934.0, 0.0, 0.0]);
+        assert_eq!(tables.token_tags[4], Tag::Text as i32);
+        assert_eq!(tables.token_tags[5], Tag::Video as i32);
+        assert_eq!(tables.prefix_index[1934], 1934);
+
+        // The generated audio fills four tiles from row 7552: 128, 128, 128 and 30.
+        let audio = packing.audio_indices();
+        assert_eq!(tables.variable_block_sizes[59], 128);
+        assert_eq!(tables.variable_block_sizes[62], 30);
+        assert_eq!(tables.variable_block_sizes[63], 128);
+        let (_, widths) = frame_grid(latent_raster(&canvas()).expect("raster"));
+        assert_eq!(
+            tables.position_ids[audio.start as usize],
+            [1935.0, 0.0, widths[0]]
+        );
+        assert_eq!(
+            tables.position_ids[audio.start as usize + 207],
+            [1935.0, 0.0, widths[41]]
+        );
+        assert_eq!(tables.groups[audio.start as usize], Group::Audio as i32);
+        assert_eq!(tables.token_tags[audio.start as usize], Tag::Audio as i32);
+
+        // The generated video is the last segment: 360 tiles from tile 63, keeping 36.
+        assert!(tables.tile_segments[62] < 0);
+        assert_eq!(tables.tile_segments[63], 0);
+        assert_eq!(tables.tile_segments[422], 0);
+        assert_eq!(tables.segment_starts[0], 63);
+        assert_eq!(tables.segment_keep[0], 36);
+        let (spatial, _) = frame_grid(latent_raster(&canvas()).expect("raster"));
+        assert_eq!(
+            tables.position_ids[packing.video_indices[0] as usize],
+            [1935.0, spatial[0][0], spatial[0][1]]
+        );
+        // The generated video's tile sizes are the layout's own.
+        assert_eq!(
+            tables.variable_block_sizes[63..423],
+            packing.video_variable_block_sizes[..]
+        );
+    }
+
+    #[test]
+    fn a_reference_video_forms_its_own_segment_of_video_tiles() {
+        let packing = segment_packing(124, &canvas(), 7040, 10240, 128, 128).expect("a layout");
+        let extent = packing.extent;
+        assert_eq!(extent.video_start(), 17792);
+        assert_eq!(extent.padded_tokens, 499 * 128);
+        let reference = Segment {
+            kind: SegmentKind::Video,
+            condition: 0,
+            anchor: None,
+            visual: Some(Visual {
+                frames: 37,
+                raster: LatentRaster {
+                    height: 32,
+                    width: 32,
+                },
+            }),
+            audio_frames: 0,
+        };
+        assert_eq!(segment_tiles(&reference, 128).expect("tiles"), 80);
+        let tables = segment_tables(
+            &packing,
+            124,
+            &canvas(),
+            6913,
+            std::slice::from_ref(&reference),
+            &[],
+            0.9,
+            Some(0.1),
+        )
+        .expect("a reference request");
+
+        // The prompt takes 54 whole tiles and one row of the next.
+        assert_eq!(tables.variable_block_sizes[53], 128);
+        assert_eq!(tables.variable_block_sizes[54], 1);
+        // The reference video owns tiles 55..135, each its own segment.
+        assert_eq!(tables.tile_segments[55], 0);
+        assert_eq!(tables.tile_segments[134], 0);
+        assert!(tables.tile_segments[135] < 0);
+        assert_eq!(tables.variable_block_sizes[55], 128);
+        // Its rows sit at the clock the prompt leaves, at its own patch grid.
+        let first = 55 * 128;
+        assert_eq!(tables.position_ids[first], [6913.0, 0.0, 0.0]);
+        assert_eq!(tables.groups[first], Group::VisualCondition as i32);
+        assert_eq!(tables.prefix_index[first], 7040);
+        assert_eq!(tables.prefix_index[first + 1], 7041);
+
+        // The generated audio fills tiles 135..139 and the video 139..499.
+        assert_eq!(tables.variable_block_sizes[135], 128);
+        assert_eq!(tables.variable_block_sizes[138], 30);
+        assert_eq!(tables.tile_segments[139], 1);
+        // 59 dense and empty tiles below the reference, then its 80 tiles.
+        assert_eq!(tables.segment_starts[0], 59);
+        assert_eq!(tables.segment_keep[0], 8);
+        assert_eq!(tables.segment_starts[1], 139);
+        assert_eq!(tables.segment_keep[1], 36);
+
+        // The generated rows start a reference video's span after the prompt.
+        let clock = 6913.0 + 620.0 / 3.0;
+        assert_eq!(tables.position_ids[extent.audio_start() as usize][0], clock);
+        assert_eq!(tables.position_ids[extent.video_start() as usize][0], clock);
+    }
+
+    #[test]
+    fn a_reference_request_needs_a_keep_rate_for_its_videos() {
+        let packing = segment_packing(124, &canvas(), 7040, 10240, 128, 128).expect("a layout");
+        let reference = Segment {
+            kind: SegmentKind::Video,
+            condition: 0,
+            anchor: None,
+            visual: Some(Visual {
+                frames: 37,
+                raster: LatentRaster {
+                    height: 32,
+                    width: 32,
+                },
+            }),
+            audio_frames: 0,
+        };
+        let error = segment_tables(
+            &packing,
+            124,
+            &canvas(),
+            6913,
+            std::slice::from_ref(&reference),
+            &[],
+            0.9,
+            None,
+        )
+        .err()
+        .expect("a reference video without a keep rate");
+        assert!(
+            matches!(error, Error::Config(ref problem) if problem.contains("keep rate")),
+            "{error}"
+        );
+
+        // Conditions that do not fit their capacity are refused before any table exists.
+        let error = segment_tables(
+            &packing,
+            124,
+            &canvas(),
+            6913,
+            &[reference; 2],
+            &[],
+            0.9,
+            Some(0.1),
+        )
+        .err()
+        .expect("160 tiles do not fit 80");
+        assert!(
+            matches!(error, Error::Config(ref problem) if problem.contains("capacities")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn conditions_are_ordered_keyframes_first_and_typed_by_what_they_carry() {
+        let target = canvas();
+        let conditions = [
+            Condition {
+                role: Role::Reference,
+                frame: None,
+                audio_samples: 124 * 800,
+            },
+            Condition {
+                role: Role::LastFrame,
+                frame: Some(Frame {
+                    canvas: target,
+                    num_frames: 1,
+                }),
+                audio_samples: 0,
+            },
+            Condition {
+                role: Role::Reference,
+                frame: Some(Frame {
+                    canvas: Canvas {
+                        short_edge: 512,
+                        aspect: (1, 1),
+                        width: 512,
+                        height: 512,
+                    },
+                    num_frames: 124,
+                }),
+                audio_samples: 0,
+            },
+            Condition {
+                role: Role::FirstFrame,
+                frame: Some(Frame {
+                    canvas: target,
+                    num_frames: 1,
+                }),
+                audio_samples: 0,
+            },
+        ];
+        let segments = condition_segments(&conditions, &target).expect("four conditions");
+        let kinds: Vec<_> = segments.iter().map(|segment| segment.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                SegmentKind::Keyframe,
+                SegmentKind::Keyframe,
+                SegmentKind::Video,
+                SegmentKind::Audio
+            ]
+        );
+        // The keyframes keep their request order, and their condition index with it.
+        assert_eq!(segments[0].condition, 1);
+        assert_eq!(segments[0].anchor, Some(Anchor::LastFrame));
+        assert_eq!(segments[1].condition, 3);
+        assert_eq!(segments[1].anchor, Some(Anchor::FirstFrame));
+        assert_eq!(segments[2].condition, 2);
+        assert_eq!(segments[2].visual.expect("pixels").frames, 37);
+        assert_eq!(segments[3].condition, 0);
+        assert_eq!(segments[3].audio_frames, 124);
+        assert_eq!(segments[3].audio_rows(), 248);
+
+        // A one-frame reference is an image, and an image carries no audio.
+        let image = Condition {
+            role: Role::Reference,
+            frame: Some(Frame {
+                canvas: Canvas {
+                    short_edge: 512,
+                    aspect: (1, 1),
+                    width: 512,
+                    height: 512,
+                },
+                num_frames: 1,
+            }),
+            audio_samples: 0,
+        };
+        let segments = condition_segments(&[image], &target).expect("an image");
+        assert_eq!(segments[0].kind, SegmentKind::Image);
+        assert_eq!(segments[0].visual.expect("pixels").frames, 1);
+
+        let with_audio = Condition {
+            audio_samples: 800,
+            ..image
+        };
+        assert!(condition_segments(&[with_audio], &target).is_err());
+
+        let off_canvas = Condition {
+            role: Role::FirstFrame,
+            frame: Some(Frame {
+                canvas: Canvas {
+                    short_edge: 512,
+                    aspect: (1, 1),
+                    width: 512,
+                    height: 512,
+                },
+                num_frames: 1,
+            }),
+            audio_samples: 0,
+        };
+        assert!(condition_segments(&[off_canvas], &target).is_err());
     }
 }
