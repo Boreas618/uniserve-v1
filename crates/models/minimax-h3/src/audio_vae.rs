@@ -29,6 +29,11 @@
 //! alone.
 
 use crate::{AudioVaeConfig, Error, Result};
+use nn::layers::{
+    AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
+};
+use nn::weights::WeightRequest;
+use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 
 /// One upsampling stage of the decoder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -663,6 +668,392 @@ impl Statistics {
         })?;
         let std = self.std[channel];
         Ok(value * std + mean)
+    }
+}
+
+/// The audio decoder: the checkpoint's BigVGAN network, one call per run of latent frames.
+///
+/// Layout everywhere is `[batch, channels, samples]`, the form the one-dimensional convolutions take.
+/// The batch is two because the reference decodes a stereo pair of identical rows and interleaves them;
+/// nothing in the network mixes the rows, so both output channels carry the same signal.
+pub struct AudioDecoder {
+    config: AudioVaeConfig,
+    input: Conv1d,
+    pre: Conv1d,
+    stages: Vec<DecoderStage>,
+    post: AudioActivation,
+    output: Conv1d,
+    pcm: PcmInterleave,
+}
+
+/// One upsampling stage: a transposed convolution whose output is the sum of three anti-aliased blocks,
+/// divided by three.
+struct DecoderStage {
+    upsample: ConvTranspose1d,
+    blocks: Vec<DecoderBlock>,
+    /// Latent samples become `rate` times as many.
+    rate: u32,
+    /// The stage's width, which its blocks keep.
+    channels: u32,
+}
+
+/// One anti-aliased multi-periodicity block: one residual kernel run at each of its dilations, the steps
+/// accumulating on the running value.
+struct DecoderBlock {
+    steps: Vec<DecoderStep>,
+    /// The width the block runs at: its stage's output channels.
+    channels: u32,
+}
+
+/// One dilation step: an alias-free activation, the dilated convolution, a second activation and the
+/// plain convolution, whose result is added to the running value.
+struct DecoderStep {
+    first: Conv1d,
+    first_activation: AudioActivation,
+    second: Conv1d,
+    second_activation: AudioActivation,
+}
+
+/// The alias-free activation's geometry, from the checkpoint's own constants.
+const ACTIVATION_KERNEL: u32 = 12;
+const ACTIVATION_RATIO: u32 = 2;
+/// The program's width, as the operator states it.
+const ACTIVATION_BLOCK: u32 = 256;
+/// The two channels the reference decodes and interleaves.
+const PCM_CHANNELS: u32 = 2;
+
+impl AudioDecoder {
+    /// Bind every parameter the checkpoint's audio decoder has, through [`sources`].
+    ///
+    /// The table is consumed exactly: a tensor it names but the load never reads is an error, so a
+    /// checkpoint field cannot be silently dropped, and a parameter read twice is an error too.
+    pub fn load(config: &AudioVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
+        let mut binder = Binder::new(loader, sources(config)?);
+        let input = Conv1d::new(
+            binder.normalized("input.weight")?,
+            Some(binder.region("input.bias", &[u64::from(config.latent_dim)])?),
+            geometry(1, 1, 0)?,
+            false,
+        )?;
+        let pre = Conv1d::new(
+            binder.normalized("pre.weight")?,
+            Some(binder.region("pre.bias", &[u64::from(config.decoder_dim)])?),
+            geometry(7, 1, 3)?,
+            false,
+        )?;
+        let stages = stages(config)?;
+        let blocks = blocks(config)?;
+        let mut built = Vec::with_capacity(stages.len());
+        for (index, stage) in stages.iter().enumerate() {
+            let upsample = ConvTranspose1d::new(
+                binder.normalized(&format!("stages.{index}.upsample.weight"))?,
+                Some(binder.region(
+                    &format!("stages.{index}.upsample.bias"),
+                    &[u64::from(stage.channels_out)],
+                )?),
+                geometry(stage.kernel, stage.rate, stage.padding)?,
+                false,
+            )?;
+            let width = u64::from(stage.channels_out);
+            let mut stage_blocks = Vec::with_capacity(BLOCKS_PER_STAGE);
+            for block in blocks.iter().filter(|block| block.stage == index) {
+                let at = |name: &str| format!("stages.{index}.blocks.{}.{name}", block.index);
+                let mut steps = Vec::with_capacity(block.steps.len());
+                for (step, dilation) in block.steps.iter().enumerate() {
+                    let first = Conv1d::new(
+                        binder.normalized(&at(&format!("convs1.{step}.weight")))?,
+                        Some(binder.region(&at(&format!("convs1.{step}.bias")), &[width])?),
+                        geometry(block.kernel, 1, dilation.padding)?,
+                        false,
+                    )?;
+                    let first_activation =
+                        binder.activation(&at(&format!("activations.{}", 2 * step)), width)?;
+                    let second = Conv1d::new(
+                        binder.normalized(&at(&format!("convs2.{step}.weight")))?,
+                        Some(binder.region(&at(&format!("convs2.{step}.bias")), &[width])?),
+                        geometry(block.kernel, 1, Step::padding_plain(block.kernel))?,
+                        false,
+                    )?;
+                    let second_activation =
+                        binder.activation(&at(&format!("activations.{}", 2 * step + 1)), width)?;
+                    steps.push(DecoderStep {
+                        first,
+                        first_activation,
+                        second,
+                        second_activation,
+                    });
+                }
+                stage_blocks.push(DecoderBlock {
+                    steps,
+                    channels: stage.channels_out,
+                });
+            }
+            built.push(DecoderStage {
+                upsample,
+                blocks: stage_blocks,
+                rate: stage.rate,
+                channels: stage.channels_out,
+            });
+        }
+        let last = stages
+            .last()
+            .ok_or_else(|| Error::config("the audio decoder has no stage".to_owned()))?;
+        let post = binder.activation("post", u64::from(last.channels_out))?;
+        let output = Conv1d::new(
+            binder.normalized("output.weight")?,
+            None,
+            geometry(7, 1, 3)?,
+            false,
+        )?;
+        binder.finish()?;
+        Ok(Self {
+            config: config.clone(),
+            input,
+            pre,
+            stages: built,
+            post,
+            output,
+            pcm: PcmInterleave::new(DType::F32)?,
+        })
+    }
+
+    /// Decode `latents [2, latent_channels, frames]` into interleaved PCM `[samples, 2]`.
+    ///
+    /// The two rows of the latent are the stereo pair the reference decodes; both hold the same latent,
+    /// so the network's two output rows are equal and [`PcmInterleave`] writes them interleaved. Every
+    /// intermediate is FP32 — `specs/worker.md` 9's audio rows keep no reduced precision — and the
+    /// length grows only through the stages' transposed convolutions, so `samples` is `frames · Π rates`.
+    pub fn forward(&self, f: &Forward, latents: TensorView, out: TensorView) -> Result<()> {
+        let shape = latents.shape;
+        if shape.rank() != 3
+            || shape.dim(0) != u64::from(PCM_CHANNELS)
+            || shape.dim(1) != u64::from(self.config.latent_channels)
+        {
+            return Err(Error::config(format!(
+                "{:?} is not [{PCM_CHANNELS}, {}, frames] latents",
+                shape.dims(),
+                self.config.latent_channels
+            )));
+        }
+        let mut length = shape.dim(2);
+        let projected = self.buffer(f, self.config.latent_dim, length)?;
+        self.input.forward(f, latents, projected)?;
+        let mut current = self.buffer(f, self.config.decoder_dim, length)?;
+        self.pre.forward(f, projected, current)?;
+        for stage in &self.stages {
+            length = length
+                .checked_mul(u64::from(stage.rate))
+                .ok_or_else(|| Error::config("the audio track's length overflows".to_owned()))?;
+            let upsampled = self.buffer(f, stage.channels, length)?;
+            stage.upsample.forward(f, current, upsampled)?;
+            current = self.stage(f, stage, upsampled, length)?;
+        }
+        let activated = self.buffer(f, self.last_channels()?, length)?;
+        self.post.forward(f, current, activated)?;
+        let mono = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[u64::from(PCM_CHANNELS), 1, length]),
+        )?;
+        self.output.forward(f, activated, mono)?;
+        let planes = mono.reshape(Shape::new(&[u64::from(PCM_CHANNELS), length]));
+        self.pcm.forward(f, planes, out)?;
+        Ok(())
+    }
+
+    /// One stage's output: its three blocks summed and divided by three.
+    fn stage(
+        &self,
+        f: &Forward,
+        stage: &DecoderStage,
+        input: TensorView,
+        length: u64,
+    ) -> Result<TensorView> {
+        let accumulated = self.buffer(f, stage.channels, length)?;
+        for (index, block) in stage.blocks.iter().enumerate() {
+            let block_out = self.block(f, block, input, length)?;
+            // The first block initialises the sum; the rest add to it.
+            let beta = if index == 0 { 0.0 } else { 1.0 };
+            ScaledAdd.forward(f, rows(accumulated)?, rows(block_out)?, 1.0, beta)?;
+        }
+        // The reference divides the sum by the number of kernels; multiplying by the reciprocal differs
+        // only in the last bit of a FP32 value, three orders below one PCM step.
+        ScaledAdd.forward(
+            f,
+            rows(accumulated)?,
+            rows(accumulated)?,
+            0.0,
+            1.0 / BLOCKS_PER_STAGE as f32,
+        )?;
+        Ok(accumulated)
+    }
+
+    /// One block: its steps accumulate on the stage's input, which the block never modifies.
+    fn block(
+        &self,
+        f: &Forward,
+        block: &DecoderBlock,
+        input: TensorView,
+        length: u64,
+    ) -> Result<TensorView> {
+        if block.steps.is_empty() {
+            return Err(Error::config("an audio block has no step".to_owned()));
+        }
+        let running = self.buffer(f, block.channels, length)?;
+        // `beta = 0` initialises the running value from the stage's input without touching it.
+        ScaledAdd.forward(f, rows(running)?, rows(input)?, 1.0, 0.0)?;
+        let activated = self.buffer(f, block.channels, length)?;
+        let convolved = self.buffer(f, block.channels, length)?;
+        let residual = self.buffer(f, block.channels, length)?;
+        for step in &block.steps {
+            step.first_activation.forward(f, running, activated)?;
+            step.first.forward(f, activated, convolved)?;
+            step.second_activation.forward(f, convolved, activated)?;
+            step.second.forward(f, activated, residual)?;
+            ScaledAdd.forward(f, rows(running)?, rows(residual)?, 1.0, 1.0)?;
+        }
+        Ok(running)
+    }
+
+    /// The width the last stage leaves, which the post activation and the output convolution read.
+    fn last_channels(&self) -> Result<u32> {
+        self.stages
+            .last()
+            .map(|stage| stage.channels)
+            .ok_or_else(|| Error::config("the audio decoder has no stage".to_owned()))
+    }
+
+    /// A FP32 buffer of the audio network's layout.
+    fn buffer(&self, f: &Forward, channels: u32, length: u64) -> Result<TensorView> {
+        Ok(f.arena().tensor(
+            DType::F32,
+            Shape::new(&[u64::from(PCM_CHANNELS), u64::from(channels), length]),
+        )?)
+    }
+}
+
+/// The 1-d convolution geometry: `kernel` taps, `stride`, `padding`, no dilation of its own, one group.
+fn geometry(kernel: u32, stride: u32, padding: u32) -> Result<ConvGeometry> {
+    Ok(ConvGeometry::new(
+        1,
+        [kernel; 3],
+        [stride; 3],
+        [padding; 3],
+        [1; 3],
+        1,
+    )?)
+}
+
+/// A view of `[channels, rows, columns]` as `[rows · channels, columns]`, the form the in-place
+/// accumulation takes.
+fn rows(view: TensorView) -> Result<TensorView> {
+    let columns = view.shape.dim(view.shape.rank() - 1);
+    if columns == 0 {
+        return Err(Error::config("a tensor of no column".to_owned()));
+    }
+    Ok(view.reshape(Shape::new(&[view.shape.numel() / columns, columns])))
+}
+
+/// The parameters of one load, with every table entry tracked so none is skipped.
+struct Binder<'a, 'b> {
+    loader: &'a mut WeightLoader<'b>,
+    table: Vec<Source>,
+    used: Vec<bool>,
+}
+
+impl<'a, 'b> Binder<'a, 'b> {
+    fn new(loader: &'a mut WeightLoader<'b>, table: Vec<Source>) -> Self {
+        let used = vec![false; table.len()];
+        Self {
+            loader,
+            table,
+            used,
+        }
+    }
+
+    /// The table entry of `parameter`, marked used.
+    fn entry(&mut self, parameter: &str) -> Result<Tensor> {
+        let index = self
+            .table
+            .iter()
+            .position(|source| source.parameter == parameter)
+            .ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "{}: {}",
+                    parameter.to_owned(),
+                    "the checkpoint's audio decoder has no such parameter".to_owned()
+                ))
+            })?;
+        if self.used[index] {
+            return Err(Error::checkpoint(format!(
+                "{}: {}",
+                parameter.to_owned(),
+                "the parameter is bound twice".to_owned()
+            )));
+        }
+        self.used[index] = true;
+        Ok(self.table[index].tensor.clone())
+    }
+
+    /// A weight-normalized convolution's folded weight.
+    fn normalized(&mut self, parameter: &str) -> Result<Weight> {
+        match self.entry(parameter)? {
+            Tensor::Normalized { value, gain } => {
+                Ok(self.loader.weight_norm(parameter, &value, &gain)?)
+            }
+            other => Err(Error::checkpoint(format!(
+                "{parameter}: the parameter is not weight-normalized: {other:?}"
+            ))),
+        }
+    }
+
+    /// One tensor, read at `shape`.
+    fn region(&mut self, parameter: &str, shape: &[u64]) -> Result<Weight> {
+        match self.entry(parameter)? {
+            Tensor::Region(tensor) => {
+                Ok(self
+                    .loader
+                    .load(&WeightRequest::region(tensor, 0, Shape::new(shape)))?)
+            }
+            other => Err(Error::checkpoint(format!(
+                "{}: {}",
+                parameter.to_owned(),
+                format!("the parameter is not one tensor: {other:?}")
+            ))),
+        }
+    }
+
+    /// One alias-free activation: its two frequencies and its two filters.
+    fn activation(&mut self, parameter: &str, channels: u64) -> Result<AudioActivation> {
+        let alpha = self.region(&format!("{parameter}.act.alpha"), &[channels])?;
+        let beta = self.region(&format!("{parameter}.act.beta"), &[channels])?;
+        let up = self.region(
+            &format!("{parameter}.upsample.filter"),
+            &[1, 1, u64::from(ACTIVATION_KERNEL)],
+        )?;
+        let down = self.region(
+            &format!("{parameter}.downsample.lowpass.filter"),
+            &[1, 1, u64::from(ACTIVATION_KERNEL)],
+        )?;
+        Ok(AudioActivation::new(
+            DType::F32,
+            u32::try_from(channels)
+                .map_err(|_| Error::config("an audio width wider than 32 bits".to_owned()))?,
+            ACTIVATION_KERNEL,
+            ACTIVATION_RATIO,
+            ACTIVATION_BLOCK,
+        )?
+        .with_weights(alpha, beta, up, down)?)
+    }
+
+    /// Fail if the table names a parameter the load did not read.
+    fn finish(self) -> Result<()> {
+        match self.table.iter().zip(&self.used).find(|(_, used)| !**used) {
+            Some((source, _)) => Err(Error::checkpoint(format!(
+                "{}: the checkpoint's parameter is never bound",
+                source.parameter
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
