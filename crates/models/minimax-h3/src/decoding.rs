@@ -356,27 +356,32 @@ impl ClipDecoder {
         f: &Forward,
         tile: &Tile,
         tokens: TensorView,
-        dest: TensorView,
+        decoded: TensorView,
+        blended: TensorView,
     ) -> Result<()> {
-        let shape = dest.shape;
-        if shape.rank() != 4 || shape.dim(0) != u64::from(self.unpatchify.channels()) {
-            return Err(Error::config(format!(
-                "{:?} is not a [channels, frames, rows, columns] raster",
-                shape.dims()
-            )));
+        for (name, raster) in [("decoded", decoded), ("blended", blended)] {
+            let shape = raster.shape;
+            if shape.rank() != 4 || shape.dim(0) != u64::from(self.unpatchify.channels()) {
+                return Err(Error::config(format!(
+                    "the {name} raster is {:?}, not [channels, frames, rows, columns]",
+                    shape.dims()
+                )));
+            }
         }
         let ratio = u64::from(self.ratio);
         let first_row = u64::from(tile.latent_rows.0) * ratio;
         let first_column = u64::from(tile.latent_columns.0) * ratio;
-        let view = self.placement(dest, tile, first_row, first_column, 0, 0)?;
+        let plain = self.placement(decoded, tile, first_row, first_column, 0, 0)?;
+        let view = self.placement(blended, tile, first_row, first_column, 0, 0)?;
+        self.unpatchify.forward(f, tokens, plain)?;
         self.unpatchify.forward(f, tokens, view)?;
         if tile.above != 0 {
-            let previous = self.placement(dest, tile, first_row, first_column, tile.above, 0)?;
+            let previous = self.placement(decoded, tile, first_row, first_column, tile.above, 0)?;
             self.blend(tile.above, 2)?
                 .forward(f, previous, view, view)?;
         }
         if tile.left != 0 {
-            let previous = self.placement(dest, tile, first_row, first_column, 0, tile.left)?;
+            let previous = self.placement(decoded, tile, first_row, first_column, 0, tile.left)?;
             self.blend(tile.left, 3)?.forward(f, previous, view, view)?;
         }
         Ok(())
@@ -414,6 +419,80 @@ impl ClipDecoder {
             shape,
             dest.strides,
         ))
+    }
+
+    /// Decode one clip: every tile of its canvas, in [`Tile`] order, into the clip's two rasters.
+    ///
+    /// `latents[i]` is tile `i`'s latent voxel rows `[voxels, latent_channels]` and `positions[i]` its
+    /// `[3, rows]` rotary table, both as the caller uploaded them; `tokens` is one buffer for the whole
+    /// clip, `[tiles · rows, out_channels · temporal · spatial²]`, which each tile's decode writes into in
+    /// its own row range. `decoded` and `blended` are the clip's rasters: the first holds every tile as it
+    /// was decoded and is only ever read as a neighbour, the second carries the stitched result.
+    ///
+    /// The tiles are the clip's own canvas — [`Tiles::tiles`] — and they are decoded one after another
+    /// because a seam blend reads what the tile above and the tile to the left have already written.
+    pub fn decode_clip(
+        &self,
+        f: &Forward,
+        decoder: &crate::video_vae::VideoDecoder,
+        tiles: &[Tile],
+        latents: &[TensorView],
+        positions: &[TensorView],
+        tokens: TensorView,
+        decoded: TensorView,
+        blended: TensorView,
+    ) -> Result<()> {
+        if latents.len() != tiles.len() || positions.len() != tiles.len() {
+            return Err(Error::config(format!(
+                "{} tiles need {} latent views and {} position tables, found {} and {}",
+                tiles.len(),
+                tiles.len(),
+                tiles.len(),
+                latents.len(),
+                positions.len()
+            )));
+        }
+        let rows: u64 = tiles
+            .iter()
+            .map(|tile| crate::video_vae::Canvas::rows(&tile.canvas))
+            .sum();
+        if tokens.shape.rank() != 2 || tokens.shape.dim(0) != rows {
+            return Err(Error::config(format!(
+                "the clip's token buffer is {:?}, {rows} rows expected",
+                tokens.shape.dims()
+            )));
+        }
+        let mut start = 0_u64;
+        for (index, tile) in tiles.iter().enumerate() {
+            let tile_rows = crate::video_vae::Canvas::rows(&tile.canvas);
+            let view = TensorView::new(
+                tokens.offset_elements(start * tokens.shape.dim(1)),
+                tokens.dtype,
+                Shape::new(&[tile_rows, tokens.shape.dim(1)]),
+            );
+            decoder.decode(f, latents[index], positions[index], view)?;
+            self.write_tile(f, tile, view, decoded, blended)?;
+            start += tile_rows;
+        }
+        Ok(())
+    }
+
+    /// Blend one clip into the request's frames: its body, the tail it shares with the next clip, and the
+    /// pixels the media stage reads.
+    ///
+    /// **Not callable yet, and deliberately so.** The splice is two operators the tree does not have:
+    /// `nn::layers::CrossFade` on the frames axis (it takes rows and columns today — M1229) for the
+    /// five-frame tail, whose weights are [`Clip::overlap_weights`], and `ops::rgb_bytes` for the byte
+    /// raster, which also assembles the clips into one frame range because it writes through the
+    /// destination's strides. Both are model's and both are asked for; until they land this function
+    /// refuses rather than approximating either step on the host.
+    pub fn splice(&self, clips: usize, frames: u32, height: u32, width: u32) -> Result<()> {
+        let _ = (clips, frames, height, width);
+        Err(Error::config(
+        "the clip splice blends the frames axis and quantizes to bytes; nn::layers::CrossFade takes \
+         rows and columns only (M1229) and ops::rgb_bytes is not in this tree"
+            .to_owned(),
+    ))
     }
 }
 
