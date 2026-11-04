@@ -94,6 +94,9 @@ pub struct GraphStorage {
     pub budget: u64,
     /// How many streams the executor issues on; the range is divided among them.
     pub streams: usize,
+    /// Bytes for the shadow pair's region (`ops::Twins`), carved from the device's allocator's
+    /// scratch pool on the first shadow batch (7.3). Zero when the rank never shadows.
+    pub scratch: u64,
 }
 
 impl Executor {
@@ -129,6 +132,8 @@ impl Executor {
             device,
             runners,
             queue: Arc::clone(&queue),
+            scratch: graph.scratch,
+            pools: Arc::clone(&pools),
             counters: Arc::clone(&counters),
             sticky: None,
         };
@@ -153,6 +158,16 @@ impl Executor {
     /// The device this executor drives.
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    /// Gives every runner the shadow harness of its device, carved from the device allocator
+    /// (7.3): the main process calls this once, before the epoch serves.
+    pub fn set_shadow(&self) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue
+            .submit(Command::SetShadow, &submission, JobKind::Shadow, None)?;
+        Ok(submission)
     }
 
     /// The queue every thread submits device work through.
@@ -371,6 +386,10 @@ struct Device {
     device: DeviceId,
     runners: Vec<NamedRunner>,
     queue: Arc<JobQueue>,
+    /// Bytes for the shadow pair's region, as the engine sized it.
+    scratch: u64,
+    /// The device's one graph pool, which also lends its allocator for the shadow pair's region.
+    pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device thread has done, shared with the handle the control thread reads.
     counters: Arc<SharedCounters>,
     /// The context's first sticky error, once one has been seen (2.4).
@@ -479,6 +498,23 @@ impl Device {
                     named.runner.switchover(*generation);
                 }
                 self.synchronize()?;
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::SetShadow => {
+                // The shadow pair's region is allocator-backed and comes from the same device
+                // allocator as the graph pools, reserved on first use; the harness then goes to
+                // every runner, because the update may shadow an operator of any of them.
+                let mut pools = self
+                    .pools
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pools.reserve_scratch(self.scratch)?;
+                for named in &mut self.runners {
+                    let twins = ops::Twins::new(pools.allocator(), self.scratch)
+                        .map_err(|error| Error::Interface(error.to_string()))?;
+                    let shadow = crate::shadow::Shadow::new(self.device, twins)?;
+                    named.runner.attach_shadow(shadow);
+                }
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Revert(generation) => {
