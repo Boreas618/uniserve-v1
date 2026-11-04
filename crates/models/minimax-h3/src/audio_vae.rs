@@ -33,7 +33,9 @@ use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
 };
 use nn::weights::WeightRequest;
-use nn::{DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader};
+use nn::{
+    DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader,
+};
 
 /// One upsampling stage of the decoder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
