@@ -874,39 +874,44 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // fails at `plan.bytes` past the first. The mark is taken once and released after each
         // measurement has been read back to the host.
         let mark = arena.mark();
-        let mut digests = Vec::new();
-        for run in 0..2 {
-            let rows = measure(None)?;
-            stream.synchronize()?;
-            let values = download_bf16(
-                &stream,
-                rows,
-                tokens_usize(&batch),
-                usize::try_from(plan.hidden).unwrap_or(0),
-            )?;
-            arena.release(mark);
-            digests.push(digest(&values));
+        // The digest is the block measurement's own evidence that two identical runs agree, and
+        // it costs two extra passes of the layer. A cut, the router's selection or the gate's
+        // scores ask a different question of the same layer, so their runs pay for one forward.
+        if args.substage.is_none() && !args.routing && !args.scores {
+            let mut digests = Vec::new();
+            for run in 0..2 {
+                let rows = measure(None)?;
+                stream.synchronize()?;
+                let values = download_bf16(
+                    &stream,
+                    rows,
+                    tokens_usize(&batch),
+                    usize::try_from(plan.hidden).unwrap_or(0),
+                )?;
+                arena.release(mark);
+                digests.push(digest(&values));
+                println!(
+                    "block: layer {layer}, run {run}: {} rows of {} bf16 columns, digest {digests:?}",
+                    count,
+                    usize::try_from(plan.hidden).unwrap_or(0),
+                );
+            }
             println!(
-                "block: layer {layer}, run {run}: {} rows of {} bf16 columns, digest {digests:?}",
-                count,
-                usize::try_from(plan.hidden).unwrap_or(0),
+                "block: layer {layer} {} across two runs; worst |value| {:.6}, sum {:.6}",
+                if digests[0] == digests[1] {
+                    "reproduced"
+                } else {
+                    "DIFFERS"
+                },
+                digests[0].1,
+                digests[0].0,
             );
-        }
-        println!(
-            "block: layer {layer} {} across two runs; worst |value| {:.6}, sum {:.6}",
-            if digests[0] == digests[1] {
-                "reproduced"
-            } else {
-                "DIFFERS"
-            },
-            digests[0].1,
-            digests[0].0,
-        );
-        if digests[0] != digests[1] {
-            return Err(Failure::message(format!(
-                "layer {layer} gave two different outputs from the same inputs: the digest moved                  from {:?} to {:?}",
-                digests[0], digests[1]
-            )));
+            if digests[0] != digests[1] {
+                return Err(Failure::message(format!(
+                    "layer {layer} gave two different outputs from the same inputs: the digest moved                  from {:?} to {:?}",
+                    digests[0], digests[1]
+                )));
+            }
         }
         // One layer against the reference, without walking the stack: the same comparison the
         // decode stage makes, at a hundredth of the cost, for when a stage has already been named and
@@ -1376,6 +1381,7 @@ fn cut_hook(cut: Substage) -> &'static str {
     match cut {
         Substage::Normalized => "`input_layernorm`",
         Substage::Attended => "`self_attn`",
+        Substage::GateIn => "`post_attention_layernorm`",
         Substage::MlpOut => "`mlp`",
     }
 }
@@ -1390,6 +1396,7 @@ fn cut_file(cut: Substage) -> &'static str {
     match cut {
         Substage::Normalized => "normalized",
         Substage::Attended => "attended",
+        Substage::GateIn => "gate_in",
         Substage::MlpOut => "mlp",
     }
 }

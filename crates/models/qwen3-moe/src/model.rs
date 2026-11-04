@@ -706,9 +706,9 @@ impl Qwen3Moe {
     /// whole run hands it: an in-layer walk whose prefix differed from the model's would answer a
     /// question about a model nobody runs. The cuts sit *inside* the layer, so `MlpOut` is the
     /// block's update and [`Self::forward_through`] is that update folded into the stream: the two
-    /// differ by the boundary's residual add. The three cuts are one operator each, which is what
-    /// lets a reference post-hook on `input_layernorm`, on `self_attn` and on `mlp` be their
-    /// counterparts.
+    /// differ by the boundary's residual add. The cuts are one operator each, which is what lets a
+    /// reference post-hook on `input_layernorm`, on `self_attn`, on `post_attention_layernorm` and
+    /// on `mlp` be their counterparts.
     ///
     /// The prefix's error is the cut's error floor: what the cut shows is a divergence *on top of*
     /// the state layers `0..layer` already produced, which is the walk's `hidden_{layer}` row. A cut
@@ -944,6 +944,9 @@ impl DecoderLayer {
         self.post_attention_norm
             .forward_with_residual(f, update, residual, residual_out, normalized)
             .map_err(Error::from)?;
+        if stop == Some(Substage::GateIn) {
+            return Ok(normalized);
+        }
 
         match &self.mlp {
             Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from),
@@ -1124,13 +1127,16 @@ pub struct Run {
 
 /// How far through one layer an in-layer walk goes.
 ///
-/// A whole-run bisection answers which *layer* diverges; a layer is four operators deep and its
-/// output alone cannot say which of them. These are the three cuts a layer can be stopped at, in
-/// the order the layer runs them, each naming the tensor the reference's module holds at that point:
+/// A whole-run bisection answers which *layer* diverges; a layer is five operators deep and its
+/// output alone cannot say which of them. These are the cuts a layer can be stopped at, in the order
+/// the layer runs them, each naming the tensor the reference's module holds at that point:
 ///
 /// - [`Substage::Normalized`] is `input_layernorm`'s output, residual add included for every layer
 ///   after the first (the first's input residual is the embedding itself);
 /// - [`Substage::Attended`] is `self_attn`'s output, projected out and **before** the residual add;
+/// - [`Substage::GateIn`] is `post_attention_layernorm`'s output — the routing gate's operand, with
+///   the attention's residual add folded in — which is the tensor the reference's post-hook on that
+///   module holds and the one the router's weight is multiplied by;
 /// - [`Substage::MlpOut`] is the routed (or dense) block's output, **before** its residual add —
 ///   transformers' `mlp` post-hook — and one fold short of the layer's output state, which is what
 ///   `forward_through` answers and which no cut names because the layer walk already shows it.
@@ -1144,6 +1150,8 @@ pub enum Substage {
     Normalized,
     /// The attention block's projection out, before the residual add.
     Attended,
+    /// The post-attention normalization: the gate's operand (`post_attention_layernorm`).
+    GateIn,
     /// The routed (or dense) block's output, before its residual add (`mlp`).
     MlpOut,
 }
@@ -1153,13 +1161,14 @@ impl Substage {
     ///
     /// The spellings are the contract with a command line that names a stage: the model refuses
     /// anything else, so a mistyped stage cannot silently run a different cut.
-    pub const NAMES: [&'static str; 3] = ["normalized", "attended", "mlp_out"];
+    pub const NAMES: [&'static str; 4] = ["normalized", "attended", "gate_in", "mlp_out"];
 
     /// The stage `name` asks for, or `None` when it names no cut.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "normalized" => Some(Self::Normalized),
             "attended" => Some(Self::Attended),
+            "gate_in" => Some(Self::GateIn),
             "mlp_out" => Some(Self::MlpOut),
             _ => None,
         }
@@ -1170,6 +1179,7 @@ impl Substage {
         match self {
             Self::Normalized => "normalized",
             Self::Attended => "attended",
+            Self::GateIn => "gate_in",
             Self::MlpOut => "mlp_out",
         }
     }
@@ -1314,6 +1324,7 @@ mod tests {
         }
         assert_eq!(Substage::parse("normalized"), Some(Substage::Normalized));
         assert_eq!(Substage::parse("attended"), Some(Substage::Attended));
+        assert_eq!(Substage::parse("gate_in"), Some(Substage::GateIn));
         assert_eq!(Substage::parse("mlp_out"), Some(Substage::MlpOut));
         for refused in [
             "",
