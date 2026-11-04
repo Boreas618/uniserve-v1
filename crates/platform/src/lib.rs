@@ -67,7 +67,7 @@ pub use device::{
 pub use dtype::DataType;
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
-pub use graph::{Capture, Graph, GraphExec, GraphNode, KernelNodeParams};
+pub use graph::{Capture, CaptureMode, Graph, GraphExec, GraphNode, KernelNodeParams};
 pub use launch::{Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig};
 pub use library::Library;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
