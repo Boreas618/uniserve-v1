@@ -562,14 +562,22 @@ pub(crate) fn nanos_at(unix_secs: f64) -> Nanos {
 
 /// Free request slots: the sequence budget of the next admission.
 ///
-/// The worker's request rows are the other bound, and admission checks them
-/// as it admits (`Storage::request_pool`); the rows a policy's plan may use are
-/// the ones this count leaves.
+/// Admission stops at either bound today — the configured count of running
+/// requests, and the worker's request rows, which a running token request holds
+/// through its allocations (`Storage::request_pool`). A slot is free only when
+/// both have room, so the room is their minimum.
 fn free_slots(scheduler: &Scheduler) -> usize {
-    scheduler
+    let held_rows = scheduler
+        .running
+        .values()
+        .filter(|state| state.allocations().is_some())
+        .count();
+    let by_rows = (scheduler.info.request_slots as usize).saturating_sub(held_rows);
+    let by_requests = scheduler
         .config
         .max_running_requests
-        .saturating_sub(scheduler.running_request_count())
+        .saturating_sub(scheduler.running_request_count());
+    by_rows.min(by_requests)
 }
 
 /// This step's room.
@@ -625,13 +633,20 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
 /// A refill chunk is a prefill call named by the request's draft state, and a
 /// readout request's token-denoising call is the readout phase.
 fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Option<PhaseId> {
-    if scheduler.refill_due(id) {
-        return Some(phase_id(PhaseKind::Refill));
-    }
     let kind = scheduler.peek_next_call_variant(id)?;
     let phase = match kind {
         CallKind::Forward(ForwardMode::TokenDenoising) if state.req.is_readout() => {
             PhaseKind::Readout
+        }
+        // A prefill chunk of a prompt the request already computed is a refill
+        // of its draft cache. The gap is a fact of the request's state; whether
+        // the refill is worth running is the policy's (`Plan::refill`), so the
+        // view names the phase and `refill_tokens` names the cost.
+        CallKind::Forward(ForwardMode::Prefill)
+            if state.num_computed_prompt_tokens as usize >= state.prompt_tokens
+                && refill_gap(scheduler, state).is_some() =>
+        {
+            PhaseKind::Refill
         }
         other => call_phase(other),
     };
@@ -677,9 +692,13 @@ fn reservation_units(scheduler: &Scheduler, state: &RequestState) -> u64 {
         .units_for_tokens(state.max_reserved_cache_tokens) as u64
 }
 
-/// The tokens a refill of the request's draft cache would cost, or `None` when
-/// its draft cache has no gap.
-fn refill_tokens(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
+/// The gap in the request's draft cache: the tokens a refill would evaluate,
+/// or `None` when there is none.
+///
+/// A fact, not a judgement: whether a refill is worth its cost is the policy's
+/// to decide (`Plan::refill`). Both `refill_tokens` and the `Refill` phase read
+/// it here.
+fn refill_gap(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
     if !scheduler.speculates() {
         return None;
     }
@@ -693,6 +712,12 @@ fn refill_tokens(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
         .map_or(visible, |(start, _)| start.min(visible));
     let gap = end.saturating_sub(state.draft.valid);
     (gap > 0).then_some(gap)
+}
+
+/// The tokens a refill of the request's draft cache would cost, or `None` when
+/// its draft cache has no gap.
+fn refill_tokens(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
+    refill_gap(scheduler, state)
 }
 
 /// The KV pages a request holds.
@@ -851,13 +876,11 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
             continue;
         };
         let facts = recorded.get(id).copied().unwrap_or(empty);
+        // A media request keeps no arrival time of its own once it runs.
         views.push(diffusion_request(
             &flow.request,
             Standing::Resident,
-            scheduler
-                .running
-                .get(id)
-                .map_or(0.0, |state| state.queued_at),
+            0.0,
             &facts,
         ));
     }
@@ -906,7 +929,9 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
             tokens: u32::try_from(page.tokens.len()).unwrap_or(u32::MAX),
             last_used: Nanos(0),
             on_host: false,
-            evictable: !held.contains(&first),
+            // A page is evictable once no resident request continues from any
+            // of its units, not just from the one its id names.
+            evictable: !page.units.iter().any(|unit| held.contains(unit)),
         }));
     }
     views
