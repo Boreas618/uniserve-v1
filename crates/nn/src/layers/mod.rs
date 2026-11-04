@@ -38,6 +38,7 @@ mod patch;
 mod pcm;
 mod pool;
 mod position;
+mod posterior;
 mod residual;
 mod rgb;
 mod rope;
@@ -72,6 +73,7 @@ pub use patch::Patch;
 pub use pcm::PcmInterleave;
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
+pub use posterior::Posterior;
 pub use residual::{
     ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };

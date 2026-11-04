@@ -1,0 +1,42 @@
+# The posterior operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one architecture of
+# `[kernel.architectures]`, built by `src/build.py`.
+#
+# This is the condition encoder's last numerical step: the VAE encoder's moments to the sample a
+# conditioner reads, through its FP16 round trip. The chain is fixed
+# -- clamp, `0.5 · log_variance`, `exp`, `· noise`, `+ mean`, round to FP16 and back -- in f32
+# throughout, and no part of it is a launch value, so the key names only the tiling and whether the
+# module was compiled for programmatic dependent launch: `block_1024_pdl_false`.
+#
+# The geometry is not compiled: the positions, the channels and all four row strides are launch
+# words, because the two moments are the halves of one `[positions, 2 · channels]` output and the
+# sample's rows are half as wide. The element type is not in the key either: the reference's chain is
+# f32 and the sample is stored as f32 after the round trip, so there is nothing to choose. The
+# FP16 round trip is inside the kernel, not a storage type.
+
+op = "posterior"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/posterior.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
+
+[kernel.descriptors]
+dimensions = { block = ["1024"], pdl = ["true", "false"] }
+
+[parameters]

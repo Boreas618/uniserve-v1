@@ -371,6 +371,18 @@ fn main() {
         }
         .to_string(),
     );
+    // The solver's step flattens the latent to `[elements, 1]` and steps it by one scalar, so the
+    // residual's width there is one column and the kernel's `WIDTH` is one.
+    push(
+        "scaled_residual",
+        ScaledResidualDescriptor {
+            dtype: DType::BF16,
+            columns: 1,
+            block: ops::residual::RESIDUAL_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
     push(
         "scaled_residual",
         ScaledResidualDescriptor {
@@ -427,21 +439,24 @@ fn main() {
     // The DiT's row mapping, one key per latent raster the served canvases produce. The canvas is
     // divided by the VAE's 16x spatial compression, and each side is even for every served canvas
     // because the canvas's sides are multiples of the model's own step.
+    // A canvas is named width by height, and `packing::latent_raster` divides each by the VAE's
+    // compression into a raster named height by width - so a landscape canvas gives a wide raster
+    // and a portrait one a tall raster, and the pair is not the canvas's own order.
     for (height, width) in [
-        (96, 42), // 1536x672
-        (84, 48), // 1344x768
-        (64, 48), // 1024x768
+        (42, 96), // 1536x672
+        (48, 84), // 1344x768
+        (48, 64), // 1024x768
         (48, 48), // 768x768
-        (48, 64), // 768x1024
-        (42, 48), // 672x768
+        (64, 48), // 768x1024
+        (48, 42), // 672x768
         // The 480p class: its caps give pixel sides like 992 and 832, but a canvas side is a
         // multiple of 32, so every latent side stays even.
-        (62, 26), // 992x416
-        (52, 30), // 832x480
-        (40, 30), // 640x480
+        (26, 62), // 992x416
+        (30, 52), // 832x480
+        (30, 40), // 640x480
         (30, 30), // 480x480
-        (30, 40), // 480x640
-        (30, 52), // 480x832
+        (40, 30), // 480x640
+        (52, 30), // 480x832
     ] {
         // One key per raster: the inverse is `unpatchify_video` at 1×2×2, not a mode of this op.
         push(
@@ -516,6 +531,18 @@ fn main() {
             .to_string(),
         );
     }
+    // The condition encoder's last numerical step: the VAE encoder's moments to the sample a
+    // conditioner reads, through its FP16 round trip. One row: the chain is fixed and in f32 by the
+    // reference, so the only thing the key can name is the operator's own tiling -- and the two
+    // launches the conditioned path makes (it does not use programmatic dependent launch) share it.
+    push(
+        "posterior",
+        ops::posterior::Descriptor {
+            block: ops::posterior::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     push(
         "audio_activation",
@@ -551,6 +578,20 @@ fn main() {
         }
         .to_string(),
     );
+    // The conditioner's anchoring mix runs over `[condition rows, video_channels * 4]`, which is
+    // narrower than any hidden width, in the conditioner's own dtype and in the trace path's.
+    for (target, source) in [(DType::F32, DType::F32), (DType::BF16, DType::BF16)] {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target,
+                source,
+                columns: 96,
+                block: 1024,
+            }
+            .to_string(),
+        );
+    }
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
     push(
