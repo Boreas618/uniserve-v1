@@ -228,6 +228,12 @@ pub struct EncoderInputs<'a> {
     pub batch: TokenBatch,
     /// The images of a multimodal tower, empty for a text-only encoder.
     pub images: &'a [ImageInput],
+    /// The layout the encode fills, as the executor got it from [`Encoder::layout`].
+    ///
+    /// The model reads the grids and counts from it: a device table cannot be read back, so without
+    /// the layout a tower could not tell which of its per-layout rows belong to which image. It is
+    /// a host value whose shape the encode was asked for, and it carries no request identity.
+    pub layout: &'a EncoderLayout,
     /// The encoder's tables for this layout, in [`Encoder::state_tables`]' order.
     pub state: &'a [TensorView],
     /// The rows an encoder reports back for its caller's inspection, in the model's order.
