@@ -529,8 +529,8 @@ impl Qwen3Moe {
                 plan.hidden
             )));
         }
-        let (update, residual) = self.walk(f, batch, cache, hidden, last, None)?;
-        self.fold(f, update, residual)
+        let (update, residual, buffers) = self.walk(f, batch, cache, hidden, last, None)?;
+        self.fold(f, update, residual, buffers.normalized)
     }
 
     /// The state after a layer: its block's update folded into the residual stream.
@@ -545,15 +545,21 @@ impl Qwen3Moe {
     /// launch at the next layer's input norm, so the state answered here is bit-identical to the
     /// one the run produces. The normalization the operator fuses is computed and discarded; its
     /// weights do not touch the sum.
-    fn fold(&self, f: &Forward, update: TensorView, residual: TensorView) -> Result<TensorView> {
-        let shape = update.shape;
-        let sum = f.arena.tensor(update.dtype, shape)?;
-        let discarded = f.arena.tensor(update.dtype, shape)?;
+    /// The sum lands in `update` itself, which the operator may alias, and the normalization it
+    /// fuses is discarded into `scratch` — the last layer's dead `normalized` buffer — so the fold
+    /// costs no arena beyond the step the walk already reserved.
+    fn fold(
+        &self,
+        f: &Forward,
+        update: TensorView,
+        residual: TensorView,
+        scratch: TensorView,
+    ) -> Result<TensorView> {
         self.layers[0]
             .input_norm
-            .forward_with_residual(f, update, residual, sum, discarded)
+            .forward_with_residual(f, update, residual, update, scratch)
             .map_err(Error::from)?;
-        Ok(sum)
+        Ok(update)
     }
 
     /// Run layers `0..=layer` and stop inside `layer` after `stage`, answering what it wrote there.
@@ -580,7 +586,7 @@ impl Qwen3Moe {
         stage: Substage,
     ) -> Result<TensorView> {
         self.walk(f, batch, cache, hidden, layer, Some(stage))
-            .map(|(out, _)| out)
+            .map(|(out, _, _)| out)
     }
 
     /// Run layers `0..=last`, or `0..last` and then `last` up to `tail`, and answer the rows the
@@ -598,7 +604,7 @@ impl Qwen3Moe {
         hidden: TensorView,
         last: usize,
         tail: Option<Substage>,
-    ) -> Result<(TensorView, TensorView)> {
+    ) -> Result<(TensorView, TensorView, Buffers)> {
         let tokens = batch.tokens();
         let plan = self.plan(tokens)?;
         if last >= self.layers.len() {
@@ -661,7 +667,7 @@ impl Qwen3Moe {
             input = out;
             residual = buffers.residual;
         }
-        Ok((input, residual))
+        Ok((input, residual, buffers))
     }
 
     /// The model as the executor sees it: one causal-LM block named `backbone`.
@@ -970,7 +976,7 @@ impl CausalLm for Qwen3Moe {
             self.layers.len().checked_sub(1).ok_or_else(|| {
                 capability(Error::Config("the model has no decoder layer".into()))
             })?;
-        let (input, residual) = self
+        let (input, residual, _) = self
             .walk(f, batch, cache, hidden, last, None)
             .map_err(capability)?;
 
