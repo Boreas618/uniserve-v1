@@ -35,9 +35,14 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
-# `dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`.
+# `dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_32_kv_heads_4_mask_causal_window_false`.
+#
+# The offsets path only: `cu_seq_lens = true` is what the descriptor prints for a packed
+# launch and prints nothing for it, so a package that serves packed sequences names no such
+# field. `max_kv_len` is a bound the caller supplies, deliberately absent from the key, so it
+# is a build parameter here and not a dimension.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64"], q_heads = ["32", "24", "16"], kv_heads = ["4", "8", "2"], mask = ["causal", "dense"], window = ["false"], len = ["40960", "32768", "16384", "8192"] }
+dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64"], q_heads = ["32", "24", "16"], kv_heads = ["4", "8", "2"], mask = ["causal", "dense"], window = ["false"] }
 
 [parameters]
 # The representative problem the vendor's configuration is chosen for: the batch and
@@ -45,3 +50,6 @@ dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f1
 # chosen for this one.
 batch = 8
 query_len = 512
+# The longest key extent the module claims to serve, which the vendor's selection is told
+# about and a launch longer than is refused.
+max_kv_len = 40960

@@ -114,8 +114,9 @@ class DenseCompiler:
         self.causal = fields["mask"] == "causal"
         if fields["window"] != "false":
             raise SystemExit("FA4's dense pass is compiled without a window")
-        # The longest key sequence the module serves, which the descriptor bounds.
-        self.max_kv_len = int(fields["len"])
+        # The longest key sequence the module serves, which the package's parameters declare:
+        # the descriptor's bound is deliberately absent from the key, so it cannot be a field.
+        self.max_kv_len = int(parameters.get("max_kv_len", 40960))
         # The representative problem the vendor's selection is asked about.
         self.batch = int(parameters.get("batch", 8))
         self.query_len = int(parameters.get("query_len", 512))
