@@ -122,6 +122,7 @@ impl fmt::Display for ConversionDescriptor {
 }
 
 /// The arguments of `page_conversion`.
+#[derive(Clone, Copy)]
 pub struct ConversionArgs {
     /// `[scratch_bytes]` u8, contiguous: the workspace's scratch.
     pub scratch: TensorView,
@@ -330,6 +331,7 @@ impl fmt::Display for CopyRegionDescriptor {
 }
 
 /// The arguments of `cache_copy_region`.
+#[derive(Clone, Copy)]
 pub struct CopyRegionArgs {
     /// `[columns, units, plane_bytes]` u8, contiguous: the field's stored values.
     pub values: TensorView,

@@ -59,6 +59,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of `kv_write`.
+#[derive(Clone, Copy)]
 pub struct Args {
     /// `[tokens, heads, head_dim]` keys.
     pub key: TensorView,

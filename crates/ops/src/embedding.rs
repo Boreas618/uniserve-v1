@@ -48,6 +48,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of `embedding`.
+#[derive(Clone, Copy)]
 pub struct Args {
     /// `[tokens]` token ids.
     pub ids: TensorView,

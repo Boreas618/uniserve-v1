@@ -188,6 +188,7 @@ impl NativeCall for Call {
 }
 
 /// The arguments of one product.
+#[derive(Clone, Copy)]
 pub struct Args {
     /// Activations, `[m, k]`.
     pub input: TensorView,

@@ -59,6 +59,7 @@ impl fmt::Display for WeightedRmsNormDescriptor {
 }
 
 /// The arguments of `weighted_rms_norm`.
+#[derive(Clone, Copy)]
 pub struct WeightedRmsNormArgs {
     /// `[rows, columns]`, contiguous.
     pub x: TensorView,
@@ -161,6 +162,7 @@ impl fmt::Display for ScaledResidualRmsNormDescriptor {
 }
 
 /// The arguments of `scaled_residual_rms_norm`.
+#[derive(Clone, Copy)]
 pub struct ScaledResidualRmsNormArgs {
     /// `[rows, columns]`, contiguous: the residual, updated in place.
     pub hidden: TensorView,
@@ -307,6 +309,7 @@ impl fmt::Display for ScaledResidualLayerNormDescriptor {
 }
 
 /// The arguments of `scaled_residual_layer_norm`.
+#[derive(Clone, Copy)]
 pub struct ScaledResidualLayerNormArgs {
     /// `[rows, columns]`, contiguous: the residual, unchanged by the launch.
     pub hidden: TensorView,
@@ -456,6 +459,7 @@ impl fmt::Display for ScaledResidualDescriptor {
 }
 
 /// The arguments of `scaled_residual`.
+#[derive(Clone, Copy)]
 pub struct ScaledResidualArgs {
     /// `[rows, columns]`, contiguous: the residual, updated in place.
     pub hidden: TensorView,

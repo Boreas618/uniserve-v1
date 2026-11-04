@@ -158,6 +158,7 @@ impl BlockShape {
 pub type SnapshotDescriptor = BlockShape;
 
 /// The arguments of `cache_block_snapshot`.
+#[derive(Clone, Copy)]
 pub struct SnapshotArgs {
     /// The field's block-major storage, at any strides.
     pub field: TensorView,
@@ -236,6 +237,7 @@ impl Op for CacheBlockSnapshot {
 pub type ScatterDescriptor = BlockShape;
 
 /// The arguments of `cache_block_scatter`.
+#[derive(Clone, Copy)]
 pub struct ScatterArgs {
     /// The field's block-major storage, at any strides; the selected blocks are overwritten.
     pub field: TensorView,

@@ -41,6 +41,7 @@ impl fmt::Display for GatherDescriptor {
 }
 
 /// The arguments of `logits_gather`.
+#[derive(Clone, Copy)]
 pub struct GatherArgs {
     /// `[tokens, columns]` hidden state of the whole batch.
     pub hidden: TensorView,
@@ -136,6 +137,7 @@ impl fmt::Display for UnpadDescriptor {
 }
 
 /// The arguments of `vocab_unpad`.
+#[derive(Clone, Copy)]
 pub struct UnpadArgs {
     /// `[rows, padded]` the gathered logits.
     pub gathered: TensorView,

@@ -100,6 +100,7 @@ impl fmt::Display for CommitDescriptor {
 /// The arguments of `slot_commit`.
 ///
 /// The per-task columns are indexed by each row's task; the state tensors are indexed by its slot.
+#[derive(Clone, Copy)]
 pub struct CommitArgs {
     /// `[8, capacity]` i64: the step's commit rows, `stride` elements between columns.
     pub columns: TensorView,

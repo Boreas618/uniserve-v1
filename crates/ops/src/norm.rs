@@ -47,6 +47,7 @@ impl fmt::Display for RmsNormDescriptor {
 }
 
 /// The arguments of `rms_norm`.
+#[derive(Clone, Copy)]
 pub struct RmsNormArgs {
     /// `[rows, columns]`.
     pub x: TensorView,
@@ -141,6 +142,7 @@ impl fmt::Display for AddRmsNormDescriptor {
 }
 
 /// The arguments of `add_rms_norm`.
+#[derive(Clone, Copy)]
 pub struct AddRmsNormArgs {
     /// `[rows, columns]`, this layer's output before the residual add.
     pub x: TensorView,
@@ -252,6 +254,7 @@ impl fmt::Display for LayerNormDescriptor {
 }
 
 /// The arguments of `layer_norm`.
+#[derive(Clone, Copy)]
 pub struct LayerNormArgs {
     /// `[rows, columns]`.
     pub x: TensorView,
@@ -373,6 +376,7 @@ impl fmt::Display for SoftmaxDescriptor {
 }
 
 /// The arguments of `softmax`.
+#[derive(Clone, Copy)]
 pub struct SoftmaxArgs {
     /// `[rows, columns]`.
     pub x: TensorView,

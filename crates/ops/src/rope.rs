@@ -74,6 +74,7 @@ impl fmt::Display for FactorsDescriptor {
 }
 
 /// The arguments of `rotary_factors`.
+#[derive(Clone, Copy)]
 pub struct FactorsArgs {
     /// `[…, tokens]` positions, in any leading shape; every element is one token's position.
     pub positions: TensorView,
@@ -204,6 +205,7 @@ impl fmt::Display for QkNormRopeDescriptor {
 }
 
 /// The arguments of `qk_norm_rope`.
+#[derive(Clone, Copy)]
 pub struct QkNormRopeArgs {
     /// `[tokens, q_heads, head_dim]` queries, before normalization.
     pub query: TensorView,
