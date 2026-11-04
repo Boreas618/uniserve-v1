@@ -43,14 +43,20 @@ impl Pool {
 
 impl Batches for Pool {
     fn submit(&self, batch: Batch) -> Result<Submission, executor::Error> {
-        self.submitted.lock().expect("the pool's batches").push(batch);
+        self.submitted
+            .lock()
+            .expect("the pool's batches")
+            .push(batch);
         Err(executor::Error::Invalid(
             "this test's pool serves no batch".to_owned(),
         ))
     }
 
     fn shadow(&self, batch: Batch) -> Result<Submission, executor::Error> {
-        self.submitted.lock().expect("the pool's batches").push(batch);
+        self.submitted
+            .lock()
+            .expect("the pool's batches")
+            .push(batch);
         Err(executor::Error::Invalid(
             "this test's pool runs no shadow batch".to_owned(),
         ))
@@ -135,7 +141,11 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
 
     // A scheduler with no policy forms no batch: the pool was asked for none.
     assert!(
-        batch_sink.submitted.lock().expect("the pool's batches").is_empty(),
+        batch_sink
+            .submitted
+            .lock()
+            .expect("the pool's batches")
+            .is_empty(),
         "no batch reached the executor before a policy serves"
     );
     handle.shutdown();

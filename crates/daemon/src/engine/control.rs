@@ -808,6 +808,11 @@ pub fn prepare_epoch(
     filled: &crate::epoch::FilledPrograms,
     descriptors: &[program_server::Descriptors],
 ) -> anyhow::Result<crate::epoch::FilledPrograms> {
+    // A program is selected by its backend's name, so a deployment that left
+    // one at `auto` has not said which program it means: refused here, by the
+    // option that would state it, rather than as a package the server is not
+    // missing (§5.1).
+    filled.stated().map_err(anyhow::Error::msg)?;
     let leader_server = servers
         .iter()
         .find(|server| server.host == leader)
