@@ -227,6 +227,13 @@ struct Buffers {
     key_rotated: TensorView,
     value: TensorView,
     attended: TensorView,
+    /// The dense feed-forward pair; absent when every layer routes to experts, so the plan's
+    /// zero feed-forward extent reserves nothing.
+    dense: Option<DenseBuffers>,
+}
+
+/// The two dense feed-forward intermediates.
+struct DenseBuffers {
     gate: TensorView,
     up: TensorView,
 }
@@ -261,12 +268,18 @@ impl Buffers {
                 .tensor(dtype, rows(plan.key_value))
                 .map_err(Error::from)?,
             attended: arena.tensor(dtype, rows(plan.query)).map_err(Error::from)?,
-            gate: arena
-                .tensor(dtype, rows(plan.feed_forward.max(1)))
-                .map_err(Error::from)?,
-            up: arena
-                .tensor(dtype, rows(plan.feed_forward.max(1)))
-                .map_err(Error::from)?,
+            dense: if plan.feed_forward == 0 {
+                None
+            } else {
+                Some(DenseBuffers {
+                    gate: arena
+                        .tensor(dtype, rows(plan.feed_forward))
+                        .map_err(Error::from)?,
+                    up: arena
+                        .tensor(dtype, rows(plan.feed_forward))
+                        .map_err(Error::from)?,
+                })
+            },
         })
     }
 }
@@ -492,17 +505,20 @@ impl DenseMlp {
         buffers: &Buffers,
         out: TensorView,
     ) -> Result<()> {
+        let dense = buffers.dense.as_ref().ok_or_else(|| {
+            Error::Config("a dense block runs in a forward planned without dense buffers".to_owned())
+        })?;
         self.gate_proj
-            .forward(f, normalized, buffers.gate)
+            .forward(f, normalized, dense.gate)
             .map_err(Error::from)?;
         self.up_proj
-            .forward(f, normalized, buffers.up)
+            .forward(f, normalized, dense.up)
             .map_err(Error::from)?;
         self.activation
-            .forward(f, buffers.up, buffers.gate, buffers.gate)
+            .forward(f, dense.up, dense.gate, dense.gate)
             .map_err(Error::from)?;
         self.down_proj
-            .forward(f, buffers.gate, out)
+            .forward(f, dense.gate, out)
             .map_err(Error::from)
     }
 }
