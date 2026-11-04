@@ -287,8 +287,123 @@ message LedgerReport {
 message Event {
   oneof kind {
     Exit exit = 1;
+    // A command for the main process of one epoch (minor 4).
+    Command command = 2;
   }
 }
+
+// A program: the backend that fills an operator or the scheduling interface,
+// the revision of its package the upstream Program Server numbered, and its
+// parameters (`specs/worker.md` §5.1). The Rust type is `crates/program-server`'s
+// `Program`; this is only its wire form, which the daemon records and sends.
+message Program {
+  // The backend's name, from the configuration field that selects it.
+  string backend = 1;
+  // The revision the upstream Program Server gave the package: the same
+  // content on every host, and never overwritten.
+  uint32 revision = 2;
+  // The program's parameters as TOML key/value pairs: each value is the TOML
+  // representation of that parameter's configured value, so `chunked_prefill_size
+  // = 4096` arrives as `chunked_prefill_size = "4096"`. A main process of
+  // another build reads them back as TOML values.
+  map<string, string> arguments = 3;
+}
+
+// The phase of an operator's calls that a kernel program fills. An operator
+// is filled once for all its phases unless the configuration fills it per
+// phase, which attention allows (`prefill_attention_backend`,
+// `decode_attention_backend`, §5.2).
+enum PhaseKind {
+  PHASE_KIND_UNSPECIFIED = 0;
+  PHASE_KIND_PREFILL = 1;
+  PHASE_KIND_DECODE = 2;
+}
+
+// One operator's kernel program, or one phase's of it: the epoch record's
+// key is the operator and the phase, `phase` absent for every phase.
+message KernelProgram {
+  // The operator's name, as the `ops` crate names it.
+  string op = 1;
+  optional PhaseKind phase = 2;
+  Program program = 3;
+}
+
+// A command for the main process of one epoch, from the daemon that manages
+// it. Commands go only downward: the main process reports on `Upstream`'s
+// `Report` and never commands the daemon (`specs/worker.md` §2.3).
+message Command {
+  oneof kind {
+    // Park every request at a step boundary and execute nothing more: a
+    // standby that mapped its weights read-only, captured its graphs on
+    // scratch and is ready to be promoted (§2.5, §7.4).
+    Park park = 1;
+    // Promote this parked standby in place, on the addresses its graphs
+    // already use: map the storage it mapped read-only writable and serve
+    // (§2.5).
+    Promote promote = 2;
+    // Prepare the next generation of kernels and the next scheduling policy
+    // while serving: resolve and load the modules, instantiate the policy on
+    // the current snapshot and trial every decision, rebind or recapture the
+    // graphs, and run the shadow execution of every replaced operator
+    // (§7.3 step 2). Answered with `Report::Precopied` when it succeeded.
+    Precopy precopy = 3;
+    // Use generation `generation` from the next batch boundary: rebind the
+    // graphs or point at the recaptured ones, and switch the scheduling
+    // policy (§7.3 step 3).
+    Switchover switchover = 4;
+    // End the probation: the previous generation is the last resort no
+    // longer (§7.3 step 5).
+    Commit commit = 5;
+    // Return to the previous generation: the reverse of the switchover
+    // (§7.3 step 5).
+    Revert revert = 6;
+    // Drop everything older than `generation` once no batch uses it: rebind
+    // or destroy the graphs that still reference the old kernels, whose last
+    // reference then unloads their libraries (§7.3 step 6).
+    Purge purge = 7;
+  }
+}
+
+// The programs an epoch's main process is to switch to: one kernel program
+// per operator (and, for attention, per phase), and the scheduling policy.
+message Precopy {
+  repeated KernelProgram kernels = 1;
+  Program policy = 2;
+}
+
+message Park {}
+message Promote {}
+
+message Switchover {
+  uint64 generation = 1;
+}
+
+message Commit {}
+message Revert {}
+
+message Purge {
+  uint64 generation = 1;
+}
+
+// What a daemon tells an engine, unasked: a report of one epoch's main
+// process (§7.3).
+message Report {
+  oneof kind {
+    // `Precopy` succeeded: generation `generation` is ready for the
+    // switchover.
+    Precopied precopied = 1;
+    // The scheduling policy failed after a commit: the main process
+    // reinstantiated the previous policy on the current snapshot, and the
+    // daemon's record takes it back.
+    PolicyReverted policy_reverted = 2;
+  }
+}
+
+message Precopied {
+  uint64 generation = 1;
+}
+
+message PolicyReverted {}
 
 // A supervised process exited.
 message Exit {
@@ -304,6 +419,8 @@ message Exit {
 message Upstream {
   oneof kind {
     Request request = 1;
+    // The main process's report of its own state, unasked (minor 4).
+    Report report = 2;
   }
 }
 
