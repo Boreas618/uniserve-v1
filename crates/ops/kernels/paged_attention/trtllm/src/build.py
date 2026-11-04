@@ -28,9 +28,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 #: The operator's element types, as the artifact names them in a kernel.
-NAMES = {"bf16": "Bfloat16", "fp16": "Fp16", "f8e4m3": "E4m3", "f4e2m1": "E2m1"}
+NAMES = {"bf16": "Bfloat16", "f16": "Fp16", "f8e4m3": "E4m3", "f4e2m1": "E2m1"}
 
 #: The architecture families each target runs. A GB200 reports SM 100 and runs the
 #: family-conditional `Sm100f` kernels beside the specific `Sm100a` ones.
@@ -137,9 +138,8 @@ def fetcher_python():
     raise SystemExit("no interpreter carries uniserve_program_server's artifact fetcher")
 
 
-def stage_artifact(out):
-    """Stage the artifact's generated header and manifest into ``out``."""
-    staged = out / "artifact"
+def stage_artifact(staged):
+    """Stage the artifact's generated header and manifest into ``staged``."""
     if (staged / "include/flashInferMetaInfo.h").is_file():
         return staged
     staged.mkdir(parents=True, exist_ok=True)
@@ -202,12 +202,12 @@ def matching_kernels(header, fields, target):
     return sorted(set(kept))
 
 
-def fetch_cubin(name, out):
+def fetch_cubin(name, artifact, out):
     """Publish one cubin beside the module, as bytes rather than a link."""
     target = out / "cubins" / f"{name}.cubin"
     if target.is_file():
         return target
-    staged = out / "artifact"
+    staged = artifact
     run = subprocess.run(
         [fetcher_python(), "-m", "uniserve_program_server.trtllm_gen", "--out", str(staged), "--cubin", f"{name}.cubin"],
         capture_output=True,
@@ -230,12 +230,23 @@ def main():
     fields = fields_of(package, descriptor)
     data = distribution()
     out.mkdir(parents=True, exist_ok=True)
-    artifact = stage_artifact(out)
+    # The artifact is the build's input, not the module: it is staged where the
+    # fetcher puts it, compiled against, and never enters the directory a runner
+    # is handed.
+    staging = pathlib.Path(tempfile.mkdtemp(prefix="uniserve-trtllm-gen-"))
+    try:
+        build(package, descriptor, fields, target, out, data, stage_artifact(staging))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def build(package, descriptor, fields, target, out, data, artifact):
+    """Compile one descriptor's module and publish the cubins it can select."""
     header_path = artifact / "include/flashInferMetaInfo.h"
     header = header_path.read_text()
     names = matching_kernels(header, fields, target)
     for name in names:
-        fetch_cubin(name, out)
+        fetch_cubin(name, artifact, out)
     print(f"published {len(names)} cubins", file=sys.stderr)
 
     metainfo_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
@@ -248,12 +259,17 @@ def main():
         data / "csrc/nv_internal/include",
         data / "cutlass/include",
         data / "cutlass/tools/util/include",
+        data / "cccl/libcudacxx/include",
+        data / "cccl/cub",
+        data / "cccl/thrust",
     ]
     unit = out / "entry.o"
     compiled = subprocess.run(
         [
             compiler,
             "-c",
+            "-x",
+            "cu",
             "-O3",
             "-std=c++17",
             f"-arch={target}",

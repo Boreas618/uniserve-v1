@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -34,7 +35,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include "flashinfer/cubin_loader.h"
 #include "flashinfer/trtllm/fmha/fmhaRunner.cuh"
 
 #include "entry.h"
@@ -53,23 +53,35 @@ fs::path module_directory() {
   return fs::path(info.dli_fname).parent_path();
 }
 
-// The cubin loader the trtllm-gen launch code calls: the module publishes its
-// cubins under `cubins/` beside itself and reads the one the kernel table names.
-void load_beside_module(const char* path, const char* sha256) {
-  (void)sha256;  // recorded in the manifest and verified when the module arrived
-  const fs::path cubin = module_directory() / "cubins" / fs::path(path).filename();
+}  // namespace
+
+namespace flashinfer::trtllm_cubin_loader {
+
+// The artifact's kernel table asks for a cubin by the name its build gave it;
+// this module publishes the ones its descriptors can select beside itself,
+// under `cubins/`. The manifest recorded each cubin's sha256, which the
+// installer verified when the module arrived, so the file the table names is the
+// one the table's hash belongs to.
+std::string getCubin(const std::string& name, const std::string& sha256) {
+  (void)sha256;
+  // The build host cannot run a kernel, so the module names the cubin its
+  // launcher asked for when asked to: the GPU check reads which kernel served a
+  // call from that file. Diagnostics only; the load path does not depend on it.
+  if (const char* log = std::getenv("UNISERVE_CUBIN_LOG"); log != nullptr && log[0] != '\0') {
+    std::ofstream written(log, std::ios::app);
+    written << fs::path(name).filename().string() << "\n";
+  }
+  const fs::path cubin = module_directory() / "cubins" / fs::path(name).filename();
   std::ifstream file(cubin, std::ios::binary);
   if (!file) {
     throw std::runtime_error("the module has no cubin " + cubin.string());
   }
-  const std::string bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-  FlashInferSetCurrentCubin(bytes.data(), static_cast<int>(bytes.size()));
+  return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
 
-void ensure_cubin_loader() {
-  static std::once_flag once;
-  std::call_once(once, [] { FlashInferSetCubinCallback(&load_beside_module); });
-}
+}  // namespace flashinfer::trtllm_cubin_loader
+
+namespace {
 
 // The message an entry writes before it returns a nonzero status.
 int32_t refuse(uniserve_paged_attention_call* call, const std::string& message) {
@@ -143,7 +155,6 @@ extern "C" int32_t uniserve_paged_attention(const uniserve_paged_attention_call*
   if (call == nullptr) {
     return 1;
   }
-  ensure_cubin_loader();
   auto refuse_call = [&](const std::string& message) {
     return refuse(const_cast<uniserve_paged_attention_call*>(call), message);
   };
