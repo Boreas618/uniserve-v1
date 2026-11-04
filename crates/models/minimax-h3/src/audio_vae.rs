@@ -23,7 +23,7 @@
 //! ## Precision
 //!
 //! The audio decoder is FP32 throughout (specs/worker.md 9; `precision.py` keeps it unquantized and
-//! unconverted). Its 128 weight-normalized convolutions are folded once at the loading boundary
+//! unconverted). Its 135 weight-normalized convolutions are folded once at the loading boundary
 //! (`nn::WeightLoader::weight_norm`), so no layer carries the magnitude/direction pair, and its
 //! convolutions run through cuDNN without TF32: spec 9 keeps TF32 for the video VAE's FP32 `conv3d`
 //! alone.
@@ -315,6 +315,124 @@ impl Pcm {
     }
 }
 
+/// One logical parameter of the audio decoder and the checkpoint tensor that fills it.
+///
+/// The names are composed from the sidecar's stage table, never transcribed: `parameter` is the
+/// decoder's own path and `tensor` is the checkpoint's key (`audio_vae/diffusion_pytorch_model.
+/// safetensors` after the reference's name translation, `dec_in_proj.*` and `decoder.*`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Source {
+    /// The decoder's path for the parameter.
+    pub parameter: String,
+    /// Where the checkpoint stores it.
+    pub tensor: Tensor,
+}
+
+/// How the checkpoint stores one tensor.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Tensor {
+    /// One tensor under one key.
+    Region(String),
+    /// A weight-normalized convolution: `value` holds the weight's extents and `gain` one magnitude
+    /// per output channel. `nn::WeightLoader::weight_norm` folds the pair once at load, so no layer
+    /// below carries it (specs/worker.md 9, the BigVGAN row).
+    Normalized {
+        /// The key of the direction tensor (`weight_v`).
+        value: String,
+        /// The key of the magnitude tensor (`weight_g`).
+        gain: String,
+    },
+}
+
+/// Every parameter of the decoder, with its checkpoint key.
+///
+/// The decoder is 135 weight-normalized convolutions (the pre- and post-convolutions, the seven
+/// upsamplers, and 126 anti-aliased multi-periodicity convolutions), 127 alias-free activations —
+/// each with a Kaiser-sinc filter pair and a log-space `alpha`/`beta` — and the input projection with
+/// its bias.
+pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
+    let stages = stages(config)?;
+    let mut sources = Vec::new();
+    let region = |parameter: String, tensor: String| Source {
+        parameter,
+        tensor: Tensor::Region(tensor),
+    };
+    let normalized = |parameter: String, base: String| Source {
+        parameter,
+        tensor: Tensor::Normalized {
+            value: format!("{base}.weight_v"),
+            gain: format!("{base}.weight_g"),
+        },
+    };
+    let activation = |sources: &mut Vec<Source>, parameter: String, base: String| {
+        for field in [
+            "act.alpha",
+            "act.beta",
+            "upsample.filter",
+            "downsample.lowpass.filter",
+        ] {
+            sources.push(region(format!("{parameter}.{field}"), format!("{base}.{field}")));
+        }
+    };
+
+    sources.push(normalized("input.weight".to_owned(), "dec_in_proj".to_owned()));
+    sources.push(region(
+        "input.bias".to_owned(),
+        "dec_in_proj.bias".to_owned(),
+    ));
+    sources.push(normalized("pre.weight".to_owned(), "decoder.conv_pre".to_owned()));
+    sources.push(region(
+        "pre.bias".to_owned(),
+        "decoder.conv_pre.bias".to_owned(),
+    ));
+
+    for (index, _stage) in stages.iter().enumerate() {
+        let base = format!("decoder.ups.{index}.0");
+        sources.push(normalized(
+            format!("stages.{index}.upsample.weight"),
+            base.clone(),
+        ));
+        sources.push(region(format!("stages.{index}.upsample.bias"), format!("{base}.bias")));
+        // Three anti-aliased multi-periodicity blocks per stage, in the reference's order.
+        for block in 0..BLOCKS_PER_STAGE {
+            let base = format!("decoder.resblocks.{}", index * BLOCKS_PER_STAGE + block);
+            let parameter = |name: &str| format!("stages.{index}.blocks.{block}.{name}");
+            for dilation in 0..config.resblock_dilation_sizes.len() {
+                for pair in ["convs1", "convs2"] {
+                    sources.push(normalized(
+                        parameter(&format!("{pair}.{dilation}.weight")),
+                        format!("{base}.{pair}.{dilation}"),
+                    ));
+                    sources.push(region(
+                        parameter(&format!("{pair}.{dilation}.bias")),
+                        format!("{base}.{pair}.{dilation}.bias"),
+                    ));
+                }
+                // A dilation contributes two activations: one before each convolution.
+                for half in 0..2 {
+                    let at = 2 * dilation + half;
+                    activation(
+                        &mut sources,
+                        parameter(&format!("activations.{at}")),
+                        format!("{base}.activations.{at}"),
+                    );
+                }
+            }
+        }
+    }
+
+    activation(
+        &mut sources,
+        "post".to_owned(),
+        "decoder.activation_post".to_owned(),
+    );
+    sources.push(normalized("output.weight".to_owned(), "decoder.conv_post".to_owned()));
+    Ok(sources)
+}
+
+/// The anti-aliased multi-periodicity blocks one decoder stage holds.
+pub const BLOCKS_PER_STAGE: usize = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +523,49 @@ mod tests {
     fn the_receptive_field_is_the_references_thirty_latent_frames() {
         // Computed from the reference `receptive_field`: spread 58.31 output samples, one side 30.
         assert_eq!(receptive_field(&audio_config()).expect("field"), 30);
+    }
+
+    #[test]
+    fn the_weight_table_names_every_parameter_of_the_checkpoint() {
+        let config = audio_config();
+        let table = sources(&config).expect("the decoder's parameters");
+        let normalized = table
+            .iter()
+            .filter(|source| matches!(source.tensor, Tensor::Normalized { .. }))
+            .count();
+        // 135 convolutions: the pre- and post-convolutions, seven upsamplers, 126 AMP convolutions.
+        assert_eq!(normalized, 135);
+        // 127 activations of four tensors each, plus the input projection's pair, the two
+        // convolution biases, the seven upsampler biases and the 126 AMP biases.
+        assert_eq!(table.len(), 135 + 127 * 4 + 2 + 2 + 7 + 126);
+        let names: Vec<&str> = table
+            .iter()
+            .map(|source| source.parameter.as_str())
+            .collect();
+        assert!(names.contains(&"input.weight"));
+        assert!(names.contains(&"pre.weight"));
+        assert!(names.contains(&"stages.6.upsample.weight"));
+        assert!(names.contains(&"stages.0.blocks.2.convs1.2.weight"));
+        assert!(names.contains(&"stages.6.blocks.2.activations.5.act.alpha"));
+        assert!(names.contains(&"post.downsample.lowpass.filter"));
+        assert!(names.contains(&"output.weight"));
+        // No parameter repeats: the stack is named once.
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        // A weight-normalized convolution names both directions and one gain.
+        let pre = table
+            .iter()
+            .find(|source| source.parameter == "pre.weight")
+            .expect("the pre-convolution");
+        assert_eq!(
+            pre.tensor,
+            Tensor::Normalized {
+                value: "decoder.conv_pre.weight_v".to_owned(),
+                gain: "decoder.conv_pre.weight_g".to_owned(),
+            }
+        );
     }
 
     #[test]
