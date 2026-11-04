@@ -130,6 +130,7 @@ impl EngineControl {
     pub fn start(
         &self,
         mut spec: wire::EngineSpec,
+        build: &crate::epoch::BuildConfig,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +147,10 @@ impl EngineControl {
             .map(|workers| workers.executable.clone())
             .context("the engine spec states no workers")?;
         let standby = spec.predecessor.is_some();
+        // The epoch's build config, written once per world: every process of
+        // that world reads the same bytes, and the launch file names its path
+        // (`specs/worker.md` §2.3).
+        self.write_build_config(world, build)?;
         let launch = self.launch(&spec, engine)?;
         let path = launch::write(&self.runtime, engine, &launch)?;
         let mut control = self.spawn(engine, &executable, &spec.host, Self::arguments(&path))?;

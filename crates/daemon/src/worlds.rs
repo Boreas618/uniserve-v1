@@ -2238,9 +2238,10 @@ impl Replica {
             (done, task)
         };
         let start_spec = spec.clone();
+        let start_build = crate::epoch::BuildConfig::of(&target);
         let prepared = async {
             let successor = Arc::new(
-                tokio::task::spawn_blocking(move || control.start(start_spec, sink))
+                tokio::task::spawn_blocking(move || control.start(start_spec, &start_build, sink))
                     .await
                     .context("the successor's start did not complete")?
                     .context("the successor world did not start")?,
@@ -2995,10 +2996,14 @@ pub(crate) async fn rollback(
                 retire: vec![trial.world],
                 ..trial.previous_spec.clone()
             };
-            let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
-                .await
-                .context("the previous world's start did not complete")
-                .and_then(|started| started.context("the previous world did not start"));
+            // The previous world's epoch: the replica's configuration is
+            // still the previous one, the trial having not been committed.
+            let previous_build = crate::epoch::BuildConfig::of(&locked(&replica.config));
+            let started =
+                tokio::task::spawn_blocking(move || control.start(spec, &previous_build, sink))
+                    .await
+                    .context("the previous world's start did not complete")
+                    .and_then(|started| started.context("the previous world did not start"));
             let started = match started {
                 Ok(started) => Arc::new(started),
                 Err(error) => {
