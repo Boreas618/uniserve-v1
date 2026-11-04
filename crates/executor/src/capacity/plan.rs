@@ -321,6 +321,65 @@ pub(crate) struct TokenLayout {
     warmup_units: u32,
 }
 
+/// The three numbers a dense cache's geometry is stated by, as
+/// [`CacheDescription::dense`](crate::memory::CacheDescription::dense)
+/// takes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheGeometry {
+    pub layers: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+}
+
+/// Everything the engine states about the rank it starts.
+///
+/// Every figure here is one the engine owns or has already agreed; nothing is
+/// inferred, because a wrong admission bound or memory fraction is a silently
+/// smaller cache rather than an error.
+pub struct RankFacts<'a> {
+    pub device: Device,
+    /// The rank's host endpoint, as it advertises itself.
+    pub host: &'a str,
+    pub world: u64,
+    /// The deployment's rank count, which no peer list states.
+    pub world_size: usize,
+    /// Requests the scheduler may have in flight, which the daemon places.
+    pub queue_depth: usize,
+    /// Tokens per logical cache page, when the deployment fixed it.
+    pub block_size: Option<u32>,
+    /// Most calls and most tokens one batch may carry: the largest bucket of
+    /// the rank's catalog, which is its admission bound because a larger batch
+    /// is refused before a kernel runs.
+    pub max_batch_calls: usize,
+    pub max_batch_tokens: usize,
+    /// Request slots the rank keeps.
+    pub max_request_pool_size: usize,
+    /// The model's longest request.
+    pub max_model_len: usize,
+    /// Fraction of the device's storage the epoch may hold.
+    pub mem_fraction_static: f64,
+    pub cache: CacheGeometry,
+    pub kv_dtype: ipc::PrefixCacheDtype,
+}
+
+/// A rank's plan with the one figure no owner states: the widest block table a
+/// request needs, which follows from the block size the plan chose.
+pub struct TokenPlan {
+    pub plan: Plan,
+    pub width: u32,
+}
+
+impl TokenPlan {
+    /// The tokens one page of the served cache holds.
+    pub fn block_size(&self) -> u32 {
+        self.plan
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.groups.first().map(|group| group.block_size))
+            .unwrap_or(0)
+    }
+}
+
 /// Resolve a token rank's capacity plan: the buffers, products and latents
 /// sized, the block size agreed over `group`, the cache pool fitted to the
 /// device grant.
@@ -382,6 +441,73 @@ pub fn token_plan(
         group,
     )?;
     Ok(layout.finish(Some(plan)))
+}
+
+/// Resolve a token rank's plan from what the engine states, agreeing the block
+/// size and the slot count over `group` and fitting the cache pool to the
+/// device's grant.
+///
+/// The cache geometry is the model's own three numbers: the plan's page size
+/// may come out lower than the requested one, because every layer's attention
+/// must be able to read it, and the answer states the width a batch's block
+/// table needs at that page size.
+pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
+    let total_bytes = match facts.device {
+        Device::Cuda(index) => crate::capacity::device::total_bytes(index)?,
+        Device::Cpu => 0,
+    };
+    let request = CapacityRequest {
+        device: facts.device,
+        block_size: facts.block_size.map(|size| size as usize),
+        pool_storage_bytes: None,
+        pool_storage_full_bytes: None,
+        mem_fraction_static: facts.mem_fraction_static,
+        max_batch_calls: facts.max_batch_calls,
+        max_batch_tokens: facts.max_batch_tokens,
+        max_total_tokens: Some(facts.max_model_len),
+        max_request_pool_size: facts.max_request_pool_size,
+        encoder_cache_entries: 0,
+        segments: None,
+        stage_cache: false,
+        predecessor: None,
+        world: facts.world,
+        world_size: facts.world_size,
+        decode_graph_batch_sizes: Vec::new(),
+        prefill_graph_token_sizes: Vec::new(),
+        flow_graph_shapes: Vec::new(),
+    };
+    let token_facts = TokenFacts {
+        image_processor: false,
+        vision_feature_bytes: 0,
+        latent_feature_bytes: 0,
+        latent: None,
+    };
+    let plan = token_plan(
+        &request,
+        report,
+        &token_facts,
+        facts.queue_depth,
+        0,
+        total_bytes,
+        None,
+        group,
+        |size| {
+            Ok(Some(Arc::new(crate::memory::CachePlan::new(
+                crate::memory::CacheDescription::dense(
+                    size as u32,
+                    facts.cache.layers,
+                    facts.cache.kv_heads,
+                    facts.cache.head_dim,
+                    facts.kv_dtype,
+                ),
+            )?)))
+        },
+    )?;
+    let mut answer = TokenPlan { plan, width: 0 };
+    let block = answer.block_size().max(1);
+    answer.width = u32::try_from(facts.max_model_len.div_ceil(block as usize))
+        .map_err(|_| Error::Invalid("the model's length states too many pages".into()))?;
+    Ok(answer)
 }
 
 impl TokenLayout {

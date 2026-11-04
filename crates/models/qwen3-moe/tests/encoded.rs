@@ -108,8 +108,19 @@ fn tensor_scale(seed: u8) -> Vec<u8> {
     f32::from(seed).to_le_bytes().to_vec()
 }
 
-/// A shard holding `projections` of every expert of `layers.0.mlp.experts`, in both encodings.
+/// A shard holding `projections` of every expert of `layers.0.mlp.experts`, in both encodings, with
+/// one scale element type for every expert.
 fn encoded_shard(projections: &[&str], packed_dtype: &str, scale_dtype: &str) -> TempDir {
+    encoded_shard_with(projections, packed_dtype, |_| scale_dtype.to_owned())
+}
+
+/// The same shard, with the block-scale element type chosen per expert: a checkpoint whose experts
+/// disagree is a misread stack, and one case below needs to write exactly that.
+fn encoded_shard_with(
+    projections: &[&str],
+    packed_dtype: &str,
+    scale_dtype: impl Fn(usize) -> String,
+) -> TempDir {
     let dir = TempDir::new().unwrap_or_else(|error| panic!("a temporary directory: {error}"));
     let mut owned: Vec<(String, Vec<u64>, String, Vec<u8>)> = Vec::new();
     for expert in 0..EXPERTS {
@@ -125,7 +136,7 @@ fn encoded_shard(projections: &[&str], packed_dtype: &str, scale_dtype: &str) ->
             owned.push((
                 format!("{stem}.weight_scale"),
                 vec![ROWS, CONTRACTION / BLOCK_ELEMENTS],
-                scale_dtype.to_owned(),
+                scale_dtype(expert as usize),
                 scales(seed),
             ));
             owned.push((
@@ -184,7 +195,7 @@ impl RetainedWeights for Retaining {
 
 #[test]
 fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
-    let dir = encoded_shard(&["up", "gate"], "U8", "U8");
+    let dir = encoded_shard(&["up", "gate"], "U8", "F8_E4M3");
     let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
     let mut store = Retaining::default();
     let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
@@ -208,6 +219,10 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
     );
     // The block scales keep the layout the loader was told to read, and one reciprocal per expert.
     assert_eq!(stack.layout, ScaleLayout::Linear);
+    // The block-scale field is the shard's own element type and is published unchanged: a real
+    // ModelOpt export stores it as E4M3, and a loader that relabelled it U8 would hide which byte
+    // the kernel decodes.
+    assert_eq!(stack.scales.view.dtype, DType::F8E4M3);
     // One tensor scale per (expert, projection), in the reading order the stack fuses: a checkpoint
     // carries one `weight_scale_2` per projection tensor, so the two halves of `up_gate` generally
     // differ and a kernel that used one for both would be wrong by their ratio.
@@ -240,7 +255,7 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
 }
 
 #[test]
-fn a_packed_field_that_is_not_u8_or_a_stack_whose_experts_disagree_is_refused() {
+fn a_packed_field_that_is_not_u8_is_refused_by_name() {
     // The packed values declared as F32: the field holds codes, so this is a misread checkpoint.
     let dir = encoded_shard(&["up"], "F32", "U8");
     let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
@@ -256,6 +271,31 @@ fn a_packed_field_that_is_not_u8_or_a_stack_whose_experts_disagree_is_refused() 
         )
         .unwrap_err();
     assert!(format!("{error}").contains("up_proj.weight"), "{error}");
+}
+
+#[test]
+fn a_stack_whose_experts_declare_different_scale_types_is_refused() {
+    // One set of views serves every expert, so the block-scale element type is the stack's, not the
+    // projection's: a checkpoint where one expert says E4M3 and the next says U8 is a misread stack,
+    // and reading it would decode one expert's scales with the other's rule.
+    let dir = encoded_shard_with(&["up"], "U8", |expert| match expert {
+        0 => "F8_E4M3".to_owned(),
+        _ => "U8".to_owned(),
+    });
+    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
+    let mut store = Retaining::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let error = loader
+        .nvfp4_stack(
+            "layers.0.mlp.experts.up",
+            "model.layers.0.mlp.experts",
+            &["up"],
+            EXPERTS,
+            ScaleLayout::Linear,
+        )
+        .unwrap_err();
+    let message = format!("{error}");
+    assert!(message.contains("weight_scale"), "{message}");
 }
 
 #[test]

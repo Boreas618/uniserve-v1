@@ -16,6 +16,8 @@
 
 mod cli;
 mod engine;
+mod engine_main;
+mod engine_plan;
 mod frontend;
 mod logging;
 mod program_server;

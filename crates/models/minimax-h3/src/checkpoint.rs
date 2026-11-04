@@ -16,7 +16,7 @@
 //! [`crate::config::Config`] is the typed architecture the layers consume.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nn::VideoTask;
 use serde_json::{Map, Value};
@@ -383,11 +383,49 @@ impl Sidecars {
     /// `None` for a checkpoint that holds every directory, and a sidecar both roots lack is an
     /// error naming it.
     pub fn read(root: &Path, base: Option<&Path>, layout: &Layout) -> Result<Self> {
-        let read = |relative: &str| -> Result<Value> { read_sidecar(root, base, relative) };
+        Self::read_through(
+            |relative| read_sidecar(root, base, relative),
+            |relative| optional_sidecar(root, base, relative),
+            layout,
+        )
+    }
+
+    /// Read every sidecar from the roots a loaded checkpoint holds.
+    ///
+    /// A pipeline's components do not have to lie in one directory: an export that continues a base
+    /// release holds its own DiT partition and schedulers, and the base holds the text encoder, the
+    /// processor and the VAEs, which the engine opens as one checkpoint. Each directory is
+    /// therefore read from the component that owns it - `<component>/config.json` from
+    /// `checkpoint.component(component)` - falling back to the pipeline's own root, which is where
+    /// a checkpoint that answers as one tree keeps everything.
+    pub fn read_components(checkpoint: &nn::Checkpoint, layout: &Layout) -> Result<Self> {
+        let root = checkpoint.root();
+        let roots = |relative: &str| -> Vec<PathBuf> {
+            let mut roots = Vec::with_capacity(2);
+            if let Some((component, _)) = relative.split_once('/')
+                && let Ok(held) = checkpoint.component(component)
+            {
+                roots.push(held.root().to_path_buf());
+            }
+            roots.push(root.to_path_buf());
+            roots
+        };
+        Self::read_through(
+            |relative| read_any(&roots(relative), relative),
+            |relative| optional_any(&roots(relative), relative),
+            layout,
+        )
+    }
+
+    /// The body every reader shares: eight named sidecars and each DiT partition's own.
+    fn read_through(
+        read: impl Fn(&str) -> Result<Value>,
+        optional: impl Fn(&str) -> Result<Option<Value>>,
+        layout: &Layout,
+    ) -> Result<Self> {
         let text_encoder = read("text_encoder/config.json")?;
         let processor = read("processor/preprocessor_config.json")?;
-        let video_processor =
-            optional_sidecar(root, base, "processor/video_preprocessor_config.json")?;
+        let video_processor = optional("processor/video_preprocessor_config.json")?;
         let video_vae = read("vae/config.json")?;
         let audio_vae = read("audio_vae/config.json")?;
         let scheduler = read("scheduler/scheduler_config.json")?;
@@ -438,6 +476,35 @@ fn optional_sidecar(root: &Path, base: Option<&Path>, relative: &str) -> Result<
         Some(base) if base.join(relative).is_file() => read_json(&base.join(relative)).map(Some),
         _ => Ok(None),
     }
+}
+
+/// Read one sidecar from the first of `roots` that holds it.
+fn read_any(roots: &[PathBuf], relative: &str) -> Result<Value> {
+    for root in roots {
+        let path = root.join(relative);
+        if path.is_file() {
+            return read_json(&path);
+        }
+    }
+    Err(Error::checkpoint(format!(
+        "neither {} holds {relative}",
+        roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" nor ")
+    )))
+}
+
+/// Read one sidecar that a checkpoint may omit, from the first of `roots` that holds it.
+fn optional_any(roots: &[PathBuf], relative: &str) -> Result<Option<Value>> {
+    for root in roots {
+        let path = root.join(relative);
+        if path.is_file() {
+            return read_json(&path).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 /// Read and parse one JSON file.
@@ -516,15 +583,13 @@ mod tests {
         // `MiniMax-H3/FL2VA/model_index.json`: the pipeline class a task export states, with its
         // `video_vae` directory rather than the modular pipeline's `vae`.
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             r#"{"_class_name": "MiniMaxH3Pipeline", "transformer": ["diffusers", "Model"]}"#,
         );
-        write(&root.path(), "transformer/config.json", "{}");
-        write(&root.path(), "video_vae/config.json", "{}");
-        let error = Layout::detect(root.path())
-            .err()
-            .expect("a task export is refused");
+        write(root.path(), "transformer/config.json", "{}");
+        write(root.path(), "video_vae/config.json", "{}");
+        let error = Layout::detect(root.path()).expect_err("a task export is refused");
         assert!(
             matches!(error, Error::Checkpoint(ref problem)
                 if problem.contains("MiniMaxH3Pipeline") && problem.contains("pipeline root")),
@@ -534,7 +599,7 @@ mod tests {
         // The modular pipeline's own class name is taken, and an index that states none is not
         // refused for it: a hand-built export need not name one.
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             &format!(
                 r#"{{"_class_name": "{PIPELINE_CLASS}", "transformer": ["diffusers", "Model"]}}"#
@@ -547,13 +612,13 @@ mod tests {
     fn a_base_release_lists_the_dits_its_index_names_and_its_root_holds() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             &base_index(&["transformer", "transformer_ref"]),
         );
         for dit in Dit::ALL {
             write(
-                &root.path(),
+                root.path(),
                 &format!("{}/config.json", dit.directory()),
                 "{}",
             );
@@ -580,17 +645,17 @@ mod tests {
     fn a_dit_the_index_names_but_the_root_lacks_is_not_a_layout() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             &base_index(&["transformer", "transformer_ref"]),
         );
-        write(&root.path(), "transformer/config.json", "{}");
+        write(root.path(), "transformer/config.json", "{}");
         let layout = Layout::detect(root.path()).expect("the base DiT is present");
         assert_eq!(layout.dits.len(), 1);
 
         let empty = tempfile::tempdir().expect("tempdir");
         write(
-            &empty.path(),
+            empty.path(),
             "model_index.json",
             &base_index(&["transformer"]),
         );
@@ -614,7 +679,7 @@ mod tests {
     fn a_dmd_export_states_its_rungs_and_serves_its_partitions_tasks() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{
                 "task": "t2av",
@@ -660,7 +725,7 @@ mod tests {
     fn an_omniref_export_states_its_block_grid_its_keep_rate_and_its_base_revision() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{
                 "model_type": "ref2va",
@@ -699,7 +764,7 @@ mod tests {
     fn a_contract_is_refused_when_it_states_no_supported_task() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{"task": "t2v", "video_scheduler_shift": 1.0, "audio_scheduler_shift": 1.0,
                 "dmd_denoising_steps": [10], "vsa_tile_size": 64, "vsa_sparsity": 0.0}"#,
@@ -715,7 +780,7 @@ mod tests {
     fn a_contract_states_exactly_one_schedule() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{"task": "t2av", "video_scheduler_shift": 1.0, "audio_scheduler_shift": 1.0,
                 "vsa_tile_size": 64, "vsa_sparsity": 0.0}"#,
@@ -739,10 +804,10 @@ mod tests {
             ("scheduler/scheduler_config.json", r#"{"shift": 12.0}"#),
             ("audio_scheduler/scheduler_config.json", r#"{"shift": 3.0}"#),
         ] {
-            write(&base.path(), relative, body);
+            write(base.path(), relative, body);
         }
         write(
-            &export.path(),
+            export.path(),
             "transformer/config.json",
             r#"{"num_layers": 50}"#,
         );
@@ -757,12 +822,65 @@ mod tests {
         assert_eq!(sidecars.dits[&Dit::Base]["num_layers"], 50);
         assert!(sidecars.video_processor.is_none());
 
-        let error = Sidecars::read(export.path(), None, &layout)
-            .err()
-            .expect("without the base the text encoder is missing");
+        // Without the base the export holds no text encoder: the reader says which sidecar it
+        // looked for. `Sidecars` is not `Debug`, so the error is matched rather than unwrapped.
+        let error = match Sidecars::read(export.path(), None, &layout) {
+            Ok(_) => panic!("without the base the text encoder is missing"),
+            Err(error) => error,
+        };
         assert!(
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("text_encoder/config.json")),
             "{error}"
         );
+    }
+
+    /// A scratch directory under the system temporary directory, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("h3-sidecars-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_sidecar_is_read_from_the_root_that_holds_it() {
+        // A checkpoint may span an export and the base release it continues, so a directory is
+        // looked up in the component that owns it and only then in the pipeline's own root.
+        let held = Scratch::new("held");
+        let pipeline = Scratch::new("pipeline");
+        std::fs::create_dir_all(held.0.join("text_encoder")).expect("a component directory");
+        std::fs::write(
+            held.0.join("text_encoder/config.json"),
+            "{\"hidden_size\": 5120}",
+        )
+        .expect("a component sidecar");
+        std::fs::write(pipeline.0.join("vae.json"), "{\"blocks\": 36}").expect("a root sidecar");
+
+        let roots = [held.0.clone(), pipeline.0.clone()];
+        let config = read_any(&roots, "text_encoder/config.json").expect("from the component");
+        assert_eq!(config["hidden_size"], 5120);
+        let config = read_any(&roots, "vae.json").expect("from the pipeline root");
+        assert_eq!(config["blocks"], 36);
+
+        // A sidecar neither root holds names both, so the error says where it looked.
+        let missing = read_any(&roots, "audio_vae/config.json").expect_err("neither holds it");
+        assert!(missing.to_string().contains("audio_vae"), "{missing}");
+        assert!(
+            missing.to_string().contains(&held.0.display().to_string()),
+            "{missing}"
+        );
+        let absent = optional_any(&roots, "processor/video_preprocessor_config.json")
+            .expect("an optional sidecar");
+        assert!(absent.is_none());
     }
 }

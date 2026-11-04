@@ -1458,7 +1458,12 @@ impl Leader {
     }
 }
 
-fn resolve(
+/// Resolves `request` against the serving configuration `current`: the target
+/// configuration, the fields the request stated and the target's update
+/// options, which [`crate::epoch::layer`] and the update entry decide on. The
+/// admin API resolves a change here before it routes it, so the target an
+/// operator sees planned is the target the leader applies.
+pub(crate) fn resolve(
     current: &ServeConfig,
     request: &ApplyRequest,
 ) -> Result<
