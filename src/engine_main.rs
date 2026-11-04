@@ -254,7 +254,18 @@ struct ProcessInterface {
 impl ProcessInterface {
     /// Connects to `address` and states this process's identity, which the daemon answers with the
     /// deployment's nodes or a refusal (§2.3).
-    fn connect(address: &str, deployment: &str) -> Result<Self> {
+    fn connect(address: &str, deployment: &str, engine: u64) -> Result<Self> {
+        // A process link that cannot name its engine is refused here rather than sent: zero states
+        // "no main process", and a daemon that accepted it would file this connection in the place
+        // of a process it can never command. The launch file states the number, so a launch without
+        // one is the deployment's fault and this is where it is named.
+        if engine == 0 {
+            bail!(
+                "the launch file states engine 0, which names no main process: the daemon addresses \
+                 the epoch's program-layer commands by this number, so a process it started under \
+                 none cannot be commanded"
+            );
+        }
         let mut connection = proto::Connection::connect(address).with_context(|| {
             format!("connecting to the daemon's process interface at {address}")
         })?;
@@ -265,6 +276,14 @@ impl ProcessInterface {
             peer: Some(proto::process::hello::Peer::Engine(
                 proto::process::Engine {
                     deployment: deployment.to_owned(),
+                    // The daemon keys this connection by the number the epoch layer started this
+                    // process under, so a command it sends for engine N reaches this process and
+                    // not whichever connection the daemon happened to accept Nth.
+                    engine,
+                    // This is the process link: the one the daemon's program-layer commands
+                    // travel down. The request link, on its own socket, states `REQUESTS`, so the
+                    // two links of one engine are never confused for one another.
+                    interface: proto::process::Interface::Process as i32,
                 },
             )),
         })?;
@@ -292,6 +311,11 @@ impl ProcessInterface {
         tracing::info!(
             nodes = welcome.nodes.len(),
             build = %welcome.build,
+            // The engine number this link claims, so this process's line and the daemon's
+            // "a process connected engine=N" are matched by a number rather than by their order in
+            // the log - which is the confusion that cost a run.
+            engine,
+            interface = "process",
             "connected to the deployment's process interface"
         );
         Ok(Self {
@@ -681,7 +705,11 @@ impl MainProcess {
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
-        let mut process = ProcessInterface::connect(&launch.processes, &launch.deployment)?;
+        let mut process = ProcessInterface::connect(
+            &launch.processes,
+            &launch.deployment,
+            launch.engine,
+        )?;
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -702,7 +730,7 @@ impl MainProcess {
         // one `Arc` and not a second load. The load and the capacity plan are one call because the
         // order between them is the plan's: the weights are mapped first, so what the plan measures
         // is what is left of the device rather than what was there before the model.
-        let (model, mut memory, inventory) = plan
+        let (model, mut memory, inventory, graph) = plan
             .load_and_open(&mut weights, &mut &*client)
             .context("loading the epoch's model")?;
 
@@ -731,14 +759,15 @@ impl MainProcess {
         // memory and handed to the executor thread, so every owner and every runner books against
         // the same allowance.
         let pools = memory.pools();
-        let device = *plan
-            .devices()
-            .first()
-            .context("this rank serves no device")?;
-        // Only the scratch figure is read here: the device thread starts before any batch and the
-        // shadow region is the one pool it is sized with. The resident pool is the capacity plan's
-        // and `open_memory` opens it, so this call states none.
-        let scratch = plan.graph(device, 0)?.scratch;
+        // A rank with no device serves nothing, and saying it here names the deployment's fault
+        // rather than leaving the pool's figure to a plan that never sized one.
+        if plan.devices().is_empty() {
+            bail!("this rank serves no device");
+        }
+        // The scratch pool's figure comes from the one call that sized it, with the memory: the
+        // shadow region and the state group's snapshot are one reservation (4.5), and a second
+        // computation here could disagree with the pool the allocator reserved.
+        let scratch = graph.scratch;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
@@ -1326,7 +1355,7 @@ impl MainProcess {
                     operators = programs.len(),
                     policy = %policy.backend,
                     policy_revision = policy.revision,
-                    "received the daemon's precopy"
+                    "the daemon's Precopy arrived"
                 );
                 self.start_precopy(generation, &programs, &policy, reply)?;
                 return Ok(None);
@@ -4214,6 +4243,9 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
         build: proto::BUILD.to_owned(),
         major: proto::PROTOCOL_MAJOR,
         minor: proto::PROTOCOL_MINOR,
+        // The request link: requests, their events and the epoch's metrics. The process link
+        // states `PROCESS` on its own socket, and both name the same engine number.
+        interface: proto::process::Interface::Requests as i32,
     })?;
     let welcome: proto::request::wire::Welcome = control
         .daemon_mut()
