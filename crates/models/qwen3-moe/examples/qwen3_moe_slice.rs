@@ -321,7 +321,9 @@ fn stage_embedding(args: &Args) -> Result<()> {
 
     // 2. The kernels. Every key the fixture names is resolved before a byte is allocated, so a
     //    missing package is reported as coverage rather than as the first operator to launch.
-    let needed = needed_keys(&store_root)?;
+    // Only the operator this stage launches is required: a key the stage never calls must be
+    // reported, not fatal, or a missing sampler program would read as a broken embedding.
+    let needed = needed_keys(&store_root, Stage::Embedding)?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
     // 3. Weights on the device, through the loader's own boundary.
@@ -407,7 +409,7 @@ fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
 }
 
 /// The (operator, key) pairs the fixture names for the slice, which is what the store must hold.
-fn needed_keys(store_root: &Path) -> Result<Vec<(String, String)>> {
+fn needed_keys(store_root: &Path, stage: Stage) -> Result<Vec<(String, String)>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/programs/qwen3-moe-keys.txt");
     let text = std::fs::read_to_string(&fixture).map_err(|error| {
@@ -427,9 +429,26 @@ fn needed_keys(store_root: &Path) -> Result<Vec<(String, String)>> {
         let (Some(operator), Some(descriptor)) = (fields.next(), fields.next()) else {
             continue;
         };
+        if !required(stage, operator) {
+            continue;
+        }
         keys.push((operator.to_owned(), descriptor.to_owned()));
     }
     Ok(keys)
+}
+
+/// Whether `stage` launches `operator`, which decides whether a missing key is fatal.
+///
+/// A stage that needs one operator must not be blocked by a key the model uses elsewhere: the store
+/// coverage is the caller's report (`notes/programs/store-coverage.md`), and this harness's job is
+/// to launch what it says it launches.
+fn required(stage: Stage, operator: &str) -> bool {
+    match stage {
+        Stage::Weights => false,
+        Stage::Embedding => operator == "embedding",
+        // A block launches everything the model's layer calls, so every fixture key is required.
+        Stage::Block | Stage::Decode => true,
+    }
 }
 
 /// Load every kernel the fixture names from `root`, failing with the complete list of what is
