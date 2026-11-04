@@ -1666,6 +1666,10 @@ impl Scheduler {
     /// Publishes `terminal` and releases every resource owned by one token
     /// request; see `finish_with`.
     fn retire_token_request(&mut self, id: RequestId, terminal: TokenTerminal) {
+        // A call of this request still queued behind a full worker queue can
+        // never be served nor state its layout once the request's allocation
+        // goes, so it leaves the queue with the request.
+        self.retire_queued_calls(id);
         // The policy sees the request end, with how it ended.
         let end = match &terminal {
             TokenTerminal::Migratable(..) => scheduling::guest::End::Migratable,
