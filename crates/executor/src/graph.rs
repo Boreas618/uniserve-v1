@@ -37,6 +37,26 @@ pub struct Graphs {
 /// Newest first is what lets a bucket an update did not prepare keep serving: its programs did not
 /// change, so the newest generation that named it is the same program. Smallest within a generation
 /// is the planning rule (4.5): a batch is served by the smallest bucket that holds it.
+/// The entries a purge of `generation` releases, over the table's keys alone.
+///
+/// A capture of `generation` is released only when a **newer** capture of the same bucket exists:
+/// the newer one is what serves from then on, so the older one is what a commit retires. A capture
+/// with no newer sibling is the program its bucket still serves (`served_key` takes the newest at or
+/// below the serving generation), so releasing it would leave the bucket with nothing to answer.
+fn released(keys: &[(Bucket, u64)], generation: u64) -> Vec<(Bucket, u64)> {
+    let serving: Vec<Bucket> = keys
+        .iter()
+        .filter(|(_, captured_generation)| *captured_generation > generation)
+        .map(|(bucket, _)| *bucket)
+        .collect();
+    keys.iter()
+        .filter(|(bucket, captured_generation)| {
+            *captured_generation == generation && serving.contains(bucket)
+        })
+        .copied()
+        .collect()
+}
+
 fn served_key(
     keys: impl Iterator<Item = (Bucket, u64)>,
     generation: u64,
@@ -185,16 +205,22 @@ impl Graphs {
     /// *newer* than the serving one, so a rule of "everything older than this" would have released
     /// the graphs of the generation that serves: the device would keep answering from nothing.
     ///
+    /// A bucket whose only capture is this generation's - one the update did not prepare - is
+    /// **kept**, because it is still the program that bucket serves: releasing it would leave the
+    /// bucket with no graph to answer from and every request in it would fail after the commit. A
+    /// purge releases what a newer generation has replaced, which is what a commit retires.
+    ///
     /// The buckets come back so the caller can give each one's arena region to its graph pool:
     /// `Captured` guarantees that the executable goes first, so the regions are released only
     /// after the graphs that addressed them are gone.
     pub fn purge(&mut self, generation: u64) -> Vec<Bucket> {
-        let stale: Vec<(Bucket, u64)> = self
-            .captured
-            .keys()
-            .filter(|(_, captured_generation)| *captured_generation == generation)
-            .copied()
-            .collect();
+        // An entry of this generation that **no newer capture supersedes** still serves: a bucket
+        // the update did not prepare keeps answering from it, because `served_key` takes the newest
+        // capture at or below the serving generation. Releasing it would leave that bucket with
+        // nothing to answer a batch - a Commit would fail every request in a bucket nobody changed.
+        // So a purge releases what a newer generation has replaced, and keeps what still serves.
+        let keys: Vec<(Bucket, u64)> = self.captured.keys().copied().collect();
+        let stale = released(&keys, generation);
         let mut buckets: Vec<Bucket> = stale.iter().map(|(bucket, _)| *bucket).collect();
         buckets.sort_unstable();
         buckets.dedup();
@@ -304,5 +330,25 @@ mod tests {
         assert!(graphs.using("rms_norm", 1).is_empty());
         assert!(graphs.generations().is_empty());
         assert!(graphs.purge(1).is_empty());
+    }
+
+    /// What a commit releases, over keys only: the captures a newer generation has replaced, and
+    /// never the capture a bucket the update did not prepare still serves from. A purge that took
+    /// that one would leave the bucket with no graph, and every request in it would fail after the
+    /// commit - the failure this rule exists to prevent.
+    #[test]
+    fn a_purge_keeps_the_capture_an_unprepared_bucket_serves_from() {
+        let prepared = Bucket::decode(4, Variant::DecodeGreedy);
+        let untouched = Bucket::decode(8, Variant::DecodeGreedy);
+        let keys = [(prepared, 1), (prepared, 2), (untouched, 1)];
+
+        // Generation 2 replaced the prepared bucket's generation-1 capture: that one is released.
+        assert_eq!(released(&keys, 1), vec![(prepared, 1)]);
+        // The untouched bucket's only capture is generation 1's, and it still serves: kept.
+        assert!(!released(&keys, 1).contains(&(untouched, 1)));
+        // Purging the generation that serves releases nothing.
+        assert!(released(&keys, 2).is_empty());
+        // A bucket prepared for the first time in generation 2 has no older capture to release.
+        assert!(released(&[(prepared, 2)], 1).is_empty());
     }
 }
