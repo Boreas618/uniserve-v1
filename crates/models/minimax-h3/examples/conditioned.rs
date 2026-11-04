@@ -1,30 +1,35 @@
-//! MiniMax-H3's conditioned path: `fl2va`, one image reference, and the rows it writes.
+//! MiniMax-H3's conditioned path: `fl2va`, one image, and the condition rows it writes.
 //!
-//! The fifth stage, and the only one that binds `VideoEncoder`: a `t2va` request's prefix is
-//! `text_rows + 1` rows and never touches this code, while a conditioned request's is
+//! The fifth device stage, and the only one that binds `VideoEncoder`: a `t2va` request's prefix is
+//! `text_rows + 1` rows and never reaches this code, while a conditioned request's is
 //! `text_rows + condition_rows + 1` and those condition rows come from the encoder's tiles, the
-//! posterior, the draw and the projection.
+//! posterior, the anchoring draw and the projection.
 //!
 //! ```text
 //! --stage weights  no device: what the `fl2va` deployment places, the two encoder key lists against
-//!                  the export's indexes, and the condition arithmetic of the case - the segment
-//!                  kinds, their row counts, and the prefix the rows make
-//! --stage encode   one image on a device: the encoder's tile walk, the posterior, the condition rows
-//!                  written as `<out>/latent_encoder/condition_rows.h3t` with `case.json` and
-//!                  `walk.txt`
+//!                  the export's indexes, and where the case's rows come from
+//! --stage encode   one image on a device: the encoder's tile walk, the posterior, the anchoring and
+//!                  the projection, then the rows read back through the packing's own placement -
+//!                  `<out>/latent_encoder/condition_rows.h3t` with `case.json`, `walk.txt` and
+//!                  `readback.txt`
 //! ```
 //!
-//! **The case is one image at one canvas, and the page is a row count.** A conditioned first page is
-//! about *which* rows exist and where they are placed, not about a canvas: the wiring is what has
-//! never run. The tensors are compared by the caller against the reference's own conditioned dump
-//! (`notes/h3/conditioned-diagnosis.md`); this harness writes what a comparison needs and states what
-//! it cannot check.
+//! **It runs the served entry point, not a method of convenience.** `Denoiser::prepare_conditioning`
+//! is what a runner calls once per request, and it is the arm that carried the defect that every
+//! condition was written where nothing gathers it (`39a41fd55`); `encode_conditions` was the arm that
+//! was right. A stage that exercised only the second would have printed a healthy page.
 //!
-//! **Three things it refuses rather than approximates:** a request whose conditions include audio
-//! (this export carries no `audio_vae/` weights, so the audio half is unprovable here and a page that
-//! ran it would imply otherwise), a condition draw out of the request's order (the draw's stream is
-//! the request's, and an offset there moves every later sample), and a prefix buffer whose shape is
-//! not `[text + condition + 1, hidden]`.
+//! **The verdict is a readback, not a row count.** For each piece the page prints the prefix rows the
+//! packing gathers for it - `layout.text_rows` plus the rows of the pieces before it - and the mean
+//! magnitude of what it found there. A dropped condition reads as zeros; a row count cannot say so.
+//! The verdict is only as strong as the model's claim: **a black keyframe is a legal request with
+//! zero rows**, so the failure this stage names is *every* piece reading as zeros, not one. The zero
+//! row is a separate claim and a hard one: no write may reach it.
+//!
+//! Untested halves, stated rather than implied: the text region of the prefix is a **synthetic,
+//! stated** pattern (stage 4 is the text encoder), and the case carries **no audio** - this export
+//! holds no `audio_vae/` weights, so a case that carried audio would be refused by the model for want
+//! of samples, and a page that claimed to have proved the audio rows would prove nothing.
 //!
 //! `--stage encode` needs a program store (`--store <path>` or `UNISERVE_STORE`) holding committed
 //! modules for the operators the encoder launches; the store is read, never written.
@@ -32,8 +37,16 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use minimax_h3::checkpoint::Dit;
+use minimax_h3::config::Config;
+use minimax_h3::denoiser::{Denoiser, Layouts};
+use minimax_h3::encoding::Extent;
 use minimax_h3::partition::{Component, Partition};
-use nn::VideoTask;
+use nn::capability::{Conditioning, Denoiser as _, MediaInput, MediaRole};
+use nn::{
+    Arena, Backing, Checkpoint, ConditionRole, ConditionShape, DType, DevicePtr, Forward,
+    RetainedWeights, Shape, TensorView, VideoRequest, VideoTask, WeightKey, WeightLoader,
+};
 
 /// The export root the caller's GPU host holds, when `--root` does not name another.
 const DEFAULT_ROOT: &str = "/workspace/models/MiniMax-H3";
@@ -41,6 +54,9 @@ const DEFAULT_ROOT: &str = "/workspace/models/MiniMax-H3";
 /// The two checkpoint directories a conditioned deployment reads its media from.
 const VAE: &str = "vae";
 const AUDIO_VAE: &str = "audio_vae";
+
+/// The `.h3t` element-type codes this harness writes, from `tools/dump_tables.py`'s table.
+const H3T_F32: u8 = 1;
 
 fn main() -> ExitCode {
     match run() {
@@ -61,10 +77,17 @@ struct Args {
     /// The generated canvas, in pixels.
     width: u32,
     height: u32,
+    /// Generated frames the request asks for.
+    frames: u32,
     /// Prompt tokens the case presents.
     text_tokens: u32,
-    /// The reference image's raster, in pixels.
+    /// The condition image's raster, in pixels; an anchor is fitted to the canvas.
     image: u32,
+    /// The request's seed, which addresses the condition's draw.
+    seed: u64,
+    device: u32,
+    /// Device GiB to reserve for the workspace when it is larger than the plan.
+    arena_gib: u64,
     /// The program store `--stage encode` reads its modules from.
     store: Option<PathBuf>,
 }
@@ -89,8 +112,12 @@ impl Args {
             task: VideoTask::FirstLastToVideoAudio,
             width: 256,
             height: 256,
+            frames: 5,
             text_tokens: 15,
             image: 256,
+            seed: 0,
+            device: 0,
+            arena_gib: 8,
             store: std::env::var_os("UNISERVE_STORE").map(PathBuf::from),
         };
         let mut words = std::env::args().skip(1);
@@ -130,6 +157,11 @@ impl Args {
                         .parse()
                         .map_err(|_| format!("`{height}` is not a height"))?;
                 }
+                "--frames" => {
+                    args.frames = value()?
+                        .parse()
+                        .map_err(|_| "`--frames` takes a count".to_owned())?;
+                }
                 "--text-tokens" => {
                     args.text_tokens = value()?
                         .parse()
@@ -139,6 +171,21 @@ impl Args {
                     args.image = value()?
                         .parse()
                         .map_err(|_| "`--image` takes a pixel side".to_owned())?;
+                }
+                "--seed" => {
+                    args.seed = value()?
+                        .parse()
+                        .map_err(|_| "`--seed` takes a number".to_owned())?;
+                }
+                "--device" => {
+                    args.device = value()?
+                        .parse()
+                        .map_err(|_| "`--device` takes an index".to_owned())?;
+                }
+                "--arena-gib" => {
+                    args.arena_gib = value()?
+                        .parse()
+                        .map_err(|_| "`--arena-gib` takes a number".to_owned())?;
                 }
                 other => return Err(format!("`{other}` is not a flag of this harness")),
             }
@@ -201,12 +248,12 @@ fn report_names(label: &str, keys: &[String], index: &std::collections::BTreeSet
     missing.is_empty()
 }
 
-/// The host stage: what the deployment places, what the encoders read, and the case's rows.
+/// The host stage: what the deployment places, what the encoders read, and where the rows come from.
 fn weights(args: &Args) -> Result<(), String> {
     let layout = minimax_h3::checkpoint::Layout::detect(&args.root).map_err(show)?;
     let sidecars =
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
-    let config = minimax_h3::config::Config::normalize(&layout, &sidecars).map_err(show)?;
+    let config = Config::normalize(&layout, &sidecars).map_err(show)?;
 
     let partition = Partition::serving(&config, args.task, 1, 1, 0, 0).map_err(show)?;
     println!(
@@ -254,39 +301,914 @@ fn weights(args: &Args) -> Result<(), String> {
     if !resolved {
         return Err("a name the conditioned path reads is not in the checkpoint".to_owned());
     }
-    println!("case: {}", case_note(args));
-    Ok(())
-}
-
-/// What the case's rows need, and why this harness does not compute them itself.
-///
-/// The rows are the packing's answer: `condition_segments` decides what a condition contributes and
-/// `condition_placements` where it sits, and both are private to the denoiser today. Re-deriving
-/// either here would be a second statement of a number the model already makes - the defect class
-/// this branch has paid for twice - so the harness names what it needs instead of guessing.
-fn case_note(args: &Args) -> String {
-    format!(
-        "the case's rows come from the model's own packing, which is not public: expose \
-         `conditions_of` and `condition_placements` (or one `Denoiser` method answering the segments \
-         and their intervals for a `VideoRequest`), and this stage computes `condition_rows` and the \
-         per-segment placement from the same code the forward runs. The case is {}x{} with a {} px \
-         image and {} prompt tokens.",
+    println!(
+        "case: the rows a condition contributes are the model's answer - the segments it packs and \
+         the placement the packing gathers them from - so they need the loaded block and are printed \
+         by `--stage encode`. The case is {}x{} with a {} px image and {} prompt tokens.",
         args.width, args.height, args.image, args.text_tokens
-    )
+    );
+    Ok(())
 }
 
 /// The device stage: one image through the encoder, the posterior and the projection.
 fn encode(args: &Args) -> Result<(), String> {
-    let _ = args;
-    Err(
-        "`--stage encode` is not built yet: it needs the device weight loader and a program store, \
-         and its two halves are the encoder's tile walk and the condition rows. `--stage weights` \
-         answers everything about the case that needs no device."
-            .to_owned(),
-    )
+    let store_root = args.store.clone().ok_or_else(|| {
+        "stage `encode` needs a program store: pass --store <path> or set UNISERVE_STORE".to_owned()
+    })?;
+    if !args
+        .image
+        .is_multiple_of(minimax_h3::video_vae::TILE_PIXELS)
+    {
+        return Err(format!(
+            "the condition image is {} px and the encoder's tile is {} px, so a raster that is not a \
+             whole number of tiles is not this stage's case",
+            args.image,
+            minimax_h3::video_vae::TILE_PIXELS
+        ));
+    }
+    if args.image != args.width.min(args.height) && args.image != args.width {
+        return Err(format!(
+            "a first-frame anchor is fitted to the generated canvas, and {} px is neither the \
+             canvas's {} px nor its short edge {}: the packing would refuse it",
+            args.image,
+            args.width,
+            args.width.min(args.height)
+        ));
+    }
+
+    // 1. The device and the kernels first: a driver that cannot give a device, or a store missing an
+    //    operator, fails before a byte of the checkpoint is read.
+    let device = platform::Device::new(platform::DeviceId(args.device as i32))
+        .map_err(|error| format!("device {}: {error}", args.device))?;
+    let _guard = device
+        .enter()
+        .map_err(|error| format!("entering device {}: {error}", args.device))?;
+    let stream = device.stream().map_err(show)?;
+    let generation = load_generation(&device, &store_root)?;
+
+    // 2. The deployment's own loading boundary, not a harness's. `load` refuses a name it cannot
+    //    build, attaches the condition encoders to the denoiser block, and converts nothing.
+    let checkpoint = Checkpoint::open(&args.root).map_err(show)?;
+    let config = Config::read(&args.root, None).map_err(show)?;
+    let partition = Partition::serving(&config, args.task, 1, 1, 0, 0).map_err(show)?;
+    let dit = config
+        .denoisers
+        .get(&Dit::Base)
+        .ok_or_else(|| "the checkpoint states no base DiT".to_owned())?
+        .clone();
+    let arrangement = partition.arrangement(&dit).map_err(show)?;
+    let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
+
+    // 3. The case: one first-frame anchor at the canvas, and a request the deployment lays out
+    //    with its own rule.
+    let condition = ConditionShape {
+        role: ConditionRole::FirstFrame,
+        frames: 1,
+        height: args.image,
+        width: args.image,
+        audio_samples: 0,
+    };
+    let request = VideoRequest {
+        task: args.task,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: 24,
+        first_frames: 1,
+        last_frames: 0,
+        references: 0,
+        text_tokens: args.text_tokens,
+        conditions: std::slice::from_ref(&condition),
+        vision_spans: &[],
+    };
+    let (layout, _packing) = layouts.layout(&request).map_err(show)?;
+
+    let mut weights = DeviceWeights::new(&device, 0)?;
+    let model = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
+        minimax_h3::load(&checkpoint, partition, &mut loader).map_err(show)?
+    };
+    let denoiser = std::sync::Arc::clone(
+        model
+            .transformer()
+            .ok_or_else(|| "the deployment placed no denoiser block".to_owned())?,
+    );
+    let dtype = denoiser_dtype(&denoiser);
+    let hidden = u64::from(dit.transformer.hidden_size);
+    let source_width = u64::from(config.text_encoder.hidden_size);
+    let rows = u64::from(layout.text_rows + layout.condition_rows + 1);
+    println!(
+        "loaded: {} is the deployment's element type, hidden {hidden}, text {} rows of capacity, \
+         conditions {} rows of capacity, prefix {rows} rows",
+        dtype, layout.text_rows, layout.condition_rows
+    );
+
+    // 4. The pieces, from the model: `rows` per piece is the packing's own number, and a harness
+    //    that derived it would be a second statement of the arithmetic `39a41fd55` was about.
+    let segments = denoiser.segments(&request).map_err(show)?;
+    let pieces: Vec<(u32, u32)> = segments
+        .iter()
+        .map(|segment| (segment.video_rows(), segment.audio_rows()))
+        .collect();
+    let mut piece_rows = 0_u32;
+    let mut starts = Vec::new();
+    for segment in &segments {
+        starts.push(piece_rows);
+        piece_rows += segment.video_rows() + segment.audio_rows();
+        println!(
+            "piece {} of condition {}: {:?}, {} visual rows, {} audio rows",
+            starts.len() - 1,
+            segment.condition,
+            segment.kind,
+            segment.video_rows(),
+            segment.audio_rows()
+        );
+    }
+    if pieces.len() != 1 {
+        return Err(format!(
+            "this stage's case is one image, and the model packed {} pieces for it",
+            pieces.len()
+        ));
+    }
+    if piece_rows as u64 > u64::from(layout.condition_rows) {
+        return Err(format!(
+            "the model packed {piece_rows} condition rows and the layout reserves {}",
+            layout.condition_rows
+        ));
+    }
+    let visual = segments[0]
+        .visual
+        .ok_or_else(|| "the one piece is not visual, so this case has no pixels".to_owned())?;
+
+    // 5. The buffers the runner owns: the prefix source, the text encoder's features, the piece's
+    //    pixels and its draw. The draws are FP32 like every condition view; the source is the
+    //    deployment's type, since the refiner reads and writes it.
+    let constant_specs = denoiser.constant_tables();
+    let state_specs = denoiser.state_tables(&layout);
+    let latent = Extent {
+        frames: visual.frames,
+        height: visual.raster.height,
+        width: visual.raster.width,
+    };
+    // The pixels' raster is the model's answer, not this harness's flags: a canvas the request's own
+    // rounding produced and one read back from the flags agree only where that rounding is the
+    // identity, which is most canvases and not all.
+    let canvas = layouts.canvas(&request).map_err(show)?;
+    let pixels = Extent {
+        frames: u32::from(visual.frames > 0),
+        height: canvas.height,
+        width: canvas.width,
+    };
+    let conditioning_bytes: u64 =
+        minimax_h3::encoding::conditioning_arena(&config.video_vae, pixels.frames, latent)
+            .map_err(show)?
+            .iter()
+            .map(|buffer| buffer.bytes())
+            .sum();
+    let encoder_bytes: u64 =
+        minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, pixels)
+            .map_err(show)?
+            .iter()
+            .map(|buffer| buffer.bytes())
+            .sum();
+    let text_elements = u64::from(layout.text_rows) * hidden;
+    let source_elements = u64::from(layout.text_rows) * source_width;
+    let prefix_elements = rows * hidden;
+    let pixel_elements = u64::from(config.video_vae.in_channels)
+        * u64::from(pixels.frames)
+        * u64::from(pixels.height)
+        * u64::from(pixels.width);
+    let draw_elements = u64::from(dit.transformer.video_channels)
+        * u64::from(latent.frames)
+        * u64::from(latent.height)
+        * u64::from(latent.width);
+    let tables = table_bytes(&constant_specs) + table_bytes(&state_specs);
+    // Every element this harness allocates for itself is four bytes except the two text buffers,
+    // which are the deployment's type: the draws and the pixels are FP32 by the contract.
+    let width = dtype.bytes().unwrap_or(4);
+    let needed = conditioning_bytes
+        + encoder_bytes
+        + tables
+        + (text_elements + source_elements + prefix_elements) * width
+        + (pixel_elements + draw_elements) * 4;
+    let arena_bytes = needed.max(args.arena_gib << 30);
+    let allocator = weights.allocator();
+    let reserve = usize::try_from(arena_bytes).unwrap_or(usize::MAX);
+    allocator
+        .reserve(platform::PoolKind::Graph, reserve)
+        .map_err(|error| format!("reserving {arena_bytes} B of workspace: {error}"))?;
+    let region = allocator
+        .allocate(platform::PoolKind::Graph, reserve)
+        .map_err(|error| format!("allocating {arena_bytes} B of workspace: {error}"))?;
+    let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
+    let forward = Forward::new(&stream, &generation, &arena);
+    println!(
+        "workspace: {:.2} GiB needed of {:.2} GiB reserved (conditioning {:.0} MiB, encoder tiles \
+         {:.0} MiB, tables {:.0} MiB)",
+        needed as f64 / f64::from(1 << 30),
+        arena_bytes as f64 / f64::from(1 << 30),
+        conditioning_bytes as f64 / f64::from(1 << 20),
+        encoder_bytes as f64 / f64::from(1 << 20),
+        tables as f64 / f64::from(1 << 20)
+    );
+
+    // 6. The walk starts at the constants: the denoiser's AdaLN cache is a set of launches, and a
+    //    walk that began at the conditioning would report a list missing them.
+    let mut walk = Walk(Vec::new());
+    ops::capture::set_sink(Some(&mut walk));
+    let _sink = SinkGuard;
+
+    let constant_views = allocate_tables(&arena, &constant_specs).map_err(show)?;
+    denoiser
+        .prepare_constants(&forward, &constant_views)
+        .map_err(show)?;
+
+    let mut state_host = host_tables(&state_specs).map_err(show)?;
+    denoiser
+        .prepare_state(&request, &layout, &mut state_host)
+        .map_err(show)?;
+    let state_views = allocate_tables(&arena, &state_specs).map_err(show)?;
+    for (view, bytes) in state_views.iter().zip(&state_host) {
+        upload_bytes(&stream, *view, bytes)?;
+    }
+
+    // 7. The runner's own buffers. The text region is a stated pattern rather than the text
+    //    encoder's output (stage 4 is that), and it is the *refiner's* input, so it is written in the
+    //    deployment's type; the source is the encoder's features, one block wide.
+    let text = arena
+        .tensor(dtype, Shape::new(&[u64::from(layout.text_rows), hidden]))
+        .map_err(show)?;
+    let source = arena
+        .tensor(
+            dtype,
+            Shape::new(&[u64::from(layout.text_rows), source_width]),
+        )
+        .map_err(show)?;
+    let prefix = arena
+        .tensor(dtype, Shape::new(&[rows, hidden]))
+        .map_err(show)?;
+    // The pixels are the *encoder's* input, `[channels, frames, height, width]`: the buffer is
+    // allocated in that order and filled in it, because a runner that filled the other order and
+    // transposed on the way in would be one stride away from a silently permuted image.
+    let channels = u64::from(config.video_vae.in_channels);
+    let image = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[
+                channels,
+                u64::from(pixels.frames),
+                u64::from(pixels.height),
+                u64::from(pixels.width),
+            ]),
+        )
+        .map_err(show)?;
+    let noise = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[
+                u64::from(dit.transformer.video_channels),
+                u64::from(latent.frames),
+                u64::from(latent.height),
+                u64::from(latent.width),
+            ]),
+        )
+        .map_err(show)?;
+    let text_bytes = pseudo_bytes(text_elements, dtype);
+    upload_bytes(&stream, text, &text_bytes)?;
+    upload_bytes(&stream, source, &pseudo_bytes(source_elements, dtype))?;
+    // The pixels are the encoder's input: `[frames, height, width, channels]`, normalised. A
+    // deterministic ramp stands in for an image and the case says so.
+    let mut pixels_host = Vec::with_capacity(pixel_elements as usize * 4);
+    for plane in 0..channels {
+        for element in 0..(pixel_elements / channels) {
+            let value = ((element + plane) % 255) as f32 / 255.0;
+            pixels_host.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    upload_bytes(&stream, image, &pixels_host)?;
+    // The anchoring draw sits at the offset the model gives the piece - not at zero by assumption:
+    // a condition is drawn before the video and audio latents, and an audio-only reference takes a
+    // zero-length entry at the cursor rather than no entry, so the index alignment survives.
+    let offsets = layouts.condition_offsets(&request).map_err(show)?;
+    let (start, elements) = offsets
+        .first()
+        .copied()
+        .ok_or_else(|| "the model gave no condition offset for a one-piece request".to_owned())?;
+    if elements != noise.shape.numel() {
+        return Err(format!(
+            "the piece's draw is {elements} elements and this harness allocated {}",
+            noise.shape.numel()
+        ));
+    }
+    let noise_layer = nn::Noise::new();
+    noise_layer
+        .draw(
+            &forward,
+            noise,
+            nn::NoiseKey::Scalar(args.seed),
+            0,
+            0,
+            start,
+        )
+        .map_err(show)?;
+
+    // 8. The served entry point, once per request, over the layout the deployment made.
+    let media = [MediaInput {
+        role: MediaRole::FirstFrame,
+        rows: pieces[0].0,
+        audio_rows: pieces[0].1,
+        pixels: Some(image),
+        audio: None,
+        noise: Some(noise),
+    }];
+    denoiser
+        .prepare_conditioning(
+            &forward,
+            Conditioning {
+                text,
+                source: Some(source),
+                media: &media,
+                images: None,
+                audio: None,
+                state: &state_views,
+                step: None,
+            },
+        )
+        .map_err(show)?;
+    stream.synchronize().map_err(show)?;
+
+    // 9. The readback: the prefix source, read at the rows the packing gathers each piece from.
+    //
+    // What this can and cannot say is the model's own claim. A piece whose pixels are black is a
+    // legal request with zero rows, so the verdict is **at least one piece non-zero** - the failure
+    // it catches is every piece zero, which is a condition the reader gathers nothing for
+    // (`39a41fd55`). The zero row is a different claim: no write may reach it, so a non-zero value
+    // there is a defect whatever the pieces hold.
+    let produced = download(&stream, prefix)?;
+    let values = to_f32(&produced, dtype);
+    let mut readback = String::new();
+    let mut non_zero = 0_usize;
+    for (index, segment) in segments.iter().enumerate() {
+        let first = u64::from(layout.text_rows) + u64::from(starts[index]);
+        let rows_here = u64::from(segment.video_rows() + segment.audio_rows());
+        let base = (first * hidden) as usize;
+        let count = (rows_here * hidden) as usize;
+        let piece = &values[base..base + count];
+        let mean = piece.iter().map(|value| value.abs()).sum::<f32>() / count.max(1) as f32;
+        if piece.iter().any(|value| *value != 0.0) {
+            non_zero += 1;
+        }
+        readback.push_str(&format!(
+            "piece {index} (condition {}): prefix rows [{first}, {}), {} visual rows and {} audio \
+             rows, mean |x| {mean:.6e}\n",
+            segment.condition,
+            first + rows_here,
+            segment.video_rows(),
+            segment.audio_rows()
+        ));
+    }
+    let zero_base = ((rows - 1) * hidden) as usize;
+    let zero_nonzero = values[zero_base..zero_base + hidden as usize]
+        .iter()
+        .filter(|value| **value != 0.0)
+        .count();
+    readback.push_str(&format!(
+        "zero row {}: {zero_nonzero} non-zero of {hidden}\n",
+        rows - 1
+    ));
+    let text_nonzero = values[..(u64::from(layout.text_rows) * hidden) as usize]
+        .iter()
+        .filter(|value| **value != 0.0)
+        .count();
+    readback.push_str(&format!(
+        "text region [0, {}): {text_nonzero} non-zero values\n",
+        layout.text_rows
+    ));
+    print!("{readback}");
+
+    // 10. The files. The container is FP32 with the deployment's type named in the case, so one
+    //     writer serves every deployment and the reader is told what the block computed in.
+    let directory = args.out.join("latent_encoder");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
+    let mut container = Vec::with_capacity(values.len() * 4);
+    for value in &values {
+        container.extend_from_slice(&value.to_le_bytes());
+    }
+    write_h3t(
+        &directory.join("condition_rows.h3t"),
+        H3T_F32,
+        &[rows, hidden],
+        &container,
+    )?;
+    std::fs::write(directory.join("readback.txt"), &readback)
+        .map_err(|error| format!("readback.txt: {error}"))?;
+    let case = format!(
+        "{{\n  \"stage\": \"encode\",\n  \"task\": \"{}\",\n  \"canvas\": [{}, {}],\n  \
+         \"frames\": {},\n  \"image\": {},\n  \"prompt_tokens\": {},\n  \"seed\": {},\n  \
+         \"dtype\": \"{}\",\n  \"text_rows\": {},\n  \"condition_rows\": {},\n  \
+         \"prefix_rows\": {},\n  \"hidden\": {},\n  \"pieces\": {},\n  \
+         \"piece_rows\": [{}, {}],\n  \"pixels\": \"deterministic ramp, stated\",\n  \
+         \"text\": \"deterministic pattern, stated (stage 4 owns the text encoder)\"\n}}\n",
+        task_name(args.task),
+        args.width,
+        args.height,
+        args.frames,
+        args.image,
+        args.text_tokens,
+        args.seed,
+        dtype,
+        layout.text_rows,
+        layout.condition_rows,
+        rows,
+        hidden,
+        segments.len(),
+        pieces[0].0,
+        pieces[0].1
+    );
+    std::fs::write(directory.join("case.json"), case)
+        .map_err(|error| format!("case.json: {error}"))?;
+    std::fs::write(directory.join("walk.txt"), walk.text())
+        .map_err(|error| format!("walk.txt: {error}"))?;
+    println!(
+        "wrote {}: {rows} x {hidden} {} as FP32, {} launches in the walk",
+        directory.join("condition_rows.h3t").display(),
+        dtype,
+        walk.distinct()
+    );
+
+    if zero_nonzero != 0 {
+        return Err(format!(
+            "the prefix's zero row ({}) holds {zero_nonzero} non-zero values: a write reached past \
+             the layout's condition capacity",
+            rows - 1
+        ));
+    }
+    if non_zero == 0 {
+        return Err(format!(
+            "every one of the {segments_len} pieces reads as zeros in the prefix: the reader gathers \
+             nothing where the encoder wrote, which is a dropped condition and not a tolerance",
+            segments_len = segments.len()
+        ));
+    }
+    Ok(())
 }
 
-/// One failure, as the harness's own layer turns a library error into text.
+/// The deployment's element type, as the loaded block reports it.
+fn denoiser_dtype(denoiser: &Denoiser) -> DType {
+    denoiser.dtype()
+}
+
+/// One `.h3t` file: the container's magic, one element-type byte, a rank byte, the extents as `u64`,
+/// then the payload.
+fn write_h3t(path: &Path, element: u8, extents: &[u64], payload: &[u8]) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(10 + extents.len() * 8 + payload.len());
+    bytes.extend_from_slice(b"H3D1");
+    bytes.push(element);
+    bytes.push(extents.len() as u8);
+    for extent in extents {
+        bytes.extend_from_slice(&extent.to_le_bytes());
+    }
+    bytes.extend_from_slice(payload);
+    std::fs::write(path, bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// A deterministic pattern of `elements` values in `dtype`, the same bytes on every host.
+fn pseudo_bytes(elements: u64, dtype: DType) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity((elements as usize) * dtype.bytes().unwrap_or(4) as usize);
+    for element in 0..elements {
+        let value = ((element % 97) as f32 + 1.0) / 97.0;
+        match dtype {
+            DType::BF16 => bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes()),
+            DType::F16 => bytes.extend_from_slice(&half_bits(value).to_le_bytes()),
+            _ => bytes.extend_from_slice(&value.to_le_bytes()),
+        }
+    }
+    bytes
+}
+
+/// The nearest float16 bit pattern of `value`, round to nearest even.
+fn half_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent <= 0 {
+        return sign;
+    }
+    if exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    let mut half = (exponent as u16) << 10 | (mantissa >> 13) as u16;
+    if mantissa & 0x1000 != 0 {
+        half += 1;
+    }
+    sign | half
+}
+
+/// The bytes a list of tables occupies, in each table's own element type.
+fn table_bytes(specs: &[nn::capability::StateTable]) -> u64 {
+    specs
+        .iter()
+        .map(|spec| spec.shape.numel() * spec.dtype.bytes().unwrap_or(1))
+        .sum()
+}
+
+/// Allocate one device tensor per table, in the table's own element type and extents.
+fn allocate_tables(
+    arena: &Arena,
+    specs: &[nn::capability::StateTable],
+) -> Result<Vec<TensorView>, String> {
+    specs
+        .iter()
+        .map(|spec| arena.tensor(spec.dtype, spec.shape).map_err(show))
+        .collect()
+}
+
+/// Zeroed host bytes for one table list, sized as the model declared each table.
+fn host_tables(specs: &[nn::capability::StateTable]) -> Result<Vec<Vec<u8>>, String> {
+    specs
+        .iter()
+        .map(|spec| {
+            let bytes = spec
+                .dtype
+                .bytes()
+                .ok_or_else(|| format!("table {} has no byte width", spec.name))?;
+            Ok(vec![
+                0_u8;
+                usize::try_from(spec.shape.numel() * bytes)
+                    .unwrap_or(usize::MAX)
+            ])
+        })
+        .collect()
+}
+
+/// Upload host bytes into a tensor already allocated for them.
+fn upload_bytes(stream: &platform::Stream, view: TensorView, bytes: &[u8]) -> Result<(), String> {
+    let width = view
+        .dtype
+        .bytes()
+        .ok_or_else(|| format!("a {} view has no byte width", view.dtype))?;
+    let expected = usize::try_from(view.shape.numel() * width).unwrap_or(usize::MAX);
+    if bytes.len() != expected {
+        return Err(format!(
+            "{} bytes for a {} view of {:?}, which holds {expected}",
+            bytes.len(),
+            view.dtype,
+            view.shape.dims()
+        ));
+    }
+    // SAFETY: `bytes` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            view.ptr.address(),
+            bytes.as_ptr() as u64,
+            bytes.len(),
+            stream,
+        )
+        .map_err(show)?;
+    }
+    stream.synchronize().map_err(show)?;
+    Ok(())
+}
+
+/// The whole of a tensor's device memory, as bytes.
+fn download(stream: &platform::Stream, view: TensorView) -> Result<Vec<u8>, String> {
+    let width = view
+        .dtype
+        .bytes()
+        .ok_or_else(|| format!("a {} view has no byte width", view.dtype))?;
+    let count = usize::try_from(view.shape.numel() * width)
+        .map_err(|_| format!("{:?} is not a host allocation", view.shape.dims()))?;
+    let mut bytes = vec![0_u8; count];
+    // SAFETY: `bytes` is written by the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(bytes.as_mut_ptr() as u64, view.ptr.address(), count, stream)
+            .map_err(show)?;
+    }
+    stream.synchronize().map_err(show)?;
+    Ok(bytes)
+}
+
+/// The values of a buffer of `dtype` as FP32, so one container serves every deployment type.
+fn to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
+    match dtype {
+        DType::BF16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
+            .collect(),
+        DType::F16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let bits = u16::from_le_bytes([pair[0], pair[1]]);
+                let sign = if bits & 0x8000 != 0 { -1.0_f32 } else { 1.0 };
+                let exponent = ((bits >> 10) & 0x1f) as i32;
+                let mantissa = (bits & 0x3ff) as f32;
+                if exponent == 0 {
+                    sign * mantissa * 2.0_f32.powi(-24)
+                } else if exponent == 0x1f {
+                    sign * f32::INFINITY
+                } else {
+                    sign * (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent - 15)
+                }
+            })
+            .collect(),
+        _ => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect(),
+    }
+}
+
+/// Every committed module of every operator the store holds, as one generation.
+///
+/// The store is read, never written, and no descriptor is named here: a launch that finds no module
+/// says which descriptor it needed, which is the fact a missing cell is fixed from.
+fn load_generation(device: &platform::Device, root: &Path) -> Result<ops::Generation, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "the store root {} is not a directory: nothing is installed there, so no stage past              `weights` can launch",
+            root.display()
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut installed = 0_usize;
+    let mut operators: Vec<String> = std::fs::read_dir(root)
+        .map_err(|error| format!("{}: {error}", root.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    operators.sort();
+    for operator in &operators {
+        for (descriptor, directory) in committed(&root.join(operator)) {
+            entries.push(install(device, operator, &descriptor, &directory)?);
+            installed += 1;
+        }
+    }
+    println!(
+        "store: {installed} committed modules of {} operators",
+        operators.len()
+    );
+    Ok(ops::Generation::new(1, entries))
+}
+
+/// The committed descriptor directories under one operator's root, sorted for a stable order.
+fn committed(op_root: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    for backend in std::fs::read_dir(op_root).into_iter().flatten().flatten() {
+        for revision in std::fs::read_dir(backend.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for target in std::fs::read_dir(revision.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                for descriptor in std::fs::read_dir(target.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    if descriptor.path().join(".committed").is_file() {
+                        found.push((
+                            descriptor.file_name().to_string_lossy().into_owned(),
+                            descriptor.path(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    found.sort_by(|left, right| left.0.cmp(&right.0));
+    found
+}
+
+/// Load one committed module as an `ops` kernel entry.
+fn install(
+    device: &platform::Device,
+    operator: &str,
+    descriptor: &str,
+    directory: &Path,
+) -> Result<ops::KernelEntry, String> {
+    let metadata_path = directory.join("metadata.json");
+    let metadata = std::fs::read(&metadata_path).ok();
+    let launch = std::fs::read_to_string(directory.join("launch.json")).unwrap_or_default();
+    let entry = metadata
+        .as_deref()
+        .and_then(|bytes| json_field(&String::from_utf8_lossy(bytes), "name"))
+        .or_else(|| json_field(&launch, "name"))
+        .unwrap_or_else(|| format!("uniserve_{operator}"));
+    let cubin = directory.join("module.cubin");
+    if cubin.is_file() {
+        let image = std::fs::read(&cubin)
+            .map_err(|error| format!("reading {}: {error}", cubin.display()))?;
+        let kernel = ops::install::install(
+            device,
+            operator,
+            descriptor,
+            ops::install::Module::Cubin {
+                image: &image,
+                metadata: metadata.as_deref(),
+                entry: &entry,
+            },
+        )
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
+        return kernel.ok_or_else(|| {
+            format!(
+                "{}: this build of `ops` has no operator `{operator}`",
+                directory.display()
+            )
+        });
+    }
+    let library = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|file| file.path())
+        .find(|path| path.extension().is_some_and(|kind| kind == "so"))
+        .ok_or_else(|| {
+            format!(
+                "{}: neither module.cubin nor a shared object",
+                directory.display()
+            )
+        })?;
+    let installed = ops::install::install(
+        device,
+        operator,
+        descriptor,
+        ops::install::Module::Native {
+            path: &library,
+            entry: &entry,
+        },
+    )
+    .map_err(|error| format!("{}: {error}", directory.display()))?;
+    installed.ok_or_else(|| {
+        format!(
+            "{}: this build of `ops` has no operator `{operator}`",
+            directory.display()
+        )
+    })
+}
+
+/// One string field of a JSON document, without a parser: the store's files are flat.
+fn json_field(text: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let at = text.find(&needle)? + needle.len();
+    let rest = text[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_owned())
+}
+
+/// One launch of the walk: the operator and the descriptor key it bound.
+struct Walk(Vec<(&'static str, String)>);
+
+impl ops::capture::Sink for Walk {
+    fn launched(&mut self, operator: &'static str, key: &str) {
+        self.0.push((operator, key.to_owned()));
+    }
+}
+
+impl Walk {
+    /// The walk as the store's key list is written: one `operator<TAB>key` per launch, in order.
+    fn text(&self) -> String {
+        let mut text = String::new();
+        for (operator, key) in &self.0 {
+            text.push_str(operator);
+            text.push('\t');
+            text.push_str(key);
+            text.push('\n');
+        }
+        text
+    }
+
+    /// How many distinct programs the walk bound.
+    fn distinct(&self) -> usize {
+        let mut keys: Vec<(&str, &str)> = self
+            .0
+            .iter()
+            .map(|(operator, key)| (*operator, key.as_str()))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.len()
+    }
+}
+
+/// Removes the capture sink when it leaves scope, so a failing launch cannot leave one installed.
+struct SinkGuard;
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        ops::capture::set_sink(None);
+    }
+}
+
+/// Device storage for weights: a resident pool, one buffer per tensor, every publish waited on.
+struct DeviceWeights {
+    pools: platform::Allocator,
+    buffers: Vec<platform::Buffer>,
+    bytes: u64,
+}
+
+impl DeviceWeights {
+    fn new(device: &platform::Device, requested: u64) -> Result<Self, String> {
+        let budget = std::sync::Arc::new(NoLimit);
+        let mut pools = platform::Allocator::new(device, budget).map_err(show)?;
+        let mut wanted = requested.max(8 << 30);
+        let mut reserved = None;
+        while wanted >= (1 << 30) {
+            if pools
+                .reserve(
+                    platform::PoolKind::Resident,
+                    usize::try_from(wanted).unwrap_or(usize::MAX),
+                )
+                .is_ok()
+            {
+                reserved = Some(wanted);
+                break;
+            }
+            wanted /= 2;
+        }
+        let reserved = reserved.ok_or_else(|| {
+            "the driver refused every resident reservation down to 1 GiB: the deployment's weights \
+             cannot be held on this device"
+                .to_owned()
+        })?;
+        println!("resident pool: {} GiB reserved", reserved >> 30);
+        Ok(Self {
+            pools,
+            buffers: Vec::new(),
+            bytes: 0,
+        })
+    }
+
+    fn allocator(&mut self) -> &mut platform::Allocator {
+        &mut self.pools
+    }
+}
+
+/// The budget a harness with one model on one device needs: the driver's own limit is the only one.
+struct NoLimit;
+
+impl platform::Budget for NoLimit {
+    fn book(
+        &self,
+        _device: platform::DeviceId,
+        _pool: platform::PoolKind,
+        _bytes: u64,
+    ) -> platform::Result<()> {
+        Ok(())
+    }
+}
+
+impl RetainedWeights for DeviceWeights {
+    fn retained(&mut self, _key: &WeightKey) -> nn::Result<Option<Backing>> {
+        Ok(None)
+    }
+
+    fn publish(
+        &mut self,
+        _key: &WeightKey,
+        dtype: DType,
+        shape: Shape,
+        bytes: &[u8],
+    ) -> nn::Result<Backing> {
+        let buffer = self
+            .pools
+            .allocate(platform::PoolKind::Resident, bytes.len())?;
+        // The publish is synchronous with respect to the host: the copy is issued on the device's
+        // default stream and waited on before the backing is handed out, because the loader keeps no
+        // stream and a later launch may use another one.
+        let stream = platform::Stream::new(buffer.device())?;
+        // SAFETY: `bytes` outlives the copy, which completes before the wait below.
+        unsafe {
+            platform::memcpy_async(
+                buffer.address(),
+                bytes.as_ptr() as u64,
+                bytes.len(),
+                &stream,
+            )?;
+        }
+        stream.synchronize()?;
+        let backing = Backing::new(DevicePtr::new(buffer.address()), bytes.len() as u64);
+        backing.view(dtype, shape)?;
+        self.bytes += bytes.len() as u64;
+        self.buffers.push(buffer);
+        Ok(backing)
+    }
+}
+
 fn show<E: std::fmt::Display>(error: E) -> String {
     error.to_string()
 }
