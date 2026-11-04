@@ -30,6 +30,6 @@ architectures = ["sm_100a", "sm_100f", "sm_90a"]
 
 # `input_bf16_columns_2048_layout_linear_block_256_pdl_true`.
 [kernel.descriptors]
-dimensions = { input = ["bf16", "f16"], columns = ["2048", "4096", "8192", "32768"], layout = ["linear"], block = ["256", "512", "1024", "2048", "4096"], pdl = ["true", "false"] }
+dimensions = { input = ["bf16", "f16"], columns = ["2048", "4096", "8192", "32768"], layout = ["linear", "swizzled_128x4"], block = ["256", "512", "1024", "2048", "4096"], pdl = ["true", "false"] }
 
 [parameters]
