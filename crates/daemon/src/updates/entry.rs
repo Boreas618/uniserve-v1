@@ -348,18 +348,18 @@ impl Leader {
         let current = locked(&replicas[0].config).clone();
         let (target, stated, _update) = resolve(&current, &request)?;
         // A change of what the main processes build is the epoch layer's
-        // (§7.4): one switch for the deployment, before any worlds work. The
-        // program layer's and the host layer's paths stay below until their
-        // own switches replace them.
+        // (§7.4): one switch for the deployment, decided before either of the
+        // other two layers looks at the change.
         if let Some(applied) = self.apply_epoch(&current, &target, request.dry_run)? {
             return Ok(applied);
         }
         // The program layer (§7.2): only what the serving epoch's processes
         // execute differs, and the programs are prepared against every host's
         // Program Server before the processes switch to them. A program-layer
-        // update is named by the epoch it executes in; `route` answers `None`
-        // when the programs a configuration selects do not differ, and the
-        // world path below decides the rest.
+        // update is named by the epoch it executes in; the program layer
+        // answers `None` when the programs a configuration selects do not
+        // differ, and what remains is the daemon's own options and the
+        // scheduling limits.
         let epoch = self
             .updates
             .epochs()
@@ -738,6 +738,15 @@ impl Replica {
                     target_spec.model
                 )));
             }
+        }
+        // A dry run answers what the change would do and changes nothing: no
+        // handover, no engine command, no configuration written back.
+        if request.dry_run {
+            return Ok(Applied::Planned(serde_json::json!({
+                "daemon": daemon_changes,
+                "scheduling": in_place,
+                "fence_probes": switches_probes_only(&served, &target_spec),
+            })));
         }
         // The daemon orchestrates what changes in its own options: a hot
         // restart applies them first, and its successor applies the change
