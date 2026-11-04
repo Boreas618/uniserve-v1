@@ -798,4 +798,61 @@ mod tests {
             }
         );
     }
+
+    /// A step allocates nothing: the arena is a cursor over the range the pool reserved for the
+    /// stream, so a bucket's forward lands on the same addresses on every replay, the plan it
+    /// records is the extent it reached, and a reservation past the range is refused with the
+    /// figures instead of growing the range.
+    ///
+    /// The reservations are the shape of one causal-language step over a bucket of eight rows:
+    /// the hidden states, the K/V the stack writes, and one logit row per sampling row. Their
+    /// order is the forward's, which is what makes the addresses repeat.
+    #[test]
+    fn a_buckets_plan_repeats_its_addresses_and_an_oversized_reservation_is_refused() {
+        const RESERVED: u64 = 1 << 20;
+        let base = ops::DevicePtr::new(0x1000_0000);
+        let arena = nn::Arena::new(base, RESERVED);
+
+        let walk = || -> Vec<u64> {
+            let mut addresses = Vec::new();
+            for (dtype, numel) in [
+                (ops::DType::F32, 8 * 4_096),
+                (ops::DType::BF16, 8 * 4_096),
+                (ops::DType::F32, 8 * 1_024),
+            ] {
+                let view = arena
+                    .tensor(dtype, ops::Shape::new(&[numel]))
+                    .expect("the step fits the reserved range");
+                addresses.push(view.ptr.address());
+            }
+            addresses
+        };
+
+        let first = walk();
+        let extent = arena.used();
+        assert!(extent <= RESERVED, "a step cannot exceed the pool's range");
+        assert_eq!(
+            super::Plan { bytes: extent }.bytes(),
+            extent,
+            "the plan the pool records is the extent the arena reached"
+        );
+
+        // The next replay starts from the region's first address, not from where the last ended.
+        arena.reset();
+        assert_eq!(arena.used(), 0);
+        let second = walk();
+        assert_eq!(
+            first, second,
+            "a replay of one bucket must address the same bytes"
+        );
+        assert_eq!(extent, arena.used(), "and reach exactly as far");
+
+        // The same sequence over a range that does not hold it is refused, naming the figures.
+        arena.reset();
+        let error = arena
+            .reserve(RESERVED + 1)
+            .expect_err("a reservation past the range has nowhere to go");
+        let message = error.to_string();
+        assert!(message.contains(&format!("{RESERVED}")), "{message}");
+    }
 }
