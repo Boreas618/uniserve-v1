@@ -25,9 +25,6 @@
 //! type definitions first; the switch here is driven by it once that entry
 //! moves.
 
-use crate::leader::UpdateError;
-use crate::options::ServeConfig;
-
 pub(crate) mod change;
 pub(crate) mod driver;
 pub(crate) mod epoch;
