@@ -26,6 +26,7 @@
 //! frame is entirely the predecessor's and the fifth one fifth the successor's.
 
 use nn::Shape;
+use nn::capability::StateTable;
 use nn::layers::{RgbBytes, ScaledAdd};
 use nn::{DType, Forward, TensorView, Weight};
 
@@ -338,6 +339,35 @@ impl VideoPostprocessor {
 }
 
 impl nn::capability::Decoder for VideoPostprocessor {
+    /// No tables: the splice's parameters are its arguments, not state.
+    ///
+    /// The preprocessor holds two `[3]` constants the load reads once, and every other number a splice
+    /// needs - which frames it keeps, how many fade, where on the timeline it writes - arrives as the
+    /// [`nn::capability::Splice`] the runner passes. So an empty list is the *correct* answer for this
+    /// block, not a refusal, and a runner that asks must get it.
+    fn layout_tables(&self, _layout: &nn::capability::Layout) -> Vec<StateTable> {
+        Vec::new()
+    }
+
+    /// Nothing to prepare, for the reason above: `layout_tables` answers no tables, so there are no
+    /// bytes to write and `out` must already be empty.
+    fn prepare_layout(
+        &self,
+        _layout: &nn::capability::Layout,
+        out: &mut [Vec<u8>],
+    ) -> nn::Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        Err(nn::Error::Shape {
+            owner: "VideoPostprocessor",
+            problem: format!(
+                "a postprocessor has no layout tables, and {} buffers were offered",
+                out.len()
+            ),
+        })
+    }
+
     /// Refuse: the postprocessor has no latents to decode.
     ///
     /// It is a named block of the decoder kind because the splice is a decode of the *timeline*, not of one
