@@ -17,7 +17,11 @@
 //! rounded through `compute_dtype`, which is the rounding the source's own writes had; a dense source
 //! is taken as it is. The second writes each layer's rows into its destination unit, grows the unit's
 //! FP8 scale when the new rows need a larger one, rescales the unit's resident values, and raises the
-//! column's initialized flag.
+//! column's initialized flag. It runs **one program per (column, unit slot)**, and that program owns
+//! the written span of its cell: the scale grows once from one amax over the span
+//! (`max(scale, max(abs(span), 1e-12) / 448)`, `uniserve/prefix_cache/mha.py:257-304`) and the
+//! resident values are rescaled by `old/new` before the write. A program per token would compute a
+//! partial amax each and race several scales into one cell.
 //!
 //! ## The scratch layout
 //!
@@ -483,14 +487,30 @@ impl Op for CacheCopyRegion {
             .view(args.source)
             .view(args.units)
             .u64(args.offset)
-            .u64(args.count);
-        // One program per (column, unit slot, token): it writes that column's row of one unit and
-        // raises that cell's initialized flag.
+            .u64(args.count)
+            // The field's units *per column*. `values` and `initialized` are addressed as
+            // `[column, unit, …]` and the unit ids arrive per page, so a program needs the pool's own
+            // shape to turn (column, unit) into an offset; the views do not carry extents into the
+            // kernel.
+            .u32(u32::try_from(args.values.shape.dim(1)).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the field's {} units per column do not fit a kernel parameter",
+                        args.values.shape.dim(1)
+                    ),
+                )
+            })?);
+        // One program per (column, unit slot): it owns the whole written span of that cell, so the
+        // FP8 path's amax is one reduction over the span rather than one per token - the reference
+        // takes `max(scale, max(abs(span), 1e-12) / 448)` once and rescales the unit's resident
+        // values by `old/new` before writing (`uniserve/prefix_cache/mha.py:257-304`). A program per
+        // token would give every token its own partial amax and race several scales into one cell.
         kernel.launch(
             LaunchGrid::new([
                 u64::from(descriptor.columns),
                 u64::from(descriptor.units_per_page),
-                args.count,
+                1,
             ])?,
             &mut arguments,
             stream,

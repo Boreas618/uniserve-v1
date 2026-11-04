@@ -8,7 +8,7 @@
 #![cfg(test)]
 use std::path::Path;
 
-use nn::weights::{RetainedWeights, WeightRequest};
+use nn::weights::{Nvfp4Names, RetainedWeights, WeightRequest};
 use nn::{Checkpoint, DType, DevicePtr, Shape, WeightKey, WeightLayout, WeightLoader};
 
 /// The bytes of `values` as BF16.
@@ -452,6 +452,8 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
         .nvfp4(
             &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            None,
+            Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Linear,
             0.25,
         )
@@ -497,6 +499,8 @@ fn the_block_scales_must_have_the_layout_s_shape() {
         .nvfp4(
             &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            None,
+            Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Swizzled128X4,
             0.25,
         )
@@ -556,7 +560,9 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 "experts",
                 &["up", "gate"],
                 2,
+                Nvfp4Names::vllm(),
                 ops::fp4::ScaleLayout::Linear,
+                false,
             )
             .unwrap()
     };
@@ -597,7 +603,9 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 "experts",
                 &["up", "gate"],
                 2,
+                Nvfp4Names::vllm(),
                 ops::fp4::ScaleLayout::Linear,
+                false,
             )
             .unwrap()
     };
@@ -657,7 +665,9 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
             "experts",
             &["up"],
             2,
+            Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Linear,
+            false,
         )
         .expect_err("two experts of different shapes are not one stack");
     assert!(
@@ -1013,7 +1023,9 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
             "experts",
             &["up", "gate"],
             2,
+            Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Linear,
+            false,
         )
         .unwrap();
     assert_eq!(
@@ -1024,4 +1036,175 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
     assert_eq!(stack.values.dtype(), DType::U8);
     assert_eq!(stack.scales.shape().dims(), &[2, 4, 4]);
     assert_eq!(stack.global_scale.shape().dims(), &[2, 2]);
+}
+
+/// A calibrated projection is read in the spelling its export wrote: the same numbers are `weight`
+/// and `weight_scale_2` in one toolchain's checkpoint and `weight_packed` and `weight_tensor_scale`
+/// in another's, so the vocabulary is the loading boundary's statement about its own checkpoint.
+#[test]
+fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
+    shard_typed(
+        directory,
+        "model.safetensors",
+        &[
+            ("p.up_proj.weight", DType::U8, vec![4, 32], values),
+            ("p.up_proj.weight_scale", DType::U8, vec![4, 4], scales),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+
+    // vLLM's spelling: the packed values are `weight` and the block scales `weight_scale`.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        let quantized = loader
+            .nvfp4(
+                &WeightRequest::region("p.up_proj.weight", 0, Shape::new(&[4, 32])),
+                &WeightRequest::region("p.up_proj.weight_scale", 0, Shape::new(&[4, 4])),
+                None,
+                Nvfp4Names::vllm(),
+                ops::fp4::ScaleLayout::Linear,
+                0.25,
+            )
+            .unwrap();
+        assert_eq!(quantized.packed.dtype(), DType::U8);
+    }
+
+    // The same checkpoint read as the other export's spelling: the name it asks for is the one it
+    // says it expected, so a wrong vocabulary is a loading-boundary error and not a silent zero.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        let error = loader
+            .nvfp4(
+                &WeightRequest::region("p.up_proj.weight_packed", 0, Shape::new(&[4, 32])),
+                &WeightRequest::region("p.up_proj.weight_scale", 0, Shape::new(&[4, 4])),
+                None,
+                Nvfp4Names::diffusers(),
+                ops::fp4::ScaleLayout::Linear,
+                0.25,
+            )
+            .expect_err("a checkpoint in the other export's spelling");
+        let text = format!("{error}");
+        assert!(text.contains("weight_packed"), "{text}");
+        assert!(text.contains("diffusers ModelOpt"), "{text}");
+    }
+}
+
+/// A stack names its fields with the export's own suffixes: the same experts read as one stack in
+/// each spelling, and the vocabulary is not a property of the layout the scales arrive in.
+#[test]
+fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let values: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..32).map(|byte| 0x30 + byte).collect();
+    let tensor_scale: Vec<u8> = 1.0_f32.to_le_bytes().to_vec();
+    let mut tensors: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
+    for expert in 0..2 {
+        for (field, dtype, shape, bytes) in [
+            ("weight_packed", DType::U8, vec![4, 32], values.clone()),
+            ("weight_scale", DType::U8, vec![4, 4], scales.clone()),
+            (
+                "weight_tensor_scale",
+                DType::F32,
+                vec![1],
+                tensor_scale.clone(),
+            ),
+        ] {
+            tensors.push((
+                format!("experts.{expert}.up_proj.{field}"),
+                dtype,
+                shape,
+                bytes,
+            ));
+        }
+    }
+    let borrowed: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(directory, "model.safetensors", &borrowed);
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+
+    let stack = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up",
+            "experts",
+            &["up"],
+            2,
+            Nvfp4Names::diffusers(),
+            ops::fp4::ScaleLayout::Linear,
+            false,
+        )
+        .expect("an export that states weight_packed and weight_tensor_scale loads as such");
+    assert_eq!(stack.values.shape().dims(), &[2, 4, 32]);
+    assert_eq!(stack.global_scale.shape().dims(), &[2, 1]);
+
+    // Read as the other spelling the stack asks for names this checkpoint does not have, and the
+    // refusal names the field and the export it expected.
+    let other = {
+        let mut store = Recording::default();
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up",
+                "experts",
+                &["up"],
+                2,
+                Nvfp4Names::vllm(),
+                ops::fp4::ScaleLayout::Linear,
+                false,
+            )
+            .expect_err("a diffusers checkpoint read as vLLM's spelling")
+    };
+    let text = format!("{other}");
+    assert!(text.contains("experts.0.up_proj.weight"), "{text}");
+    assert!(text.contains("vLLM ModelOpt"), "{text}");
+}
+
+/// A host store answers the weights a model needs with no device, so a loading audit — which
+/// programs a request space names, which keys the layers build — costs no GPU time.
+#[test]
+fn a_host_store_retains_weights_and_answers_the_first_region() {
+    let mut store = nn::HostStore::new();
+    assert!(store.is_empty());
+    let key = |tensor: &str| WeightKey {
+        files: Vec::new(),
+        dtype: DType::BF16,
+        layout: WeightLayout::ROW_MAJOR,
+        region: nn::weights::WeightRegion {
+            tensors: vec![tensor.to_owned()],
+            start: 0,
+            shape: Shape::new(&[4, 32]),
+            stride: None,
+        },
+    };
+    let bytes: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
+    let first = store
+        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
+        .expect("a host store publishes");
+    assert_eq!(first.bytes(), 256);
+    // A view carved from it names the bytes the store kept.
+    let view = nn::TensorView::new(first.address(), DType::BF16, Shape::new(&[4, 32]));
+    assert_eq!(view.rows(), 4);
+    // The same key again answers the first region rather than a second buffer.
+    let again = store
+        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
+        .expect("a repeated publish answers the first region");
+    assert_eq!(again.address(), first.address());
+    assert_eq!(store.len(), 1);
+    assert_eq!(
+        store
+            .retained(&key("w"))
+            .unwrap()
+            .map(|held| held.address()),
+        Some(first.address())
+    );
+    assert!(store.retained(&key("other")).unwrap().is_none());
 }

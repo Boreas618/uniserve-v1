@@ -22,6 +22,7 @@
 //! program selects the transport. A `Moe` layer built for a placement that does not hold every
 //! expert refuses the forward rather than computing a routing the weights do not have.
 
+use ops::fp4::ScaleLayout;
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
 use ops::moe::grouped::{
@@ -39,6 +40,15 @@ use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::Linear;
 use crate::weights::{QuantizedStack, Weight};
+
+/// Scratch the encoded expert products are handed.
+///
+/// The size the trtllm-gen batched-GEMM tactic actually needs is the artifact's, so this is a *floor*
+/// rather than a promise: the entry computes its own requirement from the call and allocates a larger
+/// buffer when this one is short, which costs one allocation instead of a wrong result. Sizing it for
+/// the largest Qwen3-MoE case we serve (128 experts, 8 routes, 7168 hidden) keeps the launch path
+/// allocation-free, which is what a captured graph needs.
+const MOE_WORKSPACE_BYTES: u64 = 16 << 20;
 
 /// The tile geometry the grouped products' packages are compiled for.
 ///
@@ -459,13 +469,7 @@ impl Moe {
         let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
         let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
         self.router.forward(f, hidden, scores)?;
-        let routing = TopkDescriptor {
-            scores: scores.dtype,
-            experts: self.experts,
-            top: self.top,
-            renormalize: self.renormalize,
-            scale: self.scale.as_ref().map(Weight::dtype),
-        };
+        let routing = self.topk_descriptor(scores.dtype);
         let args = TopkArgs {
             scores,
             scale: self.scale.as_ref().map(Weight::view),
@@ -479,10 +483,7 @@ impl Moe {
         let local_ids = match &self.map {
             Some(map) => {
                 let mapped = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-                let descriptor = GatherDescriptor {
-                    experts: self.experts,
-                    top: self.top,
-                };
+                let descriptor = self.map_descriptor();
                 let args = GatherArgs {
                     ids,
                     map: map.view(),
@@ -504,13 +505,7 @@ impl Moe {
         let permuted_to_expanded = arena.tensor(DType::I32, Shape::new(&[rows]))?;
         let total_padded_tokens = arena.tensor(DType::I32, Shape::new(&[1]))?;
         let num_non_exiting_tiles = arena.tensor(DType::I32, Shape::new(&[1]))?;
-        let sort = sort::Descriptor {
-            experts: self.experts,
-            top: self.top,
-            local_experts: self.experts,
-            tile_tokens: self.tile,
-            scales: DType::F32,
-        };
+        let sort = self.sort_descriptor(self.experts);
         let args = SortArgs {
             ids: local_ids,
             scales: weights,
@@ -578,16 +573,7 @@ impl Moe {
 
         // 4. FC1: the gated product of each permuted row, then FC2.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
-        let first = GatherGemmDescriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            activation: self.activation,
-            dtype: hidden.dtype,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        };
+        let first = self.gather_descriptor(hidden.dtype);
         let args = GatherGemmArgs {
             hidden,
             weights: up_gate.view(),
@@ -602,15 +588,7 @@ impl Moe {
         f.operate::<GatherGemm>(&first, args)?;
 
         let products = arena.tensor(hidden.dtype, Shape::new(&[tokens * top, hidden_width]))?;
-        let second = RouteGemmDescriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            dtype: hidden.dtype,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        };
+        let second = self.route_descriptor(hidden.dtype);
         let args = RouteGemmArgs {
             rows: gated,
             weights: down.view(),
@@ -625,14 +603,7 @@ impl Moe {
         f.operate::<RouteGemm>(&second, args)?;
 
         // 5. Sum the routes back in FP32 and round once to the hidden dtype.
-        let combine = combine::Descriptor {
-            hidden: self.hidden,
-            top: self.top,
-            experts: self.experts,
-            input: products.dtype,
-            scales: DType::F32,
-            output: out.dtype,
-        };
+        let combine = self.combine_descriptor(products.dtype, out.dtype);
         let args = UnpermuteArgs {
             routes: products,
             expanded_to_permuted: routes.expanded_to_permuted,
@@ -641,6 +612,123 @@ impl Moe {
         };
 
         f.operate::<MoeUnpermute>(&combine, args)
+    }
+
+    /// The routing descriptor: the experts' softmax, the top-k, and whether the kept weights are
+    /// renormalized. The scale's type is the model's — a calibrated router carries one.
+    pub fn topk_descriptor(&self, scores: DType) -> TopkDescriptor {
+        TopkDescriptor {
+            scores,
+            experts: self.experts,
+            top: self.top,
+            renormalize: self.renormalize,
+            scale: self.scale.as_ref().map(Weight::dtype),
+        }
+    }
+
+    /// The descriptor that turns logical expert ids into this rank's weight rows. It is launched
+    /// only when the rank holds a subset of the experts.
+    pub fn map_descriptor(&self) -> GatherDescriptor {
+        GatherDescriptor {
+            experts: self.experts,
+            top: self.top,
+        }
+    }
+
+    /// The sort's descriptor, for a block whose rank holds `local_experts` experts.
+    ///
+    /// `local_experts` is an argument and not the layer's field because the same layer sorts for
+    /// the dense block (every expert) and for an expert-parallel rank (its own), and the two are
+    /// different programs.
+    pub fn sort_descriptor(&self, local_experts: u32) -> sort::Descriptor {
+        sort::Descriptor {
+            experts: self.experts,
+            top: self.top,
+            local_experts,
+            tile_tokens: self.tile,
+            scales: DType::F32,
+        }
+    }
+
+    /// The first product's descriptor: the gated FC1 over the dense packed stack.
+    pub fn gather_descriptor(&self, hidden: DType) -> GatherGemmDescriptor {
+        GatherGemmDescriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            activation: self.activation,
+            dtype: hidden,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
+
+    /// The second product's descriptor: FC2 over the dense packed stack.
+    pub fn route_descriptor(&self, hidden: DType) -> RouteGemmDescriptor {
+        RouteGemmDescriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            dtype: hidden,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
+
+    /// The first product's descriptor over an encoded stack: the block scale's element type and the
+    /// scale layout are the weights', so they are arguments.
+    pub fn gather_nvfp4_descriptor(
+        &self,
+        hidden: DType,
+        scale: DType,
+        layout: ScaleLayout,
+    ) -> GatherGemmNvfp4Descriptor {
+        GatherGemmNvfp4Descriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            activation: self.activation,
+            dtype: hidden,
+            scale,
+            layout,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
+
+    /// The second product's descriptor over an encoded stack.
+    pub fn route_nvfp4_descriptor(
+        &self,
+        hidden: DType,
+        scale: DType,
+        layout: ScaleLayout,
+    ) -> RouteGemmNvfp4Descriptor {
+        RouteGemmNvfp4Descriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            dtype: hidden,
+            scale,
+            layout,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
+
+    /// The combine's descriptor: the routes summed in FP32 and rounded once to `output`.
+    pub fn combine_descriptor(&self, product: DType, output: DType) -> combine::Descriptor {
+        combine::Descriptor {
+            hidden: self.hidden,
+            top: self.top,
+            experts: self.experts,
+            input: product,
+            scales: DType::F32,
+            output,
+        }
     }
 
     /// `out = Σ_routes weight · expert(hidden)` over packed experts.
@@ -662,20 +750,17 @@ impl Moe {
         // 1-3. The same prefix the dense block runs.
         let routes = self.route(f, hidden)?;
 
+        // The two encoded products take scratch the program uses for its own bookkeeping. The size is
+        // the artifact's, not ours: both keys are trtllm-gen modules, and their entry computes what its
+        // tactic needs and grows this buffer itself when it is short. What a caller buys by sizing it
+        // is that no launch allocates. One buffer serves both products because they run one after the
+        // other on this stream and neither keeps a view past its launch.
+        let workspace = arena.tensor(DType::U8, Shape::new(&[MOE_WORKSPACE_BYTES]))?;
+
         // 4. FC1 over the packed up/gate stack: the gated product of each permuted row.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
-        let first = GatherGemmNvfp4Descriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            activation: self.activation,
-            dtype: hidden.dtype,
-            scale: up_gate.scales.dtype(),
-            layout: up_gate.layout,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        };
+        let first =
+            self.gather_nvfp4_descriptor(hidden.dtype, up_gate.scales.dtype(), up_gate.layout);
         let args = GatherGemmNvfp4Args {
             hidden,
             weights: up_gate.values.view(),
@@ -687,23 +772,14 @@ impl Moe {
             permuted_to_expanded: routes.permuted_to_expanded,
             num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: gated,
+            workspace,
         };
 
         f.operate::<GatherGemmNvfp4>(&first, args)?;
 
         // 5. FC2 over the packed down stack: one hidden row per route.
         let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
-        let second = RouteGemmNvfp4Descriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            dtype: hidden.dtype,
-            scale: down.scales.dtype(),
-            layout: down.layout,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        };
+        let second = self.route_nvfp4_descriptor(hidden.dtype, down.scales.dtype(), down.layout);
         let args = RouteGemmNvfp4Args {
             hidden: gated,
             weights: down.values.view(),
@@ -715,19 +791,13 @@ impl Moe {
             permuted_to_expanded: routes.permuted_to_expanded,
             num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: products,
+            workspace,
         };
 
         f.operate::<RouteGemmNvfp4>(&second, args)?;
 
         // 6. Sum the routes back in FP32 and round once to the hidden dtype.
-        let combine = combine::Descriptor {
-            hidden: self.hidden,
-            top: self.top,
-            experts: self.experts,
-            input: products.dtype,
-            scales: DType::F32,
-            output: out.dtype,
-        };
+        let combine = self.combine_descriptor(products.dtype, out.dtype);
         let args = UnpermuteArgs {
             routes: products,
             expanded_to_permuted: routes.expanded_to_permuted,
@@ -848,13 +918,7 @@ impl Moe {
         let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
         let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
         self.router.forward(f, hidden, scores)?;
-        let routing = TopkDescriptor {
-            scores: scores.dtype,
-            experts: self.experts,
-            top: self.top,
-            renormalize: self.renormalize,
-            scale: self.scale.as_ref().map(Weight::dtype),
-        };
+        let routing = self.topk_descriptor(scores.dtype);
         let args = TopkArgs {
             scores,
             scale: self.scale.as_ref().map(Weight::view),
@@ -869,10 +933,7 @@ impl Moe {
         let sent = match &self.map {
             Some(map) => {
                 let mapped = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-                let descriptor = GatherDescriptor {
-                    experts: self.experts,
-                    top: self.top,
-                };
+                let descriptor = self.map_descriptor();
                 let args = GatherArgs {
                     ids,
                     map: map.view(),
@@ -919,13 +980,7 @@ impl Moe {
         let permuted_to_expanded = arena.tensor(DType::I32, Shape::new(&[rows]))?;
         let total_padded_tokens = arena.tensor(DType::I32, Shape::new(&[1]))?;
         let num_non_exiting_tiles = arena.tensor(DType::I32, Shape::new(&[1]))?;
-        let sort = sort::Descriptor {
-            experts: self.experts,
-            top: self.top,
-            local_experts: self.local,
-            tile_tokens: self.tile,
-            scales: DType::F32,
-        };
+        let sort = self.sort_descriptor(self.local);
         let args = SortArgs {
             ids: exchange.ids,
             scales: exchange.weights,
@@ -1119,6 +1174,7 @@ pub(super) mod tests {
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
             global_scale: weight(DType::F32, &[u64::from(experts), projections]),
             layout: ops::fp4::ScaleLayout::Linear,
+            input_scale: None,
         };
         Moe::quantized(
             router,
@@ -1163,6 +1219,7 @@ pub(super) mod tests {
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
             global_scale: weight(DType::F32, &[u64::from(experts), projections]),
             layout: ops::fp4::ScaleLayout::Linear,
+            input_scale: None,
         };
         // Down's contraction is the gated width, so 512 experts' contraction does not fit 768.
         assert!(

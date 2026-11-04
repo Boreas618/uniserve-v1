@@ -59,20 +59,32 @@ def split_key(dimensions, key):
     return pairs
 
 
-def covers(package, key):
-    kernel = package["manifest"].get("kernel")
-    if kernel is None:
-        return False
-    descriptors = kernel["descriptors"]
+def shapes(kernel):
+    """The descriptor tables a package declares: one, or one per shape."""
+    descriptors = kernel.get("descriptors")
+    if descriptors is None:
+        return []
+    return descriptors if isinstance(descriptors, list) else [descriptors]
+
+
+def covers_one(descriptors, key):
     if key in descriptors.get("keys", []):
         return True
-    dimensions = descriptors.get("dimensions", {})
+    dimensions = descriptors.get("dimensions") or {}
     if not dimensions:
         return False
     pairs = split_key(dimensions, key)
     if pairs is None:
         return False
     return all(value in dimensions.get(name, []) for name, value in pairs)
+
+
+def covers(package, key):
+    """Whether the package covers this key: it covers one of the shapes it declares."""
+    kernel = package["manifest"].get("kernel")
+    if kernel is None:
+        return False
+    return any(covers_one(descriptors, key) for descriptors in shapes(kernel))
 
 
 def build(package, key, target, out_dir):
