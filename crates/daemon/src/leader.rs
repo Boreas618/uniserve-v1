@@ -1646,8 +1646,12 @@ impl Leader {
                     .map_err(|error| {
                         UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
                     })?,
+                // Not a refusal: the deployment asked for nothing the
+                // Program Server turned down — the server did not answer at
+                // all. The change may be legitimate, so this is the
+                // deployment's failure (500), not the request's (400).
                 Err(_) => {
-                    return Err(UpdateError::Refused(format!(
+                    return Err(UpdateError::Failed(anyhow::anyhow!(
                         "preparing the target's programs: no Program Server answered within \
                          {} s: the daemon was {}",
                         PREPARE_TIMEOUT.as_secs(),
