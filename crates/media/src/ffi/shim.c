@@ -35,7 +35,6 @@
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
-#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
@@ -837,21 +836,24 @@ struct UsvMuxer {
 };
 
 /* Adds an output stream whose parameters match `input`'s stream `index`,
- * the way PyAV's add_stream_from_template does: the template's parameters are
- * round-tripped through a codec context (so the output stream holds a codec's
- * parameters, not the demuxer's), the codec tag is reset for remuxing, the
- * time base and the properties that are not derived from a codec context are
- * mirrored, and the muxer numbers the track. */
+ * the way PyAV's add_stream_from_template does for a template that has a codec
+ * context: a new stream with the template's codec, the template's parameters
+ * round-tripped through a codec context (so the output stream holds that
+ * codec's parameters), the codec tag reset for remuxing, and the template's
+ * time base on the stream and the context. It does not copy the template's
+ * start time, duration, disposition, metadata or stream id: those belong to
+ * the attachment/data path without a codec context, and the muxer numbers the
+ * tracks and derives the rest. */
 static int muxer_template_stream(UsvMuxer *muxer, AVFormatContext *input,
                                  int index, AVStream **stream) {
     AVStream *source = input->streams[index];
-    AVStream *target = avformat_new_stream(muxer->output, NULL);
-    if (!target) {
-        return fail("creating an MP4 stream failed");
-    }
     const AVCodec *codec = avcodec_find_encoder(source->codecpar->codec_id);
     if (!codec) {
         codec = avcodec_find_decoder(source->codecpar->codec_id);
+    }
+    AVStream *target = avformat_new_stream(muxer->output, codec);
+    if (!target) {
+        return fail("creating an MP4 stream failed");
     }
     AVCodecContext *context = avcodec_alloc_context3(codec);
     if (!context) {
@@ -869,12 +871,6 @@ static int muxer_template_stream(UsvMuxer *muxer, AVFormatContext *input,
     avcodec_free_context(&context);
     if (code < 0) {
         return fail_averror("writing a stream's parameters", code);
-    }
-    target->start_time = source->start_time;
-    target->duration = source->duration;
-    target->disposition = source->disposition;
-    if (av_dict_copy(&target->metadata, source->metadata, 0) < 0) {
-        return fail("copying a stream's metadata failed");
     }
     *stream = target;
     return USV_OK;
