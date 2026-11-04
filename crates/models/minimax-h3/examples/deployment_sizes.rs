@@ -25,29 +25,29 @@ struct Stage {
 #[rustfmt::skip]
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 1470, tables: 12 },
+    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11069, tables: 12 },
     Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 1470, tables: 12 },
+    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11069, tables: 12 },
     Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 5924, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner)", weights: 41953, constants: 1946, arena: 1550, tables: 14 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner)", weights: 41953, constants: 1946, arena: 11069, tables: 14 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 5924, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 1470, tables: 12 },
+    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 11069, tables: 12 },
     Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, TP2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
-    Stage { deployment: "t2va dense, TP2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 735, tables: 12 },
+    Stage { deployment: "t2va dense, TP2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 10035, tables: 12 },
     Stage { deployment: "t2va dense, TP2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense, TP2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, TP2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
@@ -167,7 +167,76 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The DiT's plans, from the crate's own function, one line per deployment shape: the base DiT on
+    // one rank and on two, and the reference DiT a `ref2va` runs. Each is one evaluation's reservations.
     let ratio = config.video_vae.spatial_compression();
+    for (name, dit, task, shard) in [
+        (
+            "t2va / fl2va, 1 rank",
+            Dit::Base,
+            nn::capability::VideoTask::TextToVideoAudio,
+            1_u32,
+        ),
+        (
+            "t2va, TP2",
+            Dit::Base,
+            nn::capability::VideoTask::TextToVideoAudio,
+            2,
+        ),
+        (
+            "ref2va (OmniRef DiT), 1 rank",
+            Dit::Reference,
+            nn::capability::VideoTask::ReferenceToVideoAudio,
+            1,
+        ),
+    ] {
+        let Some(rules) = config.denoisers.get(&dit) else {
+            println!("DiT plan {name}: this checkpoint has no such DiT");
+            continue;
+        };
+        let partition = minimax_h3::partition::Partition::serving(
+            &config,
+            task,
+            shard as usize,
+            shard as usize,
+            0,
+        )?;
+        let arrangement = partition.arrangement(rules)?;
+        for frames in [124_u32, 362] {
+            let conditioned = !matches!(task, nn::capability::VideoTask::TextToVideoAudio);
+            let request = nn::capability::Layout {
+                video: nn::capability::LatentShape {
+                    channels: rules.transformer.video_channels,
+                    frames: minimax_h3::packing::video_latent_frames(frames)?,
+                    height: 672 / ratio,
+                    width: 1536 / ratio,
+                },
+                audio: Some(nn::capability::LatentShape {
+                    channels: minimax_h3::config::AUDIO_CHANNELS * rules.transformer.audio_channels,
+                    frames: minimax_h3::packing::audio_latent_frames(frames),
+                    height: 1,
+                    width: 1,
+                }),
+                text_rows: arrangement.text_rows,
+                condition_rows: arrangement.condition_rows,
+                condition_elements: 0,
+            };
+            let plan = minimax_h3::denoiser::denoise_arena(
+                rules,
+                &arrangement,
+                minimax_h3::modulation::Groups::of(conditioned).count(),
+                nn::DType::BF16,
+                &request,
+            )?;
+            let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+            println!(
+                "DiT plan {name}, {frames} frames: {} entries, {}",
+                plan.len(),
+                mib(bytes / (1 << 20))
+            );
+        }
+    }
+
     for canvas in NAMED_CANVASES {
         let latent = minimax_h3::video_vae::Canvas::clip(
             &config.video_vae,
@@ -191,6 +260,72 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             arena,
             arena / (1 << 20)
         );
+        if canvas.width == 1536 && false {
+            // The DiT's plan, from the crate's own function. `t2va` reads the generated groups and
+            // `fl2va`/`ref2va` read a condition's clean level too, so both are printed: they are
+            // different plans, and a deployment's task decides which one its rank sizes against.
+
+            for conditioned in [false, true] {
+                let groups = minimax_h3::modulation::Groups::of(conditioned);
+                let task = if conditioned {
+                    nn::capability::VideoTask::FirstLastToVideoAudio
+                } else {
+                    nn::capability::VideoTask::TextToVideoAudio
+                };
+                let arrangement =
+                    minimax_h3::partition::Partition::serving(&config, task, 1, 1, 0)?
+                        .arrangement(denoiser)?;
+                let request = nn::capability::Layout {
+                    video: nn::capability::LatentShape {
+                        channels: denoiser.transformer.video_channels,
+                        frames: minimax_h3::packing::video_latent_frames(124)?,
+                        height: canvas.height / ratio,
+                        width: canvas.width / ratio,
+                    },
+                    audio: Some(nn::capability::LatentShape {
+                        channels: minimax_h3::config::AUDIO_CHANNELS
+                            * denoiser.transformer.audio_channels,
+                        frames: minimax_h3::packing::audio_latent_frames(124),
+                        height: 1,
+                        width: 1,
+                    }),
+                    text_rows: arrangement.text_rows,
+                    condition_rows: arrangement.condition_rows,
+                    condition_elements: 0,
+                };
+                let plan = minimax_h3::denoiser::denoise_arena(
+                    denoiser,
+                    &arrangement,
+                    groups.count(),
+                    nn::DType::BF16,
+                    &request,
+                )?;
+                let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+                if std::env::var("H3_DIT_BUFFERS").is_ok() {
+                    for buffer in &plan {
+                        println!(
+                            "      {:28} {:5} {:>12} elements {:>12} B",
+                            buffer.name,
+                            buffer.element,
+                            buffer.elements,
+                            buffer.bytes()
+                        );
+                    }
+                }
+                println!(
+                    "  DiT plan {} at {}x{}: {} entries, {}",
+                    if conditioned {
+                        "conditioned"
+                    } else {
+                        "generated"
+                    },
+                    canvas.width,
+                    canvas.height,
+                    plan.len(),
+                    mib(bytes / (1 << 20))
+                );
+            }
+        }
     }
     for frames in [124_u32, 362] {
         // `audio_arena` takes audio latent steps, not video frames: one latent step is 800 samples and
