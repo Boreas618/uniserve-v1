@@ -789,7 +789,6 @@ impl VisionTower {
             u64::from(self.config.hidden_size),
             self.position_grid,
             geometry.patches,
-            1,
         )
         .map_err(Error::from)?
         .forward(
