@@ -89,6 +89,9 @@ pub(crate) struct Replicas {
     pub(crate) replacing: tokio::sync::Mutex<()>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     pub(crate) schedulers: Arc<std::sync::atomic::AtomicUsize>,
+    /// The update layer, so a replica that loses its engine asks whether an
+    /// update in flight owns that decision (§7.2, §7.4).
+    pub(crate) updates: std::sync::Weak<crate::updates::driver::Driver>,
 }
 
 /// Keeps deployment updates and replica recovery out of a daemon handoff.
@@ -964,6 +967,7 @@ impl Leader {
             replacing: tokio::sync::Mutex::new(()),
             adapters: Arc::clone(&adapters),
             schedulers,
+            updates: Arc::downgrade(&updates),
         });
         for replica in replicas.serving.borrow().iter() {
             replica.monitor();
@@ -2234,6 +2238,30 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
             return;
         }
         drop(lost_client);
+        // Once the switch's target serves, the engine this replica lost is
+        // the target's: the switch judges its death itself and reverts to the
+        // previous epoch, and a relaunch from here would start the target
+        // again from a `served` spec the switch is in the middle of reverting.
+        // Before the switchover the lost engine is the previous epoch's, which
+        // a relaunch restores as any loss does.
+        if let Some(registry) = replica.registry.upgrade()
+            && let Some(updates) = registry.updates.upgrade()
+            && updates.phase().is_some_and(|phase| {
+                matches!(
+                    phase,
+                    crate::updates::switch::Phase::Serving
+                        | crate::updates::switch::Phase::Probation
+                        | crate::updates::switch::Phase::Committing
+                        | crate::updates::switch::Phase::Reverting
+                )
+            })
+        {
+            tracing::error!(
+                %reason,
+                "the engine was lost while the switch's target served; the switch reverts"
+            );
+            return;
+        }
         tracing::error!(%reason, "the engine was lost; starting another");
         match replica.recover().await {
             Ok(relaunched) => {
