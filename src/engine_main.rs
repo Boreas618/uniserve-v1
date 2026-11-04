@@ -554,6 +554,11 @@ pub(crate) struct MainProcess {
     /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
     /// hold one beside the control thread without a lock.
     storage: Option<Arc<Retained>>,
+    /// Whether this process's segments are given back to the Storage Server: a park sets it, a wake
+    /// clears it. It exists so a process that never parked sends no wake at all - a wake for a pool
+    /// that never slept is a no-op, but its round trip would still wait behind a queued capture on
+    /// the first `Serve`, and the first token must not pay for a mechanism it did not use.
+    slept: bool,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
     modules: Lane<Install>,
@@ -793,6 +798,10 @@ impl MainProcess {
             let shadow = executor.set_shadow()?;
             device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
+            // §2.5's two commands reach the Storage Server's ledger from the device thread, which
+            // owns the stream a wake resets its units on, so the client is bound beside the cache
+            // handle rather than kept only here.
+            executor.bind_storage(Arc::clone(&client));
             executors.push(Arc::new(executor));
             generations.push(generation);
         }
@@ -809,6 +818,7 @@ impl MainProcess {
             executors,
             memory: Some(memory),
             storage: Some(retained),
+            slept: false,
             blocking,
             modules,
             update,
@@ -906,20 +916,61 @@ impl MainProcess {
     /// through the same ledger for the process's life. A pool that is not segmented has nothing to
     /// give back, and the line says that rather than reading as a release that happened.
     fn give_back_segments(&mut self) -> Result<()> {
-        let (Some(storage), Some(memory)) = (self.storage.clone(), self.memory.as_ref()) else {
+        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        // One command per device, and the control thread waits for each: the release is what the
+        // successor's memory depends on, so a park that has not given its segments back is not
+        // reported `Parked` yet. The device queue serialises commands, so this runs between
+        // batches.
+        for executor in &self.executors {
+            let device = executor.device();
+            let submission = executor
+                .sleep()
+                .with_context(|| format!("queueing device {device}'s sleep"))?;
+            device_command(&self.watchdog, device, "the park's sleep", submission)?;
+        }
+        self.slept = true;
+        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        if let (Some(before), Some(after)) = (kept_before, kept) {
+            tracing::info!(
+                given_back = before.saturating_sub(after),
+                kept = after,
+                pool = "the cache's segments",
+                devices = self.executors.len(),
+                "the park gave back the segments it no longer serves, and kept the pools it serves \
+                 with"
+            );
+        }
+        Ok(())
+    }
+
+    /// §2.5: takes the cache's segments back on every device, `limit` at a time, before admission
+    /// opens. A wake is a remap, not a repair: the generation's captures keep their addresses, so no
+    /// warmup follows it, and a wake that fails leaves admission closed and fails its caller by name.
+    fn take_back_segments(&mut self) -> Result<()> {
+        if !self.slept {
             return Ok(());
-        };
-        let cache = memory.shared_cache();
-        let kept_before = memory.mapped_resident();
-        executor::memory::sleep(&cache, &mut &*storage)
-            .context("giving the parked process's cache segments back")?;
-        let kept = memory.mapped_resident();
-        tracing::info!(
-            given_back = kept_before.saturating_sub(kept),
-            kept,
-            pool = "the cache's segments",
-            "the park gave back the segments it no longer serves, and kept the pools it serves with"
-        );
+        }
+        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        for executor in &self.executors {
+            let device = executor.device();
+            // No limit: this process takes back everything the Storage Server still holds for its
+            // rank. A limit is a bound on a smaller wake, not a demand that everything return.
+            let submission = executor
+                .wake(None)
+                .with_context(|| format!("queueing device {device}'s wake"))?;
+            device_command(&self.watchdog, device, "the wake", submission)?;
+        }
+        self.slept = false;
+        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        if let (Some(before), Some(after)) = (kept_before, kept) {
+            tracing::info!(
+                taken_back = after.saturating_sub(before),
+                kept_after = after,
+                limit = "every segment the storage holds",
+                devices = self.executors.len(),
+                "the wake took its segments back before admission opened"
+            );
+        }
         Ok(())
     }
 
@@ -1310,6 +1361,10 @@ impl MainProcess {
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
+                    // §2.5: the promotion runs on the addresses the predecessor's segments held, so
+                    // they are mapped again before anything is admitted, and a wake that fails fails
+                    // the promotion by name.
+                    self.take_back_segments()?;
                     self.promoted = true;
                     // A promoted standby admits on the same rule as any other process: once the
                     // generation it will serve has been warmed (§4.5).
@@ -2469,6 +2524,11 @@ impl MainProcess {
             self.pending_serve = true;
             return Ok(());
         }
+        // §2.5: a process that parked gave its segments back, so nothing may be admitted until they
+        // are mapped again - and a wake that fails fails the resume by name rather than serving
+        // unmapped pages.
+        self.take_back_segments()
+            .with_context(|| format!("waking epoch {} before it admits", serve.epoch))?;
         // A `Serve` that arrives while the warmup still has to capture this generation's buckets is
         // owed rather than refused: admission opens when the last submission finishes, the same way
         // it does at a switchover (§4.5).
