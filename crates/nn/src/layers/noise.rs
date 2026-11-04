@@ -6,7 +6,7 @@
 //! caller's, because the executor computes it from the request seed and the phase.
 
 use ops::TensorView;
-use ops::noise::{self, PhiloxNoise as NoiseOp};
+use ops::noise::{self, NoiseKind, PhiloxNoise as NoiseOp};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -14,10 +14,33 @@ use crate::forward::Forward;
 /// The elements one noise program draws.
 const BLOCK: u32 = noise::NOISE_BLOCK;
 
-/// Standard normal noise addressed by (sampling key, element).
-pub struct Noise;
+/// Noise addressed by (sampling key, element): standard normal, or uniform in `[0, 1)`.
+pub struct Noise {
+    kind: NoiseKind,
+}
+
+impl Default for Noise {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Noise {
+    /// The standard-normal draw, the initial noise of a request.
+    pub const fn new() -> Self {
+        Self {
+            kind: NoiseKind::Normal,
+        }
+    }
+
+    /// The same stream drawn as uniforms in `[0, 1)`, for a schedule that keeps a request's noise
+    /// reproducible without a normal's tail.
+    pub const fn uniform(self) -> Self {
+        Self {
+            kind: NoiseKind::Uniform,
+        }
+    }
+
     /// Draw `out` `[rows, elements]` in its own element type.
     ///
     /// `keys` is `[rows]` i64 with each row's sampling key as its bit pattern; `stage` and `draw`
@@ -43,6 +66,7 @@ impl Noise {
         let descriptor = noise::NoiseDescriptor {
             dtype: out.dtype,
             block: BLOCK,
+            kind: self.kind,
         };
         let args = noise::NoiseArgs {
             out,

@@ -37,6 +37,23 @@ fn shard(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::
     path
 }
 
+/// Write one shard whose tensors are byte buffers, and answer the path.
+fn shard_u8(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let views: Vec<(String, TensorView<'_>)> = tensors
+        .iter()
+        .map(|(tensor, shape, bytes)| {
+            let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
+            (
+                (*tensor).to_owned(),
+                TensorView::new(Dtype::U8, shape, bytes).unwrap(),
+            )
+        })
+        .collect();
+    safetensors::serialize_to_file(views, &None, &path).unwrap();
+    path
+}
+
 /// A store that keeps what it was given, in host memory.
 #[derive(Default)]
 struct Recording {
@@ -257,4 +274,251 @@ fn a_computed_constant_is_published_once_and_needs_its_own_name() {
             .is_err()
     );
     assert_eq!(store.published.len(), 2);
+}
+/// The `f32` values of BF16 bytes.
+fn from_bf16(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_bits(u32::from(u16::from_le_bytes(*chunk)) << 16))
+        .collect()
+}
+
+#[test]
+fn a_weight_normalized_convolution_is_computed_once_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[
+            // Two output channels of two elements: v = [[3, 4], [0, 1]].
+            ("conv.weight_v", vec![2, 2], bf16(&[3.0, 4.0, 0.0, 1.0])),
+            // PyTorch keeps the gain as [channels, 1, 1].
+            ("conv.weight_g", vec![2, 1, 1], bf16(&[5.0, 10.0])),
+        ],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+    let weight = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g")
+            .unwrap()
+    };
+
+    // v · g / ‖v‖ per channel: [3, 4] · 5/5 and [0, 1] · 10/1.
+    let (_, bytes, dtype, shape, _) = &store.published[0];
+    assert_eq!(*dtype, DType::BF16);
+    assert_eq!(shape.dims(), &[2, 2]);
+    assert_eq!(from_bf16(bytes), vec![3.0, 4.0, 0.0, 10.0]);
+    assert_eq!(weight.shape().dims(), &[2, 2]);
+    assert_eq!(store.published.len(), 1);
+
+    // A second load reuses the retained region.
+    let again = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g")
+            .unwrap()
+    };
+    assert_eq!(again.view().ptr, weight.view().ptr);
+    assert_eq!(store.published.len(), 1);
+}
+
+#[test]
+fn a_weight_normalized_gain_must_match_the_output_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[
+            ("conv.weight_v", vec![2, 2], bf16(&[3.0, 4.0, 0.0, 1.0])),
+            ("conv.weight_g", vec![3, 1, 1], bf16(&[5.0, 10.0, 1.0])),
+        ],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    assert!(
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g")
+            .is_err()
+    );
+    assert!(store.published.is_empty());
+}
+
+#[test]
+fn a_strided_row_parallel_shard_gathers_its_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    // Four rows of six elements: row r holds 6r .. 6r+5.
+    let values: Vec<f32> = (0..24).map(|value| value as f32).collect();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[("o_proj.weight", vec![4, 6], bf16(&values))],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+
+    let request = WeightRequest::strided("o_proj.weight", 0, Shape::new(&[4, 3]), 6);
+    let weight = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader.load(&request).unwrap()
+    };
+    assert_eq!(weight.shape().dims(), &[4, 3]);
+    let (_, bytes, _, _, _) = &store.published[0];
+    assert_eq!(
+        from_bf16(bytes),
+        vec![
+            0.0, 1.0, 2.0, 6.0, 7.0, 8.0, 12.0, 13.0, 14.0, 18.0, 19.0, 20.0
+        ],
+        "columns 0..2 of every row, rows contiguous"
+    );
+
+    // The same request reuses the retained region.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader.load(&request).unwrap();
+    }
+    assert_eq!(store.published.len(), 1);
+
+    // A second column block of the same extents is another key.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .load(&WeightRequest::strided(
+                "o_proj.weight",
+                3,
+                Shape::new(&[4, 3]),
+                6,
+            ))
+            .unwrap();
+    }
+    assert_eq!(store.published.len(), 2);
+    assert_ne!(store.published[0].0, store.published[1].0);
+}
+
+/// A calibrated NVFP4 matrix is its two byte fields and its tensor scale, published under keys that
+/// name the scale layout; nothing is quantized at load.
+#[test]
+fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    // `[4, 64]` encoded: 32 bytes a row of packed pairs, four block scales a row.
+    let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
+    shard_u8(
+        directory,
+        "model.safetensors",
+        &[
+            ("w", vec![4, 32], values.clone()),
+            ("w_scale", vec![4, 4], scales.clone()),
+        ],
+    );
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let quantized = loader
+        .nvfp4(
+            &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
+            &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            ops::fp4::ScaleLayout::Linear,
+            0.25,
+        )
+        .unwrap();
+
+    assert_eq!(quantized.packed.shape().dims(), &[4, 32]);
+    assert_eq!(quantized.packed.dtype(), DType::U8);
+    assert_eq!(quantized.scales.shape().dims(), &[4, 4]);
+    assert_eq!(quantized.scales.dtype(), DType::U8);
+    assert_eq!(quantized.global_scale, 0.25);
+    assert_eq!(store.published.len(), 2);
+    assert_eq!(store.published[0].1, values);
+    assert_eq!(store.published[1].1, scales);
+    // The layout names the arrangement, so the two fields never share a key with a plain region.
+    assert_eq!(store.published[0].0.layout, WeightLayout::NVFP4_VALUES);
+    assert_eq!(
+        store.published[1].0.layout,
+        WeightLayout::NVFP4_SCALES_LINEAR
+    );
+}
+
+/// The block scales are the shape the requested layout names; another layout's shape is refused
+/// rather than reinterpreted, because the two arrangements index the same bytes differently.
+#[test]
+fn the_block_scales_must_have_the_layout_s_shape() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let values: Vec<u8> = vec![0; 128];
+    let scales: Vec<u8> = vec![0x38; 16];
+    shard_u8(
+        directory,
+        "model.safetensors",
+        &[("w", vec![4, 32], values), ("w_scale", vec![4, 4], scales)],
+    );
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let error = loader
+        .nvfp4(
+            &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
+            &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            ops::fp4::ScaleLayout::Swizzled128X4,
+            0.25,
+        )
+        .expect_err("a linear scale field is not the swizzled layout's field");
+    assert!(format!("{error}").contains("swizzled_128x4"), "{error}");
+    assert!(store.published.is_empty());
+}
+
+/// A pipeline's components keep their indexes apart; one loader borrows another checkpoint and
+/// keeps the store, so the two components share the conversion path and its retained weights.
+#[test]
+fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
+    let root = tempfile::tempdir().unwrap();
+    let transformer = root.path().join("transformer");
+    let vae = root.path().join("vae");
+    std::fs::create_dir_all(&transformer).unwrap();
+    std::fs::create_dir_all(&vae).unwrap();
+    let scale = bf16(&[1.0, 2.0]);
+    shard(
+        &transformer,
+        "model.safetensors",
+        &[("weight", vec![2], scale.clone())],
+    );
+    shard(&vae, "model.safetensors", &[("weight", vec![2], scale)]);
+
+    let transformer = Checkpoint::open(&transformer).unwrap();
+    let vae = Checkpoint::open(&vae).unwrap();
+    let mut store = Recording::default();
+    let (first_ptr, again_ptr) = {
+        let mut loader = WeightLoader::new(&transformer, &mut store, Some(DType::F32), None);
+        let first = loader
+            .load(&WeightRequest::region("weight", 0, Shape::new(&[2])))
+            .unwrap();
+        assert_eq!(first.dtype(), DType::F32);
+        {
+            let mut vae_loader = loader.for_checkpoint(&vae);
+            let second = vae_loader
+                .load(&WeightRequest::region("weight", 0, Shape::new(&[2])))
+                .unwrap();
+            assert_eq!(second.dtype(), DType::F32);
+        }
+        // Read again through the first loader: the store answers, nothing is published a third
+        // time.
+        let again = loader
+            .load(&WeightRequest::region("weight", 0, Shape::new(&[2])))
+            .unwrap();
+        (first.view().ptr, again.view().ptr)
+    };
+
+    // Same tensor name, same bytes, two components: the keys differ by the file that holds them,
+    // and both are retained by the one store.
+    assert_eq!(store.published.len(), 2);
+    assert_ne!(store.published[0].0.files, store.published[1].0.files);
+    assert_eq!(store.published[0].1, store.published[1].1);
+    assert_eq!(again_ptr, first_ptr);
 }

@@ -75,6 +75,25 @@ pub struct CubinMetadata {
 }
 
 impl CubinMetadata {
+    /// The metadata of an image that carries none: only the symbol is known.
+    ///
+    /// A package's cubins carry Triton's metadata record, which is what a launch needs; an image
+    /// that does not carry one is still loadable, and its launch takes the defaults (four warps,
+    /// no dynamic shared memory, one block per cluster, no programmatic dependent launch, no
+    /// global scratch).
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            num_warps: 4,
+            shared: 0,
+            num_ctas: 1,
+            launch_pdl: false,
+            launch_cooperative_grid: false,
+            global_scratch_size: 0,
+            global_scratch_align: 1,
+        }
+    }
+
     /// Read the metadata Triton wrote beside a cubin.
     ///
     /// Only the fields above are read; other keys are skipped, including the arrays and objects a
