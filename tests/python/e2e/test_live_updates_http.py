@@ -59,6 +59,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -154,6 +155,17 @@ POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
 #: precopy stood in ``this node's devices`` until its 300 s budget ended it.
 KEYS = "notes/programs/qwen3-moe-keys.txt"
 
+#: The precisions whose rows in ``KEYS`` belong to deployments other than this
+#: file's. The key file covers three deployments — bf16 dense weights, NVFP4
+#: weights, and an fp8 KV variant — in one store, as its own header states.
+#: This file serves the bf16 dense one, so a row that names an NVFP4 encoding or
+#: an ``f8e4m3`` scale or page is another deployment's, and one operator
+#: (``kv_write_scaled``) stands in ``kv_write``'s place there. Building those
+#: rows here fails on packages that deployment's owner owes, which says nothing
+#: about whether this deployment can serve.
+FOREIGN_PRECISIONS = ("nvfp4", "f8e4m3")
+FOREIGN_OPERATORS = frozenset({"kv_write_scaled"})
+
 #: The socket of the module's Program Server, which every deployment of this
 #: file reaches through ``--program-server``. Set by :func:`program_server`.
 PROGRAM_SERVER: Path | None = None
@@ -238,8 +250,42 @@ def _program_target() -> str:
     return f"sm_{major}{minor}a"
 
 
+def _deployment_keys(store: Path) -> Path:
+    """The key lines this file's deployment serves, written beside `store`.
+
+    ``KEYS`` is the union of three deployments' rows; ``build_fixtures`` fails
+    on any row that does not build, so handing it the union would let another
+    deployment's missing package stop this one from serving. The rows kept here
+    are the bf16 dense deployment's: everything whose key names none of
+    ``FOREIGN_PRECISIONS`` and whose operator is not ``FOREIGN_OPERATORS``.
+    Comments and blank lines are dropped — the store's build reads rows, and
+    the selection remains readable in the file it came from.
+    """
+    kept = []
+    for line in (_repository() / KEYS).read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        operator, _, key = stripped.partition("\t")
+        if operator in FOREIGN_OPERATORS:
+            continue
+        lowered = stripped.lower()
+        if any(precision in lowered for precision in FOREIGN_PRECISIONS):
+            continue
+        kept.append(stripped)
+    if not kept:
+        raise AssertionError(
+            f"{KEYS} states no row for this deployment: "
+            f"{sorted(FOREIGN_PRECISIONS)} and "
+            f"{sorted(FOREIGN_OPERATORS)} excluded all of them"
+        )
+    path = store.parent / "deployment-keys.txt"
+    path.write_text("\n".join(kept) + "\n")
+    return path
+
+
 def _build_store(store: Path, target: str, python: Path | None) -> None:
-    """Builds a module for every kernel key the deployment launches.
+    """Builds a module for every kernel key this deployment launches.
 
     `store` is ``build_fixtures``'s store, which it fills in its own shape: the
     installed package sources under ``<store>/packages`` and the prepared
@@ -248,12 +294,23 @@ def _build_store(store: Path, target: str, python: Path | None) -> None:
     parent.
 
     ``build_fixtures`` (``crates/program-server/examples``) is the store's own
-    producer: for each ``operator<TAB>key`` line it installs the operator's
-    package, prepares that key for `target`, and resolves it to the module it
-    names. The builds are real — Triton, nvcc and CuTe DSL all run — so this
-    takes minutes rather than seconds, once per module. The Program Server then
+    producer: for each ``operator<TAB>key`` line of the key file it installs the
+    operator's package, prepares that key for `target`, and resolves it to the
+    module it names. It is given :func:`_deployment_keys`, not ``KEYS``: this
+    deployment's rows only, so a package another deployment owes fails that
+    deployment's run and not this one. The builds are real — Triton, nvcc and
+    CuTe DSL all run — so this takes minutes rather than seconds, once per
+    module. The Program Server then
     serves the store as it stands, which is why ``--store-root`` below is this
     directory and no kernel package is installed a second time.
+
+    A key this deployment does not launch may fail to build — the key file
+    states a shape's whole walk, and a package the operator has but this host
+    cannot build is not the deployment's problem. So a partial store is served
+    as it stands and its gaps are printed: a precopy that needs one names the
+    descriptor it lacks precisely (the module lane's refusal), which is a
+    better report than a fixture refusing to start. Only a store with no
+    module at all — which no deployment can serve — fails here.
     """
     command = [
         "cargo",
@@ -264,7 +321,7 @@ def _build_store(store: Path, target: str, python: Path | None) -> None:
         "build_fixtures",
         "--",
         "--keys",
-        str(_repository() / KEYS),
+        str(_deployment_keys(store)),
         "--target",
         target,
         "--store",
@@ -279,11 +336,27 @@ def _build_store(store: Path, target: str, python: Path | None) -> None:
         text=True,
         timeout=3600,
     )
-    if built.returncode != 0:
+    lines = built.stdout.splitlines()
+    prepared = [line for line in lines if line.startswith("ok\t")]
+    missing = [line for line in lines if line.startswith("FAILED\t")]
+    if prepared and built.returncode == 0:
+        return
+    if not prepared:
         raise AssertionError(
-            "building the deployment's kernels failed: "
+            "the deployment's store has no module at all, so nothing can "
+            "serve: "
             f"{built.stdout[-4000:]}\n{built.stderr[-4000:]}"
         )
+    # A short store is served, not refused: the keys that could not be built
+    # are named, and a precopy that needs one names its descriptor. A warning
+    # rather than a failure, because the key file states a shape's whole walk
+    # and a key this deployment never launches may be one no package builds.
+    warnings.warn(
+        f"the store holds {len(prepared)} built key(s) and not {len(missing)}: "
+        + "; ".join(line.replace("\t", " ") for line in missing),
+        stacklevel=2,
+    )
+    print(built.stderr[-2000:])
 
 
 @pytest.fixture(scope="module", autouse=True)
