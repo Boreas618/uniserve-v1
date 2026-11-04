@@ -2034,6 +2034,9 @@ impl MainProcess {
         for error in self.blocking.close() {
             tracing::warn!(%error, "closing a blocking lane failed");
         }
+        // The caches a park handed back name segments of the pools below: they go before the
+        // resident owners close, so nothing the memory releases is still described as parked.
+        self.parked = None;
         if let Some(memory) = self.memory.take() {
             if let Err(error) = memory.close() {
                 tracing::warn!(%error, "closing the resident owners failed");
