@@ -303,6 +303,26 @@ impl RequestEvents {
         }
     }
 
+    /// The events of a request this process takes over from another: the
+    /// engine's stream `stream`, which goes on after the position the
+    /// previous consumer reached (design §7.5.1), and no hold, because the
+    /// request is already admitted and migrated by the engine itself.
+    pub(crate) fn taken_over(stream: EventStream, consumed: u64) -> Self {
+        Self {
+            stream,
+            request: None,
+            hold: None,
+            max_migrations: 0,
+            losses: 0,
+            pending: None,
+            resumed: consumed > 0,
+            images: HashMap::new(),
+            migrated_at: None,
+            open: true,
+            on_finish: None,
+        }
+    }
+
     /// Registers a callback to run once, on the terminal event, the end of
     /// the stream or its drop.
     pub fn set_on_finish(&mut self, on_finish: impl FnOnce() + Send + 'static) {

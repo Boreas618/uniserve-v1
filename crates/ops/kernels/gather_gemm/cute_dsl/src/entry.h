@@ -1,35 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The C entry of the gather_gemm module. The operator's Rust side mirrors this
-// struct field for field and calls the entry through the loaded library.
+// The C entry of the gather_gemm module: the operator's `moe::grouped::GatherCall`
+// (crates/ops/src/moe/grouped.rs, GATHER_CALL_LAYOUT), field for field, and the
+// entry the operator's Rust side calls.
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
-// One FC1 launch. Device addresses come from the executor's arena; `stream` is
+// One FC1 launch. The call struct is the operator's, byte for byte; `stream` is
 // the CUstream of the device the executor drives.
 //
-// `a` is `[tokens, k]` BF16 hidden states, `b` `[experts, n, k]` BF16 weights
-// with each expert's `n / 2` up rows followed by its `n / 2` gate rows, `c`
-// `[m, n / 2]` BF16 permuted output rows. The sort metadata holds `m /
-// tile_size` tile entries (`tile_idx_to_expert_idx`, `tile_idx_to_mn_limit`),
-// the `m` row-to-token map, and one tile count.
-struct uniserve_gather_gemm_args {
-  void* a;
-  void* b;
-  void* c;
-  void* tile_idx_to_expert_idx;
-  void* tile_idx_to_mn_limit;
-  void* token_id_mapping;
-  void* num_non_exiting_tiles;
+// `hidden` is [tokens, hidden_size], `weights` [experts, 2*intermediate,
+// hidden_size] with each expert's intermediate up rows then its intermediate
+// gate rows, and `out` [permuted_rows, intermediate]. The sort metadata holds
+// permuted_rows / tile entries in `tile_to_expert` and `tile_to_limit`, the
+// permuted_rows row-to-expanded map in `permuted_to_expanded`, and one tile
+// count in `num_non_exiting_tiles`.
+struct uniserve_gather_call {
+  const void* hidden;
+  const void* weights;
+  void* out;
+  const int32_t* tile_to_expert;
+  const int32_t* tile_to_limit;
+  const int32_t* permuted_to_expanded;
+  const int32_t* num_non_exiting_tiles;
   int64_t tokens;
-  int64_t m;
-  int64_t n;
-  int64_t k;
+  int64_t permuted_rows;
+  int64_t width;
+  int64_t hidden_size;
   int64_t experts;
-  void* stream;
+  int64_t top;
+  int64_t dtype;
+  char error[512];
 };
 
-// Launch the module's FC1 kernel. Returns 0, or the host launcher's error code.
-extern "C" int uniserve_gather_gemm(const uniserve_gather_gemm_args* args);
+// The operator crate's `DType::as_i64()` numbering.
+enum uniserve_dtype : int64_t {
+  UNISERVE_DTYPE_U8 = 0,
+  UNISERVE_DTYPE_I32 = 1,
+  UNISERVE_DTYPE_I64 = 2,
+  UNISERVE_DTYPE_F16 = 3,
+  UNISERVE_DTYPE_BF16 = 4,
+  UNISERVE_DTYPE_F32 = 5,
+  UNISERVE_DTYPE_F8E4M3 = 6,
+  UNISERVE_DTYPE_F4E2M1 = 7,
+};
+
+static_assert(offsetof(uniserve_gather_call, error) == 112,
+              "the call's error message must sit where the operator's layout puts it");
+static_assert(sizeof(uniserve_gather_call) == 624,
+              "the call must be the size of the operator's layout");
+
+// Launch the module's FC1 kernel. Returns 0, or a nonzero status with a
+// NUL-terminated message in `call->error`.
+extern "C" int32_t uniserve_gather_gemm(const uniserve_gather_call* call, void* stream);

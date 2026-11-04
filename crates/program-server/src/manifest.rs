@@ -396,6 +396,12 @@ impl Manifest {
             ));
         }
         match (&self.kernel, self.module.form) {
+            (Some(_), ModuleForm::Wasm) => {
+                return Err(ManifestError::Invalid(
+                    "a scheduling policy fills a whole interface, so it names no kernel program"
+                        .into(),
+                ));
+            }
             (Some(kernel), _) if kernel.architectures.is_empty() => {
                 return Err(ManifestError::Invalid(
                     "the package must name the architectures it supports".into(),

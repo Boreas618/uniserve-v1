@@ -10,6 +10,7 @@
 //! input processing.
 
 mod assembly;
+pub(crate) mod run;
 pub mod chat;
 mod events;
 pub(crate) mod omni;

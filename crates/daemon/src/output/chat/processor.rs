@@ -9,6 +9,7 @@
 //! parser for Bagel. `output::assembly` feeds the processor and frames its
 //! [`AssistantEvent`]s as content blocks and tool calls (`structured`).
 
+use proto::handoff;
 use uuid::Uuid;
 
 use crate::output::chat::{AssistantBlockKind, Error, Result};
@@ -55,6 +56,9 @@ pub enum AssistantEvent {
 pub struct ChatOutputProcessor {
     reasoning: Option<Box<dyn ReasoningParser>>,
     tools: Option<ToolStage>,
+    /// The parser set the request's model family chose, which a successor
+    /// rebuilds the same processors from (design §7.5.1 step 3).
+    parser: handoff::Parser,
 }
 
 impl ChatOutputProcessor {
@@ -66,6 +70,42 @@ impl ChatOutputProcessor {
         Self {
             reasoning,
             tools: tools.map(ToolStage::new),
+            parser: handoff::Parser::default(),
+        }
+    }
+
+    /// The parser set this processor was built for.
+    pub fn parser(&self) -> &handoff::Parser {
+        &self.parser
+    }
+
+    /// The parsers' state, for the process that goes on writing the response
+    /// after a handoff (design §7.5.1 step 3); `None` when a parser of this
+    /// processor cannot be continued, in which case the response cannot be
+    /// handed over.
+    pub fn state(&self) -> Option<handoff::Processor> {
+        let reasoning = match self.reasoning.as_ref() {
+            Some(reasoning) => Some(reasoning.state()?),
+            None => None,
+        };
+        let tools = match self.tools.as_ref() {
+            Some(tools) => Some(tools.state()?),
+            None => None,
+        };
+        Some(handoff::Processor { reasoning, tools })
+    }
+
+    /// Puts the parsers back where `state` left them: the successor builds
+    /// the same processor for the request (its family and its tools) and
+    /// resumes the parsers from the state the predecessor handed over.
+    pub fn resume(&mut self, state: &handoff::Processor) {
+        if let (Some(reasoning), Some(reasoning_state)) =
+            (self.reasoning.as_mut(), state.reasoning.as_ref())
+        {
+            reasoning.resume(reasoning_state);
+        }
+        if let (Some(tools), Some(tools_state)) = (self.tools.as_mut(), state.tools.as_ref()) {
+            tools.resume(tools_state);
         }
     }
 
@@ -91,11 +131,18 @@ impl ChatOutputProcessor {
                 name: "qwen3".to_string(),
                 error: Box::new(error),
             })?;
+        let parse_tools = tools.is_some();
         let tools = tools.map(Qwen25ToolParser::new);
-        Ok(Self::new(
+        let mut processor = Self::new(
             reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
             tools.map(|parser| Box::new(parser) as Box<dyn ToolParser>),
-        ))
+        );
+        processor.parser = handoff::Parser {
+            kind: handoff::parser::Kind::ParserKindQwen3 as i32,
+            parse_reasoning,
+            parse_tools,
+        };
+        Ok(processor)
     }
 
     /// The Gemma-4 processor of a request: thought channels when
@@ -133,10 +180,16 @@ impl ChatOutputProcessor {
                 error: Box::new(error),
             })?;
         let tools = parse_tools.then(Gemma4ToolParser::new);
-        Ok(Self::new(
+        let mut processor = Self::new(
             reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
             tools.map(|parser| Box::new(parser) as Box<dyn ToolParser>),
-        ))
+        );
+        processor.parser = handoff::Parser {
+            kind: handoff::parser::Kind::ParserKindGemma4 as i32,
+            parse_reasoning,
+            parse_tools,
+        };
+        Ok(processor)
     }
 
     /// Chooses the region generation starts in from the prompt.

@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use libloading::Library;
 
 use crate::driver::Handle;
-use crate::{DataType, Device, DeviceId, Error, Result, Stream};
+use crate::{DataType, Device, DeviceId, DeviceRange, Error, Result, Stream};
 
 const LIBCUBLASLT: &str = "libcublasLt.so.13";
 
@@ -136,12 +136,27 @@ impl Epilogue {
     }
 }
 
+/// The order the caller stores the operands in.
+///
+/// cuBLASLt only multiplies column-major matrices: a row-major `D = A · B` is
+/// the column-major `Dᵀ = Bᵀ · Aᵀ`, so the library is handed the operands
+/// swapped, and `m` and `n` with them. The descriptor keeps the caller's
+/// names — `a` is the caller's left operand — and this order says which way
+/// round the library is given them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    ColumnMajor,
+    RowMajor,
+}
+
 /// One matrix multiplication: element and compute types, the four matrix
 /// layouts, the transpose flags, and the epilogue. It is the key under which
 /// a GEMM program records its tuning data (§5.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatmulDescriptor {
     pub compute: ComputeType,
+    /// The order `a`, `b`, `c` and `d` are stored in.
+    pub order: Order,
     pub a: MatrixLayout,
     pub b: MatrixLayout,
     pub c: MatrixLayout,
@@ -157,12 +172,15 @@ impl MatmulDescriptor {
     pub fn row_major(m: u64, n: u64, k: u64, dtype: DataType, compute: ComputeType) -> Self {
         Self {
             compute,
+            order: Order::RowMajor,
             a: MatrixLayout::row_major(m, k, dtype),
             b: MatrixLayout::row_major(k, n, dtype),
             c: MatrixLayout::row_major(m, n, dtype),
             d: MatrixLayout::row_major(m, n, dtype),
-            transpose_a: true,
-            transpose_b: true,
+            // The row-major form swaps the operands rather than transposing
+            // them: `op(A)` is `Bᵀ` there, which is `b` as stored.
+            transpose_a: false,
+            transpose_b: false,
             epilogue: Epilogue::Default,
         }
     }
@@ -175,10 +193,17 @@ impl MatmulDescriptor {
             b: self.b.elements() * self.b.dtype.bytes() as u64,
             c: self.c.elements() * self.c.dtype.bytes() as u64,
             d: self.d.elements() * element,
+            bias: self.d.rows * self.d.dtype.bytes() as u64,
         }
     }
 
     fn check(&self) -> Result<()> {
+        if self.order == Order::RowMajor && (self.transpose_a || self.transpose_b) {
+            return Err(Error::invalid(
+                "a row-major multiplication reaches the library by swapping its operands, \
+                 so it cannot also transpose them: leave transpose_a and transpose_b false",
+            ));
+        }
         for (name, layout) in [("A", self.a), ("B", self.b), ("C", self.c), ("D", self.d)] {
             if layout.rows == 0 || layout.cols == 0 || layout.batch == 0 {
                 return Err(Error::invalid(format!(
@@ -204,6 +229,11 @@ pub struct MatmulBytes {
     pub b: u64,
     pub c: u64,
     pub d: u64,
+    /// The bias vector of [`Epilogue::Bias`]: one element per row of `D` as
+    /// the library sees it, of `D`'s type, and one vector for every batch.
+    /// For a [`MatmulDescriptor::row_major`] descriptor the library sees the
+    /// transposed matrices, so that is the matrix's columns.
+    pub bias: u64,
 }
 
 /// An algorithm cuBLASLt proposes for one [`MatmulDescriptor`], with the
@@ -246,26 +276,26 @@ impl Algorithm {
     }
 }
 
-/// The pointers and scalars of one multiplication:
+/// The buffers and scalars of one multiplication:
 /// `D = alpha · op(A) · op(B) + beta · C`, with the bias of
 /// [`Epilogue::Bias`] and the algorithm's workspace.
 ///
-/// Every pointer addresses device storage the caller keeps alive until the
-/// stream work completes, and that stays at its address for a captured
-/// graph's life.
+/// Each range states where its buffer starts and how many bytes are valid from
+/// there; [`Matmul::run`] checks them against the descriptor before any
+/// cuBLASLt call. The storage stays at its address for the work's life,
+/// including every replay of a graph that captured it.
 #[derive(Clone, Copy, Debug)]
 pub struct MatmulArgs {
-    pub a: u64,
-    pub b: u64,
-    pub c: u64,
-    pub d: u64,
+    pub a: DeviceRange,
+    pub b: DeviceRange,
+    pub c: DeviceRange,
+    pub d: DeviceRange,
     pub alpha: f32,
     pub beta: f32,
-    /// The bias vector, `D`'s rows long, for [`Epilogue::Bias`]; 0 otherwise.
-    pub bias: u64,
-    /// The workspace's address and bytes; at least the algorithm's need.
-    pub workspace: u64,
-    pub workspace_bytes: usize,
+    /// The bias vector for [`Epilogue::Bias`]; an empty range otherwise.
+    pub bias: DeviceRange,
+    /// The workspace the algorithm runs in, at least its need.
+    pub workspace: DeviceRange,
 }
 
 /// `cublasLtMatmulHeuristicResult_t`.
@@ -282,14 +312,18 @@ struct HeuristicResult {
 /// The most results one search returns.
 const HEURISTIC_RESULTS: usize = 8;
 
-const PREFERENCE_WORKSPACE_SIZE: i32 = 0; // CUBLASLT_WORKSPACE_SIZE
+// `cublasLt.h`'s numbers, each named after its enumerator; the unit test
+// `the_attribute_numbers_are_the_headers` compares every one of them with the
+// header itself, because a wrong number here is a wrong computation or a
+// refused call, never a compile error.
+const PREFERENCE_WORKSPACE_SIZE: i32 = 1; // CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES
 const DESC_TRANSA: i32 = 3; // CUBLASLT_MATMUL_DESC_TRANSA
 const DESC_TRANSB: i32 = 4; // CUBLASLT_MATMUL_DESC_TRANSB
 const DESC_EPILOGUE: i32 = 7; // CUBLASLT_MATMUL_DESC_EPILOGUE
 const DESC_BIAS_POINTER: i32 = 8; // CUBLASLT_MATMUL_DESC_BIAS_POINTER
-const DESC_BIAS_DATA_TYPE: i32 = 11; // CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE
-const LAYOUT_BATCH_COUNT: i32 = 2; // CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT
-const LAYOUT_BATCH_STRIDE: i32 = 3; // CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET
+const DESC_BIAS_DATA_TYPE: i32 = 26; // CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE
+const LAYOUT_BATCH_COUNT: i32 = 5; // CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT
+const LAYOUT_BATCH_STRIDE: i32 = 6; // CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET
 
 /// The cuBLASLt entry points this module uses, resolved once per process.
 struct Api {
@@ -339,6 +373,17 @@ struct Api {
     get_version: unsafe extern "C" fn() -> usize,
     // Declared last: the library outlives every copied function pointer.
     _library: Library,
+}
+
+/// Fails unless `range` states at least `needed` bytes from its address.
+fn require_room(range: DeviceRange, needed: u64, what: &'static str) -> Result<()> {
+    if (range.bytes() as u64) < needed {
+        return Err(Error::invalid(format!(
+            "the {what} range states {} bytes, but the multiplication needs {needed}",
+            range.bytes()
+        )));
+    }
+    Ok(())
 }
 
 fn api() -> Result<&'static Api> {
@@ -526,13 +571,12 @@ impl Matmul {
     /// The call issues device work and returns without waiting for it; on a
     /// capturing stream it is captured into the graph.
     ///
-    /// # Safety
-    ///
-    /// `args` must address device storage that outlives every execution of
-    /// the launch: each operand at least [`MatmulDescriptor::bytes`] long,
-    /// the bias vector `D`'s rows long, and the workspace at least
-    /// `algorithm`'s.
-    pub unsafe fn run(
+    /// Before any cuBLASLt call, every range is checked against what the
+    /// descriptor's shapes need ([`MatmulDescriptor::bytes`]), the bias range
+    /// against [`Epilogue::Bias`]'s vector, and the workspace against
+    /// `algorithm`'s need; a range too small is refused by name. The caller
+    /// keeps the storage alive until the stream work completes.
+    pub fn run(
         &self,
         descriptor: &MatmulDescriptor,
         algorithm: &Algorithm,
@@ -540,19 +584,41 @@ impl Matmul {
         stream: &Stream,
     ) -> Result<()> {
         descriptor.check()?;
-        if args.workspace_bytes < algorithm.workspace_bytes {
+        let bytes = descriptor.bytes();
+        require_room(args.a, bytes.a, "A")?;
+        require_room(args.b, bytes.b, "B")?;
+        require_room(args.c, bytes.c, "C")?;
+        require_room(args.d, bytes.d, "D")?;
+        if descriptor.epilogue == Epilogue::Bias {
+            require_room(args.bias, bytes.bias, "bias")?;
+        }
+        if args.workspace.bytes() < algorithm.workspace_bytes {
             return Err(Error::invalid(format!(
                 "the multiplication needs {} bytes of workspace, {} given",
-                algorithm.workspace_bytes, args.workspace_bytes
+                algorithm.workspace_bytes,
+                args.workspace.bytes()
+            )));
+        }
+        if stream.device() != self.device {
+            return Err(Error::invalid(format!(
+                "the multiplication runs on {}, not on {}'s stream",
+                self.device,
+                stream.device()
             )));
         }
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let descriptions = Descriptions::new(self.api, descriptor)?;
         if descriptor.epilogue == Epilogue::Bias {
-            descriptions.set_bias(self.api, args.bias, descriptor.bias_type())?;
+            descriptions.set_bias(self.api, args.bias.ptr().address(), descriptor.bias_type())?;
         }
         let (alpha, beta) = (args.alpha, args.beta);
+        // The row-major form reaches the library with its operands swapped,
+        // so the pointers go where their layouts went.
+        let (left, right) = match descriptor.order {
+            Order::ColumnMajor => (args.a, args.b),
+            Order::RowMajor => (args.b, args.a),
+        };
         // SAFETY: forwarded from the caller; every pointer is device storage
         // live for the launch, every descriptor is live, the stream is live.
         self.api.check(
@@ -561,18 +627,18 @@ impl Matmul {
                     self.handle,
                     descriptions.matmul,
                     std::ptr::from_ref(&alpha).cast(),
-                    args.a as *const c_void,
+                    left.ptr().address() as *const c_void,
                     descriptions.a,
-                    args.b as *const c_void,
+                    right.ptr().address() as *const c_void,
                     descriptions.b,
                     std::ptr::from_ref(&beta).cast(),
-                    args.c as *const c_void,
+                    args.c.ptr().address() as *const c_void,
                     descriptions.c,
-                    args.d as *mut c_void,
+                    args.d.ptr().address() as *mut c_void,
                     descriptions.d,
                     &algorithm.bytes,
-                    args.workspace as *mut c_void,
-                    args.workspace_bytes,
+                    args.workspace.ptr().address() as *mut c_void,
+                    args.workspace.bytes(),
                     stream.handle(),
                 )
             },
@@ -622,9 +688,15 @@ impl Descriptions {
             c: std::ptr::null_mut(),
             d: std::ptr::null_mut(),
         };
+        // The library's "A" is the caller's left operand in column-major
+        // order, and its right one in row-major order: `Dᵀ = Bᵀ · Aᵀ`.
+        let (left, right) = match descriptor.order {
+            Order::ColumnMajor => (&descriptor.a, &descriptor.b),
+            Order::RowMajor => (&descriptor.b, &descriptor.a),
+        };
         for (slot, layout) in [
-            (&mut descriptions.a, &descriptor.a),
-            (&mut descriptions.b, &descriptor.b),
+            (&mut descriptions.a, left),
+            (&mut descriptions.b, right),
             (&mut descriptions.c, &descriptor.c),
             (&mut descriptions.d, &descriptor.d),
         ] {
@@ -799,6 +871,42 @@ impl Drop for Preference {
 mod tests {
     use super::*;
 
+    /// Every attribute number this binding passes to cuBLASLt is compared
+    /// with `cublasLt.h`: the workspace preference was 0, which is the search
+    /// mode attribute, and every heuristic call was refused for it. A wrong
+    /// number here is never a compile error.
+    #[test]
+    fn the_attribute_numbers_are_the_headers() {
+        crate::header::assert_constants(
+            "cublasLt.h",
+            &[
+                (
+                    "CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES",
+                    PREFERENCE_WORKSPACE_SIZE as i64,
+                ),
+                ("CUBLASLT_MATMUL_DESC_TRANSA", DESC_TRANSA as i64),
+                ("CUBLASLT_MATMUL_DESC_TRANSB", DESC_TRANSB as i64),
+                ("CUBLASLT_MATMUL_DESC_EPILOGUE", DESC_EPILOGUE as i64),
+                (
+                    "CUBLASLT_MATMUL_DESC_BIAS_POINTER",
+                    DESC_BIAS_POINTER as i64,
+                ),
+                (
+                    "CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE",
+                    DESC_BIAS_DATA_TYPE as i64,
+                ),
+                (
+                    "CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT",
+                    LAYOUT_BATCH_COUNT as i64,
+                ),
+                (
+                    "CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET",
+                    LAYOUT_BATCH_STRIDE as i64,
+                ),
+            ],
+        );
+    }
+
     #[test]
     fn a_recorded_algorithm_round_trips_through_its_tuning_bytes() {
         let algorithm = Algorithm::from_bytes(&[7u8; 64], 4096);
@@ -827,14 +935,20 @@ mod tests {
             }
         );
         assert_eq!((descriptor.b.rows, descriptor.b.cols), (6, 3));
-        assert!(descriptor.transpose_a && descriptor.transpose_b);
+        // The row-major form reaches the library swapped, not transposed.
+        assert_eq!(descriptor.order, Order::RowMajor);
+        assert!(!descriptor.transpose_a && !descriptor.transpose_b);
         assert_eq!(
             descriptor.bytes(),
             MatmulBytes {
                 a: 4 * 3 * 2,
                 b: 3 * 6 * 2,
                 c: 4 * 6 * 2,
-                d: 4 * 6 * 2
+                d: 4 * 6 * 2,
+                // One bias vector for every batch: the rows of D as
+                // cuBLASLt sees it, which for a row-major descriptor are the
+                // matrix's columns (6), of D's type (2 bytes).
+                bias: 6 * 2,
             }
         );
     }
