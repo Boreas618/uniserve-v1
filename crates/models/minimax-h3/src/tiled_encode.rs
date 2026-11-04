@@ -25,7 +25,7 @@
 //!   (`:51-56`). [`Tile::above`] and [`Tile::left`] name those reads, and the driver keeps a second
 //!   raster for them.
 
-use crate::encoding::{Grid, SPATIAL_RATIO, VideoEncoder};
+use crate::encoding::{Extent, Grid, SPATIAL_RATIO, VideoEncoder};
 use crate::{Error, Result};
 use nn::layers::CrossFade;
 use nn::{DType, Forward, Shape, Strides, TensorView};
@@ -76,6 +76,24 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The pixel extent each tile of the run encodes, one per tile in plan order.
+    ///
+    /// This is what a driver passes to `VideoEncoder::reserve` before its loop: the reservation is
+    /// made once for the whole run, because the arena never rewinds inside a forward. A grid's tiles
+    /// are uniform - `Seams::split` keeps every tile at the raster's tile size and spends the slack on
+    /// wider seams, so the grid's multiset of extents is one - and a raster smaller than a tile is one
+    /// tile of the raster's own size.
+    pub fn tile_extents(&self, frames: u32) -> Vec<Extent> {
+        self.tiles
+            .iter()
+            .map(|tile| Extent {
+                frames,
+                height: tile.rows.1 * SPATIAL_RATIO,
+                width: tile.columns.1 * SPATIAL_RATIO,
+            })
+            .collect()
+    }
+
     /// The latent rows the run covers before the crop, as `(origin, end)`, `end` exclusive.
     ///
     /// A run of `end - origin` latent rows is what the caller's two rasters must hold; the crop then
@@ -100,6 +118,12 @@ impl Plan {
 #[derive(Clone, Copy, Debug)]
 pub struct Scene<'a> {
     /// Tile `i`'s pixels, `[1, in_channels, frames, tile_height, tile_width]`, in plan order.
+    ///
+    /// Each view is **packed**: `nn::layers::FramePad` pads a frame's rows in place of the source's
+    /// own, so it requires a frame's rows to be contiguous in the view it reads, and a tile cut from a
+    /// wider raster has the raster's row stride instead of the tile's width. A caller whose raster is
+    /// one buffer therefore copies each tile's block out first (one tile is a few megabytes against the
+    /// encoder's set); a caller that uploads tiles as separate buffers passes them as they are.
     pub pixels: &'a [TensorView],
     /// The run's stitched latents, `[channels, frames, run_rows, latent_columns]`.
     pub blended: TensorView,
@@ -226,6 +250,18 @@ impl ClipEncoder {
             return Err(Error::config("a tiled encoding without a tile".to_owned()));
         }
 
+        // One reservation for the whole run, before the loop: the arena never rewinds inside a
+        // forward, so a reservation inside the loop is multiplied by the tile count, and one tile's
+        // buffers are most of a gigabyte at the served canvas. The grid's tiles are uniform
+        // (`Seams::split` keeps every tile at the raster's tile size and spends the slack on wider
+        // seams), so the plan's tiles are one extent; the list is passed whole because a raster
+        // smaller than a tile is the case where they would not be.
+        let frames = pixels
+            .first()
+            .map(|tile| u32::try_from(tile.shape.dim(2)).unwrap_or(0))
+            .unwrap_or(0);
+        let scratch = encoder.reserve(f, &plan.tile_extents(frames))?;
+
         let block = Shape::new(&[
             blended.shape.dim(0),
             blended.shape.dim(1),
@@ -272,7 +308,7 @@ impl ClipEncoder {
                 ]),
                 Strides::new(&[strides[0], strides[0], strides[1], strides[2], strides[3]]),
             );
-            encoder.encode(f, pixels[index], out)?;
+            encoder.encode_tile(f, &scratch, pixels[index], out)?;
 
             let placed = self.place_in(blended, plan, tile, block)?;
             let above = match tile.fades_above() {
@@ -431,6 +467,7 @@ mod tests {
     //! written down.
 
     use super::*;
+    use crate::config::CLIP_FRAMES;
 
     /// The 768 by 1344 canvas the fixtures use: 48 by 84 latents, four tile rows and seven columns.
     fn canvas() -> ClipEncoder {
@@ -505,6 +542,40 @@ mod tests {
         // A served canvas passes: 768 by 1344 and 480 by 832 are both multiples of the compression.
         assert!(ClipEncoder::new(768, 1344).is_ok());
         assert!(ClipEncoder::new(480, 832).is_ok());
+    }
+
+    #[test]
+    fn a_run_reserves_one_set_of_buffers_because_its_tiles_are_uniform() {
+        // The driver reserves the encoder's buffers once, before its loop over the plan's tiles: the
+        // arena never rewinds inside a forward, so a per-tile reservation is multiplied by the tile
+        // count. That reservation is sound exactly while the plan's tiles share an extent, and
+        // `Seams::split` is what guarantees it - it keeps every tile at the raster's tile size and
+        // spends the slack of a canvas that does not divide evenly on wider seams, which is why a
+        // 1344-pixel raster is seven 256-pixel tiles whose first seams are 80 pixels.
+        let encoder = canvas();
+        let plan = encoder.plan();
+        let extents = plan.tile_extents(CLIP_FRAMES);
+        assert_eq!(extents.len(), plan.tiles.len());
+        for extent in &extents {
+            assert_eq!(*extent, extents[0]);
+        }
+
+        // The one extent is the raster's tile, in pixels, and it is the tile's latent extent scaled
+        // back up - the same factor the split is aligned to.
+        let tile = &plan.tiles[0];
+        assert_eq!(
+            (extents[0].height, extents[0].width),
+            (tile.rows.1 * SPATIAL_RATIO, tile.columns.1 * SPATIAL_RATIO)
+        );
+        assert_eq!(extents[0].frames, CLIP_FRAMES);
+
+        // A raster smaller than a tile is one tile of the raster's own size, so the same reservation
+        // rule holds there: one extent, not the tile's.
+        let small = ClipEncoder::new(256, 256).expect("a fourth of a tile");
+        let plan = small.plan();
+        let extents = plan.tile_extents(CLIP_FRAMES);
+        assert_eq!(plan.tiles.len(), 1);
+        assert_eq!((extents[0].height, extents[0].width), (256, 256));
     }
 
     #[test]

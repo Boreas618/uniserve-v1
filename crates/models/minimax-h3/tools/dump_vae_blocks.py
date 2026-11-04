@@ -48,6 +48,11 @@ from torch import nn
 VIDEO_LATENT_FRAMES = 7
 VIDEO_LATENT_SIDE = 16
 AUDIO_LATENT_FRAMES = 20
+# The encoder reads pixels, so its fixed input is one tile of one clip: the
+# checkpoint's 256-pixel tile, and the clip length its own config states.
+TILE_SIDE = 256
+# One clip's frames: the encoder reads a still or a clip, never a fraction.
+ENCODER_FRAMES = 17
 SEED = 0
 
 # The compute dtypes a caller may load the reference's parameters in; the checkpoint's own is the
@@ -64,10 +69,11 @@ DTYPES = {
 VIDEO_LAYERS = (0, 3)
 CATALOGUE = {
     "video_decoder": (
-        (
-            "decoder.post_quant_conv",
-            "the latents after the 1x1x1 post-quantisation projection, before unpatchifying",
-        ),
+        # The reference's `decoder.post_quant_conv` is deliberately **not** a probe: this implementation
+        # folds the latent statistics, that one-by-one projection and the transformer's input projection
+        # into one affine at load (design 10 declares the composition, and the fold's own test checks the
+        # three steps against it). A probe of it could only ever be "not dumped by the Rust side", which
+        # a report reads as a hole rather than as the declared deviation it is.
         (
             "decoder.decoder.input",
             "the transformer's input projection: one row per latent voxel plus the register tokens",
@@ -94,6 +100,28 @@ CATALOGUE = {
         ),
         ("decoder.decoder.norm", "the transformer's final norm"),
         ("decoder.decoder.output", "the transformer's output projection to pixels"),
+    ),
+    "video_encoder": (
+        # The condition path's first half, which had no probe at all. These
+        # four localise a divergence to the input convolution, the first
+        # stage's blocks and downsampling, the moment convolution, or the
+        # one-by-one projection that follows the stitch.
+        (
+            "encoder.input",
+            "the input convolution, unbiased: normalized pixels to width 0",
+        ),
+        (
+            "encoder.stages.0",
+            "stage 0's output: two blocks then its downsampling",
+        ),
+        (
+            "encoder.output",
+            "the moment convolution, after the final norm and activation",
+        ),
+        (
+            "quant_conv",
+            "the projection the condition stage reads the posterior from",
+        ),
     ),
     "audio_decoder": (
         ("decoder.input", "the latent to the decoder's width"),
@@ -127,6 +155,13 @@ def latent_shape(component: str) -> tuple[int, ...]:
         # [batch, channels, latent frames, latent height, latent width]; the channel count is the
         # checkpoint's own and is checked against the module below.
         return (1, 0, VIDEO_LATENT_FRAMES, VIDEO_LATENT_SIDE, VIDEO_LATENT_SIDE)
+    if component == "video_encoder":
+        # [batch, channels, frames, height, width] of normalized pixels: one
+        # 256-pixel tile of one clip. The values are a standard normal draw,
+        # which is *not* what a real condition looks like - a normalized pixel
+        # is bounded - so this is the reference's own reproducible value, to be
+        # replayed by whichever case writes the same raster on the crate side.
+        return (1, 0, ENCODER_FRAMES, TILE_SIDE, TILE_SIDE)
     if component == "audio_decoder":
         # [stereo, channels, frames]: each stereo channel is one batch row.
         return (2, 0, AUDIO_LATENT_FRAMES)
@@ -139,6 +174,9 @@ def build(component: str, config):
 
     if component == "video_decoder":
         return video_vae.Model(config.video_vae)
+    if component == "video_encoder":
+        # The reference's own encoder: the causal network, then the projection.
+        return video_vae.Encoder(config.video_vae)
     return audio_vae.Model(config.audio_vae)
 
 
@@ -155,6 +193,15 @@ def mapping(component: str, module):
             lambda reader: video_vae.assignments(module, reader),
             frozenset(name for name, _ in module.named_parameters()),
         )
+    if component == "video_encoder":
+        from uniserve.models.minimax_h3 import video_vae
+
+        return weights.ModuleMapping(
+            module,
+            "video_encoder",
+            lambda reader: video_vae.encoder_assignments(module, reader),
+            frozenset(name for name, _ in module.named_parameters()),
+        )
     from uniserve.models.minimax_h3 import audio_vae
 
     return weights.ModuleMapping(
@@ -169,7 +216,9 @@ def component_source(name: str, checkpoint: Path):
     """The checkpoint source for one component: the files the loader would read its weights from."""
     from uniserve.loading import checkpoint as checkpoint_module
 
-    directory = checkpoint / ("vae" if name == "video_decoder" else "audio_vae")
+    directory = checkpoint / (
+        "audio_vae" if name == "audio_decoder" else "vae"
+    )
     files = tuple(sorted(directory.glob("*.safetensors")))
     if not files:
         index = directory / "diffusion_pytorch_model.safetensors.index.json"
@@ -243,6 +292,14 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001 - the first line of a bad checkpoint path
         print(f"CONFIG FAILED: {type(error).__name__}: {error}")
         return 1
+    if component == "video_encoder":
+        clip = sidecars.video_vae.clip_length
+        if clip != ENCODER_FRAMES:
+            print(
+                f"CONFIG FAILED: the checkpoint's clip_length is {clip}, and"
+                f" this probe's fixed input is one {ENCODER_FRAMES}-frame clip"
+            )
+            return 1
     module = build(component, sidecars)
     # The channel count is the checkpoint's; the fixed input only fixes the extents.
     shape = latent_shape(component)
@@ -311,6 +368,18 @@ def _latent_channels(component: str, config, module: nn.Module) -> int:
     take the latent width, so the module itself names it; the config is asked first so a mismatch
     between the two stops here rather than three tiles into a decode.
     """
+    if component == "video_encoder":
+        # The encoder reads pixels and writes the posterior's two fields; the
+        # config is asked first so a mismatch stops here rather than one stage
+        # into an encode.
+        expected = config.video_vae.in_channels
+        found = module.encoder.input.in_channels
+        if expected != found:
+            raise SystemExit(
+                f"{component}: the config says {expected} input channels,"
+                f" the module expects {found}"
+            )
+        return found
     expected = (
         config.video_vae.latent_channels
         if component == "video_decoder"

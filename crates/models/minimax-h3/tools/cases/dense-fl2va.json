@@ -1,14 +1,43 @@
 {
-  "canvas": {"width": 1344, "height": 768},
+  "canvas": {
+    "width": 1344,
+    "height": 768
+  },
   "num_frames": 124,
   "num_text_tokens": 1935,
   "text_capacity": 2048,
   "condition_capacity": 2048,
   "token_multiple": 64,
-  "attention": {"kind": "dense"},
+  "attention": {
+    "kind": "dense"
+  },
   "conditions": [
-    {"role": "first_frame", "canvas": {"width": 1344, "height": 768}, "frames": 1},
-    {"role": "last_frame", "canvas": {"width": 1344, "height": 768}, "frames": 1}
+    {
+      "role": "first_frame",
+      "canvas": {
+        "width": 1344,
+        "height": 768
+      },
+      "frames": 1
+    },
+    {
+      "role": "last_frame",
+      "canvas": {
+        "width": 1344,
+        "height": 768
+      },
+      "frames": 1
+    }
   ],
-  "vision_spans": [[5, 10]]
+  "vision_spans": [
+    [
+      5,
+      10
+    ]
+  ],
+  "clip": {
+    "frames": 17,
+    "latents": 5,
+    "token_drop": 3
+  }
 }

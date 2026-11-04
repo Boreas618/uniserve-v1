@@ -73,7 +73,14 @@ fn run() -> Result<String, String> {
         .iter()
         .map(|condition| condition.condition())
         .collect::<Result<_, _>>()?;
-    let segments = packing::condition_segments(&conditions, &canvas).map_err(problem)?;
+    // The condition's count is the encoder's clip rule, which the case states: the reference's own
+    // `video_vae` numbers, so the two sides cannot disagree about how a clip is cut.
+    let clip = minimax_h3::encoding::Clip {
+        frames: case.clip.frames,
+        latents: case.clip.latents,
+        token_drop: case.clip.token_drop,
+    };
+    let segments = packing::condition_segments(&conditions, &canvas, clip).map_err(problem)?;
     let spans: Vec<(u32, u32)> = case.vision_spans.to_vec();
 
     let mut tensors: Vec<Named> = Vec::new();
@@ -326,6 +333,7 @@ fn problem(error: minimax_h3::Error) -> String {
 #[derive(Deserialize)]
 struct Case {
     canvas: Size,
+    clip: CaseClip,
     num_frames: u32,
     num_text_tokens: u32,
     text_capacity: u32,
@@ -336,6 +344,14 @@ struct Case {
     conditions: Vec<CaseCondition>,
     #[serde(default)]
     vision_spans: Vec<(u32, u32)>,
+}
+
+/// The checkpoint's encoder clip rule, which the condition's latent count follows.
+#[derive(Deserialize, Clone, Copy)]
+struct CaseClip {
+    frames: u32,
+    latents: u32,
+    token_drop: u32,
 }
 
 #[derive(Deserialize, Clone, Copy)]

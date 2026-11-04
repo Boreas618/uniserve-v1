@@ -26,7 +26,8 @@
 //! frame is entirely the predecessor's and the fifth one fifth the successor's.
 
 use nn::Shape;
-use nn::layers::{CrossFade, RgbBytes};
+use nn::capability::StateTable;
+use nn::layers::{RgbBytes, ScaledAdd};
 use nn::{DType, Forward, TensorView, Weight};
 
 use crate::config::CLIP_FRAMES;
@@ -209,12 +210,13 @@ impl Splice {
 /// The blend is `CrossFade` on the **frames** axis: the two sources are each one contiguous block (a
 /// `[3, 25, H, W]` clip and a `[3, 5, H, W]` tail), which is the operator's condition, and the frames'
 /// weights are the ones it applies along the leading positions of its axis, and they are the reference's
-/// to the rounding: the operator builds its ramp as `position / extent` **in the raster's dtype**, which
-/// is `torch.arange(5, dtype=…)/5` in `output.py`, so the blend needs no declared deviation. The
-/// arithmetic is the reference's decoded-precision blend followed by the FP32 de-normalization, in that
-/// order: the de-normalization is [`RgbBytes`]' and reads the same constants the checkpoint publishes.
+/// to the rounding: the weights are `i / 5` for frame `i` of the overlap, which is
+/// `torch.arange(5, dtype=torch.float16)/5` in `output.py`, and each frame is two `scaled_add` launches
+/// with those two host scalars. The ramp is built here in FP32 where the reference builds it in the
+/// raster's type: one declared deviation, at the ramp's last bit and not in the blend's arithmetic. The arithmetic is the reference's decoded-precision
+/// blend followed by the FP32 de-normalization, in that order: the de-normalization is [`RgbBytes`]' and
+/// reads the same constants the checkpoint publishes.
 pub struct VideoPostprocessor {
-    fade: CrossFade,
     bytes: RgbBytes,
     dtype: DType,
 }
@@ -224,14 +226,7 @@ impl VideoPostprocessor {
     ///
     /// `mean` and `std` are the checkpoint's `[3]` de-normalization constants, published by the loader.
     pub fn new(dtype: DType, mean: Weight, std: Weight) -> Result<Self> {
-        let fade = CrossFade::new(dtype, OVERLAP_FRAMES, 1).map_err(|error| {
-            Error::config(format!(
-                "the clip splice fades five frames of the frames axis, and CrossFade refuses axis 1: \
-                 {error}"
-            ))
-        })?;
         Ok(Self {
-            fade,
             bytes: RgbBytes::new(dtype, Rgb::CHANNELS, mean, std)?,
             dtype,
         })
@@ -271,17 +266,182 @@ impl VideoPostprocessor {
             Some(previous) => {
                 raster.check_previous(previous, self.dtype)?;
                 let blended = f.arena().tensor(clip.dtype, clip.shape)?;
-                self.fade.forward(f, Some(previous), clip, blended)?;
+                self.blend(f, &raster, previous, clip, splice.overlap, blended)?;
                 blended
             }
             None => clip,
         };
-        self.bytes.forward(f, raster.body(source, splice)?, out)?;
-        if splice.last {
+        // The byte step writes as many frames as it reads, so each range goes to its own slice of `out`:
+        // the body to the clip's kept frames, and the last clip's tail after them. Handing `out` whole to
+        // either write would be refused by the layer's own shape check, and the tail written at the front
+        // of a wider output would overwrite the body's first frames.
+        let (body_out, tail_out) = raster.destinations(out, splice)?;
+        self.bytes
+            .forward(f, raster.body(source, splice)?, body_out)?;
+        if let Some(tail_out) = tail_out {
             self.bytes
-                .forward(f, raster.written(source, splice.overlap)?, out)?;
+                .forward(f, raster.written(source, splice.overlap)?, tail_out)?;
         }
         Ok(())
+    }
+}
+
+impl VideoPostprocessor {
+    /// Fade the clip in against its predecessor, five frames at a time.
+    ///
+    /// The reference's weights are `i/5` for frame `i` of the overlap, `0` to `0.8`: the blend is
+    /// `previous · (1 − w) + clip · w`. The two scalars the sum takes are host values, so each frame is two
+    /// launches of the operator every other sum in the model uses. The reference builds its ramp in the
+    /// raster's type and this one in FP32; the products and the sum are FP32 either way and round to the
+    /// raster once, so the difference is at most the ramp's own last bit. `CrossFade` is the row-and-column seam blend and refuses the frames axis; a
+    /// blend along frames is not that operator with another argument, and this is the arithmetic with the
+    /// operands a raster has - one contiguity per channel per frame, which is what `scaled_add` reads.
+    fn blend(
+        &self,
+        f: &Forward,
+        raster: &Raster,
+        previous: TensorView,
+        clip: TensorView,
+        overlap: (u32, u32),
+        blended: TensorView,
+    ) -> Result<()> {
+        let count = overlap.1 - overlap.0;
+        let pixels = u64::from(raster.height) * u64::from(raster.width);
+        for channel in 0..u64::from(Rgb::CHANNELS) {
+            for frame in 0..count {
+                // The reference weights the *current* clip `i/5` over the five frames: `0, 0.2, ..., 0.8`,
+                // so the first blended frame is entirely the predecessor's and the last keeps a fifth of
+                // it. A ramp that started at `1/5` would drop the predecessor from the last frame.
+                let weight = frame as f32 / count as f32;
+                let target = TensorView::new(
+                    blended.element(&[channel, u64::from(overlap.0 + frame), 0, 0]),
+                    blended.dtype,
+                    Shape::new(&[1, pixels]),
+                );
+                let source = TensorView::new(
+                    previous.element(&[channel, u64::from(frame), 0, 0]),
+                    previous.dtype,
+                    Shape::new(&[1, pixels]),
+                );
+                // `target ← (1 − w) · previous + w · clip`, in two steps because the operator scales its own
+                // target: the adjacent frame of the clip is only read.
+                ScaledAdd.forward(f, target, source, 1.0, 0.0)?;
+                let current = TensorView::new(
+                    clip.element(&[channel, u64::from(overlap.0 + frame), 0, 0]),
+                    clip.dtype,
+                    Shape::new(&[1, pixels]),
+                );
+                ScaledAdd.forward(f, target, current, weight, 1.0 - weight)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl nn::capability::Decoder for VideoPostprocessor {
+    /// No tables: the splice's parameters are its arguments, not state.
+    ///
+    /// The preprocessor holds two `[3]` constants the load reads once, and every other number a splice
+    /// needs - which frames it keeps, how many fade, where on the timeline it writes - arrives as the
+    /// [`nn::capability::Splice`] the runner passes. So an empty list is the *correct* answer for this
+    /// block, not a refusal, and a runner that asks must get it.
+    fn layout_tables(&self, _layout: &nn::capability::Layout) -> Vec<StateTable> {
+        Vec::new()
+    }
+
+    /// Nothing to prepare, for the reason above: `layout_tables` answers no tables, so there are no
+    /// bytes to write and `out` must already be empty.
+    fn prepare_layout(
+        &self,
+        _layout: &nn::capability::Layout,
+        out: &mut [Vec<u8>],
+    ) -> nn::Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        Err(nn::Error::Shape {
+            owner: "VideoPostprocessor",
+            problem: format!(
+                "a postprocessor has no layout tables, and {} buffers were offered",
+                out.len()
+            ),
+        })
+    }
+
+    /// Refuse: the postprocessor has no latents to decode.
+    ///
+    /// It is a named block of the decoder kind because the splice is a decode of the *timeline*, not of one
+    /// clip, and placing it under its own name is what lets a deployment serve without it. A runner that
+    /// asks it to decode a clip hears which operation it should have called.
+    fn decode(
+        &self,
+        f: &Forward,
+        latents: TensorView,
+        state: &[TensorView],
+        out: nn::capability::DecodedMedia,
+    ) -> nn::Result<()> {
+        let _ = (f, latents, state, out);
+        Err(nn::Error::Shape {
+            owner: "VideoPostprocessor",
+            problem: "a postprocessor splices; it decodes nothing".to_owned(),
+        })
+    }
+
+    /// Write one clip's kept frames into the timeline, fading it against its predecessor.
+    ///
+    /// `previous` is the predecessor's own decode of the frames the two share,
+    /// `[channels, splice.overlap, rows, columns]`, and is absent for the timeline's first clip;
+    /// `out.video` is the whole timeline's byte raster `[frames, rows, columns, channels]`, whose frames at
+    /// `splice.first` this writes. The clip keeps `splice.keep` frames from its first, so the clip that ends
+    /// the timeline - the one that keeps its tail as well - states a larger `keep`, which is this block's
+    /// own `last`.
+    fn splice(
+        &self,
+        f: &Forward,
+        previous: Option<TensorView>,
+        clip: TensorView,
+        splice: nn::capability::Splice,
+        out: nn::capability::DecodedMedia,
+    ) -> nn::Result<()> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoPostprocessor",
+            problem,
+        };
+        let video = out
+            .video
+            .ok_or_else(|| refuse("a splice writes a timeline's raster".to_owned()))?;
+        if out.audio.is_some() {
+            return Err(refuse("a splice writes no audio".to_owned()));
+        }
+        if splice.overlap > OVERLAP_FRAMES {
+            return Err(refuse(format!(
+                "{} frames of overlap, and the checkpoint fades {OVERLAP_FRAMES}",
+                splice.overlap
+            )));
+        }
+        let raster = Raster::of(clip).map_err(|error| refuse(format!("{error}")))?;
+        // The checkpoint's clip is 25 decoded frames: 17 the timeline keeps and, after three padding
+        // frames, a five-frame tail. A clip a successor follows hands that tail on; the clip that ends the
+        // timeline keeps it, which the runner states by keeping frames beyond the body.
+        let internal = Splice {
+            body: (0, CLIP_FRAMES),
+            overlap: (CLIP_OUTPUT_FRAMES - splice.overlap, CLIP_OUTPUT_FRAMES),
+            last: splice.keep > CLIP_FRAMES,
+        };
+        // The clip's frames go where the runner says they do, so the view handed to the write starts at
+        // `first`: the raster is `[frames, rows, columns, channels]` and a frame is one contiguous block.
+        let view = TensorView::new(
+            video.element(&[u64::from(splice.first), 0, 0, 0]),
+            DType::U8,
+            Shape::new(&[
+                u64::from(Self::frames(&internal)),
+                u64::from(raster.height),
+                u64::from(raster.width),
+                u64::from(Rgb::CHANNELS),
+            ]),
+        );
+        self.forward(f, previous, clip, &internal, view)
+            .map_err(|error| refuse(format!("{error}")))
     }
 }
 
@@ -355,6 +515,29 @@ impl Raster {
         self.written(raster, splice.body)
     }
 
+    /// The frames of `out` each write goes to: the body's, and the last clip's tail after them.
+    ///
+    /// `out` is `[frames, rows, columns, channels]` bytes for the whole clip, and a write covers exactly
+    /// the frames its source reads, so a clip that keeps its own tail needs two destination views.
+    fn destinations(
+        &self,
+        out: TensorView,
+        splice: &Splice,
+    ) -> Result<(TensorView, Option<TensorView>)> {
+        let keep = splice.body.1 - splice.body.0;
+        let body = frames_of(out, 0, keep)?;
+        let tail = if splice.last {
+            Some(frames_of(
+                out,
+                keep,
+                keep + (splice.overlap.1 - splice.overlap.0),
+            )?)
+        } else {
+            None
+        };
+        Ok((body, tail))
+    }
+
     /// The output view of one clip: `[frames, rows, columns, channels]` bytes.
     fn check_out(&self, out: TensorView, splice: &Splice) -> Result<()> {
         let frames = u64::from(splice.frames());
@@ -421,13 +604,40 @@ pub fn splice_arena(
     };
     let (height, width) = canvas.pixels(config);
     Ok(vec![Buffer {
-        name: "blended",
+        name: "blended".to_owned(),
         element,
         elements: u64::from(Rgb::CHANNELS)
             * u64::from(crate::decoding::CLIP_OUTPUT_FRAMES)
             * u64::from(height)
             * u64::from(width),
     }])
+}
+
+/// The frames `start..stop` of an output raster: `[frames, rows, columns, channels]` bytes.
+///
+/// The last axis is dense, so a frame slice is that frame's own element address and a narrowed first
+/// extent; the strides are the raster's own, which keeps the view right for a raster that is itself a
+/// slice of a larger buffer.
+fn frames_of(out: TensorView, start: u32, stop: u32) -> Result<TensorView> {
+    let shape = out.shape;
+    if shape.rank() != 4 || start >= stop || shape.dim(0) < u64::from(stop) {
+        return Err(Error::config(format!(
+            "frames {start}..{stop} of a {}-frame output raster do not exist",
+            shape.dim(0)
+        )));
+    }
+    let element = out.element(&[u64::from(start), 0, 0, 0]);
+    Ok(TensorView::with_strides(
+        element,
+        out.dtype,
+        Shape::new(&[
+            u64::from(stop - start),
+            shape.dim(1),
+            shape.dim(2),
+            shape.dim(3),
+        ]),
+        nn::Strides::new(out.strides.as_slice()),
+    ))
 }
 
 /// The whole timeline of `clips` clips: how many frames it writes.
@@ -479,6 +689,69 @@ mod tests {
             }
         };
         assert!(RgbBytes::new(DType::F16, 2, two, constants(PIXEL_STD)).is_err());
+    }
+
+    #[test]
+    fn the_last_clips_tail_is_written_after_its_body() {
+        // A `[frames, rows, columns, channels]` output raster of 22 frames, the last clip's own count:
+        // its body goes to the first 17 and its tail to the 5 after them. Handing the whole raster to
+        // either write is what the byte layer refuses, and writing the tail at the front would overwrite
+        // the body - so the destination views are the contract this test pins.
+        let (height, width) = (4u32, 6u32);
+        let channels = Rgb::CHANNELS;
+        let out = TensorView::with_strides(
+            nn::DevicePtr::new(0),
+            DType::U8,
+            Shape::new(&[22, u64::from(height), u64::from(width), u64::from(channels)]),
+            nn::Strides::new(&[
+                u64::from(height) * u64::from(width) * u64::from(channels),
+                u64::from(width) * u64::from(channels),
+                u64::from(channels),
+                1,
+            ]),
+        );
+        let raster = Raster {
+            frames: 25,
+            height,
+            width,
+        };
+        let (body, tail) = raster
+            .destinations(out, &Splice::LAST)
+            .expect("the last clip's two destinations");
+        assert_eq!(
+            body.shape.dims()[0],
+            u64::from(Splice::LAST.body.1 - Splice::LAST.body.0)
+        );
+        assert_eq!(body.element(&[0, 0, 0, 0]).address(), 0);
+        let tail = tail.expect("the last clip keeps its tail");
+        assert_eq!(
+            tail.shape.dims()[0],
+            u64::from(Splice::LAST.overlap.1 - Splice::LAST.overlap.0)
+        );
+        // The tail starts at the body's end, which is the 17th frame's own address.
+        assert_eq!(
+            tail.element(&[0, 0, 0, 0]).address(),
+            out.element(&[17, 0, 0, 0]).address()
+        );
+        // A clip that is not last writes one destination, and it is the body.
+        let (body, tail) = raster
+            .destinations(
+                TensorView::with_strides(
+                    nn::DevicePtr::new(0),
+                    DType::U8,
+                    Shape::new(&[17, u64::from(height), u64::from(width), u64::from(channels)]),
+                    nn::Strides::new(&[
+                        u64::from(height) * u64::from(width) * u64::from(channels),
+                        u64::from(width) * u64::from(channels),
+                        u64::from(channels),
+                        1,
+                    ]),
+                ),
+                &Splice::CLIP,
+            )
+            .expect("the interior clip's destination");
+        assert_eq!(body.shape.dims()[0], 17);
+        assert!(tail.is_none());
     }
 
     #[test]

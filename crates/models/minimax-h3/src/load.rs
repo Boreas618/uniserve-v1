@@ -27,7 +27,7 @@ use nn::{Block, BlockName};
 use crate::audio_vae::AudioDecoder;
 use crate::checkpoint::{Dit, Layout, Sidecars};
 use crate::config::Config;
-use crate::denoiser::{Denoiser, Layouts};
+use crate::denoiser::{ConditionEncoders, Denoiser, Layouts};
 use crate::schedule::Schedule;
 use crate::text_encoder::TextEncoder;
 use crate::transformer::StudentHeads;
@@ -58,6 +58,17 @@ pub fn load(
     let (layout, sidecars) = sidecars(checkpoint)?;
     let config = Config::normalize(&layout, &sidecars)?;
     partition.validate(&config)?;
+
+    // The two condition encoders are the denoiser block's half, and they are loaded before the
+    // loop because a block is boxed as it is built: the partition places `transformer` before
+    // `latent_encoder`, so by the time the encoders' own component is reached the denoiser is a
+    // `Block::Denoiser` and the concrete block that holds them is out of reach. A deployment whose
+    // tasks carry no conditions places none.
+    let mut encoders = if partition.blocks.contains(Component::LatentEncoder) {
+        Some(ConditionEncoders::load(&config, checkpoint, loader)?)
+    } else {
+        None
+    };
 
     let mut blocks = Vec::new();
     for component in partition.blocks.iter() {
@@ -109,7 +120,7 @@ pub fn load(
                 } else {
                     None
                 };
-                let denoiser = Denoiser::load(
+                let mut denoiser = Denoiser::load(
                     denoiser.clone(),
                     arrangement,
                     rows,
@@ -117,7 +128,39 @@ pub fn load(
                     &mut shards,
                     heads,
                 )?;
+                // The encoders are this block's conditioning half. Only one DiT partition can be
+                // placed on a rank (`Partition::validate` refuses both), so at most one arm takes
+                // them; `attach_encoders` refuses a second attach as well.
+                if let Some(encoders) = encoders.take() {
+                    denoiser.attach_encoders(encoders)?;
+                }
                 Block::Denoiser(Box::new(denoiser))
+            }
+            Component::VideoPostprocessor => {
+                // Weightless: the splice's only constants are the reference's ImageNet means and standard
+                // deviations, uploaded once as the two `[3]` weights the byte step reads.
+                let dtype = Component::VideoDecoder.activation();
+                let bytes = |values: [f32; 3]| -> Vec<u8> {
+                    values
+                        .iter()
+                        .flat_map(|value| value.to_ne_bytes())
+                        .collect()
+                };
+                let shape = nn::Shape::new(&[3]);
+                let mean = loader.constant(
+                    "video_postprocessor.pixel_mean",
+                    nn::DType::F32,
+                    shape,
+                    &bytes(crate::output::PIXEL_MEAN),
+                )?;
+                let std = loader.constant(
+                    "video_postprocessor.pixel_std",
+                    nn::DType::F32,
+                    shape,
+                    &bytes(crate::output::PIXEL_STD),
+                )?;
+                let postprocessor = crate::output::VideoPostprocessor::new(dtype, mean, std)?;
+                nn::Block::Decoder(Box::new(postprocessor))
             }
             Component::AudioDecoder => {
                 // The audio decoder has no layout tables - every table it reads is a weight bound
@@ -192,22 +235,42 @@ pub fn load(
                 Block::Decoder(Box::new(decoder))
             }
             Component::LatentEncoder => {
-                // Both condition encoders are written to the reference (`VideoEncoder::encode` and
-                // `AudioEncoder`), and neither is the text tower: `nn::Encoder` takes a token batch,
-                // an image shape and a prompt, while these take pixels `[1, 3, frames, height,
-                // width]` and raw samples `[1, 1, samples]`. `nn::model::Block` has no kind for a
-                // condition encoder, so a deployment that places this component is refused by name
-                // rather than served by a block that would misdescribe itself as a text tower.
-                return Err(Error::Unsupported(format!(
-                    "the {} block holds the two condition encoders, which need an nn condition-encoder \
-                     capability that does not exist; `Encoder` is the text tower's interface",
-                    component.name()
-                )));
+                // No block of its own: the two condition encoders are the `denoiser` block's
+                // conditioning half, loaded above and attached when that block is built. This
+                // component names the two checkpoint directories they read from, and `validate`
+                // requires a DiT beside it.
+                continue;
             }
         };
         // The runner addresses a block by the capability it serves, not by the checkpoint's
         // directory: both DiT partitions are the `denoiser` block.
         blocks.push((BlockName::new(component.block()), block));
+    }
+
+    // The encoders are constructed and attached, and nothing writes a condition row yet:
+    // `Denoiser::prepare_conditioning` returns before the video encoder's posterior epilogue
+    // exists. A deployment that would serve `fl2va` or `ref2va` is therefore refused by the tasks
+    // it names rather than loaded and served with a video conditioned on nothing - a load that
+    // succeeds here would be a different model than the one the checkpoint states.
+    if partition.blocks.contains(Component::LatentEncoder) {
+        let mut conditioned: Vec<String> = config
+            .denoisers
+            .values()
+            .flat_map(|denoiser| denoiser.tasks.iter())
+            .filter(|task| !matches!(task, nn::capability::VideoTask::TextToVideoAudio))
+            .map(|task| format!("{task:?}"))
+            .collect();
+        conditioned.sort();
+        conditioned.dedup();
+        if !conditioned.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "this deployment places the condition encoders for {}, and neither task can be \
+                 served yet: the conditioning pass writes no condition row until the video \
+                 encoder's posterior epilogue exists, so a conditioned request would produce a \
+                 video conditioned on nothing",
+                conditioned.join(", ")
+            )));
+        }
     }
 
     Ok(nn::Model::new(blocks))

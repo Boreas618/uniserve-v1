@@ -25,41 +25,49 @@ struct Stage {
 #[rustfmt::skip]
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 1470, tables: 12 },
-    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7757, tables: 3 },
-    Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 2, tables: 0 },
+    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 9341, tables: 12 },
+    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 1470, tables: 12 },
-    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7757, tables: 3 },
-    Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 2, tables: 0 },
+    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 16216, tables: 12 },
+    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 2, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner)", weights: 41953, constants: 1946, arena: 1550, tables: 14 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7757, tables: 3 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 2, tables: 0 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 16216, tables: 14 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 2, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 1470, tables: 12 },
-    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7757, tables: 3 },
-    Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 2, tables: 0 },
+    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 9341, tables: 12 },
+    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "t2va dense, TP2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
-    Stage { deployment: "t2va dense, TP2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 735, tables: 12 },
-    Stage { deployment: "t2va dense, TP2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7757, tables: 3 },
-    Stage { deployment: "t2va dense, TP2", stage: "audio_decoder", weights: 123, constants: 0, arena: 2, tables: 0 },
-    Stage { deployment: "t2va dense, TP2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 10383, tables: 12 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 10383, tables: 12 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
 ];
 
 /// The deployments, in the note's order.
-const DEPLOYMENTS: [&str; 5] = [
+///
+/// The last two state their degrees because the two shard different stages: the Ulysses degree cuts
+/// the denoiser's heads and its plan grows with it, while the tensor degree shards the text encoder's
+/// projections and leaves the DiT's plan exactly where it was (`2d44d7da8`, measured).
+const DEPLOYMENTS: [&str; 6] = [
     "t2va dense",
     "fl2va dense",
     "ref2va dense (tile 128)",
     "t2va + DMD student",
-    "t2va dense, TP2",
+    "t2va dense, Ulysses 2",
+    "t2va dense, Ulysses 2 x tensor 2",
 ];
 
 fn mib(bytes: u64) -> String {
@@ -112,7 +120,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mib(weights),
             mib(constants)
         );
-        println!("largest stage: {} of weights + constants", mib(largest));
+        // The note's "largest stage" is weights + constants + arena; this line says which of the three
+        // it is summing so the two cannot drift apart quietly.
+        println!(
+            "largest stage by weights + constants: {} (the note's largest stage counts the arena too, and the \
+             table above carries it)",
+            mib(largest)
+        );
+        // The note's "largest stage" is weights + constants + arena for the stage that needs most, and
+        // that is the number a deployment is bought against; it is printed in MiB because the note adds
+        // the long request's arena to it and a rounded GiB would not add up.
+        if let Some(peak) = stages
+            .iter()
+            .max_by_key(|stage| stage.weights + stage.constants + stage.arena)
+        {
+            println!(
+                "largest stage, weights + constants + arena: {} MiB ({})",
+                peak.weights + peak.constants + peak.arena,
+                peak.stage
+            );
+        }
     }
 
     if let Some(root) = root {
@@ -161,7 +188,116 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The DiT's plans, from the crate's own function, one line per deployment shape: the base DiT on
+    // one rank and on two, and the reference DiT a `ref2va` runs. Each is one evaluation's reservations.
     let ratio = config.video_vae.spatial_compression();
+    // (name, DiT, task, Ulysses degree, text-tensor degree). The two degrees are stated apart
+    // because they shard different things: the denoiser's heads follow the Ulysses degree, while the
+    // text encoder's shards follow the tensor degree and leave the DiT's plan untouched. A row that
+    // named one degree while measuring the other would size a deployment it never planned.
+    for (name, dit, task, ulysses, tensor) in [
+        (
+            "t2va / fl2va, 1 rank",
+            Dit::Base,
+            nn::capability::VideoTask::TextToVideoAudio,
+            1_usize,
+            1_usize,
+        ),
+        (
+            "t2va, Ulysses 2 (the text encoder unsharded)",
+            Dit::Base,
+            nn::capability::VideoTask::TextToVideoAudio,
+            2,
+            1,
+        ),
+        (
+            "t2va, Ulysses 2 x tensor 2",
+            Dit::Base,
+            nn::capability::VideoTask::TextToVideoAudio,
+            2,
+            2,
+        ),
+        (
+            "ref2va (OmniRef DiT), 1 rank",
+            Dit::Reference,
+            nn::capability::VideoTask::ReferenceToVideoAudio,
+            1,
+            1,
+        ),
+    ] {
+        let Some(rules) = config.denoisers.get(&dit) else {
+            println!("DiT plan {name}: this checkpoint has no such DiT");
+            continue;
+        };
+        let partition =
+            minimax_h3::partition::Partition::serving(&config, task, ulysses, tensor, 0, 0)?;
+        let arrangement = partition.arrangement(rules)?;
+        for frames in [124_u32, 362] {
+            let conditioned = !matches!(task, nn::capability::VideoTask::TextToVideoAudio);
+            let request = nn::capability::Layout {
+                video: nn::capability::LatentShape {
+                    channels: rules.transformer.video_channels,
+                    frames: minimax_h3::packing::video_latent_frames(frames)?,
+                    height: 672 / ratio,
+                    width: 1536 / ratio,
+                },
+                audio: Some(nn::capability::LatentShape {
+                    channels: minimax_h3::config::AUDIO_CHANNELS * rules.transformer.audio_channels,
+                    frames: minimax_h3::packing::audio_latent_frames(frames),
+                    height: 1,
+                    width: 1,
+                }),
+                text_rows: arrangement.text_rows,
+                condition_rows: arrangement.condition_rows,
+                condition_elements: 0,
+            };
+            let plan = minimax_h3::denoiser::denoise_arena(
+                rules,
+                &arrangement,
+                minimax_h3::modulation::Groups::of(conditioned).count(),
+                nn::DType::BF16,
+                &request,
+            )?;
+            let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+            println!(
+                "DiT plan {name}, {frames} frames: {} entries, {}",
+                plan.len(),
+                mib(bytes / (1 << 20))
+            );
+        }
+    }
+
+    // The audio encoder's plan, which a ref2va's conditioning pass reserves beside the video
+    // encoder's set: `samples` is the reference's sample count at the request's frame count.
+    for frames in [124_u32, 362] {
+        let samples = u64::from(minimax_h3::packing::audio_latent_frames(frames)) * 800;
+        let plan = minimax_h3::encoding::audio_encoder_arena(&config.audio_vae, 2, samples)?;
+        let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+        println!(
+            "audio encoder plan {frames} frames ({samples} samples): {} buffers, {}",
+            plan.len(),
+            mib(bytes / (1 << 20))
+        );
+    }
+    // The splice's plan: one buffer, one clip's raster at the canvas's pixel extents. It does not
+    // grow with the grid or the clip count, because a splice blends one clip at a time.
+    for canvas in NAMED_CANVASES {
+        let clip = minimax_h3::video_vae::Canvas::clip(
+            &config.video_vae,
+            canvas.height / ratio,
+            canvas.width / ratio,
+        );
+        let plan = minimax_h3::output::splice_arena(&config.video_vae, &clip, nn::DType::F16)?;
+        let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+        println!(
+            "splice plan {}x{}: {} buffers, {} bytes = {} MiB",
+            canvas.width,
+            canvas.height,
+            plan.len(),
+            bytes,
+            bytes / (1 << 20)
+        );
+    }
     for canvas in NAMED_CANVASES {
         let latent = minimax_h3::video_vae::Canvas::clip(
             &config.video_vae,
@@ -170,11 +306,11 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         );
         let arena: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?
             .iter()
-            .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
+            .map(|buffer| buffer.bytes())
             .sum();
         if std::env::var("H3_ARENA_BUFFERS").is_ok() && canvas.width == 1536 {
             for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent)? {
-                let bytes = buffer.elements * if buffer.element == "f16" { 2 } else { 4 };
+                let bytes = buffer.bytes();
                 println!("    {} {} {} B", buffer.name, buffer.element, bytes);
             }
         }
@@ -185,11 +321,191 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             arena,
             arena / (1 << 20)
         );
+        if canvas.width == 1536 && false {
+            // The DiT's plan, from the crate's own function. `t2va` reads the generated groups and
+            // `fl2va`/`ref2va` read a condition's clean level too, so both are printed: they are
+            // different plans, and a deployment's task decides which one its rank sizes against.
+
+            for conditioned in [false, true] {
+                let groups = minimax_h3::modulation::Groups::of(conditioned);
+                let task = if conditioned {
+                    nn::capability::VideoTask::FirstLastToVideoAudio
+                } else {
+                    nn::capability::VideoTask::TextToVideoAudio
+                };
+                let arrangement =
+                    minimax_h3::partition::Partition::serving(&config, task, 1, 1, 0, 0)?
+                        .arrangement(denoiser)?;
+                let request = nn::capability::Layout {
+                    video: nn::capability::LatentShape {
+                        channels: denoiser.transformer.video_channels,
+                        frames: minimax_h3::packing::video_latent_frames(124)?,
+                        height: canvas.height / ratio,
+                        width: canvas.width / ratio,
+                    },
+                    audio: Some(nn::capability::LatentShape {
+                        channels: minimax_h3::config::AUDIO_CHANNELS
+                            * denoiser.transformer.audio_channels,
+                        frames: minimax_h3::packing::audio_latent_frames(124),
+                        height: 1,
+                        width: 1,
+                    }),
+                    text_rows: arrangement.text_rows,
+                    condition_rows: arrangement.condition_rows,
+                    condition_elements: 0,
+                };
+                let plan = minimax_h3::denoiser::denoise_arena(
+                    denoiser,
+                    &arrangement,
+                    groups.count(),
+                    nn::DType::BF16,
+                    &request,
+                )?;
+                let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+                if std::env::var("H3_DIT_BUFFERS").is_ok() {
+                    for buffer in &plan {
+                        println!(
+                            "      {:28} {:5} {:>12} elements {:>12} B",
+                            buffer.name,
+                            buffer.element,
+                            buffer.elements,
+                            buffer.bytes()
+                        );
+                    }
+                }
+                println!(
+                    "  DiT plan {} at {}x{}: {} entries, {}",
+                    if conditioned {
+                        "conditioned"
+                    } else {
+                        "generated"
+                    },
+                    canvas.width,
+                    canvas.height,
+                    plan.len(),
+                    mib(bytes / (1 << 20))
+                );
+            }
+        }
+    }
+    for frames in [124_u32, 362] {
+        // `audio_arena` takes audio latent steps, not video frames: one latent step is 800 samples and
+        // the request's frame count reaches them through the packing rule.
+        let plan = minimax_h3::audio_vae::audio_arena(
+            &config.audio_vae,
+            minimax_h3::packing::audio_latent_frames(frames),
+        )?;
+        let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+        println!(
+            "audio plan {frames} frames ({} latent steps): {} buffers, {} bytes = {} MiB",
+            minimax_h3::packing::audio_latent_frames(frames),
+            plan.len(),
+            bytes,
+            bytes / (1 << 20)
+        );
+        if std::env::var("H3_PLAN_BUFFERS").is_ok() && frames == 124 {
+            for buffer in &plan {
+                let size = buffer.bytes();
+                println!(
+                    "    {:32} {} {:>12} elements {:>10} B",
+                    buffer.name, buffer.element, buffer.elements, size
+                );
+            }
+        }
+    }
+    // A reference clip's tile grid, so the loop's multiplication is visible beside the per-tile plan.
+    for (height, width) in [(768_u32, 1344_u32), (672, 1536)] {
+        let encoder = minimax_h3::tiled_encode::ClipEncoder::new(height, width)?;
+        let plan = encoder.plan();
+        let ratio = config.video_vae.spatial_compression();
+        let mut total = 0_u64;
+        let mut largest = 0_u64;
+        for tile in &plan.tiles {
+            let extent = minimax_h3::encoding::Extent {
+                frames: minimax_h3::decoding::CLIP_OUTPUT_FRAMES,
+                height: tile.rows.1 * ratio,
+                width: tile.columns.1 * ratio,
+            };
+            let bytes: u64 =
+                minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, extent)?
+                    .iter()
+                    .map(|buffer| buffer.bytes())
+                    .sum();
+            total += bytes;
+            if largest < bytes {
+                largest = bytes;
+                println!(
+                    "    largest tile: latent {}x{}, pixels {}x{}",
+                    tile.rows.1, tile.columns.1, extent.height, extent.width
+                );
+            }
+        }
+        // After the hoist the run reserves one set per *distinct* tile extent, which is what
+        // `VideoEncoder::reserve` keeps; the extents are the plan's, so the sum is the rank's cost.
+        let mut distinct: Vec<(u32, u32)> = Vec::new();
+        for tile in &plan.tiles {
+            let extent = (tile.rows.1 * ratio, tile.columns.1 * ratio);
+            if !distinct.contains(&extent) {
+                distinct.push(extent);
+            }
+        }
+        let mut hoisted = 0_u64;
+        for (height, width) in &distinct {
+            let extent = minimax_h3::encoding::Extent {
+                frames: minimax_h3::decoding::CLIP_OUTPUT_FRAMES,
+                height: *height,
+                width: *width,
+            };
+            hoisted += minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, extent)?
+                .iter()
+                .map(|buffer| buffer.bytes())
+                .sum::<u64>();
+        }
+        if std::env::var("H3_PLAN_TILES").is_ok() && width == 1344 {
+            for tile in &plan.tiles {
+                println!(
+                    "    tile r{} c{}: latent {}x{} at ({},{}) overlaps {}/{}",
+                    tile.row,
+                    tile.column,
+                    tile.rows.1,
+                    tile.columns.1,
+                    tile.rows.0,
+                    tile.columns.0,
+                    tile.above,
+                    tile.left
+                );
+            }
+        }
+        println!(
+            "encoder grid {width}x{height}: {} tiles, {} distinct extents, one set {} MiB, if-reserved-per-tile {} MiB, reserved once {} MiB",
+            plan.tiles.len(),
+            distinct.len(),
+            largest / (1 << 20),
+            total / (1 << 20),
+            hoisted / (1 << 20)
+        );
+    }
+    // The video encoder reads one tile per call, so its plan is stated per tile; the driver's loop
+    // must hoist it or the arena is reserved once per tile.
+    for (width, height) in [(256_u32, 256_u32), (512, 128)] {
+        let raster = minimax_h3::encoding::Extent {
+            frames: 25,
+            height,
+            width,
+        };
+        let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
+        let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+        println!(
+            "encoder tile {width}x{height} px: {} buffers, {} bytes = {} MiB",
+            plan.len(),
+            bytes,
+            bytes / (1 << 20)
+        );
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
     let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
         .iter()
-        .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
+        .map(|buffer| buffer.bytes())
         .sum();
     println!("one tile: {}", mib(one / (1 << 20)));
     Ok(())
