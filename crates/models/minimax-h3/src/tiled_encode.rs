@@ -177,6 +177,12 @@ impl ClipEncoder {
 
 #[cfg(test)]
 mod tests {
+    //! The expectations below are the reference's own numbers, not this module's arithmetic run
+    //! backwards: `split_tiles` (`uniserve/nn/vae/tiled.py:9-44`) and the band prelude of
+    //! `TiledEncoder.encode` (`:246-262`) were extracted from the reference source and evaluated on
+    //! the rasters these tests use - 768 by 1344, 256 by 256, 480 by 832 - before the values were
+    //! written down.
+
     use super::*;
 
     /// The 768 by 1344 canvas the fixtures use: 48 by 84 latents, four tile rows and seven columns.
