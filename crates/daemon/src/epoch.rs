@@ -1004,7 +1004,11 @@ impl Epochs {
             .iter()
             .map(|(epoch, record)| record_report(*epoch, record))
             .collect::<Vec<_>>();
-        let processes = locked(&self.processes)
+        // The rows the daemon supervises now, not the ones this record was
+        // given before it attached its table: a process that started or ended
+        // is reported from the table's state (§2.3).
+        let processes = self
+            .processes()
             .iter()
             .map(process_report)
             .collect::<Vec<_>>();
@@ -1382,7 +1386,7 @@ mod tests {
     /// (§7.3 steps 4-6).
     #[test]
     fn a_program_update_serves_from_the_generation_it_switched_to_until_it_is_committed() {
-        use crate::engine::stand_in::{Answer, Seen, main_processes, process};
+        use crate::engine::stand_in::{main_processes, process, Answer, Seen};
 
         let (commands, seen) =
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
@@ -1465,7 +1469,7 @@ mod tests {
     /// step 4).
     #[test]
     fn a_main_process_failure_during_probation_reverts_the_program_update() {
-        use crate::engine::stand_in::{main_processes, process, Answer, Seen};
+        use crate::engine::stand_in::{Answer, Seen, main_processes, process};
 
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
@@ -1678,9 +1682,18 @@ mod tests {
         epochs
             .apply_programs(Update::new(1, target.clone()), processes(), false)
             .expect("the first application is taken");
-        epochs
-            .revert_programs("the policy refused a decision")
-            .expect("the revert is answered");
+        // The revert a failure causes, which is the one §7.2 makes the update
+        // unavailable with (§7.3 step 4): the failure is recorded as the
+        // update's first one, and the reason the refusal quotes is its
+        // account.
+        assert!(
+            epochs.program_failure(Failure {
+                kind: "policy_reverted".to_owned(),
+                reason: "the policy refused a decision".to_owned(),
+                device: None,
+            }),
+            "the update on probation is reverted"
+        );
 
         let refused = epochs
             .apply_programs(Update::new(1, target.clone()), processes(), false)
