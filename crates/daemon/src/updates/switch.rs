@@ -124,11 +124,11 @@ pub(crate) trait Roster {
     fn command(&mut self, host: &str, generation: u64, command: process::Command);
     /// Commands the frontend to serve `epoch` from `requests`.
     fn serve(&mut self, epoch: u64, requests: &str);
-    /// Makes the previous epoch's main process of `generation` on `host`
-    /// admit again after its drain. Exec settles whether the wire for that is
-    /// `Revert` or `Pause { paused: false }` (§2.3, §7.4); this method is
-    /// where that answer lands, so the switch states only that the epoch
-    /// must admit again.
+    /// Makes the previous epoch serve again on `host`: promote its parked
+    /// standby if one is alive, otherwise start a successor generation, claim
+    /// it, park it and promote it. A drained process is terminal (§2.3), so
+    /// nothing re-admits one; the epoch layer owns whichever of the two paths
+    /// applies, and the switch only waits for the epoch to report serving.
     fn resume(&mut self, host: &str, generation: u64, reason: &str);
     /// Takes the events that arrived since the last call.
     fn events(&mut self) -> Vec<Event>;
@@ -147,7 +147,8 @@ pub(crate) enum Phase {
     Probation,
     /// The operator committed; the target acknowledges.
     Committing,
-    /// The update reverted; the target acknowledges.
+    /// The update reverted: the target is drained, or a restore waits for the
+    /// previous epoch to serve again.
     Reverting,
     /// The update was committed.
     Purged,
@@ -201,7 +202,9 @@ pub(crate) struct Switch {
     /// frontend is served it.
     pending_restore: Option<Failure>,
     committed: BTreeSet<String>,
-    reverted: BTreeSet<String>,
+    /// Hosts whose target main process reported its drain, when a revert
+    /// drains the target.
+    target_drained: BTreeSet<String>,
     failure: Option<Failure>,
     /// Where the switchover began and how long its pause took: from its first
     /// promote to the last drained epoch.
@@ -260,7 +263,7 @@ impl Switch {
             serving: BTreeSet::new(),
             pending_restore: None,
             committed: BTreeSet::new(),
-            reverted: BTreeSet::new(),
+            target_drained: BTreeSet::new(),
             failure: None,
             switchover_started: None,
             pause: None,
@@ -507,8 +510,9 @@ impl Switch {
         self.phase = Phase::Abandoned;
     }
 
-    /// Reverts a target that serves on probation: the target's own `Revert`
-    /// is acknowledged, then the previous epoch takes over again.
+    /// Reverts a target that serves on probation: the target is drained so
+    /// that it admits nothing and ends its requests as migratable, then the
+    /// previous epoch takes over again.
     fn reverting(&mut self, roster: &mut impl Roster, failure: Failure) {
         self.update.fail(failure.clone());
         self.failure = Some(failure.clone());
@@ -518,8 +522,8 @@ impl Switch {
             roster.command(
                 &node.host,
                 generation,
-                command(process::command::Kind::Revert(process::Revert {
-                    reason: failure.reason.clone(),
+                command(process::command::Kind::Drain(process::Drain {
+                    epoch: self.target,
                 })),
             );
         }
@@ -537,19 +541,8 @@ impl Switch {
             self.finish_restore(roster, &failure.reason);
             return;
         }
-        // Its replacement must serve first: serving it before that would
-        // route requests to an epoch that is not running. Until then the
-        // target keeps serving, on its previous program generation.
-        let generation = self.target_generation();
-        for node in &self.nodes {
-            roster.command(
-                &node.host,
-                generation,
-                command(process::command::Kind::Revert(process::Revert {
-                    reason: failure.reason.clone(),
-                })),
-            );
-        }
+        // Its successor must serve first: serving it before that would route
+        // requests to an epoch that is not running.
         self.pending_restore = Some(failure);
         self.phase = Phase::Reverting;
     }
@@ -758,8 +751,12 @@ impl Switch {
                     self.failure = Some(failure);
                 }
             }
-            (Phase::Reverting, Some(Kind::Reverted(_))) if self.is_target(generation) => {
-                self.reverted.insert(host);
+            (Phase::Reverting, Some(Kind::Drained(drained)))
+                if self.pending_restore.is_none()
+                    && self.is_target(generation)
+                    && drained.epoch == self.target =>
+            {
+                self.target_drained.insert(host);
             }
             _ => {}
         }
@@ -826,7 +823,9 @@ impl Switch {
                 self.update.commit();
                 self.phase = Phase::Purged;
             }
-            Phase::Reverting if hosts.is_subset(&self.reverted) => {
+            Phase::Reverting
+                if self.pending_restore.is_none() && hosts.is_subset(&self.target_drained) =>
+            {
                 self.reverted(roster);
             }
             _ => {}
@@ -1365,9 +1364,9 @@ mod tests {
             "the replacement of the dead epoch must serve first"
         );
         assert_eq!(
-            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Revert(_))),
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Drain(_))),
             2,
-            "the target returns to its previous program generation meanwhile"
+            "the target is drained while the replacement comes up"
         );
 
         switch.serving(&mut roster, "n0", 7);
@@ -1455,25 +1454,26 @@ mod tests {
         )];
         switch.advance(&mut roster);
         assert_eq!(switch.phase(), Phase::Reverting);
-        assert_eq!(roster.commands.len(), 2, "a revert per node");
+        assert_eq!(roster.commands.len(), 2, "a drain per node");
         assert!(roster.commands.iter().all(|(_, generation, kind)| {
-            *generation == 6 && matches!(kind, process::command::Kind::Revert(_))
+            *generation == 6
+                && matches!(kind, process::command::Kind::Drain(drain) if drain.epoch == 12)
         }));
-        assert!(roster.serves.is_empty(), "the frontend waits for the ack");
+        assert!(roster.serves.is_empty(), "the frontend waits for the drain");
 
         roster.scripted = vec![
             report_event(
                 "n0",
                 6,
-                report(process::report::Kind::Reverted(process::Reverted {
-                    reason: String::new(),
+                report(process::report::Kind::Drained(process::Drained {
+                    epoch: 12,
                 })),
             ),
             report_event(
                 "n1",
                 6,
-                report(process::report::Kind::Reverted(process::Reverted {
-                    reason: String::new(),
+                report(process::report::Kind::Drained(process::Drained {
+                    epoch: 12,
                 })),
             ),
         ];
