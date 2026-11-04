@@ -315,7 +315,6 @@ pub fn latent_key(trajectory: Trajectory, steps: u32, representation: &Represent
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn representation() -> Representation<'static> {
         Representation {
@@ -519,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn another_file_is_another_identity_and_a_rewrite_changes_it() {
+    fn another_file_is_another_identity_and_a_replacement_changes_it() {
         let root = tempfile::tempdir().expect("a temporary directory");
         let first = root.path().join("first.safetensors");
         let second = root.path().join("second.safetensors");
@@ -540,17 +539,19 @@ mod tests {
             FileIdentity::of(&settled).expect("an identity")
         );
 
-        // A rewrite changes the identity, so the old weights no longer match.
-        let before = FileIdentity::of(&settled).expect("an identity");
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&settled)
-            .expect("the file");
-        file.write_all(b"more").expect("the rewrite");
-        drop(file);
-        settle(&settled);
-        assert_ne!(before, FileIdentity::of(&settled).expect("an identity"));
-        settled.push("nothing");
+        // A replacement is another file: a loader writes a checkpoint by renaming a new file
+        // over the old one, so the identity names the new inode whatever the filesystem's
+        // timestamp resolution is. Nothing here reads a timestamp.
+        let replaced = root.path().join("replaced.safetensors");
+        std::fs::write(&replaced, b"one").expect("the first contents");
+        settle(&replaced);
+        let before = FileIdentity::of(&replaced).expect("an identity");
+        let staged = root.path().join("staged.safetensors");
+        std::fs::write(&staged, b"more").expect("the new contents");
+        settle(&staged);
+        std::fs::rename(&staged, &replaced).expect("the replacement");
+        settle(&replaced);
+        assert_ne!(before, FileIdentity::of(&replaced).expect("an identity"));
     }
 
     /// Make `path` old enough for its identity to name its contents: the
