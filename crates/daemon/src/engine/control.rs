@@ -797,6 +797,55 @@ pub struct ProgramServer {
 /// the Program Server selected for it, which is what the epoch record keeps
 /// and what `Precopy` sends to the main processes.
 ///
+/// The step of the Program Server exchange the daemon is in.
+///
+/// The exchange waits twice in a way this crate cannot bound: the client opens
+/// its socket, and reads the answer a Program Server may never send, with no
+/// deadline (`crates/program-server/src/protocol.rs`: `Connection::connect` and
+/// `Connection::receive`). Whoever times the call out reads the step recorded
+/// here, so a deadline names the wait rather than the phase (§7.3 step 1).
+#[derive(Clone)]
+pub struct PrepareSteps(std::sync::Arc<std::sync::Mutex<PrepareStep>>);
+
+#[derive(Clone)]
+struct PrepareStep {
+    host: String,
+    what: &'static str,
+}
+
+impl Default for PrepareSteps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PrepareSteps {
+    /// A record of an exchange that has not reached a Program Server yet.
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(PrepareStep {
+            host: String::new(),
+            what: "about to reach its first Program Server",
+        })))
+    }
+
+    /// Records that the exchange with `host` is waiting at `what`.
+    fn at(&self, host: &str, what: &'static str) {
+        let mut step = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
+        step.host = host.to_owned();
+        step.what = what;
+    }
+
+    /// The wait the daemon was in, and the host it was in it with.
+    pub fn describe(&self) -> String {
+        let step = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
+        if step.host.is_empty() {
+            step.what.to_owned()
+        } else {
+            format!("{} ({})", step.what, step.host)
+        }
+    }
+}
+
 /// # Errors
 ///
 /// Fails when a host has no Program Server in `servers`, when a Program
@@ -807,6 +856,7 @@ pub fn prepare_epoch(
     leader: &str,
     filled: &crate::epoch::FilledPrograms,
     descriptors: &[program_server::Descriptors],
+    steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::FilledPrograms> {
     // A program is selected by its backend's name, so a deployment that left
     // one at `auto` has not said which program it means: refused here, by the
@@ -824,12 +874,12 @@ pub fn prepare_epoch(
         policy = %filled.policy.backend,
         "resolving the epoch's programs at its Program Servers"
     );
-    let pinned = prepare_at(leader_server, Selector::Latest, filled, descriptors)?;
+    let pinned = prepare_at(leader_server, Selector::Latest, filled, descriptors, steps)?;
     for server in servers {
         if server.host == leader {
             continue;
         }
-        let selected = prepare_at(server, Selector::Fixed, filled, descriptors)?;
+        let selected = prepare_at(server, Selector::Fixed, filled, descriptors, steps)?;
         anyhow::ensure!(
             selected == pinned,
             "the Program Server of {} selected other programs than the leader's",
@@ -861,6 +911,7 @@ fn prepare_at(
     selector: Selector,
     filled: &crate::epoch::FilledPrograms,
     descriptors: &[program_server::Descriptors],
+    steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::FilledPrograms> {
     let policy_slot = program_server::ProgramSlot::all(POLICY_SLOT);
     let mut requests = Vec::with_capacity(filled.kernels.len() + 1);
@@ -882,6 +933,7 @@ fn prepare_at(
     // Before the connect, not after it: a daemon that blocks opening the
     // socket names the host it was reaching from this line alone, and the
     // server it never reached logs nothing at all.
+    steps.at(&server.host, "opening its connection to a Program Server");
     tracing::info!(
         host = %server.host,
         socket = %server.socket.display(),
@@ -930,9 +982,17 @@ fn prepare_at(
             );
         }
     };
+    steps.at(
+        &server.host,
+        "waiting for a Program Server's answer to the prepare",
+    );
     let prepared = client
         .prepare(&request, &mut progress)
         .with_context(|| format!("preparing the epoch's programs at {}", server.host))?;
+    steps.at(
+        &server.host,
+        "reading the programs a Program Server selected",
+    );
     tracing::info!(
         host = %server.host,
         prepared = prepared.programs.len(),

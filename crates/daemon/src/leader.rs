@@ -644,15 +644,26 @@ impl Leader {
             let servers = servers.clone();
             let leader_host = leader_host.clone();
             let filled = filled.clone();
+            // The deadline below names the wait, so the blocking task records
+            // which of the client's two unbounded waits it is in.
+            let steps = crate::engine::control::PrepareSteps::new();
+            let recorded = steps.clone();
             let preparing = tokio::task::spawn_blocking(move || {
-                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
+                crate::engine::control::prepare_epoch(
+                    &servers,
+                    &leader_host,
+                    &filled,
+                    &[],
+                    &recorded,
+                )
             });
             match tokio::time::timeout(PREPARE_TIMEOUT, preparing).await {
                 Ok(joined) => joined.context("preparing the epoch's programs")?,
                 Err(_) => anyhow::bail!(
-                    "the epoch's Program Servers selected nothing within {} s \
-                     (the last step logged above is where the daemon waited)",
-                    PREPARE_TIMEOUT.as_secs()
+                    "the epoch's Program Servers selected nothing within {} s: \
+                     the daemon was {}",
+                    PREPARE_TIMEOUT.as_secs(),
+                    steps.describe()
                 ),
             }
             .context("preparing the epoch's programs")?
@@ -1612,7 +1623,8 @@ impl Leader {
             let leader_host = leader_host.clone();
             let filled = filled.clone();
             tokio::task::spawn_blocking(move || {
-                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
+                let steps = crate::engine::control::PrepareSteps::new();
+                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[], &steps)
             })
             .await
             .map_err(|error| {
