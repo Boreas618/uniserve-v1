@@ -365,10 +365,15 @@ impl Arguments {
             return Ok(());
         };
         // `parameters` appends the global and the profile scratch address after the packed words, so
-        // the launch passes two more words than the operator packed whatever the scratch sizes are.
-        // Triton's metadata may already name those two entries inside the signature (`_embedding_kernel`
-        // does) and may not; filtering them out leaves the signature's own parameters on both sides,
-        // which is the count the operator can be held to.
+        // the launch passes two more words than the operator packed, whatever the scratch sizes are.
+        //
+        // The signature is held to the packed words alone, with any entry naming one of those two
+        // addresses left out. A module the compiler builds today names neither: `_embedding_kernel`'s
+        // signature is its seven parameters and `global_scratch_size`/`profile_scratch_size` are
+        // separate fields, so its nine-parameter PTX is those seven plus the two appended here. A
+        // module whose metadata does name them states two entries this operator never packs, and
+        // filtering keeps that from being counted twice. Either way the count is "what the operator
+        // states", which is the only thing it can be held to.
         let declared: Vec<&Parameter> = metadata
             .signature
             .iter()
@@ -384,8 +389,7 @@ impl Arguments {
                 Self::describe_packed(&self.kinds),
             )));
         }
-        for (position, (parameter, word)) in declared.iter().zip(&self.kinds).enumerate()
-        {
+        for (position, (parameter, word)) in declared.iter().zip(&self.kinds).enumerate() {
             if parameter.is_pointer() != (*word == Word::Pointer) {
                 return Err(Error::Metadata(format!(
                     "{} parameter {position} `{}` is `{}` and the operator packed a {} there",
