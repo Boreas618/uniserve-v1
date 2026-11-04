@@ -8,6 +8,11 @@
 // wrapper the export emits; `entry.h` is the stable ABI the operator's Rust
 // side calls.
 
+// The build compiles this unit beside the header `export_to_c` wrote, whose
+// name is the build script's module name (`gather_gemm`): it declares the
+// module handle and the exported launcher this entry calls.
+#include "gather_gemm.h"
+
 #include "entry.h"
 
 #include <mutex>
