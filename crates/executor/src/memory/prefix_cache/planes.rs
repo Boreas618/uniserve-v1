@@ -837,6 +837,15 @@ impl CachePlanes {
         let (segmenting, device) = self.segmented()?;
         let from = segmenting.released_from.load(Ordering::Acquire);
         if first >= from {
+            // Nothing to give back: every segment from `first` on was already
+            // released. Said here, by the pool, because a caller's own count
+            // cannot tell this apart from a pool that has no segments at all.
+            tracing::info!(
+                first,
+                released_from = from,
+                pool = "the cache's segments",
+                "no cache segment is left to give back: the pool released these already"
+            );
             return Ok(());
         }
         if segmenting.segments[first as usize..from as usize]
