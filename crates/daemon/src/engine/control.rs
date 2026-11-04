@@ -874,16 +874,12 @@ impl<'a> ProgramSwitch<'a> {
             send(process, command.clone())?;
             let generation = match await_report(process, update, PRECOPY_TIMEOUT, |report| {
                 match report.kind.as_ref() {
-                    Some(report::Kind::Precopied(precopied)) => {
-                        Some(Ok(precopied.generation))
-                    }
-                    Some(report::Kind::PrecopyFailed(failed)) => {
-                        Some(Err(crate::epoch::Failure {
-                            kind: "precopy_failed".to_owned(),
-                            reason: failed.reason.clone(),
-                            device: None,
-                        }))
-                    }
+                    Some(report::Kind::Precopied(precopied)) => Some(Ok(precopied.generation)),
+                    Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
+                        kind: "precopy_failed".to_owned(),
+                        reason: failed.reason.clone(),
+                        device: None,
+                    })),
                     _ => None,
                 }
             }) {
@@ -925,7 +921,9 @@ impl<'a> ProgramSwitch<'a> {
             send(
                 process,
                 process::Command {
-                    kind: Some(command::Kind::Switchover(process::Switchover { generation })),
+                    kind: Some(command::Kind::Switchover(process::Switchover {
+                        generation,
+                    })),
                 },
             )?;
             await_report(process, update, COMMAND_TIMEOUT, |report| {
@@ -1104,7 +1102,9 @@ fn answered(report: &process::Report, matched: bool) -> Result<(), crate::epoch:
     }
     Err(crate::epoch::Failure {
         kind: "out_of_order".to_owned(),
-        reason: format!("the main process answered a generation the switch did not ask for: {report:?}"),
+        reason: format!(
+            "the main process answered a generation the switch did not ask for: {report:?}"
+        ),
         device: None,
     })
 }
@@ -1126,261 +1126,299 @@ mod tests {
     use super::*;
     use crate::options::ServeConfig;
 
-/// What a stand-in main process saw a daemon send it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Seen {
-    Precopy,
-    Switchover(u64),
-    Commit,
-    Revert(String),
-    Purge(u64),
-}
+    /// What a stand-in main process saw a daemon send it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Seen {
+        Precopy,
+        Switchover(u64),
+        Commit,
+        Revert(String),
+        Purge(u64),
+    }
 
-/// A stand-in main process on the other end of the daemon's process
-/// connection: it records the commands it is sent and answers them as the
-/// protocol says the main process answers, numbering a generation of its own
-/// for the precopy it answers.
-fn main_process(host: &str, generation: u64) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
-    answer_as(host, move |command| match command.kind.as_ref() {
-        Some(command::Kind::Precopy(_)) => Some((
-            Seen::Precopy,
-            Some(process::Report {
-                kind: Some(report::Kind::Precopied(process::Precopied { generation })),
-            }),
-        )),
-        Some(command::Kind::Switchover(switchover)) => Some((
-            Seen::Switchover(switchover.generation),
-            Some(process::Report {
-                kind: Some(report::Kind::Switched(process::Switched {
-                    generation: switchover.generation,
-                })),
-            }),
-        )),
-        Some(command::Kind::Commit(_)) => Some((
-            Seen::Commit,
-            Some(process::Report {
-                kind: Some(report::Kind::Committed(process::Committed {})),
-            }),
-        )),
-        Some(command::Kind::Revert(revert)) => Some((
-            Seen::Revert(revert.reason.clone()),
-            Some(process::Report {
-                kind: Some(report::Kind::Reverted(process::Reverted {
-                    reason: String::new(),
-                })),
-            }),
-        )),
-        Some(command::Kind::Purge(purge)) => Some((
-            Seen::Purge(purge.generation),
-            Some(process::Report {
-                kind: Some(report::Kind::Purged(process::Purged {
-                    generation: purge.generation,
-                })),
-            }),
-        )),
-        other => panic!("the daemon sent a command the switch does not send: {other:?}"),
-    })
-}
+    /// A stand-in main process on the other end of the daemon's process
+    /// connection: it records the commands it is sent and answers them as the
+    /// protocol says the main process answers, numbering a generation of its own
+    /// for the precopy it answers.
+    fn main_process(host: &str, generation: u64) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
+        answer_as(host, move |command| match command.kind.as_ref() {
+            Some(command::Kind::Precopy(_)) => Some((
+                Seen::Precopy,
+                Some(process::Report {
+                    kind: Some(report::Kind::Precopied(process::Precopied { generation })),
+                }),
+            )),
+            Some(command::Kind::Switchover(switchover)) => Some((
+                Seen::Switchover(switchover.generation),
+                Some(process::Report {
+                    kind: Some(report::Kind::Switched(process::Switched {
+                        generation: switchover.generation,
+                    })),
+                }),
+            )),
+            Some(command::Kind::Commit(_)) => Some((
+                Seen::Commit,
+                Some(process::Report {
+                    kind: Some(report::Kind::Committed(process::Committed {})),
+                }),
+            )),
+            Some(command::Kind::Revert(revert)) => Some((
+                Seen::Revert(revert.reason.clone()),
+                Some(process::Report {
+                    kind: Some(report::Kind::Reverted(process::Reverted {
+                        reason: String::new(),
+                    })),
+                }),
+            )),
+            Some(command::Kind::Purge(purge)) => Some((
+                Seen::Purge(purge.generation),
+                Some(process::Report {
+                    kind: Some(report::Kind::Purged(process::Purged {
+                        generation: purge.generation,
+                    })),
+                }),
+            )),
+            other => panic!("the daemon sent a command the switch does not send: {other:?}"),
+        })
+    }
 
-/// A stand-in main process whose precopy fails with `reason` and which
-/// answers nothing else, as a main process that kept serving the generation
-/// it runs.
-fn refusing(host: &str, reason: &str) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
-    let reason = reason.to_owned();
-    answer_as(host, move |command| match command.kind.as_ref() {
-        Some(command::Kind::Precopy(_)) => Some((
-            Seen::Precopy,
-            Some(process::Report {
-                kind: Some(report::Kind::PrecopyFailed(process::PrecopyFailed {
-                    reason: reason.clone(),
-                })),
-            }),
-        )),
-        other => panic!("a failed precopy is not followed by a command: {other:?}"),
-    })
-}
+    /// A stand-in main process whose precopy fails with `reason` and which
+    /// answers nothing else, as a main process that kept serving the generation
+    /// it runs.
+    fn refusing(host: &str, reason: &str) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
+        let reason = reason.to_owned();
+        answer_as(host, move |command| match command.kind.as_ref() {
+            Some(command::Kind::Precopy(_)) => Some((
+                Seen::Precopy,
+                Some(process::Report {
+                    kind: Some(report::Kind::PrecopyFailed(process::PrecopyFailed {
+                        reason: reason.clone(),
+                    })),
+                }),
+            )),
+            other => panic!("a failed precopy is not followed by a command: {other:?}"),
+        })
+    }
 
-/// A stand-in main process that reports `report` when the precopy arrives.
-fn reporting(
-    host: &str,
-    report: impl Fn() -> process::Report + Send + 'static,
-) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
-    answer_as(host, move |command| match command.kind.as_ref() {
-        Some(command::Kind::Precopy(_)) => Some((Seen::Precopy, Some(report()))),
-        other => panic!("a failing report is not followed by a command: {other:?}"),
-    })
-}
+    /// A stand-in main process that reports `report` when the precopy arrives.
+    fn reporting(
+        host: &str,
+        report: impl Fn() -> process::Report + Send + 'static,
+    ) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
+        answer_as(host, move |command| match command.kind.as_ref() {
+            Some(command::Kind::Precopy(_)) => Some((Seen::Precopy, Some(report()))),
+            other => panic!("a failing report is not followed by a command: {other:?}"),
+        })
+    }
 
-/// The daemon's end of a connection to a stand-in main process that records
-/// what it is sent and answers with `answer`.
-fn answer_as(
-    host: &str,
-    answer: impl Fn(&process::Command) -> Option<(Seen, Option<process::Report>)> + Send + 'static,
-) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
-    let (daemon, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&seen);
-    std::thread::spawn(move || {
-        let mut peer = Connection::from_unix(peer).unwrap();
-        while let Ok(Some(message)) = peer.recv::<process::Downstream>(Duration::from_secs(60)) {
-            let Some(downstream::Kind::Event(process::Event {
-                kind: Some(event::Kind::Command(command)),
-            })) = message.kind
-            else {
-                continue;
-            };
-            let Some((what, answer)) = answer(&command) else {
-                continue;
-            };
-            recorded.lock().unwrap().push(what);
-            if let Some(report) = answer {
-                peer.send(&process::Upstream {
-                    kind: Some(upstream::Kind::Report(report)),
-                })
-                .unwrap();
+    /// The daemon's end of a connection to a stand-in main process that records
+    /// what it is sent and answers with `answer`.
+    fn answer_as(
+        host: &str,
+        answer: impl Fn(&process::Command) -> Option<(Seen, Option<process::Report>)> + Send + 'static,
+    ) -> (EpochProcess, Arc<Mutex<Vec<Seen>>>) {
+        let (daemon, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut peer = Connection::from_unix(peer).unwrap();
+            while let Ok(Some(message)) = peer.recv::<process::Downstream>(Duration::from_secs(60))
+            {
+                let Some(downstream::Kind::Event(process::Event {
+                    kind: Some(event::Kind::Command(command)),
+                })) = message.kind
+                else {
+                    continue;
+                };
+                let Some((what, answer)) = answer(&command) else {
+                    continue;
+                };
+                recorded.lock().unwrap().push(what);
+                if let Some(report) = answer {
+                    peer.send(&process::Upstream {
+                        kind: Some(upstream::Kind::Report(report)),
+                    })
+                    .unwrap();
+                }
             }
-        }
-    });
-    let process = EpochProcess {
-        host: host.to_owned(),
-        connection: Connection::from_unix(daemon).unwrap(),
-    };
-    (process, seen)
-}
+        });
+        let process = EpochProcess {
+            host: host.to_owned(),
+            connection: Connection::from_unix(daemon).unwrap(),
+        };
+        (process, seen)
+    }
 
-/// An update of the default deployment's filled programs, for the switch to
-/// move.
-fn update() -> crate::epoch::Update {
-    crate::epoch::Update::new(1, crate::epoch::Deployment::of(ServeConfig::default()))
-}
+    /// An update of the default deployment's filled programs, for the switch to
+    /// move.
+    fn update() -> crate::epoch::Update {
+        crate::epoch::Update::new(1, crate::epoch::Deployment::of(ServeConfig::default()))
+    }
 
-/// The program layer moves every main process through the generations each
-/// one numbered for itself (§7.3): the precopy, then the switchover to the
-/// generation that process answered with, then the commit, and the purge of
-/// the generation each one executes.
-#[test]
-fn a_switch_moves_every_main_process_through_the_generations_they_numbered() {
-    let (first, first_seen) = main_process("rank-0", 11);
-    let (second, second_seen) = main_process("rank-1", 12);
-    let mut processes = vec![first, second];
-    let target = crate::epoch::Deployment::of(ServeConfig::default());
-    let mut switch = ProgramSwitch::new(&mut processes, update());
-    switch
-        .precopy(&target.programs.kernels, &target.programs.policy)
-        .expect("both main processes prepared the programs");
-    switch.switchover().expect("both switched to what they prepared");
-    switch.commit().expect("both committed");
-    switch.purge().expect("both purged what they no longer run");
-    assert_eq!(switch.update().state, crate::epoch::UpdateState::Committed);
+    /// The program layer moves every main process through the generations each
+    /// one numbered for itself (§7.3): the precopy, then the switchover to the
+    /// generation that process answered with, then the commit, and the purge of
+    /// the generation each one executes.
+    #[test]
+    fn a_switch_moves_every_main_process_through_the_generations_they_numbered() {
+        let (first, first_seen) = main_process("rank-0", 11);
+        let (second, second_seen) = main_process("rank-1", 12);
+        let mut processes = vec![first, second];
+        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let mut switch = ProgramSwitch::new(&mut processes, update());
+        switch
+            .precopy(&target.programs.kernels, &target.programs.policy)
+            .expect("both main processes prepared the programs");
+        switch
+            .switchover()
+            .expect("both switched to what they prepared");
+        switch.commit().expect("both committed");
+        switch.purge().expect("both purged what they no longer run");
+        assert_eq!(switch.update().state, crate::epoch::UpdateState::Committed);
 
-    let seen = |seen: &Arc<Mutex<Vec<Seen>>>| seen.lock().unwrap().clone();
-    // Each process's own number comes back to it: the daemon does not
-    // invent one.
-    assert_eq!(
-        seen(&first_seen),
-        vec![
-            Seen::Precopy,
-            Seen::Switchover(11),
-            Seen::Commit,
-            Seen::Purge(11)
-        ]
-    );
-    assert_eq!(
-        seen(&second_seen),
-        vec![
-            Seen::Precopy,
-            Seen::Switchover(12),
-            Seen::Commit,
-            Seen::Purge(12)
-        ]
-    );
-}
+        let seen = |seen: &Arc<Mutex<Vec<Seen>>>| seen.lock().unwrap().clone();
+        // Each process's own number comes back to it: the daemon does not
+        // invent one.
+        assert_eq!(
+            seen(&first_seen),
+            vec![
+                Seen::Precopy,
+                Seen::Switchover(11),
+                Seen::Commit,
+                Seen::Purge(11)
+            ]
+        );
+        assert_eq!(
+            seen(&second_seen),
+            vec![
+                Seen::Precopy,
+                Seen::Switchover(12),
+                Seen::Commit,
+                Seen::Purge(12)
+            ]
+        );
+    }
 
-/// A main process that cannot prepare the programs fails the update and
-/// keeps serving the generation it runs: the serving generation is never
-/// switched, and the update is not unavailable, since nothing reverted
-/// (§7.3 step 2).
-#[test]
-fn a_failed_precopy_ends_the_switch_before_any_generation_moves() {
-    let (fine, fine_seen) = main_process("rank-0", 11);
-    let (failing, _) = refusing("rank-1", "the package has no module for this GPU");
-    let mut processes = vec![fine, failing];
-    let target = crate::epoch::Deployment::of(ServeConfig::default());
-    let mut switch = ProgramSwitch::new(&mut processes, update());
-    let failure = switch
-        .precopy(&target.programs.kernels, &target.programs.policy)
-        .expect_err("a refused precopy fails");
-    assert_eq!(failure.kind, "precopy_failed");
-    assert!(
-        failure.reason.contains("no module for this GPU"),
-        "{}",
-        failure.reason
-    );
-    // Nothing moved: the first process prepared and was never switched.
-    assert_eq!(*fine_seen.lock().unwrap(), vec![Seen::Precopy]);
-    assert_eq!(switch.update().state, crate::epoch::UpdateState::Probation);
-    assert!(switch.update().unavailable().is_none());
-    // A switchover without a prepared generation is refused, not sent.
-    assert!(switch.switchover().is_err());
-}
+    /// A main process that cannot prepare the programs fails the update and
+    /// keeps serving the generation it runs: the serving generation is never
+    /// switched, and the update is not unavailable, since nothing reverted
+    /// (§7.3 step 2).
+    #[test]
+    fn a_failed_precopy_ends_the_switch_before_any_generation_moves() {
+        let (fine, fine_seen) = main_process("rank-0", 11);
+        let (failing, _) = refusing("rank-1", "the package has no module for this GPU");
+        let mut processes = vec![fine, failing];
+        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let mut switch = ProgramSwitch::new(&mut processes, update());
+        let failure = switch
+            .precopy(&target.programs.kernels, &target.programs.policy)
+            .expect_err("a refused precopy fails");
+        assert_eq!(failure.kind, "precopy_failed");
+        assert!(
+            failure.reason.contains("no module for this GPU"),
+            "{}",
+            failure.reason
+        );
+        // Nothing moved: the first process prepared and was never switched.
+        assert_eq!(*fine_seen.lock().unwrap(), vec![Seen::Precopy]);
+        assert_eq!(switch.update().state, crate::epoch::UpdateState::Probation);
+        assert!(switch.update().unavailable().is_none());
+        // A switchover without a prepared generation is refused, not sent.
+        assert!(switch.switchover().is_err());
+    }
 
-/// A main process's fault while the programs are prepared fails the update
-/// with that first failure, and a reverted update stays unavailable until
-/// `force` is asked for (§7.3 step 4).
-#[test]
-fn a_fault_during_the_precopy_is_the_updates_first_failure() {
-    let (faulty, _) = reporting("rank-0", || process::Report {
-        kind: Some(report::Kind::Fault(process::Fault {
-            kind: "sticky".to_owned(),
-            reason: "an earlier launch failed".to_owned(),
-            device: 1,
-        })),
-    });
-    let mut processes = vec![faulty];
-    let target = crate::epoch::Deployment::of(ServeConfig::default());
-    let mut switch = ProgramSwitch::new(&mut processes, update());
-    let failure = switch
-        .precopy(&target.programs.kernels, &target.programs.policy)
-        .expect_err("a fault fails the update");
-    assert_eq!(failure.kind, "sticky");
-    switch
-        .revert(&failure.reason)
-        .expect("the reverted main process answers");
-    assert_eq!(switch.update().state, crate::epoch::UpdateState::Reverted);
-    let unavailable = switch
-        .update()
-        .unavailable()
-        .expect("a reverted update is unavailable");
-    assert_eq!(unavailable.kind, "sticky");
-}
+    /// A main process's fault while the programs are prepared fails the update
+    /// with that first failure, and a reverted update stays unavailable until
+    /// `force` is asked for (§7.3 step 4).
+    #[test]
+    fn a_fault_during_the_precopy_is_the_updates_first_failure() {
+        let (faulty, _) = reporting("rank-0", || process::Report {
+            kind: Some(report::Kind::Fault(process::Fault {
+                kind: "sticky".to_owned(),
+                reason: "an earlier launch failed".to_owned(),
+                device: 1,
+            })),
+        });
+        let mut processes = vec![faulty];
+        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let mut switch = ProgramSwitch::new(&mut processes, update());
+        let failure = switch
+            .precopy(&target.programs.kernels, &target.programs.policy)
+            .expect_err("a fault fails the update");
+        assert_eq!(failure.kind, "sticky");
+        switch
+            .revert(&failure.reason)
+            .expect("the reverted main process answers");
+        assert_eq!(switch.update().state, crate::epoch::UpdateState::Reverted);
+        let unavailable = switch
+            .update()
+            .unavailable()
+            .expect("a reverted update is unavailable");
+        assert_eq!(unavailable.kind, "sticky");
+    }
 
-/// A policy that fails after the switchover reports `PolicyReverted` without
-/// being asked, and that report is the update's first failure (§4.4).
-#[test]
-fn a_policy_revert_while_the_programs_are_prepared_fails_the_update() {
-    let (reverted, _) = reporting("rank-0", || process::Report {
-        kind: Some(report::Kind::PolicyReverted(process::PolicyReverted {
-            scheduler: Some(0),
-            backend: "priority".to_owned(),
-            revision: 3,
-            reason: "the trial refused a decision".to_owned(),
-            fatal: false,
-        })),
-    });
-    let mut processes = vec![reverted];
-    let target = crate::epoch::Deployment::of(ServeConfig::default());
-    let mut switch = ProgramSwitch::new(&mut processes, update());
-    let failure = switch
-        .precopy(&target.programs.kernels, &target.programs.policy)
-        .expect_err("a policy revert fails the update");
-    assert_eq!(failure.kind, "policy_reverted");
-    assert!(
-        failure.reason.contains("priority"),
-        "{}",
-        failure.reason
-    );
-}
+    /// A policy that fails after the switchover reports `PolicyReverted` without
+    /// being asked, and that report is the update's first failure (§4.4).
+    #[test]
+    fn a_policy_revert_while_the_programs_are_prepared_fails_the_update() {
+        let (reverted, _) = reporting("rank-0", || process::Report {
+            kind: Some(report::Kind::PolicyReverted(process::PolicyReverted {
+                scheduler: Some(0),
+                backend: "priority".to_owned(),
+                revision: 3,
+                reason: "the trial refused a decision".to_owned(),
+                fatal: false,
+            })),
+        });
+        let mut processes = vec![reverted];
+        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let mut switch = ProgramSwitch::new(&mut processes, update());
+        let failure = switch
+            .precopy(&target.programs.kernels, &target.programs.policy)
+            .expect_err("a policy revert fails the update");
+        assert_eq!(failure.kind, "policy_reverted");
+        assert!(failure.reason.contains("priority"), "{}", failure.reason);
+    }
 
+    /// An epoch's start names this daemon's own build only for its own
+    /// binary; another executable's children vouch for themselves with their
+    /// first `Hello` (§7.4). The arguments are the engine's own, built once.
+    #[test]
+    fn an_epoch_start_names_the_build_of_the_daemons_own_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = EngineControl::new(
+            &directory.path().join("requests.sock"),
+            "unix:/run/processes.sock".into(),
+            "rank-0".into(),
+            "model".into(),
+            Some(std::path::PathBuf::from("/run/program-server.sock")),
+        )
+        .unwrap();
+
+        let own = std::env::current_exe().unwrap();
+        let start = control.epoch_start(&own.display().to_string(), 9);
+        assert_eq!(start.build, Some(proto::BUILD.to_owned()));
+        assert_eq!(start.executable, own.display().to_string());
+        assert_eq!(
+            start.arguments,
+            vec![
+                "engine".to_owned(),
+                "--requests".to_owned(),
+                control.request_address().to_owned(),
+                "--processes".to_owned(),
+                "unix:/run/processes.sock".to_owned(),
+                "--engine".to_owned(),
+                "9".to_owned(),
+                "--program-server".to_owned(),
+                "/run/program-server.sock".to_owned(),
+            ]
+        );
+
+        let other = control.epoch_start("/opt/uniserve-b", 9);
+        assert_eq!(other.build, None);
+        assert_eq!(other.executable, "/opt/uniserve-b");
+        assert_eq!(other.arguments, start.arguments);
+    }
 
     #[test]
     fn publication_resumes_after_a_node_refuses_the_commit() {
