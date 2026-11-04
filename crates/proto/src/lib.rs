@@ -54,7 +54,9 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// management of a main process's epoch: the commands parking, promotion and
 /// program switch (`Park`, `Promote`, `Precopy`, `Switchover`, `Commit`,
 /// `Revert`, `Purge`), the programs those commands carry, and the main
-/// process's reports (`Precopied`, `PolicyReverted`).
+/// process's reports (`Precopied`, `PolicyReverted`), and the acknowledgements
+/// and fault reports the main process answers a command with (`Switched`,
+/// `Committed`, `Reverted`, `Purged`, `Stalled`, `Fault`).
 pub const PROTOCOL_MINOR: u32 = 4;
 
 /// The build this crate is compiled in: the package version, then `+` and a
