@@ -487,8 +487,8 @@ fn the_block_scales_must_have_the_layout_s_shape() {
 }
 
 /// An expert stack is its experts' encoded tensors concatenated in the operator's reading order —
-/// expert-major, up before gate — and its tensor scales become one reciprocal per expert, because a
-/// stack's scale varies per expert where a single matrix has one.
+/// expert-major, up before gate — and its tensor scales become one reciprocal per expert **and
+/// projection**, because the checkpoint gives each expert's up and gate their own `weight_scale_2`.
 #[test]
 fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection() {
     let directory = tempfile::tempdir().unwrap();
@@ -545,7 +545,11 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
     assert_eq!(stack.values.shape().dims(), &[2, 4, 32]);
     assert_eq!(stack.values.dtype(), DType::U8);
     assert_eq!(stack.scales.shape().dims(), &[2, 4, 4]);
-    assert_eq!(stack.global_scale.shape().dims(), &[2]);
+    assert_eq!(
+        stack.global_scale.shape().dims(),
+        &[2, 2],
+        "two experts, and one scalar per projection within each"
+    );
     assert_eq!(stack.global_scale.dtype(), DType::F32);
     // The store received the values in reading order, then the scales, then the reciprocals.
     assert_eq!(store.published.len(), 3);
@@ -559,7 +563,11 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         .iter()
         .map(|word| f32::from_le_bytes(*word))
         .collect();
-    assert_eq!(reciprocals, [2.0, 1.0], "1 / (0.5 · (e + 1))");
+    assert_eq!(
+        reciprocals,
+        [2.0, 2.0, 1.0, 1.0],
+        "1 / (0.5 · (e + 1)), expert-major and then projection-major"
+    );
 
     // A second load of the same checkpoint publishes nothing: the three keys hit the store.
     let again = {
@@ -599,7 +607,7 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
                 "experts.0.up_proj.weight_scale_2",
                 Dtype::F32,
                 vec![1],
-                byte(4),
+                1.0f32.to_le_bytes().to_vec(),
             ),
             (
                 "experts.1.up_proj.weight",
@@ -617,7 +625,7 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
                 "experts.1.up_proj.weight_scale_2",
                 Dtype::F32,
                 vec![1],
-                byte(4),
+                1.0f32.to_le_bytes().to_vec(),
             ),
         ],
     );
