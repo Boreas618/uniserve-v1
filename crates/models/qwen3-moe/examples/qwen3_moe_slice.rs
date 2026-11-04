@@ -100,6 +100,9 @@ struct Args {
     resident: u64,
     /// Where the decode stage writes its hidden rows and logits as `.npy`, when asked.
     dump: Option<PathBuf>,
+    /// A reference stack's `hidden_NN.npy` directory: its files are read one stage at a time as the
+    /// decode stage walks the model, and the first stage past [`RELATIVE_BUDGET`] is named.
+    reference: Option<PathBuf>,
 }
 
 /// The four stages of the run.
@@ -121,6 +124,7 @@ impl Args {
         let mut tokens = String::new();
         let mut resident = 0;
         let mut dump = None;
+        let mut reference = None;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -159,6 +163,7 @@ impl Args {
                 }
                 "--tokens" => tokens = value("--tokens")?,
                 "--dump" => dump = Some(PathBuf::from(value("--dump")?)),
+                "--reference" => reference = Some(PathBuf::from(value("--reference")?)),
                 "--resident" => {
                     let gib = value("--resident")?;
                     let size: u64 = gib.parse().map_err(|_| {
@@ -170,13 +175,13 @@ impl Args {
                     return Err(Failure::message(
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
-                         [--tokens ID,ID,...] [--dump DIR]",
+                         [--tokens ID,ID,...] [--dump DIR] [--reference DIR]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
-                         --device, --layer, --tokens or --dump"
+                         --device, --layer, --tokens, --dump or --reference"
                     )));
                 }
             }
@@ -190,6 +195,7 @@ impl Args {
             tokens,
             resident,
             dump,
+            reference,
         })
     }
 }
@@ -659,26 +665,64 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // layer's output is to stop there - `forward_through` runs layers `0..=layer` and releases each
     // layer's scratch as it ends, so the arena pays for one layer and not the stack.
     let width = usize::try_from(plan.hidden).unwrap_or(0);
-    if let Some(dir) = args.dump.as_deref() {
-        std::fs::create_dir_all(dir)
-            .map_err(|error| Failure::message(format!("--dump {}: {error}", dir.display())))?;
+    if args.dump.is_some() || args.reference.is_some() {
+        if let Some(dir) = args.dump.as_deref() {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| Failure::message(format!("--dump {}: {error}", dir.display())))?;
+        }
         let rows = tokens_usize(&batch);
+        let mut first_above = None;
         let embedded = download_bf16(&stream, hidden, rows, width)?;
-        write_npy(&dir.join("hidden_00.npy"), &embedded, rows, width)?;
-        println!("dump: hidden_00.npy is the embedding's output, {rows} x {width} f32");
+        report_stage(
+            &args,
+            "hidden_00.npy",
+            0,
+            &embedded,
+            rows,
+            width,
+            &mut first_above,
+        )?;
         // Every call reserves a step's scratch, and nothing returns it: the arena is sized for one
         // forward and not for forty-eight, so each layer's rows are read back to the host and the
         // arena is then released to the mark taken before the first call. Without the release the
-        // dump would stop a few layers in, with the arena exhausted.
+        // walk would stop a few layers in, with the arena exhausted.
         let mark = arena.mark();
         for layer in 0..config.num_hidden_layers {
             let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
             stream.synchronize()?;
             let values = download_bf16(&stream, out, rows, width)?;
-            let name = format!("hidden_{:02}.npy", layer + 1);
-            write_npy(&dir.join(&name), &values, rows, width)?;
-            println!("dump: {name} is layer {layer}'s output");
+            let index = layer + 1;
+            let name = format!("hidden_{index:02}.npy");
+            // The reference's last file is after the final norm while a layer's output is before it,
+            // so that one stage is written and not compared: the head's logits are what carry the
+            // end of the model, and a difference there is not a difference in the stack.
+            if index < config.num_hidden_layers {
+                report_stage(&args, &name, index, &values, rows, width, &mut first_above)?;
+            } else {
+                if let Some(dir) = args.dump.as_deref() {
+                    write_npy(&dir.join(&name), &values, rows, width)?;
+                    println!("dump: {name} is {}", stage_name(index));
+                }
+                if args.reference.is_some() {
+                    println!(
+                        "reference: {name} is not compared - the reference's file is after the final \
+                         norm and this stage is before it; the logits below carry the end of the model"
+                    );
+                }
+            }
             arena.release(mark);
+        }
+        match first_above {
+            Some(index) => println!(
+                "reference: the first stage past {:.0}% is hidden_{index:02}, {}",
+                RELATIVE_BUDGET * 100.0,
+                stage_name(index)
+            ),
+            None => println!(
+                "reference: every stage is within {:.0}% of the reference, hidden_00 to hidden_{:02}",
+                RELATIVE_BUDGET * 100.0,
+                config.num_hidden_layers - 1
+            ),
         }
     }
 
@@ -716,6 +760,154 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 /// The batch's token count, as a `usize`, for the host-side readbacks.
 fn tokens_usize(batch: &TokenBatch) -> usize {
     usize::try_from(batch.num_tokens).unwrap_or(0)
+}
+
+/// The relative distance a stage is allowed from the reference before it is a divergence.
+///
+/// The reference is a bf16 run of the same prompt, so the per-element floor is `2**-8` and a row of
+/// `hidden` values averages it down; five percent is two orders above that floor and still far below
+/// what a wrong computation produces, which is what makes it a line worth printing.
+const RELATIVE_BUDGET: f64 = 0.05;
+
+/// `hidden_NN`'s stage: the embedding's output at zero, then one layer per file.
+fn stage_name(index: usize) -> String {
+    match index {
+        0 => "the embedding's output".to_owned(),
+        other => format!("after layer {}", other - 1),
+    }
+}
+
+/// Write one stage's rows when `--dump` asked, and compare them against the reference when
+/// `--reference` did, recording the first stage that passes [`RELATIVE_BUDGET`].
+fn report_stage(
+    args: &Args,
+    name: &str,
+    index: usize,
+    values: &[f32],
+    rows: usize,
+    width: usize,
+    first_above: &mut Option<usize>,
+) -> Result<()> {
+    if let Some(dir) = args.dump.as_deref() {
+        write_npy(&dir.join(name), values, rows, width)?;
+        println!("dump: {name} is {}", stage_name(index));
+    }
+    let Some(dir) = args.reference.as_deref() else {
+        return Ok(());
+    };
+    let path = dir.join(name);
+    let (theirs, their_rows, their_width) = read_npy(&path)?;
+    if their_rows != rows || their_width != width {
+        return Err(Failure::message(format!(
+            "{} is {their_rows} x {their_width}, the stage is {rows} x {width}",
+            path.display()
+        )));
+    }
+    let (relative, worst, scale) = distance(values, &theirs);
+    let marker = if relative > RELATIVE_BUDGET {
+        if first_above.is_none() {
+            *first_above = Some(index);
+        }
+        "  <-- past the budget"
+    } else {
+        ""
+    };
+    println!(
+        "reference: {name}, {}, rms/scale {relative:.3e} of the reference's rms {scale:.3e} \
+         (max |diff| {worst:.3e}){marker}",
+        stage_name(index)
+    );
+    Ok(())
+}
+
+/// A stage's root-mean-square distance from the reference, relative to the reference's own scale,
+/// with the largest absolute difference and that scale beside it.
+///
+/// The root-mean-square is the measure, not the largest element: a bf16 reference differs from a
+/// bf16 computation by about `2**-8` per element and the maximum of a row says more about one
+/// rounding than about the two rows' agreement.
+fn distance(values: &[f32], reference: &[f32]) -> (f64, f64, f64) {
+    let count = values.len().min(reference.len()).max(1) as f64;
+    let mut squared = 0.0_f64;
+    let mut theirs = 0.0_f64;
+    let mut worst = 0.0_f64;
+    for (mine, other) in values.iter().zip(reference.iter()) {
+        let difference = f64::from(*mine) - f64::from(*other);
+        squared += difference * difference;
+        theirs += f64::from(*other) * f64::from(*other);
+        worst = worst.max(difference.abs());
+    }
+    let scale = (theirs / count).sqrt();
+    let relative = if scale > 0.0 {
+        (squared / count).sqrt() / scale
+    } else {
+        f64::INFINITY
+    };
+    (relative, worst, scale)
+}
+
+/// Read a C-ordered `f32` `.npy` file: the magic, one version, a header dict this reads for the
+/// shape, then the little-endian data.
+///
+/// It is as narrow as the writer beside it on purpose: the reference dumps are `'<f4'` and
+/// C-ordered, and a file that is not is refused rather than read into the wrong shape.
+fn read_npy(path: &std::path::Path) -> Result<(Vec<f32>, usize, usize)> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+    let refuse = |what: &str| Failure::message(format!("{}: {what}", path.display()));
+    if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
+        return Err(refuse("not a .npy file"));
+    }
+    let (header_at, header_len): (usize, usize) = match bytes[6] {
+        1 => (10, usize::from(u16::from_le_bytes([bytes[8], bytes[9]]))),
+        2 | 3 => (
+            12,
+            usize::try_from(u32::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11],
+            ]))
+            .unwrap_or(usize::MAX),
+        ),
+        other => return Err(refuse(&format!("a .npy version of {other}"))),
+    };
+    let header = std::str::from_utf8(&bytes[header_at..header_at.saturating_add(header_len)])
+        .map_err(|_| refuse("a header that is not UTF-8"))?;
+    if !header.contains("'<f4'") || header.contains("'fortran_order': True") {
+        return Err(refuse("not a C-ordered float32 array"));
+    }
+    let shape_at = header
+        .find("'shape': (")
+        .ok_or_else(|| refuse("a header with no shape"))?
+        + "'shape': (".len();
+    let shape_end = header[shape_at..]
+        .find(')')
+        .ok_or_else(|| refuse("a header with an unterminated shape"))?
+        + shape_at;
+    let extents: Vec<usize> = header[shape_at..shape_end]
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    let (rows, columns) = match extents.as_slice() {
+        [rows, columns] => (*rows, *columns),
+        _ => return Err(refuse("an array that is not two-dimensional")),
+    };
+    let data_at = header_at + header_len;
+    let wanted = rows.saturating_mul(columns);
+    let available = bytes.len().saturating_sub(data_at) / 4;
+    if available < wanted {
+        return Err(refuse(&format!(
+            "{available} values for a {rows} x {columns} array"
+        )));
+    }
+    let mut values = Vec::with_capacity(wanted);
+    for at in (data_at..data_at + wanted * 4).step_by(4) {
+        values.push(f32::from_le_bytes([
+            bytes[at],
+            bytes[at + 1],
+            bytes[at + 2],
+            bytes[at + 3],
+        ]));
+    }
+    Ok((values, rows, columns))
 }
 
 /// Write `values` as a C-ordered `f32` `.npy` file of `rows` x `columns`.
