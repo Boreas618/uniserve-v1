@@ -16,19 +16,36 @@
 //!   makes them writable again at the same addresses, so captured graphs stay
 //!   valid (§8).
 
+// The mechanism-to-executor crossing and the device's work: §4.4, §4.5, §2.4.
+pub mod batch;
+pub mod captured;
+pub mod device;
+pub mod graph;
+pub mod job;
+pub mod plan;
+pub mod profiling;
+pub mod runner;
+pub mod runners;
+pub mod shadow;
+
+// The program layer's state and decisions (§7.3); the driver lives in the
+// `uniserve engine` command, which links the scheduler beside this crate.
+pub mod hot_update;
+pub mod watchdog;
+
+// The main process's blocking work (§2.4) and the resident memory (§4, §8).
+pub mod arena;
 pub mod blocking;
 pub mod completion;
 pub mod config;
 pub mod error;
 pub mod host;
-pub mod hot_update;
 pub mod keys;
 pub mod memory;
 pub mod parallel;
 pub mod stream;
 pub mod tensor;
 pub mod transfer;
-pub mod watchdog;
 
 pub use completion::Outcome;
 pub use error::{Error, Failure, Result};
