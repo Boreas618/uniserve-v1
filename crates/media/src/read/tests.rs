@@ -338,7 +338,17 @@ fn conditions_fill_both_products_from_an_image_and_a_track() {
     )
     .unwrap();
     assert_eq!(pixels, image.expected);
-    assert_eq!(samples, audio.expected);
+    // The resampler reproduces torchaudio's mathematics, not its float32
+    // rounding: the reader's own acceptance is a per-sample bound.
+    let difference = samples
+        .iter()
+        .zip(&audio.expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        difference <= 1e-5,
+        "the condition's soundtrack differs from the reference by {difference}"
+    );
 }
 
 #[test]
