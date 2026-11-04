@@ -34,13 +34,13 @@ const STAGES: &[Stage] = &[
     Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 189582, tables: 0 },
+    Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 5924, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner)", weights: 41953, constants: 1946, arena: 1550, tables: 14 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 189582, tables: 0 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 5924, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 1470, tables: 12 },
     Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
@@ -284,7 +284,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!(
-            "encoder grid {width}x{height}: {} tiles, {} distinct extents, largest tile {} MiB, loop-today {} MiB, hoisted {} MiB",
+            "encoder grid {width}x{height}: {} tiles, {} distinct extents, one set {} MiB, if-reserved-per-tile {} MiB, reserved once {} MiB",
             plan.tiles.len(),
             distinct.len(),
             largest / (1 << 20),
