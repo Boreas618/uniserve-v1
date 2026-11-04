@@ -526,4 +526,21 @@ mod tests {
         };
         assert_eq!(partition.vocabulary_shard(10), (9, 10));
     }
+
+    #[test]
+    fn a_block_is_named_for_the_capability_its_runner_serves() {
+        // Both DiT partitions are the denoiser: a rank places one of them, and the runner's media
+        // call looks the capability up, not the checkpoint's directory.
+        assert_eq!(Component::Transformer.block(), "denoiser");
+        assert_eq!(Component::TransformerRef.block(), "denoiser");
+        assert_ne!(
+            Component::Transformer.name(),
+            Component::TransformerRef.name(),
+            "the two partitions stay distinct components of one checkpoint"
+        );
+        for component in Component::ALL {
+            assert!(!component.block().is_empty());
+            assert!(!component.name().is_empty());
+        }
+    }
 }
