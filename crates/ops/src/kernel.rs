@@ -74,10 +74,17 @@ pub struct CubinMetadata {
     /// checked against: the operator packs one word per entry here, plus the global scratch when the
     /// module declares one.
     pub signature: Vec<Parameter>,
-    /// Global scratch bytes the kernel needs, handed to it as its last parameter.
+    /// Global scratch bytes the kernel needs, handed to it as one of its last parameters.
     pub global_scratch_size: u64,
     /// The alignment global scratch must have.
     pub global_scratch_align: u64,
+    /// Profile scratch bytes the kernel needs, handed to it after the global scratch.
+    ///
+    /// Triton's launcher passes the address whatever the size; a launch that runs no profiler passes
+    /// null and the kernel never reads it.
+    pub profile_scratch_size: u64,
+    /// The alignment profile scratch must have.
+    pub profile_scratch_align: u64,
 }
 
 /// One parameter of a kernel's runtime signature.
@@ -122,6 +129,8 @@ impl CubinMetadata {
             signature: Vec::new(),
             global_scratch_size: 0,
             global_scratch_align: 1,
+            profile_scratch_size: 0,
+            profile_scratch_align: 1,
         }
     }
 
@@ -156,6 +165,8 @@ impl CubinMetadata {
                 .unwrap_or_default(),
             global_scratch_size: fields.integer("global_scratch_size").unwrap_or(0),
             global_scratch_align: fields.integer("global_scratch_align").unwrap_or(0),
+            profile_scratch_size: fields.integer("profile_scratch_size").unwrap_or(0),
+            profile_scratch_align: fields.integer("profile_scratch_align").unwrap_or(0),
         })
     }
 
@@ -228,6 +239,8 @@ pub struct Arguments {
     scratch: Option<DevicePtr>,
     /// The word the scratch address is read from at launch.
     scratch_slot: Box<u64>,
+    /// The word the profile scratch address is read from at launch.
+    profile_slot: Box<u64>,
     parameters: Vec<*mut c_void>,
 }
 
@@ -320,13 +333,18 @@ impl Arguments {
                 .iter_mut()
                 .map(|word| word.as_mut() as *mut u64 as *mut c_void),
         );
-        if let Some(scratch) = self.scratch {
-            // The scratch address is a value the driver reads at launch, exactly like the packed
-            // words above; keeping it in the same `words` vector would misplace it among the
-            // kernel's own parameters, so it is passed through a slot of its own.
-            *self.scratch_slot = platform::address(scratch);
+        if metadata.is_some() {
+            // A cubin module takes two parameters after its own signature, which the compiler's
+            // launcher appends and its PTX declares whatever their size is: the global scratch
+            // address and the profile scratch address. They are values the driver reads at launch,
+            // exactly like the packed words above, so they are passed through slots of their own that
+            // outlive this call.
+            *self.scratch_slot = self.scratch.map(platform::address).unwrap_or(0);
+            *self.profile_slot = 0;
             self.parameters
                 .push(self.scratch_slot.as_mut() as *mut u64 as *mut c_void);
+            self.parameters
+                .push(self.profile_slot.as_mut() as *mut u64 as *mut c_void);
         }
         Ok(&mut self.parameters)
     }
@@ -341,7 +359,9 @@ impl Arguments {
         let Some(metadata) = metadata.filter(|metadata| !metadata.signature.is_empty()) else {
             return Ok(());
         };
-        let scratch = usize::from(metadata.needs_scratch());
+        // The global and the profile scratch address follow the kernel's own parameters whatever the
+        // scratch sizes are, so a module's signature is two parameters short of what it takes.
+        let scratch = 2;
         let expected = metadata.signature.len() + scratch;
         let supplied = self.kinds.len();
         if expected != supplied {
@@ -378,6 +398,7 @@ impl Arguments {
             .collect();
         if scratch > 0 {
             names.push("`global_scratch`: *i8".to_owned());
+            names.push("`profile_scratch`: *i8".to_owned());
         }
         names.join(", ")
     }
@@ -821,11 +842,13 @@ mod tests {
     }
 
     #[test]
-    fn a_module_that_records_no_signature_is_launched_as_before() {
+    fn a_module_takes_its_own_parameters_and_then_the_two_scratch_addresses() {
         let module = metadata(r#"{"name":"_kernel","num_warps":4}"#);
         let mut arguments = Arguments::new();
         arguments.pointer(DevicePtr::new(0x1000)).u32(7);
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 2);
+        // The program's two parameters, then the global and the profile scratch address Triton's
+        // launcher appends and its PTX declares whatever their size is.
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
     }
 
     #[test]
@@ -836,7 +859,7 @@ mod tests {
         short.pointer(DevicePtr::new(0x1000)).u32(7);
         let error = short.parameters(Some(&module)).unwrap_err().to_string();
         assert!(error.contains("_kernel"), "{error}");
-        assert!(error.contains("takes 3 parameters"), "{error}");
+        assert!(error.contains("takes 5 parameters"), "{error}");
         assert!(error.contains("packed 2"), "{error}");
         assert!(error.contains("`eps`: fp32"), "{error}");
     }
@@ -852,13 +875,14 @@ mod tests {
     }
 
     #[test]
-    fn global_scratch_is_one_more_parameter_than_the_signature() {
+    fn global_scratch_is_a_value_the_caller_supplies_and_its_absence_is_refused() {
         let module =
             metadata(r#"{"name":"_kernel","signature":{"x":"*bf16"},"global_scratch_size":4096}"#);
         let mut arguments = Arguments::new();
         arguments.pointer(DevicePtr::new(0x1000));
         arguments.scratch(Some(DevicePtr::new(0x2000)));
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 2);
+        // One declared parameter and the two scratch addresses.
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 3);
 
         let mut without = Arguments::new();
         without.pointer(DevicePtr::new(0x1000));
@@ -875,6 +899,6 @@ mod tests {
             .pointer(DevicePtr::new(0x1000))
             .pointer(DevicePtr::new(0x2000))
             .u64(4);
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 3);
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 5);
     }
 }
