@@ -138,13 +138,14 @@ impl Track {
 ///
 /// The executor sizes the arena from these; the model never allocates. Names are the ones the arena
 /// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place - **and the order
-/// is the order the model reserves them in**, because the arena is one cursor: `VideoDecoder::decode`
-/// reserves the per-tile scratch of each tile as it goes, so a buffer listed before another is also
-/// reserved before it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// is the order the model reserves them in**, because the arena is one cursor: a buffer listed before
+/// another is also reserved before it, and anything the code reserves inside a loop is multiplied. The
+/// transformer's fourteen are reserved once per clip (`VideoDecoder::scratch`) and handed to every tile;
+/// the token buffers are per tile, so their entry is the grid's sum.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Buffer {
-    /// The buffer's name.
-    pub name: &'static str,
+    /// The buffer's name, unique within its plan: the executor keys storage by it.
+    pub name: String,
     /// Its element type: `f16`, `f32` or `u8`.
     pub element: &'static str,
     /// How many elements it holds.
@@ -245,82 +246,82 @@ pub fn video_arena(
         * u64::from(config.spatial_compression());
     Ok(vec![
         Buffer {
-            name: "decoded",
+            name: "decoded".to_owned(),
             element: "f16",
             elements: raster * channels,
         },
         Buffer {
-            name: "tokens",
+            name: "tokens".to_owned(),
             element: "f16",
             elements: rows * patch,
         },
         Buffer {
-            name: "stream",
+            name: "stream".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "projected",
+            name: "projected".to_owned(),
             element: "f16",
             elements: voxels * columns,
         },
         Buffer {
-            name: "cosine",
+            name: "cosine".to_owned(),
             element: "f32",
             elements: rows * u64::from(rotated / 2),
         },
         Buffer {
-            name: "sine",
+            name: "sine".to_owned(),
             element: "f32",
             elements: rows * u64::from(rotated / 2),
         },
         Buffer {
-            name: "normalized",
+            name: "normalized".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "query",
+            name: "query".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "key",
+            name: "key".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "value",
+            name: "value".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "rotated_query",
+            name: "rotated_query".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "rotated_key",
+            name: "rotated_key".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "attended",
+            name: "attended".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "update",
+            name: "update".to_owned(),
             element: "f16",
             elements: rows * columns,
         },
         Buffer {
-            name: "gate_up",
+            name: "gate_up".to_owned(),
             element: "f16",
             elements: rows * 2 * columns * ffn,
         },
         Buffer {
-            name: "gated",
+            name: "gated".to_owned(),
             element: "f16",
             elements: rows * columns * ffn,
         },
@@ -887,10 +888,14 @@ mod tests {
         // The clip-level buffers come first and the per-tile ones after, which is the order the model
         // reserves them in: a plan that lists them the other way round is a plan the code does not
         // follow.
-        let clip_level: Vec<&str> = arena.iter().take(2).map(|buffer| buffer.name).collect();
+        let clip_level: Vec<&str> = arena
+            .iter()
+            .take(2)
+            .map(|buffer| buffer.name.as_str())
+            .collect();
         assert_eq!(clip_level, ["decoded", "tokens"]);
         // Every buffer is named once and no buffer is empty.
-        let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name).collect();
+        let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name.as_str()).collect();
         let count = names.len();
         names.sort_unstable();
         names.dedup();
