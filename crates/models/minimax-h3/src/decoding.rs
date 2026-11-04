@@ -824,14 +824,52 @@ mod tests {
             assert!((*block.last().expect("a block has a voxel") as u64) < voxels);
             offset += *count as usize;
         }
-        // Every voxel of the clip is covered at least once by the grid, and no voxel is covered more
-        // than twice: the seams are the only place two tiles both decode a position.
+        // The multiplicity is the grid's own geometry, not a bound: a voxel is claimed by exactly the
+        // tiles whose latent rectangle contains it. In a two-dimensional grid that is one tile in the
+        // interior, two along one seam, and **four** at a corner where a row seam and a column seam
+        // cross - so a bound of two is wrong, and the expected count is derived here from the same
+        // rectangles the blocks were checked against above.
         let mut coverage = vec![0u8; voxels as usize];
         for row in &rows {
             coverage[*row as usize] += 1;
         }
+        // A voxel's index is frame-major, then the latent row, then the column: `frames · height ·
+        // width` voxels in all, which is `canvas.voxels()`.
+        let plane = u64::from(canvas.height) * u64::from(canvas.width);
+        let mut expected = vec![0u8; voxels as usize];
+        for tile in grid.iter() {
+            for frame in 0..canvas.frames {
+                for latent_row in tile.latent_rows.0..tile.latent_rows.1 {
+                    for latent_column in tile.latent_columns.0..tile.latent_columns.1 {
+                        let voxel = u64::from(frame) * plane
+                            + u64::from(latent_row) * u64::from(canvas.width)
+                            + u64::from(latent_column);
+                        expected[voxel as usize] += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(coverage, expected);
         assert!(coverage.iter().all(|count| *count >= 1));
-        assert!(coverage.iter().all(|count| *count <= 2));
+        // The derived count is confirmed by the seam arithmetic rather than by a literal: a voxel can
+        // only be claimed by a tile of its row band and a tile of its column band, so the multiplicity
+        // is at most the product of the two bands' widths, which is what a corner reaches.
+        let mut rows_band = vec![0u32; canvas.height as usize];
+        let mut columns_band = vec![0u32; canvas.width as usize];
+        for tile in grid.iter() {
+            for latent_row in tile.latent_rows.0..tile.latent_rows.1 {
+                rows_band[latent_row as usize] += 1;
+            }
+            for latent_column in tile.latent_columns.0..tile.latent_columns.1 {
+                columns_band[latent_column as usize] += 1;
+            }
+        }
+        let bound = u8::try_from(
+            rows_band.iter().copied().max().unwrap_or(0) as u64
+                * columns_band.iter().copied().max().unwrap_or(0) as u64,
+        )
+        .expect("a seam band narrower than a voxel's count");
+        assert!(coverage.iter().all(|count| *count <= bound));
         let covered: u64 = coverage.iter().map(|count| u64::from(*count)).sum();
         assert_eq!(covered, rows.len() as u64);
     }
