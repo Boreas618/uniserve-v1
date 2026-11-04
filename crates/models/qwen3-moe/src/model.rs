@@ -461,26 +461,6 @@ impl Qwen3Moe {
     }
 
     /// The activation plan of a forward over `tokens` tokens.
-    /// The vocabulary embedding.
-    pub(crate) fn embedding(&self) -> &Embedding {
-        &self.embedding
-    }
-
-    /// The decoder layers, in order.
-    pub(crate) fn layers(&self) -> &[DecoderLayer] {
-        &self.layers
-    }
-
-    /// The final normalization.
-    pub(crate) fn norm(&self) -> &RmsNorm {
-        &self.norm
-    }
-
-    /// The vocabulary head.
-    pub(crate) fn head(&self) -> &ParallelLMHead {
-        &self.head
-    }
-
     pub fn plan(&self, tokens: u64) -> Result<Plan> {
         Plan::new(
             &self.config,
@@ -828,6 +808,16 @@ impl Qwen3Moe {
     }
 
     /// The number of tokens one page of the prefix cache holds.
+    /// The tokens one prefix-cache page holds, which the deployment's cache chose.
+    pub const fn cache_page_tokens(&self) -> u32 {
+        self.options.page_tokens
+    }
+
+    /// Whether the checkpoint's expert stacks were read as calibrated NVFP4.
+    pub const fn experts_encoded(&self) -> bool {
+        self.options.experts_encoded
+    }
+
     pub const fn page_tokens(&self) -> u32 {
         self.options.page_tokens
     }
