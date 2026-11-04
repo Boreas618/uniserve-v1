@@ -1169,6 +1169,19 @@ impl CachePlanes {
         Ok(self.num_units / plan.units_per_page)
     }
 
+    /// How many attention groups the plan holds.
+    pub fn groups(&self) -> usize {
+        self.plan.groups.len()
+    }
+
+    /// How many layers read `group`, in model order.
+    pub fn layers(&self, group: usize) -> usize {
+        self.plan
+            .groups
+            .get(group)
+            .map_or(0, |plan| plan.layers.len())
+    }
+
     /// The columns a page of the pool is split into.
     ///
     /// A group's page holds `block_size = plane_bytes / row_bytes` tokens of
