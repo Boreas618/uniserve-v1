@@ -1852,6 +1852,50 @@ mod layer_view_tests {
         Ok(())
     }
 
+    /// A unit copy moves a page's bytes into the units a batch was newly given: after it, the
+    /// destination's plane of each column holds what the source's held.
+    ///
+    /// This is the whole of what a cache-unit allocation asks of the pool - the source's bytes on
+    /// the destination's cells - so a run that reuses a cached prefix reads the destination and
+    /// finds the source's tokens.
+    #[test]
+    fn a_unit_copy_moves_a_pages_bytes_into_its_destination() -> Result<()> {
+        let pool = pool(vec![group(2, 1)], 2, 4, false);
+        let plane_bytes = pool.plan.plane_bytes as usize;
+        let cells = 2 * 4;
+        let address = pool.value_storage(0)?.address();
+        // SAFETY: the storage holds `cells` planes of `plane_bytes` bytes and is owned by `pool`;
+        // the test holds the only handle to it.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(address as *mut u8, cells * plane_bytes);
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::try_from(index % 251).expect("a byte");
+            }
+        }
+        let events = crate::stream::EventPool::new();
+        let batch = crate::stream::recorded::Batch::new(None, events);
+        pool.copy_units(&[(ipc::UnitId(1), ipc::UnitId(2))], batch.on().host())?;
+        batch.perform()?;
+        // Cell `column * num_units + unit`: unit 1 and unit 2 of column 0.
+        let expected: Vec<u8> = (plane_bytes..2 * plane_bytes)
+            .map(|index| u8::try_from(index % 251).expect("a byte"))
+            .collect();
+        let read = |cell: usize| {
+            // SAFETY: the same storage, still owned by `pool`, still `cells * plane_bytes` long.
+            unsafe {
+                std::slice::from_raw_parts(address as *const u8, cells * plane_bytes)
+                    [cell * plane_bytes..(cell + 1) * plane_bytes]
+                    .to_vec()
+            }
+        };
+        assert_eq!(
+            read(2),
+            expected,
+            "the destination did not take the source's bytes"
+        );
+        Ok(())
+    }
+
     /// A state page's checkpoints live in field storages of their own, one per field run of the
     /// page - never in a K/V plane's storage, because every group indexes the same units.
     #[test]
