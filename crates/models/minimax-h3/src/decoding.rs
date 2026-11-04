@@ -239,7 +239,37 @@ pub fn video_arena(
         .sum();
     // The clip's own raster, which the tiles are stitched into.
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
+    let channels = u64::from(crate::output::Rgb::CHANNELS);
+    // **The order is the reservation order**: the clip-level buffers are reserved once, before the
+    // tile loop, and live across the whole clip; the per-tile ones are reserved inside it and reused by
+    // every tile. `VideoDecoder::decode` reserves them in this list's order, and the executor sizes the
+    // arena by the sum, because the clip-level buffers are live while the per-tile ones are in use.
     Ok(vec![
+        Buffer {
+            name: "pixels",
+            element: "f16",
+            elements: patches * channels,
+        },
+        Buffer {
+            name: "decoded",
+            element: "f16",
+            elements: raster * channels,
+        },
+        Buffer {
+            name: "blended",
+            element: "f16",
+            elements: raster * channels,
+        },
+        Buffer {
+            name: "rgb",
+            element: "u8",
+            elements: raster * channels,
+        },
+        Buffer {
+            name: "overlap",
+            element: "f16",
+            elements: crate::output::Rgb::of(frames, height, width_px).overlap_elements(),
+        },
         Buffer {
             name: "stream",
             element: "f16",
@@ -309,31 +339,6 @@ pub fn video_arena(
             name: "gated",
             element: "f16",
             elements: rows * columns * ffn,
-        },
-        Buffer {
-            name: "pixels",
-            element: "f16",
-            elements: patches * u64::from(crate::output::Rgb::CHANNELS),
-        },
-        Buffer {
-            name: "decoded",
-            element: "f16",
-            elements: raster * u64::from(crate::output::Rgb::CHANNELS),
-        },
-        Buffer {
-            name: "blended",
-            element: "f16",
-            elements: raster * u64::from(crate::output::Rgb::CHANNELS),
-        },
-        Buffer {
-            name: "rgb",
-            element: "u8",
-            elements: raster * u64::from(crate::output::Rgb::CHANNELS),
-        },
-        Buffer {
-            name: "overlap",
-            element: "f16",
-            elements: crate::output::Rgb::of(frames, height, width_px).overlap_elements(),
         },
     ])
 }
@@ -942,6 +947,14 @@ mod tests {
             28 * 1797 * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
         );
         assert_eq!(arena[cosine].elements, arena[sine].elements);
+        // The clip-level buffers come first and the per-tile ones after, which is the order the model
+        // reserves them in: a plan that lists them the other way round is a plan the code does not
+        // follow.
+        let clip_level: Vec<&str> = arena.iter().take(5).map(|buffer| buffer.name).collect();
+        assert_eq!(
+            clip_level,
+            ["pixels", "decoded", "blended", "rgb", "overlap"]
+        );
         // Every buffer is named once and no buffer is empty.
         let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name).collect();
         let count = names.len();
