@@ -1551,18 +1551,22 @@ impl UnitColumn {
         if !plan.quantized {
             return Ok(());
         }
-        for &unit in units {
-            self.planes.reset_units(unit, 1, false, stream)?;
-        }
-        Ok(())
-    }
-
-    /// Commit transferred values and scales of whole units: set both fields'
-    /// initialization flags in every column.
-    pub(crate) fn mark_initialized(&self, units: &[u32], stream: impl Issue) -> Result<()> {
-        self.require_stream(stream)?;
-        for &unit in units {
-            self.planes.reset_units(unit, 1, false, stream)?;
+        // One fill per run of consecutive units per column, in the order the
+        // caller gave them: a reused unit's scales are one again, so a later
+        // import re-converts it, and a scattered release costs its runs and not
+        // its units.
+        let mut units = units.to_vec();
+        units.sort_unstable();
+        units.dedup();
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = start + 1;
+            while end < units.len() && units[end] == units[end - 1] + 1 {
+                end += 1;
+            }
+            self.planes
+                .reset_units(units[start], (end - start) as u32, false, stream)?;
+            start = end;
         }
         Ok(())
     }
