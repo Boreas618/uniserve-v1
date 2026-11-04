@@ -56,7 +56,7 @@ The factor is the two-sided 95% normal quantile the evaluator computes, `statist
 
 ## FP8 KV pages
 
-The FP8 KV cell is the BF16 checkpoint with `kv_cache_config.dtype = float8_e4m3fn`. It is the only cell that names an attention provider: `--set attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}`, because only the torch provider reads per-block FP8 pages at head dimension 128 and the automatic selection raises for them. The baseline leaves the variable unset and so uses `torch`; the candidate sets it to `auto` or to its own provider, and changes nothing else. The BF16 and NVFP4 cells name no attention backend, so each implementation selects the provider it has.
+The FP8 KV cell is the BF16 checkpoint with `kv_cache_config.dtype = float8_e4m3fn`. It is the only cell that names an attention provider: `--set attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}`, because only the torch provider reads per-block FP8 pages at head dimension 128 and the automatic selection raises for them. Both runs use the `torch` provider: the baseline through the unset default, the candidate by naming it or by leaving the variable unset. A candidate provider that reads per-block FP8 pages may be named instead, but the automatic selection does not serve them: every native paged provider refuses a per-block FP8 cache. The BF16 and NVFP4 cells name no attention backend, so each implementation selects the provider it has.
 
 ## Running the confirmation
 
@@ -72,24 +72,26 @@ export UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES=0
 # UNISERVE_QWEN3_FP8_ATTENTION_BACKEND selects the FP8 cell's provider.
 ```
 
-The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight, the baseline plan and run, the candidate plan and its three cell runs, then compare each cell:
+The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. The candidate needs the root package's release binary and an environment installed from this checkout, because the worker imports the `uniserve` package of the environment it runs in. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight and the baseline plan and run, then build and run the candidate's three cells by name, then compare each cell:
 
 ```bash
 .venv/bin/python -m pytest -q tests/python/unit/eval_driver/test_gsm8k_benchmark.py tests/python/unit/eval_driver/test_accuracy_compare.py
 .venv/bin/python -c "from uniserve_eval.config import load_config; from uniserve_eval.datasets import load_examples; c = load_config('uniserve_eval/qwen3_moe.toml'); rows, _ = load_examples(c.selected_points('qwen3-moe-gsm8k-bf16')[0]); print(len(rows), rows[0].id, rows[-1].id)"
-.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k
-.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k --output-root artifacts/qwen3_moe/gsm8k-baseline
-# Candidate: plan with the new binary, then the same profile's three cells by name.
-.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k --executable <new server binary>
-.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k-bf16 --executable <new server binary> --output-root artifacts/qwen3_moe/gsm8k-candidate
-.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k-nvfp4 --executable <new server binary> --output-root artifacts/qwen3_moe/gsm8k-candidate
-UNISERVE_QWEN3_FP8_ATTENTION_BACKEND=<provider> .venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k-bf16-fp8-kv --executable <new server binary> --output-root artifacts/qwen3_moe/gsm8k-candidate
-.venv/bin/uniserve-eval compare artifacts/qwen3_moe/gsm8k-baseline/qwen3-moe-gsm8k-bf16 artifacts/qwen3_moe/gsm8k-candidate/qwen3-moe-gsm8k-bf16
-.venv/bin/uniserve-eval compare artifacts/qwen3_moe/gsm8k-baseline/qwen3-moe-gsm8k-nvfp4 artifacts/qwen3_moe/gsm8k-candidate/qwen3-moe-gsm8k-nvfp4
-.venv/bin/uniserve-eval compare artifacts/qwen3_moe/gsm8k-baseline/qwen3-moe-gsm8k-bf16-fp8-kv artifacts/qwen3_moe/gsm8k-candidate/qwen3-moe-gsm8k-bf16-fp8-kv
+.venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k
+.venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k --output-root artifacts/qwen3_moe/gsm8k-baseline
+# Candidate: build the root package's binary, install this checkout's environment, then run the cells by name.
+cargo build --release
+export VIRTUAL_ENV=$PWD/.venv
+.venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k --executable "$PWD/target/release/uniserve"
+for cell in qwen3-moe-gsm8k-bf16 qwen3-moe-gsm8k-nvfp4 qwen3-moe-gsm8k-bf16-fp8-kv; do
+  .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml run "$cell" --executable "$PWD/target/release/uniserve" --output-root artifacts/qwen3_moe/gsm8k-candidate || break
+done
+for cell in qwen3-moe-gsm8k-bf16 qwen3-moe-gsm8k-nvfp4 qwen3-moe-gsm8k-bf16-fp8-kv; do
+  .venv/bin/python -m uniserve_eval compare "artifacts/qwen3_moe/gsm8k-baseline/$cell" "artifacts/qwen3_moe/gsm8k-candidate/$cell"
+done
 ```
 
-The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs its three cells serially, one server at a time. The candidate runs the two non-FP8 cells by name and then the FP8 cell once with its own provider, also serially, each writing only its own `<point>` directory. `run` refuses a non-empty result directory, so the baseline and candidate roots are separate and a rerun needs a fresh one. The candidate run uses the same profile and may differ from the baseline only in `--executable`, `--output-root` and, for the FP8 KV cell, `UNISERVE_QWEN3_FP8_ATTENTION_BACKEND`.
+The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs its three cells serially, one server at a time. The candidate builds the root package's `target/release/uniserve`, installs the environment from the same checkout, names that binary with `--executable`, and runs the same three cells by name, also serially, each writing only its own `<point>` directory. `run` refuses a non-empty result directory, so the baseline and candidate roots are separate and a rerun needs a fresh one. The candidate run uses the same profile and may differ from the baseline only in `--executable` and `--output-root`; both runs use the `torch` attention provider for the FP8 KV cell.
 
 ## Results
 
