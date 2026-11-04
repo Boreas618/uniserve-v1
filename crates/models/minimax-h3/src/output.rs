@@ -208,9 +208,11 @@ impl Splice {
 ///
 /// The blend is `CrossFade` on the **frames** axis: the two sources are each one contiguous block (a
 /// `[3, 25, H, W]` clip and a `[3, 5, H, W]` tail), which is the operator's condition, and the frames'
-/// weights are the ones it applies along the leading positions of its axis. The arithmetic is the
-/// reference's decoded-precision blend followed by the FP32 de-normalization, in that order: the
-/// de-normalization is [`RgbBytes`]' and reads the same constants the checkpoint publishes.
+/// weights are the ones it applies along the leading positions of its axis, and they are the reference's
+/// to the rounding: the operator builds its ramp as `position / extent` **in the raster's dtype**, which
+/// is `torch.arange(5, dtype=…)/5` in `output.py`, so the blend needs no declared deviation. The
+/// arithmetic is the reference's decoded-precision blend followed by the FP32 de-normalization, in that
+/// order: the de-normalization is [`RgbBytes`]' and reads the same constants the checkpoint publishes.
 pub struct VideoPostprocessor {
     fade: CrossFade,
     bytes: RgbBytes,
