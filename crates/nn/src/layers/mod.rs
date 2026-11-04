@@ -30,12 +30,13 @@ mod modulation;
 mod moe;
 mod noise;
 mod norm;
+mod pool;
 mod residual;
 mod rope;
 mod sampler;
 mod segments;
 
-pub use activation::{GatedActivation, PackedSwiGlu, SwiGlu};
+pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Snake, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use embedding::Embedding;
@@ -48,6 +49,7 @@ pub use moe::Moe;
 pub use noise::Noise;
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::rope::Rotation;
+pub use pool::AdaptivePool;
 pub use residual::{
     ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };

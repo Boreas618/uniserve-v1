@@ -7,9 +7,9 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    DType, DevicePtr, FrameNormPad, KvGroup, KvPlanes, KvView, Linear, ModulatedRmsNorm, Rotary,
-    Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, SwiGlu, TensorView, VsaTiles, Weight,
-    WeightedRmsNorm,
+    AdaptivePool, DType, DevicePtr, FrameNormPad, KvGroup, KvPlanes, KvView, Linear,
+    ModulatedRmsNorm, Rotary, Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, Snake,
+    SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -204,4 +204,21 @@ fn a_group_carries_each_layers_own_page_scales() {
     assert_eq!(second.key_scale.unwrap().ptr, DevicePtr::new(0x2_0400));
     assert_eq!(first.value_scale.unwrap().ptr, DevicePtr::new(0x1_0500));
     assert_eq!(second.value_scale.unwrap().ptr, DevicePtr::new(0x2_0500));
+}
+
+/// The audio encoder's activation and head pool are built from the checkpoint's channel counts, so
+/// a mismatched checkpoint fails where it is loaded rather than at the first launch.
+#[test]
+fn the_audio_layers_hold_their_channels() {
+    assert!(Snake::new(0).is_err());
+    assert!(Snake::new(8).is_ok());
+
+    let pool = AdaptivePool::new(8, 256, 32).unwrap();
+    assert_eq!(pool.output(), 32);
+    // A pool of nothing, or into nothing, has no geometry to compile.
+    assert!(AdaptivePool::new(0, 256, 32).is_err());
+    assert!(AdaptivePool::new(8, 0, 32).is_err());
+    assert!(AdaptivePool::new(8, 256, 0).is_err());
+    // Wider than the descriptor's fields hold.
+    assert!(AdaptivePool::new(u64::from(u32::MAX) + 1, 256, 32).is_err());
 }
