@@ -1019,11 +1019,11 @@ name = "executor"
 version = "2.0.0"
 dependencies = [
  "bytemuck",
- "cuda",
  "indexmap 2.14.0",
  "ipc",
  "libc",
  "libloading",
+ "platform",
  "proto",
  "rustix",
  "serde",

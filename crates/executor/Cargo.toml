@@ -11,7 +11,7 @@ publish = false
 # device work live beside these modules in the same crate.
 [dependencies]
 bytemuck.workspace = true
-cuda.workspace = true
+platform.workspace = true
 indexmap.workspace = true
 ipc.workspace = true
 libc.workspace = true

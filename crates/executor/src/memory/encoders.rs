@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use ::storage::Key;
 use ::storage::protocol::{PageShape, Reply, Request};
-use cuda::DeviceId;
 use ipc::EncoderPoolInfo;
+use platform::DeviceId;
 
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::Retained;

@@ -3,11 +3,13 @@
 
 pub mod events;
 pub mod issue;
+pub mod recorded;
 
 pub use events::{DRAIN_LIMIT, Deferral, Deferred, EventPool, JobId, Submitter, drain_event};
 pub use issue::{Fill, HostFunction, Issue, RowFill};
+pub use recorded::{Batch, Recording, RecordingHost};
 
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 
 use crate::config::Device;
 use crate::{Error, Result};

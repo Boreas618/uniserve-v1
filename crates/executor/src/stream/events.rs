@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use cuda::{DeviceId, Event, EventFlags};
 use ipc::Wake;
+use platform::{DeviceId, Event, EventFlags};
 
 use super::Issue;
 use crate::{Error, Result, lock};
@@ -733,8 +733,8 @@ mod tests {
     /// A retained lease of device 0, one reference, not recorded: what an owner
     /// fences its storage with.
     fn fence(events: &EventPool) -> Result<Arc<Event>> {
-        let event = events.acquire(cuda::DeviceId(0), false, false)?;
-        events.retain(&event, cuda::DeviceId(0), 1)?;
+        let event = events.acquire(platform::DeviceId(0), false, false)?;
+        events.retain(&event, platform::DeviceId(0), 1)?;
         Ok(event)
     }
 
