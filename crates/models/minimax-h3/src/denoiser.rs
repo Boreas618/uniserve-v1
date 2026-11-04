@@ -2942,6 +2942,15 @@ impl Denoiser {
         &self.solver
     }
 
+    /// The element type the block computes in: the checkpoint's own, read from the input projection.
+    ///
+    /// A runner allocates the prefix source, the latents and the conditioning's views in it. The
+    /// design's default `dtype = "auto"` is the checkpoint's representation converted nowhere, so the
+    /// model states the type rather than letting a caller assume one.
+    pub fn dtype(&self) -> DType {
+        self.transformer.dtype()
+    }
+
     /// How many solver evaluations one request makes.
     pub const fn evaluations(&self) -> u32 {
         self.evaluations
