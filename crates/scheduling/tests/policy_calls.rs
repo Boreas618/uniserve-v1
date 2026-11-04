@@ -36,6 +36,9 @@ const HEAP_BASE: u32 = 65536 / 2;
 #[derive(Default)]
 struct Toy {
     omitted: Option<&'static str>,
+    /// Whether the module's allocator refuses every buffer, as a module does
+    /// when it cannot grow its memory.
+    refuses_allocation: bool,
     replies: Vec<(&'static str, Vec<u8>)>,
     indexes: Vec<(&'static str, u32)>,
     bodies: Vec<(&'static str, &'static str)>,
@@ -68,6 +71,12 @@ impl Toy {
     /// export's result.
     fn body(mut self, export: &'static str, body: &'static str) -> Self {
         self.bodies.push((export, body));
+        self
+    }
+
+    /// Makes the module's allocator refuse every buffer.
+    fn refusing_allocation(mut self) -> Self {
+        self.refuses_allocation = true;
         self
     }
 
@@ -109,17 +118,24 @@ impl Toy {
             Some(offset)
         };
 
-        let mut text = String::from(
-            r#"(module
-  (memory (export "memory") 1)
-  (func (export "sched_alloc") (param $len i32) (result i32)
+        let allocator = if self.refuses_allocation {
+            r#"  (func (export "sched_alloc") (param $len i32) (result i32)
+    (i32.const 0))
+"#
+        } else {
+            r#"  (func (export "sched_alloc") (param $len i32) (result i32)
     (local $ptr i32)
     (local.set $ptr (global.get $heap))
     (global.set $heap
       (i32.add (global.get $heap) (i32.add (local.get $len) (i32.const 8))))
     (local.get $ptr))
-  (func (export "sched_free") (param $ptr i32) (param $len i32))
-"#,
+"#
+        };
+        let mut text = format!(
+            r#"(module
+  (memory (export "memory") 1)
+{allocator}  (func (export "sched_free") (param $ptr i32) (param $len i32))
+"#
         );
         text.push_str(&format!(
             "  (global $heap (mut i32) (i32.const {HEAP_BASE}))\n"
@@ -400,6 +416,22 @@ fn an_answer_that_does_not_decode_is_malformed() {
     match policy.dispatch(&Room::default()) {
         Err(PolicyError::Malformed { call, .. }) => assert_eq!(call, Call::Dispatch),
         other => panic!("expected a malformed answer, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_module_that_cannot_reserve_the_message_fails_the_call() {
+    let engine = engine();
+    // The allocator refuses, so the host has nowhere to write the message: a
+    // protocol failure of this call, not a trap and not a decision.
+    let toy = Toy::new().refusing_allocation();
+    let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
+    // `limits()` is read at instantiation and needs a buffer too, so the
+    // module refuses to instantiate before any decision is made.
+    match module.instantiate(&Init::default(), &Limits::default()) {
+        Err(PolicyError::Malformed { call, .. }) => assert_eq!(call, Call::Init),
+        Err(other) => panic!("expected a malformed call, got {other:?}"),
+        Ok(_) => panic!("expected a malformed call, got an instance"),
     }
 }
 
