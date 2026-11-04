@@ -1664,6 +1664,17 @@ impl Cudnn {
             self.api
                 .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
+        for (label, descriptor) in [("mode A", &heuristic), ("mode B", &mode_b)] {
+            let line = match self.mode_of(descriptor) {
+                Ok(mode) => format!(
+                    "the heuristic reads back as mode {mode} ({}), where A is {HEURISTIC_MODE_A} and B is {HEURISTIC_MODE_B}",
+                    mode_name(mode)
+                ),
+                Err(error) => format!("refused: {error}"),
+            };
+            steps.push((format!("engine heuristic: {label} read back"), None));
+            steps.push((format!("engine heuristic: {label} {line}"), None));
+        }
         steps.extend(self.fill_variants(&graph, &mode_b, listed_b));
         let exhaustive = stage!(
             "engine heuristic: mode B, read up to eight configurations and their numerical notes",
@@ -1854,6 +1865,26 @@ impl Cudnn {
             None,
         ));
         steps
+    }
+
+    /// The heuristic mode a finalized heuristic descriptor holds, read back
+    /// from the attribute this crate set.
+    ///
+    /// A line of the probe, because the two modes answered the same number of
+    /// configurations on both shapes tried — a shortlist that matches the
+    /// exhaustive list exactly is not what the header describes, and an
+    /// attribute that did not reach the descriptor would look exactly like
+    /// that.
+    fn mode_of(&self, heuristic: &Descriptor) -> Result<i32> {
+        let mut mode = -1i32;
+        self.api.get(
+            heuristic,
+            ATTR_ENGINEHEUR_MODE,
+            TYPE_HEUR_MODE,
+            std::slice::from_mut(&mut mode),
+            "cudnnBackendGetAttribute",
+        )?;
+        Ok(mode)
     }
 
     /// One fill of the heuristic's results with the slots and the initial
