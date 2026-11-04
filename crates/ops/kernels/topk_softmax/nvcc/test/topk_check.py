@@ -26,7 +26,13 @@ python crates/ops/kernels/topk_softmax/nvcc/test/topk_check.py --verify <dir>
 
 so the arithmetic is exercised through `platform`'s launch surface — the same route the executor
 takes — and this script's device half is a comparison of two dumped buffers against numbers it
-computed before the launch, not a second launcher.
+computed before the launch, not a second launcher. **That half is unproven until a device takes
+it**: what is proven here is the module half, the pinned numbers, and the comparison's power to
+fail against wrong dumps.
+
+The module's own descriptor key states what it was built for, so `--module` alone is enough:
+`experts`, `top`, the scores' storage and the renormalization flag are derived from the last path
+component and the flags stay as overrides. The run prints what it derived.
 
 **The rule it pins.** The scores are a softmax over the vocabulary, and the picks are the top
 `top` of it, descending, **equal probabilities in ascending expert id** — the kernel compares
@@ -39,9 +45,8 @@ ever read.
 
 import argparse
 import json
-import math
 import pathlib
-import struct
+import re
 import sys
 
 import torch
@@ -78,7 +83,34 @@ UNIT_ROUNDOFF = 2.0**-24
 WARPS_PER_BLOCK = 4
 
 
-def fixed_case(experts, top, rows, row_stride):
+def derive(module):
+    """The descriptor a module directory names, from its last path component.
+
+    A store path ends in the descriptor's key —
+    `scores_bf16_experts_128_top_8_renormalize_true_scale_none` — so the run takes the
+    vocabulary, the top-k, the scores' storage and the renormalization flag from it. A key that
+    does not say them is not a module this check can pin, and the run says so rather than asking
+    for the same numbers twice.
+    """
+    key = module.name
+    fields = {}
+    for name, pattern in (
+        ("experts", r"(?:^|_)experts_(\d+)(?=_|$)"),
+        ("top", r"(?:^|_)top_(\d+)(?=_|$)"),
+    ):
+        found = re.search(pattern, key)
+        if found:
+            fields[name] = int(found.group(1))
+    storage = re.search(r"(?:^|_)scores_([a-z0-9]+)(?=_|$)", key)
+    if storage and storage.group(1) in TORCH_TYPES:
+        fields["dtype"] = storage.group(1)
+    renormalize = re.search(r"(?:^|_)renormalize_(true|false)(?=_|$)", key)
+    if renormalize:
+        fields["renormalize"] = renormalize.group(1) == "true"
+    return fields
+
+
+def fixed_case(experts, top, rows, row_stride, renormalize=True):
     """The input every phase agrees on, and the routing it must produce.
 
     The scores are built in `bf16`, so a tie made in the values is a tie the kernel sees. Row 0
@@ -115,11 +147,14 @@ def fixed_case(experts, top, rows, row_stride):
         picked[row] = probabilities[row][order]
 
     # Renormalized over the picks, as the kernel's butterfly does; its floor is FP32's epsilon.
-    total = picked.sum(dim=-1, keepdim=True)
-    total = torch.where(
-        total < FLT_EPSILON, torch.full_like(total, FLT_EPSILON), total
-    )
-    weights = picked / total
+    # A module built without renormalization reports the vocabulary's own probabilities.
+    weights = picked
+    if renormalize:
+        total = picked.sum(dim=-1, keepdim=True)
+        total = torch.where(
+            total < FLT_EPSILON, torch.full_like(total, FLT_EPSILON), total
+        )
+        weights = picked / total
     return scores, ids, weights
 
 
@@ -303,21 +338,34 @@ def verify(directory, ids, weights, experts, rows, top):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module", type=pathlib.Path, default=None)
-    parser.add_argument("--experts", type=int, default=64)
-    parser.add_argument("--top", type=int, default=8)
+    parser.add_argument(
+        "--experts",
+        type=int,
+        default=None,
+        help="the vocabulary; taken from the module's descriptor key when omitted",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=None,
+        help="the picks per token; taken from the module's descriptor key when omitted",
+    )
     parser.add_argument("--rows", type=int, default=4)
-    parser.add_argument("--row-stride", type=int, default=96)
-    parser.add_argument("--dtype", choices=sorted(TORCH_TYPES), default="bf16")
+    parser.add_argument(
+        "--row-stride",
+        type=int,
+        default=None,
+        help="elements between the score rows; the vocabulary when omitted, since a row that "
+        "is wider than the vocabulary exercises the padding a lane must not read",
+    )
+    parser.add_argument("--dtype", choices=sorted(TORCH_TYPES), default=None)
+    parser.add_argument(
+        "--renormalize", choices=["true", "false"], default=None
+    )
     parser.add_argument("--write", type=pathlib.Path, default=None)
     parser.add_argument("--verify", type=pathlib.Path, default=None)
     arguments = parser.parse_args()
 
-    if arguments.top > 32:
-        parser.error(
-            "a warp routes one token, so the top-k width is at most 32"
-        )
-    if arguments.row_stride < arguments.experts:
-        parser.error("a row narrower than the vocabulary cannot hold it")
     if arguments.module is None and arguments.verify is None:
         print(
             "this check needs a module directory (--module) or a device run's output "
@@ -325,6 +373,39 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    # The module's own descriptor key states what it was built for, so the natural invocation
+    # needs no numbers: the flags stay as overrides, and the run says where the rest came from.
+    fields = derive(arguments.module) if arguments.module is not None else {}
+    derived = []
+    for name in ("experts", "top", "dtype", "renormalize"):
+        value = getattr(arguments, name)
+        if value is None:
+            value = fields.get(name)
+            if name in fields:
+                derived.append(f"{name} {value}")
+        if value is None:
+            print(
+                f"--{name} is not given and the module's path does not state it: "
+                f"{arguments.module if arguments.module else arguments.verify}",
+                file=sys.stderr,
+            )
+            return 1
+        setattr(arguments, name, value)
+    if arguments.row_stride is None:
+        arguments.row_stride = arguments.experts
+    if arguments.renormalize == "true":
+        arguments.renormalize = True
+    elif arguments.renormalize == "false":
+        arguments.renormalize = False
+    if derived:
+        print(f"derived {', '.join(derived)} from the descriptor key")
+    if arguments.top > 32:
+        parser.error(
+            "a warp routes one token, so the top-k width is at most 32"
+        )
+    if arguments.row_stride < arguments.experts:
+        parser.error("a row narrower than the vocabulary cannot hold it")
 
     problems = []
     if arguments.module is not None:
@@ -337,7 +418,11 @@ def main() -> int:
         )
 
     scores, ids, weights = fixed_case(
-        arguments.experts, arguments.top, arguments.rows, arguments.row_stride
+        arguments.experts,
+        arguments.top,
+        arguments.rows,
+        arguments.row_stride,
+        arguments.renormalize,
     )
     # The pinned expectation: printed so a device run compares against numbers rather than
     # re-deriving them, and so a reader can see the tie resolved the right way.
