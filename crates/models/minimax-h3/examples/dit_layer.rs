@@ -574,7 +574,12 @@ fn stage_denoise(args: &Args) -> Result<()> {
 
     // 5. The walk starts at the constants: the AdaLN cache's own projections are launches, and a walk
     //    that began at the forward would report a complete list while the run refused at the cache.
-    let mut walk = Walk(Vec::new());
+    let mut walk = Walk::new();
+    let mut walk_file = WalkFile {
+        path: args.out.join("walk.txt"),
+        recorded: walk.clone(),
+        written: false,
+    };
     ops::capture::set_sink(Some(&mut walk));
     let sink = SinkGuard;
 
@@ -790,18 +795,17 @@ fn stage_denoise(args: &Args) -> Result<()> {
     // 12. What ran, and the one verdict a run cannot fake: a trajectory whose last sample is its own
     //     draw wrote nothing, which the exit code would otherwise pass.
     let walk_path = directory.join("walk.txt");
-    if !walk.0.is_empty() {
-        std::fs::write(&walk_path, walk.text())
-            .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
+    if walk.len() != 0 {
+        walk_file.write()?;
         println!(
             "walk    {} launches of {} distinct programs -> {}",
-            walk.0.len(),
+            walk.len(),
             walk.distinct(),
             walk_path.display()
         );
     }
     let last = trajectory?;
-    if walk.0.is_empty() {
+    if walk.len() == 0 {
         return Err(Failure::message(
             "the walk recorded no launches: the forward replayed a captured graph, or no sink was \
              installed",
@@ -1066,7 +1070,12 @@ fn stage_block(args: &Args) -> Result<()> {
     // The walk starts here rather than at the forward, because this stage's first launches are the
     // cache's own F32 projections - one of them was a stop, and a walk that began at the stack would
     // have reported a complete list while the run still refused at the cache.
-    let mut walk = Walk(Vec::new());
+    let mut walk = Walk::new();
+    let mut walk_file = WalkFile {
+        path: args.out.join("walk.txt"),
+        recorded: walk.clone(),
+        written: false,
+    };
     ops::capture::set_sink(Some(&mut walk));
     let sink = SinkGuard;
     cache_projections(&forward, &projections, &memory)?;
@@ -1124,7 +1133,7 @@ fn stage_block(args: &Args) -> Result<()> {
     drop(sink);
     forward_result?;
     stream.synchronize()?;
-    if walk.0.is_empty() {
+    if walk.len() == 0 {
         return Err(Failure::message(
             "the walk recorded no launches: the forward replayed a captured graph, or no sink was \
              installed",
@@ -1176,11 +1185,10 @@ fn stage_block(args: &Args) -> Result<()> {
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     let walk_path = args.out.join("walk.txt");
-    std::fs::write(&walk_path, walk.text())
-        .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
+    walk_file.write()?;
     println!(
         "walk    {} launches of {} distinct programs -> {}",
-        walk.0.len(),
+        walk.len(),
         walk.distinct(),
         walk_path.display()
     );
@@ -1392,11 +1400,17 @@ fn transpose_positions(
 /// recorder is the executor's own mechanism (`ops::capture`), installed for the duration of the
 /// forward and removed whether it succeeds or fails: a sink left installed would be reported to by
 /// every later launch on the thread.
-struct Walk(Vec<(&'static str, String)>);
+///
+/// The recording is shared (`Rc<RefCell<..>>`), so the stage keeps a handle it can read while the
+/// sink is still installed: a failing launch must be reportable *at* the failure, and a sink that
+/// owned its rows outright would borrow them exclusively until it was removed - after the `?` that
+/// ends the stage, which is too late to say anything.
+#[derive(Clone, Default)]
+struct Walk(std::rc::Rc<std::cell::RefCell<Vec<(&'static str, String)>>>);
 
 impl ops::capture::Sink for Walk {
     fn launched(&mut self, operator: &'static str, key: &str) {
-        self.0.push((operator, key.to_owned()));
+        self.0.borrow_mut().push((operator, key.to_owned()));
     }
 }
 
@@ -1413,11 +1427,51 @@ impl Drop for SinkGuard {
     }
 }
 
+/// Writes the stage's walk when it leaves scope if nothing wrote it earlier.
+///
+/// A failing launch ends the stage through a `?` long before the end of the pass, and the launches
+/// recorded so far are then the only evidence of where it died: the stop line names a native entry
+/// and nothing more (`native entry \`uniserve_gemm\` failed with status 1`), while one operator is
+/// launched at many descriptor keys in one forward. The guard writes the file and prints the last
+/// launches, so a stop says which program launched before it.
+struct WalkFile {
+    path: std::path::PathBuf,
+    recorded: Walk,
+    written: bool,
+}
+
+impl WalkFile {
+    fn write(&mut self) -> Result<()> {
+        std::fs::write(&self.path, self.recorded.text())
+            .map_err(|error| Failure::message(format!("{}: {error}", self.path.display())))?;
+        self.written = true;
+        Ok(())
+    }
+}
+
+impl Drop for WalkFile {
+    fn drop(&mut self) {
+        if self.written {
+            return;
+        }
+        let _ = std::fs::write(&self.path, self.recorded.text());
+        eprintln!(
+            "walk: the stage stopped after {} launches; the last ones were\n{}",
+            self.recorded.len(),
+            self.recorded.tail(5)
+        );
+    }
+}
+
 impl Walk {
+    fn new() -> Self {
+        Self::default()
+    }
+
     /// The walk as the store's key list is written: one `operator<TAB>key` per launch, in order.
     fn text(&self) -> String {
         let mut text = String::new();
-        for (operator, key) in &self.0 {
+        for (operator, key) in self.0.borrow().iter() {
             text.push_str(operator);
             text.push('\t');
             text.push_str(key);
@@ -1428,14 +1482,33 @@ impl Walk {
 
     /// How many distinct programs the walk bound.
     fn distinct(&self) -> usize {
-        let mut keys: Vec<(&str, &str)> = self
-            .0
+        let launches = self.0.borrow();
+        let mut keys: Vec<(&str, &str)> = launches
             .iter()
             .map(|(operator, key)| (*operator, key.as_str()))
             .collect();
         keys.sort_unstable();
         keys.dedup();
         keys.len()
+    }
+
+    /// The launches this walk has recorded, oldest first, as lines.
+    fn tail(&self, count: usize) -> String {
+        let launches = self.0.borrow();
+        let start = launches.len().saturating_sub(count);
+        let mut text = String::new();
+        for (operator, key) in &launches[start..] {
+            text.push_str(operator);
+            text.push('\t');
+            text.push_str(key);
+            text.push('\n');
+        }
+        text
+    }
+
+    /// The launches recorded so far.
+    fn len(&self) -> usize {
+        self.0.borrow().len()
     }
 }
 
