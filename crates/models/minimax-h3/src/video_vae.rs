@@ -185,8 +185,8 @@ impl Seams {
         self.starts.is_empty()
     }
 
-    /// The latent span of tile `index`: `(start, length)` in latent columns, and the tile's extent
-    /// clipped to the raster.
+    /// The latent span of tile `index`: `(first, end)` in latent cells, end exclusive, over a raster
+    /// whose extent is `raster` **output pixels** (the same unit `split` was given).
     pub fn latent(&self, index: usize, raster: u32, ratio: u32) -> (u32, u32) {
         let start = self.starts[index];
         let end = (start + self.lengths[index]).min(raster);
@@ -250,11 +250,15 @@ impl Tiles {
     /// will, and a tile trims its trailing rows and columns exactly when those are nonzero.
     pub fn tiles(&self, config: &VideoVaeConfig, canvas: &Canvas) -> Vec<Tile> {
         let ratio = config.spatial_compression();
+        // The seams are split on the canvas's output pixels, so the tile's span is clipped there and
+        // then divided into latent cells; using the latent extent here would clip pixel coordinates
+        // to a latent count and give a tile that ends before it starts.
+        let (height, width) = canvas.pixels(config);
         let mut tiles = Vec::with_capacity(self.rows.len() * self.columns.len());
         for row in 0..self.rows.len() {
             for column in 0..self.columns.len() {
-                let (row_start, row_end) = self.rows.latent(row, canvas.height, ratio);
-                let (column_start, column_end) = self.columns.latent(column, canvas.width, ratio);
+                let (row_start, row_end) = self.rows.latent(row, height, ratio);
+                let (column_start, column_end) = self.columns.latent(column, width, ratio);
                 let above = row
                     .checked_sub(1)
                     .map_or(0, |previous| self.rows.overlap(previous).unwrap_or(0));
@@ -536,13 +540,13 @@ impl VideoDecoder {
             loader,
             "video_vae.register_rows",
             canvas.voxels() as u32,
-            canvas.registers as u32,
+            canvas.registers,
         )?;
         let zero_rows = indices(
             loader,
             "video_vae.zero_rows",
             (canvas.voxels() + u64::from(canvas.registers)) as u32,
-            canvas.tail as u32,
+            canvas.tail,
         )?;
 
         let mut layers = Vec::with_capacity(config.decoder_num_layers as usize);
@@ -851,6 +855,52 @@ impl VideoDecoder {
     }
 }
 
+/// Fold the latent statistics into the projection that follows them.
+///
+/// The decoder's first step restores a latent channel (`value · std + mean`) and then applies the
+/// checkpoint's one-by-one post-quantization convolution. The two compose into one affine:
+/// `W · (std ⊙ x + mean) + b`, i.e. a weight whose input column `i` is scaled by `std[i]` and a bias
+/// shifted by `W · mean`. Folding them at the loading boundary keeps one element type and one
+/// operator, with the checkpoint's own rounding of the stored result.
+///
+/// `weight` is `[out, in]` row-major, `bias` is `[out]`, and `std`/`mean` are `[in]`. The result is the
+/// folded `(weight, bias)`; a checkpoint whose extents disagree is refused rather than read past.
+pub fn fold_statistics(
+    weight: &[f32],
+    bias: &[f32],
+    std: &[f32],
+    mean: &[f32],
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let out = bias.len();
+    if out == 0 || mean.len() != std.len() || mean.is_empty() {
+        return Err(Error::config(
+            "the latent statistics and the projection's channels disagree".to_owned(),
+        ));
+    }
+    let channels = mean.len();
+    if weight.len() != out * channels {
+        return Err(Error::config(format!(
+            "a {}-element projection for {out} outputs of {channels} inputs",
+            weight.len()
+        )));
+    }
+    if std.iter().any(|value| !value.is_finite()) || mean.iter().any(|value| !value.is_finite()) {
+        return Err(Error::config(
+            "the latent statistics are not finite".to_owned(),
+        ));
+    }
+    let mut folded = weight.to_vec();
+    let mut shift = bias.to_vec();
+    for channel in 0..channels {
+        for (output, shift_output) in shift.iter_mut().enumerate().take(out) {
+            let at = output * channels + channel;
+            folded[at] = weight[at] * std[channel];
+            *shift_output += weight[at] * mean[channel];
+        }
+    }
+    Ok((folded, shift))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -939,9 +989,12 @@ pub(crate) mod tests {
         assert_eq!(first.latent_columns, (0, 16));
         assert_eq!((first.above, first.left), (0, 0));
         assert_eq!((first.below, first.right), (96, 80));
-        // The second column of the first row cross-fades 80 pixels of its predecessor.
+        // The second column of the first row cross-fades 80 pixels of its predecessor: the width's
+        // slack of 64 pixels is four alignment steps over six seams, so the first four seams carry
+        // 80 pixels and the last two the minimum 64, and the second tile starts 176 pixels in.
         assert_eq!(planned[1].left, 80);
-        assert_eq!(planned[1].latent_columns, (192 / 16, (192 + 256) / 16));
+        assert_eq!(planned[1].latent_columns, (176 / 16, (176 + 256) / 16));
+        assert_eq!(planned[5].left, 64);
         // A tile that has a successor below trims its trailing rows; the last row does not.
         let below = planned[7];
         assert_eq!(below.row, 1);
@@ -1162,50 +1215,4 @@ pub(crate) mod tests {
         });
         VideoVaeConfig::parse(&sidecar).expect("the checkpoint's video VAE sidecar")
     }
-}
-
-/// Fold the latent statistics into the projection that follows them.
-///
-/// The decoder's first step restores a latent channel (`value · std + mean`) and then applies the
-/// checkpoint's one-by-one post-quantization convolution. The two compose into one affine:
-/// `W · (std ⊙ x + mean) + b`, i.e. a weight whose input column `i` is scaled by `std[i]` and a bias
-/// shifted by `W · mean`. Folding them at the loading boundary keeps one element type and one
-/// operator, with the checkpoint's own rounding of the stored result.
-///
-/// `weight` is `[out, in]` row-major, `bias` is `[out]`, and `std`/`mean` are `[in]`. The result is the
-/// folded `(weight, bias)`; a checkpoint whose extents disagree is refused rather than read past.
-pub fn fold_statistics(
-    weight: &[f32],
-    bias: &[f32],
-    std: &[f32],
-    mean: &[f32],
-) -> Result<(Vec<f32>, Vec<f32>)> {
-    let out = bias.len();
-    if out == 0 || mean.len() != std.len() || mean.is_empty() {
-        return Err(Error::config(
-            "the latent statistics and the projection's channels disagree".to_owned(),
-        ));
-    }
-    let channels = mean.len();
-    if weight.len() != out * channels {
-        return Err(Error::config(format!(
-            "a {}-element projection for {out} outputs of {channels} inputs",
-            weight.len()
-        )));
-    }
-    if std.iter().any(|value| !value.is_finite()) || mean.iter().any(|value| !value.is_finite()) {
-        return Err(Error::config(
-            "the latent statistics are not finite".to_owned(),
-        ));
-    }
-    let mut folded = weight.to_vec();
-    let mut shift = bias.to_vec();
-    for channel in 0..channels {
-        for output in 0..out {
-            let at = output * channels + channel;
-            folded[at] = weight[at] * std[channel];
-            shift[output] += weight[at] * mean[channel];
-        }
-    }
-    Ok((folded, shift))
 }
