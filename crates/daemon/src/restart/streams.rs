@@ -125,6 +125,27 @@ pub(crate) struct Paused {
     pub(crate) descriptors: Vec<OwnedFd>,
     /// The registrations this process answers, in the same order.
     frozen: Vec<FrozenStream>,
+    /// The handoff this pause closed, for the path that gives it back.
+    handoff: Option<Arc<crate::http::handoff::Handoff>>,
+    /// Whether the responses were answered: a pause that ends any other way
+    /// gives the deployment back to this daemon.
+    decided: bool,
+}
+
+/// A pause that ends without answering its responses — the successor gave up,
+/// or the takeover failed before it answered — gives the deployment back: the
+/// responses resume here (their decision's sender dies with this struct) and
+/// the daemon admits new requests again, instead of closing every connection
+/// for a handover that never happened.
+impl Drop for Paused {
+    fn drop(&mut self) {
+        if self.decided {
+            return;
+        }
+        if let Some(handoff) = &self.handoff {
+            handoff.release();
+        }
+    }
 }
 
 impl Paused {
@@ -134,6 +155,8 @@ impl Paused {
             records: Vec::new(),
             descriptors: Vec::new(),
             frozen: Vec::new(),
+            handoff: None,
+            decided: true,
         }
     }
 
@@ -148,9 +171,10 @@ impl Paused {
     /// deployment's restart test parses. This is the shorter of the two views:
     /// §7.5.1's pause, which ends when the successor writes the response's next
     /// event, is the successor's [`adopted`] record.
-    pub(crate) fn decide(self, adopted: &[Taken], successor_pid: u32) {
+    pub(crate) fn decide(mut self, adopted: &[Taken], successor_pid: u32) {
+        self.decided = true;
         let decided_at = crate::http::handoff::now_ns();
-        for frozen in self.frozen {
+        for frozen in std::mem::take(&mut self.frozen) {
             let taken = adopted
                 .iter()
                 .find(|taken| taken.request_id == frozen.request_id);
@@ -235,6 +259,8 @@ impl super::Restarter {
             records,
             descriptors,
             frozen,
+            handoff: Some(handoff),
+            decided: false,
         }
     }
 }
@@ -492,6 +518,8 @@ mod tests {
             records: Vec::new(),
             descriptors: Vec::new(),
             frozen: vec![taken, resumed],
+            handoff: None,
+            decided: false,
         };
 
         paused.decide(
