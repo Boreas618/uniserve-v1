@@ -37,6 +37,23 @@ fn shard(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::
     path
 }
 
+/// Write one shard whose tensors are byte buffers, and answer the path.
+fn shard_u8(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let views: Vec<(String, TensorView<'_>)> = tensors
+        .iter()
+        .map(|(tensor, shape, bytes)| {
+            let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
+            (
+                (*tensor).to_owned(),
+                TensorView::new(Dtype::U8, shape, bytes).unwrap(),
+            )
+        })
+        .collect();
+    safetensors::serialize_to_file(views, &None, &path).unwrap();
+    path
+}
+
 /// A store that keeps what it was given, in host memory.
 #[derive(Default)]
 struct Recording {
@@ -380,4 +397,79 @@ fn a_strided_row_parallel_shard_gathers_its_columns() {
     }
     assert_eq!(store.published.len(), 2);
     assert_ne!(store.published[0].0, store.published[1].0);
+}
+
+/// A calibrated NVFP4 matrix is its two byte fields and its tensor scale, published under keys that
+/// name the scale layout; nothing is quantized at load.
+#[test]
+fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    // `[4, 64]` encoded: 32 bytes a row of packed pairs, four block scales a row.
+    let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
+    shard_u8(
+        directory,
+        "model.safetensors",
+        &[
+            ("w", vec![4, 32], values.clone()),
+            ("w_scale", vec![4, 4], scales.clone()),
+        ],
+    );
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let quantized = loader
+        .nvfp4(
+            &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
+            &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            ops::fp4::ScaleLayout::Linear,
+            0.25,
+        )
+        .unwrap();
+
+    assert_eq!(quantized.packed.shape().dims(), &[4, 32]);
+    assert_eq!(quantized.packed.dtype(), DType::U8);
+    assert_eq!(quantized.scales.shape().dims(), &[4, 4]);
+    assert_eq!(quantized.scales.dtype(), DType::U8);
+    assert_eq!(quantized.global_scale, 0.25);
+    assert_eq!(store.published.len(), 2);
+    assert_eq!(store.published[0].1, values);
+    assert_eq!(store.published[1].1, scales);
+    // The layout names the arrangement, so the two fields never share a key with a plain region.
+    assert_eq!(store.published[0].0.layout, WeightLayout::NVFP4_VALUES);
+    assert_eq!(
+        store.published[1].0.layout,
+        WeightLayout::NVFP4_SCALES_LINEAR
+    );
+}
+
+/// The block scales are the shape the requested layout names; another layout's shape is refused
+/// rather than reinterpreted, because the two arrangements index the same bytes differently.
+#[test]
+fn the_block_scales_must_have_the_layout_s_shape() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let values: Vec<u8> = vec![0; 128];
+    let scales: Vec<u8> = vec![0x38; 16];
+    shard_u8(
+        directory,
+        "model.safetensors",
+        &[("w", vec![4, 32], values), ("w_scale", vec![4, 4], scales)],
+    );
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let error = loader
+        .nvfp4(
+            &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
+            &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            ops::fp4::ScaleLayout::Swizzled128X4,
+            0.25,
+        )
+        .expect_err("a linear scale field is not the swizzled layout's field");
+    assert!(format!("{error}").contains("swizzled_128x4"), "{error}");
+    assert!(store.published.is_empty());
 }
