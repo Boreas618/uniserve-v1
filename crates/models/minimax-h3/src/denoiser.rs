@@ -22,8 +22,8 @@
 //! in the order [`Layouts::state_tables`] names them; nothing of a request reaches a capture as a
 //! host value, and no table is uploaded from inside a forward.
 
-use nn::Shape;
 use nn::capability::{LatentShape, Layout, StateTable, VideoRequest};
+use nn::{DType, Shape};
 
 use crate::config::{Canvas, DenoiserConfig};
 use crate::packing::{self, DensePacking};
@@ -172,39 +172,65 @@ impl Layouts {
     pub fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
         let packing = self.packing_of(layout)?;
         let rows = u64::from(packing.padded_tokens);
+        let video = u64::from(packing.video_rows);
+        let audio = u64::from(packing.audio_rows);
         let mut tables = vec![
+            // The row each modality's projected latents are scattered into: the layout places the
+            // video rows first and the audio rows after them.
+            StateTable {
+                name: "audio_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[audio]),
+            },
+            StateTable {
+                name: "video_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[video]),
+            },
+            // One sequence over the whole shard: every query row sees the used key rows and no
+            // query sees a padding row. `cu_seq_lens_k` is the dense visibility, `_q` the rows.
+            StateTable {
+                name: "cu_seq_lens_k",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows + 1]),
+            },
+            StateTable {
+                name: "cu_seq_lens_q",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows + 1]),
+            },
             StateTable {
                 name: "groups",
-                dtype: nn::DType::I32,
+                dtype: DType::I32,
                 shape: Shape::new(&[rows]),
             },
             StateTable {
                 name: "modulation_indices",
-                dtype: nn::DType::I32,
+                dtype: DType::I32,
                 shape: Shape::new(&[rows]),
             },
             // Axis-major, `[axes, rows]`: `nn::Rotary`'s sectioned rotation reads one coordinate
             // per axis per token and refuses a leading extent that is not the axis count.
             StateTable {
                 name: "position_ids",
-                dtype: nn::DType::F32,
+                dtype: DType::F32,
                 shape: Shape::new(&[3, rows]),
             },
             StateTable {
                 name: "prefix_index",
-                dtype: nn::DType::I32,
+                dtype: DType::I32,
                 shape: Shape::new(&[rows]),
             },
             StateTable {
                 name: "token_tags",
-                dtype: nn::DType::I32,
+                dtype: DType::I32,
                 shape: Shape::new(&[rows]),
             },
-            // The step the schedule evaluates, written by the executor before each replay. One
-            // value per (request, capture), not per row.
+            // The step the schedule evaluates: written by the executor before each replay, one
+            // value per (request, capture) rather than per row.
             StateTable {
                 name: "step",
-                dtype: nn::DType::I64,
+                dtype: DType::I32,
                 shape: Shape::new(&[1]),
             },
         ];
