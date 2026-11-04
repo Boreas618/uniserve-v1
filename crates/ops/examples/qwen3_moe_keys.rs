@@ -17,6 +17,22 @@
 //! cannot call it. If a value here and the layer crate's disagree, the layer crate is right and
 //! this file follows it. Candidate widths and the sampler's extras are the slice's own request
 //! state (`crates/nn/src/layers/sampler.rs`, `Sampler::new`).
+//!
+//! Gaps this file does not fill, named rather than invented, so that the 85 declared operators are
+//! accounted for between the two fixtures and these lines:
+//!
+//! - **The quantized export's family**: `nvfp4_gemm`, `nvfp4_quantize`, `gather_gemm_nvfp4`,
+//!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8`, `kv_quantize` and
+//!   `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
+//!   the expert packing, the exchange's ranks — and no NVFP4 shard exists in this workspace, so a
+//!   key here would be a guess about an artifact nobody has opened.
+//! - **The executor's path, not the model's**: `slot_commit` (its views are the sampler's state),
+//!   `attention_gather_rows`, `attention_gather_decode_inputs`, `page_conversion`,
+//!   `cache_block_snapshot`, `cache_block_scatter` and `cache_copy_region` (the page geometry and
+//!   the block shapes are the executor's scheduling), and `paged_attention`, whose decode attention
+//!   is trtllm-gen. These are keyed where the executor compiles its own plans.
+//! - `logprob_gather`, `logits_gather`, `vocab_unpad` and the sampler's chain are above: they are the
+//!   slice's, and the widths are its request state.
 
 use ops::attention::{Descriptor as AttentionDescriptor, Mask, Phase};
 use ops::moe;
@@ -206,8 +222,10 @@ fn main() {
             positions: DType::I32,
             columns: HEAD_DIM / 2,
             block: ROTARY_BLOCK,
-            // Qwen3's rope theta is 1e6, from the checkpoint's configuration.
-            scale: Float::from(1_000_000.0_f32),
+            // The layer's scale, not the rope base: `Rotary` multiplies every angle by 1.0 and the
+            // frequencies table carries Qwen3's 1e6 base, so a key that named the base would compile
+            // the same program under a name no layer asks for.
+            scale: Float::from(1.0_f32),
             pdl: PDL,
             // One-dimensional positions: Qwen3 is text only, so no section is cut.
             axes: 1,
@@ -338,8 +356,21 @@ fn main() {
         "argmax".to_owned(),
         key(&ops::sampler::ArgMaxDescriptor {
             dtype: DType::F32,
-            width: CANDIDATE_WIDTH,
+            // Greedy reads the row the head shaped, so the width is the vocabulary and not the
+            // candidate width the top-k chain keeps (`nn::Sampler::greedy` passes `self.vocabulary`).
+            width: VOCABULARY,
             ids: DType::I32,
+            pdl: PDL,
+        }),
+    ));
+    lines.push((
+        // The candidates' probabilities: the general selection's step between the top-k program and
+        // the filters, over the candidate width rather than the vocabulary.
+        "softmax".to_owned(),
+        key(&ops::norm::SoftmaxDescriptor {
+            dtype: DType::F32,
+            columns: CANDIDATE_WIDTH,
+            tile: row_tile(CANDIDATE_WIDTH),
             pdl: PDL,
         }),
     ));

@@ -31,7 +31,9 @@ def capability(target):
     while digits and digits[-1].isalpha():
         digits = digits[:-1]
     if not digits.isdigit():
-        raise SystemExit(f"target {target!r} is not an sm_<capability> architecture")
+        raise SystemExit(
+            f"target {target!r} is not an sm_<capability> architecture"
+        )
     return int(digits)
 
 
@@ -48,13 +50,21 @@ def parse_key(key, dimensions):
     remaining = key
     fields = {}
     while remaining:
-        name = next((one for one in names if remaining.startswith(one + "_")), None)
+        name = next(
+            (one for one in names if remaining.startswith(one + "_")), None
+        )
         if name is None:
-            raise SystemExit(f"{key}: no dimension among {names} starts {remaining!r}")
+            raise SystemExit(
+                f"{key}: no dimension among {names} starts {remaining!r}"
+            )
         rest = remaining[len(name) + 1 :]
         values = sorted(dimensions[name], key=len, reverse=True)
         value = next(
-            (one for one in values if rest == one or rest.startswith(one + "_")),
+            (
+                one
+                for one in values
+                if rest == one or rest.startswith(one + "_")
+            ),
             None,
         )
         if value is None:
@@ -93,7 +103,9 @@ def compile_one(package, target, key, out, spec):
     out.mkdir(parents=True, exist_ok=True)
     (out / "module.cubin").write_bytes(compiled.asm["cubin"])
     metadata = next(
-        path for name, path in compiled.metadata_group.items() if name.endswith(".json")
+        path
+        for name, path in compiled.metadata_group.items()
+        if name.endswith(".json")
     )
     # The module states the parameters it takes at launch, in order and with their types, so `ops`
     # can compare the operator's packed words against them and refuse a disagreement by name instead
@@ -104,7 +116,11 @@ def compile_one(package, target, key, out, spec):
         name: ty for name, ty in described["signature"].items() if ty != "constexpr"
     }
     (out / "metadata.json").write_text(json.dumps(written))
-    print(json.dumps({"descriptor": key, "target": target, "symbol": compiled.name}))
+    print(
+        json.dumps(
+            {"descriptor": key, "target": target, "symbol": compiled.name}
+        )
+    )
 
 
 def arguments():
@@ -118,7 +134,10 @@ def arguments():
     if os.environ.get("UNISERVE_OUT"):
         package = Path(os.environ["UNISERVE_PACKAGE"])
         manifest = tomllib.loads((package / "package.toml").read_text())
-        target = os.environ.get("UNISERVE_TARGET") or manifest["kernel"]["architectures"][0]
+        target = (
+            os.environ.get("UNISERVE_TARGET")
+            or manifest["kernel"]["architectures"][0]
+        )
         return (
             package,
             target,

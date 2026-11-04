@@ -87,6 +87,9 @@ pub struct Descriptor {
 
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The contraction length is not in the key: cublasLt takes `m`, `n` and `k` with the call and
+        // the module is the same code whatever they are. A key that named `k` compiled one module per
+        // weight shape for no gain.
         Key::new()
             .field("input", self.input)
             .field("weight", self.weight)
@@ -94,7 +97,6 @@ impl fmt::Display for Descriptor {
             .field("output", self.output)
             .field("order", self.order)
             .field("epilogue", self.epilogue)
-            .field("k", self.k)
             .finish(formatter)
     }
 }

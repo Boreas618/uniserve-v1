@@ -526,7 +526,9 @@ impl Op for ScaledResidual {
                 ));
             }
         };
-        let width = scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
+        // The channel count is compiled into the program (the package's `WIDTH`), so this only checks
+        // that the scale is as wide as a row; the value is not a launch parameter.
+        scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
         let elements = args.hidden.shape.numel();
         if elements > i32::MAX as u64 {
             return Err(Error::argument(
@@ -541,8 +543,10 @@ impl Op for ScaledResidual {
             .view(args.update)
             .view(bias.unwrap_or(args.update))
             .view(args.scale)
-            .i32(elements as i32)
-            .u32(width);
+            .i32(elements as i32);
+        // The channel count is compiled into the program (the package's `WIDTH`), so it is not a
+        // parameter: a word the module does not declare takes the position of the global scratch
+        // address the compiler's launcher appends after the kernel's own parameters.
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,
