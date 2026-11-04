@@ -53,8 +53,11 @@
 //! request continues, is retried with different parameters, or fails is the executor's decision, not
 //! a numerical one.
 
-/// Lanes one `softmax` program walks at a time: a chunk of the row, not the row.
-const SOFTMAX_TILE: u32 = 8192;
+/// Lanes one candidate program walks at a time: a chunk of the row, not the row.
+///
+/// Both programs that walk a row of candidates - the distribution and the draw - take it, so a
+/// candidate width may be the whole vocabulary without either holding a row in registers.
+const CANDIDATE_TILE: u32 = 8192;
 
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
@@ -391,22 +394,26 @@ impl Sampler {
     /// The candidates' distribution.
     ///
     /// The tile is a **chunk of the row**, not the row: the program walks the width in tiles of
-    /// `SOFTMAX_TILE` lanes and keeps only a running maximum and a running denominator, so the
+    /// `CANDIDATE_TILE` lanes and keeps only a running maximum and a running denominator, so the
     /// candidate width may be the whole vocabulary. A tile derived from the width would ask for one
     /// register per candidate.
     pub fn softmax_descriptor(&self) -> SoftmaxDescriptor {
         SoftmaxDescriptor {
             dtype: DType::F32,
             columns: self.width,
-            tile: SOFTMAX_TILE,
+            tile: CANDIDATE_TILE,
             pdl: launch::PDL,
         }
     }
 
     /// One inverse-CDF draw per row, over the ordered candidates.
+    ///
+    /// The tile is a chunk of the row, as the distribution's is: the draw walks the candidates in
+    /// tiles and keeps a running cumulative, so the width may be the whole vocabulary.
     pub fn draw_descriptor(&self) -> InverseCdfDescriptor {
         InverseCdfDescriptor {
             width: self.width,
+            tile: CANDIDATE_TILE,
             ids: DType::I32,
             tokens: self.tokens,
             pdl: launch::PDL,

@@ -408,6 +408,9 @@ impl Op for FilterCandidates {
 pub struct InverseCdfDescriptor {
     /// How many candidates a row carries.
     pub width: u32,
+    /// Lanes one program walks at a time: a chunk of the row, not the row, so the walk costs the
+    /// same registers at any width.
+    pub tile: u32,
     /// Element type of the candidate vocabulary ids.
     pub ids: DType,
     /// The element type of an emitted token.
@@ -420,6 +423,7 @@ impl fmt::Display for InverseCdfDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("width", self.width)
+            .field("tile", self.tile)
             .field("ids", self.ids)
             .field("tokens", self.tokens)
             .field("pdl", self.pdl)
@@ -488,15 +492,16 @@ impl Op for InverseCdf {
         }
 
         let mut arguments = Arguments::new();
+        // The row count and the width are both runtime values: the program walks the row in tiles
+        // of the descriptor's `tile` lanes, so no block covers the row and nothing in the
+        // signature depends on its width.
         arguments
             .view(args.probabilities)
             .view(args.ids)
             .view(args.draws)
             .view(args.tokens)
-            .u64(rows);
-        // The candidate width is compiled into the program, so it is not a parameter here: a word the
-        // module does not declare would push the two scratch addresses the compiler's launcher appends
-        // out of place.
+            .u64(rows)
+            .u32(descriptor.width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
