@@ -171,6 +171,31 @@ def tokenizer_check(
     )
 
 
+def tokenize(checkpoint: Path, text: str) -> int:
+    """The ids the checkpoint's own tokenizer gives `text`, ready for a case's `prompt_ids`.
+
+    The crates have no tokenizer, so a case's ids come from the front end that will serve it. This
+    prints the checkpoint's own answer - the same tokenizer `tokenizer_check` compares against - so
+    the ids a case carries and the ids the reference recomputes cannot come from two tokenizers.
+    """
+    directory = checkpoint / "tokenizer"
+    if not directory.is_dir():
+        print(f"{directory} is absent; point --checkpoint at the export's root")
+        return 1
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    try:
+        processing = reference("uniserve.processing")
+    except SystemExit:
+        return 1
+    tokenizer = processing.load_tokenizer(directory)
+    ids = [int(value) for value in tokenizer(text)["input_ids"]]
+    print(f"prompt    {text!r}")
+    print(f"tokenizer {type(tokenizer).__name__}")
+    print(f"ids       {len(ids)}: {', '.join(str(value) for value in ids)}")
+    print(f"case      \"prompt_ids\": {ids}")
+    return 0
+
+
 def text_source(checkpoint: Path):
     """The checkpoint source of the text encoder's own shards."""
     from uniserve.loading import checkpoint as checkpoint_module
@@ -405,12 +430,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, help="where to write the dump")
     parser.add_argument(
+        "--tokenize",
+        metavar="TEXT",
+        help=(
+            "print the checkpoint's tokenizer and the ids it gives TEXT, then exit: the"
+            " ids a case's `prompt_ids` must carry (`--checkpoint` required)"
+        ),
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         help="the device the reference's model runs on (default: cpu)",
     )
     options = parser.parse_args(argv)
 
+    if options.tokenize is not None:
+        if options.checkpoint is None:
+            parser.error("--tokenize needs --checkpoint")
+        return tokenize(options.checkpoint, options.tokenize)
     if options.list:
         for name, description in CATALOGUE.items():
             print(f"{name}\t{description}")
