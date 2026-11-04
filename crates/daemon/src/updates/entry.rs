@@ -587,7 +587,12 @@ impl Leader {
             .into_iter()
             .map(|replica| replica.config_status())
             .collect();
-        let mut status = statuses.first().cloned().unwrap_or_default();
+        // An object even when no replica answers, so the fields below are
+        // written into it rather than into a null.
+        let mut status = statuses
+            .first()
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
         status["replicas"] = statuses.into();
         status["gpus"] = ledgers.as_array().map_or(serde_json::Value::Null, |nodes| {
             deployment_gpus(nodes).into()
