@@ -309,6 +309,226 @@ pub fn sources(config: &VideoVaeConfig) -> Result<Vec<crate::audio_vae::Source>>
     Ok(sources)
 }
 
+/// The audio encoder's stack: DAC's strided widening network and the latent projection.
+///
+/// The decoder's rates are the encoder's reversed only in effect: the encoder's five strided stages
+/// multiply to the 800 samples of one latent frame, so a whole number of latent frames in gives whole
+/// latent frames out. `encoder_rates` are [2, 4, 4, 5, 5] and each stage doubles the width, starting
+/// from `encoder_dim` after the input convolution.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AudioStack {
+    /// Width after the input convolution.
+    pub encoder_dim: u32,
+    /// Each strided stage's rate, in order.
+    pub rates: Vec<u32>,
+    /// The width of each stage's output: `encoder_dim * 2^(stage + 1)`.
+    pub widths: Vec<u32>,
+    /// The encoder's features before the latent projection.
+    pub latent_dim: u32,
+    /// Latent channels.
+    pub latent_channels: u32,
+    /// Attention heads of the latent projection.
+    pub heads: u32,
+    /// Samples per latent frame: the product of the rates.
+    pub samples_per_latent: u32,
+}
+
+impl AudioStack {
+    /// The stack the config states.
+    pub fn of(config: &crate::AudioVaeConfig) -> Result<Self> {
+        if config.encoder_rates.is_empty() || config.encoder_dim == 0 {
+            return Err(Error::config(
+                "the audio encoder has no stage or no input width".to_owned(),
+            ));
+        }
+        if config.latent_channels == 0 || config.num_attention_heads == 0 {
+            return Err(Error::config(
+                "the audio encoder has no latent channel or no head".to_owned(),
+            ));
+        }
+        if !config.latent_dim.is_multiple_of(config.num_attention_heads) {
+            return Err(Error::config(format!(
+                "{} heads do not divide the audio encoder's width {}",
+                config.num_attention_heads, config.latent_dim
+            )));
+        }
+        let samples_per_latent = config
+            .encoder_rates
+            .iter()
+            .try_fold(1u32, |product, rate| product.checked_mul(*rate))
+            .ok_or_else(|| Error::config("the audio encoder's rates overflow".to_owned()))?;
+        let mut width = config.encoder_dim;
+        let widths = config
+            .encoder_rates
+            .iter()
+            .map(|_| {
+                width *= 2;
+                width
+            })
+            .collect();
+        Ok(Self {
+            encoder_dim: config.encoder_dim,
+            rates: config.encoder_rates.clone(),
+            widths,
+            latent_dim: config.latent_dim,
+            latent_channels: config.latent_channels,
+            heads: config.num_attention_heads,
+            samples_per_latent,
+        })
+    }
+
+    /// The length after each stage, from the samples to the latent frames.
+    ///
+    /// A strided stage is a convolution of `2 * rate` taps with `ceil(rate / 2)` samples of padding
+    /// each side, so it maps `L` to `(L + 2 * ceil(rate / 2) - 2 * rate) / rate + 1`: 800 samples
+    /// become 400, 100, 25, 5 and 1.
+    pub fn lengths(&self, samples: u32) -> Vec<u32> {
+        let mut lengths = vec![samples];
+        let mut current = samples;
+        for rate in &self.rates {
+            let pad = rate.div_ceil(2);
+            let padded = current + 2 * pad;
+            current = if padded < 2 * rate {
+                0
+            } else {
+                (padded - 2 * rate) / rate + 1
+            };
+            lengths.push(current);
+        }
+        lengths
+    }
+
+    /// The latent frames a track of `samples` encodes to, which must be a whole number of frames.
+    pub fn latent_frames(&self, samples: u32) -> Result<u32> {
+        if !samples.is_multiple_of(self.samples_per_latent) {
+            return Err(Error::config(format!(
+                "{samples} samples are not whole {} sample latent frames",
+                self.samples_per_latent
+            )));
+        }
+        Ok(*self.lengths(samples).last().expect("a nonempty stack"))
+    }
+}
+
+/// Every parameter of the audio encoder, with the checkpoint keys that fill it.
+///
+/// The encoder is DAC's network — the input convolution, five stages of three dilated residual units
+/// each and a strided widening convolution, then the output convolution — followed by the latent
+/// projection (`pre_block` in the checkpoint) and the mean convolution (`mean_proj`). Every
+/// convolution is weight-normalized. The projection's query, key and value biases are three separate
+/// checkpoint tensors that fill one fused parameter, the key's being a stored zero vector.
+pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_vae::Source>> {
+    use crate::audio_vae::{Source, Tensor};
+
+    fn region(sources: &mut Vec<Source>, parameter: String, tensor: String) {
+        sources.push(Source {
+            parameter,
+            tensor: Tensor::Region(tensor),
+        });
+    }
+    fn normalized(sources: &mut Vec<Source>, parameter: String, base: String) {
+        sources.push(Source {
+            parameter,
+            tensor: Tensor::Normalized {
+                value: format!("{base}.weight_v"),
+                gain: format!("{base}.weight_g"),
+            },
+        });
+    }
+
+    let stack = AudioStack::of(config)?;
+    let mut sources = Vec::new();
+
+    // `network` is the checkpoint's `encoder.block` sequence: the input convolution, one entry per
+    // stage, a Snake, and the output convolution.
+    normalized(&mut sources, "input.weight".to_owned(), "encoder.block.0".to_owned());
+    region(&mut sources, "input.bias".to_owned(), "encoder.block.0.bias".to_owned());
+    // Three residual units per stage, at dilations 1, 3 and 9; the dilation names the branch in the
+    // plan, not a parameter.
+    let units = 3;
+    for index in 0..stack.rates.len() {
+        let base = format!("encoder.block.{}.block", index + 1);
+        let at = |name: &str| format!("stages.{index}.{name}");
+        for unit in 0..units {
+            normalized(
+                &mut sources,
+                at(&format!("units.{unit}.convs.0.weight")),
+                format!("{base}.{unit}.block.1"),
+            );
+            region(
+                &mut sources,
+                at(&format!("units.{unit}.convs.0.bias")),
+                format!("{base}.{unit}.block.1.bias"),
+            );
+            normalized(
+                &mut sources,
+                at(&format!("units.{unit}.convs.1.weight")),
+                format!("{base}.{unit}.block.3"),
+            );
+            region(
+                &mut sources,
+                at(&format!("units.{unit}.convs.1.bias")),
+                format!("{base}.{unit}.block.3.bias"),
+            );
+        }
+        normalized(&mut sources, at("widen.weight"), format!("{base}.5"));
+        region(&mut sources, at("widen.bias"), format!("{base}.5.bias"));
+    }
+    let last = stack.rates.len() + 2;
+    normalized(
+        &mut sources,
+        "output.weight".to_owned(),
+        format!("encoder.block.{last}"),
+    );
+    region(
+        &mut sources,
+        "output.bias".to_owned(),
+        format!("encoder.block.{last}.bias"),
+    );
+
+    for (parameter, tensor) in [
+        ("projection.shortcut_norm.weight", "pre_block.norm3.weight"),
+        ("projection.shortcut_norm.bias", "pre_block.norm3.bias"),
+        ("projection.shortcut.weight", "pre_block.proj.weight"),
+        ("projection.shortcut.bias", "pre_block.proj.bias"),
+        ("projection.attention_norm.weight", "pre_block.norm1.weight"),
+        ("projection.attention_norm.bias", "pre_block.norm1.bias"),
+        ("projection.qkv.weight", "pre_block.attn.qkv.weight"),
+        (
+            "projection.attention_output.weight",
+            "pre_block.attn.proj.weight",
+        ),
+        (
+            "projection.attention_output.bias",
+            "pre_block.attn.proj.bias",
+        ),
+        ("projection.mlp_norm.weight", "pre_block.norm2.weight"),
+        ("projection.mlp_norm.bias", "pre_block.norm2.bias"),
+        ("projection.mlp.norm.weight", "pre_block.mlp.norm.weight"),
+        ("projection.mlp.norm.bias", "pre_block.mlp.norm.bias"),
+        ("projection.mlp.gate.weight", "pre_block.mlp.w0.weight"),
+        ("projection.mlp.gate.bias", "pre_block.mlp.w0.bias"),
+        ("projection.mlp.value.weight", "pre_block.mlp.w1.weight"),
+        ("projection.mlp.value.bias", "pre_block.mlp.w1.bias"),
+        ("projection.mlp.output.weight", "pre_block.mlp.w2.weight"),
+        ("projection.mlp.output.bias", "pre_block.mlp.w2.bias"),
+        ("mean_projection.weight", "mean_proj.weight"),
+        ("mean_projection.bias", "mean_proj.bias"),
+    ] {
+        region(&mut sources, parameter.to_owned(), tensor.to_owned());
+    }
+    // One fused query-key-value bias from three checkpoint vectors, in query, key, value order.
+    sources.push(Source {
+        parameter: "projection.qkv.bias".to_owned(),
+        tensor: Tensor::Parts(vec![
+            "pre_block.attn.q_bias".to_owned(),
+            "pre_block.attn.zero_k_bias".to_owned(),
+            "pre_block.attn.v_bias".to_owned(),
+        ]),
+    });
+    Ok(sources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +627,74 @@ mod tests {
         // Past the end is refused.
         assert!(grid.band(84, 80, 90).is_err());
         assert!(grid.band(84, 5, 5).is_err());
+    }
+
+    #[test]
+    fn the_audio_encoder_stages_land_on_whole_latent_frames() {
+        let stack = AudioStack::of(&crate::audio_vae::tests::audio_config()).expect("the stack");
+        assert_eq!(stack.samples_per_latent, 800);
+        assert_eq!(stack.lengths(800), vec![800, 400, 100, 25, 5, 1]);
+        assert_eq!(stack.lengths(1600), vec![1600, 800, 200, 50, 10, 2]);
+        assert_eq!(stack.latent_frames(800).expect("one frame"), 1);
+        assert_eq!(stack.latent_frames(24000).expect("thirty frames"), 30);
+        // A partial frame is refused: the encoder's output is whole latent frames.
+        assert!(stack.latent_frames(801).is_err());
+        // Each stage doubles the width from the input convolution's.
+        assert_eq!(stack.widths, vec![128, 256, 512, 1024, 2048]);
+        assert_eq!(stack.latent_dim, 2048);
+    }
+
+    #[test]
+    fn the_audio_encoder_table_names_every_parameter() {
+        let table = audio_sources(&crate::audio_vae::tests::audio_config())
+            .expect("the encoder's parameters");
+        // The input pair, five stages of twenty-one, the output pair, the projection's twenty-two and
+        // the mean convolution's pair.
+        assert_eq!(table.len(), 3 + 5 * 21 + 3 + 22);
+        let names: Vec<&str> = table
+            .iter()
+            .map(|source| source.parameter.as_str())
+            .collect();
+        for expected in [
+            "input.weight",
+            "stages.0.units.0.convs.0.weight",
+            "stages.4.units.2.convs.1.bias",
+            "stages.4.widen.weight",
+            "output.weight",
+            "projection.qkv.weight",
+            "projection.qkv.bias",
+            "projection.mlp.gate.weight",
+            "mean_projection.bias",
+        ] {
+            assert!(names.contains(&expected), "{expected} is missing");
+        }
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        // Every convolution is weight-normalized: four per stage plus the input, the output and the
+        // mean convolution.
+        let normalized = table
+            .iter()
+            .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
+            .count();
+        assert_eq!(normalized, 3 + 5 * 7 + 3);
+        // The fused query-key-value bias names its three checkpoint vectors in order.
+        let bias = table
+            .iter()
+            .find(|source| source.parameter == "projection.qkv.bias")
+            .expect("the fused bias");
+        match &bias.tensor {
+            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
+                parts,
+                &vec![
+                    "pre_block.attn.q_bias".to_owned(),
+                    "pre_block.attn.zero_k_bias".to_owned(),
+                    "pre_block.attn.v_bias".to_owned(),
+                ]
+            ),
+            other => panic!("the fused bias is {other:?}"),
+        }
     }
 
     #[test]
