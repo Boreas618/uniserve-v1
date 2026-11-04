@@ -1,0 +1,37 @@
+# The cache_block_snapshot operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# A state bank's field is block-major with arbitrary strides; one program walks
+# one 1024-element tile of one flattened block, so the copy's extent comes from
+# the grid and the bank's block count from the descriptor's shape.
+
+op = "cache_block_snapshot"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/cache_block_snapshot.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_u8_shape_2048x64x1x128_strides_8192x128x128x1_index_stride_1_width_8192_block_1024`.
+[kernel.descriptors]
+# Every declared shape and stride has the same rank, so any combination of
+# them names a field a bank can hold: a block-major view at some strides.
+dimensions = { dtype = ["u8", "bf16"], shape = ["2048x64x1x128", "1024x16x2x64", "512x64x4x64"], strides = ["8192x128x128x1", "2048x64x64x1", "4096x64x128x1"], index_stride = ["1"], width = ["8192", "2048", "16384"], block = ["1024"] }
+
+[parameters]
