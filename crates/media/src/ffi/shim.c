@@ -561,6 +561,12 @@ static int video_encoder_write_packets(VideoEncoder *encoder) {
             return fail_averror("encoding a video frame", code);
         }
         encoder->packet->stream_index = encoder->stream->index;
+        /* The encoder emits in its own time base; the muxer may have chosen
+         * another one when it wrote the header (movenc gives the video track a
+         * 12288 tick timescale), so the packet is rebased before it is muxed,
+         * as PyAV does for every packet it appends to an output container. */
+        av_packet_rescale_ts(encoder->packet, encoder->context->time_base,
+                             encoder->stream->time_base);
         code = av_interleaved_write_frame(encoder->output, encoder->packet);
         av_packet_unref(encoder->packet);
         if (code < 0) {
@@ -748,6 +754,10 @@ static int audio_encoder_write_packets(AudioEncoder *encoder) {
             return fail_averror("encoding audio", code);
         }
         encoder->packet->stream_index = encoder->stream->index;
+        /* Same rebase as the video path: the muxer owns the track's time base
+         * once the header is written. */
+        av_packet_rescale_ts(encoder->packet, encoder->context->time_base,
+                             encoder->stream->time_base);
         code = av_interleaved_write_frame(encoder->output, encoder->packet);
         av_packet_unref(encoder->packet);
         if (code < 0) {
