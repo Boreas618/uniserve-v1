@@ -423,7 +423,14 @@ impl Sampler {
             ));
         }
         match (self.extras, state.extras) {
-            (0, None) | (_, Some(_)) => {}
+            (0, None) => {}
+            (0, Some(_)) => {
+                return Err(Error::shape(
+                    "Sampler",
+                    "the sampler reads no extra tokens and the state carries some".to_owned(),
+                ));
+            }
+            (_, Some(_)) => {}
             (extras, None) => {
                 return Err(Error::shape(
                     "Sampler",
@@ -550,6 +557,11 @@ mod tests {
     use super::*;
     use ops::DevicePtr;
 
+    /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
+    fn view(shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), DType::F32, Shape::new(shape))
+    }
+
     #[test]
     fn a_step_is_built_for_a_vocabulary_and_a_candidate_width() {
         let sampler = Sampler::new(151_936, 8, 256, 0).unwrap();
@@ -611,5 +623,124 @@ mod tests {
         );
         assert!(bound.allows(1.0, 1.0 + 1.0e-7));
         assert!(!bound.allows(1.0, 1.0 + 1.0e-3));
+    }
+
+    /// The refusals a caller meets before either path launches. `check` is the one body both paths
+    /// run, so a request it accepts is one both paths accept and a request it refuses names the
+    /// argument, not the path — which is the point of the tests being here rather than nowhere: the
+    /// paths themselves need a live device, and this is the half of them a host can hold to account.
+    #[test]
+    fn a_step_refuses_the_state_it_cannot_read() {
+        let sampler = Sampler::new(1_024, 4, 64, 2).unwrap();
+        let state = |extras: bool| SamplerState {
+            counts: view(&[4, 1_024]),
+            parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
+            slots: view(&[2]),
+            extras: extras.then(|| view(&[2, 2])),
+        };
+        let samples = Samples {
+            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
+            logprobabilities: Some(TensorView::new(
+                DevicePtr::new(0x2000),
+                DType::F32,
+                Shape::new(&[2]),
+            )),
+        };
+        assert!(
+            sampler
+                .check(view(&[2, 1_024]), &state(true), &samples)
+                .is_ok()
+        );
+
+        // A row of the wrong width, a step with no rows, and a logit type the shaper cannot read.
+        for (logits, named) in [
+            (view(&[2, 512]), "1024"),
+            (view(&[0, 1_024]), "one row"),
+            (
+                TensorView::new(DevicePtr::new(0x1000), DType::I32, Shape::new(&[2, 1_024])),
+                "f32, bf16 or f16",
+            ),
+        ] {
+            let text = format!(
+                "{}",
+                sampler.check(logits, &state(true), &samples).unwrap_err()
+            );
+            assert!(text.contains(named), "{text}");
+        }
+
+        // The request state: a row of parameters too narrow, counts that are not one row per slot,
+        // and the two ways the extra columns and the sampler's declaration can disagree.
+        let narrow = SamplerState {
+            counts: view(&[4, 1_024]),
+            parameters: view(&[2, 4]),
+            slots: view(&[2]),
+            extras: Some(view(&[2, 2])),
+        };
+        assert!(sampler.check(view(&[2, 1_024]), &narrow, &samples).is_err());
+        let miscounted = SamplerState {
+            counts: view(&[3, 1_024]),
+            parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
+            slots: view(&[2]),
+            extras: Some(view(&[2, 2])),
+        };
+        let text = format!(
+            "{}",
+            sampler
+                .check(view(&[2, 1_024]), &miscounted, &samples)
+                .unwrap_err()
+        );
+        assert!(text.contains('3') && text.contains('4'), "{text}");
+        let absent = format!(
+            "{}",
+            sampler
+                .check(view(&[2, 1_024]), &state(false), &samples)
+                .unwrap_err()
+        );
+        assert!(absent.contains('2'), "{absent}");
+
+        // And the sampler that reads no extra tokens refuses a state that carries them, rather than
+        // demanding a zero-width view of them.
+        let plain = Sampler::new(1_024, 4, 64, 0).unwrap();
+        let text = format!(
+            "{}",
+            plain
+                .check(view(&[2, 1_024]), &state(true), &samples)
+                .unwrap_err()
+        );
+        assert!(text.contains("no extra tokens"), "{text}");
+    }
+
+    /// A greedy step reads no draws, so the state a greedy caller must supply is exactly the state a
+    /// draw caller must supply: what it leaves out is the uniform draw, nothing else.
+    #[test]
+    fn a_greedy_step_needs_no_draws_to_be_a_valid_step() {
+        let sampler = Sampler::new(1_024, 4, 64, 0).unwrap();
+        let state = SamplerState {
+            counts: view(&[4, 1_024]),
+            parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
+            slots: view(&[2]),
+            extras: None,
+        };
+        let samples = Samples {
+            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
+            logprobabilities: None,
+        };
+        assert_eq!(
+            sampler.check(view(&[2, 1_024]), &state, &samples).unwrap(),
+            2
+        );
+        // The tokens a greedy step writes are whatever type the sampler declares, and a step whose
+        // output is a different one is refused by name rather than launched into a wrong view.
+        let narrow = Samples {
+            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[2])),
+            logprobabilities: None,
+        };
+        let text = format!(
+            "{}",
+            sampler
+                .check(view(&[2, 1_024]), &state, &narrow)
+                .unwrap_err()
+        );
+        assert!(text.contains("i32"), "{text}");
     }
 }
