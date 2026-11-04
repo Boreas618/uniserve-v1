@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::epoch::Phase;
 use crate::leader::{Leader, LeaderStatus, UpdateError};
 use crate::openai::ApiError;
-use crate::worlds::{Applied, ApplyRequest, InFlight};
+use crate::updates::change::{Applied, ApplyRequest, InFlight};
 
 /// Events the log keeps; older ones leave it.
 const EVENT_CAPACITY: usize = 1024;
@@ -614,8 +614,8 @@ fn applied_result(
         Ok(Applied::Unchanged) => Ok(json!({ "change": "none" })),
         Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
         Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
-        Ok(Applied::World(report)) => Ok(json!({ "change": "world", "world": report })),
         Ok(Applied::Epoch(report)) => Ok(json!({ "change": "epoch", "epoch": report })),
+        Ok(Applied::Program(report)) => Ok(json!({ "change": "program", "program": report })),
         Ok(Applied::Daemon { .. }) => Err((
             StatusCode::CONFLICT,
             "the daemon's own options changed again after its hot restart".to_owned(),
@@ -731,7 +731,7 @@ async fn program_update(
         // No replica serves: the world path answers that account itself.
         return Ok(None);
     };
-    let Ok((target, _, _)) = crate::worlds::resolve(&current, request) else {
+    let Ok((target, _, _)) = crate::updates::change::resolve(&current, request) else {
         // The change itself is refused; the world path answers it the same way.
         return Ok(None);
     };
@@ -750,7 +750,10 @@ async fn program_update(
     }
     let epochs = leader.epochs();
     let number = admin.running_number();
-    let planned = match leader.apply_programs(number, &target, true, request.force).await {
+    let planned = match leader
+        .apply_programs(number, &target, request.force, true)
+        .await
+    {
         Ok(Some(planned)) => planned,
         Ok(None) => return Ok(None),
         Err(error) => return Err(refused_precopy(admin, &epochs, number, &error)),
@@ -763,7 +766,10 @@ async fn program_update(
     }
     let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
     program_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
-    match leader.apply_programs(number, &target, false, request.force).await {
+    match leader
+        .apply_programs(number, &target, request.force, false)
+        .await
+    {
         Ok(Some(update)) => {
             // The main processes prepared, switched to and now serve the new
             // generation; the probation decides it (§7.3 steps 2-4).
