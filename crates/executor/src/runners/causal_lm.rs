@@ -25,9 +25,7 @@ use ops::Generation;
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{
-    Batch, BatchCall, BatchColumns, BatchOutput, CallId, Job, Jobs, SampledToken,
-};
+use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, Job, Jobs, SampledToken};
 use crate::captured::Captured;
 use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape, Variant};
@@ -36,19 +34,22 @@ use crate::{Error, Result};
 
 /// The host columns of one batch, padded to a bucket and held for the upload.
 ///
-/// The buffers are allocated once, at bind, sized for the largest bucket of each variant, so
-/// serving a batch writes into them and allocates nothing.
+/// The buffers are allocated once, at bind, sized for the largest bucket, so serving a batch writes
+/// into them and allocates nothing. The row layout is the model's `nn::BatchRows`, padded: a
+/// padded token carries `slot_mapping = -1` (it writes no cache page) and a padded row carries a
+/// commit slot below zero (it keeps no token state).
 #[derive(Default, Debug)]
 pub struct Staging {
-    input_ids: Vec<u32>,
-    positions: Vec<u32>,
-    slot_mapping: Vec<i64>,
-    seq_lens: Vec<u32>,
-    query_lens: Vec<u32>,
-    write_cache: Vec<u8>,
-    logits_rows: Vec<u32>,
-    calls: Vec<crate::batch::BatchCall>,
-    /// The rows and tokens the padded batch holds.
+    rows: nn::BatchRows,
+    input_ids: Vec<i32>,
+    slots: Vec<i32>,
+    parameters: Vec<f32>,
+    commit: Vec<i64>,
+    page_size: u32,
+    max_kv_len: u32,
+    /// The mechanism's call ids of the staged rows, in the order `rows.calls` lists them.
+    calls: Vec<CallId>,
+    /// The shape staged by the last [`Staging::stage`].
     staged: Option<Shape>,
 }
 
@@ -66,13 +67,12 @@ impl Staging {
             .copied()
             .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))?;
         self.input_ids = vec![0; largest.tokens as usize];
-        self.positions = vec![0; largest.tokens as usize];
-        self.slot_mapping = vec![-1; largest.tokens as usize];
-        self.seq_lens = vec![0; largest.rows as usize];
-        self.query_lens = vec![0; largest.rows as usize];
-        self.write_cache = vec![0; largest.rows as usize];
-        self.logits_rows = vec![0; largest.rows as usize];
-        self.calls = Vec::with_capacity(largest.rows as usize);
+        self.slots = vec![0; largest.rows as usize];
+        self.parameters = vec![0.0; largest.rows as usize * ops::sampler::PARAMETER_COLUMNS as usize];
+        // The commit table's height is ops' business; `reserve` leaves it empty and `stage` sizes
+        // it to whatever the mechanism wrote, which `check` has already validated.
+        self.commit = Vec::new();
+        self.rows = nn::BatchRows::default();
         self.staged = None;
         Ok(())
     }
@@ -80,10 +80,13 @@ impl Staging {
     /// Pads the batch's columns to `bucket` and holds them, and answers the shape that is staged.
     ///
     /// The mechanism's values are copied in order; padding is appended in the runner's layout, so
-    /// a kernel reading the staged columns sees one well-formed batch of the bucket's size.
+    /// a kernel reading the staged columns sees one well-formed batch of the bucket's size. A
+    /// prefill's padding tokens extend the last call's token range (they write no cache page); a
+    /// decode's padding rows each evaluate one padding token with a commit slot below zero.
     pub fn stage(
         &mut self,
         columns: &BatchColumns,
+        calls: &[CallId],
         shape: &Shape,
         bucket: Bucket,
     ) -> Result<Shape> {
@@ -92,121 +95,157 @@ impl Staging {
                 "bucket {bucket} does not hold a batch of {shape}"
             )));
         }
-        if bucket.tokens as usize > self.input_ids.len()
-            || bucket.rows as usize > self.seq_lens.len()
-        {
-            return Err(Error::Invariant(format!(
-                "the staging buffers are smaller than bucket {bucket}"
+        let tokens = columns.rows.tokens();
+        let rows = columns.rows.calls.len();
+        if tokens > bucket.tokens as usize || rows > bucket.rows as usize {
+            return Err(Error::Invalid(format!(
+                "the batch's {rows} rows and {tokens} tokens do not fit bucket {bucket}"
             )));
         }
-        self.calls.clear();
-        self.calls.extend_from_slice(&columns.calls);
+        let bucket_tokens = bucket.tokens as usize;
+        let bucket_rows = bucket.rows as usize;
 
-        let tokens = columns.tokens().min(bucket.tokens as usize);
+        // Token columns: the mechanism's tokens, then padding that persists nowhere.
         self.input_ids[..tokens].copy_from_slice(&columns.input_ids[..tokens]);
-        self.positions[..tokens].copy_from_slice(&columns.positions[..tokens]);
-        self.slot_mapping[..tokens].copy_from_slice(&columns.slot_mapping[..tokens]);
-
-        let rows = columns.rows().min(bucket.rows as usize);
-        self.seq_lens[..rows].copy_from_slice(&columns.seq_lens[..rows]);
-        self.query_lens[..rows].copy_from_slice(&columns.query_lens[..rows]);
-        self.write_cache[..rows].copy_from_slice(&columns.write_cache[..rows]);
-        self.logits_rows[..rows].copy_from_slice(&columns.logits_rows[..rows]);
-
-        // Padding tokens write nothing: `-1` in `slot_mapping` is what the KV-write kernel reads
-        // as "this token does not persist".
-        for index in tokens..bucket.tokens as usize {
+        for index in tokens..bucket_tokens {
             self.input_ids[index] = 0;
-            self.positions[index] = 0;
-            self.slot_mapping[index] = -1;
         }
-        for index in rows..bucket.rows as usize {
-            self.seq_lens[index] = 1;
-            self.query_lens[index] = 1;
-            self.write_cache[index] = 0;
-            self.logits_rows[index] = 0;
+        self.rows = columns.rows.clone();
+        self.rows.positions.resize(bucket_tokens, 0);
+        for index in tokens..bucket_tokens {
+            self.rows.positions[index] = 0;
+        }
+        self.rows.slot_mapping.resize(bucket_tokens, -1);
+        for index in tokens..bucket_tokens {
+            self.rows.slot_mapping[index] = -1;
         }
 
-        // One call covering every padding token of a prefill, then empty calls for the remaining
-        // rows; a decode's padding rows are rows of slot 0 and need no call of their own.
-        if bucket.variant.is_decode() {
-            let padding = Bucket::decode(bucket.rows, bucket.variant);
-            if padding != bucket {
-                return Err(Error::Invariant(
-                    "a decode bucket's rows and tokens must agree".into(),
-                ));
+        // Row columns: the mechanism's rows, then rows that sample nothing and commit nothing.
+        self.slots[..rows].copy_from_slice(&columns.slots[..rows]);
+        let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
+        self.parameters[..rows * parameters]
+            .copy_from_slice(&columns.parameters[..rows * parameters]);
+        for index in rows..bucket_rows {
+            self.slots[index] = -1;
+            for column in 0..parameters {
+                self.parameters[index * parameters + column] = 0.0;
             }
-        } else if bucket.tokens > columns.num_tokens {
-            let range = columns.num_tokens..bucket.tokens;
-            self.calls.push(crate::batch::BatchCall {
+        }
+        self.rows.seq_lens.resize(bucket_rows, 1);
+        for index in rows..bucket_rows {
+            self.rows.seq_lens[index] = 1;
+        }
+        self.rows.logits_rows.resize(bucket_rows, -1);
+        for index in rows..bucket_rows {
+            self.rows.logits_rows[index] = -1;
+        }
+
+        // Padding tokens belong to the last call's token range, and padding rows are appended
+        // after it, each evaluating the padding token that follows.
+        let mut cursor = tokens;
+        let calls = self.rows.calls.len();
+        if let Some(last) = self.rows.calls.last_mut() {
+            if tokens < bucket_tokens {
+                last.rows.end = bucket_tokens as u32;
+                cursor = bucket_tokens;
+            }
+        }
+        while self.rows.calls.len() < bucket_rows {
+            let start = cursor as u32;
+            let end = if bucket.variant.is_decode() && cursor < bucket_tokens {
+                cursor += 1;
+                cursor as u32
+            } else {
+                start
+            };
+            self.rows.calls.push(nn::BatchRow {
                 request: 0,
-                kind: crate::batch::CallKind::Prefill,
+                kind: if bucket.variant.is_decode() {
+                    nn::RowKind::Decode
+                } else {
+                    nn::RowKind::Prefill
+                },
                 cache_group: 0,
-                rows: range,
+                rows: start..end,
             });
         }
+        if self.rows.calls.is_empty() || calls > bucket_rows {
+            return Err(Error::Invariant(format!(
+                "the batch has {calls} calls and does not fit {bucket_rows} rows"
+            )));
+        }
+
+        // The commit table's padded rows keep their token state: a slot below zero.
+        self.commit = columns.commit.clone();
+        if !columns.commit.is_empty() {
+            let columns = columns.commit.len() / rows.max(1);
+            self.commit.resize(columns * bucket_rows, 0);
+            for column in 0..columns {
+                for row in rows..bucket_rows {
+                    self.commit[column * bucket_rows + row] = -1;
+                }
+            }
+        }
+        self.page_size = columns.page_size;
+        self.max_kv_len = columns.max_kv_len;
+        self.calls.clear();
+        self.calls.extend_from_slice(calls);
+        self.calls.resize(bucket_rows, CallId(u64::MAX));
+
         self.staged = Some(bucket.shape());
         Ok(bucket.shape())
     }
 
-    /// The shape staged by the last [`Staging::stage`].
-    /// The row indices a token is sampled for, in batch order (4.4's sampling rows).
-    pub fn logits_rows(&self, rows: usize) -> Vec<u32> {
-        self.logits_rows
-            .iter()
-            .copied()
-            .filter(|row| (*row as usize) < rows.max(self.logits_rows.len()))
-            .collect()
-    }
-
-    /// The batch's calls, which name the request each row belongs to.
-    pub fn calls(&self) -> &[BatchCall] {
-        &self.calls
-    }
-
+    /// The shape staged by the last [`Staging::stage`], if any.
     pub fn staged(&self) -> Option<Shape> {
         self.staged
     }
 
-    /// The staged tokens, as the upload reads them.
-    pub fn input_ids(&self, tokens: usize) -> &[u32] {
+    /// The staged rows, which the upload builds `nn::TokenBatch` from.
+    pub fn rows(&self) -> &nn::BatchRows {
+        &self.rows
+    }
+
+    /// The staged token ids, as the embedding upload reads them.
+    pub fn input_ids(&self, tokens: usize) -> &[i32] {
         &self.input_ids[..tokens]
     }
 
-    /// The staged positions.
-    pub fn positions(&self, tokens: usize) -> &[u32] {
-        &self.positions[..tokens]
+    /// The staged sampler slot view.
+    pub fn slots(&self, rows: usize) -> &[i32] {
+        &self.slots[..rows]
     }
 
-    /// The staged KV slots.
-    pub fn slot_mapping(&self, tokens: usize) -> &[i64] {
-        &self.slot_mapping[..tokens]
+    /// The staged sampling parameters, row-major.
+    pub fn parameters(&self, rows: usize) -> &[f32] {
+        let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
+        &self.parameters[..rows * parameters]
     }
 
-    /// The staged rows, as the upload reads them.
-    pub fn rows(&self) -> StagedRows<'_> {
-        StagedRows {
-            seq_lens: &self.seq_lens,
-            query_lens: &self.query_lens,
-            write_cache: &self.write_cache,
-            logits_rows: &self.logits_rows,
-            calls: &self.calls,
-        }
+    /// `ops::commit`'s column table of the staged rows.
+    pub fn commit(&self) -> &[i64] {
+        &self.commit
     }
-}
 
-/// The per-row view of the staged columns.
-pub struct StagedRows<'a> {
-    /// Per row: cached prefix plus query length.
-    pub seq_lens: &'a [u32],
-    /// Per row: query tokens of the row's call.
-    pub query_lens: &'a [u32],
-    /// Per row: whether the row's tokens persist in the prefix cache.
-    pub write_cache: &'a [u8],
-    /// Per row: the token row that feeds `logits`.
-    pub logits_rows: &'a [u32],
-    /// The batch's calls, padding calls included.
-    pub calls: &'a [crate::batch::BatchCall],
+    /// The page size and KV bound the upload hands the model with the rows.
+    pub fn geometry(&self) -> (u32, u32) {
+        (self.page_size, self.max_kv_len)
+    }
+
+    /// The sampling rows, in batch order (4.4's rows the sampler writes a token for).
+    pub fn logits_rows(&self) -> &[i32] {
+        &self.rows.logits_rows
+    }
+
+    /// The rows of the batch as the model reads them, padded to the bucket.
+    pub fn batch_rows(&self) -> &nn::BatchRows {
+        &self.rows
+    }
+
+    /// The mechanism's call ids of the staged rows, in the rows' order.
+    pub fn calls(&self) -> &[CallId] {
+        &self.calls
+    }
 }
 
 /// A causal language model's runner: one block's decode and prefill phases.
@@ -327,7 +366,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let shape = batch.shape;
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
-        self.staging.stage(&batch.columns, &shape, bucket)?;
+        self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
         // The upload and the device views are staged by the executor's stream work, then the
         // bucket's graph is replayed (design §9, `每批的规划`). Until `nn::TokenBatch`/`KvView`
         // and platform's allocator are published, the staging is as far as this path can go; the
@@ -672,14 +711,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// (`logits_rows`) and the call each row belongs to, so the output preserves the mechanism's
     /// request order. A bucket that samples nothing has no sampler buffer and answers empty.
     fn read_sampled(&mut self, bucket: Bucket) -> Result<BatchOutput> {
-        let Some(sampler) = self.samplers.get_mut(&bucket) else {
+        let Some(sampler) = self.samplers.get(&bucket) else {
             return Ok(BatchOutput::default());
         };
         self.stream.synchronize()?;
         sampler.read_back(&self.stream)?;
-        let rows = self.staging.staged().map_or(0, |shape| shape.rows as usize);
-        let sampling_rows = self.staging.logits_rows(rows);
-        sampled_output(sampler.host_tokens(), &sampling_rows, self.staging.calls())
+        sampled_output(
+            sampler.host_tokens(),
+            self.staging.logits_rows(),
+            self.staging.batch_rows(),
+            self.staging.calls(),
+        )
     }
 
     /// Walks one bucket's forward under the active capture with `generation`'s kernels.
@@ -761,28 +803,32 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let tokens = bucket.tokens as usize;
         let rows = bucket.rows as usize;
         let columns = BatchColumns {
-            calls: vec![crate::batch::BatchCall {
-                call: CallId(0),
-                request: 0,
-                kind: if bucket.variant.is_decode() {
-                    crate::batch::CallKind::Decode
-                } else {
-                    crate::batch::CallKind::Prefill
-                },
-                cache_group: 0,
-                rows: 0..bucket.tokens,
-            }],
+            rows: nn::BatchRows {
+                positions: vec![0; tokens],
+                slot_mapping: vec![-1; tokens],
+                seq_lens: vec![1; rows],
+                query_offsets: (0..=rows as i32).collect(),
+                logits_rows: vec![-1; rows],
+                calls: vec![nn::BatchRow {
+                    request: 0,
+                    kind: if bucket.variant.is_decode() {
+                        nn::RowKind::Decode
+                    } else {
+                        nn::RowKind::Prefill
+                    },
+                    cache_group: 0,
+                    rows: 0..bucket.tokens,
+                }],
+            },
             input_ids: vec![0; tokens],
-            positions: vec![0; tokens],
-            slot_mapping: vec![-1; tokens],
-            seq_lens: vec![1; rows],
-            query_lens: vec![1; rows],
-            write_cache: vec![0; rows],
-            logits_rows: vec![0; rows],
-            num_tokens: bucket.tokens,
+            slots: vec![0; rows],
+            parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
+            commit: Vec::new(),
             page_size: 1,
+            max_kv_len: 1,
         };
-        self.staging.stage(&columns, &bucket.shape(), bucket)
+        self.staging
+            .stage(&columns, &[CallId(0)], &bucket.shape(), bucket)
     }
 
     /// The device-side `TokenBatch` over the bucket's staged columns (9's `每批的规划`).
@@ -907,8 +953,9 @@ impl SamplerBuffer {
 /// mechanism's columns and its calls disagree about the batch.
 pub fn sampled_output(
     ids: &[u32],
-    sampling_rows: &[u32],
-    calls: &[BatchCall],
+    sampling_rows: &[i32],
+    rows: &nn::BatchRows,
+    calls: &[CallId],
 ) -> Result<BatchOutput> {
     if ids.len() < sampling_rows.len() {
         return Err(Error::Invariant(format!(
@@ -919,14 +966,27 @@ pub fn sampled_output(
     }
     let mut tokens = Vec::with_capacity(sampling_rows.len());
     for (index, row) in sampling_rows.iter().copied().enumerate() {
-        let call = calls
+        // `logits_rows` names the token row that feeds `logits`; a negative entry is a row that
+        // samples nothing (a padded row, or a prefill chunk that ends no prompt).
+        if row < 0 {
+            continue;
+        }
+        let row = row as u32;
+        let (position, _) = rows
+            .calls
             .iter()
-            .find(|call| call.rows.contains(&row))
+            .enumerate()
+            .find(|(_, call)| call.rows.contains(&row))
             .ok_or_else(|| {
                 Error::Invariant(format!("no call of the batch owns sampling row {row}"))
             })?;
+        let call = calls.get(position).copied().ok_or_else(|| {
+            Error::Invariant(format!(
+                "the batch names no call id for its row {position}"
+            ))
+        })?;
         tokens.push(SampledToken {
-            call: call.call,
+            call,
             token: ids[index],
         });
     }
@@ -937,10 +997,58 @@ pub fn sampled_output(
 mod tests {
     use super::*;
 
-    /// A batch is padded to its bucket: no padding token writes the KV cache, and a prefill's
-    /// padding tokens belong to one padding call.
+    fn decode_columns() -> BatchColumns {
+        BatchColumns {
+            rows: nn::BatchRows {
+                positions: vec![3, 4],
+                slot_mapping: vec![10, 11],
+                seq_lens: vec![4, 9],
+                query_offsets: vec![0, 1, 2],
+                logits_rows: vec![0, 1],
+                calls: vec![nn::BatchRow {
+                    request: 0,
+                    kind: nn::RowKind::Decode,
+                    cache_group: 0,
+                    rows: 0..2,
+                }],
+            },
+            input_ids: vec![7, 8],
+            slots: vec![0, 1],
+            parameters: vec![0.0; 2 * ops::sampler::PARAMETER_COLUMNS as usize],
+            commit: vec![0, 1],
+            page_size: 16,
+            max_kv_len: 4096,
+        }
+    }
+
+    fn prefill_columns() -> BatchColumns {
+        BatchColumns {
+            rows: nn::BatchRows {
+                positions: vec![0, 1, 2],
+                slot_mapping: vec![0, 1, 2],
+                seq_lens: vec![3],
+                query_offsets: vec![0, 3],
+                logits_rows: vec![2],
+                calls: vec![nn::BatchRow {
+                    request: 0,
+                    kind: nn::RowKind::Prefill,
+                    cache_group: 0,
+                    rows: 0..3,
+                }],
+            },
+            input_ids: vec![1, 2, 3],
+            slots: vec![0],
+            parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
+            commit: vec![0],
+            page_size: 16,
+            max_kv_len: 4096,
+        }
+    }
+
+    /// A batch is padded to its bucket: no padding token writes the KV cache, a decode's padding
+    /// rows commit nothing, and a prefill's padding tokens extend the one call's range.
     #[test]
-    fn padding_never_writes_the_cache() -> Result<()> {
+    fn padding_never_writes_the_cache_or_commits_a_row() -> Result<()> {
         let buckets = Buckets::new([
             Bucket::decode(4, Variant::DecodeGreedy),
             Bucket::prefill(4, 64, Variant::PrefillOutput),
@@ -948,69 +1056,48 @@ mod tests {
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
 
-        let decode = BatchColumns {
-            input_ids: vec![7, 8],
-            positions: vec![3, 4],
-            slot_mapping: vec![10, 11],
-            seq_lens: vec![4, 9],
-            query_lens: vec![1, 1],
-            write_cache: vec![1, 1],
-            logits_rows: vec![0, 1],
-            num_tokens: 2,
-            page_size: 16,
-            calls: vec![crate::batch::BatchCall {
-                call: CallId(0),
-                request: 0,
-                kind: crate::batch::CallKind::Decode,
-                cache_group: 0,
-                rows: 0..2,
-            }],
-        };
         let bucket = Bucket::decode(4, Variant::DecodeGreedy);
-        let staged = staging.stage(&decode, &Shape::decode(2, Variant::DecodeGreedy), bucket)?;
-        assert_eq!(staged.rows, 4);
-        assert_eq!(staged.tokens, 4);
-        // The padding rows write nothing and persist nothing.
-        assert_eq!(&staging.slot_mapping(4)[..], &[10, 11, -1, -1]);
-        assert_eq!(&staging.write_cache()[2..], &[0, 0]);
+        let staged = staging.stage(
+            &decode_columns(),
+            &[CallId(5)],
+            &Shape::decode(2, Variant::DecodeGreedy),
+            bucket,
+        )?;
+        assert_eq!((staged.rows, staged.tokens), (4, 4));
+        // No padding token persists and every padding row keeps its token state.
+        assert_eq!(&staging.batch_rows().slot_mapping[..], &[10, 11, -1, -1]);
+        assert_eq!(&staging.slots(4)[2..], &[-1, -1]);
+        assert_eq!(&staging.commit()[..4], &[0, 1, -1, -1]);
+        // A decode's padding rows do not sample.
+        assert_eq!(&staging.logits_rows()[2..], &[-1, -1]);
 
-        let prefill = BatchColumns {
-            input_ids: vec![1, 2, 3],
-            positions: vec![0, 1, 2],
-            slot_mapping: vec![0, 1, 2],
-            seq_lens: vec![3],
-            query_lens: vec![3],
-            write_cache: vec![1],
-            logits_rows: vec![0],
-            num_tokens: 3,
-            page_size: 16,
-            calls: vec![crate::batch::BatchCall {
-                call: CallId(0),
-                request: 0,
-                kind: crate::batch::CallKind::Prefill,
-                cache_group: 0,
-                rows: 0..3,
-            }],
-        };
         let bucket = Bucket::prefill(4, 64, Variant::PrefillOutput);
         let staged = staging.stage(
-            &prefill,
+            &prefill_columns(),
+            &[CallId(9)],
             &Shape::prefill(1, 3, Variant::PrefillOutput),
             bucket,
         )?;
         assert_eq!(staged.tokens, 64);
-        assert_eq!(&staging.slot_mapping(64)[3..], &[-1i64; 61]);
-        // One call for the batch and one for every padding token.
-        assert_eq!(staging.rows().calls.len(), 2);
-        assert_eq!(staging.rows().calls[1].rows, 3..64);
+        assert_eq!(&staging.batch_rows().slot_mapping[3..], &[-1i32; 61]);
         Ok(())
     }
-}
 
-impl Staging {
-    /// The staged write flags, for the upload and the padding test.
-    pub fn write_cache(&self) -> &[u8] {
-        &self.write_cache
+    /// A batch larger than the bucket it planned is refused before any staging or launch.
+    #[test]
+    fn a_batch_larger_than_its_bucket_is_refused() {
+        let buckets = Buckets::new([Bucket::decode(2, Variant::DecodeGreedy)]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets).expect("one bucket");
+        let bucket = Bucket::decode(2, Variant::DecodeGreedy);
+        staging
+            .stage(
+                &decode_columns(),
+                &[CallId(0)],
+                &Shape::decode(4, Variant::DecodeGreedy),
+                bucket,
+            )
+            .expect_err("two rows do not fit a bucket of two, and four do not either");
     }
 }
 
@@ -1018,13 +1105,22 @@ impl Staging {
 mod sampled_output_tests {
     use super::*;
 
-    fn call(call: u64, rows: std::ops::Range<u32>) -> BatchCall {
-        BatchCall {
-            call: CallId(call),
-            request: call as u32,
-            kind: crate::batch::CallKind::Decode,
-            cache_group: 0,
-            rows,
+    fn rows(calls: &[(u32, std::ops::Range<u32>)]) -> nn::BatchRows {
+        nn::BatchRows {
+            positions: Vec::new(),
+            slot_mapping: Vec::new(),
+            seq_lens: Vec::new(),
+            query_offsets: Vec::new(),
+            logits_rows: Vec::new(),
+            calls: calls
+                .iter()
+                .map(|(request, rows)| nn::BatchRow {
+                    request: *request,
+                    kind: nn::RowKind::Decode,
+                    cache_group: 0,
+                    rows: rows.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -1032,8 +1128,9 @@ mod sampled_output_tests {
     /// the mechanism listed the calls in.
     #[test]
     fn sampled_rows_are_named_by_their_calls() {
-        let calls = vec![call(7, 0..1), call(9, 1..2)];
-        let output = sampled_output(&[111, 222], &[1, 0], &calls).expect("both rows belong to a call");
+        let batch = rows(&[(0, 0..1), (1, 1..2)]);
+        let output = sampled_output(&[111, 222], &[1, 0], &batch, &[CallId(7), CallId(9)])
+            .expect("both rows belong to a call");
         assert_eq!(
             output.tokens,
             vec![
@@ -1053,7 +1150,8 @@ mod sampled_output_tests {
     /// bucket whose rows are all padding.
     #[test]
     fn a_batch_that_samples_nothing_produces_no_tokens() {
-        let output = sampled_output(&[], &[], &[call(1, 0..4)]).expect("no sampling rows");
+        let output = sampled_output(&[], &[-1], &rows(&[(0, 0..4)]), &[CallId(1)])
+            .expect("no sampling rows");
         assert!(output.tokens.is_empty());
     }
 
@@ -1061,8 +1159,8 @@ mod sampled_output_tests {
     /// violation: silently dropping either would hand the mechanism the wrong request's token.
     #[test]
     fn a_row_no_call_owns_is_refused() {
-        let calls = vec![call(1, 0..1)];
-        sampled_output(&[5], &[3], &calls).expect_err("row 3 belongs to no call");
-        sampled_output(&[], &[0], &calls).expect_err("no id was sampled for row 0");
+        let batch = rows(&[(0, 0..1)]);
+        sampled_output(&[5], &[3], &batch, &[CallId(1)]).expect_err("row 3 belongs to no call");
+        sampled_output(&[], &[0], &batch, &[CallId(1)]).expect_err("no id was sampled for row 0");
     }
 }
