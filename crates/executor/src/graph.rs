@@ -30,6 +30,37 @@ pub struct Graphs {
     captured: HashMap<(Bucket, u64), Captured>,
 }
 
+/// The table's selection rule, over the `(bucket, generation)` keys it holds: among the entries whose
+/// bucket `accepts`, the **newest** generation at or below `generation`, and within it the
+/// **smallest** bucket.
+///
+/// Newest first is what lets a bucket an update did not prepare keep serving: its programs did not
+/// change, so the newest generation that named it is the same program. Smallest within a generation
+/// is the planning rule (4.5): a batch is served by the smallest bucket that holds it.
+fn served_key(
+    keys: impl Iterator<Item = (Bucket, u64)>,
+    generation: u64,
+    accepts: impl Fn(&Bucket) -> bool,
+) -> Option<(Bucket, u64)> {
+    let mut best: Option<(Bucket, u64)> = None;
+    for (bucket, captured_generation) in keys {
+        if captured_generation > generation || !accepts(&bucket) {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((smallest, newest)) => {
+                captured_generation > newest
+                    || (captured_generation == newest && bucket < smallest)
+            }
+        };
+        if better {
+            best = Some((bucket, captured_generation));
+        }
+    }
+    best
+}
+
 impl Graphs {
     /// No captured graph.
     pub fn new() -> Self {
@@ -59,16 +90,10 @@ impl Graphs {
     /// only the scheduling policy, and so prepares no bucket at all, from stopping serving at the
     /// switchover.
     pub fn captured_for(&self, bucket: Bucket, generation: u64) -> Option<(u64, &Captured)> {
-        let mut newest: Option<(u64, &Captured)> = None;
-        for (&(held, captured_generation), captured) in &self.captured {
-            if held != bucket || captured_generation > generation {
-                continue;
-            }
-            if newest.is_none_or(|(generation, _)| captured_generation > generation) {
-                newest = Some((captured_generation, captured));
-            }
-        }
-        newest
+        let served = served_key(self.captured.keys().copied(), generation, |held| {
+            *held == bucket
+        })?;
+        self.captured.get(&served).map(|captured| (served.1, captured))
     }
 
     /// The smallest captured bucket that holds `shape` and belongs to `generation`, or, when that
@@ -85,30 +110,19 @@ impl Graphs {
     /// bucket and forbids planning a new one during serving (4.5). The error names the shape so the
     /// plan and the batch can be compared.
     pub fn select(&self, shape: &Shape, generation: u64) -> Result<(Bucket, &Captured)> {
-        let mut best: Option<(Bucket, u64, &Captured)> = None;
-        for (&(bucket, captured_generation), captured) in &self.captured {
-            if captured_generation > generation || !bucket.holds(shape) {
-                continue;
-            }
-            let better = match best {
-                // The newest generation that holds the shape wins; within it, the smallest bucket.
-                None => true,
-                Some((smallest, newest, _)) => {
-                    captured_generation > newest
-                        || (captured_generation == newest && bucket < smallest)
-                }
-            };
-            if better {
-                best = Some((bucket, captured_generation, captured));
-            }
-        }
-        best.map(|(bucket, _, captured)| (bucket, captured))
-            .ok_or_else(|| {
-                Error::Invariant(format!(
-                    "no captured bucket of generation {generation} or of a generation it replaces \
-                     holds {shape}"
-                ))
-            })
+        let served = served_key(self.captured.keys().copied(), generation, |bucket| {
+            bucket.holds(shape)
+        })
+        .ok_or_else(|| {
+            Error::Invariant(format!(
+                "no captured bucket of generation {generation} or of a generation it replaces \
+                 holds {shape}"
+            ))
+        })?;
+        self.captured
+            .get(&served)
+            .map(|captured| (served.0, captured))
+            .ok_or_else(|| Error::Invariant("the selected graph was lost from the table".into()))
     }
 
     /// The buckets of `generation` whose graph launches `operator`, in bucket order.
@@ -235,6 +249,42 @@ impl Graphs {
 mod tests {
     use super::*;
     use crate::plan::Variant;
+
+    /// The selection rule, over keys only: the newest generation at or below the one asked for, and
+    /// the smallest bucket within it. This is what lets a bucket an update did not prepare keep
+    /// serving - an update that swaps only the scheduling policy prepares no bucket at all - so it
+    /// is tested without a device, where `Captured` is not needed.
+    #[test]
+    fn the_newest_generation_at_or_below_the_asked_one_serves_a_bucket() {
+        let bucket = Bucket::decode(4, Variant::DecodeGreedy);
+        let larger = Bucket::decode(8, Variant::DecodeGreedy);
+        let keys = [(bucket, 1), (larger, 1), (bucket, 3), (larger, 5)];
+        let only = |held: &Bucket| *held == bucket;
+
+        // The generation asked for serves the bucket it prepared.
+        assert_eq!(
+            served_key(keys.into_iter(), 3, only),
+            Some((bucket, 3))
+        );
+        // One that prepared nothing for it serves from the newest older generation that did.
+        assert_eq!(
+            served_key(keys.into_iter(), 4, only),
+            Some((bucket, 3))
+        );
+        assert_eq!(
+            served_key(keys.into_iter(), 2, only),
+            Some((bucket, 1))
+        );
+        // A generation prepared later never serves an earlier request: a revert must not be served
+        // by the generation that replaced it.
+        assert_eq!(served_key(keys.into_iter(), 0, only), None);
+        assert_eq!(
+            served_key(keys.into_iter(), 5, |_| true),
+            Some((larger, 5))
+        );
+        // Within one generation the smallest bucket that accepts the batch wins.
+        assert_eq!(served_key(keys.into_iter(), 1, |_| true), Some((bucket, 1)));
+    }
 
     /// `Graphs` is exercised through its selection and purge rules; a `Captured` needs a device,
     /// so the table's own rules are what these tests pin, with the entries built by the runner
