@@ -104,9 +104,18 @@ impl Shadow {
         for pair in pairs {
             let bytes = pair.real.byte_len()?;
             if bytes != pair.shadow.byte_len()? {
-                return Err(Error::Invariant(
-                    "the twin and the real buffer have different sizes".into(),
-                ));
+                // The two programs wrote outputs of different extents: they are not comparable, and
+                // the update is refused by name rather than committed unmeasured (7.3 step 2). The
+                // command's label already states the operator, the key and the bucket, so this
+                // states what differed.
+                return Err(Error::Invariant(format!(
+                    "the twin and the real buffer have different sizes: the real output holds \
+                     {bytes} bytes of {} and the twin {} of {}, so the two programs are not \
+                     comparable",
+                    pair.real.dtype,
+                    pair.shadow.byte_len()?,
+                    pair.shadow.dtype,
+                )));
             }
             let bytes = usize::try_from(bytes)
                 .map_err(|_| Error::Invariant("a twin buffer is larger than memory".into()))?;
