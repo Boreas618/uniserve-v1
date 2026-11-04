@@ -184,4 +184,41 @@ mod tests {
             (track.latent_frames - 35, track.latent_frames)
         );
     }
+
+    #[test]
+    fn the_clip_rows_invert_the_packing_over_each_clips_seven_frames() {
+        let canvas = crate::config::Canvas {
+            short_edge: 768,
+            aspect: (5, 3),
+            width: 1280,
+            height: 768,
+        };
+        let patch_rows = u64::from(crate::packing::latent_raster(&canvas).expect("raster").patch_rows());
+        // Dense packing keeps raster order, so the clip rows are the raster rows in sequence.
+        let rows = crate::packing::clip_rows(crate::config::AttentionKind::Dense, 107, &canvas)
+            .expect("rows");
+        assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(u64::from(*row), index as u64);
+        }
+        // A sparse packing permutes them: every clip still reads seven consecutive latent frames,
+        // which covers the whole generated video exactly once across the clips.
+        let sparse = crate::config::AttentionKind::Sparse {
+            tile: 128,
+            sparsity: 0.8,
+            reference_keep: None,
+        };
+        let rows = crate::packing::clip_rows(sparse, 107, &canvas).expect("rows");
+        assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
+        let mut seen = vec![false; (5 * 6 + 2) as usize * patch_rows as usize];
+        for row in &rows {
+            let index = *row as usize;
+            assert!(!seen[index], "row {index} is named twice");
+            seen[index] = true;
+        }
+        assert!(seen.iter().all(|row| *row), "a generated row is missing");
+        // Clips overlap by two latent frames: the second clip starts five frames after the first.
+        let per_frame = patch_rows as usize;
+        assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
+    }
 }
