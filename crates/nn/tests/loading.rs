@@ -1281,24 +1281,25 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
 fn a_shuffled_stack_permutes_its_values_rows_at_load() {
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
-    // One expert, 32 rows by 32 columns: 16 packed bytes a row, two block scales a row.
+    // One expert, 64 rows by 32 columns — two 32-row blocks, so the block boundary is covered — with
+    // 16 packed bytes and two block scales a row.
     let expert = |prefix: &str| {
         let mut values = Vec::new();
-        for row in 0..32u8 {
+        for row in 0..64u8 {
             values.extend(std::iter::repeat_n(row, 16));
         }
         vec![
             (
                 format!("{prefix}.weight_packed"),
                 DType::U8,
-                vec![32, 16],
+                vec![64, 16],
                 values,
             ),
             (
                 format!("{prefix}.weight_scale"),
                 DType::F8E4M3,
-                vec![32, 2],
-                vec![0x38; 64],
+                vec![64, 2],
+                vec![0x38; 128],
             ),
             (
                 format!("{prefix}.weight_tensor_scale"),
@@ -1341,11 +1342,12 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
         "the published values name the arrangement they are in"
     );
 
-    // Destination row `d` holds source row `(d % 8) * 4 + d / 8`: the interleave of four eight-row
-    // groups that makes a thread block's tile contiguous.
+    // Destination row `d` holds source row `(d / 32) · 32 + (d % 8) · 4 + (d % 32) / 8`: within its
+    // block the interleave of four eight-row groups, and the block wherever it was.
     let published = &store.published[0].1;
-    for destination in 0..32usize {
-        let source = (destination % 8) * 4 + destination / 8;
+    for destination in 0..64usize {
+        let within = destination % 32;
+        let source = (destination / 32) * 32 + (within % 8) * 4 + within / 8;
         assert_eq!(
             published[destination * 16],
             source as u8,
