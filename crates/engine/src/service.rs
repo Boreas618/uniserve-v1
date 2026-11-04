@@ -38,6 +38,10 @@ use proto::request::{ArtifactMedia, EVENT_WINDOW, Event, MigrationCause, Request
 use crate::Validators;
 use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
+/// What names one program on the wire: its backend, its revision and the
+/// arguments the deployment stated (§5.1, §7.7).
+type ProgramKey = (String, u32, std::collections::BTreeMap<String, String>);
+
 use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, PolicyProgram, PolicyReverted, PolicySource, PolicyUsage,
     RoutePolicy, RouteTrial, SchedulerStatsReporter, TrialState, arrival_view, ceilings_of,
@@ -145,12 +149,15 @@ struct Generations {
     switched: u64,
     /// The generation no batch uses anything older than.
     purged: u64,
-    /// The generation each precopied program was given, by backend and
-    /// revision: a `Precopy` of a program this engine already prepared is
-    /// answered with that generation and prepares nothing again. A purge
-    /// forgets the entry, so a program prepared again after its modules were
-    /// dropped gets a generation of its own.
-    programs: std::collections::BTreeMap<(String, u32), u64>,
+    /// The generation each precopied program was given, by its backend, its
+    /// revision and the arguments the deployment stated: a `Precopy` of a
+    /// program this engine already prepared is answered with that generation
+    /// and prepares nothing again. The arguments are part of the program — they
+    /// are the policy's parameters (§7.7) — so the same revision with other
+    /// arguments is another generation. A purge forgets the entry, so a program
+    /// prepared again after its modules were dropped gets a generation of its
+    /// own.
+    programs: std::collections::BTreeMap<ProgramKey, u64>,
 }
 
 /// The control thread's policy state: its route instance, the candidate a
@@ -2689,7 +2696,11 @@ fn apply_process_command(
             // answered with its generation, not prepared again: the epoch
             // updates at most once per program, and the daemon's echo of the
             // number is what its switchover names.
-            let key = (program.backend.clone(), program.revision);
+            let key: ProgramKey = (
+                program.backend.clone(),
+                program.revision,
+                program.stated.clone(),
+            );
             if let Some(&generation) = crate::lock(generations).programs.get(&key) {
                 return Some(proto::process::Report {
                     kind: Some(report::Kind::Precopied(proto::process::Precopied {
@@ -3069,6 +3080,51 @@ mod tests {
             Kind::Precopied(precopied) => assert_eq!(precopied.generation, 3),
             other => panic!("a precopy after a purge is answered by Precopied, not {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_same_revision_with_other_arguments_is_another_program() {
+        use proto::process::report::Kind;
+
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+
+        fn precopy_with(max_batch: &str) -> proto::process::Command {
+            proto::process::Command {
+                kind: Some(proto::process::command::Kind::Precopy(
+                    proto::process::Precopy {
+                        kernels: Vec::new(),
+                        policy: Some(proto::process::Program {
+                            backend: "fcfs".to_owned(),
+                            revision: 3,
+                            arguments: [("max_batch".to_owned(), max_batch.to_owned())]
+                                .into_iter()
+                                .collect(),
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            }
+        }
+
+        match answered(run(precopy_with("16"))) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        }
+        // The same backend and revision, the same arguments: prepared once.
+        match answered(run(precopy_with("16"))) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
+            other => panic!("a repeated precopy is answered by Precopied, not {other:?}"),
+        }
+        // The program's arguments are its parameters (§7.7), so another
+        // argument is another program.
+        match answered(run(precopy_with("32"))) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 2),
+            other => panic!("a changed program is answered by Precopied, not {other:?}"),
+        }
+        assert_eq!(policy.calls(), vec!["precopy", "precopy"]);
     }
 
     #[test]
