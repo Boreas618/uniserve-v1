@@ -94,6 +94,27 @@ impl Representation {
         matches!(self, Self::Nvfp4 { .. })
     }
 
+    /// The declaration as one line, for a run's first output: what it is, and how many modules it
+    /// keeps out of it.
+    ///
+    /// `Debug` prints every excluded module, and a calibrated checkpoint excludes one per layer, so a
+    /// run that printed the declaration whole would bury its own first line in module paths.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Dense => "dense".to_owned(),
+            Self::Nvfp4 {
+                excluded,
+                also_excluded,
+            } => {
+                let mut summary = format!("nvfp4, {} module(s) excluded", excluded.len());
+                if !also_excluded.is_empty() {
+                    summary.push_str(&format!(" and {} on the side file", also_excluded.len()));
+                }
+                summary
+            }
+        }
+    }
+
     /// How the checkpoint stores `parameter`, whose role the caller states.
     ///
     /// A role this tree serves dense is refused when the declaration quantizes it: the refusal names
