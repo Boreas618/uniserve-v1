@@ -111,7 +111,8 @@ impl Geometry {
         }
         // The learned table bounds nothing: it is resampled to whatever grid an image has
         // (`PositionEmbedding.interpolate`), and the processor's own pixel cap is far above the
-        // table's entry count - H3's 768x1280 keyframe is 48x80 patches against a 48x48 table.
+        // table's entry count - H3's 16:9 keyframe, 1344x768, is 84x48 patches against a 48x48
+        // table.
         let patches = u64::from(time) * u64::from(height) * u64::from(width);
         let sequence = u64::from(height) * u64::from(width);
         let patches = u32::try_from(patches).map_err(|_| {
@@ -1119,13 +1120,14 @@ mod tests {
     #[test]
     fn a_grid_larger_than_the_position_table_is_resampled_not_refused() {
         let config = config();
-        // The table is 48 x 48 entries; H3's own 768x1280 keyframe is 48 x 80 patches, and the
-        // processor's pixel cap allows far more, so the grid is never bounded by the table.
+        // The table is 48 x 48 entries; H3's widest served canvas, 1344x768, is 84 x 48 patches,
+        // and the processor's pixel cap allows far more, so the grid is never bounded by the
+        // table.
         assert!(Geometry::of(&config, [1, 48, 48]).is_ok());
-        let keyframe = Geometry::of(&config, [1, 48, 80]).expect("a 768x1280 keyframe");
-        assert_eq!(keyframe.patches, 3840);
-        assert_eq!(keyframe.merged, 960);
-        assert_eq!(keyframe.sequence, 3840);
+        let keyframe = Geometry::of(&config, [1, 84, 48]).expect("a 1344x768 keyframe");
+        assert_eq!(keyframe.patches, 4032);
+        assert_eq!(keyframe.merged, 1008);
+        assert_eq!(keyframe.sequence, 4032);
         assert!(Geometry::of(&config, [1, 256, 256]).is_ok());
     }
 
