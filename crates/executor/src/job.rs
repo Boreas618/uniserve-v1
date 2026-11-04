@@ -97,7 +97,7 @@ impl Command {
                 None => format!("a step of {} prepared jobs", jobs.len()),
             },
             Self::Precopy(next) => format!("preparing generation {}", next.number()),
-            Self::Shadow(batch) => format!("shadowing generation {}", batch.generation),
+            Self::Shadow(batch) => format!("the shadow pass of generation {}", batch.generation),
             Self::SetShadow => "carving the shadow harness".to_owned(),
             Self::Switchover(generation) => format!("switching to generation {generation}"),
             Self::Revert(generation) => format!("reverting generation {generation}"),
