@@ -203,6 +203,41 @@ def _precompiler() -> Path:
     return root / "target" / "debug" / "scheduling-precompile"
 
 
+def _program_target() -> str:
+    """The target this host's modules are built for.
+
+    The engine derives it from the device it serves — ``sm_{major}{minor}a``
+    (``src/engine_plan.rs``) — and a store built for another target describes
+    nothing to overlay: the precopy then fails at the module lane rather than
+    the build. So the default is the served device's own compute capability,
+    read the way this file already reads that device; the environment's
+    ``UNISERVE_PROGRAM_TARGET`` names a target instead, for a host whose store
+    is provisioned elsewhere.
+    """
+    named = os.environ.get("UNISERVE_PROGRAM_TARGET")
+    if named:
+        return named
+    device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
+    reported = subprocess.run(
+        [
+            "nvidia-smi",
+            f"--id={device}",
+            "--query-gpu=compute_cap",
+            "--format=csv,noheader",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    major, _, minor = reported.partition(".")
+    if not major.isdigit() or not minor.isdigit():
+        raise AssertionError(
+            f"nvidia-smi reported no compute capability for GPU {device}: "
+            f"{reported!r}"
+        )
+    return f"sm_{major}{minor}a"
+
+
 def _build_store(store: Path, target: str, python: Path | None) -> None:
     """Builds a module for every kernel key the deployment launches.
 
@@ -280,7 +315,7 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     work = tmp_path_factory.mktemp("program-server")
     socket = work / "program-server.sock"
     log = work / "program-server.log"
-    target = os.environ.get("UNISERVE_PROGRAM_TARGET", "sm_100a")
+    target = _program_target()
     interpreter = _repository() / ".venv" / "bin" / "python"
     built = work / "programs"
     _build_store(built, target, interpreter if interpreter.exists() else None)
