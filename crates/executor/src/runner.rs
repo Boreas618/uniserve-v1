@@ -43,6 +43,15 @@ pub trait Runner: Send {
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
+    /// The resident cache this runner reads, when it reads one: what a sleep gives back and a wake
+    /// maps again (2.5).
+    ///
+    /// The caller dedups by the handle's address, because two runners of one device may share one
+    /// cache and a second wake would reset units the first had just mapped.
+    fn cache(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        None
+    }
+
     /// Hands the runner the device's record of the operators a program-layer update could not
     /// compare (7.3 step 2).
     ///

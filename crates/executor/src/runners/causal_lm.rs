@@ -899,6 +899,15 @@ pub trait KvProvider: Send + Sync {
         Ok(())
     }
 
+    /// The cache this provider reads, when it reads one: the handle a sleep gives back and a wake
+    /// maps again (2.5).
+    ///
+    /// One call per cache, not per runner: two runners of a device that share one cache must be
+    /// woken once, and the caller dedups by the handle's address.
+    fn cache(&self) -> Option<&Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        None
+    }
+
     /// Applies what the mechanism allocated for this batch's cache pages, on `stream`, before the
     /// batch's forward reads them.
     ///
@@ -1237,6 +1246,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
 }
 
 impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
+    fn cache(&self) -> Option<Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        self.kv.cache().cloned()
+    }
+
     fn phases(&self) -> &[PhaseId] {
         &self.phases
     }
