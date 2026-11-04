@@ -1283,6 +1283,20 @@ impl Leader {
         Arc::clone(&self.epochs)
     }
 
+    /// The configuration the deployment serves now: what a change is
+    /// resolved against before it is routed (§7.2).
+    ///
+    /// # Errors
+    ///
+    /// `UpdateError::Failed` when no replica serves — the same answer
+    /// [`Self::apply_programs`] gives, so a caller may ask either first.
+    pub(crate) fn serving_config(&self) -> Result<ServeConfig, UpdateError> {
+        self.replicas()
+            .first()
+            .map(|replica| locked(&replica.config).clone())
+            .ok_or_else(|| UpdateError::Failed(anyhow::anyhow!("no replica serves")))
+    }
+
     /// This node's main processes, by the engine number their reports carry
     /// and the node they run on: the processes a program-layer update
     /// commands (§7.3).
@@ -1322,11 +1336,7 @@ impl Leader {
         target: &ServeConfig,
         dry_run: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
-        let current = self
-            .replicas()
-            .first()
-            .map(|replica| locked(&replica.config).clone())
-            .ok_or_else(|| UpdateError::Failed(anyhow::anyhow!("no replica serves")))?;
+        let current = self.serving_config()?;
         let Some(update) = self.route(&current, target, false).await? else {
             return Ok(None);
         };
