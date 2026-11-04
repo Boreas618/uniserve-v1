@@ -82,7 +82,10 @@ pub fn clips(frames: u32) -> Result<Vec<Clip>> {
     Ok((0..count)
         .map(|index| Clip {
             index,
-            latent: (index * CLIP_LATENTS, index * CLIP_LATENTS + CLIP_LATENTS + 2),
+            latent: (
+                index * CLIP_LATENTS,
+                index * CLIP_LATENTS + CLIP_LATENTS + 2,
+            ),
             body: (0, CLIP_FRAMES),
             tail: (TAIL_START, TAIL_START + CLIP_LATENTS),
         })
@@ -155,7 +158,10 @@ impl Buffer {
 /// and its normalization, the fused query-key-value projection with its rotary factors, the attention
 /// output, the gated feed-forward, the decoded pixels of one tile batch, and the RGB bytes with the
 /// overlap block carried between clips.
-pub fn video_arena(config: &crate::VideoVaeConfig, canvas: &crate::video_vae::Canvas) -> Result<Vec<Buffer>> {
+pub fn video_arena(
+    config: &crate::VideoVaeConfig,
+    canvas: &crate::video_vae::Canvas,
+) -> Result<Vec<Buffer>> {
     let tiles = crate::video_vae::Tiles::of(config, canvas)?;
     let grid = tiles.tiles(config, canvas);
     let width = u64::from(config.decoder_num_attention_heads)
@@ -288,7 +294,10 @@ mod tests {
         // packing's audio timeline: 200 latent frames for a five-second track, 800 samples each.
         assert_eq!(track.halo, 30);
         let track = Track::of(124, &config).expect("track");
-        assert_eq!(track.latent_frames, crate::packing::audio_latent_frames(124));
+        assert_eq!(
+            track.latent_frames,
+            crate::packing::audio_latent_frames(124)
+        );
         assert_eq!(track.samples, crate::packing::audio_samples(124));
         // A window inside the track grows by the halo on both sides and is clipped at the ends.
         assert_eq!(track.window(40, 60), (10, 90));
@@ -307,7 +316,11 @@ mod tests {
             width: 1280,
             height: 768,
         };
-        let patch_rows = u64::from(crate::packing::latent_raster(&canvas).expect("raster").patch_rows());
+        let patch_rows = u64::from(
+            crate::packing::latent_raster(&canvas)
+                .expect("raster")
+                .patch_rows(),
+        );
         // Dense packing keeps raster order, so the clip rows are the raster rows in sequence.
         let rows = crate::packing::clip_rows(crate::config::AttentionKind::Dense, 107, &canvas)
             .expect("rows");
