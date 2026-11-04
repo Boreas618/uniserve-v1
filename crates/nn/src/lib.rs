@@ -65,8 +65,8 @@ pub use layers::{
     GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise, NoiseKey, PackedSwiGlu,
     ParallelLMHead, Patch, PatchMode, RmsNorm, Rotary, Rotate, Rotation, Sampler, SamplerState,
     Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections,
-    Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm,
-    gather_rows,
+    SegmentAttention, SegmentTables, Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
+    VsaTiles, WeightedRmsNorm, gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;

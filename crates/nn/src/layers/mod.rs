@@ -20,8 +20,8 @@
 
 mod activation;
 mod attention;
-mod conv;
 mod bias;
+mod conv;
 mod embedding;
 mod exchange;
 mod frame;
@@ -39,6 +39,7 @@ mod rope;
 mod rotate;
 mod rows;
 mod sampler;
+mod segment;
 mod segments;
 
 pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Silu, Snake, SwiGlu};
@@ -65,6 +66,7 @@ pub use rope::{Rotary, Sections};
 pub use rotate::Rotate;
 pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
+pub use segment::{SegmentAttention, SegmentTables};
 pub use segments::VsaTiles;
 
 /// The constants a layer's operator descriptor carries and the program package owns.
