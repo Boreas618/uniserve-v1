@@ -420,7 +420,8 @@ impl Pools {
             graph: self.allocator.mapped_bytes(PoolKind::Graph) as u64,
             scratch: self.allocator.mapped_bytes(PoolKind::Scratch) as u64,
             resident: self.allocator.mapped_bytes(PoolKind::Resident) as u64,
-            budget: self.ledger.budget,
+            // The one book every pool kind is booked against (4.1), not the graph ledger's copy.
+            budget: self.totals.allowance(),
         }
     }
 

@@ -45,6 +45,7 @@ mod rows;
 mod sampler;
 mod segment;
 mod segments;
+mod transpose;
 mod unpatchify;
 
 pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Silu, Snake, SwiGlu};
@@ -79,6 +80,7 @@ pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use segment::{SegmentAttention, SegmentTables};
 pub use segments::VsaTiles;
+pub use transpose::Transpose;
 pub use unpatchify::UnpatchifyVideo;
 
 /// The constants a layer's operator descriptor carries and the program package owns.

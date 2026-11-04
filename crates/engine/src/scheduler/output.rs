@@ -1706,6 +1706,10 @@ impl Scheduler {
         let mut allocations = None;
         let mut guidance_prefix = None;
         if let Some(mut st) = self.running.remove(&id) {
+            if st.allocations.is_some() {
+                // The pool row this request held is free from here on.
+                self.rows_held = self.rows_held.saturating_sub(1);
+            }
             if matches!(terminal, TokenTerminal::Finished { .. })
                 && let Some(resume) = st.req.cache.resume
                 && let Some(cache) = &self.storage.cache
