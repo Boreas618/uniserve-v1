@@ -154,6 +154,11 @@ pub struct GatherGemmArgs {
     pub weights: TensorView,
     /// `[tokens, top]` i32 route ids — the source of the expanded route count.
     pub ids: TensorView,
+    /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, as `moe_sort` writes it
+    /// (the same map `moe_unpermute` reads). It is the consumer's lookup, not this product's: the
+    /// product writes row `p` of `out` at the sort's permuted row `p`, so the map is what lets the
+    /// reader find a route afterwards.
+    pub expanded_to_permuted: TensorView,
     /// `[max_tiles]` i32 expert of each tile.
     pub tile_to_expert: TensorView,
     /// `[max_tiles]` i32 live rows of each tile.
@@ -387,7 +392,6 @@ impl Op for RouteGemm {
         let top = u64::from(descriptor.top);
         let rows = args.rows.rows();
         let tokens = args.ids.rows();
-        let expanded = tokens * top;
 
         args.rows
             .require_shape(Self::NAME, Shape::new(&[rows, intermediate]))?;
@@ -429,18 +433,6 @@ impl Op for RouteGemm {
                 ),
             ));
         }
-        // The output is the expanded routes' product, and a caller that keeps one buffer for the
-        // whole step may hand more rows than this launch writes: the kernel writes exactly
-        // `expanded` of them, so a longer buffer is not an error, only a bigger reservation.
-        if args.out.rows() < expanded {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the output holds {} rows and this launch writes {expanded}",
-                    args.out.rows()
-                ),
-            ));
-        }
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
 
         let mut call = RouteCall {
@@ -455,7 +447,6 @@ impl Op for RouteGemm {
             width: to_i64(Self::NAME, hidden)?,
             intermediate: to_i64(Self::NAME, intermediate)?,
             experts: to_i64(Self::NAME, experts)?,
-            expanded_rows: to_i64(Self::NAME, expanded)?,
             dtype: dtype_code(descriptor.dtype),
             error: [0; 512],
         };
@@ -526,14 +517,13 @@ pub struct RouteCall {
     pub width: i64,
     pub intermediate: i64,
     pub experts: i64,
-    pub expanded_rows: i64,
     pub dtype: i64,
     pub error: [u8; 512],
 }
 
 /// The layout of [`RouteCall`], for its header's mirror and its test.
 pub const ROUTE_CALL_LAYOUT: RouteCallLayout = RouteCallLayout {
-    size: 616,
+    size: 608,
     rows: 0,
     weights: 8,
     out: 16,
@@ -545,9 +535,8 @@ pub const ROUTE_CALL_LAYOUT: RouteCallLayout = RouteCallLayout {
     width: 64,
     intermediate: 72,
     experts: 80,
-    expanded_rows: 88,
-    dtype: 96,
-    error: 104,
+    dtype: 88,
+    error: 96,
 };
 
 /// The layout of [`RouteCall`], for the header's mirror and its test.
@@ -565,7 +554,6 @@ pub struct RouteCallLayout {
     pub width: usize,
     pub intermediate: usize,
     pub experts: usize,
-    pub expanded_rows: usize,
     pub dtype: usize,
     pub error: usize,
 }
