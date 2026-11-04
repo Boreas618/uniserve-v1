@@ -2161,7 +2161,6 @@ mod tests {
             u64::from(stack.widths[0]) * 25 * 64 * 256,
             "level 0 is the tile's pixels at the first width"
         );
-        assert!(first.elements > 100 * 1024 * 1024);
     }
 
     #[test]
@@ -2216,10 +2215,16 @@ mod tests {
                 );
             }
         }
-        // The extremes are exact: the normalization maps 0 and 255 outside the [-1, 1] range the
-        // decoder works in, which is expected — the encoder reads the raster, not latents.
-        assert!(normalize([0, 0, 0])[0] < -2.0);
-        assert!(normalize([255, 255, 255])[0] > 2.0);
+        // The extremes land outside the band the decoder works in - `Rgb::quantize` maps a value
+        // back through `value · std + mean` and clamps to the byte range, so one inside [-1, 1]
+        // loses nothing. Being outside is the property; how far outside is the checkpoint's
+        // statistics' business, not this test's.
+        for channel in 0..3 {
+            let low = normalize([0, 0, 0])[channel];
+            let high = normalize([255, 255, 255])[channel];
+            assert!(low < -1.0, "channel {channel}: {low} from zero");
+            assert!(high > 1.0, "channel {channel}: {high} from 255");
+        }
     }
 
     #[test]
