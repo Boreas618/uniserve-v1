@@ -42,9 +42,9 @@
 //!    its facts (`generation::continuation`). Either computes what it
 //!    computed before.
 
-use crate::scheduler::completion::CallCompletion;
 use super::*;
 use crate::WorkerGroupId;
+use crate::scheduler::completion::CallCompletion;
 use crate::trajectories::{Offloaded, Restored, image_trajectory};
 
 /// What [`Scheduler::store_preempted`] reads of a preempted request.
@@ -132,7 +132,7 @@ impl Scheduler {
             .map_or(DEFAULT_COMPONENT, String::as_str);
         let (_, bound, _) = self
             .placement
-            .component_candidates(self.executor.inner(), kind, component)
+            .component_candidates(&self.executor, kind, component)
             .next()?;
         self.placement
             .affinity
@@ -479,7 +479,7 @@ impl Scheduler {
         let stored = state.req.trajectory.clone();
         let trajectory = image_trajectory(stored.id, state.image_id);
         let worker = self.placement.place(
-            self.executor.inner(),
+            &self.executor,
             &self.info,
             request_key,
             CallKind::Media(MediaCall::LatentPreparation),
