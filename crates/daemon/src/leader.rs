@@ -57,10 +57,13 @@ use crate::output::RequestOutputStream;
 
 /// How long the epoch's Program Servers may take to select its programs.
 ///
-/// A Program Server that selects a program compiles it when it has no module,
-/// so this is generous; it exists so that a daemon that waits here says which
-/// wait it is in instead of staying silent for the length of a run.
-const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// A Program Server that selects a program compiles it when it has no module:
+/// a cold store builds every kernel of the epoch, which minutes of compiler
+/// work per kernel makes long. The budget is the engine's own for the precopy
+/// (§7.3), and it is a backstop rather than the signal a reader follows: the
+/// line the install prints before it waits, and the Program Server's own
+/// module progress, say whether the selection is working or stopped.
+const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// How long the main processes may take to take the epoch's programs.
 ///
