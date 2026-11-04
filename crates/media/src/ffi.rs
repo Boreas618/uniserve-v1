@@ -274,7 +274,8 @@ impl Drop for OpenMuxer {
     }
 }
 
-/// Decodes the first audio stream of `data` to planar float.
+/// Decodes the first audio stream of `data` to planar float, one channel
+/// plane after another (`channels * samples` floats).
 pub(crate) fn decode_audio(data: &[u8]) -> Result<DecodedAudio> {
     let mut rate: c_int = 0;
     let mut channels: c_int = 0;
