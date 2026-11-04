@@ -231,7 +231,13 @@ impl Rotary {
     /// Normalize and rotate `query` and `key` into `q_out` and `k_out`.
     ///
     /// `query` and `q_out` are `[tokens, q_heads, head_dim]`, `key` and `k_out`
-    /// `[tokens, k_heads, head_dim]`; the two weights are `[head_dim]`.
+    /// `[tokens, k_heads, head_dim]`; the two weights are `[head_dim]`, given together or both
+    /// absent.
+    ///
+    /// A trained transformer's per-head normalization scales the head by a learned weight; the video
+    /// VAE's decoder normalizes each head without one, and that call passes neither weight, which
+    /// compiles a program with no weight ports (specs/worker.md 9, the per-head norm row;
+    /// `ops::rope::QkNormRopeDescriptor::affine`).
     #[allow(
         clippy::too_many_arguments,
         reason = "a rotation call carries the two projections, their norms, the two factor tables \
@@ -242,8 +248,8 @@ impl Rotary {
         f: &Forward,
         query: TensorView,
         key: TensorView,
-        q_weight: TensorView,
-        k_weight: TensorView,
+        q_weight: Option<TensorView>,
+        k_weight: Option<TensorView>,
         cosine: TensorView,
         sine: TensorView,
         q_out: TensorView,
@@ -293,6 +299,26 @@ impl Rotary {
                 ),
             ));
         }
+        let affine = match (q_weight, k_weight) {
+            (Some(q_weight), Some(k_weight))
+                if q_weight.numel() == head_dim && k_weight.numel() == head_dim =>
+            {
+                Some((q_weight, k_weight))
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(Error::shape(
+                    "Rotary::apply",
+                    format!("per-head weights of {head_dim} elements"),
+                ));
+            }
+            _ => {
+                return Err(Error::shape(
+                    "Rotary::apply",
+                    "the per-head weights are given together, or both absent".to_owned(),
+                ));
+            }
+        };
         let descriptor = QkNormRopeDescriptor {
             dtype: query.dtype,
             output: q_out.dtype,
@@ -303,15 +329,18 @@ impl Rotary {
             epsilon: self.epsilon.into(),
             rows: QK_NORM_TOKENS,
             block: head_dim.next_power_of_two().min(1024) as u32,
-            // The transformer's per-head norm is trained: both weights are applied.
-            affine: true,
+            affine: affine.is_some(),
             pdl: PDL,
+        };
+        let (q_weight, k_weight) = match affine {
+            Some((q_weight, k_weight)) => (Some(q_weight), Some(k_weight)),
+            None => (None, None),
         };
         let args = QkNormRopeArgs {
             query,
             key,
-            q_weight: Some(q_weight),
-            k_weight: Some(k_weight),
+            q_weight,
+            k_weight,
             cosine,
             sine,
             q_out,
