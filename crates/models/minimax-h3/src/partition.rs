@@ -301,13 +301,17 @@ impl Partition {
             ulysses_degree: 1,
             tensor_parallel: 1,
             tensor_rank: 0,
-            blocks: Components::ALL,
+            blocks: Components::ALL.without(Component::TransformerRef),
             text_rows: RELEASED_TEXT_ROWS,
             condition_rows: RELEASED_CONDITION_ROWS,
         }
     }
 
     /// The same partition, placing `blocks`.
+    ///
+    /// A deployment that serves `ref2va` places [`Component::TransformerRef`] and drops
+    /// [`Component::Transformer`]: the two are one block, and the task decides which checkpoint's
+    /// weights fill it.
     pub const fn placing(mut self, blocks: Components) -> Self {
         self.blocks = blocks;
         self
@@ -345,7 +349,7 @@ impl Partition {
             ulysses_degree,
             tensor_parallel,
             tensor_rank,
-            blocks: Components::ALL,
+            blocks: Components::ALL.without(Component::TransformerRef),
             text_rows: RELEASED_TEXT_ROWS,
             condition_rows: RELEASED_CONDITION_ROWS,
         };
@@ -467,6 +471,11 @@ mod tests {
         assert_eq!(partition.text_query_heads(&config), 64);
         assert_eq!(partition.text_key_value_heads(&config), 8);
         assert_eq!(partition.vocabulary_shard(151_936), (0, 151_936));
+        // One rank holds every component of a base deployment, and one denoiser: the task's. A
+        // `ref2va` deployment places `TransformerRef` instead.
+        assert!(partition.blocks.contains(Component::Transformer));
+        assert!(!partition.blocks.contains(Component::TransformerRef));
+        assert_eq!(partition.blocks.iter().count(), Component::ALL.len() - 1);
     }
 
     #[test]
