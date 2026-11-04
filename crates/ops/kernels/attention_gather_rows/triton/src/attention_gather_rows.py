@@ -15,6 +15,12 @@ of the `tokens` tokens' row. That layout is the operator: a program that assumed
 different order would read a plausible number from the wrong section, which is why
 the sections are named here once and used by name below.
 
+Four strides are the caller's storage rather than this program's arithmetic:
+`unit_table_stride`, `block_table_stride`, `start_page_stride` and `write_stride` are
+words of the launch, so one module serves any storage a caller hands the program — and
+a non-contiguous call is what the check scripts exercise. The strides that decide which
+arithmetic runs stay compile-time values.
+
 The arithmetic is the model's (`uniserve/nn/attention/gather.py`), which is what the
 check scripts compare against: a token of a row sits at position `prefix + token -
 start`, appends to the unit that position falls in, and addresses that unit's page
@@ -50,14 +56,14 @@ def _attention_gather_rows_kernel(
     width,
     ROW_STRIDE: tl.constexpr,  # noqa: N803
     TOKEN_SECTION: tl.constexpr,  # noqa: N803
-    UNIT_TABLE_STRIDE: tl.constexpr,  # noqa: N803
+    unit_table_stride,
     UNIT_ROW_STRIDE: tl.constexpr,  # noqa: N803
     REQUEST_WIDTH: tl.constexpr,  # noqa: N803
     START_GROUP_STRIDE: tl.constexpr,  # noqa: N803
-    BLOCK_TABLE_STRIDE: tl.constexpr,  # noqa: N803
+    block_table_stride,
     BLOCK_TABLE_ROW_STRIDE: tl.constexpr,  # noqa: N803
-    START_PAGE_STRIDE: tl.constexpr,  # noqa: N803
-    WRITE_STRIDE: tl.constexpr,  # noqa: N803
+    start_page_stride,
+    write_stride,
     ROW_BLOCK: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
 ):
@@ -73,7 +79,7 @@ def _attention_gather_rows_kernel(
     group = tl.load(shape)
     block_size = tl.load(shape + 1)
     window = tl.load(shape + 2)
-    units = request_unit_tables + table * UNIT_TABLE_STRIDE
+    units = request_unit_tables + table * unit_table_stride
 
     # The shared sections, then this table's selected-page counts.
     slots = columns
@@ -99,7 +105,7 @@ def _attention_gather_rows_kernel(
             0,
         )
         tl.store(
-            start_pages + table * START_PAGE_STRIDE + row_offsets,
+            start_pages + table * start_page_stride + row_offsets,
             row_first,
             mask=row_live,
         )
@@ -151,7 +157,7 @@ def _attention_gather_rows_kernel(
         )
         tl.store(
             block_tables
-            + table.to(tl.int64) * BLOCK_TABLE_STRIDE
+            + table.to(tl.int64) * block_table_stride
             + row * BLOCK_TABLE_ROW_STRIDE
             + cell.to(tl.int64),
             value,
@@ -193,7 +199,7 @@ def _attention_gather_rows_kernel(
             -1,
         )
         tl.store(
-            slot_mapping + table.to(tl.int64) * WRITE_STRIDE + token,
+            slot_mapping + table.to(tl.int64) * write_stride + token,
             address.to(slot_mapping.dtype.element_ty),
             mask=live,
         )

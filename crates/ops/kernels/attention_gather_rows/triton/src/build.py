@@ -4,10 +4,11 @@
 function, its argument signature in the order the operator launches them, the
 compile-time values the descriptor dimensions give, and the compilation options.
 
-Every stride in the key is a constexpr here, because each one decides the index
-arithmetic the program performs; the counts that change per call — the rows, the
-tokens, the cell programs and the selected width — stay runtime values, so a new
-batch size loads no other module. The table count is in the key because the store
+The values that place the caller's storage — the four capacity strides — and the
+counts that change per call (the rows, the tokens, the cell programs and the selected
+width) are runtime arguments, so one module serves any storage and any batch size. A
+stride the program's own arithmetic needs stays a constexpr, because the compiler folds
+it into the index expressions. The table count is in the key because the store
 keeps one module per call shape, and it is the grid's second axis, not a constant
 the program reads.
 """
@@ -48,28 +49,24 @@ def spec(fields, parameters, target):
             "width": "i64",
             "ROW_STRIDE": "constexpr",
             "TOKEN_SECTION": "constexpr",
-            "UNIT_TABLE_STRIDE": "constexpr",
+            "unit_table_stride": "i64",
             "UNIT_ROW_STRIDE": "constexpr",
             "REQUEST_WIDTH": "constexpr",
             "START_GROUP_STRIDE": "constexpr",
-            "BLOCK_TABLE_STRIDE": "constexpr",
+            "block_table_stride": "i64",
             "BLOCK_TABLE_ROW_STRIDE": "constexpr",
-            "START_PAGE_STRIDE": "constexpr",
-            "WRITE_STRIDE": "constexpr",
+            "start_page_stride": "i64",
+            "write_stride": "i64",
             "ROW_BLOCK": "constexpr",
             "BLOCK": "constexpr",
         },
         "constexprs": {
             "ROW_STRIDE": int(fields["row_stride"]),
             "TOKEN_SECTION": int(fields["token_section"]),
-            "UNIT_TABLE_STRIDE": int(fields["unit_table_stride"]),
             "UNIT_ROW_STRIDE": int(fields["unit_row_stride"]),
             "REQUEST_WIDTH": int(fields["request_width"]),
             "START_GROUP_STRIDE": int(fields["start_group_stride"]),
-            "BLOCK_TABLE_STRIDE": int(fields["block_table_stride"]),
             "BLOCK_TABLE_ROW_STRIDE": int(fields["block_table_row_stride"]),
-            "START_PAGE_STRIDE": int(fields["start_page_stride"]),
-            "WRITE_STRIDE": int(fields["write_stride"]),
             "ROW_BLOCK": int(fields["row_block"]),
             "BLOCK": block,
         },
