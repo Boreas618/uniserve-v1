@@ -215,6 +215,30 @@ fn names_before(text: &str, name: &str) -> Option<usize> {
     None
 }
 
+/// Whether `header` declares a function called `symbol`.
+///
+/// The name must stand alone — the character before it is not part of a longer
+/// identifier — and be followed by `(`, which every prototype does. A typo or a
+/// wrong version suffix in a name the crate binds fails at load, loudly; this
+/// catches it before a machine has to.
+pub(crate) fn declares(header: &str, symbol: &str) -> Option<bool> {
+    let text = text(header)?;
+    let pattern = format!("{symbol}(");
+    let mut from = 0;
+    while let Some(found) = text[from..].find(&pattern) {
+        let at = from + found;
+        let boundary = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !(before.is_alphanumeric() || before == '_'));
+        if boundary {
+            return Some(true);
+        }
+        from = at + symbol.len();
+    }
+    Some(false)
+}
+
 /// Whether `header` could be read at all.
 pub(crate) fn found(header: &str) -> bool {
     text(header).is_some()
