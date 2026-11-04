@@ -190,9 +190,12 @@ impl Routing {
     }
 
     /// The ceilings a policy is instantiated under, from the batch the loaded
-    /// workers were built for (§4.4).
-    fn ceilings(&self) -> scheduling::guest::limits::Limits {
-        ceilings_of(BatchCapacity::of(self.slots[0].handle.info()))
+    /// workers were built for (§4.4); `None` on a main process that holds no
+    /// scheduler and therefore instantiates no policy.
+    fn ceilings(&self) -> Option<scheduling::guest::limits::Limits> {
+        self.slots
+            .first()
+            .map(|slot| ceilings_of(BatchCapacity::of(slot.handle.info())))
     }
 
     /// The state a policy is instantiated with, as the first live scheduler
@@ -303,7 +306,10 @@ impl Routing {
         program: PolicyProgram,
     ) -> Result<(), String> {
         let engine = crate::scheduler::process_engine().map_err(|error| error.to_string())?;
-        let ceilings = self.ceilings();
+        let ceilings = self.ceilings().ok_or_else(|| {
+            "this main process holds no scheduler to instantiate the route policy against"
+                .to_owned()
+        })?;
         let ranks = self.ranks();
         let Some(state) = self.policy_state(&ranks) else {
             return Err(
