@@ -82,12 +82,12 @@ pub enum Error {
     /// The Program Server was away for the whole of the wait (design section
     /// 7.5): the client reconnected `attempts` times without a server
     /// answering, so preparation is told a restart outlasted it.
-    #[error("the program server at {socket} was away for {attempts} attempts")]
+    #[error("the program server at {socket} was away for the whole {waited:?} wait")]
     Restarted {
         /// The socket that stayed unanswered.
         socket: String,
-        /// How many attempts were made before the wait ended.
-        attempts: usize,
+        /// How long the client waited before it gave up.
+        waited: std::time::Duration,
     },
     /// No such program was installed.
     #[error("no {op} program of backend {backend} at revision {revision}")]

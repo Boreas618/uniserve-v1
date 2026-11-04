@@ -121,6 +121,11 @@ pub struct Progress {
     pub detail: String,
 }
 
+// A `prepare` that waited through a Program Server restart (design section 7.5)
+// may report the same step again: the steps of an attempt the restart
+// abandoned are not undone, and the attempt that follows finds the modules it
+// committed. A consumer shows progress monotonically and never counts frames.
+
 /// One file of a module, over the descriptor it arrived on.
 #[derive(Debug)]
 pub struct ModuleFile {
@@ -342,10 +347,25 @@ pub struct Connection {
     descriptors: Vec<OwnedFd>,
 }
 
-/// How the client waits through a restart: this many attempts, this far apart
-/// (design section 7.5 bounds the wait, and the total is the product).
-const WAIT_ATTEMPTS: usize = 300;
+/// How long a `prepare` or a `resolve` waits through a restart, and how often
+/// it looks for the server again (design section 7.5 bounds the wait).
+///
+/// The wait is a wall-clock budget: an attempt costs its own time, and the
+/// pauses are what is left of the budget, so a slow attempt shortens the pause
+/// rather than the budget. A caller needing a hard deadline of its own wraps
+/// the call.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const WAIT_BETWEEN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Pauses before the next attempt, and answers whether there is time left.
+fn pause_until(deadline: std::time::Instant) -> bool {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    std::thread::sleep(WAIT_BETWEEN.min(deadline - now));
+    true
+}
 
 /// Reads one answer frame on `connection`.
 fn answer_on(connection: &mut Connection) -> Result<wire::server_message::Message> {
@@ -768,41 +788,38 @@ impl Client {
         let Some(socket) = self.socket.clone() else {
             return attempt(&mut self.connection);
         };
+        let deadline = std::time::Instant::now() + WAIT;
         let restarted = || Error::Restarted {
             socket: socket.display().to_string(),
-            attempts: WAIT_ATTEMPTS,
+            waited: WAIT,
         };
-        let mut attempts = 0_usize;
-        let mut reconnect = false;
+        // Until the wait is over: run the attempt; when it ended because the
+        // server was away, take a fresh connection after a pause and run it
+        // again. Each attempt costs its own time, so the pause is what is left
+        // of the budget rather than a fixed step.
         loop {
-            if reconnect {
-                match Connection::connect(&socket) {
-                    Ok(connection) => {
-                        self.connection = connection;
-                        reconnect = false;
-                    }
-                    Err(error) if error.away() => {
-                        attempts += 1;
-                        if attempts >= WAIT_ATTEMPTS {
-                            return Err(restarted());
-                        }
-                        std::thread::sleep(WAIT_BETWEEN);
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            attempts += 1;
             match attempt(&mut self.connection) {
                 Ok(answer) => return Ok(answer),
                 Err(error) if error.away() => {
-                    if attempts >= WAIT_ATTEMPTS {
+                    if !pause_until(deadline) {
                         return Err(restarted());
                     }
-                    std::thread::sleep(WAIT_BETWEEN);
-                    reconnect = true;
                 }
                 Err(error) => return Err(error),
+            }
+            loop {
+                match Connection::connect(&socket) {
+                    Ok(connection) => {
+                        self.connection = connection;
+                        break;
+                    }
+                    Err(error) if error.away() => {
+                        if !pause_until(deadline) {
+                            return Err(restarted());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
