@@ -1641,9 +1641,10 @@ fn recapture_builds_an_executable_of_the_new_capture() {
     );
 }
 
-/// A tensor map encodes the layout a TMA kernel moves: the driver accepts a
-/// rank-1 and a rank-2 description of device storage, and the description is
-/// checked against its rank before the driver sees it.
+/// A tensor map encodes the layout a TMA kernel moves: the driver encodes a
+/// two-dimensional description of device storage, a one-dimensional tensor
+/// reaches it as rank two with a trailing dimension of one, and a rank the
+/// driver refuses is named before the driver sees it.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn tensor_maps_encode_tiled_descriptors() {
@@ -1652,19 +1653,21 @@ fn tensor_maps_encode_tiled_descriptors() {
     let device = Device::new(DEVICE).unwrap();
     let storage = DeviceAllocation::linear(DEVICE, 4096).unwrap();
 
-    let rank_one = TensorMapSpec {
+    // A one-dimensional tensor of 64 elements, as the rank the driver takes.
+    let one_dimensional_strides = [64 * 4];
+    let one_dimensional = TensorMapSpec {
         data_type: TensorDataType::Float32,
         global_address: storage.address(),
-        global_dim: &[64],
-        global_strides: &[],
-        box_dim: &[4],
-        element_strides: &[1],
+        global_dim: &[64, 1],
+        global_strides: &one_dimensional_strides,
+        box_dim: &[4, 1],
+        element_strides: &[1, 1],
         interleave: Interleave::None,
         swizzle: Swizzle::None,
         l2_promotion: L2Promotion::None,
         oob_fill: OobFill::None,
     };
-    let encoded = TensorMap::encode_tiled(&device, &rank_one).unwrap();
+    let encoded = TensorMap::encode_tiled(&device, &one_dimensional).unwrap();
     assert!(
         encoded.as_bytes().iter().any(|byte| *byte != 0),
         "the driver encoded the descriptor"
@@ -1695,10 +1698,23 @@ fn tensor_maps_encode_tiled_descriptors() {
     ));
     let rank_zero = TensorMapSpec {
         global_dim: &[],
-        ..rank_one
+        ..one_dimensional
     };
     assert!(matches!(
         TensorMap::encode_tiled(&device, &rank_zero),
+        Err(Error::InvalidArgument(_))
+    ));
+    // The driver on this platform encodes no rank-one map, so the API states
+    // the rank it takes instead of handing the description over.
+    let rank_one = TensorMapSpec {
+        global_dim: &[64],
+        global_strides: &[],
+        box_dim: &[4],
+        element_strides: &[1],
+        ..one_dimensional
+    };
+    assert!(matches!(
+        TensorMap::encode_tiled(&device, &rank_one),
         Err(Error::InvalidArgument(_))
     ));
 }
