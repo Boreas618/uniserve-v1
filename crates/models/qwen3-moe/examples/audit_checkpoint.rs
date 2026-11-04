@@ -101,7 +101,9 @@ fn main() -> ExitCode {
         .filter(|name| {
             !claimed.contains_key(*name)
                 && !claimed.contains_key(&format!("model.{name}"))
-                && !(name.strip_prefix("model.").is_some_and(|stripped| claimed.contains_key(stripped)))
+                && !(name
+                    .strip_prefix("model.")
+                    .is_some_and(|stripped| claimed.contains_key(stripped)))
         })
         .collect();
     unclaimed.sort();
@@ -129,7 +131,10 @@ fn main() -> ExitCode {
         println!("# every claimed tensor is present");
         ExitCode::SUCCESS
     } else {
-        println!("# {} rules name a tensor the checkpoint does not hold", absent.len());
+        println!(
+            "# {} rules name a tensor the checkpoint does not hold",
+            absent.len()
+        );
         ExitCode::FAILURE
     }
 }
@@ -155,8 +160,8 @@ fn root_argument() -> Result<PathBuf, String> {
 /// Every tensor name the checkpoint's index holds.
 fn index_names(root: &Path) -> Result<BTreeSet<String>, String> {
     let path = root.join("model.safetensors.index.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let index: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     let map = index
